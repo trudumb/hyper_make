@@ -77,6 +77,7 @@ impl ExchangeClient {
     /// 1. Create action
     /// 2. Hash and sign
     /// 3. Post to exchange
+    #[allow(dead_code)]
     pub(crate) async fn execute_l1_action(
         &self,
         action: Actions,
@@ -97,6 +98,7 @@ impl ExchangeClient {
     /// Execute a typed data action with automatic signing and posting.
     ///
     /// This is used for EIP-712 signed actions like UsdSend, Withdraw3, etc.
+    #[allow(dead_code)]
     pub(crate) async fn execute_typed_data_action<T: Eip712 + serde::Serialize>(
         &self,
         action: T,

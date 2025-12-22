@@ -1,0 +1,34 @@
+use alloy::primitives::address;
+use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
+use log::info;
+use tokio::sync::mpsc::unbounded_channel;
+
+#[tokio::main]
+async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let mut info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
+    let user = address!("0xc64cc00b46101bd40aa1c3121195e85c0b0918d8");
+
+    let (sender, mut receiver) = unbounded_channel();
+    let subscription_id = info_client
+        .subscribe(Subscription::OrderUpdates { user }, sender)
+        .await
+        .unwrap();
+
+    info!("Subscribed to order updates. Press Ctrl+C to stop.");
+
+    loop {
+        tokio::select! {
+            Some(Message::OrderUpdates(order_updates)) = receiver.recv() => {
+                info!("Received order update data: {order_updates:?}");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down...");
+                break;
+            }
+        }
+    }
+
+    info_client.unsubscribe(subscription_id).await.unwrap();
+    info!("Unsubscribed and exiting cleanly.");
+}

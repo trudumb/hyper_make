@@ -14,7 +14,12 @@ cargo test                     # Run test suite
 
 Run examples with:
 ```bash
-cargo run --bin <example_name>  # e.g., cargo run --bin order_and_cancel
+cargo run --example <example_name>  # e.g., cargo run --example order_and_cancel
+```
+
+Run tools with:
+```bash
+cargo run --bin market_maker -- --help  # Market maker tool with CLI
 ```
 
 ## Architecture
@@ -51,11 +56,18 @@ This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data
 
 ### Examples
 
-34 runnable examples in `src/bin/`:
-- Exchange: `order_and_cancel`, `leverage`, `market_order_and_cancel`, `bulk_orders`
-- Spot: `spot_order`, `spot_transfer`
-- WebSocket: `ws_all_mids`, `ws_l2_book`, `ws_trades`, `ws_orders`
-- Advanced: `market_maker`, `agent`, `using_big_blocks`
+33 API examples in `examples/` (run with `cargo run --example <name>`):
+- **Exchange**: `order_and_cancel`, `leverage`, `market_order_and_cancel`, `order_and_cancel_cloid`
+- **Spot**: `spot_order`, `spot_transfer`
+- **Transfers**: `usdc_transfer`, `vault_transfer`, `class_transfer`, `bridge_withdraw`
+- **Account**: `agent`, `approve_builder_fee`, `claim_rewards`, `set_referrer`
+- **WebSocket**: `ws_all_mids`, `ws_l2_book`, `ws_trades`, `ws_orders`, `ws_candles`, `ws_bbo`, etc.
+- **Advanced**: `info` (comprehensive API reference), `using_big_blocks`
+
+### Tools
+
+Production tools in `src/bin/` (run with `cargo run --bin <name>`):
+- **market_maker**: Automated market making tool with CLI configuration, multiple strategies, and structured logging
 
 ### Key Patterns
 

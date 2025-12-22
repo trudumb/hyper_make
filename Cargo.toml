@@ -18,6 +18,7 @@ alloy = { version = "1.0", default-features = false, features = [
   "signer-local",
 ] }
 chrono = "0.4.26"
+clap = { version = "4.4", features = ["derive", "env"] }
 env_logger = "0.11.8"
 futures-util = "0.3.28"
 lazy_static = "1.0"
@@ -29,4 +30,11 @@ rmp-serde = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-tungstenite = { version = "0.20.0", features = ["native-tls"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.0", features = ["v4"] }
+
+[[bin]]
+name = "market_maker"
+path = "src/bin/market_maker.rs"
