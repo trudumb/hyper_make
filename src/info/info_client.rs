@@ -6,17 +6,18 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    info::{
+    info::response_structs::{
         ActiveAssetDataResponse, CandlesSnapshotResponse, FundingHistoryResponse,
-        L2SnapshotResponse, OpenOrdersResponse, OrderInfo, RecentTradesResponse, UserFillsResponse,
-        UserStateResponse,
+        L2SnapshotResponse, OpenOrdersResponse, OrderStatusResponse, RecentTradesResponse,
+        ReferralResponse, UserFeesResponse, UserFillsResponse, UserFundingResponse,
+        UserStateResponse, UserTokenBalanceResponse,
     },
     meta::{AssetContext, Meta, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
     req::HttpClient,
+    types::OrderInfo,
     ws::{Subscription, WsManager},
-    BaseUrl, Error, Message, OrderStatusResponse, ReferralResponse, UserFeesResponse,
-    UserFundingResponse, UserTokenBalanceResponse,
+    BaseUrl, Error, Message,
 };
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

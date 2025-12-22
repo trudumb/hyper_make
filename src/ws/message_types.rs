@@ -1,6 +1,10 @@
 use serde::Deserialize;
 
-use crate::ws::sub_structs::*;
+use crate::types::{
+    ActiveAssetCtxData, ActiveAssetDataData, ActiveSpotAssetCtxData, AllMidsData, BboData,
+    CandleData, L2BookData, NotificationData, OrderUpdate, Trade, UserData, UserFillsData,
+    UserFundingsData, UserNonFundingLedgerUpdatesData, WebData2Data,
+};
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Trades {
@@ -28,9 +32,12 @@ pub struct UserFills {
 }
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct Candle {
+pub struct CandleMessage {
     pub data: CandleData,
 }
+
+// Type alias for backwards compatibility
+pub type Candle = CandleMessage;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct OrderUpdates {

@@ -2,11 +2,13 @@ use serde::Deserialize;
 
 use alloy::primitives::Address;
 
-use crate::{
-    info::{AssetPosition, Level, MarginSummary},
-    DailyUserVlm, Delta, FeeSchedule, Leverage, OrderInfo, Referrer, ReferrerState,
-    UserTokenBalance,
+use crate::types::{
+    AssetPosition, DailyUserVlm, Delta, FeeSchedule, Leverage, MarginSummary, OrderBookLevel,
+    OrderInfo, Referrer, ReferrerState, UserTokenBalance,
 };
+
+// Type alias for backward compatibility
+type Level = OrderBookLevel;
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
