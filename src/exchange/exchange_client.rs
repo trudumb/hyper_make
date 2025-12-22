@@ -162,14 +162,16 @@ impl ExchangeClient {
         };
         let res = serde_json::to_string(&exchange_payload)
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        debug!("Sending request {res:?}");
+        // Note: Not logging request payload as it contains signatures
+        debug!("Sending exchange request");
 
         let output = &self
             .http_client
             .post("/exchange", res)
             .await
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        debug!("Response: {output}");
+        // Note: Not logging response as it may contain sensitive data
+        debug!("Received exchange response");
         serde_json::from_str(output).map_err(|e| Error::JsonParse(e.to_string()))
     }
 }

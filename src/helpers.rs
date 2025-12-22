@@ -62,6 +62,23 @@ pub fn truncate_float(float: f64, decimals: u32, round_up: bool) -> f64 {
     float as f64 / pow10
 }
 
+/// Round to max significant figures AND max decimal places.
+/// Used for Hyperliquid price formatting (max 5 sig figs, max MAX_DECIMALS-szDecimals decimals).
+/// Per Hyperliquid docs: prices can have up to 5 significant figures, but no more than
+/// MAX_DECIMALS - szDecimals decimal places (6 for perps, 8 for spot).
+/// Integer prices are always allowed regardless of significant figures.
+pub fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32) -> f64 {
+    let abs_value = value.abs();
+    if abs_value < f64::EPSILON {
+        return 0.0;
+    }
+    let magnitude = abs_value.log10().floor() as i32;
+    let scale = 10f64.powi(sig_figs as i32 - magnitude - 1);
+    let rounded = (abs_value * scale).round() / scale;
+    let factor = 10f64.powi(max_decimals as i32);
+    ((rounded * factor).round() / factor).copysign(value)
+}
+
 pub fn bps_diff(x: f64, y: f64) -> u16 {
     if x.abs() < EPSILON {
         INF_BPS

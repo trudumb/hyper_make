@@ -15,7 +15,7 @@ pub mod types;
 // Feature modules
 mod exchange;
 pub mod info;
-mod market_maker;
+pub mod market_maker;
 mod meta;
 mod signature;
 pub mod ws;
@@ -25,10 +25,14 @@ pub use consts::{EPSILON, LOCAL_API_URL, MAINNET_API_URL, TESTNET_API_URL};
 pub use eip712::Eip712;
 pub use errors::{Error, HttpErrorKind, ParseError, SigningError, WsError};
 pub use exchange::*;
-pub use helpers::{bps_diff, truncate_float, BaseUrl};
+pub use helpers::{bps_diff, round_to_significant_and_decimal, truncate_float, BaseUrl};
 pub use info::info_client::*;
 pub use info::response_structs::*;
-pub use market_maker::{MarketMaker, MarketMakerInput, MarketMakerRestingOrder};
+pub use market_maker::{
+    HyperliquidExecutor, InventoryAwareStrategy, MarketMaker, MarketMakerConfig,
+    MarketMakerMetricsRecorder, MetricsRecorder, OrderExecutor, OrderManager, OrderResult,
+    PositionTracker, Quote, QuoteConfig, QuotingStrategy, Side, SymmetricStrategy, TrackedOrder,
+};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;
 pub use types::*;

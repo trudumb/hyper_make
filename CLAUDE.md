@@ -17,9 +17,11 @@ Run examples with:
 cargo run --example <example_name>  # e.g., cargo run --example order_and_cancel
 ```
 
-Run tools with:
+Run market maker:
 ```bash
-cargo run --bin market_maker -- --help  # Market maker tool with CLI
+cargo run --bin market_maker -- --asset BTC              # Run with defaults
+cargo run --bin market_maker -- --help                   # Show CLI options
+cargo run --bin market_maker -- generate-config          # Generate sample config
 ```
 
 ## Architecture
@@ -44,7 +46,13 @@ This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data
 **`signature/`** - EIP-712 cryptographic signing
 - `sign_l1_action()`, `sign_typed_data()`: Transaction signing for Ethereum compatibility
 
-**`market_maker.rs`** - Market making utilities and order state tracking
+**`market_maker/`** - Modular market making system
+- `mod.rs`: `MarketMaker<S, E>` orchestrator - coordinates strategy, orders, position, execution
+- `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`, `MarketMakerMetricsRecorder` trait
+- `strategy.rs`: `QuotingStrategy` trait + `SymmetricStrategy` + `InventoryAwareStrategy`
+- `order_manager.rs`: `OrderManager`, `TrackedOrder`, `Side` - tracks resting orders by oid
+- `position.rs`: `PositionTracker` - position state with fill deduplication by tid
+- `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor` - abstracts order placement/cancellation
 
 ### Supporting Files
 
@@ -75,3 +83,37 @@ Production tools in `src/bin/` (run with `cargo run --bin <name>`):
 - **Async-first**: Built on tokio with async WebSocket and HTTP
 - **MessagePack**: Uses `rmp-serde` for binary protocol efficiency
 - **Builder pattern**: Complex orders built through builder structs
+
+### Market Maker Architecture
+
+The market maker uses a modular, trait-based design for extensibility:
+
+```
+MarketMaker<S: QuotingStrategy, E: OrderExecutor>
+    ├── QuotingStrategy (trait)     # Pluggable pricing logic
+    │   ├── SymmetricStrategy       # Equal spread both sides
+    │   └── InventoryAwareStrategy  # Position-based skew
+    ├── OrderExecutor (trait)       # Abstracted execution (testable)
+    │   └── HyperliquidExecutor     # Real exchange client
+    ├── OrderManager                # Tracks resting orders
+    └── PositionTracker             # Fill dedup + position state
+```
+
+**Adding a new strategy:**
+```rust
+pub struct MyStrategy { /* params */ }
+
+impl QuotingStrategy for MyStrategy {
+    fn calculate_quotes(&self, config: &QuoteConfig, position: f64,
+                        max_position: f64, target_liquidity: f64)
+        -> (Option<Quote>, Option<Quote>) {
+        // Return (bid, ask) quotes
+    }
+    fn name(&self) -> &'static str { "MyStrategy" }
+}
+```
+
+**Hyperliquid constraints:**
+- Minimum order notional: $10 USD
+- Price precision: 5 significant figures, max `6 - sz_decimals` decimals (perps)
+- Size precision: truncate to `sz_decimals` (from asset metadata)

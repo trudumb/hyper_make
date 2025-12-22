@@ -16,7 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use hyperliquid_rust_sdk::{BaseUrl, MarketMaker, MarketMakerInput};
+use hyperliquid_rust_sdk::{
+    BaseUrl, ExchangeClient, HyperliquidExecutor, InfoClient, InventoryAwareStrategy,
+    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, QuotingStrategy,
+    SymmetricStrategy,
+};
 
 // ============================================================================
 // CLI Arguments
@@ -93,7 +97,7 @@ enum Commands {
 // ============================================================================
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct MarketMakerConfig {
+pub struct AppConfig {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
@@ -144,9 +148,9 @@ pub struct TradingConfig {
     /// Maximum absolute position size
     #[serde(default = "default_max_position")]
     pub max_absolute_position_size: f64,
-    /// Decimals for price rounding
-    #[serde(default = "default_decimals")]
-    pub decimals: u32,
+    /// Decimals for price rounding (auto-calculated from asset metadata if not set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u32>,
 }
 
 fn default_asset() -> String {
@@ -164,9 +168,6 @@ fn default_max_bps_diff() -> u16 {
 fn default_max_position() -> f64 {
     0.5
 }
-fn default_decimals() -> u32 {
-    1
-}
 
 impl Default for TradingConfig {
     fn default() -> Self {
@@ -176,7 +177,7 @@ impl Default for TradingConfig {
             half_spread_bps: default_half_spread(),
             max_bps_diff: default_max_bps_diff(),
             max_absolute_position_size: default_max_position(),
-            decimals: default_decimals(),
+            decimals: None, // Auto-calculated from asset metadata
         }
     }
 }
@@ -325,12 +326,40 @@ impl MarketMakerMetrics {
     }
 }
 
+impl MarketMakerMetricsRecorder for MarketMakerMetrics {
+    fn record_order_placed(&self) {
+        self.orders_placed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_order_cancelled(&self) {
+        self.orders_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_fill(&self, amount: f64, is_buy: bool) {
+        self.orders_filled.fetch_add(1, Ordering::Relaxed);
+        let scaled = (amount * 1e8) as u64;
+        if is_buy {
+            self.volume_bought_scaled.fetch_add(scaled, Ordering::Relaxed);
+        } else {
+            self.volume_sold_scaled.fetch_add(scaled, Ordering::Relaxed);
+        }
+    }
+
+    fn update_position(&self, position: f64) {
+        let scaled = (position * 1e8) as i64;
+        self.current_position_scaled.store(scaled, Ordering::Relaxed);
+    }
+}
+
 // ============================================================================
 // Main
 // ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file if it exists (before parsing CLI args)
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     // Handle subcommands
@@ -375,7 +404,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let half_spread = cli.half_spread.unwrap_or(config.trading.half_spread_bps);
     let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
     let max_position = cli.max_position.unwrap_or(config.trading.max_absolute_position_size);
-    let decimals = cli.decimals.unwrap_or(config.trading.decimals);
+
+    // Query metadata to get sz_decimals (always needed for size precision)
+    let info_client = InfoClient::new(None, Some(base_url)).await?;
+    let meta = info_client.meta().await
+        .map_err(|e| format!("Failed to get metadata: {e}"))?;
+
+    let asset_meta = meta.universe.iter()
+        .find(|a| a.name == asset)
+        .ok_or_else(|| format!("Asset '{}' not found in metadata", asset))?;
+
+    let sz_decimals = asset_meta.sz_decimals;
+
+    // Auto-calculate price decimals from asset metadata if not explicitly set
+    let decimals = match cli.decimals.or(config.trading.decimals) {
+        Some(d) => d,
+        None => {
+            // Hyperliquid requires: price_decimals + sz_decimals = 6 (perpetuals) or 8 (spot)
+            // Perpetual assets have index < 10000, spot assets >= 10000
+            let is_spot = meta.universe.iter()
+                .position(|a| a.name == asset)
+                .map(|i| i >= 10000)
+                .unwrap_or(false);
+            let max_decimals: u32 = if is_spot { 8 } else { 6 };
+            let price_decimals = max_decimals.saturating_sub(sz_decimals);
+
+            info!(
+                asset = %asset,
+                sz_decimals = sz_decimals,
+                price_decimals = price_decimals,
+                "Auto-calculated price precision from asset metadata"
+            );
+
+            price_decimals
+        }
+    };
 
     info!(
         asset = %asset,
@@ -410,23 +473,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create market maker input
-    let market_maker_input = MarketMakerInput {
-        asset,
-        target_liquidity,
-        half_spread,
-        max_bps_diff,
-        max_absolute_position_size: max_position,
-        decimals,
-        wallet,
-        base_url: Some(base_url),
+    // Create exchange client
+    let exchange_client = ExchangeClient::new(None, wallet.clone(), Some(base_url), None, None)
+        .await
+        .map_err(|e| format!("Failed to create exchange client: {e}"))?;
+
+    // Query initial position
+    let user_address = wallet.address();
+    let user_state = info_client.user_state(user_address).await
+        .map_err(|e| format!("Failed to get user state: {e}"))?;
+    let initial_position = user_state
+        .asset_positions
+        .iter()
+        .find(|p| p.position.coin == asset)
+        .map(|p| p.position.szi.parse::<f64>().unwrap_or(0.0))
+        .unwrap_or(0.0);
+
+    info!(
+        initial_position = %initial_position,
+        "Queried initial position"
+    );
+
+    // Query available margin and cap liquidity/position accordingly
+    let (target_liquidity, max_position) = {
+        match info_client.active_asset_data(user_address, asset.clone()).await {
+            Ok(data) => {
+                let mark_px: f64 = data.mark_px.parse().unwrap_or(1.0);
+                let available_usdc: f64 = data
+                    .available_to_trade
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let available_asset = available_usdc / mark_px;
+
+                info!(
+                    available_usdc = %available_usdc,
+                    available_asset = %available_asset,
+                    mark_px = %mark_px,
+                    "Queried available margin"
+                );
+
+                // Cap to 40% for each side's liquidity, 80% for max position
+                let capped_liquidity = target_liquidity.min(available_asset * 0.4);
+                let capped_max_pos = max_position.min(available_asset * 0.8);
+
+                if capped_liquidity < target_liquidity {
+                    info!(
+                        requested = %target_liquidity,
+                        capped = %capped_liquidity,
+                        "Capped target_liquidity to available margin"
+                    );
+                }
+
+                (capped_liquidity, capped_max_pos)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query margin: {e}, using defaults");
+                (target_liquidity, max_position)
+            }
+        }
     };
 
+    // Create market maker config
+    let mm_config = MmConfig {
+        asset: asset.clone(),
+        target_liquidity,
+        half_spread_bps: half_spread,
+        max_bps_diff,
+        max_position,
+        decimals,
+        sz_decimals,
+    };
+
+    // Create strategy based on config
+    let strategy: Box<dyn QuotingStrategy> = match config.strategy.strategy_type {
+        StrategyType::Symmetric => Box::new(SymmetricStrategy::new()),
+        StrategyType::InventoryAware => Box::new(InventoryAwareStrategy::new(
+            config.strategy.inventory_skew_factor,
+        )),
+    };
+
+    // Create executor
+    let executor = HyperliquidExecutor::new(exchange_client, Some(metrics.clone()));
+
     // Create and start market maker
-    let mut market_maker = MarketMaker::new(market_maker_input).await?;
+    let mut market_maker = MarketMaker::new(
+        mm_config,
+        strategy,
+        executor,
+        info_client,
+        user_address,
+        initial_position,
+        Some(metrics),
+    );
+
+    // Sync open orders
+    market_maker.sync_open_orders().await
+        .map_err(|e| format!("Failed to sync open orders: {e}"))?;
 
     info!("Market maker initialized, starting main loop...");
-    market_maker.start().await?;
+    market_maker.start().await
+        .map_err(|e| format!("Market maker error: {e}"))?;
 
     Ok(())
 }
@@ -435,20 +582,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Helper Functions
 // ============================================================================
 
-fn load_config(cli: &Cli) -> Result<MarketMakerConfig, Box<dyn std::error::Error>> {
+fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn std::error::Error>> {
     let config_path = &cli.config;
     if Path::new(config_path).exists() {
         let content = std::fs::read_to_string(config_path)?;
-        let config: MarketMakerConfig = toml::from_str(&content)?;
+        let config: AppConfig = toml::from_str(&content)?;
         Ok(config)
     } else {
         // Return default config if file doesn't exist
-        Ok(MarketMakerConfig::default())
+        Ok(AppConfig::default())
     }
 }
 
 fn setup_logging(
-    config: &MarketMakerConfig,
+    config: &AppConfig,
     cli: &Cli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let level = cli.log_level.as_ref().unwrap_or(&config.logging.level);
@@ -503,7 +650,7 @@ fn parse_base_url(s: &str) -> Result<BaseUrl, Box<dyn std::error::Error>> {
 }
 
 fn generate_sample_config(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let sample = MarketMakerConfig::default();
+    let sample = AppConfig::default();
     let content = toml::to_string_pretty(&sample)?;
 
     let with_comments = format!(

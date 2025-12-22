@@ -13,7 +13,17 @@
       "Bash(cargo run:*)",
       "Bash(for:*)",
       "Bash(do sed -i 's/env_logger::init\\(\\);/env_logger::Builder::from_env\\(env_logger::Env::default\\(\\).default_filter_or\\(\"\"info\"\"\\)\\).init\\(\\);/' \"$f\")",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(grep:*)",
+      "Bash(test:*)",
+      "Bash(cat:*)",
+      "Bash(git config:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git log:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "WebSearch",
+      "WebFetch(domain:hyperliquid.gitbook.io)"
     ]
   }
 }
