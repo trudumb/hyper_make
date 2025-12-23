@@ -97,8 +97,8 @@ impl Default for EstimatorConfig {
             trade_flow_window_ms: 1000, // Track buy/sell imbalance over 1s
             trade_flow_alpha: 0.1,      // EWMA smoothing for flow
 
-            // Regime Detection - LOWERED from 3.0 for earlier detection
-            jump_ratio_threshold: 1.5, // RV/BV > 1.5 = toxic
+            // Regime Detection - true toxic flow detection
+            jump_ratio_threshold: 3.0, // RV/BV > 3.0 = toxic (lower values are normal bid-ask bounce)
 
             // Kappa
             kappa_max_distance: 0.01, // 1% from mid

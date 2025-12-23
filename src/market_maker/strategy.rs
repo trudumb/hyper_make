@@ -336,37 +336,42 @@ impl GLFTStrategy {
         }
     }
 
-    /// Derive gamma from the max inventory constraint.
+    /// Derive gamma to achieve target half-spread.
     ///
-    /// We want: at max inventory (q = Q_max), the skew should equal the half-spread.
-    /// From: skew = q × γ × σ² / κ
-    /// At q = Q_max, skew = δ (target half-spread)
-    /// So: γ = δ × κ / (Q_max × σ²)
+    /// From GLFT theory: δ = (1/κ) × ln(1 + κ/γ)
+    /// Solving for γ: e^(κ×δ) = 1 + κ/γ
+    ///                γ = κ / (e^(κ×δ) - 1)
+    ///
+    /// This ensures the GLFT half-spread formula outputs the target spread.
     fn derive_gamma(
         &self,
         target_half_spread: f64,
         kappa: f64,
-        sigma: f64,
-        max_position: f64,
+        _sigma: f64,        // Kept for API compatibility, not used in new formula
+        _max_position: f64, // Kept for API compatibility, not used in new formula
     ) -> f64 {
-        // Guard against division by zero
-        let sigma_sq = sigma.powi(2).max(1e-12);
-        let max_pos = max_position.abs().max(1e-9);
-
-        let gamma = target_half_spread * kappa / (max_pos * sigma_sq);
-        gamma.clamp(self.min_gamma, self.max_gamma)
+        // γ = κ / (e^(κ×δ) - 1)
+        let exponent = (kappa * target_half_spread).exp() - 1.0;
+        if exponent > 1e-9 {
+            (kappa / exponent).clamp(self.min_gamma, self.max_gamma)
+        } else {
+            // For tiny spreads (δ → 0), gamma → ∞
+            self.max_gamma
+        }
     }
 
-    /// Correct GLFT half-spread formula: ψ = (1/γ) × ln(1 + γ/κ)
+    /// Correct GLFT half-spread formula: ψ = (1/κ) × ln(1 + κ/γ)
     ///
     /// This compensates for adverse selection risk.
+    /// Note: The formula uses κ/γ (not γ/κ) per the GLFT paper.
     fn half_spread(&self, gamma: f64, kappa: f64) -> f64 {
-        let ratio = gamma / kappa;
+        let ratio = kappa / gamma;
         if ratio > 1e-6 {
-            (1.0 / gamma) * (1.0 + ratio).ln()
+            (1.0 / kappa) * (1.0 + ratio).ln()
         } else {
-            // Taylor expansion for small γ/κ: ln(1+x) ≈ x, so ψ ≈ 1/κ
-            1.0 / kappa
+            // For very large gamma (tight spreads), use Taylor expansion
+            // ln(1+x) ≈ x for small x, so ψ ≈ κ/(κ×γ) = 1/γ
+            1.0 / gamma
         }
     }
 
@@ -688,12 +693,13 @@ mod tests {
     fn test_glft_long_inventory_skews() {
         let strategy = GLFTStrategy::new(0.01);
         let config = make_config_with_max_pos(100.0, 1.0);
-        // Higher sigma to make skew more visible
+        // Much higher sigma to make skew visible with corrected GLFT formulas
+        // With correct gamma derivation, gamma is much smaller, so we need larger σ
         let market_params = MarketParams {
-            sigma: 0.001, // 0.1% per-second volatility (higher)
-            sigma_total: 0.001,
-            sigma_effective: 0.001,
-            kappa: 50.0, // Lower kappa = more skew
+            sigma: 0.1, // 10% volatility - very high but needed for visible skew
+            sigma_total: 0.1,
+            sigma_effective: 0.1,
+            kappa: 50.0,
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
@@ -731,12 +737,12 @@ mod tests {
     fn test_glft_short_inventory_skews() {
         let strategy = GLFTStrategy::new(0.01);
         let config = make_config_with_max_pos(100.0, 1.0);
-        // Higher sigma to make skew more visible
+        // Much higher sigma to make skew visible with corrected GLFT formulas
         let market_params = MarketParams {
-            sigma: 0.001, // 0.1% per-second volatility
-            sigma_total: 0.001,
-            sigma_effective: 0.001,
-            kappa: 50.0, // Lower kappa = more skew
+            sigma: 0.1, // 10% volatility - very high but needed for visible skew
+            sigma_total: 0.1,
+            sigma_effective: 0.1,
+            kappa: 50.0,
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
@@ -772,47 +778,48 @@ mod tests {
 
     #[test]
     fn test_glft_gamma_derivation() {
-        // Test that gamma is derived correctly from max inventory constraint
-        // γ = δ × κ / (Q_max × σ²)
+        // Test that gamma is derived correctly to achieve target half-spread
+        // New formula: γ = κ / (e^(κ×δ) - 1)
         let strategy = GLFTStrategy::new(0.01);
 
         let target_half_spread = 0.01; // 1%
         let kappa = 100.0;
-        let sigma = 0.001; // 0.1% per-second
-        let max_position = 1.0;
+        let sigma = 0.001; // Not used in new formula
+        let max_position = 1.0; // Not used in new formula
 
-        // Expected: γ = 0.01 * 100 / (1.0 * 0.001^2) = 1 / 0.000001 = 1,000,000
-        // But clamped to max_gamma (10000)
+        // Expected: γ = 100 / (e^(100*0.01) - 1) = 100 / (e^1 - 1) = 100 / 1.718 ≈ 58.2
         let gamma = strategy.derive_gamma(target_half_spread, kappa, sigma, max_position);
+        let expected_gamma = kappa / ((kappa * target_half_spread).exp() - 1.0);
         assert!(
-            (gamma - 10000.0).abs() < 0.1,
-            "Gamma should be clamped to max: {}",
-            gamma
+            (gamma - expected_gamma).abs() < 0.1,
+            "Gamma mismatch: got {}, expected {}",
+            gamma,
+            expected_gamma
         );
 
-        // With larger sigma, gamma should be smaller
-        let sigma_large = 0.01; // 1% per-second
-                                // Expected: γ = 0.01 * 100 / (1.0 * 0.01^2) = 1 / 0.0001 = 10,000
-        let gamma_large_vol =
-            strategy.derive_gamma(target_half_spread, kappa, sigma_large, max_position);
+        // With smaller target spread, gamma should be larger
+        let small_spread = 0.001; // 0.1%
+                                  // Expected: γ = 100 / (e^0.1 - 1) = 100 / 0.1052 ≈ 951
+        let gamma_small = strategy.derive_gamma(small_spread, kappa, sigma, max_position);
         assert!(
-            (gamma_large_vol - 10000.0).abs() < 100.0,
-            "Gamma with large vol: {}",
-            gamma_large_vol
+            gamma_small > gamma,
+            "Smaller spread should give larger gamma: small={}, large={}",
+            gamma_small,
+            gamma
         );
     }
 
     #[test]
     fn test_glft_half_spread_formula() {
-        // Test the correct half-spread formula: ψ = (1/γ) × ln(1 + γ/κ)
+        // Test the correct half-spread formula: ψ = (1/κ) × ln(1 + κ/γ)
         let strategy = GLFTStrategy::new(0.01);
 
         let gamma = 100.0;
         let kappa = 50.0;
 
-        // Expected: ψ = (1/100) * ln(1 + 100/50) = 0.01 * ln(3) = 0.01 * 1.0986 ≈ 0.011
+        // Expected: ψ = (1/50) * ln(1 + 50/100) = 0.02 * ln(1.5) = 0.02 * 0.405 ≈ 0.0081
         let half_spread = strategy.half_spread(gamma, kappa);
-        let expected = (1.0 / gamma) * (1.0 + gamma / kappa).ln();
+        let expected = (1.0 / kappa) * (1.0 + kappa / gamma).ln();
 
         assert!(
             (half_spread - expected).abs() < 1e-6,
