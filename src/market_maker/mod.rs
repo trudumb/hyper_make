@@ -21,8 +21,8 @@ pub use position::*;
 pub use strategy::*;
 
 use alloy::primitives::Address;
-use tracing::{debug, error, info, warn};
 use tokio::sync::mpsc::unbounded_channel;
+use tracing::{debug, error, info, warn};
 
 use crate::prelude::Result;
 use crate::{InfoClient, Message, Subscription};
@@ -109,7 +109,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 px
             );
 
-            self.orders.add_order(TrackedOrder::new(order.oid, side, px, sz));
+            self.orders
+                .add_order(TrackedOrder::new(order.oid, side, px, sz));
         }
 
         Ok(())
@@ -134,7 +135,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .subscribe(Subscription::AllMids, sender.clone())
             .await?;
 
-        // Subscribe to Trades for volatility estimation
+        // Subscribe to Trades for volatility and arrival intensity estimation
         self.info_client
             .subscribe(
                 Subscription::Trades {
@@ -144,8 +145,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             )
             .await?;
 
-        // Note: L2Book subscription removed - kappa is now estimated from trade depths
-        // If L2 data is needed for other purposes in the future, re-add the subscription here
+        // Subscribe to L2Book for kappa (order book depth decay) estimation
+        self.info_client
+            .subscribe(
+                Subscription::L2Book {
+                    coin: self.config.asset.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
         drop(sender); // Explicitly drop the sender since we're done with subscriptions
 
         info!(
@@ -190,16 +199,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             Message::AllMids(all_mids) => {
                 let mids = all_mids.data.mids;
                 if let Some(mid) = mids.get(&self.config.asset) {
-                    let mid: f64 = mid
-                        .parse()
-                        .map_err(|_| crate::Error::FloatStringParse)?;
+                    let mid: f64 = mid.parse().map_err(|_| crate::Error::FloatStringParse)?;
                     self.latest_mid = mid;
                     self.estimator.on_mid_update(mid);
                     self.update_quotes().await?;
                 }
             }
             Message::Trades(trades) => {
-                // Update volatility estimate from trades
+                // Update volatility estimate from trades (feeds volume clock)
                 for trade in &trades.data {
                     if trade.coin != self.config.asset {
                         continue;
@@ -208,22 +215,31 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .px
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
-                    self.estimator.on_trade(trade.time, price);
+                    let size: f64 = trade
+                        .sz
+                        .parse()
+                        .map_err(|_| crate::Error::FloatStringParse)?;
+                    // Now pass size for volume clock sampling
+                    self.estimator.on_trade(trade.time, price, size);
                 }
 
                 // Log warmup progress (throttled)
                 if !self.estimator.is_warmed_up() {
-                    let (current, min) = self.estimator.warmup_progress();
-                    // Log every 10 trades
-                    if current >= self.last_warmup_log + 10 || current == min {
-                        info!("Warming up: {}/{} trades collected", current, min);
-                        self.last_warmup_log = current;
-                    }
-                    if current >= min {
+                    let (vol_ticks, min_vol, l2_updates, min_l2) = self.estimator.warmup_progress();
+                    // Log every 5 volume ticks
+                    if vol_ticks >= self.last_warmup_log + 5 {
                         info!(
-                            "Warmup complete! σ={:.4}, κ={:.4}",
+                            "Warming up: {}/{} volume ticks, {}/{} L2 updates",
+                            vol_ticks, min_vol, l2_updates, min_l2
+                        );
+                        self.last_warmup_log = vol_ticks;
+                    }
+                    if vol_ticks >= min_vol && l2_updates >= min_l2 {
+                        info!(
+                            "Warmup complete! σ={:.6}, κ={:.2}, jump_ratio={:.2}",
                             self.estimator.sigma(),
-                            self.estimator.kappa()
+                            self.estimator.kappa(),
+                            self.estimator.jump_ratio()
                         );
                     }
                 }
@@ -275,6 +291,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Update quotes after fills
                 self.update_quotes().await?;
             }
+            Message::L2Book(l2_book) => {
+                // Update kappa estimate from L2 order book
+                if l2_book.data.coin == self.config.asset && self.latest_mid > 0.0 {
+                    // Parse L2 levels: levels[0] = bids, levels[1] = asks
+                    if l2_book.data.levels.len() >= 2 {
+                        let bids: Vec<(f64, f64)> = l2_book.data.levels[0]
+                            .iter()
+                            .filter_map(|level| {
+                                let px: f64 = level.px.parse().ok()?;
+                                let sz: f64 = level.sz.parse().ok()?;
+                                Some((px, sz))
+                            })
+                            .collect();
+
+                        let asks: Vec<(f64, f64)> = l2_book.data.levels[1]
+                            .iter()
+                            .filter_map(|level| {
+                                let px: f64 = level.px.parse().ok()?;
+                                let sz: f64 = level.sz.parse().ok()?;
+                                Some((px, sz))
+                            })
+                            .collect();
+
+                        self.estimator.on_l2_book(&bids, &asks, self.latest_mid);
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -294,13 +337,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             decimals: self.config.decimals,
             sz_decimals: self.config.sz_decimals,
             min_notional: MIN_ORDER_NOTIONAL,
+            max_position: self.config.max_position,
         };
 
-        // Build market params from live estimates
+        // Build market params from econometric estimates
         let market_params = MarketParams {
-            sigma: self.estimator.sigma(),
-            kappa: self.estimator.kappa(),
-            tau: self.estimator.tau(),
+            sigma: self.estimator.sigma(), // √BV (jump-robust)
+            kappa: self.estimator.kappa(), // Weighted L2 regression
+            arrival_intensity: self.estimator.arrival_intensity(), // Volume ticks/sec
+            is_toxic_regime: self.estimator.is_toxic_regime(), // RV/BV > threshold
+            jump_ratio: self.estimator.jump_ratio(), // RV/BV ratio
         };
 
         debug!(
@@ -309,8 +355,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             max_pos = self.config.max_position,
             target_liq = self.config.target_liquidity,
             sigma = %format!("{:.6}", market_params.sigma),
-            kappa = %format!("{:.4}", market_params.kappa),
-            tau = %format!("{:.2e}", market_params.tau),
+            kappa = %format!("{:.2}", market_params.kappa),
+            jump_ratio = %format!("{:.2}", market_params.jump_ratio),
+            is_toxic = market_params.is_toxic_regime,
             "Quote inputs"
         );
 
@@ -359,7 +406,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
             // Have order, have quote -> check if needs update
             (Some(order), Some(quote)) => {
-                let needs_update = self.orders.needs_update(side, &quote, self.config.max_bps_diff);
+                let needs_update = self
+                    .orders
+                    .needs_update(side, &quote, self.config.max_bps_diff);
                 if needs_update {
                     let oid = order.oid;
                     // Cancel first

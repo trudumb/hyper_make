@@ -63,7 +63,10 @@ impl<'a> SigningContext<'a> {
 
 impl ExchangeClient {
     /// Create a signing context for this client.
-    pub fn signing_context<'a>(&'a self, wallet: Option<&'a PrivateKeySigner>) -> SigningContext<'a> {
+    pub fn signing_context<'a>(
+        &'a self,
+        wallet: Option<&'a PrivateKeySigner>,
+    ) -> SigningContext<'a> {
         SigningContext::new(
             wallet.unwrap_or(&self.wallet),
             self.vault_address,

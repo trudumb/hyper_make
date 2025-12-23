@@ -7,22 +7,36 @@ use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 use super::config::{Quote, QuoteConfig};
 
 /// Parameters estimated from live market data.
+///
+/// For the infinite-horizon GLFT model with regime detection:
+/// - sigma: per-second volatility (√BV - jump-robust, NOT annualized)
+/// - kappa: order book depth decay constant (from weighted L2 book regression)
+/// - arrival_intensity: volume ticks per second
+/// - is_toxic_regime: whether RV/BV ratio indicates jumps (toxic flow)
+/// - jump_ratio: RV/BV ratio (1.0 = normal, >3.0 = toxic)
 #[derive(Debug, Clone, Copy)]
 pub struct MarketParams {
-    /// Estimated volatility (σ)
+    /// Estimated volatility (σ) - per-second standard deviation
+    /// Now uses √BV (Bipower Variation) which is robust to jumps
     pub sigma: f64,
-    /// Estimated order flow intensity (κ)
+    /// Estimated order book depth decay (κ) - from weighted L2 book regression
     pub kappa: f64,
-    /// Estimated time horizon (τ) in years
-    pub tau: f64,
+    /// Order arrival intensity (A) - volume ticks per second
+    pub arrival_intensity: f64,
+    /// Whether market is in toxic (jump) regime: RV/BV > threshold
+    pub is_toxic_regime: bool,
+    /// RV/BV jump ratio: ≈1.0 = normal diffusion, >3.0 = jumps present
+    pub jump_ratio: f64,
 }
 
 impl Default for MarketParams {
     fn default() -> Self {
         Self {
-            sigma: 0.5,
-            kappa: 1.5,
-            tau: 0.0001, // ~1 hour in years
+            sigma: 0.0001,          // 0.01% per-second volatility
+            kappa: 100.0,           // Moderate depth decay
+            arrival_intensity: 0.5, // 0.5 volume ticks per second
+            is_toxic_regime: false, // Default: not toxic
+            jump_ratio: 1.0,        // Default: normal diffusion
         }
     }
 }
@@ -64,7 +78,13 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        (**self).calculate_quotes(config, position, max_position, target_liquidity, market_params)
+        (**self).calculate_quotes(
+            config,
+            position,
+            max_position,
+            target_liquidity,
+            market_params,
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -99,8 +119,7 @@ impl QuotingStrategy for SymmetricStrategy {
         let upper_price_raw = config.mid_price + half_spread;
 
         // Round to 5 significant figures AND max decimal places per Hyperliquid tick size rules
-        let mut lower_price =
-            round_to_significant_and_decimal(lower_price_raw, 5, config.decimals);
+        let mut lower_price = round_to_significant_and_decimal(lower_price_raw, 5, config.decimals);
         let upper_price = round_to_significant_and_decimal(upper_price_raw, 5, config.decimals);
 
         // Ensure bid < ask (rounding may cause them to be equal for high-value assets)
@@ -186,8 +205,7 @@ impl QuotingStrategy for InventoryAwareStrategy {
         let upper_price_raw = adjusted_mid + half_spread;
 
         // Round to 5 significant figures AND max decimal places
-        let mut lower_price =
-            round_to_significant_and_decimal(lower_price_raw, 5, config.decimals);
+        let mut lower_price = round_to_significant_and_decimal(lower_price_raw, 5, config.decimals);
         let upper_price = round_to_significant_and_decimal(upper_price_raw, 5, config.decimals);
 
         // Ensure bid < ask
@@ -236,67 +254,89 @@ impl QuotingStrategy for InventoryAwareStrategy {
 
 /// GLFT (Guéant-Lehalle-Fernandez-Tapia) optimal market making strategy.
 ///
-/// Uses stochastic control theory to derive optimal bid/ask quotes based on:
-/// - Target spread (δ) - user-configured target half-spread
-/// - Order flow intensity (κ) - fill probability decay rate (estimated from L2 book)
-/// - Volatility (σ) - asset price volatility (estimated from trades)
-/// - Time horizon (τ) - estimated from trade rate (faster markets → smaller τ)
+/// Implements the **infinite-horizon** GLFT model from stochastic control theory.
 ///
-/// γ (risk aversion) is calculated dynamically to achieve the target spread:
+/// ## Key Formulas (Corrected per Guéant et al. 2013):
+///
+/// **Half-spread (adverse selection protection):**
 /// ```text
-/// γ = κ / (exp(δ*κ) - 1)
+/// ψ = (1/γ) × ln(1 + γ/κ)
 /// ```
 ///
-/// The optimal spread deltas are:
+/// **Reservation price offset (inventory skew):**
 /// ```text
-/// δ_bid = (1/κ) * ln(1 + κ/γ) + (q/Q_max) * γ * σ² * τ
-/// δ_ask = (1/κ) * ln(1 + κ/γ) - (q/Q_max) * γ * σ² * τ
+/// skew = (q/Q_max) × γ × σ² / κ
 /// ```
+///
+/// **Gamma derivation (from max inventory constraint):**
+/// At max inventory, we want skew ≈ half_spread, so:
+/// ```text
+/// γ = δ × κ / (Q_max × σ²)
+/// ```
+/// where δ = target half-spread as fraction.
+///
+/// ## Parameters:
+/// - σ (sigma): per-second volatility (NOT annualized)
+/// - κ (kappa): order book depth decay (from L2 book)
+/// - Q_max: maximum position size
 #[derive(Debug, Clone)]
 pub struct GLFTStrategy {
-    /// Target half-spread (e.g., 0.005 = 0.5%)
-    pub target_spread: f64,
-    /// Minimum gamma floor (prevents extreme behavior)
+    /// Minimum gamma floor (prevents extreme behavior with tiny σ)
     pub min_gamma: f64,
-    /// Maximum gamma ceiling
+    /// Maximum gamma ceiling (prevents extreme behavior with huge σ)
     pub max_gamma: f64,
 }
 
 impl GLFTStrategy {
-    /// Create a new GLFT strategy with the given target spread.
-    /// γ is calculated dynamically from κ to achieve this target.
-    /// τ is estimated from market trade rate via MarketParams.
-    pub fn new(target_spread: f64) -> Self {
+    /// Create a new GLFT strategy.
+    /// Gamma is derived dynamically from the max inventory constraint.
+    pub fn new(_target_spread: f64) -> Self {
+        // Note: target_spread is now derived from half_spread_bps in config
         Self {
-            target_spread,
-            min_gamma: 1.0,
-            max_gamma: 1000.0,
+            min_gamma: 0.001,   // Allow very small gamma for large positions
+            max_gamma: 10000.0, // Allow large gamma for small positions/low vol
         }
     }
 
-    /// Calculate gamma to achieve target spread given kappa.
-    /// Formula: γ = κ / (exp(δ*κ) - 1)
-    fn calculate_gamma(&self, kappa: f64) -> f64 {
-        let delta_kappa = self.target_spread * kappa;
-        let gamma = if delta_kappa > 0.001 {
-            kappa / (delta_kappa.exp() - 1.0)
-        } else {
-            // For very small δ*κ, use Taylor expansion: γ ≈ 1/δ
-            1.0 / self.target_spread
-        };
+    /// Derive gamma from the max inventory constraint.
+    ///
+    /// We want: at max inventory (q = Q_max), the skew should equal the half-spread.
+    /// From: skew = q × γ × σ² / κ
+    /// At q = Q_max, skew = δ (target half-spread)
+    /// So: γ = δ × κ / (Q_max × σ²)
+    fn derive_gamma(
+        &self,
+        target_half_spread: f64,
+        kappa: f64,
+        sigma: f64,
+        max_position: f64,
+    ) -> f64 {
+        // Guard against division by zero
+        let sigma_sq = sigma.powi(2).max(1e-12);
+        let max_pos = max_position.abs().max(1e-9);
+
+        let gamma = target_half_spread * kappa / (max_pos * sigma_sq);
         gamma.clamp(self.min_gamma, self.max_gamma)
     }
 
-    /// Calculate the base spread component from order flow intensity.
-    /// This is the minimum spread needed to compensate for adverse selection.
-    fn base_spread(&self, kappa: f64, gamma: f64) -> f64 {
-        (1.0 / kappa) * (1.0 + kappa / gamma).ln()
+    /// Correct GLFT half-spread formula: ψ = (1/γ) × ln(1 + γ/κ)
+    ///
+    /// This compensates for adverse selection risk.
+    fn half_spread(&self, gamma: f64, kappa: f64) -> f64 {
+        let ratio = gamma / kappa;
+        if ratio > 1e-6 {
+            (1.0 / gamma) * (1.0 + ratio).ln()
+        } else {
+            // Taylor expansion for small γ/κ: ln(1+x) ≈ x, so ψ ≈ 1/κ
+            1.0 / kappa
+        }
     }
 
-    /// Calculate the inventory adjustment component.
-    /// Positive inventory -> positive adjustment (widen bid, tighten ask)
-    fn inventory_adjustment(&self, inventory_ratio: f64, sigma: f64, gamma: f64, tau: f64) -> f64 {
-        inventory_ratio * gamma * sigma.powi(2) * tau
+    /// Infinite-horizon inventory skew: skew = (q/Q_max) × γ × σ² / κ
+    ///
+    /// Positive inventory → positive skew → wider bid, tighter ask (encourage selling)
+    fn inventory_skew(&self, inventory_ratio: f64, sigma: f64, gamma: f64, kappa: f64) -> f64 {
+        inventory_ratio * gamma * sigma.powi(2) / kappa
     }
 }
 
@@ -309,37 +349,75 @@ impl QuotingStrategy for GLFTStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
+        // Extract market parameters (per-second units)
+        // Note: sigma is now √BV (jump-robust) from the econometric estimator
+        let sigma = market_params.sigma;
+        let kappa = market_params.kappa;
+
+        // Target half-spread from config (as fraction, not bps)
+        let target_half_spread = config.half_spread_bps as f64 / 10000.0;
+
+        // Derive gamma from max inventory constraint:
+        // γ = δ × κ / (Q_max × σ²)
+        // This ensures at max inventory, skew ≈ target_half_spread
+        let gamma = self.derive_gamma(target_half_spread, kappa, sigma, config.max_position);
+
+        // === TOXIC REGIME ADJUSTMENT ===
+        // When jumps are detected (RV/BV >> 1), widen spreads proportionally
+        // Applied AFTER gamma derivation to ensure spreads actually widen
+        let toxicity_multiplier = if market_params.is_toxic_regime {
+            // Scale spread multiplier by how toxic: capped at 2x
+            let factor = (market_params.jump_ratio / 3.0).clamp(1.0, 2.0);
+            debug!(
+                jump_ratio = %format!("{:.2}", market_params.jump_ratio),
+                toxicity_factor = %format!("{:.2}", factor),
+                "Toxic regime: widening spread"
+            );
+            factor
+        } else {
+            1.0
+        };
+
         // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
         let inventory_ratio = if max_position > EPSILON {
-            position / max_position
+            (position / max_position).clamp(-1.0, 1.0)
         } else {
             0.0
         };
 
-        // Use estimated parameters from market data
-        let sigma = market_params.sigma;
-        let kappa = market_params.kappa;
-        let tau = market_params.tau;
+        // GLFT optimal spread components (infinite horizon)
+        // Half-spread: ψ = (1/γ) × ln(1 + γ/κ)
+        let half_spread = self.half_spread(gamma, kappa);
 
-        // Calculate gamma dynamically to achieve target spread
-        let gamma = self.calculate_gamma(kappa);
+        // Inventory skew: (q/Q_max) × γ × σ² / κ
+        let base_skew = self.inventory_skew(inventory_ratio, sigma, gamma, kappa);
 
-        // GLFT optimal spread components
-        let base = self.base_spread(kappa, gamma);
-        let inv_adj = self.inventory_adjustment(inventory_ratio, sigma, gamma, tau);
+        // === ADDITIONAL TOXIC REGIME SKEW ===
+        // In toxic regime, skew more aggressively against position
+        // This encourages faster inventory reduction during dangerous periods
+        let additional_skew = if market_params.is_toxic_regime {
+            // Extra skew proportional to toxicity and inventory
+            let toxicity_excess = (market_params.jump_ratio - 1.0).max(0.0) * 0.1;
+            inventory_ratio * toxicity_excess * half_spread
+        } else {
+            0.0
+        };
+        let skew = base_skew + additional_skew;
 
-        // Optimal deltas (as fraction of price)
-        // When long (inv_adj > 0): bid delta increases, ask delta decreases
-        let bid_delta = base + inv_adj;
-        let ask_delta = base - inv_adj;
+        // Asymmetric deltas (as fraction of price)
+        // When long (skew > 0): bid_delta increases (wider bid), ask_delta decreases (tighter ask)
+        // Apply toxicity multiplier to widen spreads in toxic regimes
+        let bid_delta = (half_spread + skew) * toxicity_multiplier;
+        let ask_delta = ((half_spread - skew).max(0.0)) * toxicity_multiplier;
 
         debug!(
             inv_ratio = %format!("{:.4}", inventory_ratio),
-            gamma = %format!("{:.4}", gamma),
-            base = %format!("{:.6}", base),
-            inv_adj = %format!("{:.6}", inv_adj),
+            gamma = %format!("{:.2}", gamma),
+            half_spread = %format!("{:.6}", half_spread),
+            skew = %format!("{:.6}", skew),
             bid_delta = %format!("{:.6}", bid_delta),
             ask_delta = %format!("{:.6}", ask_delta),
+            is_toxic = market_params.is_toxic_regime,
             "GLFT spread components"
         );
 
@@ -347,18 +425,12 @@ impl QuotingStrategy for GLFTStrategy {
         let bid_offset = config.mid_price * bid_delta;
         let ask_offset = config.mid_price * ask_delta;
 
-        // Enforce minimum spread from config
-        let min_offset = (config.mid_price * config.half_spread_bps as f64) / 10000.0;
-        let bid_offset = bid_offset.max(min_offset);
-        let ask_offset = ask_offset.max(min_offset);
-
         // Calculate raw prices
         let lower_price_raw = config.mid_price - bid_offset;
         let upper_price_raw = config.mid_price + ask_offset;
 
         // Round to exchange precision
-        let mut lower_price =
-            round_to_significant_and_decimal(lower_price_raw, 5, config.decimals);
+        let mut lower_price = round_to_significant_and_decimal(lower_price_raw, 5, config.decimals);
         let upper_price = round_to_significant_and_decimal(upper_price_raw, 5, config.decimals);
 
         // Ensure bid < ask
@@ -369,8 +441,9 @@ impl QuotingStrategy for GLFTStrategy {
 
         debug!(
             mid = config.mid_price,
-            bid_raw = %format!("{:.2}", lower_price_raw),
-            ask_raw = %format!("{:.2}", upper_price_raw),
+            sigma = %format!("{:.6}", sigma),
+            kappa = %format!("{:.2}", kappa),
+            jump_ratio = %format!("{:.2}", market_params.jump_ratio),
             bid_final = lower_price,
             ask_final = upper_price,
             spread_bps = %format!("{:.1}", (upper_price - lower_price) / config.mid_price * 10000.0),
@@ -422,10 +495,22 @@ mod tests {
     fn make_config(mid: f64) -> QuoteConfig {
         QuoteConfig {
             mid_price: mid,
-            half_spread_bps: 10, // 0.1%
+            half_spread_bps: 10, // 0.1% = 10 bps
             decimals: 2,
             sz_decimals: 4,
             min_notional: 10.0,
+            max_position: 1.0, // Default max position for gamma derivation
+        }
+    }
+
+    fn make_config_with_max_pos(mid: f64, max_pos: f64) -> QuoteConfig {
+        QuoteConfig {
+            mid_price: mid,
+            half_spread_bps: 100, // 1% = 100 bps for GLFT tests
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional: 10.0,
+            max_position: max_pos,
         }
     }
 
@@ -482,14 +567,15 @@ mod tests {
 
     #[test]
     fn test_glft_zero_inventory() {
-        // target_spread=0.01 (1% half-spread)
         let strategy = GLFTStrategy::new(0.01);
-        let config = make_config(100.0);
-        // kappa=100.0 (high order flow), sigma=0.01 (low volatility), tau from trade rate
+        let config = make_config_with_max_pos(100.0, 1.0);
+        // Per-second sigma (√BV), kappa from L2 book
         let market_params = MarketParams {
-            sigma: 0.01,
-            kappa: 100.0,
-            tau: 0.0001, // ~1 hour
+            sigma: 0.0001, // 0.01% per-second volatility (jump-robust)
+            kappa: 100.0,  // Moderate depth decay
+            arrival_intensity: 1.0,
+            is_toxic_regime: false,
+            jump_ratio: 1.0,
         };
 
         // With zero inventory, bid and ask should be symmetric around mid
@@ -501,20 +587,25 @@ mod tests {
         // Both should exist and be roughly symmetric
         let bid_offset = config.mid_price - bid.price;
         let ask_offset = ask.price - config.mid_price;
-        assert!((bid_offset - ask_offset).abs() < 0.1);
+        assert!(
+            (bid_offset - ask_offset).abs() < 0.1,
+            "Offsets should be symmetric: bid={:.4}, ask={:.4}",
+            bid_offset,
+            ask_offset
+        );
     }
 
     #[test]
     fn test_glft_long_inventory_skews() {
-        // target_spread=0.01 (1% half-spread)
         let strategy = GLFTStrategy::new(0.01);
-        let config = make_config(100.0);
-        // Use larger tau to make inventory effect visible in test
-        // In production, tau is estimated from trade rate (~0.0001)
+        let config = make_config_with_max_pos(100.0, 1.0);
+        // Higher sigma to make skew more visible
         let market_params = MarketParams {
-            sigma: 0.30,   // 30% annual vol (realistic for crypto)
-            kappa: 100.0,
-            tau: 0.01,     // larger tau to make effect visible
+            sigma: 0.001, // 0.1% per-second volatility (higher)
+            kappa: 50.0,  // Lower kappa = more skew
+            arrival_intensity: 1.0,
+            is_toxic_regime: false,
+            jump_ratio: 1.0,
         };
 
         // With long position, bid should be further from mid (discourage buying)
@@ -530,21 +621,31 @@ mod tests {
         let ask_long = ask_long.unwrap();
 
         // Long position: bid moves down (further from mid), ask moves down (closer to mid)
-        assert!(bid_long.price < bid_neutral.price);
-        assert!(ask_long.price < ask_neutral.price);
+        assert!(
+            bid_long.price < bid_neutral.price,
+            "Long: bid should move down. neutral={}, long={}",
+            bid_neutral.price,
+            bid_long.price
+        );
+        assert!(
+            ask_long.price < ask_neutral.price,
+            "Long: ask should move down. neutral={}, long={}",
+            ask_neutral.price,
+            ask_long.price
+        );
     }
 
     #[test]
     fn test_glft_short_inventory_skews() {
-        // target_spread=0.01 (1% half-spread)
         let strategy = GLFTStrategy::new(0.01);
-        let config = make_config(100.0);
-        // Use larger tau to make inventory effect visible in test
-        // In production, tau is estimated from trade rate (~0.0001)
+        let config = make_config_with_max_pos(100.0, 1.0);
+        // Higher sigma to make skew more visible
         let market_params = MarketParams {
-            sigma: 0.30,   // 30% annual vol (realistic for crypto)
-            kappa: 100.0,
-            tau: 0.01,     // larger tau to make effect visible
+            sigma: 0.001, // 0.1% per-second volatility
+            kappa: 50.0,  // Lower kappa = more skew
+            arrival_intensity: 1.0,
+            is_toxic_regime: false,
+            jump_ratio: 1.0,
         };
 
         // With short position, ask should be further from mid (discourage selling)
@@ -560,46 +661,188 @@ mod tests {
         let ask_short = ask_short.unwrap();
 
         // Short position: bid moves up (closer to mid), ask moves up (further from mid)
-        assert!(bid_short.price > bid_neutral.price);
-        assert!(ask_short.price > ask_neutral.price);
+        assert!(
+            bid_short.price > bid_neutral.price,
+            "Short: bid should move up. neutral={}, short={}",
+            bid_neutral.price,
+            bid_short.price
+        );
+        assert!(
+            ask_short.price > ask_neutral.price,
+            "Short: ask should move up. neutral={}, short={}",
+            ask_neutral.price,
+            ask_short.price
+        );
     }
 
     #[test]
-    fn test_glft_respects_min_spread() {
-        // Even with tiny target_spread, min spread from config should be enforced
-        let strategy = GLFTStrategy::new(0.0001); // 0.01% target
-        let config = make_config(100.0);
-        let market_params = MarketParams {
-            sigma: 0.001,
-            kappa: 1000.0,
-            tau: 0.0001,
+    fn test_glft_gamma_derivation() {
+        // Test that gamma is derived correctly from max inventory constraint
+        // γ = δ × κ / (Q_max × σ²)
+        let strategy = GLFTStrategy::new(0.01);
+
+        let target_half_spread = 0.01; // 1%
+        let kappa = 100.0;
+        let sigma = 0.001; // 0.1% per-second
+        let max_position = 1.0;
+
+        // Expected: γ = 0.01 * 100 / (1.0 * 0.001^2) = 1 / 0.000001 = 1,000,000
+        // But clamped to max_gamma (10000)
+        let gamma = strategy.derive_gamma(target_half_spread, kappa, sigma, max_position);
+        assert!(
+            (gamma - 10000.0).abs() < 0.1,
+            "Gamma should be clamped to max: {}",
+            gamma
+        );
+
+        // With larger sigma, gamma should be smaller
+        let sigma_large = 0.01; // 1% per-second
+                                // Expected: γ = 0.01 * 100 / (1.0 * 0.01^2) = 1 / 0.0001 = 10,000
+        let gamma_large_vol =
+            strategy.derive_gamma(target_half_spread, kappa, sigma_large, max_position);
+        assert!(
+            (gamma_large_vol - 10000.0).abs() < 100.0,
+            "Gamma with large vol: {}",
+            gamma_large_vol
+        );
+    }
+
+    #[test]
+    fn test_glft_half_spread_formula() {
+        // Test the correct half-spread formula: ψ = (1/γ) × ln(1 + γ/κ)
+        let strategy = GLFTStrategy::new(0.01);
+
+        let gamma = 100.0;
+        let kappa = 50.0;
+
+        // Expected: ψ = (1/100) * ln(1 + 100/50) = 0.01 * ln(3) = 0.01 * 1.0986 ≈ 0.011
+        let half_spread = strategy.half_spread(gamma, kappa);
+        let expected = (1.0 / gamma) * (1.0 + gamma / kappa).ln();
+
+        assert!(
+            (half_spread - expected).abs() < 1e-6,
+            "Half-spread mismatch: got {}, expected {}",
+            half_spread,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_glft_inventory_skew_formula() {
+        // Test the infinite-horizon skew: skew = (q/Q_max) × γ × σ² / κ
+        let strategy = GLFTStrategy::new(0.01);
+
+        let inventory_ratio = 0.5; // 50% of max position
+        let sigma = 0.001; // 0.1% per-second
+        let gamma = 1000.0;
+        let kappa = 100.0;
+
+        // Expected: skew = 0.5 * 1000 * 0.001^2 / 100 = 0.5 * 1000 * 0.000001 / 100 = 0.000005
+        let skew = strategy.inventory_skew(inventory_ratio, sigma, gamma, kappa);
+        let expected = inventory_ratio * gamma * sigma.powi(2) / kappa;
+
+        assert!(
+            (skew - expected).abs() < 1e-10,
+            "Skew mismatch: got {}, expected {}",
+            skew,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_glft_toxic_regime_widens_spread() {
+        let strategy = GLFTStrategy::new(0.01);
+        // Use more decimals to avoid rounding issues
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            half_spread_bps: 100, // 1% spread
+            decimals: 4,          // More precision to see spread difference
+            sz_decimals: 4,
+            min_notional: 10.0,
+            max_position: 1.0,
         };
 
-        let (bid, ask) = strategy.calculate_quotes(&config, 0.0, 1.0, 0.5, &market_params);
+        // Normal regime
+        let normal_params = MarketParams {
+            sigma: 0.001,
+            kappa: 50.0,
+            arrival_intensity: 1.0,
+            is_toxic_regime: false,
+            jump_ratio: 1.0,
+        };
 
-        let bid = bid.unwrap();
-        let ask = ask.unwrap();
+        // Toxic regime with high jump ratio (should multiply spread by ~1.5x)
+        let toxic_params = MarketParams {
+            sigma: 0.001, // Same clean volatility
+            kappa: 50.0,
+            arrival_intensity: 1.0,
+            is_toxic_regime: true,
+            jump_ratio: 4.5, // RV/BV = 4.5 -> multiplier = 4.5/3.0 = 1.5
+        };
 
-        // Spread should be at least 2 * half_spread_bps
-        let spread = ask.price - bid.price;
-        let min_spread = 100.0 * 10.0 / 10000.0 * 2.0; // 0.2
-        assert!(spread >= min_spread - 0.01);
+        let (bid_normal, ask_normal) =
+            strategy.calculate_quotes(&config, 0.0, 1.0, 0.5, &normal_params);
+        let (bid_toxic, ask_toxic) =
+            strategy.calculate_quotes(&config, 0.0, 1.0, 0.5, &toxic_params);
+
+        let bid_normal = bid_normal.unwrap();
+        let ask_normal = ask_normal.unwrap();
+        let bid_toxic = bid_toxic.unwrap();
+        let ask_toxic = ask_toxic.unwrap();
+
+        // Toxic regime should have wider spreads
+        let spread_normal = ask_normal.price - bid_normal.price;
+        let spread_toxic = ask_toxic.price - bid_toxic.price;
+
+        assert!(
+            spread_toxic > spread_normal,
+            "Toxic spread should be wider: normal={:.4}, toxic={:.4}",
+            spread_normal,
+            spread_toxic
+        );
     }
 
     #[test]
-    fn test_glft_adaptive_gamma() {
-        // Test that gamma is calculated correctly from target spread and kappa
-        let strategy = GLFTStrategy::new(0.005); // 0.5% target spread
+    fn test_glft_toxic_regime_extra_skew() {
+        let strategy = GLFTStrategy::new(0.01);
+        let config = make_config_with_max_pos(100.0, 1.0);
 
-        // With different kappa values, gamma should adjust to maintain target spread
-        // γ = κ / (exp(δ*κ) - 1)
+        // Long position in toxic regime should have more aggressive skew
+        let normal_params = MarketParams {
+            sigma: 0.001,
+            kappa: 50.0,
+            arrival_intensity: 1.0,
+            is_toxic_regime: false,
+            jump_ratio: 1.0,
+        };
 
-        // kappa = 1.0: gamma = 1.0 / (exp(0.005) - 1) ≈ 199
-        let gamma_low_kappa = strategy.calculate_gamma(1.0);
-        assert!(gamma_low_kappa > 100.0 && gamma_low_kappa < 300.0);
+        let toxic_params = MarketParams {
+            sigma: 0.001,
+            kappa: 50.0,
+            arrival_intensity: 1.0,
+            is_toxic_regime: true,
+            jump_ratio: 5.0,
+        };
 
-        // kappa = 100.0: gamma = 100 / (exp(0.5) - 1) ≈ 154
-        let gamma_high_kappa = strategy.calculate_gamma(100.0);
-        assert!(gamma_high_kappa > 100.0 && gamma_high_kappa < 200.0);
+        // With long position (0.5)
+        let (bid_normal, ask_normal) =
+            strategy.calculate_quotes(&config, 0.5, 1.0, 0.5, &normal_params);
+        let (bid_toxic, ask_toxic) =
+            strategy.calculate_quotes(&config, 0.5, 1.0, 0.5, &toxic_params);
+
+        let bid_normal = bid_normal.unwrap();
+        let _ask_normal = ask_normal.unwrap();
+        let bid_toxic = bid_toxic.unwrap();
+        let _ask_toxic = ask_toxic.unwrap();
+
+        // In toxic regime with long position:
+        // - Bid should be even lower (more skew away from buying)
+        // - Ask should be lower (more aggressive selling)
+        assert!(
+            bid_toxic.price <= bid_normal.price,
+            "Toxic bid should be lower: normal={:.4}, toxic={:.4}",
+            bid_normal.price,
+            bid_toxic.price
+        );
     }
 }

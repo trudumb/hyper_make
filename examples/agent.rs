@@ -29,9 +29,10 @@ async fn main() {
 
     info!("Agent address: {:?}", agent_wallet.address());
 
-    let exchange_client = ExchangeClient::new(None, agent_wallet, Some(BaseUrl::Testnet), None, None)
-        .await
-        .unwrap();
+    let exchange_client =
+        ExchangeClient::new(None, agent_wallet, Some(BaseUrl::Testnet), None, None)
+            .await
+            .unwrap();
 
     let order = ClientOrderRequest {
         asset: "ETH".to_string(),

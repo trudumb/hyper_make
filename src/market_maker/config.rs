@@ -39,7 +39,7 @@ pub struct MarketMakerConfig {
 pub struct QuoteConfig {
     /// Current mid price
     pub mid_price: f64,
-    /// Half spread in basis points
+    /// Half spread in basis points (used as target spread for GLFT)
     pub half_spread_bps: u16,
     /// Decimals for price rounding
     pub decimals: u32,
@@ -47,6 +47,8 @@ pub struct QuoteConfig {
     pub sz_decimals: u32,
     /// Minimum order notional value (USD)
     pub min_notional: f64,
+    /// Maximum position size (needed for GLFT gamma derivation)
+    pub max_position: f64,
 }
 
 /// A quote with price and size.

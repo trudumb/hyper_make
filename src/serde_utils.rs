@@ -23,10 +23,7 @@ where
 }
 
 /// Serialize an Alloy Signature into the {r, s, v} format expected by Hyperliquid API.
-pub fn serialize_signature<S>(
-    sig: &alloy::primitives::Signature,
-    s: S,
-) -> Result<S::Ok, S::Error>
+pub fn serialize_signature<S>(sig: &alloy::primitives::Signature, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

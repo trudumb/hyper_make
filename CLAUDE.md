@@ -51,7 +51,7 @@ This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data
 - `mod.rs`: `MarketMaker<S, E>` orchestrator - coordinates strategy, orders, position, execution
 - `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`, `MarketMakerMetricsRecorder` trait
 - `strategy.rs`: `QuotingStrategy` trait + `SymmetricStrategy` + `InventoryAwareStrategy` + `GLFTStrategy`
-- `estimator.rs`: `ParameterEstimator` - live estimation of σ (volatility), κ (order flow), τ (time horizon)
+- `estimator.rs`: `ParameterEstimator` - econometric pipeline with volume clock, bipower variation, regime detection
 - `order_manager.rs`: `OrderManager`, `TrackedOrder`, `Side` - tracks resting orders by oid
 - `position.rs`: `PositionTracker` - position state with fill deduplication by tid
 - `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor` - abstracts order placement/cancellation
@@ -106,24 +106,52 @@ MarketMaker<S: QuotingStrategy, E: OrderExecutor>
 **GLFT Strategy (default):**
 
 Uses stochastic control theory for optimal market making:
-- **σ (sigma)**: Volatility estimated from trade log returns
-- **κ (kappa)**: Order flow intensity estimated from L2 book depth decay
+- **σ (sigma)**: Jump-robust volatility from bipower variation (√BV)
+- **κ (kappa)**: Order flow intensity from weighted L2 book regression
 - **τ (tau)**: Time horizon estimated from trade rate (faster markets → smaller τ)
 - **γ (gamma)**: Risk aversion calculated dynamically to achieve target spread
+- **Toxic regime**: When RV/BV > 3.0, spreads widen by toxicity multiplier
 
 Formulas:
 ```
 γ = κ / (exp(δ*κ) - 1)           # Adaptive gamma from target spread δ
 δ_bid = (1/κ) * ln(1 + κ/γ) + (q/Q_max) * γ * σ² * τ
 δ_ask = (1/κ) * ln(1 + κ/γ) - (q/Q_max) * γ * σ² * τ
+toxicity_multiplier = clamp(jump_ratio / 3.0, 1.0, 2.0)  # Applied in toxic regime
 ```
 
-**Parameter Estimation:**
+**Parameter Estimation (Econometric Pipeline):**
 
-The `ParameterEstimator` provides live market parameter estimation:
-- Subscribes to Trades (for σ) and L2Book (for κ)
-- Adaptive warmup threshold that decays over time for low-activity markets
-- τ estimated from trade rate: `τ = (avg_interval * 10) / SECONDS_PER_YEAR`
+The `ParameterEstimator` provides HFT-grade market parameter estimation:
+
+1. **Volume Clock**: Adaptive volume-based sampling (1% of 5-min rolling volume)
+   - Normalizes by economic activity instead of wall-clock time
+   - Bucket threshold adapts to market conditions
+
+2. **VWAP Pre-Averaging**: Returns calculated on bucket VWAPs
+   - Filters bid-ask bounce noise from raw trade prices
+
+3. **Bipower Variation**: Jump-robust volatility estimation
+   - RV (Realized Variance): EWMA of r²
+   - BV (Bipower Variation): EWMA of (π/2) × |r_t| × |r_{t-1}|
+   - σ = √BV (clean diffusion component)
+
+4. **Regime Detection**: Jump ratio (RV/BV) identifies toxic flow
+   - Normal: ratio ≈ 1.0
+   - Toxic: ratio > 3.0 (jumps dominate)
+
+5. **Weighted Kappa**: L2 book depth decay estimation
+   - Truncates orders > 1% from mid
+   - Proximity-weighted regression on first 15 levels
+   - κ = negative slope of ln(cumulative_depth) vs distance
+
+Data flow:
+```
+Trades(px, sz, time) → VolumeBucket → VWAP → BipowerVariation → σ, RV/BV
+L2Book(bids, asks)   → WeightedKappa → κ
+```
+
+Warmup: 20 volume ticks + 10 L2 updates before quoting begins.
 
 **Adding a new strategy:**
 ```rust
@@ -132,8 +160,14 @@ pub struct MyStrategy { /* params */ }
 impl QuotingStrategy for MyStrategy {
     fn calculate_quotes(&self, config: &QuoteConfig, position: f64,
                         max_position: f64, target_liquidity: f64,
-                        market_params: &MarketParams)  // σ, κ, τ from estimator
+                        market_params: &MarketParams)
         -> (Option<Quote>, Option<Quote>) {
+        // MarketParams contains:
+        //   sigma: f64           - √BV (jump-robust volatility)
+        //   kappa: f64           - order flow intensity
+        //   arrival_intensity: f64 - volume ticks per second
+        //   is_toxic_regime: bool  - RV/BV > 3.0
+        //   jump_ratio: f64      - RV/BV ratio
         // Return (bid, ask) quotes
     }
     fn name(&self) -> &'static str { "MyStrategy" }

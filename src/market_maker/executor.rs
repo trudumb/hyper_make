@@ -37,13 +37,7 @@ impl OrderResult {
 #[async_trait]
 pub trait OrderExecutor: Send + Sync {
     /// Place a limit order.
-    async fn place_order(
-        &self,
-        asset: &str,
-        price: f64,
-        size: f64,
-        is_buy: bool,
-    ) -> OrderResult;
+    async fn place_order(&self, asset: &str, price: f64, size: f64, is_buy: bool) -> OrderResult;
 
     /// Cancel an order.
     /// Returns `true` if cancel was successful, `false` otherwise.
@@ -65,13 +59,7 @@ impl HyperliquidExecutor {
 
 #[async_trait]
 impl OrderExecutor for HyperliquidExecutor {
-    async fn place_order(
-        &self,
-        asset: &str,
-        price: f64,
-        size: f64,
-        is_buy: bool,
-    ) -> OrderResult {
+    async fn place_order(&self, asset: &str, price: f64, size: f64, is_buy: bool) -> OrderResult {
         let side = if is_buy { "BUY" } else { "SELL" };
 
         let order = self

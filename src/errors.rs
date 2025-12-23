@@ -58,13 +58,11 @@ pub enum ParseError {
 #[derive(Error, Debug, Clone)]
 pub enum Error {
     // === New structured errors ===
-
     /// HTTP error with status code and classification
     #[error("HTTP error (status {status}): {kind}")]
     Http { status: u16, kind: HttpErrorKind },
 
     // === Legacy variants (for backward compatibility) ===
-
     /// Client HTTP error (4xx)
     #[error("Client error: status code: {status_code}, error code: {error_code:?}, error message: {error_message}, error data: {error_data:?}")]
     ClientRequest {
@@ -177,10 +175,19 @@ pub enum Error {
 // Convenience constructors for common error patterns
 impl Error {
     /// Create an HTTP client error
-    pub fn client_error(status: u16, code: Option<u16>, message: String, data: Option<String>) -> Self {
+    pub fn client_error(
+        status: u16,
+        code: Option<u16>,
+        message: String,
+        data: Option<String>,
+    ) -> Self {
         Error::Http {
             status,
-            kind: HttpErrorKind::Client { code, message, data },
+            kind: HttpErrorKind::Client {
+                code,
+                message,
+                data,
+            },
         }
     }
 

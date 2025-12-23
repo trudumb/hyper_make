@@ -99,7 +99,9 @@ impl OrderManager {
 
     /// Get the first order on a given side (for single-order-per-side strategies).
     pub fn get_by_side(&self, side: Side) -> Option<&TrackedOrder> {
-        self.orders.values().find(|o| o.side == side && !o.is_filled())
+        self.orders
+            .values()
+            .find(|o| o.side == side && !o.is_filled())
     }
 
     /// Get all orders on a given side.

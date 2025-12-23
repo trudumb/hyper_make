@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -210,12 +210,12 @@ pub struct StrategyConfig {
     /// Default sigma to use during warmup (before enough trades collected)
     #[serde(default = "default_sigma")]
     pub default_sigma: f64,
-    /// Default kappa to use during warmup
+    /// Default kappa to use during warmup (order book decay)
     #[serde(default = "default_kappa")]
     pub default_kappa: f64,
-    /// Default tau (time horizon) to use during warmup, in years (~0.0001 = 1 hour)
-    #[serde(default = "default_tau")]
-    pub default_tau: f64,
+    /// Default arrival intensity during warmup (trades per second)
+    #[serde(default = "default_arrival_intensity")]
+    pub default_arrival_intensity: f64,
     /// Decay period for adaptive warmup threshold (in seconds). 0 = disabled.
     /// On low-activity markets, the min_trades threshold decays linearly to
     /// min_warmup_trades over this period.
@@ -236,13 +236,13 @@ fn default_min_trades() -> usize {
     50
 }
 fn default_sigma() -> f64 {
-    0.5
+    0.0001 // 0.01% per-second volatility
 }
 fn default_kappa() -> f64 {
-    1.5
+    100.0 // Moderate order book decay
 }
-fn default_tau() -> f64 {
-    0.0001 // ~1 hour in years
+fn default_arrival_intensity() -> f64 {
+    0.5 // 1 trade per 2 seconds
 }
 fn default_warmup_decay_secs() -> u64 {
     300 // 5 minutes
@@ -261,7 +261,7 @@ impl Default for StrategyConfig {
             min_trades: default_min_trades(),
             default_sigma: default_sigma(),
             default_kappa: default_kappa(),
-            default_tau: default_tau(),
+            default_arrival_intensity: default_arrival_intensity(),
             warmup_decay_secs: default_warmup_decay_secs(),
             min_warmup_trades: default_min_warmup_trades(),
         }
@@ -351,7 +351,8 @@ impl MarketMakerMetrics {
         self.orders_filled.fetch_add(1, Ordering::Relaxed);
         let scaled = (amount * 1e8) as u64;
         if is_buy {
-            self.volume_bought_scaled.fetch_add(scaled, Ordering::Relaxed);
+            self.volume_bought_scaled
+                .fetch_add(scaled, Ordering::Relaxed);
         } else {
             self.volume_sold_scaled.fetch_add(scaled, Ordering::Relaxed);
         }
@@ -359,7 +360,8 @@ impl MarketMakerMetrics {
 
     pub fn update_position(&self, position: f64) {
         let scaled = (position * 1e8) as i64;
-        self.current_position_scaled.store(scaled, Ordering::Relaxed);
+        self.current_position_scaled
+            .store(scaled, Ordering::Relaxed);
     }
 
     pub fn log_summary(&self) {
@@ -411,7 +413,8 @@ impl MarketMakerMetricsRecorder for MarketMakerMetrics {
         self.orders_filled.fetch_add(1, Ordering::Relaxed);
         let scaled = (amount * 1e8) as u64;
         if is_buy {
-            self.volume_bought_scaled.fetch_add(scaled, Ordering::Relaxed);
+            self.volume_bought_scaled
+                .fetch_add(scaled, Ordering::Relaxed);
         } else {
             self.volume_sold_scaled.fetch_add(scaled, Ordering::Relaxed);
         }
@@ -419,7 +422,8 @@ impl MarketMakerMetricsRecorder for MarketMakerMetrics {
 
     fn update_position(&self, position: f64) {
         let scaled = (position * 1e8) as i64;
-        self.current_position_scaled.store(scaled, Ordering::Relaxed);
+        self.current_position_scaled
+            .store(scaled, Ordering::Relaxed);
     }
 }
 
@@ -472,17 +476,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build market maker input, CLI args override config
     let asset = cli.asset.clone().unwrap_or(config.trading.asset.clone());
-    let target_liquidity = cli.target_liquidity.unwrap_or(config.trading.target_liquidity);
+    let target_liquidity = cli
+        .target_liquidity
+        .unwrap_or(config.trading.target_liquidity);
     let half_spread = cli.half_spread.unwrap_or(config.trading.half_spread_bps);
     let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
-    let max_position = cli.max_position.unwrap_or(config.trading.max_absolute_position_size);
+    let max_position = cli
+        .max_position
+        .unwrap_or(config.trading.max_absolute_position_size);
 
     // Query metadata to get sz_decimals (always needed for size precision)
-    let info_client = InfoClient::new(None, Some(base_url)).await?;
-    let meta = info_client.meta().await
+    // Use with_reconnect to automatically reconnect if WebSocket disconnects
+    let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
+    let meta = info_client
+        .meta()
+        .await
         .map_err(|e| format!("Failed to get metadata: {e}"))?;
 
-    let asset_meta = meta.universe.iter()
+    let asset_meta = meta
+        .universe
+        .iter()
         .find(|a| a.name == asset)
         .ok_or_else(|| format!("Asset '{}' not found in metadata", asset))?;
 
@@ -494,7 +507,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             // Hyperliquid requires: price_decimals + sz_decimals = 6 (perpetuals) or 8 (spot)
             // Perpetual assets have index < 10000, spot assets >= 10000
-            let is_spot = meta.universe.iter()
+            let is_spot = meta
+                .universe
+                .iter()
                 .position(|a| a.name == asset)
                 .map(|i| i >= 10000)
                 .unwrap_or(false);
@@ -552,7 +567,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Query initial position
     let user_address = wallet.address();
-    let user_state = info_client.user_state(user_address).await
+    let user_state = info_client
+        .user_state(user_address)
+        .await
         .map_err(|e| format!("Failed to get user state: {e}"))?;
     let initial_position = user_state
         .asset_positions
@@ -568,7 +585,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Query available margin and cap liquidity/position accordingly
     let (target_liquidity, max_position) = {
-        match info_client.active_asset_data(user_address, asset.clone()).await {
+        match info_client
+            .active_asset_data(user_address, asset.clone())
+            .await
+        {
             Ok(data) => {
                 let mark_px: f64 = data.mark_px.parse().unwrap_or(1.0);
                 let available_usdc: f64 = data
@@ -626,16 +646,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StrategyType::Glft => Box::new(GLFTStrategy::new(config.strategy.target_spread)),
     };
 
-    // Create estimator config for live parameter estimation
-    let estimator_config = EstimatorConfig {
-        window_ms: config.strategy.estimation_window_secs * 1000,
-        min_trades: config.strategy.min_trades,
-        default_sigma: config.strategy.default_sigma,
-        default_kappa: config.strategy.default_kappa,
-        default_tau: config.strategy.default_tau,
-        decay_secs: config.strategy.warmup_decay_secs,
-        min_warmup_trades: config.strategy.min_warmup_trades,
-    };
+    // Create estimator config for live parameter estimation (using legacy compatibility)
+    let estimator_config = EstimatorConfig::from_legacy(
+        config.strategy.estimation_window_secs * 1000,
+        config.strategy.min_trades,
+        config.strategy.default_sigma,
+        config.strategy.default_kappa,
+        config.strategy.default_arrival_intensity,
+        config.strategy.warmup_decay_secs,
+        config.strategy.min_warmup_trades,
+    );
 
     info!(
         estimation_window_secs = config.strategy.estimation_window_secs,
@@ -661,11 +681,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Sync open orders
-    market_maker.sync_open_orders().await
+    market_maker
+        .sync_open_orders()
+        .await
         .map_err(|e| format!("Failed to sync open orders: {e}"))?;
 
     info!("Market maker initialized, starting main loop...");
-    market_maker.start().await
+    market_maker
+        .start()
+        .await
         .map_err(|e| format!("Market maker error: {e}"))?;
 
     Ok(())
@@ -687,10 +711,7 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn std::error::Error>> {
     }
 }
 
-fn setup_logging(
-    config: &AppConfig,
-    cli: &Cli,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_logging(config: &AppConfig, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let level = cli.log_level.as_ref().unwrap_or(&config.logging.level);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -718,8 +739,7 @@ fn setup_logging(
         let file = Mutex::new(file);
 
         // When logging to file, use JSON format for both (easier to parse)
-        let stdout_layer = tracing_subscriber::fmt::layer()
-            .json();
+        let stdout_layer = tracing_subscriber::fmt::layer().json();
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(file)
             .with_ansi(false)
@@ -731,7 +751,10 @@ fn setup_logging(
             .with(file_layer)
             .init();
 
-        eprintln!("Logging to file: {} (using JSON format for both stdout and file)", log_path);
+        eprintln!(
+            "Logging to file: {} (using JSON format for both stdout and file)",
+            log_path
+        );
     } else {
         // No file, just stdout with requested format
         match format {

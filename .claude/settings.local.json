@@ -23,7 +23,8 @@
       "Bash(ls:*)",
       "Bash(find:*)",
       "WebSearch",
-      "WebFetch(domain:hyperliquid.gitbook.io)"
+      "WebFetch(domain:hyperliquid.gitbook.io)",
+      "Bash(cargo fmt:*)"
     ]
   }
 }
