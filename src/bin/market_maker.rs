@@ -17,9 +17,9 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
-    BaseUrl, ExchangeClient, HyperliquidExecutor, InfoClient, InventoryAwareStrategy,
-    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, QuotingStrategy,
-    SymmetricStrategy,
+    BaseUrl, EstimatorConfig, ExchangeClient, GLFTStrategy, HyperliquidExecutor, InfoClient,
+    InventoryAwareStrategy, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
+    QuotingStrategy, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -184,12 +184,64 @@ impl Default for TradingConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StrategyConfig {
-    /// Strategy type: symmetric, inventory_aware
+    /// Strategy type: symmetric, inventory_aware, glft
     #[serde(default)]
     pub strategy_type: StrategyType,
     /// Skew factor for inventory-aware strategy (BPS per unit position)
     #[serde(default)]
     pub inventory_skew_factor: f64,
+    /// GLFT: Target half-spread (e.g., 0.005 = 0.5%)
+    /// γ is calculated dynamically from κ to achieve this target
+    #[serde(default = "default_target_spread")]
+    pub target_spread: f64,
+    /// Rolling window for parameter estimation (in seconds)
+    #[serde(default = "default_estimation_window_secs")]
+    pub estimation_window_secs: u64,
+    /// Minimum trades before volatility estimate is valid (warmup period)
+    #[serde(default = "default_min_trades")]
+    pub min_trades: usize,
+    /// Default sigma to use during warmup (before enough trades collected)
+    #[serde(default = "default_sigma")]
+    pub default_sigma: f64,
+    /// Default kappa to use during warmup
+    #[serde(default = "default_kappa")]
+    pub default_kappa: f64,
+    /// Default tau (time horizon) to use during warmup, in years (~0.0001 = 1 hour)
+    #[serde(default = "default_tau")]
+    pub default_tau: f64,
+    /// Decay period for adaptive warmup threshold (in seconds). 0 = disabled.
+    /// On low-activity markets, the min_trades threshold decays linearly to
+    /// min_warmup_trades over this period.
+    #[serde(default = "default_warmup_decay_secs")]
+    pub warmup_decay_secs: u64,
+    /// Floor for adaptive warmup threshold (minimum trades even after full decay)
+    #[serde(default = "default_min_warmup_trades")]
+    pub min_warmup_trades: usize,
+}
+
+fn default_target_spread() -> f64 {
+    0.005 // 0.5% target half-spread
+}
+fn default_estimation_window_secs() -> u64 {
+    300 // 5 minutes
+}
+fn default_min_trades() -> usize {
+    50
+}
+fn default_sigma() -> f64 {
+    0.5
+}
+fn default_kappa() -> f64 {
+    1.5
+}
+fn default_tau() -> f64 {
+    0.0001 // ~1 hour in years
+}
+fn default_warmup_decay_secs() -> u64 {
+    300 // 5 minutes
+}
+fn default_min_warmup_trades() -> usize {
+    5
 }
 
 impl Default for StrategyConfig {
@@ -197,6 +249,14 @@ impl Default for StrategyConfig {
         Self {
             strategy_type: StrategyType::default(),
             inventory_skew_factor: 0.0,
+            target_spread: default_target_spread(),
+            estimation_window_secs: default_estimation_window_secs(),
+            min_trades: default_min_trades(),
+            default_sigma: default_sigma(),
+            default_kappa: default_kappa(),
+            default_tau: default_tau(),
+            warmup_decay_secs: default_warmup_decay_secs(),
+            min_warmup_trades: default_min_warmup_trades(),
         }
     }
 }
@@ -204,9 +264,10 @@ impl Default for StrategyConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyType {
-    #[default]
     Symmetric,
     InventoryAware,
+    #[default]
+    Glft,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -551,7 +612,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StrategyType::InventoryAware => Box::new(InventoryAwareStrategy::new(
             config.strategy.inventory_skew_factor,
         )),
+        StrategyType::Glft => Box::new(GLFTStrategy::new(config.strategy.target_spread)),
     };
+
+    // Create estimator config for live parameter estimation
+    let estimator_config = EstimatorConfig {
+        window_ms: config.strategy.estimation_window_secs * 1000,
+        min_trades: config.strategy.min_trades,
+        default_sigma: config.strategy.default_sigma,
+        default_kappa: config.strategy.default_kappa,
+        default_tau: config.strategy.default_tau,
+        decay_secs: config.strategy.warmup_decay_secs,
+        min_warmup_trades: config.strategy.min_warmup_trades,
+    };
+
+    info!(
+        estimation_window_secs = config.strategy.estimation_window_secs,
+        min_trades = config.strategy.min_trades,
+        warmup_decay_secs = config.strategy.warmup_decay_secs,
+        min_warmup_trades = config.strategy.min_warmup_trades,
+        "Live parameter estimation enabled (adaptive warmup)"
+    );
 
     // Create executor
     let executor = HyperliquidExecutor::new(exchange_client, Some(metrics.clone()));
@@ -565,6 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_address,
         initial_position,
         Some(metrics),
+        estimator_config,
     );
 
     // Sync open orders
@@ -602,7 +684,7 @@ fn setup_logging(
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(level)
-            .add_directive("hyper=warn".parse().unwrap())
+            .add_directive("hyper::=warn".parse().unwrap())
             .add_directive("reqwest=warn".parse().unwrap())
             .add_directive("tokio_tungstenite=warn".parse().unwrap())
     });

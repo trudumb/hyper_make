@@ -1,7 +1,7 @@
 //! Order execution abstraction for the market maker.
 
 use async_trait::async_trait;
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
@@ -180,6 +180,11 @@ impl OrderExecutor for HyperliquidExecutor {
                                     return true;
                                 }
                                 ExchangeDataStatus::Error(e) => {
+                                    // "already canceled or filled" means the order is gone - that's success
+                                    if e.contains("already canceled") || e.contains("filled") {
+                                        info!("Order already gone: {e}");
+                                        return true;
+                                    }
                                     error!("Cancel error: {e}");
                                 }
                                 _ => {

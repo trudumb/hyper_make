@@ -7,19 +7,21 @@
 //! - **Executor**: Handles order placement and cancellation
 
 mod config;
+mod estimator;
 mod executor;
 mod order_manager;
 mod position;
 mod strategy;
 
 pub use config::*;
+pub use estimator::*;
 pub use executor::*;
 pub use order_manager::*;
 pub use position::*;
 pub use strategy::*;
 
 use alloy::primitives::Address;
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::prelude::Result;
@@ -31,6 +33,7 @@ const MIN_ORDER_NOTIONAL: f64 = 10.0;
 /// Market maker orchestrator.
 ///
 /// Coordinates strategy, order management, position tracking, and execution.
+/// Includes live parameter estimation for GLFT strategy (σ from trades, κ from L2 book).
 pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Configuration
     config: MarketMakerConfig,
@@ -50,10 +53,15 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     latest_mid: f64,
     /// Metrics recorder
     metrics: MetricsRecorder,
+    /// Parameter estimator for σ and κ
+    estimator: ParameterEstimator,
+    /// Last logged warmup progress (to avoid spam)
+    last_warmup_log: usize,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Create a new market maker.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: MarketMakerConfig,
         strategy: S,
@@ -62,6 +70,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         user_address: Address,
         initial_position: f64,
         metrics: MetricsRecorder,
+        estimator_config: EstimatorConfig,
     ) -> Self {
         Self {
             config,
@@ -73,6 +82,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             user_address,
             latest_mid: -1.0,
             metrics,
+            estimator: ParameterEstimator::new(estimator_config),
+            last_warmup_log: 0,
         }
     }
 
@@ -120,7 +131,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Subscribe to AllMids for price updates
         self.info_client
-            .subscribe(Subscription::AllMids, sender)
+            .subscribe(Subscription::AllMids, sender.clone())
+            .await?;
+
+        // Subscribe to Trades for volatility estimation
+        self.info_client
+            .subscribe(
+                Subscription::Trades {
+                    coin: self.config.asset.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to L2Book for order flow intensity estimation
+        self.info_client
+            .subscribe(
+                Subscription::L2Book {
+                    coin: self.config.asset.clone(),
+                },
+                sender,
+            )
             .await?;
 
         info!(
@@ -128,6 +159,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.config.asset,
             self.strategy.name()
         );
+        info!("Warming up parameter estimator...");
 
         loop {
             tokio::select! {
@@ -170,6 +202,80 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     self.latest_mid = mid;
                     self.update_quotes().await?;
                 }
+            }
+            Message::Trades(trades) => {
+                // Update volatility estimate from trades
+                for trade in &trades.data {
+                    if trade.coin != self.config.asset {
+                        continue;
+                    }
+                    let price: f64 = trade
+                        .px
+                        .parse()
+                        .map_err(|_| crate::Error::FloatStringParse)?;
+                    self.estimator.on_trade(trade.time, price);
+                }
+
+                // Log warmup progress (throttled)
+                if !self.estimator.is_warmed_up() {
+                    let (current, min) = self.estimator.warmup_progress();
+                    // Log every 10 trades
+                    if current >= self.last_warmup_log + 10 || current == min {
+                        info!("Warming up: {}/{} trades collected", current, min);
+                        self.last_warmup_log = current;
+                    }
+                    if current >= min {
+                        info!(
+                            "Warmup complete! σ={:.4}, κ={:.4}",
+                            self.estimator.sigma(),
+                            self.estimator.kappa()
+                        );
+                    }
+                }
+            }
+            Message::L2Book(l2_book) => {
+                // Update order flow intensity from L2 book
+                if l2_book.data.coin != self.config.asset {
+                    return Ok(());
+                }
+                if self.latest_mid <= 0.0 {
+                    return Ok(()); // Need mid price first
+                }
+
+                // Convert L2 levels to (price, size) tuples
+                let bids: Vec<(f64, f64)> = l2_book
+                    .data
+                    .levels
+                    .first()
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|level| {
+                                let px: f64 = level.px.parse().ok()?;
+                                let sz: f64 = level.sz.parse().ok()?;
+                                Some((px, sz))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let asks: Vec<(f64, f64)> = l2_book
+                    .data
+                    .levels
+                    .get(1)
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|level| {
+                                let px: f64 = level.px.parse().ok()?;
+                                let sz: f64 = level.sz.parse().ok()?;
+                                Some((px, sz))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                self.estimator.on_l2_book(self.latest_mid, &bids, &asks);
             }
             Message::UserFills(user_fills) => {
                 if self.latest_mid < 0.0 {
@@ -226,6 +332,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Update quotes based on current market state.
     async fn update_quotes(&mut self) -> Result<()> {
+        // Don't place orders until estimator is warmed up
+        if !self.estimator.is_warmed_up() {
+            return Ok(());
+        }
+
         let quote_config = QuoteConfig {
             mid_price: self.latest_mid,
             half_spread_bps: self.config.half_spread_bps,
@@ -234,11 +345,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             min_notional: MIN_ORDER_NOTIONAL,
         };
 
+        // Build market params from live estimates
+        let market_params = MarketParams {
+            sigma: self.estimator.sigma(),
+            kappa: self.estimator.kappa(),
+            tau: self.estimator.tau(),
+        };
+
         let (bid, ask) = self.strategy.calculate_quotes(
             &quote_config,
             self.position.position(),
             self.config.max_position,
             self.config.target_liquidity,
+            &market_params,
         );
 
         // Handle bid side

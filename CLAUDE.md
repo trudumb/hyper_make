@@ -49,7 +49,8 @@ This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data
 **`market_maker/`** - Modular market making system
 - `mod.rs`: `MarketMaker<S, E>` orchestrator - coordinates strategy, orders, position, execution
 - `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`, `MarketMakerMetricsRecorder` trait
-- `strategy.rs`: `QuotingStrategy` trait + `SymmetricStrategy` + `InventoryAwareStrategy`
+- `strategy.rs`: `QuotingStrategy` trait + `SymmetricStrategy` + `InventoryAwareStrategy` + `GLFTStrategy`
+- `estimator.rs`: `ParameterEstimator` - live estimation of σ (volatility), κ (order flow), τ (time horizon)
 - `order_manager.rs`: `OrderManager`, `TrackedOrder`, `Side` - tracks resting orders by oid
 - `position.rs`: `PositionTracker` - position state with fill deduplication by tid
 - `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor` - abstracts order placement/cancellation
@@ -92,12 +93,36 @@ The market maker uses a modular, trait-based design for extensibility:
 MarketMaker<S: QuotingStrategy, E: OrderExecutor>
     ├── QuotingStrategy (trait)     # Pluggable pricing logic
     │   ├── SymmetricStrategy       # Equal spread both sides
-    │   └── InventoryAwareStrategy  # Position-based skew
+    │   ├── InventoryAwareStrategy  # Position-based skew
+    │   └── GLFTStrategy            # Optimal MM (Guéant-Lehalle-Fernandez-Tapia)
     ├── OrderExecutor (trait)       # Abstracted execution (testable)
     │   └── HyperliquidExecutor     # Real exchange client
+    ├── ParameterEstimator          # Live σ, κ, τ estimation from market data
     ├── OrderManager                # Tracks resting orders
     └── PositionTracker             # Fill dedup + position state
 ```
+
+**GLFT Strategy (default):**
+
+Uses stochastic control theory for optimal market making:
+- **σ (sigma)**: Volatility estimated from trade log returns
+- **κ (kappa)**: Order flow intensity estimated from L2 book depth decay
+- **τ (tau)**: Time horizon estimated from trade rate (faster markets → smaller τ)
+- **γ (gamma)**: Risk aversion calculated dynamically to achieve target spread
+
+Formulas:
+```
+γ = κ / (exp(δ*κ) - 1)           # Adaptive gamma from target spread δ
+δ_bid = (1/κ) * ln(1 + κ/γ) + (q/Q_max) * γ * σ² * τ
+δ_ask = (1/κ) * ln(1 + κ/γ) - (q/Q_max) * γ * σ² * τ
+```
+
+**Parameter Estimation:**
+
+The `ParameterEstimator` provides live market parameter estimation:
+- Subscribes to Trades (for σ) and L2Book (for κ)
+- Adaptive warmup threshold that decays over time for low-activity markets
+- τ estimated from trade rate: `τ = (avg_interval * 10) / SECONDS_PER_YEAR`
 
 **Adding a new strategy:**
 ```rust
@@ -105,7 +130,8 @@ pub struct MyStrategy { /* params */ }
 
 impl QuotingStrategy for MyStrategy {
     fn calculate_quotes(&self, config: &QuoteConfig, position: f64,
-                        max_position: f64, target_liquidity: f64)
+                        max_position: f64, target_liquidity: f64,
+                        market_params: &MarketParams)  // σ, κ, τ from estimator
         -> (Option<Quote>, Option<Quote>) {
         // Return (bid, ask) quotes
     }
