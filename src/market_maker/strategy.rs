@@ -1,5 +1,7 @@
 //! Quoting strategies for the market maker.
 
+use tracing::debug;
+
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use super::config::{Quote, QuoteConfig};
@@ -331,6 +333,16 @@ impl QuotingStrategy for GLFTStrategy {
         let bid_delta = base + inv_adj;
         let ask_delta = base - inv_adj;
 
+        debug!(
+            inv_ratio = %format!("{:.4}", inventory_ratio),
+            gamma = %format!("{:.4}", gamma),
+            base = %format!("{:.6}", base),
+            inv_adj = %format!("{:.6}", inv_adj),
+            bid_delta = %format!("{:.6}", bid_delta),
+            ask_delta = %format!("{:.6}", ask_delta),
+            "GLFT spread components"
+        );
+
         // Convert to absolute price offsets
         let bid_offset = config.mid_price * bid_delta;
         let ask_offset = config.mid_price * ask_delta;
@@ -354,6 +366,16 @@ impl QuotingStrategy for GLFTStrategy {
             let tick = 10f64.powi(-(config.decimals as i32));
             lower_price -= tick;
         }
+
+        debug!(
+            mid = config.mid_price,
+            bid_raw = %format!("{:.2}", lower_price_raw),
+            ask_raw = %format!("{:.2}", upper_price_raw),
+            bid_final = lower_price,
+            ask_final = upper_price,
+            spread_bps = %format!("{:.1}", (upper_price - lower_price) / config.mid_price * 10000.0),
+            "GLFT prices"
+        );
 
         // Calculate sizes based on position limits
         let buy_size_raw = (max_position - position).min(target_liquidity).max(0.0);

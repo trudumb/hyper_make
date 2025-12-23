@@ -13,7 +13,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
@@ -73,6 +76,10 @@ struct Cli {
     /// Output format (pretty, json, compact)
     #[arg(long)]
     log_format: Option<String>,
+
+    /// Log file path (logs to both file and stdout)
+    #[arg(long)]
+    log_file: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -278,6 +285,9 @@ pub struct LoggingConfig {
     /// Output format: pretty, json, compact
     #[serde(default)]
     pub format: LogFormat,
+    /// Optional log file path (logs to both file and stdout)
+    #[serde(default)]
+    pub log_file: Option<String>,
 }
 
 fn default_log_level() -> String {
@@ -289,6 +299,7 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             format: LogFormat::default(),
+            log_file: None,
         }
     }
 }
@@ -698,24 +709,50 @@ fn setup_logging(
             LogFormat::Pretty => "pretty",
         });
 
-    match format {
-        "json" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .json()
-                .init();
-        }
-        "compact" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .compact()
-                .init();
-        }
-        _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
+    // Get log file path from CLI or config
+    let log_file = cli.log_file.as_ref().or(config.logging.log_file.as_ref());
+
+    if let Some(log_path) = log_file {
+        // Create file writer
+        let file = std::fs::File::create(log_path)?;
+        let file = Mutex::new(file);
+
+        // When logging to file, use JSON format for both (easier to parse)
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .json();
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file)
+            .with_ansi(false)
+            .json();
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+
+        eprintln!("Logging to file: {} (using JSON format for both stdout and file)", log_path);
+    } else {
+        // No file, just stdout with requested format
+        match format {
+            "json" => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .json()
+                    .init();
+            }
+            "compact" => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .compact()
+                    .init();
+            }
+            _ => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    .init();
+            }
         }
     }
 

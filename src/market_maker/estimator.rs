@@ -3,6 +3,8 @@
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tracing::debug;
+
 /// Seconds per year (365.25 days)
 const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 
@@ -46,6 +48,11 @@ pub struct ParameterEstimator {
     config: EstimatorConfig,
     /// Recent trade prices for volatility calculation: (timestamp_ms, price)
     trade_prices: VecDeque<(u64, f64)>,
+    /// Recent trade depths for kappa calculation: (timestamp_ms, depth_bps)
+    /// depth_bps = |trade_price - mid_price| / mid_price * 10000
+    trade_depths: VecDeque<(u64, f64)>,
+    /// Current mid price for depth calculation
+    current_mid: f64,
     /// Cached volatility estimate
     cached_sigma: f64,
     /// Cached order intensity estimate
@@ -69,9 +76,16 @@ impl ParameterEstimator {
             cached_kappa: config.default_kappa,
             config,
             trade_prices: VecDeque::new(),
+            trade_depths: VecDeque::new(),
+            current_mid: 0.0,
             is_warmed_up: false,
             start_time_ms,
         }
+    }
+
+    /// Update current mid price for depth calculations.
+    pub fn on_mid_update(&mut self, mid_price: f64) {
+        self.current_mid = mid_price;
     }
 
     /// Calculate the effective minimum trades threshold based on elapsed time.
@@ -99,9 +113,9 @@ impl ParameterEstimator {
         threshold.max(self.config.min_warmup_trades)
     }
 
-    /// Process a new trade and update volatility estimate.
+    /// Process a new trade and update volatility and kappa estimates.
     pub fn on_trade(&mut self, timestamp_ms: u64, price: f64) {
-        // Add new trade
+        // Add new trade for sigma calculation
         self.trade_prices.push_back((timestamp_ms, price));
 
         // Remove old trades outside the window
@@ -114,6 +128,24 @@ impl ParameterEstimator {
             }
         }
 
+        // Track trade depth for kappa calculation
+        if self.current_mid > 0.0 {
+            let depth_bps = ((price - self.current_mid).abs() / self.current_mid) * 10000.0;
+            self.trade_depths.push_back((timestamp_ms, depth_bps));
+
+            // Remove old depths
+            while let Some(&(ts, _)) = self.trade_depths.front() {
+                if ts < cutoff {
+                    self.trade_depths.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            // Update kappa estimate from trade depths
+            self.cached_kappa = self.calculate_kappa();
+        }
+
         // Use adaptive threshold that decays over time
         let effective_min = self.effective_min_trades(timestamp_ms);
 
@@ -121,78 +153,94 @@ impl ParameterEstimator {
         if self.trade_prices.len() >= effective_min {
             self.cached_sigma = self.calculate_volatility();
             self.is_warmed_up = true;
+            debug!(
+                trade_count = self.trade_prices.len(),
+                sigma = %format!("{:.6}", self.cached_sigma),
+                "Sigma updated from trades"
+            );
         } else {
             // Reset warmup if trades expired below threshold
             self.is_warmed_up = false;
         }
     }
 
-    /// Process L2 book update and estimate order flow intensity.
+    /// Calculate kappa from trade execution depths using GLFT intensity fitting.
     ///
-    /// levels: Vec of (price, size) tuples, sorted by distance from mid
-    pub fn on_l2_book(&mut self, mid_price: f64, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
-        // Estimate kappa from book depth decay
-        // κ measures how quickly fill probability decays with distance from mid
-        // Higher κ = liquidity concentrated near mid = tighter optimal spread
-
-        let bid_kappa = self.estimate_kappa_from_side(mid_price, bids, true);
-        let ask_kappa = self.estimate_kappa_from_side(mid_price, asks, false);
-
-        // Average of bid and ask side estimates
-        if bid_kappa > 0.0 && ask_kappa > 0.0 {
-            self.cached_kappa = (bid_kappa + ask_kappa) / 2.0;
-        } else if bid_kappa > 0.0 {
-            self.cached_kappa = bid_kappa;
-        } else if ask_kappa > 0.0 {
-            self.cached_kappa = ask_kappa;
-        }
-        // Otherwise keep cached value
-    }
-
-    /// Estimate kappa from one side of the book.
-    fn estimate_kappa_from_side(&self, mid_price: f64, levels: &[(f64, f64)], is_bid: bool) -> f64 {
-        if levels.len() < 3 {
-            return 0.0;
+    /// Fits the exponential intensity function: λ(δ) = A * exp(-k * δ)
+    /// Where δ is the distance from mid price in fractional terms.
+    fn calculate_kappa(&self) -> f64 {
+        // Need at least 10 trades for meaningful estimation
+        if self.trade_depths.len() < 10 {
+            return self.config.default_kappa;
         }
 
-        // Calculate cumulative size and distance from mid for each level
-        let mut cumulative_size = 0.0;
-        let mut points: Vec<(f64, f64)> = Vec::new(); // (distance, ln_cumulative_size)
+        // Group trades into depth buckets (0-5bps, 5-10bps, 10-20bps, 20-50bps, 50+bps)
+        // Bucket midpoints in bps for regression
+        let bucket_midpoints_bps = [2.5, 7.5, 15.0, 35.0, 75.0];
+        let mut counts = [0u32; 5];
 
-        for &(price, size) in levels.iter().take(10) {
-            // Use top 10 levels
-            cumulative_size += size;
-            let distance = if is_bid {
-                (mid_price - price) / mid_price
+        for &(_, depth_bps) in &self.trade_depths {
+            if depth_bps < 5.0 {
+                counts[0] += 1;
+            } else if depth_bps < 10.0 {
+                counts[1] += 1;
+            } else if depth_bps < 20.0 {
+                counts[2] += 1;
+            } else if depth_bps < 50.0 {
+                counts[3] += 1;
             } else {
-                (price - mid_price) / mid_price
-            };
+                counts[4] += 1;
+            }
+        }
 
-            if distance > 0.0 && cumulative_size > 0.0 {
-                points.push((distance, cumulative_size.ln()));
+        // Build (depth_fractional, ln_count) points for non-empty buckets
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for (i, &count) in counts.iter().enumerate() {
+            if count > 0 {
+                // Convert depth from bps to fractional (e.g., 10bps = 0.001)
+                let depth = bucket_midpoints_bps[i] / 10000.0;
+                points.push((depth, (count as f64).ln()));
             }
         }
 
         if points.len() < 2 {
-            return 0.0;
+            debug!(
+                trade_count = self.trade_depths.len(),
+                bucket_counts = ?counts,
+                "Kappa: not enough depth buckets"
+            );
+            return self.config.default_kappa;
         }
 
-        // Linear regression to find slope of ln(cumulative_size) vs distance
-        // κ ≈ -1 / slope (higher slope = faster decay = higher kappa)
+        // Linear regression: ln(count) = -k * depth + const
+        // The slope should be negative (more trades near mid)
         let n = points.len() as f64;
         let sum_x: f64 = points.iter().map(|(x, _)| x).sum();
         let sum_y: f64 = points.iter().map(|(_, y)| y).sum();
         let sum_xy: f64 = points.iter().map(|(x, y)| x * y).sum();
         let sum_xx: f64 = points.iter().map(|(x, _)| x * x).sum();
 
-        let slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x);
-
-        if slope.abs() > 1e-10 {
-            // κ = 1 / |slope| with reasonable bounds
-            (1.0 / slope.abs()).clamp(0.1, 100.0)
-        } else {
-            0.0
+        let denominator = n * sum_xx - sum_x * sum_x;
+        if denominator.abs() < 1e-10 {
+            return self.config.default_kappa;
         }
+
+        let slope = (n * sum_xy - sum_x * sum_y) / denominator;
+
+        // k = -slope (slope should be negative: more trades near mid)
+        // If slope is positive (unusual), trades are concentrated far from mid
+        // Typical k values: 0.5 (broad distribution) to 20 (concentrated at mid)
+        let kappa = (-slope).clamp(0.1, 20.0);
+
+        debug!(
+            trade_count = self.trade_depths.len(),
+            bucket_counts = ?counts,
+            slope = %format!("{:.4}", slope),
+            kappa = %format!("{:.4}", kappa),
+            "Kappa estimated from trade depths"
+        );
+
+        kappa
     }
 
     /// Calculate volatility from recent trades using log returns.
@@ -269,8 +317,15 @@ impl ParameterEstimator {
             let expected_holding_secs = avg_interval_secs * fill_multiplier;
 
             // Convert to years, clamp to reasonable range
-            let tau = expected_holding_secs / SECONDS_PER_YEAR;
-            tau.clamp(1e-8, 0.01) // Min ~0.3s, Max ~3.6 days
+            let tau_raw = expected_holding_secs / SECONDS_PER_YEAR;
+            debug!(
+                trade_count,
+                avg_interval_secs = %format!("{:.3}", avg_interval_secs),
+                expected_holding_secs = %format!("{:.2}", expected_holding_secs),
+                tau = %format!("{:.2e}", tau_raw),
+                "Tau calculated from trade rate"
+            );
+            tau_raw.clamp(1e-8, 0.01) // Min ~0.3s, Max ~3.6 days
         } else {
             self.config.default_tau
         }

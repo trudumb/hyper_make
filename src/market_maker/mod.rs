@@ -21,7 +21,7 @@ pub use position::*;
 pub use strategy::*;
 
 use alloy::primitives::Address;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::prelude::Result;
@@ -144,15 +144,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             )
             .await?;
 
-        // Subscribe to L2Book for order flow intensity estimation
-        self.info_client
-            .subscribe(
-                Subscription::L2Book {
-                    coin: self.config.asset.clone(),
-                },
-                sender,
-            )
-            .await?;
+        // Note: L2Book subscription removed - kappa is now estimated from trade depths
+        // If L2 data is needed for other purposes in the future, re-add the subscription here
+        drop(sender); // Explicitly drop the sender since we're done with subscriptions
 
         info!(
             "Market maker started for {} with {} strategy",
@@ -200,6 +194,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
                     self.latest_mid = mid;
+                    self.estimator.on_mid_update(mid);
                     self.update_quotes().await?;
                 }
             }
@@ -232,50 +227,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         );
                     }
                 }
-            }
-            Message::L2Book(l2_book) => {
-                // Update order flow intensity from L2 book
-                if l2_book.data.coin != self.config.asset {
-                    return Ok(());
-                }
-                if self.latest_mid <= 0.0 {
-                    return Ok(()); // Need mid price first
-                }
-
-                // Convert L2 levels to (price, size) tuples
-                let bids: Vec<(f64, f64)> = l2_book
-                    .data
-                    .levels
-                    .first()
-                    .map(|levels| {
-                        levels
-                            .iter()
-                            .filter_map(|level| {
-                                let px: f64 = level.px.parse().ok()?;
-                                let sz: f64 = level.sz.parse().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let asks: Vec<(f64, f64)> = l2_book
-                    .data
-                    .levels
-                    .get(1)
-                    .map(|levels| {
-                        levels
-                            .iter()
-                            .filter_map(|level| {
-                                let px: f64 = level.px.parse().ok()?;
-                                let sz: f64 = level.sz.parse().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                self.estimator.on_l2_book(self.latest_mid, &bids, &asks);
             }
             Message::UserFills(user_fills) => {
                 if self.latest_mid < 0.0 {
@@ -352,12 +303,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             tau: self.estimator.tau(),
         };
 
+        debug!(
+            mid = self.latest_mid,
+            position = self.position.position(),
+            max_pos = self.config.max_position,
+            target_liq = self.config.target_liquidity,
+            sigma = %format!("{:.6}", market_params.sigma),
+            kappa = %format!("{:.4}", market_params.kappa),
+            tau = %format!("{:.2e}", market_params.tau),
+            "Quote inputs"
+        );
+
         let (bid, ask) = self.strategy.calculate_quotes(
             &quote_config,
             self.position.position(),
             self.config.max_position,
             self.config.target_liquidity,
             &market_params,
+        );
+
+        debug!(
+            bid = ?bid.as_ref().map(|q| (q.price, q.size)),
+            ask = ?ask.as_ref().map(|q| (q.price, q.size)),
+            "Calculated quotes"
         );
 
         // Handle bid side
@@ -372,6 +340,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Reconcile orders on one side.
     async fn reconcile_side(&mut self, side: Side, new_quote: Option<Quote>) -> Result<()> {
         let current_order = self.orders.get_by_side(side);
+
+        debug!(
+            side = %side_str(side),
+            current = ?current_order.map(|o| (o.oid, o.price, o.remaining())),
+            new = ?new_quote.as_ref().map(|q| (q.price, q.size)),
+            "Reconciling"
+        );
 
         match (current_order, new_quote) {
             // Have order, no quote -> cancel

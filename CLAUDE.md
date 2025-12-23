@@ -20,6 +20,7 @@ cargo run --example <example_name>  # e.g., cargo run --example order_and_cancel
 Run market maker:
 ```bash
 cargo run --bin market_maker -- --asset BTC              # Run with defaults
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker -- --asset BTC --log-file mm.log   #runwithdebug
 cargo run --bin market_maker -- --help                   # Show CLI options
 cargo run --bin market_maker -- generate-config          # Generate sample config
 ```
