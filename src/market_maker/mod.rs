@@ -206,7 +206,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
             }
             Message::Trades(trades) => {
-                // Update volatility estimate from trades (feeds volume clock)
+                // Update volatility estimate from trades (feeds volume clock + flow tracker)
                 for trade in &trades.data {
                     if trade.coin != self.config.asset {
                         continue;
@@ -219,8 +219,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .sz
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
-                    // Now pass size for volume clock sampling
-                    self.estimator.on_trade(trade.time, price, size);
+                    // Determine aggressor side from trade.side: "B" = buy aggressor, "S" = sell
+                    let is_buy_aggressor = Some(trade.side == "B");
+                    // Pass price, size, and aggressor side for volume clock + flow tracking
+                    self.estimator
+                        .on_trade(trade.time, price, size, is_buy_aggressor);
                 }
 
                 // Log warmup progress (throttled)
@@ -342,11 +345,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Build market params from econometric estimates
         let market_params = MarketParams {
-            sigma: self.estimator.sigma(), // √BV (jump-robust)
+            // Volatility (dual-sigma architecture)
+            sigma: self.estimator.sigma_clean(), // √BV (jump-robust) for spread
+            sigma_total: self.estimator.sigma_total(), // √RV (includes jumps) for risk
+            sigma_effective: self.estimator.sigma_effective(), // Blended for skew
+            // Order book
             kappa: self.estimator.kappa(), // Weighted L2 regression
             arrival_intensity: self.estimator.arrival_intensity(), // Volume ticks/sec
-            is_toxic_regime: self.estimator.is_toxic_regime(), // RV/BV > threshold
-            jump_ratio: self.estimator.jump_ratio(), // RV/BV ratio
+            // Regime detection
+            is_toxic_regime: self.estimator.is_toxic_regime(), // RV/BV > 1.5
+            jump_ratio: self.estimator.jump_ratio(),           // Fast RV/BV ratio
+            // Directional flow
+            momentum_bps: self.estimator.momentum_bps(), // Signed momentum
+            flow_imbalance: self.estimator.flow_imbalance(), // Buy/sell imbalance
+            falling_knife_score: self.estimator.falling_knife_score(), // Downward momentum
+            rising_knife_score: self.estimator.rising_knife_score(), // Upward momentum
         };
 
         debug!(
@@ -354,11 +367,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position = self.position.position(),
             max_pos = self.config.max_position,
             target_liq = self.config.target_liquidity,
-            sigma = %format!("{:.6}", market_params.sigma),
+            sigma_clean = %format!("{:.6}", market_params.sigma),
+            sigma_effective = %format!("{:.6}", market_params.sigma_effective),
             kappa = %format!("{:.2}", market_params.kappa),
             jump_ratio = %format!("{:.2}", market_params.jump_ratio),
             is_toxic = market_params.is_toxic_regime,
-            "Quote inputs"
+            momentum_bps = %format!("{:.1}", market_params.momentum_bps),
+            flow = %format!("{:.2}", market_params.flow_imbalance),
+            falling_knife = %format!("{:.2}", market_params.falling_knife_score),
+            rising_knife = %format!("{:.2}", market_params.rising_knife_score),
+            "Quote inputs with directional flow"
         );
 
         let (bid, ask) = self.strategy.calculate_quotes(

@@ -29,11 +29,25 @@ pub struct EstimatorConfig {
     /// Maximum bucket volume ceiling
     pub max_bucket_volume: f64,
 
-    // === EWMA ===
-    /// Half-life for variance EWMA (in volume ticks, not time)
-    pub variance_half_life_ticks: f64,
+    // === Multi-Timescale EWMA ===
+    /// Fast half-life for variance EWMA (~2 seconds, reacts to crashes)
+    pub fast_half_life_ticks: f64,
+    /// Medium half-life for variance EWMA (~10 seconds)
+    pub medium_half_life_ticks: f64,
+    /// Slow half-life for variance EWMA (~60 seconds, baseline)
+    pub slow_half_life_ticks: f64,
     /// Half-life for kappa EWMA (in L2 updates)
     pub kappa_half_life_updates: f64,
+
+    // === Momentum Detection ===
+    /// Window for momentum calculation (milliseconds)
+    pub momentum_window_ms: u64,
+
+    // === Trade Flow Tracking ===
+    /// Window for trade flow imbalance calculation (milliseconds)
+    pub trade_flow_window_ms: u64,
+    /// EWMA alpha for smoothing flow imbalance
+    pub trade_flow_alpha: f64,
 
     // === Regime Detection ===
     /// Jump detection threshold: RV/BV ratio > threshold = toxic regime
@@ -70,12 +84,21 @@ impl Default for EstimatorConfig {
             min_bucket_volume: 0.001,    // Floor at 0.001 BTC
             max_bucket_volume: 10.0,     // Cap at 10 BTC
 
-            // EWMA
-            variance_half_life_ticks: 50.0, // 50 volume ticks
-            kappa_half_life_updates: 30.0,  // 30 L2 updates
+            // Multi-Timescale EWMA
+            fast_half_life_ticks: 5.0,     // ~2 seconds - reacts to crashes
+            medium_half_life_ticks: 20.0,  // ~10 seconds
+            slow_half_life_ticks: 100.0,   // ~60 seconds - baseline
+            kappa_half_life_updates: 30.0, // 30 L2 updates
 
-            // Regime Detection
-            jump_ratio_threshold: 3.0, // RV/BV > 3.0 = toxic
+            // Momentum Detection
+            momentum_window_ms: 500, // Track signed returns over 500ms
+
+            // Trade Flow Tracking
+            trade_flow_window_ms: 1000, // Track buy/sell imbalance over 1s
+            trade_flow_alpha: 0.1,      // EWMA smoothing for flow
+
+            // Regime Detection - LOWERED from 3.0 for earlier detection
+            jump_ratio_threshold: 1.5, // RV/BV > 1.5 = toxic
 
             // Kappa
             kappa_max_distance: 0.01, // 1% from mid
@@ -111,6 +134,12 @@ impl EstimatorConfig {
             min_volume_ticks: min_warmup_trades.max(10),
             ..Default::default()
         }
+    }
+
+    /// Create config with custom toxic threshold
+    pub fn with_toxic_threshold(mut self, threshold: f64) -> Self {
+        self.jump_ratio_threshold = threshold;
+        self
     }
 }
 
@@ -244,42 +273,93 @@ impl VolumeBucketAccumulator {
 }
 
 // ============================================================================
-// Bipower Variation (Jump-Robust Volatility)
+// Single-Scale Bipower Variation (Building Block)
 // ============================================================================
 
-/// Bipower variation estimator for jump-robust volatility.
-///
-/// Tracks both:
-/// - RV (Realized Variance): EWMA of r² (includes jumps)
-/// - BV (Bipower Variation): EWMA of (π/2) × |r_t| × |r_{t-1}| (robust to jumps)
-///
-/// Key insight: BV ≈ RV in normal markets, but BV << RV when jumps occur.
-/// Jump ratio = RV/BV detects toxic regimes.
+/// Single-timescale RV/BV tracker - building block for multi-scale estimator.
 #[derive(Debug)]
-struct BipowerVariationEstimator {
+struct SingleScaleBipower {
     /// EWMA decay factor (per tick)
     alpha: f64,
     /// Realized variance (includes jumps): EWMA of r²
-    ewma_rv: f64,
+    rv: f64,
     /// Bipower variation (excludes jumps): EWMA of (π/2)|r_t||r_{t-1}|
-    ewma_bv: f64,
+    bv: f64,
     /// Last absolute log return (for BV calculation)
     last_abs_return: Option<f64>,
-    /// Last VWAP (for log return calculation)
+}
+
+impl SingleScaleBipower {
+    fn new(half_life_ticks: f64, default_var: f64) -> Self {
+        Self {
+            alpha: (2.0_f64.ln() / half_life_ticks).clamp(0.001, 1.0),
+            rv: default_var,
+            bv: default_var,
+            last_abs_return: None,
+        }
+    }
+
+    fn update(&mut self, log_return: f64) {
+        let abs_return = log_return.abs();
+
+        // RV: EWMA of r²
+        let rv_obs = log_return.powi(2);
+        self.rv = self.alpha * rv_obs + (1.0 - self.alpha) * self.rv;
+
+        // BV: EWMA of (π/2) × |r_t| × |r_{t-1}|
+        if let Some(last_abs) = self.last_abs_return {
+            let bv_obs = std::f64::consts::FRAC_PI_2 * abs_return * last_abs;
+            self.bv = self.alpha * bv_obs + (1.0 - self.alpha) * self.bv;
+        }
+
+        self.last_abs_return = Some(abs_return);
+    }
+
+    /// Total volatility including jumps (√RV)
+    fn sigma_total(&self) -> f64 {
+        self.rv.sqrt().clamp(1e-7, 0.05)
+    }
+
+    /// Clean volatility excluding jumps (√BV)
+    fn sigma_clean(&self) -> f64 {
+        self.bv.sqrt().clamp(1e-7, 0.05)
+    }
+
+    /// Jump ratio: RV/BV (1.0 = normal, >2 = jumps)
+    fn jump_ratio(&self) -> f64 {
+        if self.bv > 1e-12 {
+            (self.rv / self.bv).clamp(0.1, 100.0)
+        } else {
+            1.0
+        }
+    }
+}
+
+// ============================================================================
+// Multi-Timescale Bipower Estimator
+// ============================================================================
+
+/// Multi-timescale volatility with fast/medium/slow components.
+///
+/// Fast (~2s): Reacts quickly to crashes, used for early warning
+/// Medium (~10s): Balanced responsiveness
+/// Slow (~60s): Stable baseline for pricing
+#[derive(Debug)]
+struct MultiScaleBipowerEstimator {
+    fast: SingleScaleBipower,   // ~5 ticks / ~2 seconds
+    medium: SingleScaleBipower, // ~20 ticks / ~10 seconds
+    slow: SingleScaleBipower,   // ~100 ticks / ~60 seconds
     last_vwap: Option<f64>,
-    /// Number of ticks processed
     tick_count: usize,
 }
 
-impl BipowerVariationEstimator {
-    fn new(half_life_ticks: f64, default_sigma: f64) -> Self {
-        let alpha = (2.0_f64.ln() / half_life_ticks).clamp(0.001, 1.0);
-        let default_var = default_sigma.powi(2);
+impl MultiScaleBipowerEstimator {
+    fn new(config: &EstimatorConfig) -> Self {
+        let default_var = config.default_sigma.powi(2);
         Self {
-            alpha,
-            ewma_rv: default_var,
-            ewma_bv: default_var,
-            last_abs_return: None,
+            fast: SingleScaleBipower::new(config.fast_half_life_ticks, default_var),
+            medium: SingleScaleBipower::new(config.medium_half_life_ticks, default_var),
+            slow: SingleScaleBipower::new(config.slow_half_life_ticks, default_var),
             last_vwap: None,
             tick_count: 0,
         }
@@ -287,60 +367,251 @@ impl BipowerVariationEstimator {
 
     /// Process a completed volume bucket.
     fn on_bucket(&mut self, bucket: &VolumeBucket) {
-        if let Some(last_vwap) = self.last_vwap {
-            if bucket.vwap > 0.0 && last_vwap > 0.0 {
-                let log_return = (bucket.vwap / last_vwap).ln();
-                let abs_return = log_return.abs();
-
-                // RV: EWMA of r²
-                let rv_observation = log_return.powi(2);
-                self.ewma_rv = self.alpha * rv_observation + (1.0 - self.alpha) * self.ewma_rv;
-
-                // BV: EWMA of (π/2) × |r_t| × |r_{t-1}|
-                // This is the unbiased estimator for continuous variance under Gaussian assumption
-                if let Some(last_abs) = self.last_abs_return {
-                    let bv_observation = std::f64::consts::FRAC_PI_2 * abs_return * last_abs;
-                    self.ewma_bv = self.alpha * bv_observation + (1.0 - self.alpha) * self.ewma_bv;
-                }
-
-                self.last_abs_return = Some(abs_return);
+        if let Some(prev_vwap) = self.last_vwap {
+            if bucket.vwap > 0.0 && prev_vwap > 0.0 {
+                let log_return = (bucket.vwap / prev_vwap).ln();
+                self.fast.update(log_return);
+                self.medium.update(log_return);
+                self.slow.update(log_return);
                 self.tick_count += 1;
             }
         }
         self.last_vwap = Some(bucket.vwap);
     }
 
-    /// Get clean volatility: sqrt(Bipower Variation).
-    /// This is robust to jumps - measures only the continuous component.
-    fn sigma(&self) -> f64 {
-        self.ewma_bv.sqrt().clamp(1e-7, 0.01)
+    /// Get the log return for the most recent bucket (for momentum tracking)
+    fn last_log_return(&self, bucket: &VolumeBucket) -> Option<f64> {
+        self.last_vwap.and_then(|prev| {
+            if bucket.vwap > 0.0 && prev > 0.0 {
+                Some((bucket.vwap / prev).ln())
+            } else {
+                None
+            }
+        })
     }
 
-    /// Get realized variance (includes jumps).
-    #[allow(dead_code)]
-    fn realized_variance(&self) -> f64 {
-        self.ewma_rv
+    /// Clean sigma (BV-based) for spread pricing.
+    /// Uses slow timescale for stability.
+    fn sigma_clean(&self) -> f64 {
+        self.slow.sigma_clean()
     }
 
-    /// Get bipower variation (excludes jumps).
-    #[allow(dead_code)]
-    fn bipower_variation(&self) -> f64 {
-        self.ewma_bv
-    }
+    /// Total sigma (RV-based) for risk assessment.
+    /// Blends fast + slow: uses fast when market is accelerating.
+    fn sigma_total(&self) -> f64 {
+        let fast = self.fast.sigma_total();
+        let slow = self.slow.sigma_total();
 
-    /// Get jump ratio: RV / BV.
-    /// - ratio ≈ 1.0: Normal diffusion (safe market making)
-    /// - ratio >> 1.0: Jumps present (toxic environment)
-    fn jump_ratio(&self) -> f64 {
-        if self.ewma_bv > 1e-12 {
-            (self.ewma_rv / self.ewma_bv).clamp(0.1, 100.0)
+        // If fast >> slow, market is accelerating - trust fast more
+        let ratio = fast / slow.max(1e-9);
+
+        if ratio > 1.5 {
+            // Acceleration: blend toward fast
+            let weight = ((ratio - 1.0) / 3.0).clamp(0.0, 0.7);
+            weight * fast + (1.0 - weight) * slow
         } else {
-            1.0
+            // Stable: prefer slow for less noise
+            0.2 * fast + 0.8 * slow
         }
+    }
+
+    /// Effective sigma for inventory skew.
+    /// Blends clean and total based on jump regime.
+    fn sigma_effective(&self) -> f64 {
+        let clean = self.sigma_clean();
+        let total = self.sigma_total();
+        let jump_ratio = self.jump_ratio_fast();
+
+        // At ratio=1: pure clean (no jumps)
+        // At ratio=3: 67% total (jumps dominant)
+        // At ratio=5: 80% total
+        let jump_weight = 1.0 - (1.0 / jump_ratio.max(1.0));
+        let jump_weight = jump_weight.clamp(0.0, 0.85);
+
+        (1.0 - jump_weight) * clean + jump_weight * total
+    }
+
+    /// Fast jump ratio (detects recent jumps quickly)
+    fn jump_ratio_fast(&self) -> f64 {
+        self.fast.jump_ratio()
+    }
+
+    /// Medium jump ratio (more stable signal)
+    #[allow(dead_code)]
+    fn jump_ratio_medium(&self) -> f64 {
+        self.medium.jump_ratio()
     }
 
     fn tick_count(&self) -> usize {
         self.tick_count
+    }
+}
+
+// ============================================================================
+// Momentum Detector (Directional Flow)
+// ============================================================================
+
+/// Detects directional momentum from signed VWAP returns.
+///
+/// Tracks signed (not absolute) returns to detect falling/rising knife patterns.
+#[derive(Debug)]
+struct MomentumDetector {
+    /// Recent (timestamp_ms, log_return) pairs
+    returns: VecDeque<(u64, f64)>,
+    /// Window for momentum calculation (ms)
+    window_ms: u64,
+}
+
+impl MomentumDetector {
+    fn new(window_ms: u64) -> Self {
+        Self {
+            returns: VecDeque::with_capacity(100),
+            window_ms,
+        }
+    }
+
+    /// Add a new VWAP-based return
+    fn on_bucket(&mut self, end_time_ms: u64, log_return: f64) {
+        self.returns.push_back((end_time_ms, log_return));
+
+        // Expire old returns (keep 2x window for safety)
+        let cutoff = end_time_ms.saturating_sub(self.window_ms * 2);
+        while self
+            .returns
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
+            self.returns.pop_front();
+        }
+    }
+
+    /// Signed momentum in bps over the configured window
+    fn momentum_bps(&self, now_ms: u64) -> f64 {
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        let sum: f64 = self
+            .returns
+            .iter()
+            .filter(|(t, _)| *t >= cutoff)
+            .map(|(_, r)| r)
+            .sum();
+        sum * 10_000.0 // Convert to bps
+    }
+
+    /// Falling knife score: 0 = normal, 1+ = severe downward momentum
+    fn falling_knife_score(&self, now_ms: u64) -> f64 {
+        let momentum = self.momentum_bps(now_ms);
+
+        // Only trigger on negative momentum
+        if momentum >= 0.0 {
+            return 0.0;
+        }
+
+        // Score: -20 bps = 1.0, -40 bps = 2.0, etc.
+        (momentum.abs() / 20.0).clamp(0.0, 3.0)
+    }
+
+    /// Rising knife score (for protecting asks during pumps)
+    fn rising_knife_score(&self, now_ms: u64) -> f64 {
+        let momentum = self.momentum_bps(now_ms);
+
+        if momentum <= 0.0 {
+            return 0.0;
+        }
+
+        (momentum / 20.0).clamp(0.0, 3.0)
+    }
+}
+
+// ============================================================================
+// Trade Flow Tracker (Buy/Sell Imbalance)
+// ============================================================================
+
+/// Tracks buy vs sell aggressor imbalance from trade tape.
+///
+/// Uses the trade side field from Hyperliquid ("B" = buy aggressor, "S" = sell aggressor)
+/// to detect directional order flow before it shows up in price.
+#[derive(Debug)]
+struct TradeFlowTracker {
+    /// (timestamp_ms, signed_volume): positive = buy aggressor
+    trades: VecDeque<(u64, f64)>,
+    /// Rolling window (ms)
+    window_ms: u64,
+    /// EWMA smoothed imbalance
+    ewma_imbalance: f64,
+    /// EWMA alpha
+    alpha: f64,
+}
+
+impl TradeFlowTracker {
+    fn new(window_ms: u64, alpha: f64) -> Self {
+        Self {
+            trades: VecDeque::with_capacity(500),
+            window_ms,
+            ewma_imbalance: 0.0,
+            alpha,
+        }
+    }
+
+    /// Add a trade from the tape.
+    /// is_buy_aggressor: true if buyer was taker (lifted the ask)
+    fn on_trade(&mut self, timestamp_ms: u64, size: f64, is_buy_aggressor: bool) {
+        let signed = if is_buy_aggressor { size } else { -size };
+        self.trades.push_back((timestamp_ms, signed));
+
+        // Expire old trades
+        let cutoff = timestamp_ms.saturating_sub(self.window_ms);
+        while self
+            .trades
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
+            self.trades.pop_front();
+        }
+
+        // Update EWMA
+        let instant = self.compute_instant_imbalance();
+        self.ewma_imbalance = self.alpha * instant + (1.0 - self.alpha) * self.ewma_imbalance;
+    }
+
+    /// Compute instantaneous imbalance: (buy - sell) / total
+    fn compute_instant_imbalance(&self) -> f64 {
+        let (buy_vol, sell_vol) =
+            self.trades.iter().fold(
+                (0.0, 0.0),
+                |(b, s), (_, v)| {
+                    if *v > 0.0 {
+                        (b + v, s)
+                    } else {
+                        (b, s - v)
+                    }
+                },
+            );
+        let total = buy_vol + sell_vol;
+        if total < 1e-12 {
+            0.0
+        } else {
+            (buy_vol - sell_vol) / total
+        }
+    }
+
+    /// Smoothed flow imbalance [-1, 1]
+    /// Negative = sell pressure, Positive = buy pressure
+    fn imbalance(&self) -> f64 {
+        self.ewma_imbalance.clamp(-1.0, 1.0)
+    }
+
+    /// Is there dominant selling (for bid protection)?
+    #[allow(dead_code)]
+    fn is_sell_pressure(&self) -> bool {
+        self.ewma_imbalance < -0.25
+    }
+
+    /// Is there dominant buying (for ask protection)?
+    #[allow(dead_code)]
+    fn is_buy_pressure(&self) -> bool {
+        self.ewma_imbalance > 0.25
     }
 }
 
@@ -545,20 +816,27 @@ impl VolumeTickArrivalEstimator {
 // Main Orchestrator: ParameterEstimator
 // ============================================================================
 
-/// Econometric parameter estimator with volume clock, bipower variation, and regime detection.
+/// Econometric parameter estimator with multi-timescale variance, momentum detection,
+/// and trade flow tracking for robust adverse selection protection.
 ///
 /// Pipeline:
 /// 1. Raw trades → Volume Clock → Normalized volume buckets with VWAP
-/// 2. VWAP returns → Bipower Variation → Jump-robust σ + RV/BV ratio
-/// 3. L2 Book → Weighted Kappa → Order book depth decay
-/// 4. Regime detection: RV/BV > threshold = toxic
+/// 2. VWAP returns → Multi-Scale Bipower → sigma_clean, sigma_total, sigma_effective
+/// 3. VWAP returns → Momentum Detector → falling/rising knife scores
+/// 4. Trade tape → Flow Tracker → buy/sell imbalance
+/// 5. L2 Book → Weighted Kappa → Order book depth decay
+/// 6. Regime detection: fast jump_ratio > threshold = toxic
 #[derive(Debug)]
 pub struct ParameterEstimator {
     config: EstimatorConfig,
     /// Volume bucket accumulator (volume clock)
     bucket_accumulator: VolumeBucketAccumulator,
-    /// Bipower variation estimator (for sigma and jump detection)
-    bipower: BipowerVariationEstimator,
+    /// Multi-timescale bipower estimator (replaces single-scale)
+    multi_scale: MultiScaleBipowerEstimator,
+    /// Momentum detector for falling/rising knife patterns
+    momentum: MomentumDetector,
+    /// Trade flow tracker for buy/sell imbalance
+    flow: TradeFlowTracker,
     /// Weighted kappa estimator
     kappa: WeightedKappaEstimator,
     /// Volume tick arrival estimator
@@ -566,14 +844,17 @@ pub struct ParameterEstimator {
     /// Current mid price
     #[allow(dead_code)]
     current_mid: f64,
+    /// Current timestamp for momentum queries
+    current_time_ms: u64,
 }
 
 impl ParameterEstimator {
     /// Create a new parameter estimator with the given config.
     pub fn new(config: EstimatorConfig) -> Self {
         let bucket_accumulator = VolumeBucketAccumulator::new(&config);
-        let bipower =
-            BipowerVariationEstimator::new(config.variance_half_life_ticks, config.default_sigma);
+        let multi_scale = MultiScaleBipowerEstimator::new(&config);
+        let momentum = MomentumDetector::new(config.momentum_window_ms);
+        let flow = TradeFlowTracker::new(config.trade_flow_window_ms, config.trade_flow_alpha);
         let kappa = WeightedKappaEstimator::new(
             config.kappa_half_life_updates,
             config.default_kappa,
@@ -581,17 +862,20 @@ impl ParameterEstimator {
             config.kappa_max_levels,
         );
         let arrival = VolumeTickArrivalEstimator::new(
-            config.variance_half_life_ticks,
+            config.medium_half_life_ticks, // Use medium timescale
             config.default_arrival_intensity,
         );
 
         Self {
             config,
             bucket_accumulator,
-            bipower,
+            multi_scale,
+            momentum,
+            flow,
             kappa,
             arrival,
             current_mid: 0.0,
+            current_time_ms: 0,
         }
     }
 
@@ -600,30 +884,57 @@ impl ParameterEstimator {
         self.current_mid = mid_price;
     }
 
-    /// Process a new trade (feeds into volume clock).
-    /// Note: Now requires size parameter for volume-based sampling.
-    pub fn on_trade(&mut self, timestamp_ms: u64, price: f64, size: f64) {
+    /// Process a new trade (feeds into volume clock AND flow tracker).
+    ///
+    /// # Arguments
+    /// * `timestamp_ms` - Trade timestamp
+    /// * `price` - Trade price
+    /// * `size` - Trade size
+    /// * `is_buy_aggressor` - Whether buyer was the taker (if available from exchange)
+    pub fn on_trade(
+        &mut self,
+        timestamp_ms: u64,
+        price: f64,
+        size: f64,
+        is_buy_aggressor: Option<bool>,
+    ) {
+        self.current_time_ms = timestamp_ms;
+
+        // Track trade flow if we know aggressor side
+        if let Some(is_buy) = is_buy_aggressor {
+            self.flow.on_trade(timestamp_ms, size, is_buy);
+        }
+
         // Feed into volume bucket accumulator
         if let Some(bucket) = self.bucket_accumulator.on_trade(timestamp_ms, price, size) {
-            // Bucket completed - update estimators with VWAP
-            self.bipower.on_bucket(&bucket);
+            // Get log return BEFORE updating multi_scale (it will update last_vwap)
+            let log_return = self.multi_scale.last_log_return(&bucket);
+
+            // Bucket completed - update estimators
+            self.multi_scale.on_bucket(&bucket);
             self.arrival.on_bucket(&bucket);
+
+            // Update momentum detector with signed return
+            if let Some(ret) = log_return {
+                self.momentum.on_bucket(bucket.end_time_ms, ret);
+            }
 
             debug!(
                 vwap = %format!("{:.4}", bucket.vwap),
                 volume = %format!("{:.4}", bucket.volume),
                 duration_ms = bucket.end_time_ms.saturating_sub(bucket.start_time_ms),
-                tick = self.bipower.tick_count(),
+                tick = self.multi_scale.tick_count(),
+                sigma_clean = %format!("{:.6}", self.multi_scale.sigma_clean()),
+                sigma_total = %format!("{:.6}", self.multi_scale.sigma_total()),
+                jump_ratio = %format!("{:.2}", self.multi_scale.jump_ratio_fast()),
                 "Volume bucket completed"
             );
         }
     }
 
-    /// Legacy on_trade without size (for backward compatibility).
-    /// Uses a default size of 1.0 - not recommended for production.
-    #[allow(dead_code)]
-    pub fn on_trade_legacy(&mut self, timestamp_ms: u64, price: f64) {
-        self.on_trade(timestamp_ms, price, 1.0);
+    /// Legacy on_trade without aggressor info (backward compatibility).
+    pub fn on_trade_legacy(&mut self, timestamp_ms: u64, price: f64, size: f64) {
+        self.on_trade(timestamp_ms, price, size, None);
     }
 
     /// Process L2 order book update for kappa estimation.
@@ -632,13 +943,34 @@ impl ParameterEstimator {
         self.kappa.update(bids, asks, mid);
     }
 
-    // === Accessors ===
+    // === Volatility Accessors ===
 
-    /// Get current volatility estimate (σ) - per-second, NOT annualized.
-    /// This is sqrt(Bipower Variation), which is robust to jumps.
+    /// Get clean volatility (σ_clean) - per-second, NOT annualized.
+    /// Based on Bipower Variation, robust to jumps.
+    /// Use for base spread pricing (continuous risk).
     pub fn sigma(&self) -> f64 {
-        self.bipower.sigma()
+        self.multi_scale.sigma_clean()
     }
+
+    /// Get clean volatility - alias for sigma()
+    pub fn sigma_clean(&self) -> f64 {
+        self.multi_scale.sigma_clean()
+    }
+
+    /// Get total volatility (σ_total) - includes jumps.
+    /// Based on Realized Variance, captures full price risk.
+    pub fn sigma_total(&self) -> f64 {
+        self.multi_scale.sigma_total()
+    }
+
+    /// Get effective volatility (σ_effective) - blended.
+    /// Blends clean and total based on jump regime.
+    /// Use for inventory skew (reacts appropriately to jumps).
+    pub fn sigma_effective(&self) -> f64 {
+        self.multi_scale.sigma_effective()
+    }
+
+    // === Order Book Accessors ===
 
     /// Get current order book depth decay estimate (κ).
     pub fn kappa(&self) -> f64 {
@@ -650,21 +982,53 @@ impl ParameterEstimator {
         self.arrival.ticks_per_second()
     }
 
-    /// Get RV/BV jump ratio.
+    // === Regime Detection ===
+
+    /// Get fast RV/BV jump ratio.
     /// - ≈ 1.0: Normal diffusion (safe to market make)
-    /// - > 3.0: Jumps dominating (toxic environment)
+    /// - > 1.5: Jumps present (toxic environment)
     pub fn jump_ratio(&self) -> f64 {
-        self.bipower.jump_ratio()
+        self.multi_scale.jump_ratio_fast()
     }
 
     /// Check if currently in toxic (jump) regime.
     pub fn is_toxic_regime(&self) -> bool {
-        self.bipower.jump_ratio() > self.config.jump_ratio_threshold
+        self.multi_scale.jump_ratio_fast() > self.config.jump_ratio_threshold
     }
+
+    // === Directional Flow Accessors ===
+
+    /// Get signed momentum in bps over momentum window.
+    /// Negative = market falling, Positive = market rising.
+    pub fn momentum_bps(&self) -> f64 {
+        self.momentum.momentum_bps(self.current_time_ms)
+    }
+
+    /// Get falling knife score [0, 3].
+    /// > 0.5 = some downward momentum
+    /// > 1.0 = severe downward momentum (protect bids!)
+    pub fn falling_knife_score(&self) -> f64 {
+        self.momentum.falling_knife_score(self.current_time_ms)
+    }
+
+    /// Get rising knife score [0, 3].
+    /// > 0.5 = some upward momentum
+    /// > 1.0 = severe upward momentum (protect asks!)
+    pub fn rising_knife_score(&self) -> f64 {
+        self.momentum.rising_knife_score(self.current_time_ms)
+    }
+
+    /// Get trade flow imbalance [-1, 1].
+    /// Negative = sell pressure, Positive = buy pressure.
+    pub fn flow_imbalance(&self) -> f64 {
+        self.flow.imbalance()
+    }
+
+    // === Warmup ===
 
     /// Check if estimator has collected enough data.
     pub fn is_warmed_up(&self) -> bool {
-        self.bipower.tick_count() >= self.config.min_volume_ticks
+        self.multi_scale.tick_count() >= self.config.min_volume_ticks
             && self.kappa.update_count() >= self.config.min_l2_updates
     }
 
@@ -672,7 +1036,7 @@ impl ParameterEstimator {
     /// Returns (volume_ticks, min_volume_ticks, l2_updates, min_l2_updates)
     pub fn warmup_progress(&self) -> (usize, usize, usize, usize) {
         (
-            self.bipower.tick_count(),
+            self.multi_scale.tick_count(),
             self.config.min_volume_ticks,
             self.kappa.update_count(),
             self.config.min_l2_updates,
@@ -682,7 +1046,7 @@ impl ParameterEstimator {
     /// Get simplified warmup progress for legacy compatibility.
     /// Returns (current_samples, min_samples) based on volume ticks.
     pub fn warmup_progress_simple(&self) -> (usize, usize) {
-        (self.bipower.tick_count(), self.config.min_volume_ticks)
+        (self.multi_scale.tick_count(), self.config.min_volume_ticks)
     }
 }
 
@@ -699,7 +1063,9 @@ mod tests {
             initial_bucket_volume: 1.0,
             min_volume_ticks: 5,
             min_l2_updates: 3,
-            variance_half_life_ticks: 10.0,
+            fast_half_life_ticks: 5.0,
+            medium_half_life_ticks: 10.0,
+            slow_half_life_ticks: 50.0,
             kappa_half_life_updates: 10.0,
             ..Default::default()
         }
@@ -753,18 +1119,16 @@ mod tests {
     }
 
     #[test]
-    fn test_bipower_no_jumps() {
-        let mut bv = BipowerVariationEstimator::new(10.0, 0.001);
+    fn test_single_scale_bipower_no_jumps() {
+        let mut bv = SingleScaleBipower::new(10.0, 0.001_f64.powi(2));
 
         // Feed stable returns (no jumps) - small oscillations
-        let vwaps = [100.0, 100.1, 100.0, 100.1, 100.0, 100.1, 100.0, 100.1];
-        for (i, vwap) in vwaps.iter().enumerate() {
-            bv.on_bucket(&VolumeBucket {
-                start_time_ms: i as u64 * 1000,
-                end_time_ms: (i + 1) as u64 * 1000,
-                vwap: *vwap,
-                volume: 1.0,
-            });
+        let vwaps: [f64; 8] = [100.0, 100.1, 100.0, 100.1, 100.0, 100.1, 100.0, 100.1];
+        let mut last_vwap: f64 = vwaps[0];
+        for vwap in vwaps.iter().skip(1) {
+            let log_return = (vwap / last_vwap).ln();
+            bv.update(log_return);
+            last_vwap = *vwap;
         }
 
         // Jump ratio should be close to 1.0 (no jumps)
@@ -777,19 +1141,17 @@ mod tests {
     }
 
     #[test]
-    fn test_bipower_with_jump() {
-        let mut bv = BipowerVariationEstimator::new(5.0, 0.001);
+    fn test_single_scale_bipower_with_jump() {
+        let mut bv = SingleScaleBipower::new(5.0, 0.001_f64.powi(2));
 
         // Feed returns with a sudden jump
         // Normal, normal, JUMP, normal, normal
-        let vwaps = [100.0, 100.1, 100.0, 105.0, 105.1, 105.0, 105.1];
-        for (i, vwap) in vwaps.iter().enumerate() {
-            bv.on_bucket(&VolumeBucket {
-                start_time_ms: i as u64 * 1000,
-                end_time_ms: (i + 1) as u64 * 1000,
-                vwap: *vwap,
-                volume: 1.0,
-            });
+        let vwaps: [f64; 7] = [100.0, 100.1, 100.0, 105.0, 105.1, 105.0, 105.1];
+        let mut last_vwap: f64 = vwaps[0];
+        for vwap in vwaps.iter().skip(1) {
+            let log_return = (vwap / last_vwap).ln();
+            bv.update(log_return);
+            last_vwap = *vwap;
         }
 
         // Jump ratio should be elevated (RV > BV due to jump)
@@ -866,7 +1228,9 @@ mod tests {
         let mut time = 1000u64;
         for i in 0..100 {
             let price = 100.0 + (i as f64 * 0.1).sin() * 0.5;
-            estimator.on_trade(time, price, 0.5); // 0.5 per trade, 2 trades per bucket
+            // Alternate buy/sell to simulate balanced flow
+            let is_buy = i % 2 == 0;
+            estimator.on_trade(time, price, 0.5, Some(is_buy)); // 0.5 per trade, 2 trades per bucket
             time += 100;
         }
 
@@ -924,8 +1288,9 @@ mod tests {
 
         // Feed trades at consistent rate to fill buckets
         let mut time = 0u64;
-        for _ in 0..50 {
-            estimator.on_trade(time, 100.0, 1.0); // Each trade = 1 bucket
+        for i in 0..50 {
+            let is_buy = i % 2 == 0;
+            estimator.on_trade(time, 100.0, 1.0, Some(is_buy)); // Each trade = 1 bucket
             time += 500; // 500ms between buckets = 2 ticks/sec
         }
 

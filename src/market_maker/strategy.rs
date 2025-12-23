@@ -8,35 +8,73 @@ use super::config::{Quote, QuoteConfig};
 
 /// Parameters estimated from live market data.
 ///
-/// For the infinite-horizon GLFT model with regime detection:
-/// - sigma: per-second volatility (√BV - jump-robust, NOT annualized)
+/// For the infinite-horizon GLFT model with regime detection and directional protection:
+/// - Dual-sigma: sigma_clean (BV-based) for spreads, sigma_effective (blended) for skew
 /// - kappa: order book depth decay constant (from weighted L2 book regression)
 /// - arrival_intensity: volume ticks per second
-/// - is_toxic_regime: whether RV/BV ratio indicates jumps (toxic flow)
-/// - jump_ratio: RV/BV ratio (1.0 = normal, >3.0 = toxic)
+/// - Regime detection: jump_ratio > 1.5 = toxic
+/// - Directional flow: momentum_bps, flow_imbalance, falling/rising knife scores
 #[derive(Debug, Clone, Copy)]
 pub struct MarketParams {
-    /// Estimated volatility (σ) - per-second standard deviation
-    /// Now uses √BV (Bipower Variation) which is robust to jumps
+    // === Volatility (all per-second, NOT annualized) ===
+    /// Clean volatility (σ_clean) - √BV, robust to jumps
+    /// Use for base spread calculation (continuous risk)
     pub sigma: f64,
+
+    /// Total volatility (σ_total) - √RV, includes jumps
+    /// Captures full price variance including discontinuities
+    pub sigma_total: f64,
+
+    /// Effective volatility (σ_effective) - blended clean/total
+    /// Reacts to jump regime; use for inventory skew
+    pub sigma_effective: f64,
+
+    // === Order Book ===
     /// Estimated order book depth decay (κ) - from weighted L2 book regression
     pub kappa: f64,
+
     /// Order arrival intensity (A) - volume ticks per second
     pub arrival_intensity: f64,
-    /// Whether market is in toxic (jump) regime: RV/BV > threshold
+
+    // === Regime Detection ===
+    /// Whether market is in toxic (jump) regime: RV/BV > 1.5
     pub is_toxic_regime: bool,
-    /// RV/BV jump ratio: ≈1.0 = normal diffusion, >3.0 = jumps present
+
+    /// RV/BV jump ratio: ≈1.0 = normal diffusion, >1.5 = toxic
     pub jump_ratio: f64,
+
+    // === Directional Flow (NEW) ===
+    /// Signed momentum over 500ms window (in bps)
+    /// Negative = market falling, Positive = market rising
+    pub momentum_bps: f64,
+
+    /// Order flow imbalance [-1, 1]
+    /// Negative = sell pressure, Positive = buy pressure
+    pub flow_imbalance: f64,
+
+    /// Falling knife score [0, 3]
+    /// > 0.5 = some downward momentum, > 1.0 = severe (protect bids!)
+    pub falling_knife_score: f64,
+
+    /// Rising knife score [0, 3]
+    /// > 0.5 = some upward momentum, > 1.0 = severe (protect asks!)
+    pub rising_knife_score: f64,
 }
 
 impl Default for MarketParams {
     fn default() -> Self {
         Self {
-            sigma: 0.0001,          // 0.01% per-second volatility
-            kappa: 100.0,           // Moderate depth decay
-            arrival_intensity: 0.5, // 0.5 volume ticks per second
-            is_toxic_regime: false, // Default: not toxic
-            jump_ratio: 1.0,        // Default: normal diffusion
+            sigma: 0.0001,            // 0.01% per-second volatility (clean)
+            sigma_total: 0.0001,      // Same initially
+            sigma_effective: 0.0001,  // Same initially
+            kappa: 100.0,             // Moderate depth decay
+            arrival_intensity: 0.5,   // 0.5 volume ticks per second
+            is_toxic_regime: false,   // Default: not toxic
+            jump_ratio: 1.0,          // Default: normal diffusion
+            momentum_bps: 0.0,        // Default: no momentum
+            flow_imbalance: 0.0,      // Default: balanced flow
+            falling_knife_score: 0.0, // Default: no falling knife
+            rising_knife_score: 0.0,  // Default: no rising knife
         }
     }
 }
@@ -349,25 +387,51 @@ impl QuotingStrategy for GLFTStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        // Extract market parameters (per-second units)
-        // Note: sigma is now √BV (jump-robust) from the econometric estimator
-        let sigma = market_params.sigma;
+        // === 1. USE SIGMA_CLEAN FOR BASE HALF-SPREAD ===
+        // sigma (clean) is BV-based, robust to jumps - good for continuous pricing
+        let sigma_for_spread = market_params.sigma;
         let kappa = market_params.kappa;
 
         // Target half-spread from config (as fraction, not bps)
         let target_half_spread = config.half_spread_bps as f64 / 10000.0;
 
-        // Derive gamma from max inventory constraint:
-        // γ = δ × κ / (Q_max × σ²)
-        // This ensures at max inventory, skew ≈ target_half_spread
-        let gamma = self.derive_gamma(target_half_spread, kappa, sigma, config.max_position);
+        // Derive gamma for spread calculation using clean sigma
+        let gamma_spread = self.derive_gamma(
+            target_half_spread,
+            kappa,
+            sigma_for_spread,
+            config.max_position,
+        );
 
-        // === TOXIC REGIME ADJUSTMENT ===
-        // When jumps are detected (RV/BV >> 1), widen spreads proportionally
-        // Applied AFTER gamma derivation to ensure spreads actually widen
+        // GLFT half-spread: ψ = (1/γ) × ln(1 + γ/κ)
+        let half_spread = self.half_spread(gamma_spread, kappa);
+
+        // === 2. USE SIGMA_EFFECTIVE FOR INVENTORY SKEW ===
+        // sigma_effective blends clean and total based on jump regime
+        // This makes skew react to jumps (larger skew when RV >> BV)
+        let sigma_for_skew = market_params.sigma_effective;
+        let gamma_skew = self.derive_gamma(
+            target_half_spread,
+            kappa,
+            sigma_for_skew,
+            config.max_position,
+        );
+
+        // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
+        let inventory_ratio = if max_position > EPSILON {
+            (position / max_position).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Base inventory skew using sigma_effective
+        let base_skew = self.inventory_skew(inventory_ratio, sigma_for_skew, gamma_skew, kappa);
+
+        // === 3. TOXIC REGIME SPREAD WIDENING ===
+        // Now triggers at lower threshold (1.5 instead of 3.0)
         let toxicity_multiplier = if market_params.is_toxic_regime {
-            // Scale spread multiplier by how toxic: capped at 2x
-            let factor = (market_params.jump_ratio / 3.0).clamp(1.0, 2.0);
+            // Scale spread multiplier: at ratio=1.5 → 1.0x, at ratio=3.0 → 1.5x, capped at 2.5x
+            let factor = (market_params.jump_ratio / 2.0).clamp(1.0, 2.5);
             debug!(
                 jump_ratio = %format!("{:.2}", market_params.jump_ratio),
                 toxicity_factor = %format!("{:.2}", factor),
@@ -378,25 +442,36 @@ impl QuotingStrategy for GLFTStrategy {
             1.0
         };
 
-        // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
-        let inventory_ratio = if max_position > EPSILON {
-            (position / max_position).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
+        // === 4. FALLING KNIFE PROTECTION (protect bids during crashes) ===
+        let mut bid_protection = 0.0;
+        if market_params.falling_knife_score > 0.5 {
+            // Base protection: score * half_spread * 0.5
+            bid_protection = market_params.falling_knife_score * half_spread * 0.5;
 
-        // GLFT optimal spread components (infinite horizon)
-        // Half-spread: ψ = (1/γ) × ln(1 + γ/κ)
-        let half_spread = self.half_spread(gamma, kappa);
+            // Extra protection if we're already long (compound risk!)
+            if inventory_ratio > 0.0 {
+                bid_protection *= 1.0 + inventory_ratio;
+            }
+        }
 
-        // Inventory skew: (q/Q_max) × γ × σ² / κ
-        let base_skew = self.inventory_skew(inventory_ratio, sigma, gamma, kappa);
+        // === 5. RISING KNIFE PROTECTION (protect asks during pumps) ===
+        let mut ask_protection = 0.0;
+        if market_params.rising_knife_score > 0.5 {
+            ask_protection = market_params.rising_knife_score * half_spread * 0.5;
 
-        // === ADDITIONAL TOXIC REGIME SKEW ===
-        // In toxic regime, skew more aggressively against position
-        // This encourages faster inventory reduction during dangerous periods
+            // Extra protection if we're already short
+            if inventory_ratio < 0.0 {
+                ask_protection *= 1.0 + inventory_ratio.abs();
+            }
+        }
+
+        // === 6. FLOW IMBALANCE ADJUSTMENT ===
+        // If sell pressure (negative), shift quotes down (anticipate continued decline)
+        // If buy pressure (positive), shift quotes up
+        let flow_adjustment = market_params.flow_imbalance * half_spread * 0.2;
+
+        // === 7. ADDITIONAL TOXIC SKEW ===
         let additional_skew = if market_params.is_toxic_regime {
-            // Extra skew proportional to toxicity and inventory
             let toxicity_excess = (market_params.jump_ratio - 1.0).max(0.0) * 0.1;
             inventory_ratio * toxicity_excess * half_spread
         } else {
@@ -404,21 +479,29 @@ impl QuotingStrategy for GLFTStrategy {
         };
         let skew = base_skew + additional_skew;
 
-        // Asymmetric deltas (as fraction of price)
-        // When long (skew > 0): bid_delta increases (wider bid), ask_delta decreases (tighter ask)
-        // Apply toxicity multiplier to widen spreads in toxic regimes
-        let bid_delta = (half_spread + skew) * toxicity_multiplier;
-        let ask_delta = ((half_spread - skew).max(0.0)) * toxicity_multiplier;
+        // === 8. COMBINE ALL ADJUSTMENTS ===
+        // bid_delta: base spread + inventory skew + falling knife protection - flow adjustment
+        // ask_delta: base spread - inventory skew + rising knife protection - flow adjustment
+        let bid_delta =
+            (half_spread + skew + bid_protection - flow_adjustment) * toxicity_multiplier;
+        let ask_delta = ((half_spread - skew + ask_protection - flow_adjustment).max(0.0))
+            * toxicity_multiplier;
 
         debug!(
             inv_ratio = %format!("{:.4}", inventory_ratio),
-            gamma = %format!("{:.2}", gamma),
+            gamma_spread = %format!("{:.2}", gamma_spread),
+            gamma_skew = %format!("{:.2}", gamma_skew),
             half_spread = %format!("{:.6}", half_spread),
             skew = %format!("{:.6}", skew),
+            bid_protection = %format!("{:.6}", bid_protection),
+            ask_protection = %format!("{:.6}", ask_protection),
+            flow_adj = %format!("{:.6}", flow_adjustment),
             bid_delta = %format!("{:.6}", bid_delta),
             ask_delta = %format!("{:.6}", ask_delta),
             is_toxic = market_params.is_toxic_regime,
-            "GLFT spread components"
+            falling_knife = %format!("{:.2}", market_params.falling_knife_score),
+            rising_knife = %format!("{:.2}", market_params.rising_knife_score),
+            "GLFT spread components with directional protection"
         );
 
         // Convert to absolute price offsets
@@ -441,13 +524,16 @@ impl QuotingStrategy for GLFTStrategy {
 
         debug!(
             mid = config.mid_price,
-            sigma = %format!("{:.6}", sigma),
+            sigma_clean = %format!("{:.6}", sigma_for_spread),
+            sigma_effective = %format!("{:.6}", sigma_for_skew),
             kappa = %format!("{:.2}", kappa),
             jump_ratio = %format!("{:.2}", market_params.jump_ratio),
+            momentum_bps = %format!("{:.1}", market_params.momentum_bps),
+            flow = %format!("{:.2}", market_params.flow_imbalance),
             bid_final = lower_price,
             ask_final = upper_price,
             spread_bps = %format!("{:.1}", (upper_price - lower_price) / config.mid_price * 10000.0),
-            "GLFT prices"
+            "GLFT prices with directional protection"
         );
 
         // Calculate sizes based on position limits
@@ -572,10 +658,13 @@ mod tests {
         // Per-second sigma (√BV), kappa from L2 book
         let market_params = MarketParams {
             sigma: 0.0001, // 0.01% per-second volatility (jump-robust)
-            kappa: 100.0,  // Moderate depth decay
+            sigma_total: 0.0001,
+            sigma_effective: 0.0001,
+            kappa: 100.0, // Moderate depth decay
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
+            ..Default::default()
         };
 
         // With zero inventory, bid and ask should be symmetric around mid
@@ -602,10 +691,13 @@ mod tests {
         // Higher sigma to make skew more visible
         let market_params = MarketParams {
             sigma: 0.001, // 0.1% per-second volatility (higher)
-            kappa: 50.0,  // Lower kappa = more skew
+            sigma_total: 0.001,
+            sigma_effective: 0.001,
+            kappa: 50.0, // Lower kappa = more skew
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
+            ..Default::default()
         };
 
         // With long position, bid should be further from mid (discourage buying)
@@ -642,10 +734,13 @@ mod tests {
         // Higher sigma to make skew more visible
         let market_params = MarketParams {
             sigma: 0.001, // 0.1% per-second volatility
-            kappa: 50.0,  // Lower kappa = more skew
+            sigma_total: 0.001,
+            sigma_effective: 0.001,
+            kappa: 50.0, // Lower kappa = more skew
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
+            ..Default::default()
         };
 
         // With short position, ask should be further from mid (discourage selling)
@@ -765,19 +860,25 @@ mod tests {
         // Normal regime
         let normal_params = MarketParams {
             sigma: 0.001,
+            sigma_total: 0.001,
+            sigma_effective: 0.001,
             kappa: 50.0,
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
+            ..Default::default()
         };
 
         // Toxic regime with high jump ratio (should multiply spread by ~1.5x)
         let toxic_params = MarketParams {
-            sigma: 0.001, // Same clean volatility
+            sigma: 0.001,            // Same clean volatility
+            sigma_total: 0.002,      // Higher total (includes jumps)
+            sigma_effective: 0.0015, // Blended
             kappa: 50.0,
             arrival_intensity: 1.0,
             is_toxic_regime: true,
-            jump_ratio: 4.5, // RV/BV = 4.5 -> multiplier = 4.5/3.0 = 1.5
+            jump_ratio: 4.5, // RV/BV = 4.5 -> multiplier = 4.5/2.0 = 2.25 (capped at 2.5)
+            ..Default::default()
         };
 
         let (bid_normal, ask_normal) =
@@ -810,18 +911,24 @@ mod tests {
         // Long position in toxic regime should have more aggressive skew
         let normal_params = MarketParams {
             sigma: 0.001,
+            sigma_total: 0.001,
+            sigma_effective: 0.001,
             kappa: 50.0,
             arrival_intensity: 1.0,
             is_toxic_regime: false,
             jump_ratio: 1.0,
+            ..Default::default()
         };
 
         let toxic_params = MarketParams {
             sigma: 0.001,
+            sigma_total: 0.002,
+            sigma_effective: 0.0015,
             kappa: 50.0,
             arrival_intensity: 1.0,
             is_toxic_regime: true,
             jump_ratio: 5.0,
+            ..Default::default()
         };
 
         // With long position (0.5)
