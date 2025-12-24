@@ -51,7 +51,7 @@ This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data
 - `mod.rs`: `MarketMaker<S, E>` orchestrator - coordinates strategy, orders, position, execution
 - `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`, `MarketMakerMetricsRecorder` trait
 - `strategy.rs`: `QuotingStrategy` trait + `SymmetricStrategy` + `InventoryAwareStrategy` + `GLFTStrategy`
-- `estimator.rs`: `ParameterEstimator` - econometric pipeline with volume clock, bipower variation, regime detection
+- `estimator.rs`: `ParameterEstimator` - econometric pipeline with volume clock, bipower variation, regime detection, microprice estimation
 - `order_manager.rs`: `OrderManager`, `TrackedOrder`, `Side` - tracks resting orders by oid
 - `position.rs`: `PositionTracker` - position state with fill deduplication by tid
 - `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor` - abstracts order placement/cancellation
@@ -105,18 +105,20 @@ MarketMaker<S: QuotingStrategy, E: OrderExecutor>
 
 **GLFT Strategy (default):**
 
-Uses stochastic control theory for optimal market making:
+Uses stochastic control theory for optimal market making with data-driven fair price:
+- **Microprice**: Fair price learned from book/flow imbalance signals (replaces ad-hoc adjustments)
 - **σ (sigma)**: Jump-robust volatility from bipower variation (√BV)
-- **κ (kappa)**: Order flow intensity from weighted L2 book regression
+- **κ (kappa)**: Order flow intensity from fill-rate estimation
 - **τ (tau)**: Time horizon estimated from trade rate (faster markets → smaller τ)
 - **γ (gamma)**: Dynamic risk aversion via `RiskConfig`, scales with volatility/toxicity/inventory
-- **Toxic regime**: When RV/BV > 3.0, spreads widen by toxicity multiplier
 
 Formulas:
 ```
+microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)  # Data-driven fair price
 δ = (1/γ) × ln(1 + γ/κ)                    # Optimal half-spread (GLFT)
 skew = (q/Q_max) × γ × σ² × T              # Inventory skew (T = 1/λ holding time)
-γ_effective = γ_base × vol × tox × inv     # Dynamic gamma scaling
+bid = microprice × (1 - δ - skew)          # Quote around fair price
+ask = microprice × (1 + δ - skew)
 ```
 
 **RiskConfig (Dynamic Gamma):**

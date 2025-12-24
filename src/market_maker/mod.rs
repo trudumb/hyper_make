@@ -371,20 +371,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             sigma_total: self.estimator.sigma_total(), // √RV (includes jumps) for risk
             sigma_effective: self.estimator.sigma_effective(), // Blended for skew
             // Order book
-            kappa: self.estimator.kappa(), // Weighted L2 regression
+            kappa: self.estimator.kappa(), // Fill-rate kappa from trade distances
             arrival_intensity: self.estimator.arrival_intensity(), // Volume ticks/sec
             // Regime detection
             is_toxic_regime: self.estimator.is_toxic_regime(), // RV/BV > 1.5
             jump_ratio: self.estimator.jump_ratio(),           // Fast RV/BV ratio
-            // Directional flow
+            // Directional flow (for diagnostics)
             momentum_bps: self.estimator.momentum_bps(), // Signed momentum
             flow_imbalance: self.estimator.flow_imbalance(), // Buy/sell imbalance
             falling_knife_score: self.estimator.falling_knife_score(), // Downward momentum
             rising_knife_score: self.estimator.rising_knife_score(), // Upward momentum
+            // L2 book structure
+            book_imbalance: self.estimator.book_imbalance(), // Bid/ask depth asymmetry
+            liquidity_gamma_mult: self.estimator.liquidity_gamma_multiplier(), // Thin book scaling
+            // Microprice: data-driven fair price incorporating signal predictions
+            microprice: self.estimator.microprice(), // mid × (1 + β_book×imb + β_flow×flow)
+            beta_book: self.estimator.beta_book(),   // Learned coefficient for book imbalance
+            beta_flow: self.estimator.beta_flow(),   // Learned coefficient for flow imbalance
         };
 
         debug!(
             mid = self.latest_mid,
+            microprice = %format!("{:.4}", market_params.microprice),
             position = self.position.position(),
             max_pos = self.config.max_position,
             target_liq = self.config.target_liquidity,
@@ -393,11 +401,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             kappa = %format!("{:.2}", market_params.kappa),
             jump_ratio = %format!("{:.2}", market_params.jump_ratio),
             is_toxic = market_params.is_toxic_regime,
-            momentum_bps = %format!("{:.1}", market_params.momentum_bps),
-            flow = %format!("{:.2}", market_params.flow_imbalance),
-            falling_knife = %format!("{:.2}", market_params.falling_knife_score),
-            rising_knife = %format!("{:.2}", market_params.rising_knife_score),
-            "Quote inputs with directional flow"
+            beta_book = %format!("{:.6}", market_params.beta_book),
+            beta_flow = %format!("{:.6}", market_params.beta_flow),
+            book_imbalance = %format!("{:.2}", market_params.book_imbalance),
+            liq_gamma_mult = %format!("{:.2}", market_params.liquidity_gamma_mult),
+            "Quote inputs with microprice"
         );
 
         let (bid, ask) = self.strategy.calculate_quotes(

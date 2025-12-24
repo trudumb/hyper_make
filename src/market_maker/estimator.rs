@@ -1009,6 +1009,272 @@ impl BookStructureEstimator {
 }
 
 // ============================================================================
+// Microprice Estimator (Data-Driven Fair Price)
+// ============================================================================
+
+/// Observation for microprice regression.
+/// Stores signals at time t, matched with realized return at t + horizon.
+#[derive(Debug, Clone)]
+struct MicropriceObservation {
+    timestamp_ms: u64,
+    book_imbalance: f64,
+    flow_imbalance: f64,
+    mid: f64,
+}
+
+/// Estimates microprice by learning how book/flow imbalance predict returns.
+///
+/// Uses rolling online regression to estimate:
+/// E[r_{t+Δ}] = β_book × book_imbalance + β_flow × flow_imbalance
+///
+/// microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
+///
+/// This replaces magic number adjustments with data-driven coefficients.
+#[derive(Debug)]
+struct MicropriceEstimator {
+    /// Pending observations waiting for forward horizon to elapse
+    pending: VecDeque<MicropriceObservation>,
+    /// Window for regression data (ms)
+    window_ms: u64,
+    /// Forward horizon to measure realized return (ms)
+    forward_horizon_ms: u64,
+
+    // Running sums for online regression (2-variable linear regression)
+    // y = β_book × x_book + β_flow × x_flow + ε
+    n: usize,
+    sum_x_book: f64,
+    sum_x_flow: f64,
+    sum_y: f64,
+    sum_xx_book: f64,
+    sum_xx_flow: f64,
+    sum_x_cross: f64, // book * flow
+    sum_xy_book: f64,
+    sum_xy_flow: f64,
+    sum_yy: f64,
+
+    // Estimated coefficients
+    beta_book: f64,
+    beta_flow: f64,
+    r_squared: f64,
+
+    // Warmup threshold
+    min_observations: usize,
+}
+
+impl MicropriceEstimator {
+    fn new(window_ms: u64, forward_horizon_ms: u64, min_observations: usize) -> Self {
+        Self {
+            pending: VecDeque::with_capacity(2000),
+            window_ms,
+            forward_horizon_ms,
+            n: 0,
+            sum_x_book: 0.0,
+            sum_x_flow: 0.0,
+            sum_y: 0.0,
+            sum_xx_book: 0.0,
+            sum_xx_flow: 0.0,
+            sum_x_cross: 0.0,
+            sum_xy_book: 0.0,
+            sum_xy_flow: 0.0,
+            sum_yy: 0.0,
+            beta_book: 0.0,
+            beta_flow: 0.0,
+            r_squared: 0.0,
+            min_observations,
+        }
+    }
+
+    /// Update with new book state.
+    fn on_book_update(
+        &mut self,
+        timestamp_ms: u64,
+        mid: f64,
+        book_imbalance: f64,
+        flow_imbalance: f64,
+    ) {
+        // 1. Process pending observations that have reached forward horizon
+        self.process_completed(timestamp_ms, mid);
+
+        // 2. Add new observation
+        self.pending.push_back(MicropriceObservation {
+            timestamp_ms,
+            book_imbalance,
+            flow_imbalance,
+            mid,
+        });
+
+        // 3. Expire old data outside regression window
+        self.expire_old(timestamp_ms);
+
+        // 4. Update regression coefficients
+        self.update_betas();
+    }
+
+    /// Match completed observations with their realized returns.
+    fn process_completed(&mut self, now: u64, current_mid: f64) {
+        // Find observations where forward_horizon has elapsed
+        while let Some(obs) = self.pending.front() {
+            if now >= obs.timestamp_ms + self.forward_horizon_ms {
+                let obs = self.pending.pop_front().unwrap();
+
+                // Calculate realized return
+                if obs.mid > 0.0 {
+                    let realized_return = (current_mid - obs.mid) / obs.mid;
+
+                    // Add to regression sums
+                    self.add_observation(obs.book_imbalance, obs.flow_imbalance, realized_return);
+                }
+            } else {
+                break; // Remaining observations haven't reached horizon yet
+            }
+        }
+    }
+
+    /// Add a completed observation to regression.
+    fn add_observation(&mut self, x_book: f64, x_flow: f64, y: f64) {
+        self.n += 1;
+        self.sum_x_book += x_book;
+        self.sum_x_flow += x_flow;
+        self.sum_y += y;
+        self.sum_xx_book += x_book * x_book;
+        self.sum_xx_flow += x_flow * x_flow;
+        self.sum_x_cross += x_book * x_flow;
+        self.sum_xy_book += x_book * y;
+        self.sum_xy_flow += x_flow * y;
+        self.sum_yy += y * y;
+    }
+
+    /// Expire observations outside the regression window.
+    /// Note: We use a simple approach - reset if oldest data is too old.
+    /// A more sophisticated approach would subtract old observations.
+    fn expire_old(&mut self, now: u64) {
+        // Simple windowing: if we have enough data and oldest is too old, decay
+        // This is approximate but avoids complexity of exact windowing
+        if self.n > self.min_observations * 2 {
+            // Apply decay to running sums (approximate window)
+            let decay = 0.999; // Slow decay
+            self.sum_x_book *= decay;
+            self.sum_x_flow *= decay;
+            self.sum_y *= decay;
+            self.sum_xx_book *= decay;
+            self.sum_xx_flow *= decay;
+            self.sum_x_cross *= decay;
+            self.sum_xy_book *= decay;
+            self.sum_xy_flow *= decay;
+            self.sum_yy *= decay;
+            // Effective n decays too
+            self.n = ((self.n as f64) * decay) as usize;
+        }
+
+        // Also trim pending queue if it gets too large
+        let max_pending = (self.window_ms / 100) as usize; // ~10 obs per second
+        while self.pending.len() > max_pending {
+            self.pending.pop_front();
+        }
+
+        let _ = now; // Used for logging if needed
+    }
+
+    /// Solve 2-variable linear regression for β_book and β_flow.
+    fn update_betas(&mut self) {
+        if self.n < self.min_observations {
+            return;
+        }
+
+        let n = self.n as f64;
+
+        // Solve normal equations for: y = β_book × x_book + β_flow × x_flow
+        // Using matrix form: (X'X)β = X'y
+        //
+        // X'X = | Σx_book² , Σx_book×x_flow |
+        //       | Σx_book×x_flow, Σx_flow² |
+        //
+        // X'y = | Σx_book×y |
+        //       | Σx_flow×y |
+
+        // Center the data (remove means)
+        let mean_x_book = self.sum_x_book / n;
+        let mean_x_flow = self.sum_x_flow / n;
+        let mean_y = self.sum_y / n;
+
+        // Centered sums of squares
+        let sxx_book = self.sum_xx_book - n * mean_x_book * mean_x_book;
+        let sxx_flow = self.sum_xx_flow - n * mean_x_flow * mean_x_flow;
+        let sxy_book = self.sum_xy_book - n * mean_x_book * mean_y;
+        let sxy_flow = self.sum_xy_flow - n * mean_x_flow * mean_y;
+        let sx_cross = self.sum_x_cross - n * mean_x_book * mean_x_flow;
+        let syy = self.sum_yy - n * mean_y * mean_y;
+
+        // Determinant of X'X
+        let det = sxx_book * sxx_flow - sx_cross * sx_cross;
+
+        if det.abs() < 1e-12 {
+            // Singular matrix - signals are collinear or no variance
+            return;
+        }
+
+        // Solve using Cramer's rule
+        self.beta_book = (sxy_book * sxx_flow - sxy_flow * sx_cross) / det;
+        self.beta_flow = (sxy_flow * sxx_book - sxy_book * sx_cross) / det;
+
+        // Clamp betas to reasonable range (prevent explosion)
+        // Expected range: ~0.0001-0.01 (0.1-10 bps per unit signal)
+        self.beta_book = self.beta_book.clamp(-0.05, 0.05);
+        self.beta_flow = self.beta_flow.clamp(-0.05, 0.05);
+
+        // Calculate R² = 1 - SSE/SST
+        if syy > 1e-12 {
+            let y_pred_var = self.beta_book * self.beta_book * sxx_book
+                + self.beta_flow * self.beta_flow * sxx_flow
+                + 2.0 * self.beta_book * self.beta_flow * sx_cross;
+            self.r_squared = (y_pred_var / syy).clamp(0.0, 1.0);
+        }
+
+        // Log periodically
+        if self.n.is_multiple_of(500) {
+            debug!(
+                n = self.n,
+                beta_book_bps = %format!("{:.2}", self.beta_book * 10000.0),
+                beta_flow_bps = %format!("{:.2}", self.beta_flow * 10000.0),
+                r_squared = %format!("{:.4}", self.r_squared),
+                "Microprice coefficients updated"
+            );
+        }
+    }
+
+    /// Get microprice adjusted for current signals.
+    fn microprice(&self, mid: f64, book_imbalance: f64, flow_imbalance: f64) -> f64 {
+        if !self.is_warmed_up() {
+            return mid;
+        }
+
+        // microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
+        let adjustment = self.beta_book * book_imbalance + self.beta_flow * flow_imbalance;
+
+        // Clamp adjustment to ±50 bps for safety
+        let adjustment_clamped = adjustment.clamp(-0.005, 0.005);
+
+        mid * (1.0 + adjustment_clamped)
+    }
+
+    fn is_warmed_up(&self) -> bool {
+        self.n >= self.min_observations
+    }
+
+    fn beta_book(&self) -> f64 {
+        self.beta_book
+    }
+
+    fn beta_flow(&self) -> f64 {
+        self.beta_flow
+    }
+
+    fn r_squared(&self) -> f64 {
+        self.r_squared
+    }
+}
+
+// ============================================================================
 // Volume Tick Arrival Estimator
 // ============================================================================
 
@@ -1085,6 +1351,8 @@ pub struct ParameterEstimator {
     arrival: VolumeTickArrivalEstimator,
     /// Book structure estimator (imbalance, near-touch liquidity)
     book_structure: BookStructureEstimator,
+    /// Microprice estimator (data-driven fair price)
+    microprice_estimator: MicropriceEstimator,
     /// Current mid price
     current_mid: f64,
     /// Current timestamp for momentum queries
@@ -1120,6 +1388,11 @@ impl ParameterEstimator {
             config.default_arrival_intensity,
         );
 
+        let book_structure = BookStructureEstimator::new();
+
+        // Microprice estimator: 60s window, 300ms forward horizon, 50 min observations
+        let microprice_estimator = MicropriceEstimator::new(60_000, 300, 50);
+
         Self {
             config,
             bucket_accumulator,
@@ -1129,6 +1402,8 @@ impl ParameterEstimator {
             fill_rate_kappa,
             book_kappa,
             arrival,
+            book_structure,
+            microprice_estimator,
             current_mid: 0.0,
             current_time_ms: 0,
         }
@@ -1205,6 +1480,15 @@ impl ParameterEstimator {
     pub fn on_l2_book(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) {
         self.current_mid = mid;
         self.book_kappa.update(bids, asks, mid);
+        self.book_structure.update(bids, asks, mid);
+
+        // Feed microprice estimator with current signals
+        self.microprice_estimator.on_book_update(
+            self.current_time_ms,
+            mid,
+            self.book_structure.imbalance(),
+            self.flow.imbalance(),
+        );
     }
 
     // === Volatility Accessors ===
@@ -1246,6 +1530,53 @@ impl ParameterEstimator {
     /// Get current order arrival intensity (volume ticks per second).
     pub fn arrival_intensity(&self) -> f64 {
         self.arrival.ticks_per_second()
+    }
+
+    /// Get L2 book imbalance [-1, 1].
+    /// Positive = more bids (buying pressure), Negative = more asks (selling pressure).
+    /// Use for directional quote skew.
+    pub fn book_imbalance(&self) -> f64 {
+        self.book_structure.imbalance()
+    }
+
+    /// Get liquidity-based gamma multiplier [1.0, 2.0].
+    /// Returns > 1.0 when near-touch liquidity is below average (thin book).
+    /// Use to scale gamma up for wider spreads in thin conditions.
+    pub fn liquidity_gamma_multiplier(&self) -> f64 {
+        self.book_structure.gamma_multiplier()
+    }
+
+    // === Microprice Accessors ===
+
+    /// Get microprice (data-driven fair price).
+    /// Incorporates book imbalance and flow imbalance predictions.
+    /// Falls back to raw mid if not warmed up.
+    pub fn microprice(&self) -> f64 {
+        self.microprice_estimator.microprice(
+            self.current_mid,
+            self.book_structure.imbalance(),
+            self.flow.imbalance(),
+        )
+    }
+
+    /// Get β_book coefficient (return prediction per unit book imbalance).
+    pub fn beta_book(&self) -> f64 {
+        self.microprice_estimator.beta_book()
+    }
+
+    /// Get β_flow coefficient (return prediction per unit flow imbalance).
+    pub fn beta_flow(&self) -> f64 {
+        self.microprice_estimator.beta_flow()
+    }
+
+    /// Get R² of microprice regression.
+    pub fn microprice_r_squared(&self) -> f64 {
+        self.microprice_estimator.r_squared()
+    }
+
+    /// Check if microprice estimator is warmed up.
+    pub fn microprice_warmed_up(&self) -> bool {
+        self.microprice_estimator.is_warmed_up()
     }
 
     // === Regime Detection ===
