@@ -728,8 +728,141 @@ impl WeightedKappaEstimator {
         }
     }
 
+    #[allow(dead_code)]
     fn kappa(&self) -> f64 {
         self.kappa.clamp(1.0, 10000.0)
+    }
+
+    #[allow(dead_code)]
+    fn update_count(&self) -> usize {
+        self.update_count
+    }
+}
+
+// ============================================================================
+// Fill Rate Kappa Estimator (Trade Distance Distribution)
+// ============================================================================
+
+/// Estimates κ from trade execution distance distribution.
+///
+/// This is the CORRECT κ for the GLFT formula:
+/// λ(δ) = A × exp(-κ × δ)  where λ is fill rate at distance δ
+///
+/// For exponential distribution: E[δ] = 1/κ, so κ = 1/E[δ]
+///
+/// This measures WHERE trades actually execute relative to mid,
+/// NOT the shape of the order book (which is a different concept).
+#[derive(Debug)]
+struct FillRateKappaEstimator {
+    /// Rolling observations: (distance, volume, timestamp)
+    observations: VecDeque<(f64, f64, u64)>,
+    /// Rolling window (ms)
+    window_ms: u64,
+    /// Running volume-weighted distance sum (for efficiency)
+    volume_weighted_distance: f64,
+    /// Running total volume
+    total_volume: f64,
+    /// EWMA smoothed kappa
+    kappa: f64,
+    /// EWMA alpha
+    alpha: f64,
+    /// Update count for warmup
+    update_count: usize,
+}
+
+impl FillRateKappaEstimator {
+    fn new(window_ms: u64, half_life_ticks: f64, default_kappa: f64) -> Self {
+        Self {
+            observations: VecDeque::with_capacity(1000),
+            window_ms,
+            volume_weighted_distance: 0.0,
+            total_volume: 0.0,
+            kappa: default_kappa,
+            alpha: (2.0_f64.ln() / half_life_ticks).clamp(0.001, 0.5),
+            update_count: 0,
+        }
+    }
+
+    /// Process a trade. mid must be the mid price at time of trade.
+    fn on_trade(&mut self, timestamp_ms: u64, price: f64, size: f64, mid: f64) {
+        if mid <= 0.0 || size <= 0.0 || price <= 0.0 {
+            return;
+        }
+
+        // Distance from mid as fraction
+        let distance = ((price - mid) / mid).abs();
+
+        // Minimum distance floor to avoid division issues
+        // Trades AT the mid get a small floor distance
+        let distance = distance.max(0.00001); // 0.1 bps floor
+
+        // Add observation
+        self.observations.push_back((distance, size, timestamp_ms));
+        self.volume_weighted_distance += distance * size;
+        self.total_volume += size;
+
+        // Expire old observations
+        self.expire_old(timestamp_ms);
+
+        // Update kappa estimate
+        self.update_kappa();
+    }
+
+    fn expire_old(&mut self, now: u64) {
+        let cutoff = now.saturating_sub(self.window_ms);
+        while let Some((dist, size, ts)) = self.observations.front() {
+            if *ts < cutoff {
+                self.volume_weighted_distance -= dist * size;
+                self.total_volume -= size;
+                self.observations.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Ensure running sums don't go negative due to float precision
+        self.volume_weighted_distance = self.volume_weighted_distance.max(0.0);
+        self.total_volume = self.total_volume.max(0.0);
+    }
+
+    fn update_kappa(&mut self) {
+        if self.total_volume < 1e-9 {
+            return;
+        }
+
+        // Volume-weighted average distance
+        let avg_distance = self.volume_weighted_distance / self.total_volume;
+
+        // For exponential distribution λ(δ) = A·exp(-κδ):
+        // E[δ] = 1/κ (mean of exponential)
+        // Therefore: κ = 1/E[δ]
+        if avg_distance > 1e-8 {
+            let kappa_instant = 1.0 / avg_distance;
+
+            // Clamp to reasonable range
+            // κ = 1000 means avg distance = 10 bps
+            // κ = 5000 means avg distance = 2 bps
+            // κ = 500 means avg distance = 20 bps
+            let kappa_clamped = kappa_instant.clamp(100.0, 10000.0);
+
+            // EWMA update
+            self.kappa = self.alpha * kappa_clamped + (1.0 - self.alpha) * self.kappa;
+            self.update_count += 1;
+
+            if self.update_count.is_multiple_of(100) {
+                debug!(
+                    observations = self.observations.len(),
+                    avg_distance_bps = %format!("{:.2}", avg_distance * 10000.0),
+                    kappa_instant = %format!("{:.0}", kappa_instant),
+                    kappa_ewma = %format!("{:.0}", self.kappa),
+                    "Fill-rate kappa updated from trade distances"
+                );
+            }
+        }
+    }
+
+    fn kappa(&self) -> f64 {
+        self.kappa.clamp(100.0, 10000.0)
     }
 
     fn update_count(&self) -> usize {
@@ -768,6 +901,111 @@ fn weighted_linear_regression_slope(points: &[(f64, f64, f64)]) -> Option<f64> {
     }
 
     Some((sum_w * sum_wxy - sum_wx * sum_wy) / denominator)
+}
+
+// ============================================================================
+// Book Structure Estimator (L2 Order Book Analysis)
+// ============================================================================
+
+/// Analyzes L2 order book structure for auxiliary quote adjustments.
+///
+/// Provides two key signals:
+/// 1. **Book Imbalance** [-1, 1]: Bid/ask depth asymmetry
+///    - Positive = more bids than asks (buying pressure)
+///    - Used for directional skew adjustment
+///
+/// 2. **Liquidity Gamma Multiplier** [1.0, 2.0]: Thin book detection
+///    - Scales γ up when near-touch liquidity is below average
+///    - Protects against adverse selection in thin markets
+#[derive(Debug)]
+struct BookStructureEstimator {
+    /// EWMA smoothed book imbalance [-1, 1]
+    imbalance: f64,
+    /// Current near-touch depth (within 10 bps of mid)
+    near_touch_depth: f64,
+    /// Rolling reference depth for comparison
+    reference_depth: f64,
+    /// EWMA smoothing factor
+    alpha: f64,
+    /// Number of levels to consider for imbalance
+    imbalance_levels: usize,
+    /// Maximum distance for near-touch liquidity (as fraction)
+    near_touch_distance: f64,
+}
+
+impl BookStructureEstimator {
+    fn new() -> Self {
+        Self {
+            imbalance: 0.0,
+            near_touch_depth: 0.0,
+            reference_depth: 1.0, // Start with 1.0 to avoid division issues
+            alpha: 0.1,
+            imbalance_levels: 5,
+            near_touch_distance: 0.001, // 10 bps
+        }
+    }
+
+    /// Update with new L2 book data.
+    fn update(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) {
+        if mid <= 0.0 {
+            return;
+        }
+
+        // 1. Calculate bid/ask imbalance from top N levels
+        let bid_depth: f64 = bids
+            .iter()
+            .take(self.imbalance_levels)
+            .map(|(_, sz)| sz)
+            .sum();
+        let ask_depth: f64 = asks
+            .iter()
+            .take(self.imbalance_levels)
+            .map(|(_, sz)| sz)
+            .sum();
+
+        let total = bid_depth + ask_depth;
+        if total > 1e-9 {
+            let instant_imbalance = (bid_depth - ask_depth) / total;
+            self.imbalance = self.alpha * instant_imbalance + (1.0 - self.alpha) * self.imbalance;
+        }
+
+        // 2. Calculate near-touch liquidity (depth within 10 bps of mid)
+        let bid_near: f64 = bids
+            .iter()
+            .take_while(|(px, _)| (mid - px) / mid <= self.near_touch_distance)
+            .map(|(_, sz)| sz)
+            .sum();
+        let ask_near: f64 = asks
+            .iter()
+            .take_while(|(px, _)| (px - mid) / mid <= self.near_touch_distance)
+            .map(|(_, sz)| sz)
+            .sum();
+        self.near_touch_depth = bid_near + ask_near;
+
+        // 3. Update reference depth (slow-moving average)
+        // Use very slow decay to establish "normal" liquidity baseline
+        self.reference_depth =
+            0.99 * self.reference_depth + 0.01 * self.near_touch_depth.max(0.001);
+    }
+
+    /// Get current book imbalance [-1, 1].
+    /// Positive = more bids (buying pressure), Negative = more asks (selling pressure).
+    fn imbalance(&self) -> f64 {
+        self.imbalance.clamp(-1.0, 1.0)
+    }
+
+    /// Get gamma multiplier for thin book conditions [1.0, 2.0].
+    /// Returns > 1.0 when near-touch liquidity is below reference.
+    fn gamma_multiplier(&self) -> f64 {
+        if self.near_touch_depth >= self.reference_depth {
+            1.0
+        } else {
+            // Thin book → scale gamma up (wider spreads for protection)
+            // sqrt scaling: 4x thinner → 2x gamma
+            let ratio = self.reference_depth / self.near_touch_depth.max(0.001);
+            ratio.sqrt().clamp(1.0, 2.0)
+        }
+    }
 }
 
 // ============================================================================
@@ -824,8 +1062,9 @@ impl VolumeTickArrivalEstimator {
 /// 2. VWAP returns → Multi-Scale Bipower → sigma_clean, sigma_total, sigma_effective
 /// 3. VWAP returns → Momentum Detector → falling/rising knife scores
 /// 4. Trade tape → Flow Tracker → buy/sell imbalance
-/// 5. L2 Book → Weighted Kappa → Order book depth decay
-/// 6. Regime detection: fast jump_ratio > threshold = toxic
+/// 5. Trade tape → Fill Rate Kappa → trade distance distribution (CORRECT κ for GLFT)
+/// 6. L2 Book → Book analysis for auxiliary adjustments (imbalance, etc.)
+/// 7. Regime detection: fast jump_ratio > threshold = toxic
 #[derive(Debug)]
 pub struct ParameterEstimator {
     config: EstimatorConfig,
@@ -837,12 +1076,14 @@ pub struct ParameterEstimator {
     momentum: MomentumDetector,
     /// Trade flow tracker for buy/sell imbalance
     flow: TradeFlowTracker,
-    /// Weighted kappa estimator
-    kappa: WeightedKappaEstimator,
+    /// Fill-rate kappa estimator from trade distances (PRIMARY κ for GLFT)
+    fill_rate_kappa: FillRateKappaEstimator,
+    /// Weighted kappa estimator from L2 book (kept for auxiliary use)
+    #[allow(dead_code)]
+    book_kappa: WeightedKappaEstimator,
     /// Volume tick arrival estimator
     arrival: VolumeTickArrivalEstimator,
     /// Current mid price
-    #[allow(dead_code)]
     current_mid: f64,
     /// Current timestamp for momentum queries
     current_time_ms: u64,
@@ -855,12 +1096,23 @@ impl ParameterEstimator {
         let multi_scale = MultiScaleBipowerEstimator::new(&config);
         let momentum = MomentumDetector::new(config.momentum_window_ms);
         let flow = TradeFlowTracker::new(config.trade_flow_window_ms, config.trade_flow_alpha);
-        let kappa = WeightedKappaEstimator::new(
+
+        // Fill-rate kappa from trade distances (PRIMARY for GLFT)
+        // Use 5-minute window, medium half-life, default to 2000 (typical for liquid markets)
+        let fill_rate_kappa = FillRateKappaEstimator::new(
+            300_000, // 5 minute window
+            config.medium_half_life_ticks,
+            2000.0, // Default: avg trade distance = 5 bps
+        );
+
+        // Book kappa (kept for auxiliary use, may remove later)
+        let book_kappa = WeightedKappaEstimator::new(
             config.kappa_half_life_updates,
             config.default_kappa,
             config.kappa_max_distance,
             config.kappa_max_levels,
         );
+
         let arrival = VolumeTickArrivalEstimator::new(
             config.medium_half_life_ticks, // Use medium timescale
             config.default_arrival_intensity,
@@ -872,7 +1124,8 @@ impl ParameterEstimator {
             multi_scale,
             momentum,
             flow,
-            kappa,
+            fill_rate_kappa,
+            book_kappa,
             arrival,
             current_mid: 0.0,
             current_time_ms: 0,
@@ -884,7 +1137,7 @@ impl ParameterEstimator {
         self.current_mid = mid_price;
     }
 
-    /// Process a new trade (feeds into volume clock AND flow tracker).
+    /// Process a new trade (feeds into volume clock, flow tracker, AND fill-rate kappa).
     ///
     /// # Arguments
     /// * `timestamp_ms` - Trade timestamp
@@ -903,6 +1156,13 @@ impl ParameterEstimator {
         // Track trade flow if we know aggressor side
         if let Some(is_buy) = is_buy_aggressor {
             self.flow.on_trade(timestamp_ms, size, is_buy);
+        }
+
+        // Feed into fill-rate kappa estimator (trade distance from mid)
+        // This is the PRIMARY κ source for GLFT
+        if self.current_mid > 0.0 {
+            self.fill_rate_kappa
+                .on_trade(timestamp_ms, price, size, self.current_mid);
         }
 
         // Feed into volume bucket accumulator
@@ -927,6 +1187,7 @@ impl ParameterEstimator {
                 sigma_clean = %format!("{:.6}", self.multi_scale.sigma_clean()),
                 sigma_total = %format!("{:.6}", self.multi_scale.sigma_total()),
                 jump_ratio = %format!("{:.2}", self.multi_scale.jump_ratio_fast()),
+                kappa = %format!("{:.0}", self.fill_rate_kappa.kappa()),
                 "Volume bucket completed"
             );
         }
@@ -940,7 +1201,8 @@ impl ParameterEstimator {
     /// Process L2 order book update for kappa estimation.
     /// bids and asks are slices of (price, size) tuples, best first.
     pub fn on_l2_book(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) {
-        self.kappa.update(bids, asks, mid);
+        self.current_mid = mid;
+        self.book_kappa.update(bids, asks, mid);
     }
 
     // === Volatility Accessors ===
@@ -972,9 +1234,11 @@ impl ParameterEstimator {
 
     // === Order Book Accessors ===
 
-    /// Get current order book depth decay estimate (κ).
+    /// Get current fill-rate kappa estimate (κ).
+    /// This is estimated from trade execution distance distribution,
+    /// which is the CORRECT κ for the GLFT formula.
     pub fn kappa(&self) -> f64 {
-        self.kappa.kappa()
+        self.fill_rate_kappa.kappa()
     }
 
     /// Get current order arrival intensity (volume ticks per second).
@@ -1029,7 +1293,7 @@ impl ParameterEstimator {
     /// Check if estimator has collected enough data.
     pub fn is_warmed_up(&self) -> bool {
         self.multi_scale.tick_count() >= self.config.min_volume_ticks
-            && self.kappa.update_count() >= self.config.min_l2_updates
+            && self.fill_rate_kappa.update_count() >= self.config.min_l2_updates
     }
 
     /// Get current warmup progress.
@@ -1038,7 +1302,7 @@ impl ParameterEstimator {
         (
             self.multi_scale.tick_count(),
             self.config.min_volume_ticks,
-            self.kappa.update_count(),
+            self.fill_rate_kappa.update_count(),
             self.config.min_l2_updates,
         )
     }
@@ -1224,7 +1488,13 @@ mod tests {
 
         assert!(!estimator.is_warmed_up());
 
+        // Feed initial L2 book to set current_mid (needed for fill-rate kappa)
+        let bids = vec![(99.9, 5.0), (99.8, 10.0), (99.7, 15.0)];
+        let asks = vec![(100.1, 5.0), (100.2, 10.0), (100.3, 15.0)];
+        estimator.on_l2_book(&bids, &asks, 100.0);
+
         // Feed trades to fill buckets (need 5 volume ticks)
+        // These will also feed into fill_rate_kappa since current_mid is set
         let mut time = 1000u64;
         for i in 0..100 {
             let price = 100.0 + (i as f64 * 0.1).sin() * 0.5;
@@ -1234,9 +1504,7 @@ mod tests {
             time += 100;
         }
 
-        // Feed L2 books (need 3 updates)
-        let bids = vec![(99.9, 5.0), (99.8, 10.0), (99.7, 15.0)];
-        let asks = vec![(100.1, 5.0), (100.2, 10.0), (100.3, 15.0)];
+        // Feed more L2 books (total needs min_l2_updates which is checked via fill_rate_kappa)
         for _ in 0..5 {
             estimator.on_l2_book(&bids, &asks, 100.0);
         }
