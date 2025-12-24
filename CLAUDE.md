@@ -109,16 +109,30 @@ Uses stochastic control theory for optimal market making:
 - **σ (sigma)**: Jump-robust volatility from bipower variation (√BV)
 - **κ (kappa)**: Order flow intensity from weighted L2 book regression
 - **τ (tau)**: Time horizon estimated from trade rate (faster markets → smaller τ)
-- **γ (gamma)**: Risk aversion calculated dynamically to achieve target spread
+- **γ (gamma)**: Dynamic risk aversion via `RiskConfig`, scales with volatility/toxicity/inventory
 - **Toxic regime**: When RV/BV > 3.0, spreads widen by toxicity multiplier
 
 Formulas:
 ```
-γ = κ / (exp(δ*κ) - 1)           # Adaptive gamma from target spread δ
-δ_bid = (1/κ) * ln(1 + κ/γ) + (q/Q_max) * γ * σ² * τ
-δ_ask = (1/κ) * ln(1 + κ/γ) - (q/Q_max) * γ * σ² * τ
-toxicity_multiplier = clamp(jump_ratio / 3.0, 1.0, 2.0)  # Applied in toxic regime
+δ = (1/γ) × ln(1 + γ/κ)                    # Optimal half-spread (GLFT)
+skew = (q/Q_max) × γ × σ² × T              # Inventory skew (T = 1/λ holding time)
+γ_effective = γ_base × vol × tox × inv     # Dynamic gamma scaling
 ```
+
+**RiskConfig (Dynamic Gamma):**
+
+`RiskConfig` controls how γ adapts to market conditions:
+- `gamma_base`: Base risk aversion (0.1 aggressive → 1.0 conservative)
+- `sigma_baseline`: Reference volatility for scaling (default 0.0002 = 2bp/sec)
+- `volatility_weight`: How much high vol increases γ (0.0-1.0)
+- `max_volatility_multiplier`: Cap on vol-driven γ increase
+- `toxicity_threshold`: Jump ratio above which γ scales (default 1.5)
+- `toxicity_sensitivity`: γ increase per unit of jump_ratio
+- `inventory_threshold`: Utilization % before inventory scaling (default 0.5)
+- `inventory_sensitivity`: Quadratic scaling near position limits
+- `gamma_min`, `gamma_max`: Bounds for effective gamma
+- `min_spread_floor`: Minimum spread (default 1bp)
+- `max_holding_time`: Cap on T to prevent skew explosion (default 120s)
 
 **Parameter Estimation (Econometric Pipeline):**
 
@@ -163,11 +177,12 @@ impl QuotingStrategy for MyStrategy {
                         market_params: &MarketParams)
         -> (Option<Quote>, Option<Quote>) {
         // MarketParams contains:
-        //   sigma: f64           - √BV (jump-robust volatility)
-        //   kappa: f64           - order flow intensity
+        //   sigma: f64             - √BV (jump-robust volatility)
+        //   sigma_effective: f64   - σ with toxicity multiplier applied
+        //   kappa: f64             - order flow intensity
         //   arrival_intensity: f64 - volume ticks per second
         //   is_toxic_regime: bool  - RV/BV > 3.0
-        //   jump_ratio: f64      - RV/BV ratio
+        //   jump_ratio: f64        - RV/BV ratio
         // Return (bid, ask) quotes
     }
     fn name(&self) -> &'static str { "MyStrategy" }

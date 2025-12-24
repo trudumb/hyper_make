@@ -306,9 +306,78 @@ impl QuotingStrategy for InventoryAwareStrategy {
     }
 }
 
+/// Configuration for dynamic risk aversion scaling.
+///
+/// All parameters are explicit for future online optimization.
+/// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RiskConfig {
+    /// Base risk aversion (γ_base) - personality in normal conditions
+    /// Typical values: 0.1 (aggressive) to 1.0 (conservative)
+    pub gamma_base: f64,
+
+    /// Baseline volatility for scaling (per-second σ)
+    /// When σ_effective > this, γ scales up
+    pub sigma_baseline: f64,
+
+    /// Weight for volatility scaling [0.0, 1.0]
+    /// 0.0 = ignore volatility, 1.0 = full scaling
+    pub volatility_weight: f64,
+
+    /// Maximum volatility multiplier
+    /// Caps how much high volatility can increase γ
+    pub max_volatility_multiplier: f64,
+
+    /// Toxicity threshold (jump_ratio above this triggers scaling)
+    pub toxicity_threshold: f64,
+
+    /// How much toxicity increases γ per unit of jump_ratio above 1.0
+    pub toxicity_sensitivity: f64,
+
+    /// Inventory utilization threshold for γ scaling [0.0, 1.0]
+    /// Below this, no inventory scaling
+    pub inventory_threshold: f64,
+
+    /// How aggressively γ increases near position limits
+    /// Uses quadratic scaling: 1 + sensitivity × (utilization - threshold)²
+    pub inventory_sensitivity: f64,
+
+    /// Minimum γ floor
+    pub gamma_min: f64,
+
+    /// Maximum γ ceiling
+    pub gamma_max: f64,
+
+    /// Minimum spread floor (as fraction, e.g., 0.0001 = 1 bps)
+    pub min_spread_floor: f64,
+
+    /// Maximum holding time cap (seconds)
+    /// Prevents skew explosion in dead markets
+    pub max_holding_time: f64,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            gamma_base: 0.3,
+            sigma_baseline: 0.0002,           // 20bp per-second
+            volatility_weight: 0.5,
+            max_volatility_multiplier: 3.0,
+            toxicity_threshold: 1.5,
+            toxicity_sensitivity: 0.3,
+            inventory_threshold: 0.5,
+            inventory_sensitivity: 2.0,
+            gamma_min: 0.05,
+            gamma_max: 5.0,
+            min_spread_floor: 0.0001,         // 1 bps
+            max_holding_time: 120.0,          // 2 minutes
+        }
+    }
+}
+
 /// GLFT (Guéant-Lehalle-Fernandez-Tapia) optimal market making strategy.
 ///
-/// Implements the **infinite-horizon** GLFT model from stochastic control theory.
+/// Implements the **infinite-horizon** GLFT model with **dynamic risk aversion**.
 ///
 /// ## Key Formulas (Corrected per Guéant et al. 2013):
 ///
@@ -323,31 +392,95 @@ impl QuotingStrategy for InventoryAwareStrategy {
 /// ```
 /// where T = 1/λ (inverse of arrival intensity).
 ///
-/// ## Parameters:
-/// - γ (gamma): risk aversion - fixed parameter, not derived
-/// - σ (sigma): per-second volatility (NOT annualized)
-/// - κ (kappa): order book depth decay (from L2 book)
-/// - λ (lambda): arrival intensity (volume ticks per second)
+/// ## Dynamic Risk Aversion:
+/// ```text
+/// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar
+/// ```
+///
+/// This preserves GLFT's structure while adapting to:
+/// - Volatility regime (higher σ → more conservative)
+/// - Toxicity (high RV/BV → informed flow → widen)
+/// - Inventory utilization (near limits → reduce risk)
 #[derive(Debug, Clone)]
 pub struct GLFTStrategy {
-    /// Risk aversion parameter (gamma) - controls spread and inventory sensitivity
-    /// Typical values: 0.1 (aggressive) to 2.0 (conservative)
-    pub risk_aversion: f64,
-    /// Minimum gamma floor (safety bound)
-    pub min_gamma: f64,
-    /// Maximum gamma ceiling (safety bound)
-    pub max_gamma: f64,
+    /// Risk configuration for dynamic γ calculation
+    pub risk_config: RiskConfig,
 }
 
 impl GLFTStrategy {
-    /// Create a new GLFT strategy with fixed risk aversion.
-    /// The market (kappa, sigma) determines the spread, not a target spread.
-    pub fn new(risk_aversion: f64) -> Self {
+    /// Create a new GLFT strategy with base risk aversion.
+    ///
+    /// Uses default RiskConfig with the specified gamma_base.
+    /// For full control, use `with_config()`.
+    pub fn new(gamma_base: f64) -> Self {
         Self {
-            risk_aversion: risk_aversion.clamp(0.01, 100.0),
-            min_gamma: 0.01,
-            max_gamma: 100.0,
+            risk_config: RiskConfig {
+                gamma_base: gamma_base.clamp(0.01, 10.0),
+                ..Default::default()
+            },
         }
+    }
+
+    /// Create a new GLFT strategy with full risk configuration.
+    pub fn with_config(risk_config: RiskConfig) -> Self {
+        Self { risk_config }
+    }
+
+    /// Calculate effective γ based on current market conditions.
+    ///
+    /// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar
+    fn effective_gamma(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> f64 {
+        let cfg = &self.risk_config;
+
+        // === VOLATILITY SCALING ===
+        // Higher realized vol → more risk per unit inventory
+        let vol_ratio = market_params.sigma_effective / cfg.sigma_baseline.max(1e-9);
+        let vol_scalar = if vol_ratio <= 1.0 {
+            1.0 // Don't reduce γ in low vol (often precedes spikes)
+        } else {
+            let raw = 1.0 + cfg.volatility_weight * (vol_ratio - 1.0);
+            raw.min(cfg.max_volatility_multiplier)
+        };
+
+        // === TOXICITY SCALING ===
+        // High RV/BV indicates informed flow
+        let toxicity_scalar = if market_params.jump_ratio <= cfg.toxicity_threshold {
+            1.0
+        } else {
+            1.0 + cfg.toxicity_sensitivity * (market_params.jump_ratio - 1.0)
+        };
+
+        // === INVENTORY SCALING ===
+        // Near position limits → less room for error
+        let utilization = if max_position > EPSILON {
+            (position.abs() / max_position).min(1.0)
+        } else {
+            0.0
+        };
+        let inventory_scalar = if utilization <= cfg.inventory_threshold {
+            1.0
+        } else {
+            let excess = utilization - cfg.inventory_threshold;
+            1.0 + cfg.inventory_sensitivity * excess.powi(2)
+        };
+
+        // === COMBINE AND CLAMP ===
+        let gamma_effective = cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar;
+        gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
+    }
+
+    /// Calculate expected holding time from arrival intensity.
+    ///
+    /// T = 1/λ where λ = arrival intensity (fills per second)
+    /// Clamped to prevent skew explosion when market is dead.
+    fn holding_time(&self, arrival_intensity: f64) -> f64 {
+        let safe_intensity = arrival_intensity.max(0.01);
+        (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
     }
 
     /// Correct GLFT half-spread formula: δ = (1/γ) × ln(1 + γ/κ)
@@ -356,12 +489,12 @@ impl GLFTStrategy {
     /// When κ rises (deep book), spread tightens.
     fn half_spread(&self, gamma: f64, kappa: f64) -> f64 {
         let ratio = gamma / kappa;
-        if ratio > 1e-9 {
+        if ratio > 1e-9 && gamma > 1e-9 {
             (1.0 / gamma) * (1.0 + ratio).ln()
         } else {
             // When γ/κ → 0, use Taylor expansion: ln(1+x) ≈ x
             // δ ≈ (1/γ) × (γ/κ) = 1/κ
-            1.0 / kappa
+            1.0 / kappa.max(1.0)
         }
     }
 
@@ -389,17 +522,20 @@ impl QuotingStrategy for GLFTStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        // === 1. USE FIXED GAMMA (RISK AVERSION) ===
-        // Gamma is a personality parameter, not derived from target spread
-        let gamma = self.risk_aversion.clamp(self.min_gamma, self.max_gamma);
+        // === 1. DYNAMIC GAMMA ===
+        // γ scales with volatility, toxicity, and inventory utilization
+        let gamma = self.effective_gamma(market_params, position, max_position);
         let kappa = market_params.kappa;
 
-        // Time horizon from arrival intensity: T = 1/λ
-        let time_horizon = 1.0 / market_params.arrival_intensity.max(0.01);
+        // Time horizon from arrival intensity: T = 1/λ (with max cap)
+        let time_horizon = self.holding_time(market_params.arrival_intensity);
 
         // === 2. CORRECT GLFT HALF-SPREAD: δ = (1/γ) × ln(1 + γ/κ) ===
         // This is market-driven: thin book (low κ) → wider spread
-        let half_spread = self.half_spread(gamma, kappa);
+        let mut half_spread = self.half_spread(gamma, kappa);
+
+        // Apply minimum spread floor
+        half_spread = half_spread.max(self.risk_config.min_spread_floor);
 
         // === 3. USE SIGMA_EFFECTIVE FOR INVENTORY SKEW ===
         // sigma_effective blends clean and total based on jump regime
@@ -915,6 +1051,192 @@ mod tests {
             "Toxic bid should be lower: normal={:.4}, toxic={:.4}",
             bid_normal.price,
             bid_toxic.price
+        );
+    }
+
+    // ===== DYNAMIC GAMMA TESTS =====
+
+    #[test]
+    fn test_glft_dynamic_gamma_increases_with_volatility() {
+        let strategy = GLFTStrategy::with_config(RiskConfig {
+            gamma_base: 0.3,
+            sigma_baseline: 0.0002,
+            volatility_weight: 1.0, // Full weight for clear test
+            ..Default::default()
+        });
+
+        let normal_params = MarketParams {
+            sigma_effective: 0.0002, // baseline
+            ..Default::default()
+        };
+
+        let high_vol_params = MarketParams {
+            sigma_effective: 0.0006, // 3x baseline
+            ..Default::default()
+        };
+
+        let gamma_normal = strategy.effective_gamma(&normal_params, 0.0, 1.0);
+        let gamma_high_vol = strategy.effective_gamma(&high_vol_params, 0.0, 1.0);
+
+        assert!(
+            gamma_high_vol > gamma_normal,
+            "High vol should increase gamma: normal={}, high={}",
+            gamma_normal,
+            gamma_high_vol
+        );
+    }
+
+    #[test]
+    fn test_glft_dynamic_gamma_increases_with_toxicity() {
+        let strategy = GLFTStrategy::with_config(RiskConfig {
+            gamma_base: 0.3,
+            toxicity_threshold: 1.5,
+            toxicity_sensitivity: 0.5,
+            ..Default::default()
+        });
+
+        let normal_params = MarketParams {
+            jump_ratio: 1.0,
+            ..Default::default()
+        };
+
+        let toxic_params = MarketParams {
+            jump_ratio: 3.0,
+            ..Default::default()
+        };
+
+        let gamma_normal = strategy.effective_gamma(&normal_params, 0.0, 1.0);
+        let gamma_toxic = strategy.effective_gamma(&toxic_params, 0.0, 1.0);
+
+        assert!(
+            gamma_toxic > gamma_normal,
+            "Toxic regime should increase gamma: normal={}, toxic={}",
+            gamma_normal,
+            gamma_toxic
+        );
+    }
+
+    #[test]
+    fn test_glft_dynamic_gamma_increases_near_position_limits() {
+        let strategy = GLFTStrategy::with_config(RiskConfig {
+            gamma_base: 0.3,
+            inventory_threshold: 0.5,
+            inventory_sensitivity: 2.0,
+            ..Default::default()
+        });
+
+        let params = MarketParams::default();
+
+        let gamma_empty = strategy.effective_gamma(&params, 0.0, 1.0);
+        let gamma_half = strategy.effective_gamma(&params, 0.5, 1.0);
+        let gamma_near_full = strategy.effective_gamma(&params, 0.9, 1.0);
+
+        assert!(
+            gamma_near_full > gamma_half,
+            "Near-full inventory should increase gamma: half={}, near_full={}",
+            gamma_half,
+            gamma_near_full
+        );
+        assert!(
+            gamma_half >= gamma_empty,
+            "Half inventory should be >= empty: empty={}, half={}",
+            gamma_empty,
+            gamma_half
+        );
+    }
+
+    #[test]
+    fn test_glft_holding_time_calculation() {
+        let strategy = GLFTStrategy::new(0.5);
+
+        // T = 1/λ
+        assert!((strategy.holding_time(0.5) - 2.0).abs() < 1e-10);
+        assert!((strategy.holding_time(1.0) - 1.0).abs() < 1e-10);
+        assert!((strategy.holding_time(0.1) - 10.0).abs() < 1e-10);
+
+        // Should be capped at max_holding_time
+        assert!(strategy.holding_time(0.001) <= strategy.risk_config.max_holding_time + 1e-10);
+    }
+
+    #[test]
+    fn test_glft_spread_widens_in_stress() {
+        // In stress conditions (high vol + toxic + inventory), spreads should widen
+        let strategy = GLFTStrategy::with_config(RiskConfig {
+            gamma_base: 0.3,
+            sigma_baseline: 0.0002,
+            volatility_weight: 0.5,
+            toxicity_sensitivity: 0.3,
+            inventory_sensitivity: 2.0,
+            ..Default::default()
+        });
+
+        let config = make_config_with_decimals(100.0, 4);
+
+        let normal_params = MarketParams {
+            sigma: 0.0002,
+            sigma_effective: 0.0002,
+            kappa: 100.0,
+            arrival_intensity: 0.5,
+            jump_ratio: 1.0,
+            is_toxic_regime: false,
+            ..Default::default()
+        };
+
+        let stress_params = MarketParams {
+            sigma: 0.0006,           // 3x vol
+            sigma_effective: 0.0006,
+            kappa: 50.0,             // Thinner book
+            arrival_intensity: 0.2,  // Slower fills
+            jump_ratio: 3.0,         // Toxic
+            is_toxic_regime: true,
+            ..Default::default()
+        };
+
+        let (bid_normal, ask_normal) =
+            strategy.calculate_quotes(&config, 0.0, 1.0, 0.5, &normal_params);
+        let (bid_stress, ask_stress) =
+            strategy.calculate_quotes(&config, 0.5, 1.0, 0.5, &stress_params);
+
+        let spread_normal = ask_normal.unwrap().price - bid_normal.unwrap().price;
+        let spread_stress = ask_stress.unwrap().price - bid_stress.unwrap().price;
+
+        assert!(
+            spread_stress > spread_normal,
+            "Stress should widen spread: normal={}, stress={}",
+            spread_normal,
+            spread_stress
+        );
+    }
+
+    #[test]
+    fn test_glft_gamma_clamped_to_bounds() {
+        let strategy = GLFTStrategy::with_config(RiskConfig {
+            gamma_base: 0.3,
+            gamma_min: 0.1,
+            gamma_max: 2.0,
+            volatility_weight: 1.0,
+            max_volatility_multiplier: 100.0, // Very high to test clamping
+            ..Default::default()
+        });
+
+        // Extreme volatility that would push gamma way up
+        let extreme_params = MarketParams {
+            sigma_effective: 0.01, // 50x baseline
+            jump_ratio: 10.0,      // Very toxic
+            ..Default::default()
+        };
+
+        let gamma = strategy.effective_gamma(&extreme_params, 0.99, 1.0);
+
+        assert!(
+            gamma <= 2.0,
+            "Gamma should be capped at gamma_max: got {}",
+            gamma
+        );
+        assert!(
+            gamma >= 0.1,
+            "Gamma should be floored at gamma_min: got {}",
+            gamma
         );
     }
 }

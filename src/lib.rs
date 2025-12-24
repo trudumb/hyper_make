@@ -32,7 +32,7 @@ pub use market_maker::{
     EstimatorConfig, GLFTStrategy, HyperliquidExecutor, InventoryAwareStrategy, MarketMaker,
     MarketMakerConfig, MarketMakerMetricsRecorder, MarketParams, MetricsRecorder, OrderExecutor,
     OrderManager, OrderResult, ParameterEstimator, PositionTracker, Quote, QuoteConfig,
-    QuotingStrategy, Side, SymmetricStrategy, TrackedOrder,
+    QuotingStrategy, RiskConfig, Side, SymmetricStrategy, TrackedOrder,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;

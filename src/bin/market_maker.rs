@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 use hyperliquid_rust_sdk::{
     BaseUrl, EstimatorConfig, ExchangeClient, GLFTStrategy, HyperliquidExecutor, InfoClient,
     InventoryAwareStrategy, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
-    QuotingStrategy, SymmetricStrategy,
+    QuotingStrategy, RiskConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -226,6 +226,10 @@ pub struct StrategyConfig {
     /// Floor for adaptive warmup threshold (minimum trades even after full decay)
     #[serde(default = "default_min_warmup_trades")]
     pub min_warmup_trades: usize,
+    /// Full risk configuration for GLFT dynamic gamma (optional).
+    /// If not set, uses risk_aversion from [trading] as gamma_base with defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_config: Option<RiskConfig>,
 }
 
 fn default_half_spread_bps() -> u16 {
@@ -266,6 +270,7 @@ impl Default for StrategyConfig {
             default_arrival_intensity: default_arrival_intensity(),
             warmup_decay_secs: default_warmup_decay_secs(),
             min_warmup_trades: default_min_warmup_trades(),
+            risk_config: None,
         }
     }
 }
@@ -648,7 +653,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.strategy.half_spread_bps,
             config.strategy.inventory_skew_factor,
         )),
-        StrategyType::Glft => Box::new(GLFTStrategy::new(risk_aversion)),
+        StrategyType::Glft => {
+            if let Some(ref risk_cfg) = config.strategy.risk_config {
+                info!(
+                    gamma_base = risk_cfg.gamma_base,
+                    volatility_weight = risk_cfg.volatility_weight,
+                    toxicity_sensitivity = risk_cfg.toxicity_sensitivity,
+                    inventory_sensitivity = risk_cfg.inventory_sensitivity,
+                    "Using full RiskConfig for dynamic gamma"
+                );
+                Box::new(GLFTStrategy::with_config(risk_cfg.clone()))
+            } else {
+                Box::new(GLFTStrategy::new(risk_aversion))
+            }
+        }
     };
 
     // Create estimator config for live parameter estimation (using legacy compatibility)
