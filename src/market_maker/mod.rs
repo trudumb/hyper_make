@@ -172,6 +172,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Skip the immediate first tick
         sync_interval.tick().await;
 
+        // Create shutdown signal listener ONCE before the loop (not inside select!)
+        // This ensures the signal is captured even if pressed during message processing
+        let mut shutdown_signal = std::pin::pin!(tokio::signal::ctrl_c());
+
         loop {
             tokio::select! {
                 message = receiver.recv() => {
@@ -192,7 +196,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         warn!("Safety sync failed: {e}");
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut shutdown_signal => {
                     info!("Shutdown signal received");
                     break;
                 }

@@ -551,19 +551,16 @@ impl QuotingStrategy for GLFTStrategy {
         // Correct inventory skew: (q/Q_max) × γ × σ² × T
         let base_skew = self.inventory_skew(inventory_ratio, sigma_for_skew, gamma, time_horizon);
 
-        // === 4. TOXIC REGIME SPREAD WIDENING ===
-        let toxicity_multiplier = if market_params.is_toxic_regime {
-            // Scale spread multiplier: at ratio=1.5 → 1.0x, at ratio=3.0 → 1.5x, capped at 2.5x
-            let factor = (market_params.jump_ratio / 2.0).clamp(1.0, 2.5);
+        // === 4. TOXIC REGIME ===
+        // Note: Dynamic gamma already scales with toxicity via effective_gamma().
+        // We no longer apply a separate toxicity_multiplier to avoid double-scaling.
+        // The gamma-based approach is more principled as it also affects skew.
+        if market_params.is_toxic_regime {
             debug!(
                 jump_ratio = %format!("{:.2}", market_params.jump_ratio),
-                toxicity_factor = %format!("{:.2}", factor),
-                "Toxic regime: widening spread"
+                "Toxic regime detected (handled by dynamic gamma)"
             );
-            factor
-        } else {
-            1.0
-        };
+        }
 
         // === 5. FALLING KNIFE PROTECTION (protect bids during crashes) ===
         let mut bid_protection = 0.0;
@@ -596,10 +593,8 @@ impl QuotingStrategy for GLFTStrategy {
         let skew = base_skew + additional_skew;
 
         // === 9. COMBINE ALL ADJUSTMENTS ===
-        let bid_delta =
-            (half_spread + skew + bid_protection - flow_adjustment) * toxicity_multiplier;
-        let ask_delta = ((half_spread - skew + ask_protection - flow_adjustment).max(0.0))
-            * toxicity_multiplier;
+        let bid_delta = half_spread + skew + bid_protection - flow_adjustment;
+        let ask_delta = (half_spread - skew + ask_protection - flow_adjustment).max(0.0);
 
         debug!(
             inv_ratio = %format!("{:.4}", inventory_ratio),
@@ -962,9 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn test_glft_toxic_regime_widens_spread() {
+    fn test_glft_toxic_regime_increases_gamma() {
+        // Test that dynamic gamma increases in toxic regime
+        // Note: spread width may not always increase because the GLFT formula
+        // δ = (1/γ) × ln(1 + γ/κ) is non-monotonic in gamma
         let strategy = GLFTStrategy::new(0.5);
-        let config = make_config_with_decimals(100.0, 4);
 
         // Normal regime
         let normal_params = MarketParams {
@@ -990,19 +987,14 @@ mod tests {
             ..Default::default()
         };
 
-        let (bid_normal, ask_normal) =
-            strategy.calculate_quotes(&config, 0.0, 1.0, 0.5, &normal_params);
-        let (bid_toxic, ask_toxic) =
-            strategy.calculate_quotes(&config, 0.0, 1.0, 0.5, &toxic_params);
-
-        let spread_normal = ask_normal.unwrap().price - bid_normal.unwrap().price;
-        let spread_toxic = ask_toxic.unwrap().price - bid_toxic.unwrap().price;
+        let gamma_normal = strategy.effective_gamma(&normal_params, 0.0, 1.0);
+        let gamma_toxic = strategy.effective_gamma(&toxic_params, 0.0, 1.0);
 
         assert!(
-            spread_toxic > spread_normal,
-            "Toxic spread should be wider: normal={:.4}, toxic={:.4}",
-            spread_normal,
-            spread_toxic
+            gamma_toxic > gamma_normal,
+            "Toxic gamma should be higher: normal={:.4}, toxic={:.4}",
+            gamma_normal,
+            gamma_toxic
         );
     }
 
