@@ -1083,6 +1083,8 @@ pub struct ParameterEstimator {
     book_kappa: WeightedKappaEstimator,
     /// Volume tick arrival estimator
     arrival: VolumeTickArrivalEstimator,
+    /// Book structure estimator (imbalance, near-touch liquidity)
+    book_structure: BookStructureEstimator,
     /// Current mid price
     current_mid: f64,
     /// Current timestamp for momentum queries
