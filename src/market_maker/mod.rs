@@ -613,7 +613,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Log if everything is in sync
         if exchange_oids == local_oids {
             debug!(
-                "[SafetySync] State in sync: {} orders on both sides",
+                "[SafetySync] State in sync: {} orders (exchange matches local)",
                 local_oids.len()
             );
         }
