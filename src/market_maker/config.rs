@@ -22,8 +22,10 @@ pub struct MarketMakerConfig {
     pub asset: String,
     /// Amount of liquidity to target on each side
     pub target_liquidity: f64,
-    /// Half spread in basis points
-    pub half_spread_bps: u16,
+    /// Risk aversion parameter (gamma) - controls spread and inventory skew
+    /// Typical values: 0.1 (aggressive) to 2.0 (conservative)
+    /// The market (kappa, sigma) determines actual spread via GLFT formula
+    pub risk_aversion: f64,
     /// Max deviation before requoting (in BPS)
     pub max_bps_diff: u16,
     /// Maximum absolute position size
@@ -39,16 +41,12 @@ pub struct MarketMakerConfig {
 pub struct QuoteConfig {
     /// Current mid price
     pub mid_price: f64,
-    /// Half spread in basis points (used as target spread for GLFT)
-    pub half_spread_bps: u16,
     /// Decimals for price rounding
     pub decimals: u32,
     /// Decimals for size rounding
     pub sz_decimals: u32,
     /// Minimum order notional value (USD)
     pub min_notional: f64,
-    /// Maximum position size (needed for GLFT gamma derivation)
-    pub max_position: f64,
 }
 
 /// A quote with price and size.

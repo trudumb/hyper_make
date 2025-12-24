@@ -24,6 +24,15 @@ impl Side {
     }
 }
 
+/// Order lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderState {
+    /// Order is resting on the exchange
+    Resting,
+    /// Cancel request has been sent, awaiting confirmation
+    Cancelling,
+}
+
 /// A tracked order with its current state.
 #[derive(Debug, Clone)]
 pub struct TrackedOrder {
@@ -37,10 +46,12 @@ pub struct TrackedOrder {
     pub size: f64,
     /// Amount filled so far
     pub filled: f64,
+    /// Order lifecycle state
+    pub state: OrderState,
 }
 
 impl TrackedOrder {
-    /// Create a new tracked order.
+    /// Create a new tracked order in Resting state.
     pub fn new(oid: u64, side: Side, price: f64, size: f64) -> Self {
         Self {
             oid,
@@ -48,6 +59,7 @@ impl TrackedOrder {
             price,
             size,
             filled: 0.0,
+            state: OrderState::Resting,
         }
     }
 
@@ -97,19 +109,32 @@ impl OrderManager {
         self.orders.get_mut(&oid)
     }
 
-    /// Get the first order on a given side (for single-order-per-side strategies).
+    /// Get the first resting order on a given side (for single-order-per-side strategies).
+    /// Only returns orders in Resting state (not Cancelling).
     pub fn get_by_side(&self, side: Side) -> Option<&TrackedOrder> {
         self.orders
             .values()
-            .find(|o| o.side == side && !o.is_filled())
+            .find(|o| o.side == side && !o.is_filled() && o.state == OrderState::Resting)
     }
 
-    /// Get all orders on a given side.
+    /// Get all resting orders on a given side.
+    /// Only returns orders in Resting state (not Cancelling).
     pub fn get_all_by_side(&self, side: Side) -> Vec<&TrackedOrder> {
         self.orders
             .values()
-            .filter(|o| o.side == side && !o.is_filled())
+            .filter(|o| o.side == side && !o.is_filled() && o.state == OrderState::Resting)
             .collect()
+    }
+
+    /// Set the state of an order.
+    /// Returns true if the order was found and updated.
+    pub fn set_state(&mut self, oid: u64, state: OrderState) -> bool {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            order.state = state;
+            true
+        } else {
+            false
+        }
     }
 
     /// Update an order with a fill amount.

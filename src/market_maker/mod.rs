@@ -20,6 +20,9 @@ pub use order_manager::*;
 pub use position::*;
 pub use strategy::*;
 
+use std::collections::HashSet;
+use std::time::Duration;
+
 use alloy::primitives::Address;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, warn};
@@ -164,6 +167,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
         info!("Warming up parameter estimator...");
 
+        // Safety sync interval (60 seconds) - fallback to catch any state divergence
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(60));
+        // Skip the immediate first tick
+        sync_interval.tick().await;
+
         loop {
             tokio::select! {
                 message = receiver.recv() => {
@@ -177,6 +185,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             warn!("Message channel closed, stopping market maker");
                             break;
                         }
+                    }
+                }
+                _ = sync_interval.tick() => {
+                    if let Err(e) = self.safety_sync().await {
+                        warn!("Safety sync failed: {e}");
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -265,19 +278,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Process fill (handles dedup internally)
                     if self.position.process_fill(fill.tid, amount, is_buy) {
-                        let side = if is_buy { Side::Buy } else { Side::Sell };
-                        info!(
-                            "[Fill] {} {} {} | position: {}",
-                            if is_buy { "bought" } else { "sold" },
-                            amount,
-                            self.config.asset,
-                            self.position.position()
-                        );
-
-                        // Update order manager
-                        if let Some(order) = self.orders.get_by_side(side) {
-                            let oid = order.oid;
-                            self.orders.update_fill(oid, amount);
+                        // Use fill.oid for exact order matching (not side-based guessing)
+                        if self.orders.update_fill(fill.oid, amount) {
+                            info!(
+                                "[Fill] {} {} {} | oid={} | position: {}",
+                                if is_buy { "bought" } else { "sold" },
+                                amount,
+                                self.config.asset,
+                                fill.oid,
+                                self.position.position()
+                            );
+                        } else {
+                            // Order not in tracking - log warning for investigation
+                            warn!(
+                                "[Fill] Untracked order filled: oid={} {} {} {}",
+                                fill.oid,
+                                if is_buy { "bought" } else { "sold" },
+                                amount,
+                                self.config.asset
+                            );
                         }
 
                         // Record metrics
@@ -336,11 +355,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let quote_config = QuoteConfig {
             mid_price: self.latest_mid,
-            half_spread_bps: self.config.half_spread_bps,
             decimals: self.config.decimals,
             sz_decimals: self.config.sz_decimals,
             min_notional: MIN_ORDER_NOTIONAL,
-            max_position: self.config.max_position,
         };
 
         // Build market params from econometric estimates
@@ -403,47 +420,78 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     }
 
     /// Reconcile orders on one side.
+    /// Cancels ALL orders on a side (not just first) with retry logic.
     async fn reconcile_side(&mut self, side: Side, new_quote: Option<Quote>) -> Result<()> {
-        let current_order = self.orders.get_by_side(side);
+        // Get ALL resting orders on this side (not just first)
+        let current_orders: Vec<u64> = self
+            .orders
+            .get_all_by_side(side)
+            .iter()
+            .map(|o| o.oid)
+            .collect();
 
         debug!(
             side = %side_str(side),
-            current = ?current_order.map(|o| (o.oid, o.price, o.remaining())),
+            current_count = current_orders.len(),
+            current_oids = ?current_orders,
             new = ?new_quote.as_ref().map(|q| (q.price, q.size)),
             "Reconciling"
         );
 
-        match (current_order, new_quote) {
-            // Have order, no quote -> cancel
-            (Some(order), None) => {
-                let oid = order.oid;
-                if self.executor.cancel_order(&self.config.asset, oid).await {
-                    info!("Cancelled {} order: oid={}", side_str(side), oid);
-                    self.orders.remove_order(oid);
+        match (current_orders.is_empty(), new_quote) {
+            // Have orders, no quote -> cancel all
+            (false, None) => {
+                for oid in current_orders {
+                    // Mark as cancelling before attempting cancel
+                    self.orders.set_state(oid, OrderState::Cancelling);
+
+                    if self.cancel_with_retry(&self.config.asset, oid, 3).await {
+                        info!("Cancelled {} order: oid={}", side_str(side), oid);
+                        self.orders.remove_order(oid);
+                    } else {
+                        // Revert to resting if cancel failed
+                        self.orders.set_state(oid, OrderState::Resting);
+                        warn!(
+                            "Failed to cancel {} order after retries: oid={}",
+                            side_str(side),
+                            oid
+                        );
+                    }
                 }
             }
-            // Have order, have quote -> check if needs update
-            (Some(order), Some(quote)) => {
+            // Have orders, have quote -> check if needs update, cancel all if so
+            (false, Some(quote)) => {
                 let needs_update = self
                     .orders
                     .needs_update(side, &quote, self.config.max_bps_diff);
+
                 if needs_update {
-                    let oid = order.oid;
-                    // Cancel first
-                    if self.executor.cancel_order(&self.config.asset, oid).await {
-                        self.orders.remove_order(oid);
-                        // Place new order
-                        self.place_new_order(side, &quote).await?;
+                    // Cancel all orders on this side
+                    for oid in current_orders {
+                        self.orders.set_state(oid, OrderState::Cancelling);
+
+                        if self.cancel_with_retry(&self.config.asset, oid, 3).await {
+                            info!("Cancelled {} order for update: oid={}", side_str(side), oid);
+                            self.orders.remove_order(oid);
+                        } else {
+                            self.orders.set_state(oid, OrderState::Resting);
+                            warn!(
+                                "Failed to cancel {} order after retries: oid={}",
+                                side_str(side),
+                                oid
+                            );
+                        }
                     }
-                    // If cancel failed, wait for fill event
+                    // Place new order
+                    self.place_new_order(side, &quote).await?;
                 }
             }
-            // No order, have quote -> place new
-            (None, Some(quote)) => {
+            // No orders, have quote -> place new
+            (true, Some(quote)) => {
                 self.place_new_order(side, &quote).await?;
             }
-            // No order, no quote -> nothing to do
-            (None, None) => {}
+            // No orders, no quote -> nothing to do
+            (true, None) => {}
         }
 
         Ok(())
@@ -477,15 +525,85 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Ok(())
     }
 
+    /// Cancel an order with retry logic.
+    /// Returns true if cancel succeeded, false if all retries failed.
+    async fn cancel_with_retry(&self, asset: &str, oid: u64, max_attempts: u32) -> bool {
+        for attempt in 0..max_attempts {
+            if self.executor.cancel_order(asset, oid).await {
+                return true;
+            }
+            if attempt < max_attempts - 1 {
+                let delay = Duration::from_millis(100 * 2_u64.pow(attempt));
+                debug!(
+                    "Cancel failed for oid={}, retrying in {:?} (attempt {}/{})",
+                    oid,
+                    delay,
+                    attempt + 1,
+                    max_attempts
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+        false
+    }
+
     /// Graceful shutdown - cancel all resting orders.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("Cancelling all resting orders...");
 
         let oids: Vec<u64> = self.orders.order_ids();
         for oid in oids {
-            if self.executor.cancel_order(&self.config.asset, oid).await {
+            if self.cancel_with_retry(&self.config.asset, oid, 3).await {
                 info!("Cancelled order: oid={}", oid);
+            } else {
+                warn!("Failed to cancel order after retries: oid={}", oid);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Safety sync - periodically verify local state matches exchange.
+    /// This is a fallback mechanism; if working correctly, should find no discrepancies.
+    async fn safety_sync(&mut self) -> Result<()> {
+        debug!("Running safety sync...");
+
+        // Query open orders from exchange
+        let exchange_orders = self.info_client.open_orders(self.user_address).await?;
+        let exchange_oids: HashSet<u64> = exchange_orders
+            .iter()
+            .filter(|o| o.coin == self.config.asset)
+            .map(|o| o.oid)
+            .collect();
+
+        let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
+
+        // Check for orphaned orders on exchange (exist on exchange but not in local tracking)
+        for oid in exchange_oids.difference(&local_oids) {
+            warn!(
+                "[SafetySync] Orphan order detected on exchange: oid={} - cancelling",
+                oid
+            );
+            if self.executor.cancel_order(&self.config.asset, *oid).await {
+                info!("[SafetySync] Cancelled orphan order: oid={}", oid);
+            }
+        }
+
+        // Check for stale orders in tracking (exist locally but not on exchange)
+        for oid in local_oids.difference(&exchange_oids) {
+            warn!(
+                "[SafetySync] Stale order in tracking (not on exchange): oid={} - removing",
+                oid
+            );
+            self.orders.remove_order(*oid);
+        }
+
+        // Log if everything is in sync
+        if exchange_oids == local_oids {
+            debug!(
+                "[SafetySync] State in sync: {} orders on both sides",
+                local_oids.len()
+            );
         }
 
         Ok(())

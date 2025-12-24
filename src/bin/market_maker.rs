@@ -45,9 +45,10 @@ struct Cli {
     #[arg(long)]
     target_liquidity: Option<f64>,
 
-    /// Override half spread in BPS
+    /// Override risk aversion (gamma) for GLFT strategy
+    /// Typical values: 0.1 (aggressive) to 2.0 (conservative)
     #[arg(long)]
-    half_spread: Option<u16>,
+    risk_aversion: Option<f64>,
 
     /// Override max BPS diff before requoting
     #[arg(long)]
@@ -146,9 +147,11 @@ pub struct TradingConfig {
     /// Amount of liquidity to target on each side
     #[serde(default = "default_target_liquidity")]
     pub target_liquidity: f64,
-    /// Half spread in basis points
-    #[serde(default = "default_half_spread")]
-    pub half_spread_bps: u16,
+    /// Risk aversion parameter (gamma) - controls spread and inventory skew
+    /// Typical values: 0.1 (aggressive) to 2.0 (conservative)
+    /// The market (kappa, sigma) determines actual spread via GLFT formula
+    #[serde(default = "default_risk_aversion")]
+    pub risk_aversion: f64,
     /// Max deviation before requoting (in BPS)
     #[serde(default = "default_max_bps_diff")]
     pub max_bps_diff: u16,
@@ -166,8 +169,8 @@ fn default_asset() -> String {
 fn default_target_liquidity() -> f64 {
     0.25
 }
-fn default_half_spread() -> u16 {
-    1
+fn default_risk_aversion() -> f64 {
+    0.5 // Moderate risk aversion
 }
 fn default_max_bps_diff() -> u16 {
     2
@@ -181,7 +184,7 @@ impl Default for TradingConfig {
         Self {
             asset: default_asset(),
             target_liquidity: default_target_liquidity(),
-            half_spread_bps: default_half_spread(),
+            risk_aversion: default_risk_aversion(),
             max_bps_diff: default_max_bps_diff(),
             max_absolute_position_size: default_max_position(),
             decimals: None, // Auto-calculated from asset metadata
@@ -194,13 +197,12 @@ pub struct StrategyConfig {
     /// Strategy type: symmetric, inventory_aware, glft
     #[serde(default)]
     pub strategy_type: StrategyType,
+    /// Half spread in BPS for symmetric/inventory-aware strategies
+    #[serde(default = "default_half_spread_bps")]
+    pub half_spread_bps: u16,
     /// Skew factor for inventory-aware strategy (BPS per unit position)
     #[serde(default)]
     pub inventory_skew_factor: f64,
-    /// GLFT: Target half-spread (e.g., 0.005 = 0.5%)
-    /// γ is calculated dynamically from κ to achieve this target
-    #[serde(default = "default_target_spread")]
-    pub target_spread: f64,
     /// Rolling window for parameter estimation (in seconds)
     #[serde(default = "default_estimation_window_secs")]
     pub estimation_window_secs: u64,
@@ -226,8 +228,8 @@ pub struct StrategyConfig {
     pub min_warmup_trades: usize,
 }
 
-fn default_target_spread() -> f64 {
-    0.005 // 0.5% target half-spread
+fn default_half_spread_bps() -> u16 {
+    10 // 10 bps for simpler strategies
 }
 fn default_estimation_window_secs() -> u64 {
     300 // 5 minutes
@@ -255,8 +257,8 @@ impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
             strategy_type: StrategyType::default(),
+            half_spread_bps: default_half_spread_bps(),
             inventory_skew_factor: 0.0,
-            target_spread: default_target_spread(),
             estimation_window_secs: default_estimation_window_secs(),
             min_trades: default_min_trades(),
             default_sigma: default_sigma(),
@@ -479,7 +481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_liquidity = cli
         .target_liquidity
         .unwrap_or(config.trading.target_liquidity);
-    let half_spread = cli.half_spread.unwrap_or(config.trading.half_spread_bps);
+    let risk_aversion = cli.risk_aversion.unwrap_or(config.trading.risk_aversion);
     let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
     let max_position = cli
         .max_position
@@ -530,7 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         asset = %asset,
         target_liquidity = %target_liquidity,
-        half_spread_bps = %half_spread,
+        risk_aversion = %risk_aversion,
         max_bps_diff = %max_bps_diff,
         max_position = %max_position,
         decimals = %decimals,
@@ -630,7 +632,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mm_config = MmConfig {
         asset: asset.clone(),
         target_liquidity,
-        half_spread_bps: half_spread,
+        risk_aversion,
         max_bps_diff,
         max_position,
         decimals,
@@ -639,11 +641,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create strategy based on config
     let strategy: Box<dyn QuotingStrategy> = match config.strategy.strategy_type {
-        StrategyType::Symmetric => Box::new(SymmetricStrategy::new()),
+        StrategyType::Symmetric => {
+            Box::new(SymmetricStrategy::new(config.strategy.half_spread_bps))
+        }
         StrategyType::InventoryAware => Box::new(InventoryAwareStrategy::new(
+            config.strategy.half_spread_bps,
             config.strategy.inventory_skew_factor,
         )),
-        StrategyType::Glft => Box::new(GLFTStrategy::new(config.strategy.target_spread)),
+        StrategyType::Glft => Box::new(GLFTStrategy::new(risk_aversion)),
     };
 
     // Create estimator config for live parameter estimation (using legacy compatibility)
