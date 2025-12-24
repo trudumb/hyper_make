@@ -590,44 +590,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Queried initial position"
     );
 
-    // Query available margin and cap liquidity/position accordingly
+    // Query leverage and account equity for position limits
     let (target_liquidity, max_position) = {
-        match info_client
+        // Query both asset data (for leverage) and user state (for account value)
+        let asset_data_result = info_client
             .active_asset_data(user_address, asset.clone())
-            .await
-        {
-            Ok(data) => {
-                let mark_px: f64 = data.mark_px.parse().unwrap_or(1.0);
-                let available_usdc: f64 = data
-                    .available_to_trade
-                    .first()
-                    .and_then(|s| s.parse().ok())
+            .await;
+        let user_state_result = info_client.user_state(user_address).await;
+
+        match (asset_data_result, user_state_result) {
+            (Ok(asset_data), Ok(user_state)) => {
+                let mark_px: f64 = asset_data.mark_px.parse().unwrap_or(1.0);
+                let leverage: f64 = asset_data.leverage.value as f64;
+                let account_value: f64 = user_state
+                    .margin_summary
+                    .account_value
+                    .parse()
                     .unwrap_or(0.0);
-                let available_asset = available_usdc / mark_px;
+
+                // Calculate max position from account equity × leverage
+                // Use 50% safety factor to leave room for adverse moves
+                let max_from_leverage = (account_value * leverage * 0.5) / mark_px;
+
+                // Cap to configured max_position (if user wants smaller)
+                let capped_max_pos = max_position.min(max_from_leverage);
+
+                // Cap liquidity to 40% of max position for each side
+                let capped_liquidity = target_liquidity.min(capped_max_pos * 0.4);
 
                 info!(
-                    available_usdc = %available_usdc,
-                    available_asset = %available_asset,
+                    account_value = %account_value,
+                    leverage = %leverage,
                     mark_px = %mark_px,
-                    "Queried available margin"
+                    max_from_leverage = %format!("{:.6}", max_from_leverage),
+                    capped_max_pos = %format!("{:.6}", capped_max_pos),
+                    capped_liquidity = %format!("{:.6}", capped_liquidity),
+                    "Position limits from leverage (equity × leverage × 0.5 / price)"
                 );
-
-                // Cap to 40% for each side's liquidity, 80% for max position
-                let capped_liquidity = target_liquidity.min(available_asset * 0.4);
-                let capped_max_pos = max_position.min(available_asset * 0.8);
-
-                if capped_liquidity < target_liquidity {
-                    info!(
-                        requested = %target_liquidity,
-                        capped = %capped_liquidity,
-                        "Capped target_liquidity to available margin"
-                    );
-                }
 
                 (capped_liquidity, capped_max_pos)
             }
-            Err(e) => {
-                tracing::warn!("Failed to query margin: {e}, using defaults");
+            (Err(e), _) => {
+                tracing::warn!("Failed to query asset data: {e}, using config defaults");
+                (target_liquidity, max_position)
+            }
+            (_, Err(e)) => {
+                tracing::warn!("Failed to query user state: {e}, using config defaults");
                 (target_liquidity, max_position)
             }
         }

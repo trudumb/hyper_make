@@ -408,13 +408,35 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             "Quote inputs with microprice"
         );
 
-        let (bid, ask) = self.strategy.calculate_quotes(
+        let (mut bid, mut ask) = self.strategy.calculate_quotes(
             &quote_config,
             self.position.position(),
             self.config.max_position,
             self.config.target_liquidity,
             &market_params,
         );
+
+        // Reduce-only mode: when over max position, only allow quotes that reduce position
+        let position = self.position.position();
+        if position.abs() > self.config.max_position {
+            if position > 0.0 {
+                // Long position over max: only allow sells (no bids)
+                bid = None;
+                warn!(
+                    position = %format!("{:.6}", position),
+                    max_position = %format!("{:.6}", self.config.max_position),
+                    "Over max position (long) - reduce-only mode, cancelling bids"
+                );
+            } else {
+                // Short position over max: only allow buys (no asks)
+                ask = None;
+                warn!(
+                    position = %format!("{:.6}", position),
+                    max_position = %format!("{:.6}", self.config.max_position),
+                    "Over max position (short) - reduce-only mode, cancelling asks"
+                );
+            }
+        }
 
         debug!(
             bid = ?bid.as_ref().map(|q| (q.price, q.size)),
