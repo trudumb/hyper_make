@@ -165,9 +165,18 @@ Data flow:
 ```
 Trades(px, sz, time) → VolumeBucket → VWAP → BipowerVariation → σ, RV/BV
 L2Book(bids, asks)   → WeightedKappa → κ
+                     → BookImbalance ──┐
+Trades(side, sz)     → FlowImbalance ──┴→ MicropriceEstimator → microprice, β_book, β_flow
 ```
 
-Warmup: 20 volume ticks + 10 L2 updates before quoting begins.
+Warmup: 20 volume ticks + 10 L2 updates + 50 microprice observations before quoting begins.
+
+6. **Microprice Estimation**: Data-driven fair price from signal prediction
+   - Rolling online 2-variable regression (book_imbalance, flow_imbalance → returns)
+   - Window: 60 seconds, forward horizon: 300ms
+   - Learns β_book, β_flow coefficients (~0.001-0.01 typical)
+   - microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
+   - Replaces hardcoded adjustments with adaptive, market-derived coefficients
 
 **Adding a new strategy:**
 ```rust
@@ -179,12 +188,15 @@ impl QuotingStrategy for MyStrategy {
                         market_params: &MarketParams)
         -> (Option<Quote>, Option<Quote>) {
         // MarketParams contains:
+        //   microprice: f64        - Data-driven fair price (quote around this)
         //   sigma: f64             - √BV (jump-robust volatility)
-        //   sigma_effective: f64   - σ with toxicity multiplier applied
+        //   sigma_effective: f64   - σ blended with jump component
         //   kappa: f64             - order flow intensity
         //   arrival_intensity: f64 - volume ticks per second
-        //   is_toxic_regime: bool  - RV/BV > 3.0
+        //   is_toxic_regime: bool  - RV/BV > threshold
         //   jump_ratio: f64        - RV/BV ratio
+        //   beta_book: f64         - Learned book imbalance coefficient
+        //   beta_flow: f64         - Learned flow imbalance coefficient
         // Return (bid, ask) quotes
     }
     fn name(&self) -> &'static str { "MyStrategy" }
