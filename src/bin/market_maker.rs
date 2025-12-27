@@ -20,9 +20,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
-    BaseUrl, EstimatorConfig, ExchangeClient, GLFTStrategy, HyperliquidExecutor, InfoClient,
-    InventoryAwareStrategy, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
-    QuotingStrategy, RiskConfig, SymmetricStrategy,
+    AdverseSelectionConfig, BaseUrl, EstimatorConfig, ExchangeClient, GLFTStrategy,
+    HyperliquidExecutor, InfoClient, InventoryAwareStrategy, LiquidationConfig, MarketMaker,
+    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, QueueConfig, QuotingStrategy,
+    RiskConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -699,6 +700,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create executor
     let executor = HyperliquidExecutor::new(exchange_client, Some(metrics.clone()));
 
+    // Create Tier 1 module configs with defaults
+    let as_config = AdverseSelectionConfig::default();
+    let queue_config = QueueConfig::default();
+    let liquidation_config = LiquidationConfig::default();
+
     // Create and start market maker
     let mut market_maker = MarketMaker::new(
         mm_config,
@@ -709,6 +715,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_position,
         Some(metrics),
         estimator_config,
+        as_config,
+        queue_config,
+        liquidation_config,
     );
 
     // Sync open orders

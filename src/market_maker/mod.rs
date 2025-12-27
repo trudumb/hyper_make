@@ -6,18 +6,24 @@
 //! - **PositionTracker**: Tracks position and deduplicates fills
 //! - **Executor**: Handles order placement and cancellation
 
+mod adverse_selection;
 mod config;
 mod estimator;
 mod executor;
+mod liquidation;
 mod order_manager;
 mod position;
+mod queue;
 mod strategy;
 
+pub use adverse_selection::*;
 pub use config::*;
 pub use estimator::*;
 pub use executor::*;
+pub use liquidation::*;
 pub use order_manager::*;
 pub use position::*;
+pub use queue::*;
 pub use strategy::*;
 
 use std::collections::HashSet;
@@ -37,6 +43,7 @@ const MIN_ORDER_NOTIONAL: f64 = 10.0;
 ///
 /// Coordinates strategy, order management, position tracking, and execution.
 /// Includes live parameter estimation for GLFT strategy (σ from trades, κ from L2 book).
+/// Tier 1 modules provide adverse selection measurement, queue tracking, and cascade detection.
 pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Configuration
     config: MarketMakerConfig,
@@ -60,10 +67,31 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     estimator: ParameterEstimator,
     /// Last logged warmup progress (to avoid spam)
     last_warmup_log: usize,
+
+    // === Tier 1: Production Resilience Modules ===
+    /// Adverse selection estimator - measures E[Δp|fill] and provides spread adjustment
+    adverse_selection: AdverseSelectionEstimator,
+    /// Queue position tracker - estimates P(fill) for each order
+    queue_tracker: QueuePositionTracker,
+    /// Liquidation cascade detector - tail risk management with Hawkes process
+    liquidation_detector: LiquidationCascadeDetector,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Create a new market maker.
+    ///
+    /// # Parameters
+    /// - `config`: Market maker configuration (asset, position limits, etc.)
+    /// - `strategy`: Quoting strategy (GLFT, Symmetric, etc.)
+    /// - `executor`: Order executor (Hyperliquid or mock)
+    /// - `info_client`: WebSocket client for market data
+    /// - `user_address`: Trader's Ethereum address
+    /// - `initial_position`: Starting position (from exchange sync)
+    /// - `metrics`: Optional metrics recorder
+    /// - `estimator_config`: Configuration for parameter estimation
+    /// - `as_config`: Adverse selection estimator configuration
+    /// - `queue_config`: Queue position tracker configuration
+    /// - `liquidation_config`: Liquidation cascade detector configuration
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: MarketMakerConfig,
@@ -74,6 +102,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         initial_position: f64,
         metrics: MetricsRecorder,
         estimator_config: EstimatorConfig,
+        as_config: AdverseSelectionConfig,
+        queue_config: QueueConfig,
+        liquidation_config: LiquidationConfig,
     ) -> Self {
         Self {
             config,
@@ -87,6 +118,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             metrics,
             estimator: ParameterEstimator::new(estimator_config),
             last_warmup_log: 0,
+            // Tier 1 modules
+            adverse_selection: AdverseSelectionEstimator::new(as_config),
+            queue_tracker: QueuePositionTracker::new(queue_config),
+            liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
         }
     }
 
@@ -219,6 +254,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     let mid: f64 = mid.parse().map_err(|_| crate::Error::FloatStringParse)?;
                     self.latest_mid = mid;
                     self.estimator.on_mid_update(mid);
+
+                    // === Tier 1: Update AS estimator (resolves pending fills) ===
+                    self.adverse_selection.update(mid);
+
+                    // === Tier 1: Update AS signals from estimator ===
+                    self.adverse_selection.update_signals(
+                        self.estimator.sigma_total(),
+                        self.estimator.sigma_clean(),
+                        self.estimator.flow_imbalance(),
+                        self.estimator.jump_ratio(),
+                    );
+
+                    // === Tier 1: Periodic update of liquidation detector ===
+                    self.liquidation_detector.update();
+
                     self.update_quotes().await?;
                 }
             }
@@ -282,15 +332,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Process fill (handles dedup internally)
                     if self.position.process_fill(fill.tid, amount, is_buy) {
+                        // === Tier 1: Record fill for AS measurement ===
+                        self.adverse_selection.record_fill(
+                            fill.tid,
+                            amount,
+                            is_buy,
+                            self.latest_mid,
+                        );
+
+                        // === Tier 1: Remove order from queue tracker ===
+                        self.queue_tracker.order_removed(fill.oid);
+
                         // Use fill.oid for exact order matching (not side-based guessing)
                         if self.orders.update_fill(fill.oid, amount) {
                             info!(
-                                "[Fill] {} {} {} | oid={} | position: {}",
+                                "[Fill] {} {} {} | oid={} | position: {} | AS: {:.2}bps",
                                 if is_buy { "bought" } else { "sold" },
                                 amount,
                                 self.config.asset,
                                 fill.oid,
-                                self.position.position()
+                                self.position.position(),
+                                self.adverse_selection.realized_as_bps()
                             );
                         } else {
                             // Order not in tracking - log warning for investigation
@@ -341,6 +403,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             .collect();
 
                         self.estimator.on_l2_book(&bids, &asks, self.latest_mid);
+
+                        // === Tier 1: Update queue tracker with best bid/ask ===
+                        if let (Some((best_bid, _)), Some((best_ask, _))) =
+                            (bids.first(), asks.first())
+                        {
+                            self.queue_tracker.update_from_book(
+                                *best_bid,
+                                *best_ask,
+                                self.estimator.sigma_clean(),
+                            );
+                        }
                     }
                 }
             }
@@ -388,6 +461,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             microprice: self.estimator.microprice(), // mid × (1 + β_book×imb + β_flow×flow)
             beta_book: self.estimator.beta_book(),   // Learned coefficient for book imbalance
             beta_flow: self.estimator.beta_flow(),   // Learned coefficient for flow imbalance
+            // === Tier 1: Adverse Selection ===
+            as_spread_adjustment: self.adverse_selection.spread_adjustment(),
+            predicted_alpha: self.adverse_selection.predicted_alpha(),
+            as_warmed_up: self.adverse_selection.is_warmed_up(),
+            // === Tier 1: Liquidation Cascade ===
+            tail_risk_multiplier: self.liquidation_detector.tail_risk_multiplier(),
+            should_pull_quotes: self.liquidation_detector.should_pull_quotes(),
+            cascade_size_factor: self.liquidation_detector.size_reduction_factor(),
         };
 
         debug!(
@@ -482,6 +563,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     if self.cancel_with_retry(&self.config.asset, oid, 3).await {
                         info!("Cancelled {} order: oid={}", side_str(side), oid);
                         self.orders.remove_order(oid);
+                        self.queue_tracker.order_removed(oid); // Tier 1: Remove from queue tracking
                     } else {
                         // Revert to resting if cancel failed
                         self.orders.set_state(oid, OrderState::Resting);
@@ -507,6 +589,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         if self.cancel_with_retry(&self.config.asset, oid, 3).await {
                             info!("Cancelled {} order for update: oid={}", side_str(side), oid);
                             self.orders.remove_order(oid);
+                            self.queue_tracker.order_removed(oid); // Tier 1: Remove from queue tracking
                         } else {
                             self.orders.set_state(oid, OrderState::Resting);
                             warn!(
@@ -554,6 +637,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 quote.price,
                 result.resting_size,
             ));
+
+            // === Tier 1: Register with queue tracker ===
+            // Estimate depth ahead conservatively (2x our target liquidity)
+            let depth_ahead = self.config.target_liquidity * 2.0;
+            self.queue_tracker.order_placed(
+                result.oid,
+                quote.price,
+                result.resting_size,
+                depth_ahead,
+                is_buy,
+            );
         }
 
         Ok(())
@@ -630,6 +724,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 oid
             );
             self.orders.remove_order(*oid);
+            self.queue_tracker.order_removed(*oid); // Tier 1: Remove from queue tracking
         }
 
         // Log if everything is in sync

@@ -83,6 +83,30 @@ pub struct MarketParams {
     /// β_flow coefficient (return prediction per unit flow imbalance).
     /// For diagnostics: expected range ~0.001-0.01 (1-10 bps per unit signal).
     pub beta_flow: f64,
+
+    // === Tier 1: Adverse Selection ===
+    /// Spread adjustment from AS estimator (as fraction of mid price).
+    /// Add to half-spread to compensate for informed flow.
+    pub as_spread_adjustment: f64,
+
+    /// Predicted alpha: P(next trade is informed) in [0, 1].
+    /// Use for diagnostics and future alpha-aware sizing.
+    pub predicted_alpha: f64,
+
+    /// Is AS estimator warmed up with enough fills?
+    pub as_warmed_up: bool,
+
+    // === Tier 1: Liquidation Cascade ===
+    /// Tail risk multiplier for gamma [1.0, 5.0].
+    /// Multiply gamma by this during cascade conditions.
+    pub tail_risk_multiplier: f64,
+
+    /// Should pull all quotes due to extreme cascade?
+    pub should_pull_quotes: bool,
+
+    /// Size reduction factor [0, 1] for graceful degradation.
+    /// 1.0 = full size, 0.0 = no quotes (cascade severe).
+    pub cascade_size_factor: f64,
 }
 
 impl Default for MarketParams {
@@ -104,6 +128,14 @@ impl Default for MarketParams {
             microprice: 0.0,          // Will be set from estimator
             beta_book: 0.0,           // Will be learned from data
             beta_flow: 0.0,           // Will be learned from data
+            // Tier 1: Adverse Selection
+            as_spread_adjustment: 0.0, // No adjustment until warmed up
+            predicted_alpha: 0.0,      // Default: no informed flow detected
+            as_warmed_up: false,       // Starts not warmed up
+            // Tier 1: Liquidation Cascade
+            tail_risk_multiplier: 1.0, // Default: no tail risk scaling
+            should_pull_quotes: false, // Default: don't pull quotes
+            cascade_size_factor: 1.0,  // Default: full size
         }
     }
 }
@@ -551,11 +583,24 @@ impl QuotingStrategy for GLFTStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        // === 1. DYNAMIC GAMMA ===
-        // γ scales with volatility, toxicity, inventory utilization, AND liquidity
+        // === 0. CIRCUIT BREAKER: Cascade quote pulling ===
+        // Extreme liquidation cascade detected - pull all quotes immediately
+        if market_params.should_pull_quotes {
+            debug!(
+                tail_risk_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
+                cascade_size_factor = %format!("{:.2}", market_params.cascade_size_factor),
+                "CIRCUIT BREAKER: Liquidation cascade detected - pulling all quotes"
+            );
+            return (None, None);
+        }
+
+        // === 1. DYNAMIC GAMMA with Tail Risk ===
+        // γ scales with volatility, toxicity, inventory utilization, liquidity, AND cascade severity
         let base_gamma = self.effective_gamma(market_params, position, max_position);
         // Apply liquidity multiplier: thin book → higher gamma → wider spread
-        let gamma = base_gamma * market_params.liquidity_gamma_mult;
+        let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
+        // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
+        let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
         let kappa = market_params.kappa;
 
         // Time horizon from arrival intensity: T = 1/λ (with max cap)
@@ -564,6 +609,17 @@ impl QuotingStrategy for GLFTStrategy {
         // === 2. CORRECT GLFT HALF-SPREAD: δ = (1/γ) × ln(1 + γ/κ) ===
         // This is market-driven: thin book (low κ) → wider spread
         let mut half_spread = self.half_spread(gamma, kappa);
+
+        // === 2a. ADVERSE SELECTION SPREAD ADJUSTMENT ===
+        // Add measured AS cost to half-spread (only when warmed up)
+        if market_params.as_warmed_up && market_params.as_spread_adjustment > 0.0 {
+            half_spread += market_params.as_spread_adjustment;
+            debug!(
+                as_adj_bps = %format!("{:.2}", market_params.as_spread_adjustment * 10000.0),
+                predicted_alpha = %format!("{:.3}", market_params.predicted_alpha),
+                "AS spread adjustment applied"
+            );
+        }
 
         // Apply minimum spread floor
         half_spread = half_spread.max(self.risk_config.min_spread_floor);
@@ -659,8 +715,13 @@ impl QuotingStrategy for GLFTStrategy {
         let buy_size_raw = (max_position - position).min(target_liquidity).max(0.0);
         let sell_size_raw = (max_position + position).min(target_liquidity).max(0.0);
 
-        let buy_size = truncate_float(buy_size_raw, config.sz_decimals, false);
-        let sell_size = truncate_float(sell_size_raw, config.sz_decimals, false);
+        // === Apply cascade size reduction for graceful degradation ===
+        // During moderate cascade (before quote pulling), reduce size gradually
+        let buy_size_adjusted = buy_size_raw * market_params.cascade_size_factor;
+        let sell_size_adjusted = sell_size_raw * market_params.cascade_size_factor;
+
+        let buy_size = truncate_float(buy_size_adjusted, config.sz_decimals, false);
+        let sell_size = truncate_float(sell_size_adjusted, config.sz_decimals, false);
 
         // Build quotes, checking minimum notional
         let bid = if buy_size > EPSILON {

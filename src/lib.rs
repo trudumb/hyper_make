@@ -29,10 +29,17 @@ pub use helpers::{bps_diff, round_to_significant_and_decimal, truncate_float, Ba
 pub use info::info_client::*;
 pub use info::response_structs::*;
 pub use market_maker::{
+    // Core types
     EstimatorConfig, GLFTStrategy, HyperliquidExecutor, InventoryAwareStrategy, MarketMaker,
     MarketMakerConfig, MarketMakerMetricsRecorder, MarketParams, MetricsRecorder, OrderExecutor,
     OrderManager, OrderResult, ParameterEstimator, PositionTracker, Quote, QuoteConfig,
     QuotingStrategy, RiskConfig, Side, SymmetricStrategy, TrackedOrder,
+    // Tier 1: Adverse Selection
+    AdverseSelectionConfig, AdverseSelectionEstimator, AdverseSelectionSummary,
+    // Tier 1: Queue Position
+    QueueConfig, QueuePositionTracker, QueueSummary,
+    // Tier 1: Liquidation Cascade
+    CascadeDirection, LiquidationCascadeDetector, LiquidationConfig, LiquidationSummary,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;
