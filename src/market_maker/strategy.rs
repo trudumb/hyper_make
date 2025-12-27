@@ -5,6 +5,7 @@ use tracing::debug;
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use super::config::{Quote, QuoteConfig};
+use super::ladder::Ladder;
 
 /// Parameters estimated from live market data.
 ///
@@ -107,6 +108,40 @@ pub struct MarketParams {
     /// Size reduction factor [0, 1] for graceful degradation.
     /// 1.0 = full size, 0.0 = no quotes (cascade severe).
     pub cascade_size_factor: f64,
+
+    // === Tier 2: Hawkes Order Flow ===
+    /// Hawkes buy intensity (λ_buy) - self-exciting arrival rate
+    pub hawkes_buy_intensity: f64,
+
+    /// Hawkes sell intensity (λ_sell) - self-exciting arrival rate
+    pub hawkes_sell_intensity: f64,
+
+    /// Hawkes flow imbalance [-1, 1] - normalized buy/sell intensity difference
+    pub hawkes_imbalance: f64,
+
+    /// Hawkes activity percentile [0, 1] - where current intensity sits in history
+    pub hawkes_activity_percentile: f64,
+
+    // === Tier 2: Funding Rate ===
+    /// Current funding rate (annualized)
+    pub funding_rate: f64,
+
+    /// Predicted funding cost for holding period
+    pub predicted_funding_cost: f64,
+
+    // === Tier 2: Spread Process ===
+    /// Fair spread from vol-adjusted model
+    pub fair_spread: f64,
+
+    /// Spread percentile [0, 1] - where current spread sits in history
+    pub spread_percentile: f64,
+
+    /// Spread regime (Tight/Normal/Wide)
+    pub spread_regime: super::SpreadRegime,
+
+    // === Volatility Regime ===
+    /// Volatility regime (Low/Normal/High/Extreme)
+    pub volatility_regime: super::VolatilityRegime,
 }
 
 impl Default for MarketParams {
@@ -136,6 +171,20 @@ impl Default for MarketParams {
             tail_risk_multiplier: 1.0, // Default: no tail risk scaling
             should_pull_quotes: false, // Default: don't pull quotes
             cascade_size_factor: 1.0,  // Default: full size
+            // Tier 2: Hawkes Order Flow
+            hawkes_buy_intensity: 0.0,
+            hawkes_sell_intensity: 0.0,
+            hawkes_imbalance: 0.0,
+            hawkes_activity_percentile: 0.5,
+            // Tier 2: Funding Rate
+            funding_rate: 0.0,
+            predicted_funding_cost: 0.0,
+            // Tier 2: Spread Process
+            fair_spread: 0.0,
+            spread_percentile: 0.5,
+            spread_regime: super::SpreadRegime::Normal,
+            // Volatility Regime
+            volatility_regime: super::VolatilityRegime::Normal,
         }
     }
 }
@@ -163,6 +212,25 @@ pub trait QuotingStrategy: Send + Sync {
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>);
 
+    /// Generate multi-level ladder quotes.
+    ///
+    /// For strategies that support multi-level quoting, returns a full ladder
+    /// with multiple bid and ask levels. For single-level strategies, returns
+    /// an empty ladder (the default implementation).
+    ///
+    /// # Parameters
+    /// Same as `calculate_quotes`.
+    fn calculate_ladder(
+        &self,
+        _config: &QuoteConfig,
+        _position: f64,
+        _max_position: f64,
+        _target_liquidity: f64,
+        _market_params: &MarketParams,
+    ) -> Ladder {
+        Ladder::default() // Empty ladder for non-ladder strategies
+    }
+
     /// Get the name of this strategy for logging.
     fn name(&self) -> &'static str;
 }
@@ -184,6 +252,17 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
             target_liquidity,
             market_params,
         )
+    }
+
+    fn calculate_ladder(
+        &self,
+        config: &QuoteConfig,
+        position: f64,
+        max_position: f64,
+        target_liquidity: f64,
+        market_params: &MarketParams,
+    ) -> Ladder {
+        (**self).calculate_ladder(config, position, max_position, target_liquidity, market_params)
     }
 
     fn name(&self) -> &'static str {
@@ -489,7 +568,7 @@ impl GLFTStrategy {
 
     /// Calculate effective γ based on current market conditions.
     ///
-    /// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar
+    /// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar × regime_scalar × hawkes_scalar
     fn effective_gamma(
         &self,
         market_params: &MarketParams,
@@ -530,8 +609,29 @@ impl GLFTStrategy {
             1.0 + cfg.inventory_sensitivity * excess.powi(2)
         };
 
+        // === VOLATILITY REGIME SCALING (Tier 2) ===
+        // Explicit regime detection provides additional safety layer
+        let regime_scalar = match market_params.volatility_regime {
+            super::VolatilityRegime::Low => 0.8,      // Slightly less conservative
+            super::VolatilityRegime::Normal => 1.0,
+            super::VolatilityRegime::High => 1.5,     // More conservative
+            super::VolatilityRegime::Extreme => 2.5,  // Much more conservative
+        };
+
+        // === HAWKES ACTIVITY SCALING (Tier 2) ===
+        // High order flow intensity indicates potential informed trading
+        // intensity_percentile > 0.8 → unusual activity → widen spreads
+        let hawkes_scalar = if market_params.hawkes_activity_percentile > 0.9 {
+            1.5 // Very high activity
+        } else if market_params.hawkes_activity_percentile > 0.8 {
+            1.2 // High activity
+        } else {
+            1.0 // Normal activity
+        };
+
         // === COMBINE AND CLAMP ===
-        let gamma_effective = cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar;
+        let gamma_effective =
+            cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar * regime_scalar * hawkes_scalar;
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
@@ -621,6 +721,17 @@ impl QuotingStrategy for GLFTStrategy {
             );
         }
 
+        // === 2b. SPREAD REGIME ADJUSTMENT (Tier 2) ===
+        // Adjust spread based on current market spread dynamics
+        let spread_regime_mult = match market_params.spread_regime {
+            super::SpreadRegime::VeryTight => 1.3, // Widen - tight spreads = competition/manipulation
+            super::SpreadRegime::Tight => 1.1,     // Slightly widen
+            super::SpreadRegime::Normal => 1.0,
+            super::SpreadRegime::Wide => 0.95,     // Can tighten slightly to capture
+            super::SpreadRegime::VeryWide => 0.9,  // Tighten more - opportunity
+        };
+        half_spread *= spread_regime_mult;
+
         // Apply minimum spread floor
         half_spread = half_spread.max(self.risk_config.min_spread_floor);
 
@@ -637,6 +748,35 @@ impl QuotingStrategy for GLFTStrategy {
 
         // Correct inventory skew: (q/Q_max) × γ × σ² × T
         let base_skew = self.inventory_skew(inventory_ratio, sigma_for_skew, gamma, time_horizon);
+
+        // === 3a. HAWKES FLOW SKEWING (Tier 2) ===
+        // Use Hawkes-derived flow imbalance for additional directional adjustment
+        // High activity + imbalance → stronger signal than simple flow imbalance
+        let hawkes_skew = if market_params.hawkes_activity_percentile > 0.7 {
+            // Significant activity - use Hawkes imbalance for flow prediction
+            // hawkes_imbalance > 0 = more buy pressure → skew asks tighter (encourage selling)
+            // Scaling: 0.5 bps per 0.1 imbalance at high activity
+            market_params.hawkes_imbalance * 0.00005 * market_params.hawkes_activity_percentile
+        } else {
+            0.0 // Low activity - don't trust flow signal
+        };
+
+        // === 3b. FUNDING COST ADJUSTMENT (Tier 2) ===
+        // Incorporate perpetual funding cost into inventory decision
+        // Positive funding + long = cost → skew to reduce long
+        // Negative funding + short = cost → skew to reduce short
+        let funding_skew = if market_params.funding_rate.abs() > 0.0001 {
+            // Significant funding rate (> 1bp/hour)
+            // predicted_funding_cost is signed: positive = cost to current position
+            // If cost is positive and we're long, skew to sell (negative skew adds to bid_delta)
+            // If cost is positive and we're short, skew to buy (positive skew reduces bid_delta)
+            // Simplified: position * funding_rate gives us direction
+            let funding_pressure = position.signum() * market_params.funding_rate;
+            // Scale: 0.1 bps per 1bp funding rate for moderate pressure
+            funding_pressure * 0.01
+        } else {
+            0.0
+        };
 
         // === 4. TOXIC REGIME ===
         // Note: Dynamic gamma already scales with toxicity via effective_gamma().
@@ -655,11 +795,12 @@ impl QuotingStrategy for GLFTStrategy {
         // This replaces all ad-hoc adjustments with data-driven signal integration.
         let fair_price = market_params.microprice;
 
-        // === 6. PURE GLFT QUOTE DELTAS ===
-        // With microprice as fair price, we use clean GLFT formulas only:
-        // - half_spread: market-driven from κ and γ
-        // - skew: inventory-driven for optimal risk management
-        let skew = base_skew;
+        // === 6. COMBINED SKEW WITH TIER 2 ADJUSTMENTS ===
+        // Combine all skew components:
+        // - base_skew: GLFT inventory risk management
+        // - hawkes_skew: Hawkes flow-based directional adjustment
+        // - funding_skew: Perpetual funding cost pressure
+        let skew = base_skew + hawkes_skew + funding_skew;
         let bid_delta = half_spread + skew;
         let ask_delta = (half_spread - skew).max(0.0);
 
@@ -670,14 +811,19 @@ impl QuotingStrategy for GLFTStrategy {
             kappa = %format!("{:.2}", kappa),
             time_horizon = %format!("{:.2}", time_horizon),
             half_spread_bps = %format!("{:.1}", half_spread * 10000.0),
-            skew_bps = %format!("{:.4}", skew * 10000.0),
+            base_skew_bps = %format!("{:.4}", base_skew * 10000.0),
+            hawkes_skew_bps = %format!("{:.4}", hawkes_skew * 10000.0),
+            funding_skew_bps = %format!("{:.4}", funding_skew * 10000.0),
+            total_skew_bps = %format!("{:.4}", skew * 10000.0),
+            spread_regime = ?market_params.spread_regime,
+            vol_regime = ?market_params.volatility_regime,
+            hawkes_activity = %format!("{:.2}", market_params.hawkes_activity_percentile),
+            funding_rate = %format!("{:.4}", market_params.funding_rate),
             microprice = %format!("{:.4}", fair_price),
-            beta_book = %format!("{:.6}", market_params.beta_book),
-            beta_flow = %format!("{:.6}", market_params.beta_flow),
             bid_delta_bps = %format!("{:.1}", bid_delta * 10000.0),
             ask_delta_bps = %format!("{:.1}", ask_delta * 10000.0),
             is_toxic = market_params.is_toxic_regime,
-            "GLFT spread components (microprice-based)"
+            "GLFT spread components with Tier 2 adjustments"
         );
 
         // Convert to absolute price offsets using fair_price (microprice)
@@ -751,6 +897,212 @@ impl QuotingStrategy for GLFTStrategy {
 
     fn name(&self) -> &'static str {
         "GLFT"
+    }
+}
+
+// ============================================================================
+// Ladder Strategy
+// ============================================================================
+
+use super::ladder::{LadderConfig, LadderParams};
+
+/// GLFT Ladder Strategy - multi-level quoting with depth-dependent sizing.
+///
+/// Generates K levels per side with:
+/// - Geometric or linear depth spacing
+/// - Size allocation proportional to λ(δ) × SC(δ) (fill intensity × spread capture)
+/// - GLFT inventory skew applied to entire ladder
+///
+/// This strategy uses the same gamma calculation as GLFTStrategy but
+/// distributes liquidity across multiple price levels instead of just
+/// quoting at the touch.
+#[derive(Debug, Clone)]
+pub struct LadderStrategy {
+    /// Risk configuration (same as GLFTStrategy)
+    pub risk_config: RiskConfig,
+    /// Ladder-specific configuration
+    pub ladder_config: LadderConfig,
+}
+
+impl LadderStrategy {
+    /// Create a new ladder strategy with default configs.
+    pub fn new(gamma_base: f64) -> Self {
+        Self {
+            risk_config: RiskConfig {
+                gamma_base: gamma_base.clamp(0.01, 10.0),
+                ..Default::default()
+            },
+            ladder_config: LadderConfig::default(),
+        }
+    }
+
+    /// Create a new ladder strategy with custom configs.
+    pub fn with_config(risk_config: RiskConfig, ladder_config: LadderConfig) -> Self {
+        Self {
+            risk_config,
+            ladder_config,
+        }
+    }
+
+    /// Calculate effective γ based on current market conditions.
+    /// (Same logic as GLFTStrategy for consistency)
+    fn effective_gamma(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> f64 {
+        let cfg = &self.risk_config;
+
+        // Volatility scaling
+        let vol_ratio = market_params.sigma_effective / cfg.sigma_baseline.max(1e-9);
+        let vol_scalar = if vol_ratio <= 1.0 {
+            1.0
+        } else {
+            let raw = 1.0 + cfg.volatility_weight * (vol_ratio - 1.0);
+            raw.min(cfg.max_volatility_multiplier)
+        };
+
+        // Toxicity scaling
+        let toxicity_scalar = if market_params.jump_ratio <= cfg.toxicity_threshold {
+            1.0
+        } else {
+            1.0 + cfg.toxicity_sensitivity * (market_params.jump_ratio - 1.0)
+        };
+
+        // Inventory scaling
+        let utilization = if max_position > EPSILON {
+            (position.abs() / max_position).min(1.0)
+        } else {
+            0.0
+        };
+        let inventory_scalar = if utilization <= cfg.inventory_threshold {
+            1.0
+        } else {
+            let excess = utilization - cfg.inventory_threshold;
+            1.0 + cfg.inventory_sensitivity * excess.powi(2)
+        };
+
+        // Volatility regime scaling
+        let regime_scalar = match market_params.volatility_regime {
+            super::VolatilityRegime::Low => 0.8,
+            super::VolatilityRegime::Normal => 1.0,
+            super::VolatilityRegime::High => 1.5,
+            super::VolatilityRegime::Extreme => 2.5,
+        };
+
+        // Hawkes activity scaling
+        let hawkes_scalar = if market_params.hawkes_activity_percentile > 0.9 {
+            1.5
+        } else if market_params.hawkes_activity_percentile > 0.8 {
+            1.2
+        } else {
+            1.0
+        };
+
+        let gamma_effective =
+            cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar * regime_scalar * hawkes_scalar;
+        gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
+    }
+
+    /// Calculate holding time from arrival intensity.
+    fn holding_time(&self, arrival_intensity: f64) -> f64 {
+        let safe_intensity = arrival_intensity.max(0.01);
+        (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
+    }
+
+    /// Generate full ladder from market params.
+    ///
+    /// This is the main method that creates a multi-level quote ladder.
+    pub fn generate_ladder(
+        &self,
+        config: &QuoteConfig,
+        position: f64,
+        max_position: f64,
+        target_liquidity: f64,
+        market_params: &MarketParams,
+    ) -> Ladder {
+        // Circuit breaker: pull all quotes during cascade
+        if market_params.should_pull_quotes {
+            return Ladder::default();
+        }
+
+        // Calculate effective gamma (includes all scaling factors)
+        let base_gamma = self.effective_gamma(market_params, position, max_position);
+        let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
+        let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
+
+        let time_horizon = self.holding_time(market_params.arrival_intensity);
+
+        let inventory_ratio = if max_position > EPSILON {
+            (position / max_position).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Convert AS spread adjustment to bps for ladder generation
+        let as_at_touch_bps = if market_params.as_warmed_up {
+            market_params.as_spread_adjustment * 10000.0
+        } else {
+            0.0 // Use zero AS until warmed up
+        };
+
+        // Apply cascade size reduction
+        let adjusted_size = target_liquidity * market_params.cascade_size_factor;
+
+        let params = LadderParams {
+            mid_price: market_params.microprice,
+            sigma: market_params.sigma,
+            kappa: market_params.kappa,
+            arrival_intensity: market_params.arrival_intensity,
+            as_at_touch_bps,
+            total_size: adjusted_size,
+            inventory_ratio,
+            gamma,
+            time_horizon,
+            decimals: config.decimals,
+            sz_decimals: config.sz_decimals,
+            min_notional: config.min_notional,
+        };
+
+        Ladder::generate(&self.ladder_config, &params)
+    }
+}
+
+impl QuotingStrategy for LadderStrategy {
+    /// For compatibility with existing infrastructure, returns best bid/ask from ladder.
+    ///
+    /// The full ladder can be obtained via `generate_ladder()` for multi-level quoting.
+    fn calculate_quotes(
+        &self,
+        config: &QuoteConfig,
+        position: f64,
+        max_position: f64,
+        target_liquidity: f64,
+        market_params: &MarketParams,
+    ) -> (Option<Quote>, Option<Quote>) {
+        let ladder = self.generate_ladder(config, position, max_position, target_liquidity, market_params);
+
+        // Return just the best bid/ask for backward compatibility
+        let bid = ladder.bids.first().map(|l| Quote::new(l.price, l.size));
+        let ask = ladder.asks.first().map(|l| Quote::new(l.price, l.size));
+
+        (bid, ask)
+    }
+
+    fn calculate_ladder(
+        &self,
+        config: &QuoteConfig,
+        position: f64,
+        max_position: f64,
+        target_liquidity: f64,
+        market_params: &MarketParams,
+    ) -> Ladder {
+        self.generate_ladder(config, position, max_position, target_liquidity, market_params)
+    }
+
+    fn name(&self) -> &'static str {
+        "LadderGLFT"
     }
 }
 

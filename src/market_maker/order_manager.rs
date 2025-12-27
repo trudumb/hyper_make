@@ -1,10 +1,11 @@
 //! Order state management for tracking resting orders.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{bps_diff, EPSILON};
 
 use super::config::Quote;
+use super::ladder::{Ladder, LadderLevel};
 
 /// Side of an order (buy or sell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,6 +32,15 @@ pub enum OrderState {
     Resting,
     /// Cancel request has been sent, awaiting confirmation
     Cancelling,
+}
+
+/// Action to take for ladder reconciliation.
+#[derive(Debug, Clone)]
+pub enum LadderAction {
+    /// Place a new order at the specified price and size
+    Place { side: Side, price: f64, size: f64 },
+    /// Cancel an existing order by ID
+    Cancel { oid: u64 },
 }
 
 /// A tracked order with its current state.
@@ -184,6 +194,84 @@ impl OrderManager {
     pub fn len(&self) -> usize {
         self.orders.len()
     }
+
+    /// Compute actions to reconcile current orders with target ladder.
+    ///
+    /// Returns a list of `LadderAction`s to execute:
+    /// - `Cancel` for orders that don't match any target level
+    /// - `Place` for target levels that don't have matching orders
+    pub fn reconcile_ladder(&self, ladder: &Ladder, max_bps_diff: u16) -> Vec<LadderAction> {
+        let mut actions = Vec::new();
+
+        // Get current orders by side
+        let current_bids = self.get_all_by_side(Side::Buy);
+        let current_asks = self.get_all_by_side(Side::Sell);
+
+        // Reconcile bids
+        actions.extend(reconcile_side(
+            &current_bids,
+            &ladder.bids,
+            Side::Buy,
+            max_bps_diff,
+        ));
+
+        // Reconcile asks
+        actions.extend(reconcile_side(
+            &current_asks,
+            &ladder.asks,
+            Side::Sell,
+            max_bps_diff,
+        ));
+
+        actions
+    }
+}
+
+/// Reconcile a single side: match current orders to target levels.
+fn reconcile_side(
+    current: &[&TrackedOrder],
+    target: &[LadderLevel],
+    side: Side,
+    max_bps_diff: u16,
+) -> Vec<LadderAction> {
+    use crate::bps_diff;
+
+    let mut actions = Vec::new();
+    let mut matched_levels: HashSet<usize> = HashSet::new();
+
+    // Match current orders to target levels
+    for order in current {
+        let mut found_match = false;
+        for (i, level) in target.iter().enumerate() {
+            if matched_levels.contains(&i) {
+                continue;
+            }
+            // Check if order matches level (within tolerance)
+            let price_diff = bps_diff(order.price, level.price);
+            if price_diff <= max_bps_diff {
+                matched_levels.insert(i);
+                found_match = true;
+                break;
+            }
+        }
+        if !found_match {
+            // Order doesn't match any target level - cancel it
+            actions.push(LadderAction::Cancel { oid: order.oid });
+        }
+    }
+
+    // Place orders for unmatched target levels
+    for (i, level) in target.iter().enumerate() {
+        if !matched_levels.contains(&i) && level.size > EPSILON {
+            actions.push(LadderAction::Place {
+                side,
+                price: level.price,
+                size: level.size,
+            });
+        }
+    }
+
+    actions
 }
 
 #[cfg(test)]
@@ -232,5 +320,136 @@ mod tests {
 
         order.filled = 1.0;
         assert!(order.is_filled());
+    }
+
+    #[test]
+    fn test_reconcile_ladder_empty_to_ladder() {
+        let mgr = OrderManager::new();
+        let ladder = Ladder {
+            bids: vec![
+                LadderLevel {
+                    price: 99.0,
+                    size: 1.0,
+                    depth_bps: 10.0,
+                },
+                LadderLevel {
+                    price: 98.0,
+                    size: 0.5,
+                    depth_bps: 20.0,
+                },
+            ],
+            asks: vec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5);
+
+        // Should place 3 orders (2 bids, 1 ask)
+        assert_eq!(actions.len(), 3);
+        let place_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Place { .. }))
+            .count();
+        assert_eq!(place_count, 3);
+    }
+
+    #[test]
+    fn test_reconcile_ladder_orders_match() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 1.0));
+
+        let ladder = Ladder {
+            bids: vec![LadderLevel {
+                price: 99.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+            asks: vec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5);
+
+        // Orders match target levels - no actions needed
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_ladder_cancel_stale() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 95.0, 1.0)); // Too far from target
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 105.0, 1.0)); // Too far from target
+
+        let ladder = Ladder {
+            bids: vec![LadderLevel {
+                price: 99.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+            asks: vec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5); // 5 bps tolerance
+
+        // Should cancel 2 stale orders and place 2 new ones
+        assert_eq!(actions.len(), 4);
+        let cancel_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Cancel { .. }))
+            .count();
+        let place_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Place { .. }))
+            .count();
+        assert_eq!(cancel_count, 2);
+        assert_eq!(place_count, 2);
+    }
+
+    #[test]
+    fn test_reconcile_ladder_partial_match() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0)); // Matches first level
+        // No ask order
+
+        let ladder = Ladder {
+            bids: vec![
+                LadderLevel {
+                    price: 99.0,
+                    size: 1.0,
+                    depth_bps: 10.0,
+                },
+                LadderLevel {
+                    price: 98.0,
+                    size: 0.5,
+                    depth_bps: 20.0,
+                },
+            ],
+            asks: vec![LadderLevel {
+                price: 101.0,
+                size: 1.0,
+                depth_bps: 10.0,
+            }],
+        };
+
+        let actions = mgr.reconcile_ladder(&ladder, 5);
+
+        // Should place 1 bid (98.0) and 1 ask (101.0)
+        assert_eq!(actions.len(), 2);
+        let place_count = actions
+            .iter()
+            .filter(|a| matches!(a, LadderAction::Place { .. }))
+            .count();
+        assert_eq!(place_count, 2);
     }
 }

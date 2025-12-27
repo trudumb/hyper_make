@@ -8,22 +8,42 @@
 
 mod adverse_selection;
 mod config;
+mod correlation;
 mod estimator;
 mod executor;
+mod funding;
+mod hawkes;
+mod kill_switch;
+mod ladder;
 mod liquidation;
+mod margin;
+mod metrics;
 mod order_manager;
+mod pnl;
 mod position;
 mod queue;
+mod reconnection;
+mod spread;
 mod strategy;
 
 pub use adverse_selection::*;
 pub use config::*;
+pub use correlation::*;
 pub use estimator::*;
 pub use executor::*;
+pub use funding::*;
+pub use hawkes::*;
+pub use kill_switch::*;
+pub use ladder::*;
 pub use liquidation::*;
+pub use margin::*;
+pub use metrics::*;
 pub use order_manager::*;
+pub use pnl::*;
 pub use position::*;
 pub use queue::*;
+pub use reconnection::*;
+pub use spread::*;
 pub use strategy::*;
 
 use std::collections::HashSet;
@@ -75,6 +95,34 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     queue_tracker: QueuePositionTracker,
     /// Liquidation cascade detector - tail risk management with Hawkes process
     liquidation_detector: LiquidationCascadeDetector,
+
+    // === Production Safety ===
+    /// Kill switch - emergency shutdown on drawdown/loss/stale data
+    kill_switch: KillSwitch,
+
+    // === Tier 2: Process Models ===
+    /// Hawkes order flow estimator - self-exciting trade intensity
+    hawkes: HawkesOrderFlowEstimator,
+    /// Funding rate estimator - perpetual funding cost modeling
+    funding: FundingRateEstimator,
+    /// Spread process estimator - spread dynamics and regime detection
+    spread_tracker: SpreadProcessEstimator,
+    /// P&L tracker - attribution breakdown (fills, funding, unrealized)
+    pnl_tracker: PnLTracker,
+
+    // === Production Infrastructure ===
+    /// Margin-aware sizer - pre-flight checks for leverage constraints
+    margin_sizer: MarginAwareSizer,
+    /// Prometheus metrics - production monitoring
+    prometheus: PrometheusMetrics,
+    /// Connection health monitor - WS staleness tracking
+    connection_health: ConnectionHealthMonitor,
+
+    // === Multi-Asset (optional) ===
+    /// Correlation estimator - portfolio risk (None for single-asset)
+    /// Reserved for future multi-asset support
+    #[allow(dead_code)]
+    correlation: Option<CorrelationEstimator>,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -92,6 +140,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// - `as_config`: Adverse selection estimator configuration
     /// - `queue_config`: Queue position tracker configuration
     /// - `liquidation_config`: Liquidation cascade detector configuration
+    /// - `kill_switch_config`: Kill switch configuration for emergency shutdown
+    /// - `hawkes_config`: Hawkes order flow estimator configuration
+    /// - `funding_config`: Funding rate estimator configuration
+    /// - `spread_config`: Spread process estimator configuration
+    /// - `pnl_config`: P&L tracker configuration
+    /// - `margin_config`: Margin-aware sizer configuration
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: MarketMakerConfig,
@@ -105,6 +159,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         as_config: AdverseSelectionConfig,
         queue_config: QueueConfig,
         liquidation_config: LiquidationConfig,
+        kill_switch_config: KillSwitchConfig,
+        hawkes_config: HawkesConfig,
+        funding_config: FundingConfig,
+        spread_config: SpreadConfig,
+        pnl_config: PnLConfig,
+        margin_config: MarginConfig,
     ) -> Self {
         Self {
             config,
@@ -122,12 +182,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             adverse_selection: AdverseSelectionEstimator::new(as_config),
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
+            // Production safety
+            kill_switch: KillSwitch::new(kill_switch_config),
+            // Tier 2: Process models
+            hawkes: HawkesOrderFlowEstimator::new(hawkes_config),
+            funding: FundingRateEstimator::new(funding_config),
+            spread_tracker: SpreadProcessEstimator::new(spread_config),
+            pnl_tracker: PnLTracker::new(pnl_config),
+            // Production infrastructure
+            margin_sizer: MarginAwareSizer::new(margin_config),
+            prometheus: PrometheusMetrics::new(),
+            connection_health: ConnectionHealthMonitor::new(),
+            // Multi-asset (optional - disabled by default)
+            correlation: None,
         }
     }
 
     /// Sync open orders from the exchange.
     /// Call this after creating the market maker to recover state.
     pub async fn sync_open_orders(&mut self) -> Result<()> {
+        // === Refresh margin state on startup ===
+        if let Err(e) = self.refresh_margin_state().await {
+            warn!("Failed to refresh margin state on startup: {e}");
+        }
+
         let open_orders = self.info_client.open_orders(self.user_address).await?;
 
         for order in open_orders.iter().filter(|o| o.coin == self.config.asset) {
@@ -212,6 +290,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let mut shutdown_signal = std::pin::pin!(tokio::signal::ctrl_c());
 
         loop {
+            // === Kill Switch Check (before processing any message) ===
+            if self.kill_switch.is_triggered() {
+                let reasons = self.kill_switch.trigger_reasons();
+                error!(
+                    "KILL SWITCH TRIGGERED: {:?}",
+                    reasons.iter().map(|r| r.to_string()).collect::<Vec<_>>()
+                );
+                break;
+            }
+
             tokio::select! {
                 message = receiver.recv() => {
                     match message {
@@ -219,6 +307,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             if let Err(e) = self.handle_message(msg).await {
                                 error!("Error handling message: {e}");
                             }
+
+                            // Check kill switch after each message
+                            self.check_kill_switch();
                         }
                         None => {
                             warn!("Message channel closed, stopping market maker");
@@ -230,6 +321,49 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     if let Err(e) = self.safety_sync().await {
                         warn!("Safety sync failed: {e}");
                     }
+
+                    // === Update Prometheus metrics ===
+                    let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
+                    self.prometheus.update_position(
+                        self.position.position(),
+                        self.config.max_position,
+                    );
+                    self.prometheus.update_pnl(
+                        pnl_summary.total_pnl,      // daily_pnl (total for now)
+                        pnl_summary.total_pnl,      // peak_pnl (simplified)
+                        pnl_summary.realized_pnl,
+                        pnl_summary.unrealized_pnl,
+                    );
+                    self.prometheus.update_market(
+                        self.latest_mid,
+                        self.spread_tracker.current_spread_bps(),
+                        self.estimator.sigma_clean(),
+                        self.estimator.jump_ratio(),
+                        self.estimator.kappa(),
+                    );
+                    self.prometheus.update_risk(
+                        self.kill_switch.is_triggered(),
+                        self.liquidation_detector.cascade_severity(),
+                        self.adverse_selection.realized_as_bps(),
+                        self.liquidation_detector.tail_risk_multiplier(),
+                    );
+
+                    // Log Prometheus output (for scraping or debugging)
+                    debug!(
+                        prometheus_output = %self.prometheus.to_prometheus_text(&self.config.asset),
+                        "Prometheus metrics snapshot"
+                    );
+
+                    // Log kill switch status periodically
+                    let summary = self.kill_switch.summary();
+                    debug!(
+                        daily_pnl = %format!("${:.2}", summary.daily_pnl),
+                        drawdown = %format!("{:.1}%", summary.drawdown_pct),
+                        position_value = %format!("${:.2}", summary.position_value),
+                        data_age = %format!("{:.1}s", summary.data_age_secs),
+                        cascade_severity = %format!("{:.2}", summary.cascade_severity),
+                        "Kill switch status"
+                    );
                 }
                 _ = &mut shutdown_signal => {
                     info!("Shutdown signal received");
@@ -254,6 +388,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     let mid: f64 = mid.parse().map_err(|_| crate::Error::FloatStringParse)?;
                     self.latest_mid = mid;
                     self.estimator.on_mid_update(mid);
+
+                    // === Connection Health: Record data received ===
+                    self.connection_health.record_data_received();
 
                     // === Tier 1: Update AS estimator (resolves pending fills) ===
                     self.adverse_selection.update(mid);
@@ -287,10 +424,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
                     // Determine aggressor side from trade.side: "B" = buy aggressor, "S" = sell
-                    let is_buy_aggressor = Some(trade.side == "B");
+                    let is_buy_aggressor = trade.side == "B";
                     // Pass price, size, and aggressor side for volume clock + flow tracking
                     self.estimator
-                        .on_trade(trade.time, price, size, is_buy_aggressor);
+                        .on_trade(trade.time, price, size, Some(is_buy_aggressor));
+
+                    // === Tier 2: Feed Hawkes order flow estimator ===
+                    self.hawkes.record_trade(is_buy_aggressor, size);
                 }
 
                 // Log warmup progress (throttled)
@@ -343,16 +483,31 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         // === Tier 1: Remove order from queue tracker ===
                         self.queue_tracker.order_removed(fill.oid);
 
+                        // === Tier 2: Record fill in P&L tracker ===
+                        let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
+                        self.pnl_tracker.record_fill(
+                            fill.tid,
+                            fill_price,
+                            amount,
+                            is_buy,
+                            self.latest_mid, // mid_at_fill
+                        );
+
+                        // === Production: Update Prometheus metrics ===
+                        self.prometheus.record_fill(amount, is_buy);
+
                         // Use fill.oid for exact order matching (not side-based guessing)
                         if self.orders.update_fill(fill.oid, amount) {
+                            let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
                             info!(
-                                "[Fill] {} {} {} | oid={} | position: {} | AS: {:.2}bps",
+                                "[Fill] {} {} {} | oid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
                                 if is_buy { "bought" } else { "sold" },
                                 amount,
                                 self.config.asset,
                                 fill.oid,
                                 self.position.position(),
-                                self.adverse_selection.realized_as_bps()
+                                self.adverse_selection.realized_as_bps(),
+                                pnl_summary.total_pnl
                             );
                         } else {
                             // Order not in tracking - log warning for investigation
@@ -413,6 +568,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                 *best_ask,
                                 self.estimator.sigma_clean(),
                             );
+
+                            // === Tier 2: Update spread tracker from L2 book ===
+                            self.spread_tracker.update(
+                                *best_bid,
+                                *best_ask,
+                                self.estimator.sigma_clean(), // volatility
+                            );
                         }
                     }
                 }
@@ -469,6 +631,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             tail_risk_multiplier: self.liquidation_detector.tail_risk_multiplier(),
             should_pull_quotes: self.liquidation_detector.should_pull_quotes(),
             cascade_size_factor: self.liquidation_detector.size_reduction_factor(),
+            // === Tier 2: Hawkes Order Flow ===
+            hawkes_buy_intensity: self.hawkes.lambda_buy(),
+            hawkes_sell_intensity: self.hawkes.lambda_sell(),
+            hawkes_imbalance: self.hawkes.flow_imbalance(),
+            hawkes_activity_percentile: self.hawkes.intensity_percentile(),
+            // === Tier 2: Funding Rate ===
+            funding_rate: self.funding.current_rate(),
+            predicted_funding_cost: self.funding.funding_cost(
+                self.position.position(),
+                self.latest_mid,
+                3600.0, // 1 hour holding period in seconds
+            ),
+            // === Tier 2: Spread Process ===
+            fair_spread: self.spread_tracker.fair_spread(),
+            spread_percentile: self.spread_tracker.spread_percentile(),
+            spread_regime: self.spread_tracker.spread_regime(),
+            // === Volatility Regime ===
+            volatility_regime: self.estimator.volatility_regime(),
         };
 
         debug!(
@@ -489,7 +669,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             "Quote inputs with microprice"
         );
 
-        let (mut bid, mut ask) = self.strategy.calculate_quotes(
+        // Try multi-level ladder quoting first
+        let ladder = self.strategy.calculate_ladder(
             &quote_config,
             self.position.position(),
             self.config.max_position,
@@ -497,39 +678,96 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &market_params,
         );
 
-        // Reduce-only mode: when over max position, only allow quotes that reduce position
-        let position = self.position.position();
-        if position.abs() > self.config.max_position {
-            if position > 0.0 {
-                // Long position over max: only allow sells (no bids)
-                bid = None;
-                warn!(
-                    position = %format!("{:.6}", position),
-                    max_position = %format!("{:.6}", self.config.max_position),
-                    "Over max position (long) - reduce-only mode, cancelling bids"
-                );
-            } else {
-                // Short position over max: only allow buys (no asks)
-                ask = None;
-                warn!(
-                    position = %format!("{:.6}", position),
-                    max_position = %format!("{:.6}", self.config.max_position),
-                    "Over max position (short) - reduce-only mode, cancelling asks"
-                );
+        if !ladder.bids.is_empty() || !ladder.asks.is_empty() {
+            // Multi-level ladder mode
+            let mut bid_quotes: Vec<Quote> = ladder
+                .bids
+                .iter()
+                .map(|l| Quote::new(l.price, l.size))
+                .collect();
+            let mut ask_quotes: Vec<Quote> = ladder
+                .asks
+                .iter()
+                .map(|l| Quote::new(l.price, l.size))
+                .collect();
+
+            // Reduce-only mode: when over max position, only allow quotes that reduce position
+            let position = self.position.position();
+            if position.abs() > self.config.max_position {
+                if position > 0.0 {
+                    // Long position over max: only allow sells (no bids)
+                    bid_quotes.clear();
+                    warn!(
+                        position = %format!("{:.6}", position),
+                        max_position = %format!("{:.6}", self.config.max_position),
+                        "Over max position (long) - reduce-only mode, cancelling all bids"
+                    );
+                } else {
+                    // Short position over max: only allow buys (no asks)
+                    ask_quotes.clear();
+                    warn!(
+                        position = %format!("{:.6}", position),
+                        max_position = %format!("{:.6}", self.config.max_position),
+                        "Over max position (short) - reduce-only mode, cancelling all asks"
+                    );
+                }
             }
+
+            debug!(
+                bid_levels = bid_quotes.len(),
+                ask_levels = ask_quotes.len(),
+                best_bid = ?bid_quotes.first().map(|q| (q.price, q.size)),
+                best_ask = ?ask_quotes.first().map(|q| (q.price, q.size)),
+                "Calculated ladder quotes"
+            );
+
+            // Reconcile ladder quotes
+            self.reconcile_ladder_side(Side::Buy, bid_quotes).await?;
+            self.reconcile_ladder_side(Side::Sell, ask_quotes).await?;
+        } else {
+            // Fallback to single-quote mode for non-ladder strategies
+            let (mut bid, mut ask) = self.strategy.calculate_quotes(
+                &quote_config,
+                self.position.position(),
+                self.config.max_position,
+                self.config.target_liquidity,
+                &market_params,
+            );
+
+            // Reduce-only mode: when over max position, only allow quotes that reduce position
+            let position = self.position.position();
+            if position.abs() > self.config.max_position {
+                if position > 0.0 {
+                    // Long position over max: only allow sells (no bids)
+                    bid = None;
+                    warn!(
+                        position = %format!("{:.6}", position),
+                        max_position = %format!("{:.6}", self.config.max_position),
+                        "Over max position (long) - reduce-only mode, cancelling bids"
+                    );
+                } else {
+                    // Short position over max: only allow buys (no asks)
+                    ask = None;
+                    warn!(
+                        position = %format!("{:.6}", position),
+                        max_position = %format!("{:.6}", self.config.max_position),
+                        "Over max position (short) - reduce-only mode, cancelling asks"
+                    );
+                }
+            }
+
+            debug!(
+                bid = ?bid.as_ref().map(|q| (q.price, q.size)),
+                ask = ?ask.as_ref().map(|q| (q.price, q.size)),
+                "Calculated quotes"
+            );
+
+            // Handle bid side
+            self.reconcile_side(Side::Buy, bid).await?;
+
+            // Handle ask side
+            self.reconcile_side(Side::Sell, ask).await?;
         }
-
-        debug!(
-            bid = ?bid.as_ref().map(|q| (q.price, q.size)),
-            ask = ?ask.as_ref().map(|q| (q.price, q.size)),
-            "Calculated quotes"
-        );
-
-        // Handle bid side
-        self.reconcile_side(Side::Buy, bid).await?;
-
-        // Handle ask side
-        self.reconcile_side(Side::Sell, ask).await?;
 
         Ok(())
     }
@@ -614,21 +852,232 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Ok(())
     }
 
+    /// Reconcile multi-level ladder orders on one side.
+    ///
+    /// Manages multiple orders per side for ladder quoting strategy.
+    /// Uses bulk order placement for efficiency (single API call for all levels).
+    async fn reconcile_ladder_side(&mut self, side: Side, new_quotes: Vec<Quote>) -> Result<()> {
+        // Get all current orders on this side
+        let current_orders: Vec<u64> = self
+            .orders
+            .get_all_by_side(side)
+            .iter()
+            .map(|o| o.oid)
+            .collect();
+
+        debug!(
+            side = %side_str(side),
+            current_count = current_orders.len(),
+            new_levels = new_quotes.len(),
+            "Reconciling ladder"
+        );
+
+        // If no new quotes, cancel all existing orders
+        if new_quotes.is_empty() {
+            for oid in current_orders {
+                self.orders.set_state(oid, OrderState::Cancelling);
+                if self.cancel_with_retry(&self.config.asset, oid, 3).await {
+                    info!("Cancelled {} ladder order: oid={}", side_str(side), oid);
+                    self.orders.remove_order(oid);
+                    self.queue_tracker.order_removed(oid);
+                } else {
+                    self.orders.set_state(oid, OrderState::Resting);
+                    warn!(
+                        "Failed to cancel {} ladder order after retries: oid={}",
+                        side_str(side),
+                        oid
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        // Check if ladder needs update
+        let needs_update = self.ladder_needs_update(side, &new_quotes);
+
+        if needs_update || current_orders.is_empty() {
+            // Cancel all existing orders on this side first
+            for oid in &current_orders {
+                self.orders.set_state(*oid, OrderState::Cancelling);
+                if self.cancel_with_retry(&self.config.asset, *oid, 3).await {
+                    debug!(
+                        "Cancelled {} ladder order for update: oid={}",
+                        side_str(side),
+                        oid
+                    );
+                    self.orders.remove_order(*oid);
+                    self.queue_tracker.order_removed(*oid);
+                } else {
+                    self.orders.set_state(*oid, OrderState::Resting);
+                    warn!(
+                        "Failed to cancel {} ladder order after retries: oid={}",
+                        side_str(side),
+                        oid
+                    );
+                }
+            }
+
+            // Build order specs for bulk placement
+            let is_buy = side == Side::Buy;
+            let mut order_specs: Vec<OrderSpec> = Vec::new();
+
+            for quote in &new_quotes {
+                if quote.size <= 0.0 {
+                    continue;
+                }
+
+                // Apply margin check to each level
+                let sizing_result = self.margin_sizer.adjust_size(
+                    quote.size,
+                    quote.price,
+                    self.position.position(),
+                    is_buy,
+                );
+
+                if sizing_result.adjusted_size <= 0.0 {
+                    debug!(
+                        side = %side_str(side),
+                        price = quote.price,
+                        requested_size = quote.size,
+                        reason = ?sizing_result.constraint_reason,
+                        "Ladder level blocked by margin constraints"
+                    );
+                    continue;
+                }
+
+                order_specs.push(OrderSpec {
+                    price: quote.price,
+                    size: sizing_result.adjusted_size,
+                    is_buy,
+                });
+            }
+
+            if order_specs.is_empty() {
+                debug!(
+                    side = %side_str(side),
+                    "No ladder levels to place (all blocked by margin)"
+                );
+                return Ok(());
+            }
+
+            debug!(
+                side = %side_str(side),
+                levels = order_specs.len(),
+                "Placing ladder levels via bulk order"
+            );
+
+            // Place all orders in a single API call
+            let results = self.executor.place_bulk_orders(&self.config.asset, order_specs.clone()).await;
+
+            // Track placed orders
+            for (i, result) in results.iter().enumerate() {
+                if result.oid > 0 {
+                    let spec = &order_specs[i];
+                    self.orders.add_order(TrackedOrder::new(
+                        result.oid,
+                        side,
+                        spec.price,
+                        result.resting_size,
+                    ));
+
+                    // Initialize queue tracking for this order
+                    // depth_ahead is 0.0 initially; will be updated on L2 book updates
+                    self.queue_tracker.order_placed(
+                        result.oid,
+                        spec.price,
+                        result.resting_size,
+                        0.0, // depth_ahead estimated; will be refined by L2 updates
+                        side == Side::Buy,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if the ladder needs to be updated.
+    ///
+    /// Returns true if:
+    /// - Number of levels has changed
+    /// - Any level's price has moved more than max_bps_diff
+    /// - Any level's size has changed by more than 10%
+    fn ladder_needs_update(&self, side: Side, new_quotes: &[Quote]) -> bool {
+        let current = self.orders.get_all_by_side(side);
+
+        // Different number of levels
+        if current.len() != new_quotes.len() {
+            return true;
+        }
+
+        // Sort current orders by price (bids: descending, asks: ascending)
+        let mut sorted_current: Vec<_> = current.iter().collect();
+        if side == Side::Buy {
+            sorted_current.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+        } else {
+            sorted_current.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
+        }
+
+        // Check each level for meaningful price/size changes
+        for (order, quote) in sorted_current.iter().zip(new_quotes.iter()) {
+            // Price change check
+            let price_diff_bps = ((order.price - quote.price) / order.price).abs() * 10000.0;
+            if price_diff_bps > self.config.max_bps_diff as f64 {
+                return true;
+            }
+
+            // Size change check (10% threshold)
+            if order.size > 0.0 {
+                let size_diff_pct = ((order.size - quote.size) / order.size).abs();
+                if size_diff_pct > 0.1 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Place a new order.
     async fn place_new_order(&mut self, side: Side, quote: &Quote) -> Result<()> {
         let is_buy = side == Side::Buy;
+
+        // === Margin Pre-Flight Check ===
+        // Verify order meets margin requirements before placing
+        let sizing_result = self.margin_sizer.adjust_size(
+            quote.size,
+            quote.price,
+            self.position.position(),
+            is_buy,
+        );
+
+        // Skip order if margin check reduces size to zero or margin constrained
+        if sizing_result.adjusted_size <= 0.0 {
+            debug!(
+                side = %side_str(side),
+                requested_size = quote.size,
+                adjusted_size = sizing_result.adjusted_size,
+                reason = ?sizing_result.constraint_reason,
+                "Order blocked by margin constraints"
+            );
+            return Ok(());
+        }
+
+        // Use adjusted size from margin check
+        let adjusted_size = sizing_result.adjusted_size;
         let result = self
             .executor
-            .place_order(&self.config.asset, quote.price, quote.size, is_buy)
+            .place_order(&self.config.asset, quote.price, adjusted_size, is_buy)
             .await;
 
         if result.oid != 0 {
             info!(
-                "{} {} {} resting at {}",
+                "{} {} {} resting at {} (margin-adjusted from {})",
                 side_str(side),
                 result.resting_size,
                 self.config.asset,
-                quote.price
+                quote.price,
+                quote.size
             );
 
             self.orders.add_order(TrackedOrder::new(
@@ -675,19 +1124,95 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         false
     }
 
-    /// Graceful shutdown - cancel all resting orders.
+    /// Graceful shutdown - cancel all resting orders and log final state.
+    ///
+    /// Ensures:
+    /// 1. All resting orders are cancelled with retry logic
+    /// 2. Final position and P&L state is logged
+    /// 3. Kill switch status is reported
     pub async fn shutdown(&mut self) -> Result<()> {
-        info!("Cancelling all resting orders...");
+        info!("=== GRACEFUL SHUTDOWN INITIATED ===");
 
+        // Log final state before cancelling
+        let final_position = self.position.position();
+        let final_mid = self.latest_mid;
+        let position_value = final_position.abs() * final_mid;
+        let kill_switch_summary = self.kill_switch.summary();
+
+        info!(
+            position = %format!("{:.6}", final_position),
+            mid_price = %format!("{:.2}", final_mid),
+            position_value = %format!("${:.2}", position_value),
+            "Final position state"
+        );
+
+        // Log kill switch status
+        if kill_switch_summary.triggered {
+            warn!(
+                reasons = ?kill_switch_summary.reasons,
+                "Kill switch was triggered during session"
+            );
+        } else {
+            info!(
+                daily_pnl = %format!("${:.2}", kill_switch_summary.daily_pnl),
+                max_drawdown = %format!("{:.1}%", kill_switch_summary.drawdown_pct),
+                "Kill switch was NOT triggered"
+            );
+        }
+
+        // Log Tier 1 module summaries
+        let as_summary = self.adverse_selection.summary();
+        info!(
+            fills_measured = as_summary.fills_measured,
+            realized_as_bps = %format!("{:.4}", as_summary.realized_as_bps),
+            spread_adjustment_bps = %format!("{:.4}", as_summary.spread_adjustment_bps),
+            "Adverse selection summary"
+        );
+
+        let liq_summary = self.liquidation_detector.summary();
+        info!(
+            total_liquidations = liq_summary.total_liquidations,
+            cascade_severity = %format!("{:.2}", liq_summary.cascade_severity),
+            "Liquidation cascade summary"
+        );
+
+        // Cancel all resting orders with confirmation
         let oids: Vec<u64> = self.orders.order_ids();
-        for oid in oids {
-            if self.cancel_with_retry(&self.config.asset, oid, 3).await {
-                info!("Cancelled order: oid={}", oid);
+        let total_orders = oids.len();
+
+        if total_orders == 0 {
+            info!("No resting orders to cancel");
+        } else {
+            info!("Cancelling {} resting orders...", total_orders);
+
+            let mut cancelled = 0;
+            let mut failed = 0;
+
+            for oid in oids {
+                if self.cancel_with_retry(&self.config.asset, oid, 3).await {
+                    info!("Cancelled order: oid={}", oid);
+                    cancelled += 1;
+                } else {
+                    warn!("Failed to cancel order after retries: oid={}", oid);
+                    failed += 1;
+                }
+            }
+
+            if failed > 0 {
+                warn!(
+                    cancelled = cancelled,
+                    failed = failed,
+                    "Some orders failed to cancel - may need manual cleanup"
+                );
             } else {
-                warn!("Failed to cancel order after retries: oid={}", oid);
+                info!(
+                    cancelled = cancelled,
+                    "All orders cancelled successfully"
+                );
             }
         }
 
+        info!("=== GRACEFUL SHUTDOWN COMPLETE ===");
         Ok(())
     }
 
@@ -695,6 +1220,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// This is a fallback mechanism; if working correctly, should find no discrepancies.
     async fn safety_sync(&mut self) -> Result<()> {
         debug!("Running safety sync...");
+
+        // === Update margin state from user account ===
+        if let Err(e) = self.refresh_margin_state().await {
+            warn!("Failed to refresh margin state: {e}");
+        }
 
         // Query open orders from exchange
         let exchange_orders = self.info_client.open_orders(self.user_address).await?;
@@ -738,6 +1268,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Ok(())
     }
 
+    /// Refresh margin state from exchange.
+    ///
+    /// Fetches user account state and updates the MarginAwareSizer with current values.
+    async fn refresh_margin_state(&mut self) -> Result<()> {
+        let user_state = self.info_client.user_state(self.user_address).await?;
+
+        // Parse margin values from the response
+        let account_value: f64 = user_state
+            .cross_margin_summary
+            .account_value
+            .parse()
+            .unwrap_or(0.0);
+        let margin_used: f64 = user_state
+            .cross_margin_summary
+            .total_margin_used
+            .parse()
+            .unwrap_or(0.0);
+        let total_notional: f64 = user_state
+            .cross_margin_summary
+            .total_ntl_pos
+            .parse()
+            .unwrap_or(0.0);
+
+        // Update the margin sizer with fresh values
+        self.margin_sizer
+            .update_state(account_value, margin_used, total_notional);
+
+        debug!(
+            account_value = %format!("{:.2}", account_value),
+            margin_used = %format!("{:.2}", margin_used),
+            total_notional = %format!("{:.2}", total_notional),
+            available = %format!("{:.2}", account_value - margin_used),
+            "Margin state refreshed"
+        );
+
+        Ok(())
+    }
+
     /// Get current position.
     pub fn position(&self) -> f64 {
         self.position.position()
@@ -746,6 +1314,54 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Get latest mid price.
     pub fn latest_mid(&self) -> f64 {
         self.latest_mid
+    }
+
+    /// Get kill switch reference for monitoring.
+    pub fn kill_switch(&self) -> &KillSwitch {
+        &self.kill_switch
+    }
+
+    /// Check kill switch conditions and update state.
+    /// Called after each message and periodically.
+    fn check_kill_switch(&self) {
+        // Calculate data age from connection health
+        let data_age = self.connection_health.time_since_last_data();
+        let last_data_time = std::time::Instant::now()
+            .checked_sub(data_age)
+            .unwrap_or_else(std::time::Instant::now);
+
+        // Build current state for kill switch check using actual P&L
+        let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
+        let state = KillSwitchState {
+            daily_pnl: pnl_summary.total_pnl,   // Using total as daily for now
+            peak_pnl: pnl_summary.total_pnl,    // Simplified (actual peak needs tracking)
+            position: self.position.position(),
+            mid_price: self.latest_mid,
+            last_data_time,
+            rate_limit_errors: 0, // TODO: Track rate limit errors
+            cascade_severity: self.liquidation_detector.cascade_severity(),
+        };
+
+        // Update position in kill switch (for value calculation)
+        self.kill_switch
+            .update_position(self.position.position(), self.latest_mid);
+
+        // Update cascade severity
+        self.kill_switch
+            .update_cascade_severity(self.liquidation_detector.cascade_severity());
+
+        // Warn if data is stale
+        if self.connection_health.is_data_stale() {
+            warn!(
+                data_age_secs = %format!("{:.1}", data_age.as_secs_f64()),
+                "WebSocket data is stale - connection may be unhealthy"
+            );
+        }
+
+        // Check all conditions
+        if let Some(reason) = self.kill_switch.check(&state) {
+            warn!("Kill switch condition detected: {}", reason);
+        }
     }
 }
 

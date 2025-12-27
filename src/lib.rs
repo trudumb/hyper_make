@@ -31,15 +31,37 @@ pub use info::response_structs::*;
 pub use market_maker::{
     // Core types
     EstimatorConfig, GLFTStrategy, HyperliquidExecutor, InventoryAwareStrategy, MarketMaker,
-    MarketMakerConfig, MarketMakerMetricsRecorder, MarketParams, MetricsRecorder, OrderExecutor,
-    OrderManager, OrderResult, ParameterEstimator, PositionTracker, Quote, QuoteConfig,
-    QuotingStrategy, RiskConfig, Side, SymmetricStrategy, TrackedOrder,
+    MarketMakerConfig, MarketMakerMetricsRecorder, MarketParams, MetricsRecorder, ModifyResult,
+    OrderExecutor, OrderManager, OrderResult, ParameterEstimator, PositionTracker, Quote,
+    QuoteConfig, QuotingStrategy, RiskConfig, Side, SymmetricStrategy, TrackedOrder,
+    // Ladder quoting
+    Ladder, LadderAction, LadderConfig, LadderLevel, LadderParams, LadderStrategy,
     // Tier 1: Adverse Selection
     AdverseSelectionConfig, AdverseSelectionEstimator, AdverseSelectionSummary,
     // Tier 1: Queue Position
     QueueConfig, QueuePositionTracker, QueueSummary,
     // Tier 1: Liquidation Cascade
     CascadeDirection, LiquidationCascadeDetector, LiquidationConfig, LiquidationSummary,
+    // Production Safety: Kill Switch
+    KillReason, KillSwitch, KillSwitchConfig, KillSwitchState, KillSwitchSummary,
+    // Tier 2: Funding Rate
+    FundingConfig, FundingRateEstimator, FundingSummary,
+    // Tier 2: Hawkes Order Flow
+    HawkesConfig, HawkesOrderFlowEstimator, HawkesSummary,
+    // Tier 2: Spread Process
+    SpreadConfig, SpreadProcessEstimator, SpreadRegime, SpreadSummary,
+    // Tier 2: P&L Attribution
+    PnLComponents, PnLConfig, PnLSummary, PnLTracker,
+    // Production: Margin-Aware Sizing
+    MarginAwareSizer, MarginConfig, MarginState, MarginSummary as MarginSizerSummary, SizingResult,
+    // Volatility Regime
+    VolatilityRegime,
+    // Multi-Asset Correlation
+    CorrelationConfig, CorrelationEstimator, CorrelationHorizon, CorrelationSummary,
+    // Prometheus Metrics
+    MetricsSummary, PrometheusMetrics,
+    // WebSocket Reconnection
+    ConnectionHealthMonitor, ConnectionState, HealthSummary, ReconnectionConfig,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;

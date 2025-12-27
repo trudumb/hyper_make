@@ -8,7 +8,7 @@
 //! - Weighted Kappa: Proximity-weighted L2 book regression
 
 use std::collections::VecDeque;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ============================================================================
 // Configuration
@@ -743,7 +743,7 @@ impl WeightedKappaEstimator {
 // Fill Rate Kappa Estimator (Trade Distance Distribution)
 // ============================================================================
 
-/// Estimates κ from trade execution distance distribution.
+/// Estimates κ from trade execution distance distribution with confidence tracking.
 ///
 /// This is the CORRECT κ for the GLFT formula:
 /// λ(δ) = A × exp(-κ × δ)  where λ is fill rate at distance δ
@@ -752,6 +752,11 @@ impl WeightedKappaEstimator {
 ///
 /// This measures WHERE trades actually execute relative to mid,
 /// NOT the shape of the order book (which is a different concept).
+///
+/// **Enhancements:**
+/// - Variance tracking for confidence estimation
+/// - Goodness-of-fit scoring for exponential assumption validation
+/// - Sample size weighting in confidence calculation
 #[derive(Debug)]
 struct FillRateKappaEstimator {
     /// Rolling observations: (distance, volume, timestamp)
@@ -760,6 +765,8 @@ struct FillRateKappaEstimator {
     window_ms: u64,
     /// Running volume-weighted distance sum (for efficiency)
     volume_weighted_distance: f64,
+    /// Running volume-weighted squared distance sum (for variance)
+    volume_weighted_distance_sq: f64,
     /// Running total volume
     total_volume: f64,
     /// EWMA smoothed kappa
@@ -768,6 +775,13 @@ struct FillRateKappaEstimator {
     alpha: f64,
     /// Update count for warmup
     update_count: usize,
+    /// Default kappa for fallback
+    #[allow(dead_code)]
+    default_kappa: f64,
+    /// Coefficient of variation (CV) - measure of relative dispersion
+    cv: f64,
+    /// Goodness of fit score [0, 1] - how well data fits exponential
+    fit_score: f64,
 }
 
 impl FillRateKappaEstimator {
@@ -776,10 +790,14 @@ impl FillRateKappaEstimator {
             observations: VecDeque::with_capacity(1000),
             window_ms,
             volume_weighted_distance: 0.0,
+            volume_weighted_distance_sq: 0.0,
             total_volume: 0.0,
             kappa: default_kappa,
             alpha: (2.0_f64.ln() / half_life_ticks).clamp(0.001, 0.5),
             update_count: 0,
+            default_kappa,
+            cv: 1.0, // For exponential, CV = 1.0 exactly
+            fit_score: 0.5, // Start neutral
         }
     }
 
@@ -799,13 +817,15 @@ impl FillRateKappaEstimator {
         // Add observation
         self.observations.push_back((distance, size, timestamp_ms));
         self.volume_weighted_distance += distance * size;
+        self.volume_weighted_distance_sq += distance * distance * size;
         self.total_volume += size;
 
         // Expire old observations
         self.expire_old(timestamp_ms);
 
-        // Update kappa estimate
+        // Update kappa estimate and fit metrics
         self.update_kappa();
+        self.update_fit_metrics();
     }
 
     fn expire_old(&mut self, now: u64) {
@@ -813,6 +833,7 @@ impl FillRateKappaEstimator {
         while let Some((dist, size, ts)) = self.observations.front() {
             if *ts < cutoff {
                 self.volume_weighted_distance -= dist * size;
+                self.volume_weighted_distance_sq -= dist * dist * size;
                 self.total_volume -= size;
                 self.observations.pop_front();
             } else {
@@ -822,6 +843,7 @@ impl FillRateKappaEstimator {
 
         // Ensure running sums don't go negative due to float precision
         self.volume_weighted_distance = self.volume_weighted_distance.max(0.0);
+        self.volume_weighted_distance_sq = self.volume_weighted_distance_sq.max(0.0);
         self.total_volume = self.total_volume.max(0.0);
     }
 
@@ -861,8 +883,74 @@ impl FillRateKappaEstimator {
         }
     }
 
+    /// Update fit metrics (coefficient of variation and goodness of fit).
+    ///
+    /// For exponential distribution, CV = σ/μ = 1.0 exactly.
+    /// Deviation from CV = 1 indicates non-exponential behavior.
+    fn update_fit_metrics(&mut self) {
+        if self.total_volume < 1e-9 || self.observations.len() < 10 {
+            return;
+        }
+
+        // Calculate mean and variance
+        let mean = self.volume_weighted_distance / self.total_volume;
+        let mean_sq = self.volume_weighted_distance_sq / self.total_volume;
+        let variance = (mean_sq - mean * mean).max(0.0);
+        let std_dev = variance.sqrt();
+
+        // Coefficient of variation: CV = σ/μ
+        // For exponential: CV = 1.0
+        // For power-law: CV > 1.0 (heavy tail)
+        // For light-tail: CV < 1.0
+        if mean > 1e-9 {
+            self.cv = std_dev / mean;
+
+            // Fit score: how close is CV to 1.0?
+            // Score = 1 when CV = 1, decreases as CV deviates
+            // Using: score = exp(-|CV - 1|²)
+            let cv_deviation = (self.cv - 1.0).abs();
+            self.fit_score = (-cv_deviation * cv_deviation * 4.0).exp();
+        }
+    }
+
     fn kappa(&self) -> f64 {
         self.kappa.clamp(100.0, 10000.0)
+    }
+
+    /// Get kappa with confidence-based blending with fallback.
+    ///
+    /// When confidence is low (poor exponential fit), blend towards fallback.
+    fn kappa_with_fallback(&self, fallback_kappa: f64) -> f64 {
+        let confidence = self.confidence();
+        let primary = self.kappa.clamp(100.0, 10000.0);
+        let blended = confidence * primary + (1.0 - confidence) * fallback_kappa;
+        blended.clamp(100.0, 10000.0)
+    }
+
+    /// Confidence score [0, 1] based on sample size and fit quality.
+    ///
+    /// High confidence when:
+    /// - Many observations (sample size factor)
+    /// - Good exponential fit (fit_score)
+    /// - CV close to 1.0
+    fn confidence(&self) -> f64 {
+        // Sample size factor: ramps up to 1.0 at 100+ observations
+        let sample_factor = (self.observations.len() as f64 / 100.0).min(1.0);
+
+        // Combine factors
+        (sample_factor * self.fit_score).clamp(0.0, 1.0)
+    }
+
+    /// Get coefficient of variation (CV).
+    /// For exponential: CV ≈ 1.0. Higher = heavy tail, Lower = light tail.
+    fn cv(&self) -> f64 {
+        self.cv
+    }
+
+    /// Get fit score [0, 1]. Higher = better exponential fit.
+    #[allow(dead_code)]
+    fn fit_score(&self) -> f64 {
+        self.fit_score
     }
 
     fn update_count(&self) -> usize {
@@ -1031,6 +1119,15 @@ struct MicropriceObservation {
 ///
 /// This replaces magic number adjustments with data-driven coefficients.
 #[derive(Debug)]
+/// Microprice estimator with Ridge regularization.
+///
+/// Uses online OLS with L2 regularization to learn coefficients for:
+/// microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
+///
+/// **Regularization benefits:**
+/// - Prevents coefficient explosion when signals are collinear
+/// - Biases coefficients toward zero when data is noisy
+/// - Produces more stable estimates across market regimes
 struct MicropriceEstimator {
     /// Pending observations waiting for forward horizon to elapse
     pending: VecDeque<MicropriceObservation>,
@@ -1059,6 +1156,16 @@ struct MicropriceEstimator {
 
     // Warmup threshold
     min_observations: usize,
+
+    /// Ridge regularization parameter (λ)
+    /// Higher = more regularization, coefficients biased toward zero
+    lambda: f64,
+
+    /// Minimum R² threshold - below this, revert to mid price
+    min_r_squared: f64,
+
+    /// Correlation between book and flow signals (for multicollinearity detection)
+    signal_correlation: f64,
 }
 
 impl MicropriceEstimator {
@@ -1081,6 +1188,13 @@ impl MicropriceEstimator {
             beta_flow: 0.0,
             r_squared: 0.0,
             min_observations,
+            // Ridge regularization: λ = 0.01 provides moderate regularization
+            // This adds λI to X'X, shrinking coefficients toward zero
+            lambda: 0.01,
+            // Minimum R² threshold: below 1% explained variance, revert to mid
+            min_r_squared: 0.01,
+            // Initialize correlation to 0 (no correlation assumed)
+            signal_correlation: 0.0,
         }
     }
 
@@ -1175,7 +1289,10 @@ impl MicropriceEstimator {
         let _ = now; // Used for logging if needed
     }
 
-    /// Solve 2-variable linear regression for β_book and β_flow.
+    /// Solve 2-variable linear regression for β_book and β_flow with Ridge regularization.
+    ///
+    /// Uses Ridge regression: β = (X'X + λI)⁻¹ X'y
+    /// This shrinks coefficients toward zero, preventing explosion with collinear signals.
     fn update_betas(&mut self) {
         if self.n < self.min_observations {
             return;
@@ -1184,10 +1301,10 @@ impl MicropriceEstimator {
         let n = self.n as f64;
 
         // Solve normal equations for: y = β_book × x_book + β_flow × x_flow
-        // Using matrix form: (X'X)β = X'y
+        // Using Ridge regression: (X'X + λI)β = X'y
         //
-        // X'X = | Σx_book² , Σx_book×x_flow |
-        //       | Σx_book×x_flow, Σx_flow² |
+        // X'X + λI = | Σx_book² + λ, Σx_book×x_flow |
+        //           | Σx_book×x_flow, Σx_flow² + λ |
         //
         // X'y = | Σx_book×y |
         //       | Σx_flow×y |
@@ -1205,17 +1322,37 @@ impl MicropriceEstimator {
         let sx_cross = self.sum_x_cross - n * mean_x_book * mean_x_flow;
         let syy = self.sum_yy - n * mean_y * mean_y;
 
-        // Determinant of X'X
-        let det = sxx_book * sxx_flow - sx_cross * sx_cross;
+        // Calculate signal correlation (for multicollinearity detection)
+        let std_book = sxx_book.sqrt();
+        let std_flow = sxx_flow.sqrt();
+        if std_book > 1e-9 && std_flow > 1e-9 {
+            self.signal_correlation = (sx_cross / (std_book * std_flow)).clamp(-1.0, 1.0);
+        }
+
+        // Ridge regularization: add λ to diagonal of X'X
+        // Scale λ by the average variance to make it scale-invariant
+        let avg_var = (sxx_book + sxx_flow) / 2.0;
+        let lambda_scaled = self.lambda * avg_var.max(1e-6);
+
+        // Regularized diagonal elements
+        let sxx_book_reg = sxx_book + lambda_scaled;
+        let sxx_flow_reg = sxx_flow + lambda_scaled;
+
+        // Determinant of (X'X + λI)
+        let det = sxx_book_reg * sxx_flow_reg - sx_cross * sx_cross;
 
         if det.abs() < 1e-12 {
-            // Singular matrix - signals are collinear or no variance
+            // Still singular after regularization - very unusual
+            warn!(
+                correlation = %format!("{:.3}", self.signal_correlation),
+                "Microprice regression singular even with regularization"
+            );
             return;
         }
 
-        // Solve using Cramer's rule
-        self.beta_book = (sxy_book * sxx_flow - sxy_flow * sx_cross) / det;
-        self.beta_flow = (sxy_flow * sxx_book - sxy_book * sx_cross) / det;
+        // Solve using Cramer's rule with regularized matrix
+        self.beta_book = (sxy_book * sxx_flow_reg - sxy_flow * sx_cross) / det;
+        self.beta_flow = (sxy_flow * sxx_book_reg - sxy_book * sx_cross) / det;
 
         // Clamp betas to reasonable range (prevent explosion)
         // Expected range: ~0.0001-0.01 (0.1-10 bps per unit signal)
@@ -1230,6 +1367,14 @@ impl MicropriceEstimator {
             self.r_squared = (y_pred_var / syy).clamp(0.0, 1.0);
         }
 
+        // Warn about high multicollinearity
+        if self.signal_correlation.abs() > 0.8 && self.n.is_multiple_of(1000) {
+            warn!(
+                correlation = %format!("{:.3}", self.signal_correlation),
+                "High multicollinearity between book and flow signals"
+            );
+        }
+
         // Log periodically
         if self.n.is_multiple_of(500) {
             debug!(
@@ -1237,14 +1382,30 @@ impl MicropriceEstimator {
                 beta_book_bps = %format!("{:.2}", self.beta_book * 10000.0),
                 beta_flow_bps = %format!("{:.2}", self.beta_flow * 10000.0),
                 r_squared = %format!("{:.4}", self.r_squared),
-                "Microprice coefficients updated"
+                correlation = %format!("{:.3}", self.signal_correlation),
+                "Microprice coefficients updated (Ridge regularized)"
             );
         }
     }
 
     /// Get microprice adjusted for current signals.
+    ///
+    /// Returns mid price if:
+    /// - Not warmed up (insufficient data)
+    /// - R² below threshold (model has no predictive power)
+    /// - Signals are highly collinear (unreliable coefficients)
     fn microprice(&self, mid: f64, book_imbalance: f64, flow_imbalance: f64) -> f64 {
         if !self.is_warmed_up() {
+            return mid;
+        }
+
+        // If R² is too low, the model has no predictive power - use mid
+        if self.r_squared < self.min_r_squared {
+            return mid;
+        }
+
+        // If signals are extremely collinear (|ρ| > 0.95), coefficients are unreliable
+        if self.signal_correlation.abs() > 0.95 {
             return mid;
         }
 
@@ -1317,6 +1478,176 @@ impl VolumeTickArrivalEstimator {
 }
 
 // ============================================================================
+// 4-State Volatility Regime with Hysteresis
+// ============================================================================
+
+/// Volatility regime classification.
+///
+/// Four states with hysteresis to prevent rapid switching:
+/// - Low: Very quiet market (σ < 0.5 × baseline)
+/// - Normal: Standard market conditions
+/// - High: Elevated volatility (σ > 1.5 × baseline)
+/// - Extreme: Crisis/toxic conditions (σ > 3 × baseline OR high jump ratio)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolatilityRegime {
+    /// Very quiet market - can tighten spreads
+    Low,
+    /// Normal market conditions
+    Normal,
+    /// Elevated volatility - widen spreads
+    High,
+    /// Crisis/toxic - maximum caution, consider pulling quotes
+    Extreme,
+}
+
+impl Default for VolatilityRegime {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl VolatilityRegime {
+    /// Get spread multiplier for this regime.
+    ///
+    /// Used to scale spreads based on volatility state.
+    pub fn spread_multiplier(&self) -> f64 {
+        match self {
+            Self::Low => 0.8,     // Tighter spreads in quiet markets
+            Self::Normal => 1.0,  // Base case
+            Self::High => 1.5,    // Wider spreads for elevated vol
+            Self::Extreme => 2.5, // Much wider spreads in crisis
+        }
+    }
+
+    /// Get gamma multiplier for this regime.
+    ///
+    /// Risk aversion increases with volatility.
+    pub fn gamma_multiplier(&self) -> f64 {
+        match self {
+            Self::Low => 0.8,
+            Self::Normal => 1.0,
+            Self::High => 1.5,
+            Self::Extreme => 3.0,
+        }
+    }
+
+    /// Check if quotes should be pulled (extreme regime).
+    pub fn should_consider_pulling_quotes(&self) -> bool {
+        matches!(self, Self::Extreme)
+    }
+}
+
+/// Tracks volatility regime with hysteresis to prevent rapid switching.
+///
+/// Transitions between states require sustained conditions to trigger,
+/// preventing oscillation at boundaries.
+#[derive(Debug)]
+struct VolatilityRegimeTracker {
+    /// Current regime state
+    regime: VolatilityRegime,
+    /// Baseline volatility (for regime thresholds)
+    baseline_sigma: f64,
+    /// Consecutive updates in potential new regime (for hysteresis)
+    transition_count: u32,
+    /// Minimum transitions before state change (hysteresis parameter)
+    min_transitions: u32,
+    /// Thresholds relative to baseline
+    low_threshold: f64,    // σ < baseline × low_threshold → Low
+    high_threshold: f64,   // σ > baseline × high_threshold → High
+    extreme_threshold: f64, // σ > baseline × extreme_threshold → Extreme
+    /// Jump ratio threshold for Extreme regime
+    jump_threshold: f64,
+    /// Pending regime (for hysteresis tracking)
+    pending_regime: Option<VolatilityRegime>,
+}
+
+impl VolatilityRegimeTracker {
+    fn new(baseline_sigma: f64) -> Self {
+        Self {
+            regime: VolatilityRegime::Normal,
+            baseline_sigma,
+            transition_count: 0,
+            min_transitions: 5, // Require 5 consecutive updates before transition
+            low_threshold: 0.5,
+            high_threshold: 1.5,
+            extreme_threshold: 3.0,
+            jump_threshold: 3.0,
+            pending_regime: None,
+        }
+    }
+
+    /// Update regime based on current volatility and jump ratio.
+    fn update(&mut self, sigma: f64, jump_ratio: f64) {
+        // Determine target regime based on current conditions
+        let target = self.classify(sigma, jump_ratio);
+
+        // Check if target matches pending transition
+        if let Some(pending) = self.pending_regime {
+            if pending == target {
+                self.transition_count += 1;
+                if self.transition_count >= self.min_transitions {
+                    // Transition confirmed
+                    if self.regime != target {
+                        debug!(
+                            from = ?self.regime,
+                            to = ?target,
+                            sigma = %format!("{:.6}", sigma),
+                            jump_ratio = %format!("{:.2}", jump_ratio),
+                            "Volatility regime transition"
+                        );
+                    }
+                    self.regime = target;
+                    self.pending_regime = None;
+                    self.transition_count = 0;
+                }
+            } else {
+                // Target changed, reset hysteresis
+                self.pending_regime = Some(target);
+                self.transition_count = 1;
+            }
+        } else if target != self.regime {
+            // Start new pending transition
+            self.pending_regime = Some(target);
+            self.transition_count = 1;
+        }
+    }
+
+    /// Classify conditions into target regime.
+    fn classify(&self, sigma: f64, jump_ratio: f64) -> VolatilityRegime {
+        // Jump ratio overrides to Extreme
+        if jump_ratio > self.jump_threshold {
+            return VolatilityRegime::Extreme;
+        }
+
+        // Volatility-based classification
+        let sigma_ratio = sigma / self.baseline_sigma.max(1e-9);
+
+        if sigma_ratio < self.low_threshold {
+            VolatilityRegime::Low
+        } else if sigma_ratio > self.extreme_threshold {
+            VolatilityRegime::Extreme
+        } else if sigma_ratio > self.high_threshold {
+            VolatilityRegime::High
+        } else {
+            VolatilityRegime::Normal
+        }
+    }
+
+    /// Get current regime.
+    fn regime(&self) -> VolatilityRegime {
+        self.regime
+    }
+
+    /// Update baseline volatility (e.g., from long-term EWMA).
+    fn update_baseline(&mut self, new_baseline: f64) {
+        if new_baseline > 1e-9 {
+            // Slow update to baseline (EWMA with long half-life)
+            self.baseline_sigma = 0.99 * self.baseline_sigma + 0.01 * new_baseline;
+        }
+    }
+}
+
+// ============================================================================
 // Main Orchestrator: ParameterEstimator
 // ============================================================================
 
@@ -1344,8 +1675,7 @@ pub struct ParameterEstimator {
     flow: TradeFlowTracker,
     /// Fill-rate kappa estimator from trade distances (PRIMARY κ for GLFT)
     fill_rate_kappa: FillRateKappaEstimator,
-    /// Weighted kappa estimator from L2 book (kept for auxiliary use)
-    #[allow(dead_code)]
+    /// Weighted kappa estimator from L2 book (fallback when fill-rate has low confidence)
     book_kappa: WeightedKappaEstimator,
     /// Volume tick arrival estimator
     arrival: VolumeTickArrivalEstimator,
@@ -1357,6 +1687,8 @@ pub struct ParameterEstimator {
     current_mid: f64,
     /// Current timestamp for momentum queries
     current_time_ms: u64,
+    /// 4-state volatility regime tracker with hysteresis
+    volatility_regime: VolatilityRegimeTracker,
 }
 
 impl ParameterEstimator {
@@ -1393,6 +1725,9 @@ impl ParameterEstimator {
         // Microprice estimator: 60s window, 300ms forward horizon, 50 min observations
         let microprice_estimator = MicropriceEstimator::new(60_000, 300, 50);
 
+        // Volatility regime tracker with baseline from config
+        let volatility_regime = VolatilityRegimeTracker::new(config.default_sigma);
+
         Self {
             config,
             bucket_accumulator,
@@ -1406,6 +1741,7 @@ impl ParameterEstimator {
             microprice_estimator,
             current_mid: 0.0,
             current_time_ms: 0,
+            volatility_regime,
         }
     }
 
@@ -1456,6 +1792,15 @@ impl ParameterEstimator {
                 self.momentum.on_bucket(bucket.end_time_ms, ret);
             }
 
+            // Update volatility regime with current sigma and jump ratio
+            let sigma = self.multi_scale.sigma_clean();
+            let jump_ratio = self.multi_scale.jump_ratio_fast();
+            self.volatility_regime.update(sigma, jump_ratio);
+
+            // Slowly update baseline from slow sigma (long-term anchor)
+            // Using slow sigma as the stable reference for regime thresholds
+            self.volatility_regime.update_baseline(self.multi_scale.sigma_clean());
+
             debug!(
                 vwap = %format!("{:.4}", bucket.vwap),
                 volume = %format!("{:.4}", bucket.volume),
@@ -1465,6 +1810,7 @@ impl ParameterEstimator {
                 sigma_total = %format!("{:.6}", self.multi_scale.sigma_total()),
                 jump_ratio = %format!("{:.2}", self.multi_scale.jump_ratio_fast()),
                 kappa = %format!("{:.0}", self.fill_rate_kappa.kappa()),
+                regime = ?self.volatility_regime.regime(),
                 "Volume bucket completed"
             );
         }
@@ -1520,11 +1866,41 @@ impl ParameterEstimator {
 
     // === Order Book Accessors ===
 
-    /// Get current fill-rate kappa estimate (κ).
-    /// This is estimated from trade execution distance distribution,
-    /// which is the CORRECT κ for the GLFT formula.
+    /// Get current kappa estimate (κ) with confidence-based blending.
+    ///
+    /// Uses fill-rate kappa from trade execution distances as primary estimate.
+    /// When confidence is low (poor exponential fit), blends toward book-based kappa.
     pub fn kappa(&self) -> f64 {
+        // Use book kappa as fallback when fill-rate confidence is low
+        self.fill_rate_kappa
+            .kappa_with_fallback(self.book_kappa.kappa())
+    }
+
+    /// Get raw fill-rate kappa (without blending).
+    pub fn kappa_fill_rate(&self) -> f64 {
         self.fill_rate_kappa.kappa()
+    }
+
+    /// Get book-based kappa from L2 order book depth decay.
+    pub fn kappa_book(&self) -> f64 {
+        self.book_kappa.kappa()
+    }
+
+    /// Get kappa estimation confidence [0, 1].
+    ///
+    /// Based on sample size and how well data fits exponential distribution.
+    /// Low confidence indicates book-based fallback is being used more.
+    pub fn kappa_confidence(&self) -> f64 {
+        self.fill_rate_kappa.confidence()
+    }
+
+    /// Get coefficient of variation for fill distance distribution.
+    ///
+    /// For exponential: CV ≈ 1.0
+    /// CV > 1.0: Heavy tail (power-law like) - common in crypto
+    /// CV < 1.0: Light tail
+    pub fn kappa_cv(&self) -> f64 {
+        self.fill_rate_kappa.cv()
     }
 
     /// Get current order arrival intensity (volume ticks per second).
@@ -1591,6 +1967,31 @@ impl ParameterEstimator {
     /// Check if currently in toxic (jump) regime.
     pub fn is_toxic_regime(&self) -> bool {
         self.multi_scale.jump_ratio_fast() > self.config.jump_ratio_threshold
+    }
+
+    /// Get current 4-state volatility regime.
+    ///
+    /// Regime classification with hysteresis:
+    /// - Low: Quiet market (σ < 0.5 × baseline) - can tighten spreads
+    /// - Normal: Standard conditions
+    /// - High: Elevated volatility (σ > 1.5 × baseline) - widen spreads
+    /// - Extreme: Crisis/toxic (σ > 3 × baseline OR high jump ratio) - consider pulling quotes
+    pub fn volatility_regime(&self) -> VolatilityRegime {
+        self.volatility_regime.regime()
+    }
+
+    /// Get spread multiplier based on current volatility regime.
+    ///
+    /// Ranges from 0.8 (Low) to 2.5 (Extreme).
+    pub fn regime_spread_multiplier(&self) -> f64 {
+        self.volatility_regime.regime().spread_multiplier()
+    }
+
+    /// Get gamma multiplier based on current volatility regime.
+    ///
+    /// Ranges from 0.8 (Low) to 3.0 (Extreme).
+    pub fn regime_gamma_multiplier(&self) -> f64 {
+        self.volatility_regime.regime().gamma_multiplier()
     }
 
     // === Directional Flow Accessors ===

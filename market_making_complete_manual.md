@@ -1159,6 +1159,481 @@ impl StateEstimationEngine {
 
 # 5. The Quoting Engine
 
+## 5.0 Optimal Ladder Derivation: The Mathematical Foundation
+
+Before any code, we must derive *why* the ladder looks the way it does. This isn't heuristics—it's optimization.
+
+### 5.0.1 The Objective Function
+
+We are maximizing risk-adjusted expected profit rate:
+
+```
+J = E[dPnL/dt] - (γ/2) × Var[dPnL/dt]
+```
+
+**Expanding the terms:**
+
+The P&L rate from market making comes from fills:
+```
+E[dPnL/dt] = E[fills on bids] × E[profit per bid fill]
+           + E[fills on asks] × E[profit per ask fill]
+           - E[inventory cost rate]
+           - E[funding cost rate]
+```
+
+For a ladder with quote density q(δ) at depth δ:
+```
+E[dPnL/dt] = ∫₀^∞ q_bid(δ) × λ(δ) × [δ - AS(δ)] dδ
+           + ∫₀^∞ q_ask(δ) × λ(δ) × [δ - AS(δ)] dδ
+           - γσ²E[inventory²]/2
+           - f × E[inventory]
+```
+
+Where:
+- **q(δ)**: Size we quote at depth δ (our control variable)
+- **λ(δ)**: Fill intensity at depth δ (fills per unit time per unit size)
+- **δ**: The spread capture (what we earn if filled)
+- **AS(δ)**: Adverse selection at depth δ (what we lose to informed flow)
+- **γ**: Risk aversion parameter
+- **σ**: Volatility
+- **f**: Funding rate
+
+### 5.0.2 Why Multiple Levels? The Mathematical Argument
+
+**Single-level limitation:**
+
+The classic Avellaneda-Stoikov result gives optimal single-level quotes:
+```
+bid = S - γσ²qT - δ*
+ask = S - γσ²qT + δ*
+
+where δ* = (1/γ)ln(1 + γ/k)
+```
+
+This assumes:
+1. Known true price S (we only observe noisy mid)
+2. Constant fill intensity k (it varies with depth)
+3. Constant adverse selection (it varies with depth)
+4. Continuous quoting (we quote discrete sizes)
+
+**Multi-level optimality:**
+
+With uncertainty about true value and depth-dependent AS, the optimal policy is a *distribution* of quotes across depths, not a single point.
+
+**Theorem (Informal):** Under uncertainty about fair value μ ~ N(mid, σ²_est), the optimal quote density has support on an interval [δ_min, δ_max], not a single point.
+
+**Intuition:**
+- If you quote only at δ* and true value is at δ* + ε, you either miss fills or get adversely selected
+- Spreading quotes across depths hedges estimation error
+- Different depths capture different types of flow (informed vs uninformed)
+
+### 5.0.3 The Three Key Functions
+
+Everything depends on three functions of depth δ:
+
+#### Function 1: Fill Intensity λ(δ)
+
+**Definition:** λ(δ) = expected fills per unit time per unit size at depth δ
+
+**Derivation from first principles:**
+
+A fill requires two events:
+1. Price touches our level (first passage)
+2. Our queue position clears (execution)
+
+```
+λ(δ) = λ_touch(δ) × P(execute | touch)
+```
+
+**First passage for Brownian motion:**
+
+For a Brownian motion with volatility σ, the density of first passage time to level δ is:
+```
+f_τ(t; δ) = (δ / σ√(2πt³)) × exp(-δ²/(2σ²t))
+```
+
+The expected first passage time is:
+```
+E[τ_δ] = δ²/σ²  (for zero drift)
+```
+
+Therefore, the *rate* of touching level δ scales as:
+```
+λ_touch(δ) ∝ σ²/δ²
+```
+
+**Key insight: Fill probability decays QUADRATICALLY with depth.**
+
+This is not linear! Doubling depth quarters fill probability.
+
+**With jumps:**
+
+Real prices have jumps. A jump can fill deep orders directly:
+```
+λ_touch(δ) = σ²/δ² + λ_jump × P(|J| > δ)
+```
+
+For exponentially distributed jumps with mean μ_J:
+```
+λ_touch(δ) = σ²/δ² + λ_jump × exp(-δ/μ_J)
+```
+
+**Queue execution probability:**
+
+Given price touches our level, we need queue to clear:
+```
+P(execute | touch) = P(volume traded at level > queue_ahead)
+```
+
+If volume at touch is exponentially distributed with mean V:
+```
+P(execute | touch) = exp(-queue_ahead / V)
+```
+
+**Complete fill intensity:**
+```
+λ(δ) = (σ²/δ² + λ_jump × e^(-δ/μ_J)) × e^(-Q(δ)/V(δ))
+```
+
+Where Q(δ) is queue depth at level δ and V(δ) is expected volume at touch.
+
+#### Function 2: Adverse Selection AS(δ)
+
+**Definition:** AS(δ) = E[price move against us | filled at depth δ]
+
+**Derivation from first principles:**
+
+Order flow consists of:
+- **Informed traders** (fraction α): Know future price direction, want to trade NOW
+- **Uninformed traders** (fraction 1-α): No information, less time-sensitive
+
+Informed traders are impatient. They lift tight quotes. Uninformed traders will trade at any level.
+
+**Model:**
+
+Let the informed flow probability decay with depth:
+```
+α(δ) = α₀ × h(δ)
+```
+
+Where h(δ) is decreasing, h(0) = 1, h(∞) = 0.
+
+The expected adverse selection is:
+```
+AS(δ) = α(δ) × E[|ΔS| | informed]
+      = α₀ × h(δ) × σ_informed
+```
+
+**Common functional forms for h(δ):**
+
+Exponential decay (most common):
+```
+h(δ) = exp(-δ/δ_char)
+```
+
+Power law decay:
+```
+h(δ) = (δ_char / (δ + δ_char))^β
+```
+
+**Therefore:**
+```
+AS(δ) = AS₀ × exp(-δ/δ_char)
+```
+
+Where:
+- AS₀ = adverse selection at the touch (calibrate from data)
+- δ_char = characteristic depth (calibrate from data)
+
+**Calibration approach:**
+
+Measure post-fill price moves at each depth bucket. Fit exponential.
+
+#### Function 3: Spread Capture SC(δ)
+
+**Definition:** SC(δ) = net expected profit from a fill at depth δ
+
+```
+SC(δ) = δ - AS(δ) - fees
+      = δ - AS₀ × exp(-δ/δ_char) - fees
+```
+
+**Properties of SC(δ):**
+
+1. SC(0) = -AS₀ - fees < 0 (at the touch, AS dominates)
+2. SC(∞) → ∞ (deep levels have no AS, but also no fills)
+3. SC(δ) has a maximum at some δ* > 0
+
+**Finding the optimal tightest level δ*:**
+
+Take derivative, set to zero:
+```
+d/dδ [δ - AS₀ × exp(-δ/δ_char)] = 0
+1 - (AS₀/δ_char) × exp(-δ*/δ_char) = 0
+exp(-δ*/δ_char) = δ_char/AS₀
+δ* = δ_char × ln(AS₀/δ_char)
+```
+
+**Interpretation:** δ* is where marginal spread capture equals marginal AS cost.
+
+- If AS₀ is high (lots of informed flow): δ* is large (quote wide)
+- If δ_char is small (AS decays fast): δ* is small (can quote tighter)
+
+### 5.0.4 The Variational Problem
+
+Now we can formulate the full optimization.
+
+**Objective:**
+```
+max_{q(δ)} J = ∫₀^∞ q(δ) × λ(δ) × SC(δ) dδ - (γ/2)σ²(∫q(δ)dδ)² 
+```
+
+**Subject to:**
+```
+∫ q(δ) dδ ≤ Q_max  (total size constraint)
+q(δ) ≥ 0           (no negative sizes)
+```
+
+**Lagrangian:**
+```
+L = ∫ q(δ) × λ(δ) × SC(δ) dδ - (γ/2)σ²Q² - ν(Q - Q_max)
+```
+
+Where Q = ∫q(δ)dδ is total size.
+
+**First-order condition:**
+
+Taking the variational derivative:
+```
+∂L/∂q(δ) = λ(δ) × SC(δ) - γσ²Q - ν = 0
+```
+
+**Optimal quote density:**
+
+Rearranging:
+```
+λ(δ) × SC(δ) = γσ²Q + ν
+```
+
+The right side is constant (doesn't depend on δ). So:
+
+```
+q*(δ) > 0  only where  λ(δ) × SC(δ) = constant = c*
+
+q*(δ) = 0  where  λ(δ) × SC(δ) < c*
+```
+
+**Interpretation:**
+
+The optimal policy quotes where marginal value λ(δ)×SC(δ) equals a threshold c*.
+
+- Depths where λ(δ)×SC(δ) > c*: Quote maximum allowed
+- Depths where λ(δ)×SC(δ) < c*: Don't quote
+- Depths where λ(δ)×SC(δ) = c*: Optimal region
+
+**The threshold c* is determined by the constraint ∫q(δ)dδ = Q_max.**
+
+### 5.0.5 Shape of λ(δ) × SC(δ)
+
+Let's understand the shape of the objective integrand:
+
+```
+f(δ) = λ(δ) × SC(δ)
+     = (σ²/δ²) × (δ - AS₀ × e^(-δ/δ_char))
+     = σ²/δ - σ² × AS₀ × e^(-δ/δ_char) / δ²
+```
+
+**Behavior:**
+- As δ → 0: f(δ) → -∞ (AS dominates, λ explodes)
+- As δ → ∞: f(δ) → 0 (SC grows but λ → 0 faster)
+- f(δ) has a maximum at some δ_opt
+
+**Finding δ_opt:**
+
+Taking derivative and setting to zero is messy, but numerically:
+- For typical parameters (AS₀ = 2bp, δ_char = 5bp, σ = 50% annual), δ_opt ≈ 3-5bp
+
+### 5.0.6 From Continuous to Discrete: The Practical Ladder
+
+We can't quote a continuous density. We discretize to K levels.
+
+**Level placement:**
+
+Choose depths {δ₁, δ₂, ..., δ_K} to cover the region where λ(δ)×SC(δ) is significant.
+
+**Geometric spacing** often works well:
+```
+δ_k = δ_min × r^(k-1)
+
+where r = (δ_max/δ_min)^(1/(K-1))
+```
+
+Why geometric?
+- Fill probability λ(δ) ∝ 1/δ² is log-linear
+- Geometric spacing gives roughly equal log-spacing
+- Captures both tight (high λ, low SC) and wide (low λ, high SC)
+
+**Size allocation:**
+
+Given levels {δ_k}, allocate sizes proportional to marginal value:
+```
+s_k ∝ λ(δ_k) × SC(δ_k)
+```
+
+Normalize to total size budget S_total:
+```
+s_k = S_total × [λ(δ_k) × SC(δ_k)] / Σⱼ[λ(δⱼ) × SC(δⱼ)]
+```
+
+**Only quote levels with positive SC:**
+```
+s_k = 0  if SC(δ_k) ≤ 0
+```
+
+### 5.0.7 Inventory Adjustment
+
+The derivation above assumed zero inventory. With inventory q ≠ 0, we adjust.
+
+**The Avellaneda-Stoikov reservation price:**
+
+With inventory q, our "indifference price" shifts:
+```
+r = S - γσ²qT
+```
+
+**Derivation:**
+
+If we hold q until time T, our variance cost is (γ/2)σ²q²T.
+The marginal cost of one more unit: γσ²qT.
+So we should demand a discount of γσ²qT to buy more.
+
+**Effect on ladder:**
+
+Instead of quoting around mid S, quote around reservation r:
+```
+bid_k = r - δ_k = S - γσ²qT - δ_k
+ask_k = r + δ_k = S - γσ²qT + δ_k
+```
+
+- When long (q > 0): r < S, so bids wider, asks tighter → encourages selling
+- When short (q < 0): r > S, so bids tighter, asks wider → encourages buying
+
+**Size skewing:**
+
+Additionally, reduce size on the side that would increase |inventory|:
+```
+s_bid_k = s_k × (1 - q/q_max)^+  // reduce if long
+s_ask_k = s_k × (1 + q/q_max)^+  // reduce if short (q is negative)
+```
+
+### 5.0.8 Regime-Dependent Parameters
+
+All parameters should adjust with volatility regime:
+
+| Parameter | Low Vol | Normal | High Vol | Extreme |
+|-----------|---------|--------|----------|---------|
+| Base spread mult | 0.7 | 1.0 | 1.5 | 3.0 |
+| Size mult | 1.3 | 1.0 | 0.5 | 0.1 |
+| γ (risk aversion) | γ_base | γ_base | 1.5×γ_base | 3×γ_base |
+| δ_min | 0.5×normal | normal | 1.5×normal | 3×normal |
+
+### 5.0.9 The Complete Optimal Ladder Algorithm
+
+```
+ALGORITHM: ComputeOptimalLadder(state)
+
+INPUT:
+  - S: mid price
+  - σ: volatility
+  - q: current inventory
+  - AS₀, δ_char: adverse selection parameters
+  - γ: risk aversion
+  - T: holding horizon
+  - K: number of levels
+  - S_total: total size budget
+
+OUTPUT:
+  - Ladder L = {(price_k, size_k, side_k)}
+
+STEPS:
+
+1. COMPUTE RESERVATION PRICE
+   r = S - γ × σ² × q × T
+
+2. COMPUTE LEVEL DEPTHS
+   δ_min = max(tick_size, σ × √T × 0.1)
+   δ_max = σ × √T × 3.0
+   
+   // Geometric spacing
+   ratio = (δ_max / δ_min)^(1/(K-1))
+   FOR k = 1 TO K:
+     δ_k = δ_min × ratio^(k-1)
+
+3. COMPUTE WEIGHTS FOR EACH LEVEL
+   FOR k = 1 TO K:
+     // Fill intensity (simplified)
+     λ_k = σ² / δ_k²
+     
+     // Spread capture
+     SC_k = δ_k - AS₀ × exp(-δ_k / δ_char)
+     
+     // Weight (only if profitable)
+     IF SC_k > 0:
+       w_k = λ_k × SC_k
+     ELSE:
+       w_k = 0
+
+4. ALLOCATE SIZES
+   W = Σ_k w_k
+   IF W > 0:
+     FOR k = 1 TO K:
+       s_k = S_total × w_k / W
+   ELSE:
+     RETURN empty ladder (no profitable levels)
+
+5. APPLY INVENTORY SKEW
+   q_norm = q / q_max  // in [-1, 1]
+   
+   FOR k = 1 TO K:
+     // Reduce bid if long, reduce ask if short
+     s_bid_k = s_k × max(1 - q_norm, 0.1)
+     s_ask_k = s_k × max(1 + q_norm, 0.1)
+
+6. APPLY REGIME ADJUSTMENTS
+   spread_mult = regime_spread_multiplier(regime)
+   size_mult = regime_size_multiplier(regime)
+   
+   FOR k = 1 TO K:
+     δ_k = δ_k × spread_mult
+     s_bid_k = s_bid_k × size_mult
+     s_ask_k = s_ask_k × size_mult
+
+7. CONSTRUCT LADDER
+   FOR k = 1 TO K:
+     IF s_bid_k ≥ min_size:
+       ADD (price=r - δ_k, size=s_bid_k, side=BID) to L
+     IF s_ask_k ≥ min_size:
+       ADD (price=r + δ_k, size=s_ask_k, side=ASK) to L
+
+8. RETURN L
+```
+
+### 5.0.10 Summary: What Drives the Optimal Ladder
+
+| Factor | Effect on Depths | Effect on Sizes |
+|--------|------------------|-----------------|
+| σ ↑ (volatility up) | Wider spacing | Smaller sizes |
+| AS₀ ↑ (more informed flow) | Start deeper | Smaller sizes |
+| δ_char ↓ (AS decays faster) | Can quote tighter | Larger at tight levels |
+| q > 0 (long inventory) | Shift ladder down | Reduce bids, increase asks |
+| q < 0 (short inventory) | Shift ladder up | Increase bids, reduce asks |
+| γ ↑ (more risk averse) | Wider spreads | Smaller sizes |
+| Regime = Extreme | Much wider | Much smaller |
+
+The ladder is not arbitrary. Every parameter has a mathematical justification rooted in the optimization problem.
+
+---
+
 ## 5.1 The Quoting Algorithm
 
 ```rust

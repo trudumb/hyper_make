@@ -20,10 +20,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
-    AdverseSelectionConfig, BaseUrl, EstimatorConfig, ExchangeClient, GLFTStrategy,
-    HyperliquidExecutor, InfoClient, InventoryAwareStrategy, LiquidationConfig, MarketMaker,
-    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, QueueConfig, QuotingStrategy,
-    RiskConfig, SymmetricStrategy,
+    AdverseSelectionConfig, BaseUrl, EstimatorConfig, ExchangeClient, FundingConfig, GLFTStrategy,
+    HawkesConfig, HyperliquidExecutor, InfoClient, InventoryAwareStrategy, KillSwitchConfig,
+    LadderConfig, LadderStrategy, LiquidationConfig, MarginConfig, MarketMaker,
+    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
+    QuotingStrategy, RiskConfig, SpreadConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -231,6 +232,10 @@ pub struct StrategyConfig {
     /// If not set, uses risk_aversion from [trading] as gamma_base with defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_config: Option<RiskConfig>,
+    /// Ladder configuration for multi-level quoting (optional).
+    /// Only used when strategy_type = "ladder".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ladder_config: Option<LadderConfig>,
 }
 
 fn default_half_spread_bps() -> u16 {
@@ -272,6 +277,7 @@ impl Default for StrategyConfig {
             warmup_decay_secs: default_warmup_decay_secs(),
             min_warmup_trades: default_min_warmup_trades(),
             risk_config: None,
+            ladder_config: None,
         }
     }
 }
@@ -281,8 +287,10 @@ impl Default for StrategyConfig {
 pub enum StrategyType {
     Symmetric,
     InventoryAware,
-    #[default]
     Glft,
+    /// Multi-level ladder quoting with depth-dependent sizing (GLFT-based)
+    #[default]
+    Ladder,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -676,6 +684,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Box::new(GLFTStrategy::new(risk_aversion))
             }
         }
+        StrategyType::Ladder => {
+            let risk_cfg = config.strategy.risk_config.clone().unwrap_or_else(|| {
+                RiskConfig {
+                    gamma_base: risk_aversion,
+                    ..Default::default()
+                }
+            });
+            let ladder_cfg = config
+                .strategy
+                .ladder_config
+                .clone()
+                .unwrap_or_default();
+            info!(
+                gamma_base = risk_cfg.gamma_base,
+                num_levels = ladder_cfg.num_levels,
+                min_depth_bps = ladder_cfg.min_depth_bps,
+                max_depth_bps = ladder_cfg.max_depth_bps,
+                geometric_spacing = ladder_cfg.geometric_spacing,
+                "Using LadderStrategy (multi-level GLFT)"
+            );
+            Box::new(LadderStrategy::with_config(risk_cfg, ladder_cfg))
+        }
     };
 
     // Create estimator config for live parameter estimation (using legacy compatibility)
@@ -705,6 +735,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue_config = QueueConfig::default();
     let liquidation_config = LiquidationConfig::default();
 
+    // Create kill switch config (production safety)
+    let kill_switch_config = KillSwitchConfig::default();
+    info!(
+        max_daily_loss = %kill_switch_config.max_daily_loss,
+        max_drawdown = %format!("{:.1}%", kill_switch_config.max_drawdown * 100.0),
+        max_position_value = %kill_switch_config.max_position_value,
+        stale_data_threshold = ?kill_switch_config.stale_data_threshold,
+        "Kill switch enabled"
+    );
+
+    // Create Tier 2 module configs with defaults
+    let hawkes_config = HawkesConfig::default();
+    let funding_config = FundingConfig::default();
+    let spread_config = SpreadConfig::default();
+    let pnl_config = PnLConfig::default();
+    let margin_config = MarginConfig::default();
+
     // Create and start market maker
     let mut market_maker = MarketMaker::new(
         mm_config,
@@ -718,6 +765,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         as_config,
         queue_config,
         liquidation_config,
+        kill_switch_config,
+        hawkes_config,
+        funding_config,
+        spread_config,
+        pnl_config,
+        margin_config,
     );
 
     // Sync open orders
