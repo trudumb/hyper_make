@@ -114,9 +114,9 @@ pub struct PnLComponents {
 }
 
 impl PnLComponents {
-    /// Get total P&L (realized + unrealized).
+    /// Get total P&L (realized + unrealized - fees).
     pub fn total(&self) -> f64 {
-        self.realized_pnl + self.unrealized_pnl
+        self.realized_pnl + self.unrealized_pnl - self.fees
     }
 
     /// Get net trading P&L (spread - AS - fees).

@@ -88,6 +88,42 @@ pub enum LadderAction {
     Cancel { oid: u64 },
 }
 
+/// A pending order awaiting OID from exchange.
+///
+/// Used to bridge the race condition between order placement and fill notification.
+/// When an order is placed, we store it by (side, price_key) so that if a fill
+/// arrives before the OID is known, we can still find the placement price.
+#[derive(Debug, Clone)]
+pub struct PendingOrder {
+    /// Side of the order
+    pub side: Side,
+    /// Limit price
+    pub price: f64,
+    /// Intended order size
+    pub size: f64,
+    /// When the order was submitted
+    pub placed_at: Instant,
+}
+
+impl PendingOrder {
+    /// Create a new pending order.
+    pub fn new(side: Side, price: f64, size: f64) -> Self {
+        Self {
+            side,
+            price,
+            size,
+            placed_at: Instant::now(),
+        }
+    }
+}
+
+/// Convert a price to an integer key for HashMap lookup.
+/// Uses fixed-point representation with 8 decimal places.
+#[inline]
+fn price_to_key(price: f64) -> u64 {
+    (price * 1e8).round() as u64
+}
+
 /// A tracked order with its current state and lifecycle metadata.
 #[derive(Debug, Clone)]
 pub struct TrackedOrder {
@@ -214,10 +250,14 @@ impl Default for OrderManagerConfig {
 /// 1. Orders are never removed immediately after cancel - they wait for fill window
 /// 2. Position updates happen regardless of tracking (position is always correct)
 /// 3. Cleanup is centralized through the `cleanup()` method
+/// 4. Pending orders bridge the race between placement and fill notification
 #[derive(Debug)]
 pub struct OrderManager {
     /// Orders indexed by order ID
     orders: HashMap<u64, TrackedOrder>,
+    /// Pending orders awaiting OID assignment, indexed by (side, price_key).
+    /// Used to handle immediate fills that arrive before OID is known.
+    pending: HashMap<(Side, u64), PendingOrder>,
     /// Configuration
     config: OrderManagerConfig,
 }
@@ -233,6 +273,7 @@ impl OrderManager {
     pub fn new() -> Self {
         Self {
             orders: HashMap::new(),
+            pending: HashMap::new(),
             config: OrderManagerConfig::default(),
         }
     }
@@ -241,6 +282,7 @@ impl OrderManager {
     pub fn with_config(config: OrderManagerConfig) -> Self {
         Self {
             orders: HashMap::new(),
+            pending: HashMap::new(),
             config,
         }
     }
@@ -289,6 +331,70 @@ impl OrderManager {
             .values()
             .filter(|o| o.side == side && !o.is_terminal())
             .collect()
+    }
+
+    // === Pending Order Management ===
+    // These methods handle the race condition between order placement and fill notification.
+    // When a bulk order is placed, we register it as "pending" by (side, price) before the
+    // API call returns. This allows fills that arrive before the OID is known to still
+    // find the placement price.
+
+    /// Register a pending order before placing it on the exchange.
+    ///
+    /// Call this BEFORE the bulk order API call. When the API returns with OIDs,
+    /// call `finalize_pending()` to convert to a tracked order.
+    pub fn add_pending(&mut self, side: Side, price: f64, size: f64) {
+        let key = (side, price_to_key(price));
+        self.pending
+            .insert(key, PendingOrder::new(side, price, size));
+    }
+
+    /// Finalize a pending order by assigning it a real OID.
+    ///
+    /// Call this when the bulk order API returns with the assigned OID.
+    /// Moves the order from pending to tracked.
+    /// Returns the pending order if found, None if not found (shouldn't happen).
+    pub fn finalize_pending(&mut self, side: Side, price: f64, oid: u64, resting_size: f64) {
+        let key = (side, price_to_key(price));
+        if self.pending.remove(&key).is_some() {
+            // Create tracked order with the real OID and resting size from exchange
+            self.add_order(TrackedOrder::new(oid, side, price, resting_size));
+        }
+        // Note: If pending not found, order may have been cleaned up or never registered.
+        // This is fine - the order will be tracked when we see it in responses.
+    }
+
+    /// Get a pending order by side and price.
+    ///
+    /// Used when a fill arrives but the order isn't tracked by OID yet.
+    /// Returns the placement price so we can feed the kappa estimator.
+    pub fn get_pending(&self, side: Side, price: f64) -> Option<&PendingOrder> {
+        let key = (side, price_to_key(price));
+        self.pending.get(&key)
+    }
+
+    /// Remove a pending order by side and price.
+    ///
+    /// Used when an order fills immediately and we don't want to track it.
+    pub fn remove_pending(&mut self, side: Side, price: f64) -> Option<PendingOrder> {
+        let key = (side, price_to_key(price));
+        self.pending.remove(&key)
+    }
+
+    /// Remove stale pending orders that have been waiting too long.
+    ///
+    /// Pending orders should be finalized within milliseconds. If they're still
+    /// pending after max_age, something went wrong (e.g., API error, disconnection).
+    /// Returns the number of stale orders removed.
+    pub fn cleanup_stale_pending(&mut self, max_age: Duration) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|_, p| p.placed_at.elapsed() < max_age);
+        before - self.pending.len()
+    }
+
+    /// Get the number of pending orders (for debugging/metrics).
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// Set the state of an order (legacy method - prefer transition methods).

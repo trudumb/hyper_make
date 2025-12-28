@@ -47,6 +47,8 @@ pub use market_maker::{
     CorrelationSummary,
     DataQualityConfig,
     DataQualityMonitor,
+    // Dynamic Risk Configuration
+    DynamicRiskConfig,
     // Core types
     EstimatorConfig,
     // Tier 2: Funding Rate

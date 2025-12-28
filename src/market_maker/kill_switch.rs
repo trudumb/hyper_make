@@ -56,6 +56,68 @@ impl Default for KillSwitchConfig {
     }
 }
 
+use super::config::DynamicRiskConfig;
+
+/// Calculate dynamic max_position_value from first principles.
+///
+/// Two constraints applied:
+/// 1. **Leverage constraint**: position_value ≤ account_value × max_leverage
+/// 2. **Volatility constraint**: position_value ≤ (equity × risk_fraction) / (num_sigmas × σ × √T)
+///
+/// The final limit is min(leverage_limit, volatility_limit).
+/// Volatility can only reduce the limit, never exceed leverage.
+///
+/// Uses Bayesian blend to regularize volatility limit towards prior when sigma confidence is low.
+///
+/// # Arguments
+/// * `account_value` - Current account equity in USD
+/// * `sigma` - Per-second volatility estimate (from estimator)
+/// * `time_horizon` - Expected holding time in seconds (1 / arrival_intensity)
+/// * `sigma_confidence` - Confidence in sigma estimate, 0.0-1.0
+/// * `risk_config` - Dynamic risk configuration with priors and leverage
+///
+/// # Returns
+/// Position value limit in USD, capped by leverage
+pub fn calculate_dynamic_max_position_value(
+    account_value: f64,
+    sigma: f64,
+    time_horizon: f64,
+    sigma_confidence: f64,
+    risk_config: &DynamicRiskConfig,
+) -> f64 {
+    // Hard constraint from leverage - this is the ceiling
+    let leverage_limit = account_value * risk_config.max_leverage;
+
+    // Guard against degenerate inputs - fall back to leverage limit
+    if account_value <= 0.0 {
+        return 0.0;
+    }
+    if sigma <= 1e-9 || time_horizon <= 0.0 {
+        return leverage_limit;
+    }
+
+    // Prior estimate: what we'd use with no market data (but still capped by leverage)
+    let prior_move = risk_config.sigma_prior * time_horizon.sqrt();
+    let prior_volatility_limit = if prior_move > 1e-9 {
+        (account_value * risk_config.risk_fraction) / (risk_config.num_sigmas * prior_move)
+    } else {
+        leverage_limit
+    };
+
+    // Raw limit from observed volatility
+    let expected_move = sigma * time_horizon.sqrt();
+    let raw_volatility_limit =
+        (account_value * risk_config.risk_fraction) / (risk_config.num_sigmas * expected_move);
+
+    // Bayesian blend: posterior = (confidence × raw + (1-confidence) × prior)
+    let confidence = sigma_confidence.clamp(0.0, 1.0);
+    let volatility_limit = confidence * raw_volatility_limit + (1.0 - confidence) * prior_volatility_limit;
+
+    // Final limit: min of leverage and volatility constraints
+    // Volatility can reduce limit during high-risk periods, but never exceed leverage
+    leverage_limit.min(volatility_limit)
+}
+
 /// Reasons why the kill switch can be triggered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KillReason {
@@ -162,8 +224,8 @@ pub struct KillSwitch {
     triggered: AtomicBool,
     /// Reasons why the kill switch was triggered (may have multiple)
     trigger_reasons: Mutex<Vec<KillReason>>,
-    /// Configuration
-    config: KillSwitchConfig,
+    /// Configuration (uses Mutex for dynamic limit updates)
+    config: Mutex<KillSwitchConfig>,
     /// Current state
     state: Mutex<KillSwitchState>,
 }
@@ -174,7 +236,7 @@ impl KillSwitch {
         Self {
             triggered: AtomicBool::new(false),
             trigger_reasons: Mutex::new(Vec::new()),
-            config,
+            config: Mutex::new(config),
             state: Mutex::new(KillSwitchState::default()),
         }
     }
@@ -212,7 +274,10 @@ impl KillSwitch {
     /// Note: Even if already triggered, this will continue to check and log
     /// additional reasons.
     pub fn check(&self, state: &KillSwitchState) -> Option<KillReason> {
-        if !self.config.enabled {
+        // Lock config once for all checks
+        let config = self.config.lock().unwrap();
+
+        if !config.enabled {
             return None;
         }
 
@@ -223,32 +288,32 @@ impl KillSwitch {
         }
 
         // Check each condition
-        if let Some(reason) = self.check_daily_loss(state) {
+        if let Some(reason) = self.check_daily_loss(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
 
-        if let Some(reason) = self.check_drawdown(state) {
+        if let Some(reason) = self.check_drawdown(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
 
-        if let Some(reason) = self.check_position_value(state) {
+        if let Some(reason) = self.check_position_value(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
 
-        if let Some(reason) = self.check_stale_data(state) {
+        if let Some(reason) = self.check_stale_data(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
 
-        if let Some(reason) = self.check_rate_limit(state) {
+        if let Some(reason) = self.check_rate_limit(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
 
-        if let Some(reason) = self.check_cascade(state) {
+        if let Some(reason) = self.check_cascade(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
@@ -302,9 +367,23 @@ impl KillSwitch {
         self.state.lock().unwrap().clone()
     }
 
-    /// Get configuration.
-    pub fn config(&self) -> &KillSwitchConfig {
-        &self.config
+    /// Get configuration snapshot.
+    pub fn config(&self) -> KillSwitchConfig {
+        self.config.lock().unwrap().clone()
+    }
+
+    /// Update the dynamic position value limit.
+    ///
+    /// Call this periodically to adjust limits based on current account equity,
+    /// volatility, and sigma confidence. Uses Bayesian blend to regularize.
+    pub fn update_dynamic_limit(&self, new_max_value: f64) {
+        let mut config = self.config.lock().unwrap();
+        config.max_position_value = new_max_value;
+    }
+
+    /// Get the current max position value limit.
+    pub fn max_position_value(&self) -> f64 {
+        self.config.lock().unwrap().max_position_value
     }
 
     // === Private helper methods ===
@@ -320,65 +399,91 @@ impl KillSwitch {
         }
     }
 
-    fn check_daily_loss(&self, state: &KillSwitchState) -> Option<KillReason> {
+    fn check_daily_loss(
+        &self,
+        state: &KillSwitchState,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
         let loss = -state.daily_pnl; // Convert to positive loss
-        if loss > self.config.max_daily_loss {
+        if loss > config.max_daily_loss {
             return Some(KillReason::MaxLoss {
                 loss,
-                limit: self.config.max_daily_loss,
+                limit: config.max_daily_loss,
             });
         }
         None
     }
 
-    fn check_drawdown(&self, state: &KillSwitchState) -> Option<KillReason> {
+    fn check_drawdown(
+        &self,
+        state: &KillSwitchState,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
         if state.peak_pnl <= 0.0 {
             return None; // No peak to draw down from
         }
 
         let drawdown = (state.peak_pnl - state.daily_pnl) / state.peak_pnl;
-        if drawdown > self.config.max_drawdown {
+        if drawdown > config.max_drawdown {
             return Some(KillReason::MaxDrawdown {
                 drawdown,
-                limit: self.config.max_drawdown,
+                limit: config.max_drawdown,
             });
         }
         None
     }
 
-    fn check_position_value(&self, state: &KillSwitchState) -> Option<KillReason> {
+    fn check_position_value(
+        &self,
+        state: &KillSwitchState,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
         let value = state.position.abs() * state.mid_price;
-        if value > self.config.max_position_value {
+        // Kill switch at 2x soft limit (reduce-only mode handles 1x-2x range in update_quotes)
+        let hard_limit = config.max_position_value * 2.0;
+        if value > hard_limit {
             return Some(KillReason::MaxPosition {
                 value,
-                limit: self.config.max_position_value,
+                limit: hard_limit,
             });
         }
         None
     }
 
-    fn check_stale_data(&self, state: &KillSwitchState) -> Option<KillReason> {
+    fn check_stale_data(
+        &self,
+        state: &KillSwitchState,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
         let elapsed = state.last_data_time.elapsed();
-        if elapsed > self.config.stale_data_threshold {
+        if elapsed > config.stale_data_threshold {
             return Some(KillReason::StaleData {
                 elapsed,
-                threshold: self.config.stale_data_threshold,
+                threshold: config.stale_data_threshold,
             });
         }
         None
     }
 
-    fn check_rate_limit(&self, state: &KillSwitchState) -> Option<KillReason> {
-        if state.rate_limit_errors > self.config.max_rate_limit_errors {
+    fn check_rate_limit(
+        &self,
+        state: &KillSwitchState,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
+        if state.rate_limit_errors > config.max_rate_limit_errors {
             return Some(KillReason::RateLimit {
                 count: state.rate_limit_errors,
-                limit: self.config.max_rate_limit_errors,
+                limit: config.max_rate_limit_errors,
             });
         }
         None
     }
 
-    fn check_cascade(&self, state: &KillSwitchState) -> Option<KillReason> {
+    fn check_cascade(
+        &self,
+        state: &KillSwitchState,
+        _config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
         // Cascade severity > 1.0 means intensity is above normal
         // We trigger at severity > 5.0 (5x normal intensity)
         if state.cascade_severity > 5.0 {
@@ -512,15 +617,17 @@ mod tests {
 
     #[test]
     fn test_max_position_trigger() {
+        // Kill switch triggers at 2x the soft limit (reduce-only handles 1x-2x)
         let config = KillSwitchConfig {
-            max_position_value: 5000.0,
+            max_position_value: 5000.0, // Soft limit $5k, hard limit $10k
             ..Default::default()
         };
         let ks = KillSwitch::new(config);
 
+        // Position value $11k > hard limit $10k should trigger
         let state = KillSwitchState {
-            position: 0.1,        // 0.1 BTC
-            mid_price: 100_000.0, // $100k per BTC = $10k position
+            position: 0.11,       // 0.11 BTC
+            mid_price: 100_000.0, // $100k per BTC = $11k position
             last_data_time: Instant::now(),
             ..Default::default()
         };
@@ -529,11 +636,35 @@ mod tests {
         assert!(reason.is_some());
         match reason.unwrap() {
             KillReason::MaxPosition { value, limit } => {
-                assert_eq!(value, 10_000.0);
-                assert_eq!(limit, 5000.0);
+                assert_eq!(value, 11_000.0);
+                assert_eq!(limit, 10_000.0); // 2x soft limit
             }
             _ => panic!("Expected MaxPosition reason"),
         }
+    }
+
+    #[test]
+    fn test_max_position_reduce_only_zone_does_not_trigger() {
+        // Between 1x and 2x limit, reduce-only mode handles it, not kill switch
+        let config = KillSwitchConfig {
+            max_position_value: 5000.0, // Soft limit $5k, hard limit $10k
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Position value $8k is in reduce-only zone (1x-2x), should NOT trigger kill switch
+        let state = KillSwitchState {
+            position: 0.08,       // 0.08 BTC
+            mid_price: 100_000.0, // $100k per BTC = $8k position
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+
+        let reason = ks.check(&state);
+        assert!(
+            reason.is_none(),
+            "Kill switch should not trigger at 1.6x limit (reduce-only zone)"
+        );
     }
 
     #[test]

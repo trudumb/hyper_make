@@ -22,8 +22,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
-    AdverseSelectionConfig, BaseUrl, DataQualityConfig, EstimatorConfig, ExchangeClient,
-    FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient,
+    AdverseSelectionConfig, BaseUrl, DataQualityConfig, DynamicRiskConfig, EstimatorConfig,
+    ExchangeClient, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient,
     InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
     MarginConfig, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
     PnLConfig, QueueConfig, QuotingStrategy, RiskConfig, SpreadConfig, SymmetricStrategy,
@@ -61,6 +61,10 @@ struct Cli {
     /// Override max position size
     #[arg(long)]
     max_position: Option<f64>,
+
+    /// Set leverage for the asset (default: 20)
+    #[arg(long)]
+    leverage: Option<u32>,
 
     /// Override decimals for price rounding
     #[arg(long)]
@@ -195,6 +199,10 @@ pub struct TradingConfig {
     /// Maximum absolute position size
     #[serde(default = "default_max_position")]
     pub max_absolute_position_size: f64,
+    /// Leverage to use (will be set on exchange at startup)
+    /// If not specified, uses max available leverage for the asset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leverage: Option<u32>,
     /// Decimals for price rounding (auto-calculated from asset metadata if not set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decimals: Option<u32>,
@@ -224,6 +232,7 @@ impl Default for TradingConfig {
             risk_aversion: default_risk_aversion(),
             max_bps_diff: default_max_bps_diff(),
             max_absolute_position_size: default_max_position(),
+            leverage: None, // Uses max available from asset metadata
             decimals: None, // Auto-calculated from asset metadata
         }
     }
@@ -552,6 +561,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sz_decimals = asset_meta.sz_decimals;
 
+    // Use CLI/config leverage if specified, otherwise use max available from asset metadata
+    let leverage = cli
+        .leverage
+        .or(config.trading.leverage)
+        .unwrap_or(asset_meta.max_leverage as u32);
+
+    info!(
+        asset = %asset,
+        max_leverage = asset_meta.max_leverage,
+        using_leverage = leverage,
+        "Leverage: using {} (max available: {}x)",
+        if cli.leverage.is_some() || config.trading.leverage.is_some() { "configured" } else { "max available" },
+        asset_meta.max_leverage
+    );
+
     // Auto-calculate price decimals from asset metadata if not explicitly set
     let decimals = match cli.decimals.or(config.trading.decimals) {
         Some(d) => d,
@@ -584,6 +608,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         risk_aversion = %risk_aversion,
         max_bps_diff = %max_bps_diff,
         max_position = %max_position,
+        leverage = %leverage,
         decimals = %decimals,
         strategy = ?config.strategy.strategy_type,
         network = ?base_url,
@@ -616,6 +641,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("Failed to create exchange client: {e}"))?;
 
+    // Set leverage on the exchange
+    info!(leverage = leverage, asset = %asset, "Setting leverage on exchange");
+    match exchange_client
+        .update_leverage(leverage, &asset, true, None)
+        .await
+    {
+        Ok(response) => {
+            info!(leverage = leverage, response = ?response, "Leverage set successfully");
+        }
+        Err(e) => {
+            warn!(leverage = leverage, error = %e, "Failed to set leverage, using existing");
+        }
+    }
+
     // Query initial position
     let user_address = wallet.address();
     let user_state = info_client
@@ -634,9 +673,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Queried initial position"
     );
 
-    // Query leverage and account equity for position limits
+    // Query account equity for position limits (leverage was already set above)
     let (target_liquidity, max_position) = {
-        // Query both asset data (for leverage) and user state (for account value)
         let asset_data_result = info_client
             .active_asset_data(user_address, asset.clone())
             .await;
@@ -645,16 +683,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match (asset_data_result, user_state_result) {
             (Ok(asset_data), Ok(user_state)) => {
                 let mark_px: f64 = asset_data.mark_px.parse().unwrap_or(1.0);
-                let leverage: f64 = asset_data.leverage.value as f64;
                 let account_value: f64 = user_state
                     .margin_summary
                     .account_value
                     .parse()
                     .unwrap_or(0.0);
 
-                // Calculate max position from account equity × leverage
+                // Calculate max position from account equity × leverage (we set leverage above)
                 // Use 50% safety factor to leave room for adverse moves
-                let max_from_leverage = (account_value * leverage * 0.5) / mark_px;
+                let max_from_leverage = (account_value * leverage as f64 * 0.5) / mark_px;
 
                 // Cap to configured max_position (if user wants smaller)
                 let capped_max_pos = max_position.min(max_from_leverage);
@@ -669,7 +706,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_from_leverage = %format!("{:.6}", max_from_leverage),
                     capped_max_pos = %format!("{:.6}", capped_max_pos),
                     capped_liquidity = %format!("{:.6}", capped_liquidity),
-                    "Position limits from leverage (equity × leverage × 0.5 / price)"
+                    "Position limits (equity × leverage × 0.5 / price)"
                 );
 
                 (capped_liquidity, capped_max_pos)
@@ -684,6 +721,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    // Create dynamic risk config with the leverage we set
+    let dynamic_risk_config = DynamicRiskConfig::default().with_max_leverage(leverage as f64);
+    info!(
+        max_leverage = leverage,
+        risk_fraction = dynamic_risk_config.risk_fraction,
+        num_sigmas = dynamic_risk_config.num_sigmas,
+        sigma_prior = dynamic_risk_config.sigma_prior,
+        "Dynamic risk config (position limit = min(equity × leverage, volatility-based))"
+    );
 
     // Create market maker config
     let mm_config = MmConfig {
@@ -807,7 +854,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pnl_config,
         margin_config,
         data_quality_config,
-    );
+    )
+    .with_dynamic_risk_config(dynamic_risk_config);
 
     // Sync open orders
     market_maker

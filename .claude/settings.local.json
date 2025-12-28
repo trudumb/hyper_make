@@ -28,7 +28,8 @@
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 60 cargo run:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 120 cargo run:*)",
       "Bash(tee:*)",
-      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 330 cargo run:*)"
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 330 cargo run:*)",
+      "Bash(pkill:*)"
     ]
   }
 }

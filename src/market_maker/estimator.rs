@@ -53,11 +53,15 @@ pub struct EstimatorConfig {
     /// Jump detection threshold: RV/BV ratio > threshold = toxic regime
     pub jump_ratio_threshold: f64,
 
-    // === Kappa Estimation ===
-    /// Maximum distance from mid for kappa regression (as fraction, e.g., 0.01 = 1%)
-    pub kappa_max_distance: f64,
-    /// Maximum number of L2 levels to use per side
-    pub kappa_max_levels: usize,
+    // === Bayesian Kappa Estimation ===
+    /// Prior mean for κ (default 500 = 20 bps avg fill distance)
+    /// Higher κ = trades execute closer to mid (tighter markets)
+    pub kappa_prior_mean: f64,
+    /// Prior strength (effective sample size, default 10)
+    /// Higher = more confident prior, slower adaptation to data
+    pub kappa_prior_strength: f64,
+    /// Observation window for kappa estimation (ms, default 300000 = 5 min)
+    pub kappa_window_ms: u64,
 
     // === Warmup ===
     /// Minimum volume ticks before volatility estimates are valid
@@ -100,9 +104,12 @@ impl Default for EstimatorConfig {
             // Regime Detection - true toxic flow detection
             jump_ratio_threshold: 3.0, // RV/BV > 3.0 = toxic (lower values are normal bid-ask bounce)
 
-            // Kappa
-            kappa_max_distance: 0.01, // 1% from mid
-            kappa_max_levels: 15,
+            // Bayesian Kappa (First Principles)
+            // Prior: κ ~ Gamma(α₀, β₀) with mean = 500, strength = 10
+            // κ = 500 implies avg fill distance = 1/500 = 0.002 = 20 bps
+            kappa_prior_mean: 500.0,
+            kappa_prior_strength: 10.0,
+            kappa_window_ms: 300_000, // 5 minutes
 
             // Warmup - reasonable for testnet/low-activity
             min_volume_ticks: 10,
@@ -1343,225 +1350,163 @@ impl TradeFlowTracker {
 }
 
 // ============================================================================
-// Weighted Kappa Estimator (Improved L2 Analysis)
+// Bayesian Kappa Estimator (First Principles Implementation)
 // ============================================================================
 
-/// Weighted linear regression kappa estimator.
+/// Bayesian kappa estimator with Gamma conjugate prior.
 ///
-/// Improvements over simple kappa:
-/// - Truncates to orders within max_distance of mid (ignores fake far orders)
-/// - Uses first N levels only (focuses on relevant liquidity)
-/// - Weights by proximity to mid (closer levels matter more)
+/// ## First Principles
+///
+/// In GLFT, κ is the fill rate decay parameter in λ(δ) = A × exp(-κδ).
+/// When modeling fill distances as exponential with rate κ:
+///
+/// - Likelihood: L(δ₁...δₙ | κ) = κⁿ exp(-κ Σδᵢ)
+/// - Gamma prior: π(κ | α₀, β₀) ∝ κ^(α₀-1) exp(-β₀ κ)
+/// - Posterior: π(κ | data) = Gamma(α₀ + n, β₀ + Σδᵢ)
+///
+/// This conjugacy gives:
+/// - Posterior mean: E[κ | data] = (α₀ + n) / (β₀ + Σδ)
+/// - Posterior variance: Var[κ | data] = (α₀ + n) / (β₀ + Σδ)²
+/// - Posterior std: σ_κ = κ̂ / √(α₀ + n)
+///
+/// ## No Clamping Needed
+///
+/// With proper Bayesian regularization:
+/// - Prior provides natural regularization toward reasonable values
+/// - Sparse data → posterior ≈ prior (no extreme estimates)
+/// - Abundant data → posterior → MLE (data-driven)
+/// - Uncertainty is explicit, not hidden by arbitrary clamps
+///
+/// ## Interpretation
+///
+/// κ = 500 implies E[distance] = 1/500 = 0.002 = 20 bps average fill distance
+/// κ = 1000 implies E[distance] = 10 bps (tighter markets)
+/// κ = 200 implies E[distance] = 50 bps (wider markets)
 #[derive(Debug)]
-struct WeightedKappaEstimator {
-    alpha: f64,
-    kappa: f64,
-    max_distance: f64,
-    max_levels: usize,
-    update_count: usize,
-}
+struct BayesianKappaEstimator {
+    /// Prior shape parameter (α₀). Higher = more confident prior.
+    prior_alpha: f64,
 
-impl WeightedKappaEstimator {
-    fn new(
-        half_life_updates: f64,
-        default_kappa: f64,
-        max_distance: f64,
-        max_levels: usize,
-    ) -> Self {
-        Self {
-            alpha: (2.0_f64.ln() / half_life_updates).clamp(0.001, 1.0),
-            kappa: default_kappa,
-            max_distance,
-            max_levels,
-            update_count: 0,
-        }
-    }
+    /// Prior rate parameter (β₀). Prior mean = α₀/β₀.
+    prior_beta: f64,
 
-    /// Update kappa from L2 order book.
-    ///
-    /// Uses instantaneous depth (size at each level) to fit exponential decay:
-    /// L(δ) = A × exp(-κ × δ)  =>  ln(L) = ln(A) - κ × δ
-    fn update(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) {
-        if mid <= 0.0 {
-            return;
-        }
-
-        // Collect points: (distance, size_at_level, weight)
-        let mut points: Vec<(f64, f64, f64)> = Vec::new();
-
-        // Process bids (truncate and limit levels)
-        for (i, (price, size)) in bids.iter().enumerate() {
-            if i >= self.max_levels || *price <= 0.0 || *size <= 0.0 {
-                break;
-            }
-            let distance = (mid - price) / mid;
-            if distance > self.max_distance {
-                break; // Too far from mid
-            }
-            // Weight by proximity: closer to mid = higher weight
-            let weight = 1.0 / (1.0 + distance * 100.0);
-            if distance > 1e-6 {
-                points.push((distance, *size, weight));
-            }
-        }
-
-        // Process asks (same logic)
-        for (i, (price, size)) in asks.iter().enumerate() {
-            if i >= self.max_levels || *price <= 0.0 || *size <= 0.0 {
-                break;
-            }
-            let distance = (price - mid) / mid;
-            if distance > self.max_distance {
-                break;
-            }
-            let weight = 1.0 / (1.0 + distance * 100.0);
-            if distance > 1e-6 {
-                points.push((distance, *size, weight));
-            }
-        }
-
-        // Need at least 4 points for meaningful regression
-        if points.len() < 4 {
-            return;
-        }
-
-        // Weighted linear regression on (distance, ln(size))
-        // Model: ln(size) = ln(A) - κ × distance
-        // Slope = -κ, so κ = -slope
-        if let Some(slope) = weighted_linear_regression_slope(&points) {
-            // In real order books, liquidity often INCREASES slightly with distance
-            // (more limit orders stacked further from mid), giving positive slope.
-            // Use absolute value and a reasonable default if slope is wrong sign.
-            let kappa_estimated = if slope < 0.0 {
-                // Negative slope = liquidity decays with distance (expected in theory)
-                (-slope).clamp(1.0, 10000.0)
-            } else {
-                // Positive slope = liquidity increases with distance (common in practice)
-                // Use a moderate default based on typical market structure
-                50.0
-            };
-
-            // EWMA update
-            self.kappa = self.alpha * kappa_estimated + (1.0 - self.alpha) * self.kappa;
-            self.update_count += 1;
-
-            debug!(
-                points = points.len(),
-                slope = %format!("{:.4}", slope),
-                kappa_new = %format!("{:.2}", kappa_estimated),
-                kappa_ewma = %format!("{:.2}", self.kappa),
-                "Kappa updated from L2 book"
-            );
-        }
-    }
-
-    #[allow(dead_code)]
-    fn kappa(&self) -> f64 {
-        self.kappa.clamp(1.0, 10000.0)
-    }
-
-    #[allow(dead_code)]
-    fn update_count(&self) -> usize {
-        self.update_count
-    }
-}
-
-// ============================================================================
-// Fill Rate Kappa Estimator (Trade Distance Distribution)
-// ============================================================================
-
-/// Estimates κ from trade execution distance distribution with confidence tracking.
-///
-/// This is the CORRECT κ for the GLFT formula:
-/// λ(δ) = A × exp(-κ × δ)  where λ is fill rate at distance δ
-///
-/// For exponential distribution: E[δ] = 1/κ, so κ = 1/E[δ]
-///
-/// This measures WHERE trades actually execute relative to mid,
-/// NOT the shape of the order book (which is a different concept).
-///
-/// **Enhancements:**
-/// - Variance tracking for confidence estimation
-/// - Goodness-of-fit scoring for exponential assumption validation
-/// - Sample size weighting in confidence calculation
-#[derive(Debug)]
-struct FillRateKappaEstimator {
-    /// Rolling observations: (distance, volume, timestamp)
+    /// Rolling window observations: (distance, volume, timestamp)
     observations: VecDeque<(f64, f64, u64)>,
+
     /// Rolling window (ms)
     window_ms: u64,
-    /// Running volume-weighted distance sum (for efficiency)
-    volume_weighted_distance: f64,
-    /// Running volume-weighted squared distance sum (for variance)
-    volume_weighted_distance_sq: f64,
-    /// Running total volume
-    total_volume: f64,
-    /// EWMA smoothed kappa
-    kappa: f64,
-    /// EWMA alpha
-    alpha: f64,
-    /// Update count for warmup
-    update_count: usize,
-    /// Default kappa for fallback
-    #[allow(dead_code)]
-    default_kappa: f64,
-    /// Coefficient of variation (CV) - measure of relative dispersion
+
+    /// Sum of volume-weighted distances (Σ vᵢ × δᵢ) in current window
+    sum_volume_weighted_distance: f64,
+
+    /// Sum of volume-weighted squared distances (for variance/CV)
+    sum_volume_weighted_distance_sq: f64,
+
+    /// Sum of volumes (effective n for volume-weighted version)
+    sum_volume: f64,
+
+    /// Cached posterior mean κ̂
+    kappa_posterior_mean: f64,
+
+    /// Cached posterior standard deviation
+    kappa_posterior_std: f64,
+
+    /// Volume-weighted mean distance (for diagnostics)
+    mean_distance: f64,
+
+    /// Coefficient of variation (CV = σ/μ). For exponential, CV = 1.0.
     cv: f64,
-    /// Goodness of fit score [0, 1] - how well data fits exponential
-    fit_score: f64,
+
+    /// Update count for logging throttling
+    update_count: usize,
 }
 
-impl FillRateKappaEstimator {
-    fn new(window_ms: u64, half_life_ticks: f64, default_kappa: f64) -> Self {
+impl BayesianKappaEstimator {
+    /// Create a new Bayesian kappa estimator.
+    ///
+    /// # Arguments
+    /// * `prior_mean` - Prior expected value of κ (e.g., 500 for 20 bps avg distance)
+    /// * `prior_strength` - Effective sample size of prior (e.g., 10)
+    /// * `window_ms` - Rolling window in milliseconds
+    fn new(prior_mean: f64, prior_strength: f64, window_ms: u64) -> Self {
+        // Convert prior mean and strength to Gamma parameters
+        // Prior mean = α₀/β₀, prior strength = α₀
+        // So: α₀ = prior_strength, β₀ = prior_strength / prior_mean
+        let prior_alpha = prior_strength;
+        let prior_beta = prior_strength / prior_mean;
+
         Self {
-            observations: VecDeque::with_capacity(1000),
+            prior_alpha,
+            prior_beta,
+            observations: VecDeque::with_capacity(10000),
             window_ms,
-            volume_weighted_distance: 0.0,
-            volume_weighted_distance_sq: 0.0,
-            total_volume: 0.0,
-            kappa: default_kappa,
-            alpha: (2.0_f64.ln() / half_life_ticks).clamp(0.001, 0.5),
+            sum_volume_weighted_distance: 0.0,
+            sum_volume_weighted_distance_sq: 0.0,
+            sum_volume: 0.0,
+            kappa_posterior_mean: prior_mean,
+            kappa_posterior_std: prior_mean / prior_strength.sqrt(),
+            mean_distance: 1.0 / prior_mean,
+            cv: 1.0, // Exponential has CV = 1.0
             update_count: 0,
-            default_kappa,
-            cv: 1.0,        // For exponential, CV = 1.0 exactly
-            fit_score: 0.5, // Start neutral
         }
     }
 
-    /// Process a trade. mid must be the mid price at time of trade.
+    /// Process a trade and update posterior.
+    ///
+    /// # Arguments
+    /// * `timestamp_ms` - Trade timestamp
+    /// * `price` - Trade execution price
+    /// * `size` - Trade size (volume weight)
+    /// * `mid` - Mid price at time of trade
     fn on_trade(&mut self, timestamp_ms: u64, price: f64, size: f64, mid: f64) {
         if mid <= 0.0 || size <= 0.0 || price <= 0.0 {
             return;
         }
 
-        // Distance from mid as fraction
+        // Calculate distance as fraction of mid
         let distance = ((price - mid) / mid).abs();
 
-        // Minimum distance floor to avoid division issues
-        // Trades AT the mid get a small floor distance
-        let distance = distance.max(0.00001); // 0.1 bps floor
+        // Apply small floor to prevent division issues for trades at mid
+        // 0.1 bps = 0.00001 is a reasonable floor
+        let distance = distance.max(0.00001);
 
-        // Add observation
+        // Add observation (volume-weighted)
         self.observations.push_back((distance, size, timestamp_ms));
-        self.volume_weighted_distance += distance * size;
-        self.volume_weighted_distance_sq += distance * distance * size;
-        self.total_volume += size;
+        self.sum_volume_weighted_distance += distance * size;
+        self.sum_volume_weighted_distance_sq += distance * distance * size;
+        self.sum_volume += size;
 
         // Expire old observations
         self.expire_old(timestamp_ms);
 
-        // Update kappa estimate and fit metrics
-        self.update_kappa();
-        self.update_fit_metrics();
+        // Update posterior
+        self.update_posterior();
+
+        self.update_count += 1;
+
+        // Log periodically (every 100 updates)
+        if self.update_count.is_multiple_of(100) {
+            debug!(
+                observations = self.observations.len(),
+                sum_volume = %format!("{:.2}", self.sum_volume),
+                mean_distance_bps = %format!("{:.2}", self.mean_distance * 10000.0),
+                kappa_posterior = %format!("{:.0}", self.kappa_posterior_mean),
+                kappa_std = %format!("{:.0}", self.kappa_posterior_std),
+                confidence = %format!("{:.2}", self.confidence()),
+                cv = %format!("{:.2}", self.cv),
+                "Kappa posterior updated (Bayesian)"
+            );
+        }
     }
 
+    /// Expire old observations outside the rolling window.
     fn expire_old(&mut self, now: u64) {
         let cutoff = now.saturating_sub(self.window_ms);
         while let Some((dist, size, ts)) = self.observations.front() {
             if *ts < cutoff {
-                self.volume_weighted_distance -= dist * size;
-                self.volume_weighted_distance_sq -= dist * dist * size;
-                self.total_volume -= size;
+                self.sum_volume_weighted_distance -= dist * size;
+                self.sum_volume_weighted_distance_sq -= dist * dist * size;
+                self.sum_volume -= size;
                 self.observations.pop_front();
             } else {
                 break;
@@ -1569,153 +1514,138 @@ impl FillRateKappaEstimator {
         }
 
         // Ensure running sums don't go negative due to float precision
-        self.volume_weighted_distance = self.volume_weighted_distance.max(0.0);
-        self.volume_weighted_distance_sq = self.volume_weighted_distance_sq.max(0.0);
-        self.total_volume = self.total_volume.max(0.0);
+        self.sum_volume_weighted_distance = self.sum_volume_weighted_distance.max(0.0);
+        self.sum_volume_weighted_distance_sq = self.sum_volume_weighted_distance_sq.max(0.0);
+        self.sum_volume = self.sum_volume.max(0.0);
     }
 
-    fn update_kappa(&mut self) {
-        if self.total_volume < 1e-9 {
-            return;
-        }
+    /// Update posterior parameters from sufficient statistics.
+    fn update_posterior(&mut self) {
+        // Calculate mean distance for diagnostics
+        if self.sum_volume > 1e-9 {
+            self.mean_distance = self.sum_volume_weighted_distance / self.sum_volume;
 
-        // Volume-weighted average distance
-        let avg_distance = self.volume_weighted_distance / self.total_volume;
-
-        // For exponential distribution λ(δ) = A·exp(-κδ):
-        // E[δ] = 1/κ (mean of exponential)
-        // Therefore: κ = 1/E[δ]
-        if avg_distance > 1e-8 {
-            let kappa_instant = 1.0 / avg_distance;
-
-            // Clamp to reasonable range
-            // κ = 1000 means avg distance = 10 bps
-            // κ = 5000 means avg distance = 2 bps
-            // κ = 500 means avg distance = 20 bps
-            let kappa_clamped = kappa_instant.clamp(100.0, 10000.0);
-
-            // EWMA update
-            self.kappa = self.alpha * kappa_clamped + (1.0 - self.alpha) * self.kappa;
-            self.update_count += 1;
-
-            if self.update_count.is_multiple_of(100) {
-                debug!(
-                    observations = self.observations.len(),
-                    avg_distance_bps = %format!("{:.2}", avg_distance * 10000.0),
-                    kappa_instant = %format!("{:.0}", kappa_instant),
-                    kappa_ewma = %format!("{:.0}", self.kappa),
-                    "Fill-rate kappa updated from trade distances"
-                );
+            // Calculate CV for exponential fit checking
+            let mean_sq = self.sum_volume_weighted_distance_sq / self.sum_volume;
+            let variance = (mean_sq - self.mean_distance * self.mean_distance).max(0.0);
+            if self.mean_distance > 1e-9 {
+                self.cv = variance.sqrt() / self.mean_distance;
             }
         }
+
+        // Posterior parameters with volume weighting
+        // Note: Using sum_volume as effective n (volume-weighted sample size)
+        // and sum_volume_weighted_distance as the sum of distances
+        let posterior_alpha = self.prior_alpha + self.sum_volume;
+        let posterior_beta = self.prior_beta + self.sum_volume_weighted_distance;
+
+        // Posterior mean: E[κ | data] = (α₀ + n) / (β₀ + Σδ)
+        self.kappa_posterior_mean = posterior_alpha / posterior_beta;
+
+        // Posterior std: σ_κ = κ̂ / √(α₀ + n)
+        self.kappa_posterior_std = self.kappa_posterior_mean / posterior_alpha.sqrt();
     }
 
-    /// Update fit metrics (coefficient of variation and goodness of fit).
+    /// Get posterior mean of kappa.
+    fn posterior_mean(&self) -> f64 {
+        self.kappa_posterior_mean
+    }
+
+    /// Get posterior standard deviation of kappa.
+    fn posterior_std(&self) -> f64 {
+        self.kappa_posterior_std
+    }
+
+    /// Get confidence score [0, 1] based on sample size.
     ///
-    /// For exponential distribution, CV = σ/μ = 1.0 exactly.
-    /// Deviation from CV = 1 indicates non-exponential behavior.
-    fn update_fit_metrics(&mut self) {
-        if self.total_volume < 1e-9 || self.observations.len() < 10 {
-            return;
-        }
-
-        // Calculate mean and variance
-        let mean = self.volume_weighted_distance / self.total_volume;
-        let mean_sq = self.volume_weighted_distance_sq / self.total_volume;
-        let variance = (mean_sq - mean * mean).max(0.0);
-        let std_dev = variance.sqrt();
-
-        // Coefficient of variation: CV = σ/μ
-        // For exponential: CV = 1.0
-        // For power-law: CV > 1.0 (heavy tail)
-        // For light-tail: CV < 1.0
-        if mean > 1e-9 {
-            self.cv = std_dev / mean;
-
-            // Fit score: how close is CV to 1.0?
-            // Score = 1 when CV = 1, decreases as CV deviates
-            // Using: score = exp(-|CV - 1|²)
-            let cv_deviation = (self.cv - 1.0).abs();
-            self.fit_score = (-cv_deviation * cv_deviation * 4.0).exp();
-        }
-    }
-
-    fn kappa(&self) -> f64 {
-        self.kappa.clamp(100.0, 10000.0)
-    }
-
-    /// Get kappa with confidence-based blending with fallback.
-    ///
-    /// When confidence is low (poor exponential fit), blend towards fallback.
-    fn kappa_with_fallback(&self, fallback_kappa: f64) -> f64 {
-        let confidence = self.confidence();
-        let primary = self.kappa.clamp(100.0, 10000.0);
-        let blended = confidence * primary + (1.0 - confidence) * fallback_kappa;
-        blended.clamp(100.0, 10000.0)
-    }
-
-    /// Confidence score [0, 1] based on sample size and fit quality.
-    ///
-    /// High confidence when:
-    /// - Many observations (sample size factor)
-    /// - Good exponential fit (fit_score)
-    /// - CV close to 1.0
+    /// Ramps up to 1.0 as effective sample size increases.
+    /// With prior_alpha = 10, confidence = √(n) / 10 capped at 1.0.
     fn confidence(&self) -> f64 {
-        // Sample size factor: ramps up to 1.0 at 100+ observations
-        let sample_factor = (self.observations.len() as f64 / 100.0).min(1.0);
-
-        // Combine factors
-        (sample_factor * self.fit_score).clamp(0.0, 1.0)
+        let effective_n = self.sum_volume;
+        (effective_n.sqrt() / 10.0).min(1.0)
     }
 
-    /// Get coefficient of variation (CV).
-    /// For exponential: CV ≈ 1.0. Higher = heavy tail, Lower = light tail.
+    /// Get coefficient of variation (CV = σ/μ of distances).
+    ///
+    /// For exponential distribution, CV = 1.0 exactly.
+    /// CV > 1.0 indicates heavy tail (power-law like)
+    /// CV < 1.0 indicates light tail
     fn cv(&self) -> f64 {
         self.cv
     }
 
-    /// Get fit score [0, 1]. Higher = better exponential fit.
+    /// Get mean fill distance for diagnostics.
     #[allow(dead_code)]
-    fn fit_score(&self) -> f64 {
-        self.fit_score
+    fn mean_distance(&self) -> f64 {
+        self.mean_distance
     }
 
+    /// Get observation count.
+    #[allow(dead_code)]
+    fn observation_count(&self) -> usize {
+        self.observations.len()
+    }
+
+    /// Get effective sample size (sum of volumes).
+    #[allow(dead_code)]
+    fn effective_sample_size(&self) -> f64 {
+        self.sum_volume
+    }
+
+    /// Get update count (for warmup checking).
     fn update_count(&self) -> usize {
         self.update_count
     }
-}
 
-/// Weighted linear regression to get slope.
-/// Points are (x, y, weight). Fits ln(y) ~ a + b*x, returns b.
-fn weighted_linear_regression_slope(points: &[(f64, f64, f64)]) -> Option<f64> {
-    if points.len() < 2 {
-        return None;
-    }
-
-    let mut sum_w = 0.0;
-    let mut sum_wx = 0.0;
-    let mut sum_wy = 0.0;
-    let mut sum_wxx = 0.0;
-    let mut sum_wxy = 0.0;
-
-    for (x, y, w) in points {
-        if *y <= 0.0 {
-            continue;
+    /// Record a fill observation from our own order.
+    ///
+    /// This is the CORRECT measurement for OUR fill rate decay:
+    /// - placement_price: Where we placed the order
+    /// - fill_price: Where it actually filled
+    /// - distance: |fill - placement| / placement
+    ///
+    /// For a market maker, this measures how far price moved
+    /// against us before our order got hit. This is exactly what
+    /// GLFT's κ models.
+    fn record_fill_distance(
+        &mut self,
+        timestamp_ms: u64,
+        placement_price: f64,
+        fill_price: f64,
+        fill_size: f64,
+    ) {
+        if placement_price <= 0.0 || fill_price <= 0.0 || fill_size <= 0.0 {
+            return;
         }
-        let ln_y = y.ln();
-        sum_w += w;
-        sum_wx += w * x;
-        sum_wy += w * ln_y;
-        sum_wxx += w * x * x;
-        sum_wxy += w * x * ln_y;
-    }
 
-    let denominator = sum_w * sum_wxx - sum_wx * sum_wx;
-    if denominator.abs() < 1e-12 {
-        return None;
-    }
+        // Distance as fraction of placement price
+        let distance = ((fill_price - placement_price) / placement_price).abs();
 
-    Some((sum_w * sum_wxy - sum_wx * sum_wy) / denominator)
+        // Minimum floor (fills exactly at placement price get 0.1 bps)
+        let distance = distance.max(0.00001);
+
+        // Add to posterior (same math as on_trade)
+        self.observations
+            .push_back((distance, fill_size, timestamp_ms));
+        self.sum_volume_weighted_distance += distance * fill_size;
+        self.sum_volume_weighted_distance_sq += distance * distance * fill_size;
+        self.sum_volume += fill_size;
+
+        self.expire_old(timestamp_ms);
+        self.update_posterior();
+        self.update_count += 1;
+
+        // Log every fill (own fills are valuable data)
+        debug!(
+            fill_distance_bps = %format!("{:.2}", distance * 10000.0),
+            placement_price = %format!("{:.2}", placement_price),
+            fill_price = %format!("{:.2}", fill_price),
+            fill_size = %format!("{:.4}", fill_size),
+            kappa_posterior = %format!("{:.0}", self.kappa_posterior_mean),
+            confidence = %format!("{:.2}", self.confidence()),
+            "Own fill recorded for kappa estimation"
+        );
+    }
 }
 
 // ============================================================================
@@ -2410,10 +2340,10 @@ pub struct ParameterEstimator {
     momentum: MomentumDetector,
     /// Trade flow tracker for buy/sell imbalance
     flow: TradeFlowTracker,
-    /// Fill-rate kappa estimator from trade distances (PRIMARY κ for GLFT)
-    fill_rate_kappa: FillRateKappaEstimator,
-    /// Weighted kappa estimator from L2 book (fallback when fill-rate has low confidence)
-    book_kappa: WeightedKappaEstimator,
+    /// Bayesian kappa from OUR order fills (PRIMARY - correct GLFT semantics)
+    own_kappa: BayesianKappaEstimator,
+    /// Bayesian kappa from market-wide trades (FALLBACK during warmup)
+    market_kappa: BayesianKappaEstimator,
     /// Volume tick arrival estimator
     arrival: VolumeTickArrivalEstimator,
     /// Book structure estimator (imbalance, near-touch liquidity)
@@ -2440,20 +2370,19 @@ impl ParameterEstimator {
         let momentum = MomentumDetector::new(config.momentum_window_ms);
         let flow = TradeFlowTracker::new(config.trade_flow_window_ms, config.trade_flow_alpha);
 
-        // Fill-rate kappa from trade distances (PRIMARY for GLFT)
-        // Use 5-minute window, medium half-life, default to 2000 (typical for liquid markets)
-        let fill_rate_kappa = FillRateKappaEstimator::new(
-            300_000, // 5 minute window
-            config.medium_half_life_ticks,
-            2000.0, // Default: avg trade distance = 5 bps
+        // Dual Bayesian kappa estimators with Gamma conjugate prior:
+        // 1. own_kappa: Fed by our order fills (PRIMARY - correct GLFT semantics)
+        // 2. market_kappa: Fed by market-wide trades (FALLBACK during warmup)
+        // Both use same prior and window configuration.
+        let own_kappa = BayesianKappaEstimator::new(
+            config.kappa_prior_mean,
+            config.kappa_prior_strength,
+            config.kappa_window_ms,
         );
-
-        // Book kappa (kept for auxiliary use, may remove later)
-        let book_kappa = WeightedKappaEstimator::new(
-            config.kappa_half_life_updates,
-            config.default_kappa,
-            config.kappa_max_distance,
-            config.kappa_max_levels,
+        let market_kappa = BayesianKappaEstimator::new(
+            config.kappa_prior_mean,
+            config.kappa_prior_strength,
+            config.kappa_window_ms,
         );
 
         let arrival = VolumeTickArrivalEstimator::new(
@@ -2481,8 +2410,8 @@ impl ParameterEstimator {
             multi_scale,
             momentum,
             flow,
-            fill_rate_kappa,
-            book_kappa,
+            own_kappa,
+            market_kappa,
             arrival,
             book_structure,
             microprice_estimator,
@@ -2499,7 +2428,7 @@ impl ParameterEstimator {
         self.current_mid = mid_price;
     }
 
-    /// Process a new trade (feeds into volume clock, flow tracker, AND fill-rate kappa).
+    /// Process a new trade (feeds into volume clock, flow tracker, AND market kappa).
     ///
     /// # Arguments
     /// * `timestamp_ms` - Trade timestamp
@@ -2520,10 +2449,10 @@ impl ParameterEstimator {
             self.flow.on_trade(timestamp_ms, size, is_buy);
         }
 
-        // Feed into fill-rate kappa estimator (trade distance from mid)
-        // This is the PRIMARY κ source for GLFT
+        // Feed into MARKET kappa estimator (trade distance from mid)
+        // This is the FALLBACK source - used when own_kappa confidence is low
         if self.current_mid > 0.0 {
-            self.fill_rate_kappa
+            self.market_kappa
                 .on_trade(timestamp_ms, price, size, self.current_mid);
         }
 
@@ -2569,11 +2498,33 @@ impl ParameterEstimator {
                 sigma_clean = %format!("{:.6}", self.multi_scale.sigma_clean()),
                 sigma_total = %format!("{:.6}", self.multi_scale.sigma_total()),
                 jump_ratio = %format!("{:.2}", self.multi_scale.jump_ratio_fast()),
-                kappa = %format!("{:.0}", self.fill_rate_kappa.kappa()),
+                kappa_blended = %format!("{:.0}", self.kappa()),
+                own_kappa_conf = %format!("{:.2}", self.own_kappa.confidence()),
                 regime = ?self.volatility_regime.regime(),
                 "Volume bucket completed"
             );
         }
+    }
+
+    /// Process a fill from our own order for kappa estimation.
+    ///
+    /// This provides the TRUE fill rate decay for our orders (correct GLFT semantics),
+    /// not market-wide proxy data. Call this when we receive a fill notification.
+    ///
+    /// # Arguments
+    /// * `timestamp_ms` - Fill timestamp
+    /// * `placement_price` - Where we originally placed the order
+    /// * `fill_price` - Where the order actually filled
+    /// * `fill_size` - Size of the fill
+    pub fn on_own_fill(
+        &mut self,
+        timestamp_ms: u64,
+        placement_price: f64,
+        fill_price: f64,
+        fill_size: f64,
+    ) {
+        self.own_kappa
+            .record_fill_distance(timestamp_ms, placement_price, fill_price, fill_size);
     }
 
     /// Legacy on_trade without aggressor info (backward compatibility).
@@ -2581,11 +2532,12 @@ impl ParameterEstimator {
         self.on_trade(timestamp_ms, price, size, None);
     }
 
-    /// Process L2 order book update for kappa estimation.
+    /// Process L2 order book update for book structure analysis.
     /// bids and asks are slices of (price, size) tuples, best first.
+    /// Note: Kappa is now estimated from trade distances (Bayesian), not book shape.
     pub fn on_l2_book(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) {
         self.current_mid = mid;
-        self.book_kappa.update(bids, asks, mid);
+        // Book structure for imbalance and liquidity signals (still valid uses)
         self.book_structure.update(bids, asks, mid);
 
         // Feed microprice estimator with current signals
@@ -2626,32 +2578,64 @@ impl ParameterEstimator {
 
     // === Order Book Accessors ===
 
-    /// Get current kappa estimate (κ) with confidence-based blending.
+    /// Get current kappa estimate (blended from own fills and market data).
     ///
-    /// Uses fill-rate kappa from trade execution distances as primary estimate.
-    /// When confidence is low (poor exponential fit), blends toward book-based kappa.
+    /// Blending formula:
+    /// - At startup (0% own confidence): 100% market data
+    /// - After some fills (50% own confidence): 50/50 blend
+    /// - After many fills (100% own confidence): 100% own data
+    ///
+    /// This gives fast warmup from market data, but converges to
+    /// the theoretically correct own-fill based estimate.
     pub fn kappa(&self) -> f64 {
-        // Use book kappa as fallback when fill-rate confidence is low
-        self.fill_rate_kappa
-            .kappa_with_fallback(self.book_kappa.kappa())
+        let own_conf = self.own_kappa.confidence();
+
+        // Blend: as own confidence grows, phase out market data
+        let own = self.own_kappa.posterior_mean();
+        let market = self.market_kappa.posterior_mean();
+
+        own_conf * own + (1.0 - own_conf) * market
     }
 
-    /// Get raw fill-rate kappa (without blending).
-    pub fn kappa_fill_rate(&self) -> f64 {
-        self.fill_rate_kappa.kappa()
-    }
-
-    /// Get book-based kappa from L2 order book depth decay.
-    pub fn kappa_book(&self) -> f64 {
-        self.book_kappa.kappa()
-    }
-
-    /// Get kappa estimation confidence [0, 1].
+    /// Get kappa from our own order fills only (no blending).
     ///
-    /// Based on sample size and how well data fits exponential distribution.
-    /// Low confidence indicates book-based fallback is being used more.
+    /// This is the theoretically correct κ for GLFT - our actual fill rate decay.
+    /// May have high uncertainty if we haven't received many fills yet.
+    pub fn kappa_own(&self) -> f64 {
+        self.own_kappa.posterior_mean()
+    }
+
+    /// Get kappa from market-wide trades (fallback source).
+    ///
+    /// This is a proxy estimate based on where all trades execute vs mid.
+    /// Used during warmup when we don't have enough own-fill data.
+    pub fn kappa_market(&self) -> f64 {
+        self.market_kappa.posterior_mean()
+    }
+
+    /// Get kappa posterior standard deviation (uncertainty estimate).
+    ///
+    /// Returns weighted combination of both estimator uncertainties.
+    pub fn kappa_std(&self) -> f64 {
+        let own_conf = self.own_kappa.confidence();
+        let own_std = self.own_kappa.posterior_std();
+        let market_std = self.market_kappa.posterior_std();
+
+        // Weighted combination of uncertainties
+        own_conf * own_std + (1.0 - own_conf) * market_std
+    }
+
+    /// Get own-fill kappa confidence [0, 1].
+    ///
+    /// Based on effective sample size of our own fills.
+    /// Low confidence means we're relying more on market data.
     pub fn kappa_confidence(&self) -> f64 {
-        self.fill_rate_kappa.confidence()
+        self.own_kappa.confidence()
+    }
+
+    /// Get market kappa confidence [0, 1].
+    pub fn kappa_market_confidence(&self) -> f64 {
+        self.market_kappa.confidence()
     }
 
     /// Get coefficient of variation for fill distance distribution.
@@ -2659,8 +2643,14 @@ impl ParameterEstimator {
     /// For exponential: CV ≈ 1.0
     /// CV > 1.0: Heavy tail (power-law like) - common in crypto
     /// CV < 1.0: Light tail
+    ///
+    /// Uses blended CV from both sources based on confidence.
     pub fn kappa_cv(&self) -> f64 {
-        self.fill_rate_kappa.cv()
+        let own_conf = self.own_kappa.confidence();
+        let own_cv = self.own_kappa.cv();
+        let market_cv = self.market_kappa.cv();
+
+        own_conf * own_cv + (1.0 - own_conf) * market_cv
     }
 
     /// Get current order arrival intensity (volume ticks per second).
@@ -2869,18 +2859,45 @@ impl ParameterEstimator {
     // === Warmup ===
 
     /// Check if estimator has collected enough data.
+    ///
+    /// Uses market_kappa for warmup since it receives trade tape data
+    /// immediately, while own_kappa needs actual fills to accumulate.
     pub fn is_warmed_up(&self) -> bool {
         self.multi_scale.tick_count() >= self.config.min_volume_ticks
-            && self.fill_rate_kappa.update_count() >= self.config.min_l2_updates
+            && self.market_kappa.update_count() >= self.config.min_l2_updates
+    }
+
+    /// Get confidence in sigma estimate (0.0 to 1.0).
+    ///
+    /// Confidence is based on how much data we've collected relative to
+    /// minimum warmup requirements. Uses a smooth transition:
+    /// - 0.0 when no data
+    /// - 0.5 at minimum warmup threshold
+    /// - Approaches 1.0 as data accumulates (3x warmup ≈ 0.95)
+    ///
+    /// This is used for Bayesian blending with the prior - low confidence
+    /// means the prior dominates, high confidence means observations dominate.
+    pub fn sigma_confidence(&self) -> f64 {
+        let tick_count = self.multi_scale.tick_count();
+        let min_ticks = self.config.min_volume_ticks.max(1);
+
+        // Use a sigmoid-like function: confidence = 1 - exp(-ratio / scale)
+        // At ratio = 1 (min warmup): confidence ≈ 0.63
+        // At ratio = 2: confidence ≈ 0.86
+        // At ratio = 3: confidence ≈ 0.95
+        let ratio = tick_count as f64 / min_ticks as f64;
+        1.0 - (-ratio).exp()
     }
 
     /// Get current warmup progress.
-    /// Returns (volume_ticks, min_volume_ticks, l2_updates, min_l2_updates)
+    /// Returns (volume_ticks, min_volume_ticks, kappa_updates, min_kappa_updates)
+    ///
+    /// Uses market_kappa for progress since own_kappa needs fills.
     pub fn warmup_progress(&self) -> (usize, usize, usize, usize) {
         (
             self.multi_scale.tick_count(),
             self.config.min_volume_ticks,
-            self.fill_rate_kappa.update_count(),
+            self.market_kappa.update_count(),
             self.config.min_l2_updates,
         )
     }
@@ -3006,46 +3023,120 @@ mod tests {
     }
 
     #[test]
-    fn test_weighted_kappa_estimator() {
-        let mut kappa = WeightedKappaEstimator::new(10.0, 100.0, 0.01, 15);
+    fn test_bayesian_kappa_prior_dominates_with_no_data() {
+        // With no data, posterior mean should equal prior mean
+        let prior_mean = 500.0;
+        let prior_strength = 10.0;
+        let kappa = BayesianKappaEstimator::new(prior_mean, prior_strength, 300_000);
+
+        assert!(
+            (kappa.posterior_mean() - prior_mean).abs() < 1e-6,
+            "Posterior should equal prior with no data, got {}",
+            kappa.posterior_mean()
+        );
+
+        // Prior std = mean / sqrt(strength) = 500 / sqrt(10) ≈ 158
+        let expected_std = prior_mean / prior_strength.sqrt();
+        assert!(
+            (kappa.posterior_std() - expected_std).abs() < 1e-6,
+            "Posterior std should equal prior std, got {}",
+            kappa.posterior_std()
+        );
+    }
+
+    #[test]
+    fn test_bayesian_kappa_converges_to_mle() {
+        let prior_mean = 500.0;
+        let prior_strength = 10.0;
+        let mut kappa = BayesianKappaEstimator::new(prior_mean, prior_strength, 300_000);
         let mid = 100.0;
 
-        // Synthetic book where depth increases at each level
-        // This is typical: more liquidity accumulates further from mid
-        // Cumulative depth at level i: sum of sizes from 0 to i
-        let bids: Vec<(f64, f64)> = (1..=10)
-            .map(|i| {
-                let price = mid - i as f64 * 0.05; // 99.95, 99.90, ...
-                let size = 1.0; // Constant size at each level
-                (price, size)
-            })
-            .collect();
-
-        let asks: Vec<(f64, f64)> = (1..=10)
-            .map(|i| {
-                let price = mid + i as f64 * 0.05; // 100.05, 100.10, ...
-                let size = 1.0;
-                (price, size)
-            })
-            .collect();
-
-        // Run multiple updates to converge
-        for _ in 0..30 {
-            kappa.update(&bids, &asks, mid);
+        // Feed many trades with consistent 10 bps distance
+        // True κ = 1/0.001 = 1000
+        let true_distance = 0.001; // 10 bps
+        for i in 0..1000 {
+            let price = mid + mid * true_distance; // Trade 10 bps above mid
+            kappa.on_trade(i * 10, price, 1.0, mid);
         }
 
-        // Kappa should be in a reasonable range (changed from default 100)
-        let k = kappa.kappa();
+        // With lots of data, posterior should approach MLE (1/distance = 1000)
+        let expected_kappa = 1.0 / true_distance;
+        let posterior = kappa.posterior_mean();
+
+        // Allow 10% tolerance - with 1000 observations, prior influence is minimal
+        let tolerance = expected_kappa * 0.1;
         assert!(
-            k > 1.0 && k < 10000.0,
-            "Kappa should be in valid range, got {}",
-            k
+            (posterior - expected_kappa).abs() < tolerance,
+            "Expected kappa ≈ {:.0}, got {:.0}",
+            expected_kappa,
+            posterior
         );
-        // Verify it's updating (not stuck at default)
+
+        // Confidence should be high with many observations
         assert!(
-            k != 100.0,
-            "Kappa should have changed from default 100, got {}",
-            k
+            kappa.confidence() > 0.9,
+            "Confidence should be high, got {}",
+            kappa.confidence()
+        );
+    }
+
+    #[test]
+    fn test_bayesian_kappa_uncertainty_decreases_with_data() {
+        let prior_mean = 500.0;
+        let prior_strength = 10.0;
+        let mut kappa = BayesianKappaEstimator::new(prior_mean, prior_strength, 300_000);
+        let mid = 100.0;
+
+        let initial_std = kappa.posterior_std();
+
+        // Feed some trades
+        for i in 0..100 {
+            let price = mid + mid * 0.001; // 10 bps distance
+            kappa.on_trade(i * 10, price, 1.0, mid);
+        }
+
+        let final_std = kappa.posterior_std();
+
+        // Uncertainty should decrease as we get more data
+        assert!(
+            final_std < initial_std,
+            "Std should decrease: initial={:.1}, final={:.1}",
+            initial_std,
+            final_std
+        );
+    }
+
+    #[test]
+    fn test_bayesian_kappa_rolling_window() {
+        let prior_mean = 500.0;
+        let prior_strength = 10.0;
+        let window_ms = 1000; // 1 second window
+        let mut kappa = BayesianKappaEstimator::new(prior_mean, prior_strength, window_ms);
+        let mid = 100.0;
+
+        // Feed trades that should fall outside window
+        for i in 0..10 {
+            let price = mid + mid * 0.001;
+            kappa.on_trade(i * 100, price, 1.0, mid); // 0-900ms
+        }
+
+        let old_posterior = kappa.posterior_mean();
+
+        // Now feed more trades far in the future (old ones should expire)
+        for i in 10..20 {
+            let price = mid + mid * 0.002; // Larger distance = lower kappa
+            kappa.on_trade(10000 + i * 100, price, 1.0, mid); // 10s+ later
+        }
+
+        // New trades have larger distance → lower kappa
+        // Old trades should have expired, so posterior should shift
+        let new_posterior = kappa.posterior_mean();
+
+        assert!(
+            new_posterior < old_posterior,
+            "Kappa should decrease with larger distances: old={:.0}, new={:.0}",
+            old_posterior,
+            new_posterior
         );
     }
 
@@ -3072,7 +3163,7 @@ mod tests {
         estimator.on_l2_book(&bids, &asks, 100.0);
 
         // Feed trades to fill buckets (need 5 volume ticks)
-        // These will also feed into fill_rate_kappa since current_mid is set
+        // These will also feed into kappa_estimator since current_mid is set
         let mut time = 1000u64;
         for i in 0..100 {
             let price = 100.0 + (i as f64 * 0.1).sin() * 0.5;
@@ -3082,7 +3173,7 @@ mod tests {
             time += 100;
         }
 
-        // Feed more L2 books (total needs min_l2_updates which is checked via fill_rate_kappa)
+        // Feed more L2 books (for book structure analysis)
         for _ in 0..5 {
             estimator.on_l2_book(&bids, &asks, 100.0);
         }
@@ -3146,6 +3237,148 @@ mod tests {
             intensity > 1.0 && intensity < 5.0,
             "Expected ~2 ticks/sec, got {}",
             intensity
+        );
+    }
+
+    // === Dual-Source Kappa Blending Tests ===
+
+    #[test]
+    fn test_dual_kappa_startup_uses_market() {
+        // At startup, own_kappa has no data (0% confidence)
+        // Should use 100% market_kappa
+        let config = make_config();
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Feed market trades only (no own fills)
+        let mid = 100.0;
+        for i in 0..20 {
+            let price = mid + mid * 0.001; // 10bps from mid
+            estimator.on_trade(i * 100, price, 1.0, Some(i % 2 == 0));
+        }
+
+        // own_kappa should have 0 confidence (no fills)
+        let own_conf = estimator.own_kappa.confidence();
+        assert!(
+            own_conf < 0.1,
+            "Own kappa confidence should be near zero with no fills: {}",
+            own_conf
+        );
+
+        // Blended kappa should equal market_kappa
+        let blended = estimator.kappa();
+        let market = estimator.kappa_market();
+        assert!(
+            (blended - market).abs() < 1.0,
+            "Blended kappa {} should equal market kappa {} at startup",
+            blended,
+            market
+        );
+    }
+
+    #[test]
+    fn test_dual_kappa_own_fills_increase_confidence() {
+        let config = make_config();
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Start with market trades
+        let mid = 100.0;
+        for i in 0..20 {
+            let price = mid + mid * 0.001;
+            estimator.on_trade(i * 100, price, 1.0, Some(i % 2 == 0));
+        }
+
+        let initial_conf = estimator.own_kappa.confidence();
+
+        // Now feed own fills
+        let placement_price = 99.5; // 50bps below mid
+        let fill_price = 99.6; // Filled 10bps above placement
+        for i in 0..50 {
+            estimator.on_own_fill(10000 + i * 100, placement_price, fill_price, 1.0);
+        }
+
+        let final_conf = estimator.own_kappa.confidence();
+
+        assert!(
+            final_conf > initial_conf,
+            "Own kappa confidence should increase with fills: {} -> {}",
+            initial_conf,
+            final_conf
+        );
+        assert!(
+            final_conf > 0.3,
+            "Own kappa confidence should be meaningful after 50 fills: {}",
+            final_conf
+        );
+    }
+
+    #[test]
+    fn test_dual_kappa_blending_weights() {
+        let config = make_config();
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Feed market data to get market_kappa estimate
+        let mid = 100.0;
+        for i in 0..50 {
+            let price = mid + mid * 0.002; // 20bps = distance 0.002
+            estimator.on_trade(i * 100, price, 1.0, Some(i % 2 == 0));
+        }
+        let market_kappa = estimator.kappa_market();
+
+        // Feed own fills at different distance
+        let placement = 100.0;
+        let fill = 100.05; // 5bps = distance 0.0005 (tighter fills = higher kappa)
+        for i in 0..100 {
+            estimator.on_own_fill(20000 + i * 100, placement, fill, 1.0);
+        }
+        let own_kappa = estimator.kappa_own();
+        let own_conf = estimator.own_kappa.confidence();
+
+        // Blended should be between own and market, weighted by confidence
+        let blended = estimator.kappa();
+        let expected = own_conf * own_kappa + (1.0 - own_conf) * market_kappa;
+
+        assert!(
+            (blended - expected).abs() < 10.0,
+            "Blended kappa {} should match formula {}: own={:.0}, market={:.0}, conf={:.2}",
+            blended,
+            expected,
+            own_kappa,
+            market_kappa,
+            own_conf
+        );
+    }
+
+    #[test]
+    fn test_record_fill_distance_measurement() {
+        let prior_mean = 500.0;
+        let prior_strength = 10.0;
+        let window_ms = 60000;
+        let mut kappa = BayesianKappaEstimator::new(prior_mean, prior_strength, window_ms);
+
+        // Record fills at specific distances
+        let placement = 100.0;
+
+        // Fill exactly at placement (0 distance, uses floor)
+        kappa.record_fill_distance(1000, placement, placement, 1.0);
+
+        // Fill 10bps away
+        kappa.record_fill_distance(2000, placement, 100.01, 1.0);
+
+        // Fill 50bps away
+        kappa.record_fill_distance(3000, placement, 100.05, 1.0);
+
+        // Should have updated
+        assert!(
+            kappa.update_count() > 0,
+            "Should have recorded fill observations"
+        );
+
+        // With small distances, kappa should be high (fills happen close to placement)
+        let kappa_val = kappa.posterior_mean();
+        assert!(
+            kappa_val > prior_mean * 0.5,
+            "Kappa {} should not collapse with small distances",
+            kappa_val
         );
     }
 }

@@ -55,6 +55,7 @@ use alloy::primitives::Address;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, warn};
 
+use crate::helpers::truncate_float;
 use crate::prelude::Result;
 use crate::{InfoClient, Message, Subscription};
 
@@ -127,6 +128,10 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Reserved for future multi-asset support
     #[allow(dead_code)]
     correlation: Option<CorrelationEstimator>,
+
+    // === First-Principles Risk ===
+    /// Dynamic risk configuration for adaptive position limits
+    dynamic_risk_config: DynamicRiskConfig,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -209,7 +214,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             } else {
                 None
             },
+            // First-principles dynamic risk
+            dynamic_risk_config: DynamicRiskConfig::default(),
         }
+    }
+
+    /// Set the dynamic risk configuration.
+    pub fn with_dynamic_risk_config(mut self, config: DynamicRiskConfig) -> Self {
+        self.dynamic_risk_config = config;
+        self
     }
 
     /// Sync open orders from the exchange.
@@ -523,71 +536,109 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         let (order_found, is_new_fill, is_complete) =
                             self.orders.process_fill(oid, tid, amount);
 
-                        if !order_found {
-                            // Order not in tracking - log warning for investigation
-                            // Position is still correct (updated above)
-                            warn!(
-                                "[Fill] Untracked order filled: oid={} tid={} {} {} {} | position updated to {}",
-                                oid,
-                                tid,
-                                if is_buy { "bought" } else { "sold" },
-                                amount,
-                                self.config.asset,
-                                self.position.position()
-                            );
-                        } else if is_new_fill {
-                            // New fill on tracked order - record in all systems
-                            let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
+                        // Parse fill price early - needed for pending order lookup
+                        let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
 
-                            // === Tier 1: Record fill for AS measurement ===
-                            self.adverse_selection.record_fill(
-                                tid,
-                                amount,
-                                is_buy,
-                                self.latest_mid,
-                            );
-
-                            // === Tier 2: Record fill in P&L tracker ===
-                            self.pnl_tracker.record_fill(
-                                tid,
-                                fill_price,
-                                amount,
-                                is_buy,
-                                self.latest_mid, // mid_at_fill
-                            );
-
-                            // === Production: Update Prometheus metrics ===
-                            self.prometheus.record_fill(amount, is_buy);
-
-                            let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
-                            info!(
-                                "[Fill] {} {} {} | oid={} tid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
-                                if is_buy { "bought" } else { "sold" },
-                                amount,
-                                self.config.asset,
-                                oid,
-                                tid,
-                                self.position.position(),
-                                self.adverse_selection.realized_as_bps(),
-                                pnl_summary.total_pnl
-                            );
-
-                            // Record metrics
-                            if let Some(ref m) = self.metrics {
-                                m.record_fill(amount, is_buy);
-                                m.update_position(self.position.position());
-                            }
-
-                            // Update queue tracker based on fill completeness
-                            if is_complete {
-                                // Order fully filled - will be removed via cleanup()
-                                // Don't remove from queue tracker here; let cleanup() handle it
+                        // Determine placement price - either from tracked order or pending order
+                        let placement_price: Option<f64> = if order_found {
+                            // Order found by OID - get placement price directly
+                            self.orders.get_order(oid).map(|o| o.price)
+                        } else {
+                            // Order not found by OID - check pending orders by (side, fill_price)
+                            // This handles the race condition when fill arrives before OID is registered
+                            let side = if is_buy { Side::Buy } else { Side::Sell };
+                            if let Some(pending) = self.orders.get_pending(side, fill_price) {
+                                debug!(
+                                    oid = oid,
+                                    tid = tid,
+                                    fill_price = fill_price,
+                                    placement_price = pending.price,
+                                    "Fill matched to pending order (immediate fill race condition)"
+                                );
+                                Some(pending.price)
                             } else {
-                                // Partial fill - update queue position
-                                self.queue_tracker.order_partially_filled(oid, amount);
+                                // Truly untracked - not in orders or pending
+                                warn!(
+                                    "[Fill] Untracked order filled: oid={} tid={} {} {} {} | position updated to {}",
+                                    oid,
+                                    tid,
+                                    if is_buy { "bought" } else { "sold" },
+                                    amount,
+                                    self.config.asset,
+                                    self.position.position()
+                                );
+                                None
+                            }
+                        };
+
+                        // Process fill if we have placement info (tracked or pending order)
+                        if let Some(placement_price) = placement_price {
+                            if !order_found || is_new_fill {
+                                // === Tier 1: Record fill for AS measurement ===
+                                self.adverse_selection.record_fill(
+                                    tid,
+                                    amount,
+                                    is_buy,
+                                    self.latest_mid,
+                                );
+
+                                // === Kappa Estimation: Feed own fill rate ===
+                                let timestamp_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+
+                                self.estimator.on_own_fill(
+                                    timestamp_ms,
+                                    placement_price,
+                                    fill_price,
+                                    amount,
+                                );
+
+                                // === Tier 2: Record fill in P&L tracker ===
+                                self.pnl_tracker.record_fill(
+                                    tid,
+                                    fill_price,
+                                    amount,
+                                    is_buy,
+                                    self.latest_mid, // mid_at_fill
+                                );
+
+                                // === Production: Update Prometheus metrics ===
+                                self.prometheus.record_fill(amount, is_buy);
+
+                                let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
+                                info!(
+                                    "[Fill] {} {} {} | oid={} tid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
+                                    if is_buy { "bought" } else { "sold" },
+                                    amount,
+                                    self.config.asset,
+                                    oid,
+                                    tid,
+                                    self.position.position(),
+                                    self.adverse_selection.realized_as_bps(),
+                                    pnl_summary.total_pnl
+                                );
+
+                                // Record metrics
+                                if let Some(ref m) = self.metrics {
+                                    m.record_fill(amount, is_buy);
+                                    m.update_position(self.position.position());
+                                }
+
+                                // Update queue tracker based on fill completeness
+                                if order_found && is_complete {
+                                    // Order fully filled - will be removed via cleanup()
+                                    // Don't remove from queue tracker here; let cleanup() handle it
+                                } else if order_found {
+                                    // Partial fill - update queue position
+                                    self.queue_tracker.order_partially_filled(oid, amount);
+                                }
+                                // Note: For pending-matched fills, queue tracking is handled
+                                // when the order is finalized with its OID
                             }
                         }
-                        // else: duplicate fill at order level - already processed
+                        // else: placement_price is None - truly untracked (warning logged above)
 
                         // Position milestone warnings
                         let current_position = self.position.position();
@@ -829,25 +880,49 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .map(|l| Quote::new(l.price, l.size))
                 .collect();
 
-            // Reduce-only mode: when over max position, only allow quotes that reduce position
+            // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
             let position = self.position.position();
-            if position.abs() > self.config.max_position {
+            let position_value = position.abs() * self.latest_mid;
+            let max_position_value = self.kill_switch.max_position_value();
+
+            let over_position_limit = position.abs() > self.config.max_position;
+            let over_value_limit = position_value > max_position_value;
+
+            if over_position_limit || over_value_limit {
                 if position > 0.0 {
                     // Long position over max: only allow sells (no bids)
                     bid_quotes.clear();
-                    warn!(
-                        position = %format!("{:.6}", position),
-                        max_position = %format!("{:.6}", self.config.max_position),
-                        "Over max position (long) - reduce-only mode, cancelling all bids"
-                    );
+                    if over_value_limit {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            position_value = %format!("${:.2}", position_value),
+                            limit = %format!("${:.2}", max_position_value),
+                            "Position value over limit (long) - reduce-only mode, cancelling all bids"
+                        );
+                    } else {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            max_position = %format!("{:.6}", self.config.max_position),
+                            "Over max position (long) - reduce-only mode, cancelling all bids"
+                        );
+                    }
                 } else {
                     // Short position over max: only allow buys (no asks)
                     ask_quotes.clear();
-                    warn!(
-                        position = %format!("{:.6}", position),
-                        max_position = %format!("{:.6}", self.config.max_position),
-                        "Over max position (short) - reduce-only mode, cancelling all asks"
-                    );
+                    if over_value_limit {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            position_value = %format!("${:.2}", position_value),
+                            limit = %format!("${:.2}", max_position_value),
+                            "Position value over limit (short) - reduce-only mode, cancelling all asks"
+                        );
+                    } else {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            max_position = %format!("{:.6}", self.config.max_position),
+                            "Over max position (short) - reduce-only mode, cancelling all asks"
+                        );
+                    }
                 }
             }
 
@@ -872,25 +947,49 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 &market_params,
             );
 
-            // Reduce-only mode: when over max position, only allow quotes that reduce position
+            // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
             let position = self.position.position();
-            if position.abs() > self.config.max_position {
+            let position_value = position.abs() * self.latest_mid;
+            let max_position_value = self.kill_switch.max_position_value();
+
+            let over_position_limit = position.abs() > self.config.max_position;
+            let over_value_limit = position_value > max_position_value;
+
+            if over_position_limit || over_value_limit {
                 if position > 0.0 {
                     // Long position over max: only allow sells (no bids)
                     bid = None;
-                    warn!(
-                        position = %format!("{:.6}", position),
-                        max_position = %format!("{:.6}", self.config.max_position),
-                        "Over max position (long) - reduce-only mode, cancelling bids"
-                    );
+                    if over_value_limit {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            position_value = %format!("${:.2}", position_value),
+                            limit = %format!("${:.2}", max_position_value),
+                            "Position value over limit (long) - reduce-only mode, cancelling bids"
+                        );
+                    } else {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            max_position = %format!("{:.6}", self.config.max_position),
+                            "Over max position (long) - reduce-only mode, cancelling bids"
+                        );
+                    }
                 } else {
                     // Short position over max: only allow buys (no asks)
                     ask = None;
-                    warn!(
-                        position = %format!("{:.6}", position),
-                        max_position = %format!("{:.6}", self.config.max_position),
-                        "Over max position (short) - reduce-only mode, cancelling asks"
-                    );
+                    if over_value_limit {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            position_value = %format!("${:.2}", position_value),
+                            limit = %format!("${:.2}", max_position_value),
+                            "Position value over limit (short) - reduce-only mode, cancelling asks"
+                        );
+                    } else {
+                        warn!(
+                            position = %format!("{:.6}", position),
+                            max_position = %format!("{:.6}", self.config.max_position),
+                            "Over max position (short) - reduce-only mode, cancelling asks"
+                        );
+                    }
                 }
             }
 
@@ -1079,9 +1178,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     continue;
                 }
 
+                // Truncate size to sz_decimals to ensure valid order size
+                let truncated_size =
+                    truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, false);
+                if truncated_size <= 0.0 {
+                    continue;
+                }
+
                 order_specs.push(OrderSpec {
                     price: quote.price,
-                    size: sizing_result.adjusted_size,
+                    size: truncated_size,
                     is_buy,
                 });
             }
@@ -1100,22 +1206,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "Placing ladder levels via bulk order"
             );
 
+            // Pre-register orders as pending BEFORE the API call.
+            // This allows fill notifications (via WebSocket) that arrive before the
+            // API response to still find the placement price for kappa estimation.
+            for spec in &order_specs {
+                self.orders.add_pending(side, spec.price, spec.size);
+            }
+
             // Place all orders in a single API call
             let results = self
                 .executor
                 .place_bulk_orders(&self.config.asset, order_specs.clone())
                 .await;
 
-            // Track placed orders
+            // Finalize pending orders with real OIDs
             for (i, result) in results.iter().enumerate() {
                 if result.oid > 0 {
                     let spec = &order_specs[i];
-                    self.orders.add_order(TrackedOrder::new(
-                        result.oid,
-                        side,
-                        spec.price,
-                        result.resting_size,
-                    ));
+
+                    // Remove from pending regardless of fill status
+                    // (pending is keyed by price, not OID)
+
+                    if result.filled {
+                        // Order filled immediately - just remove from pending, don't track
+                        // The WebSocket fill notification will handle position update
+                        // We don't add to orders because it would just be cleaned up immediately
+                        self.orders.remove_pending(side, spec.price);
+                        debug!(
+                            oid = result.oid,
+                            price = spec.price,
+                            size = spec.size,
+                            "Order filled immediately, not tracking (WebSocket will handle fill)"
+                        );
+                        continue;
+                    }
+
+                    // Move from pending to tracked with real OID
+                    self.orders
+                        .finalize_pending(side, spec.price, result.oid, result.resting_size);
 
                     // Initialize queue tracking for this order
                     // depth_ahead is 0.0 initially; will be updated on L2 book updates
@@ -1200,8 +1328,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
-        // Use adjusted size from margin check
-        let adjusted_size = sizing_result.adjusted_size;
+        // Use adjusted size from margin check, truncated to sz_decimals
+        let adjusted_size =
+            truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, false);
+        if adjusted_size <= 0.0 {
+            debug!(
+                side = %side_str(side),
+                "Adjusted size truncated to zero, skipping order"
+            );
+            return Ok(());
+        }
         let result = self
             .executor
             .place_order(&self.config.asset, quote.price, adjusted_size, is_buy)
@@ -1377,6 +1513,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.queue_tracker.order_removed(oid);
         }
 
+        // === Cleanup stale pending orders ===
+        // Pending orders should be finalized within milliseconds. If they're still
+        // pending after 5 seconds, the API call failed or something went wrong.
+        let stale_pending = self
+            .orders
+            .cleanup_stale_pending(std::time::Duration::from_secs(5));
+        if stale_pending > 0 {
+            warn!(
+                "[SafetySync] Cleaned up {} stale pending orders",
+                stale_pending
+            );
+        }
+
         // === Check for stuck cancels ===
         let stuck = self.orders.check_stuck_cancels();
         if !stuck.is_empty() {
@@ -1449,6 +1598,66 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             debug!(
                 "[SafetySync] State in sync: {} active orders (exchange matches local)",
                 active_local_oids.len()
+            );
+        }
+
+        // === Dynamic Position Limit Update ===
+        // Update max_position_value based on current equity, volatility, and confidence
+        let account_value = self.margin_sizer.state().account_value;
+        let sigma = self.estimator.sigma_clean();
+        let sigma_confidence = self.estimator.sigma_confidence();
+        let time_horizon = (1.0 / self.estimator.arrival_intensity()).min(120.0);
+
+        if account_value > 0.0 {
+            let new_limit = calculate_dynamic_max_position_value(
+                account_value,
+                sigma,
+                time_horizon,
+                sigma_confidence,
+                &self.dynamic_risk_config,
+            );
+
+            self.kill_switch.update_dynamic_limit(new_limit);
+
+            debug!(
+                "[SafetySync] Dynamic limit: ${:.2} (equity=${:.2}, σ={:.6}, conf={:.2}, T={:.1}s)",
+                new_limit, account_value, sigma, sigma_confidence, time_horizon
+            );
+        }
+
+        // Log reduce-only mode status
+        let position = self.position.position();
+        let position_value = position.abs() * self.latest_mid;
+        let max_position_value = self.kill_switch.max_position_value();
+
+        let over_position_limit = position.abs() > self.config.max_position;
+        let over_value_limit = position_value > max_position_value;
+
+        if over_position_limit || over_value_limit {
+            let direction = if position > 0.0 { "long" } else { "short" };
+            let reason = if over_value_limit && over_position_limit {
+                format!(
+                    "position={:.4} > {:.4} contracts AND value ${:.2} > ${:.2}",
+                    position.abs(),
+                    self.config.max_position,
+                    position_value,
+                    max_position_value
+                )
+            } else if over_value_limit {
+                format!(
+                    "value ${:.2} > ${:.2} limit",
+                    position_value, max_position_value
+                )
+            } else {
+                format!(
+                    "position={:.4} > {:.4} limit",
+                    position.abs(),
+                    self.config.max_position
+                )
+            };
+            warn!(
+                "[SafetySync] REDUCE-ONLY MODE ACTIVE ({}) - {}",
+                direction, reason
             );
         }
 

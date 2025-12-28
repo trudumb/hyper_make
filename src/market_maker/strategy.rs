@@ -555,6 +555,15 @@ pub struct RiskConfig {
     /// Maximum holding time cap (seconds)
     /// Prevents skew explosion in dead markets
     pub max_holding_time: f64,
+
+    /// Flow sensitivity β for inventory skew adjustment.
+    /// Controls how strongly flow alignment dampens/amplifies skew.
+    /// exp(-β × alignment) is the modifier:
+    ///   - β = 0.5 → ±39% adjustment at perfect alignment
+    ///   - β = 1.0 → ±63% adjustment at perfect alignment
+    ///
+    /// Derived from information theory (exponential link function).
+    pub flow_sensitivity: f64,
 }
 
 impl Default for RiskConfig {
@@ -572,6 +581,7 @@ impl Default for RiskConfig {
             gamma_max: 5.0,
             min_spread_floor: 0.0001, // 1 bps
             max_holding_time: 120.0,  // 2 minutes
+            flow_sensitivity: 0.5,    // exp(-0.5) ≈ 0.61 at perfect alignment
         }
     }
 }
@@ -739,18 +749,48 @@ impl GLFTStrategy {
         }
     }
 
-    /// Correct GLFT inventory skew: skew = (q/Q_max) × γ × σ² × T
+    /// Flow-adjusted inventory skew with exponential regularization.
     ///
-    /// Where T = 1/λ (time horizon from arrival intensity).
-    /// Positive inventory → positive skew → wider bid, tighter ask (encourage selling)
-    fn inventory_skew(
+    /// The flow_alignment ∈ [-1, 1] measures how aligned position is with flow:
+    ///   +1 = perfectly aligned (long + buy flow, or short + sell flow)
+    ///   -1 = perfectly opposed (long + sell flow, or short + buy flow)
+    ///    0 = no flow signal
+    ///
+    /// We use exponential regularization that naturally bounds the modifier:
+    ///   modifier = exp(-β × flow_alignment)
+    ///
+    /// This is mathematically clean:
+    ///   - exp(0) = 1.0 (no adjustment when no flow)
+    ///   - exp(β) ≈ 1 + β for small β (linear approximation)
+    ///   - Always positive (can't flip skew sign)
+    ///   - Symmetric in positive/negative alignment
+    ///
+    /// When aligned (flow pushed us here): dampen counter-skew (don't fight momentum)
+    /// When opposed (fighting informed flow): amplify counter-skew (reduce risk faster)
+    fn inventory_skew_with_flow(
         &self,
         inventory_ratio: f64,
         sigma: f64,
         gamma: f64,
         time_horizon: f64,
+        flow_imbalance: f64,
     ) -> f64 {
-        inventory_ratio * gamma * sigma.powi(2) * time_horizon
+        // Base GLFT skew (Avellaneda-Stoikov)
+        let base_skew = inventory_ratio * gamma * sigma.powi(2) * time_horizon;
+
+        // Flow alignment: positive when position and flow have same sign
+        // inventory_ratio.signum() gives direction of position
+        // flow_imbalance ∈ [-1, 1] from MarketParams
+        // flow_alignment = inventory_ratio.signum() * flow_imbalance ∈ [-1, 1]
+        let flow_alignment = inventory_ratio.signum() * flow_imbalance;
+
+        // Regularized modifier using exponential
+        // exp(-β × alignment) because:
+        //   aligned (positive) → smaller modifier → dampen skew
+        //   opposed (negative) → larger modifier → amplify skew
+        let flow_modifier = (-self.risk_config.flow_sensitivity * flow_alignment).exp();
+
+        base_skew * flow_modifier
     }
 }
 
@@ -826,8 +866,16 @@ impl QuotingStrategy for GLFTStrategy {
             0.0
         };
 
-        // Correct inventory skew: (q/Q_max) × γ × σ² × T
-        let base_skew = self.inventory_skew(inventory_ratio, sigma_for_skew, gamma, time_horizon);
+        // Flow-dampened inventory skew: base_skew × exp(-β × flow_alignment)
+        // Uses flow_imbalance to dampen skew when aligned with flow (don't fight momentum)
+        // and amplify skew when opposed to flow (reduce risk faster)
+        let base_skew = self.inventory_skew_with_flow(
+            inventory_ratio,
+            sigma_for_skew,
+            gamma,
+            time_horizon,
+            market_params.flow_imbalance,
+        );
 
         // === 3a. HAWKES FLOW SKEWING (Tier 2) ===
         // Use Hawkes-derived flow imbalance for additional directional adjustment
@@ -877,10 +925,14 @@ impl QuotingStrategy for GLFTStrategy {
 
         // === 6. COMBINED SKEW WITH TIER 2 ADJUSTMENTS ===
         // Combine all skew components:
-        // - base_skew: GLFT inventory risk management
+        // - base_skew: GLFT inventory skew × flow modifier (exp(-β × alignment))
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
         let skew = base_skew + hawkes_skew + funding_skew;
+
+        // Calculate flow modifier for logging (same as in inventory_skew_with_flow)
+        let flow_alignment = inventory_ratio.signum() * market_params.flow_imbalance;
+        let flow_modifier = (-self.risk_config.flow_sensitivity * flow_alignment).exp();
         let bid_delta = half_spread + skew;
         let ask_delta = (half_spread - skew).max(0.0);
 
@@ -891,6 +943,8 @@ impl QuotingStrategy for GLFTStrategy {
             kappa = %format!("{:.2}", kappa),
             time_horizon = %format!("{:.2}", time_horizon),
             half_spread_bps = %format!("{:.1}", half_spread * 10000.0),
+            flow_imb = %format!("{:.3}", market_params.flow_imbalance),
+            flow_mod = %format!("{:.3}", flow_modifier),
             base_skew_bps = %format!("{:.4}", base_skew * 10000.0),
             hawkes_skew_bps = %format!("{:.4}", hawkes_skew * 10000.0),
             funding_skew_bps = %format!("{:.4}", funding_skew * 10000.0),
@@ -903,7 +957,7 @@ impl QuotingStrategy for GLFTStrategy {
             bid_delta_bps = %format!("{:.1}", bid_delta * 10000.0),
             ask_delta_bps = %format!("{:.1}", ask_delta * 10000.0),
             is_toxic = market_params.is_toxic_regime,
-            "GLFT spread components with Tier 2 adjustments"
+            "GLFT spread components with flow-dampened skew"
         );
 
         // Convert to absolute price offsets using fair_price (microprice)
@@ -1425,16 +1479,23 @@ mod tests {
 
     #[test]
     fn test_glft_inventory_skew_formula() {
-        // Test the correct skew formula: skew = (q/Q_max) × γ × σ² × T
+        // Test flow-dampened skew: base_skew × exp(-β × flow_alignment)
         let strategy = GLFTStrategy::new(0.5);
 
-        let inventory_ratio = 0.5; // 50% of max position
-        let sigma = 0.01; // 1% per-second volatility
-        let gamma = 0.5;
-        let time_horizon = 2.0; // T = 2 seconds
+        let inventory_ratio = 0.5_f64; // 50% of max position (long)
+        let sigma = 0.01_f64; // 1% per-second volatility
+        let gamma = 0.5_f64;
+        let time_horizon = 2.0_f64; // T = 2 seconds
+        let flow_imbalance = 0.0_f64; // No flow signal
 
-        // Expected: skew = 0.5 * 0.5 * 0.01^2 * 2 = 0.5 * 0.5 * 0.0001 * 2 = 0.00005
-        let skew = strategy.inventory_skew(inventory_ratio, sigma, gamma, time_horizon);
+        // With no flow, should get base skew: 0.5 * 0.5 * 0.01^2 * 2 = 0.00005
+        let skew = strategy.inventory_skew_with_flow(
+            inventory_ratio,
+            sigma,
+            gamma,
+            time_horizon,
+            flow_imbalance,
+        );
         let expected = inventory_ratio * gamma * sigma.powi(2) * time_horizon;
 
         assert!(
@@ -1442,6 +1503,44 @@ mod tests {
             "Skew mismatch: got {}, expected {}",
             skew,
             expected
+        );
+
+        // Test flow dampening: long position + buy flow = aligned → dampen skew
+        let aligned_flow = 0.8_f64; // Strong buy flow
+        let dampened_skew = strategy.inventory_skew_with_flow(
+            inventory_ratio,
+            sigma,
+            gamma,
+            time_horizon,
+            aligned_flow,
+        );
+        // flow_alignment = 0.5.signum() * 0.8 = 0.8
+        // modifier = exp(-0.5 * 0.8) = exp(-0.4) ≈ 0.67
+        // dampened_skew should be less than base_skew
+        assert!(
+            dampened_skew < skew,
+            "Aligned flow should dampen skew: got {} vs base {}",
+            dampened_skew,
+            skew
+        );
+
+        // Test flow amplification: long position + sell flow = opposed → amplify skew
+        let opposed_flow = -0.8_f64; // Strong sell flow
+        let amplified_skew = strategy.inventory_skew_with_flow(
+            inventory_ratio,
+            sigma,
+            gamma,
+            time_horizon,
+            opposed_flow,
+        );
+        // flow_alignment = 0.5.signum() * -0.8 = -0.8
+        // modifier = exp(-0.5 * -0.8) = exp(0.4) ≈ 1.49
+        // amplified_skew should be greater than base_skew
+        assert!(
+            amplified_skew > skew,
+            "Opposed flow should amplify skew: got {} vs base {}",
+            amplified_skew,
+            skew
         );
     }
 
