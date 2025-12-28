@@ -34,6 +34,9 @@ pub struct MarketMakerConfig {
     pub decimals: u32,
     /// Decimals for size rounding (from asset metadata)
     pub sz_decimals: u32,
+    /// Enable multi-asset correlation tracking (First Principles Gap 5)
+    /// When true, tracks correlations for portfolio risk management
+    pub multi_asset: bool,
 }
 
 /// Configuration passed to strategy for quote calculation.
@@ -72,3 +75,21 @@ impl Quote {
 
 /// Type alias for optional metrics recorder.
 pub type MetricsRecorder = Option<Arc<dyn MarketMakerMetricsRecorder>>;
+
+/// Monitoring and metrics export configuration.
+#[derive(Debug, Clone)]
+pub struct MonitoringConfig {
+    /// Port for HTTP metrics endpoint
+    pub metrics_port: u16,
+    /// Whether to enable HTTP metrics endpoint
+    pub enable_http_metrics: bool,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            metrics_port: 9090,
+            enable_http_metrics: true,
+        }
+    }
+}

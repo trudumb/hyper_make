@@ -247,8 +247,7 @@ impl AdverseSelectionEstimator {
         }
 
         // Total AS (magnitude)
-        self.realized_as_total =
-            alpha * signed_as.abs() + (1.0 - alpha) * self.realized_as_total;
+        self.realized_as_total = alpha * signed_as.abs() + (1.0 - alpha) * self.realized_as_total;
         self.fills_measured += 1;
 
         debug!(
@@ -338,8 +337,7 @@ impl AdverseSelectionEstimator {
             return 0.0;
         }
 
-        let raw_adjustment =
-            self.realized_as_total * self.config.spread_adjustment_multiplier;
+        let raw_adjustment = self.realized_as_total * self.config.spread_adjustment_multiplier;
 
         // Clamp to configured bounds
         raw_adjustment

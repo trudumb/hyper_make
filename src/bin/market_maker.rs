@@ -5,8 +5,10 @@
 //! - Multiple quoting strategies
 //! - Structured logging with tracing
 //! - Metrics collection
+//! - Prometheus HTTP metrics endpoint
 
 use alloy::signers::local::PrivateKeySigner;
+use axum::{routing::get, Router};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -14,17 +16,17 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
-    AdverseSelectionConfig, BaseUrl, EstimatorConfig, ExchangeClient, FundingConfig, GLFTStrategy,
-    HawkesConfig, HyperliquidExecutor, InfoClient, InventoryAwareStrategy, KillSwitchConfig,
-    LadderConfig, LadderStrategy, LiquidationConfig, MarginConfig, MarketMaker,
-    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
-    QuotingStrategy, RiskConfig, SpreadConfig, SymmetricStrategy,
+    AdverseSelectionConfig, BaseUrl, DataQualityConfig, EstimatorConfig, ExchangeClient,
+    FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient,
+    InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
+    MarginConfig, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
+    PnLConfig, QueueConfig, QuotingStrategy, RiskConfig, SpreadConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -84,6 +86,10 @@ struct Cli {
     #[arg(long)]
     log_file: Option<String>,
 
+    /// Metrics HTTP port (0 to disable)
+    #[arg(long)]
+    metrics_port: Option<u16>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -116,6 +122,35 @@ pub struct AppConfig {
     pub strategy: StrategyConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringAppConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MonitoringAppConfig {
+    /// HTTP port for Prometheus metrics endpoint (0 to disable)
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    /// Enable HTTP metrics endpoint
+    #[serde(default = "default_enable_metrics")]
+    pub enable_http_metrics: bool,
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+fn default_enable_metrics() -> bool {
+    true
+}
+
+impl Default for MonitoringAppConfig {
+    fn default() -> Self {
+        Self {
+            metrics_port: default_metrics_port(),
+            enable_http_metrics: default_enable_metrics(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -659,6 +694,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position,
         decimals,
         sz_decimals,
+        multi_asset: false, // Single-asset mode by default
     };
 
     // Create strategy based on config
@@ -685,17 +721,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         StrategyType::Ladder => {
-            let risk_cfg = config.strategy.risk_config.clone().unwrap_or_else(|| {
-                RiskConfig {
+            let risk_cfg = config
+                .strategy
+                .risk_config
+                .clone()
+                .unwrap_or_else(|| RiskConfig {
                     gamma_base: risk_aversion,
                     ..Default::default()
-                }
-            });
-            let ladder_cfg = config
-                .strategy
-                .ladder_config
-                .clone()
-                .unwrap_or_default();
+                });
+            let ladder_cfg = config.strategy.ladder_config.clone().unwrap_or_default();
             info!(
                 gamma_base = risk_cfg.gamma_base,
                 num_levels = ladder_cfg.num_levels,
@@ -751,6 +785,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spread_config = SpreadConfig::default();
     let pnl_config = PnLConfig::default();
     let margin_config = MarginConfig::default();
+    let data_quality_config = DataQualityConfig::default();
 
     // Create and start market maker
     let mut market_maker = MarketMaker::new(
@@ -771,6 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spread_config,
         pnl_config,
         margin_config,
+        data_quality_config,
     );
 
     // Sync open orders
@@ -778,6 +814,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sync_open_orders()
         .await
         .map_err(|e| format!("Failed to sync open orders: {e}"))?;
+
+    // Start HTTP metrics endpoint if enabled
+    let metrics_port = cli.metrics_port.unwrap_or(config.monitoring.metrics_port);
+    if config.monitoring.enable_http_metrics && metrics_port > 0 {
+        let prometheus = market_maker.prometheus().clone();
+        let asset_for_metrics = asset.clone();
+
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/metrics",
+                get(move || {
+                    let prom = prometheus.clone();
+                    let asset = asset_for_metrics.clone();
+                    async move { prom.to_prometheus_text(&asset) }
+                }),
+            );
+
+            let addr = format!("0.0.0.0:{}", metrics_port);
+            info!(port = metrics_port, "Starting Prometheus metrics endpoint");
+
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        warn!(error = %e, "Metrics server error");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, port = metrics_port, "Failed to bind metrics port");
+                }
+            }
+        });
+    }
 
     info!("Market maker initialized, starting main loop...");
     market_maker

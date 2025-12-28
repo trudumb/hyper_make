@@ -114,11 +114,23 @@ impl Ladder {
 
         let spreads: Vec<f64> = depths
             .iter()
-            .map(|&d| spread_capture(d, params.as_at_touch_bps, config.as_decay_bps, config.fees_bps))
+            .map(|&d| {
+                spread_capture(
+                    d,
+                    params.as_at_touch_bps,
+                    config.as_decay_bps,
+                    config.fees_bps,
+                )
+            })
             .collect();
 
         // 3. Allocate sizes proportional to marginal value
-        let sizes = allocate_sizes(&intensities, &spreads, params.total_size, config.min_level_size);
+        let sizes = allocate_sizes(
+            &intensities,
+            &spreads,
+            params.total_size,
+            config.min_level_size,
+        );
 
         // 4. Build raw ladder (before skew)
         let mut ladder = build_raw_ladder(
@@ -319,8 +331,16 @@ fn build_raw_ladder(
     }
 
     // Sort: bids highest first (best bid), asks lowest first (best ask)
-    bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-    asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+    bids.sort_by(|a, b| {
+        b.price
+            .partial_cmp(&a.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    asks.sort_by(|a, b| {
+        a.price
+            .partial_cmp(&b.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ladder { bids, asks }
 }

@@ -524,6 +524,733 @@ impl MomentumDetector {
 }
 
 // ============================================================================
+// Jump Process Estimator (First Principles Gap 1)
+// ============================================================================
+
+/// Configuration for jump process estimation.
+#[derive(Debug, Clone)]
+pub struct JumpEstimatorConfig {
+    /// Threshold for jump detection (in sigma units, e.g., 3.0 = 3σ)
+    pub jump_threshold_sigmas: f64,
+    /// Window for jump intensity estimation (ms)
+    pub window_ms: u64,
+    /// EWMA alpha for online parameter updates
+    pub alpha: f64,
+    /// Minimum jumps before estimates are valid
+    pub min_jumps: usize,
+}
+
+impl Default for JumpEstimatorConfig {
+    fn default() -> Self {
+        Self {
+            jump_threshold_sigmas: 3.0,
+            window_ms: 300_000, // 5 minutes
+            alpha: 0.1,
+            min_jumps: 5,
+        }
+    }
+}
+
+/// Jump process estimator for explicit λ (intensity), μ_j (mean), σ_j (std dev).
+///
+/// Implements the jump component of the price process:
+/// dP = μ dt + σ dW + J dN where J ~ N(μ_j, σ_j²), N ~ Poisson(λ)
+///
+/// Key formulas:
+/// - Total variance over horizon h: Var[P(t+h) - P(t)] = σ²h + λh×E[J²]
+/// - E[J²] = μ_j² + σ_j²
+#[derive(Debug)]
+pub struct JumpEstimator {
+    /// Jump intensity (jumps per second)
+    lambda_jump: f64,
+    /// Mean jump size (in log-return units)
+    mu_jump: f64,
+    /// Jump size standard deviation
+    sigma_jump: f64,
+    /// Recent detected jumps: (timestamp_ms, size, is_positive)
+    recent_jumps: VecDeque<(u64, f64, bool)>,
+    /// Online mean tracker
+    sum_sizes: f64,
+    sum_sq_sizes: f64,
+    jump_count: usize,
+    /// Configuration
+    config: JumpEstimatorConfig,
+    /// Last update timestamp
+    last_update_ms: u64,
+}
+
+impl JumpEstimator {
+    /// Create a new jump estimator with default configuration.
+    pub fn new() -> Self {
+        Self::with_config(JumpEstimatorConfig::default())
+    }
+
+    /// Create with custom configuration.
+    pub fn with_config(config: JumpEstimatorConfig) -> Self {
+        Self {
+            lambda_jump: 0.0,
+            mu_jump: 0.0,
+            sigma_jump: 0.0001, // Small default
+            recent_jumps: VecDeque::with_capacity(100),
+            sum_sizes: 0.0,
+            sum_sq_sizes: 0.0,
+            jump_count: 0,
+            config,
+            last_update_ms: 0,
+        }
+    }
+
+    /// Check if a return qualifies as a jump.
+    ///
+    /// A return is a "jump" if |return| > threshold × σ_clean
+    pub fn is_jump(&self, log_return: f64, sigma_clean: f64) -> bool {
+        let threshold = self.config.jump_threshold_sigmas * sigma_clean;
+        log_return.abs() > threshold
+    }
+
+    /// Record a detected jump and update parameters.
+    pub fn record_jump(&mut self, timestamp_ms: u64, log_return: f64) {
+        let size = log_return.abs();
+        let is_positive = log_return > 0.0;
+
+        self.recent_jumps
+            .push_back((timestamp_ms, size, is_positive));
+
+        // Update online statistics
+        self.sum_sizes += size;
+        self.sum_sq_sizes += size * size;
+        self.jump_count += 1;
+
+        // Expire old jumps
+        let cutoff = timestamp_ms.saturating_sub(self.config.window_ms);
+        while self
+            .recent_jumps
+            .front()
+            .map(|(t, _, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
+            if let Some((_, old_size, _)) = self.recent_jumps.pop_front() {
+                self.sum_sizes -= old_size;
+                self.sum_sq_sizes -= old_size * old_size;
+                self.jump_count = self.jump_count.saturating_sub(1);
+            }
+        }
+
+        // Update parameters using EWMA
+        self.update_parameters(timestamp_ms);
+        self.last_update_ms = timestamp_ms;
+    }
+
+    /// Update lambda, mu, sigma from recent jumps.
+    fn update_parameters(&mut self, _timestamp_ms: u64) {
+        if self.jump_count < self.config.min_jumps {
+            return;
+        }
+
+        let n = self.jump_count as f64;
+        let window_secs = self.config.window_ms as f64 / 1000.0;
+
+        // Lambda: jumps per second
+        let new_lambda = n / window_secs;
+        self.lambda_jump =
+            self.config.alpha * new_lambda + (1.0 - self.config.alpha) * self.lambda_jump;
+
+        // Mu: mean jump size (signed average would be near 0, use unsigned)
+        let new_mu = self.sum_sizes / n;
+        self.mu_jump = self.config.alpha * new_mu + (1.0 - self.config.alpha) * self.mu_jump;
+
+        // Sigma: standard deviation of jump sizes
+        let variance = (self.sum_sq_sizes / n) - (new_mu * new_mu);
+        if variance > 0.0 {
+            let new_sigma = variance.sqrt();
+            self.sigma_jump =
+                self.config.alpha * new_sigma + (1.0 - self.config.alpha) * self.sigma_jump;
+        }
+    }
+
+    /// Process a return observation (called on each volume bucket).
+    pub fn on_return(&mut self, timestamp_ms: u64, log_return: f64, sigma_clean: f64) {
+        if self.is_jump(log_return, sigma_clean) {
+            self.record_jump(timestamp_ms, log_return);
+        }
+    }
+
+    /// Get jump intensity (λ) - jumps per second.
+    pub fn lambda(&self) -> f64 {
+        self.lambda_jump
+    }
+
+    /// Get mean jump size (μ_j) in log-return units.
+    pub fn mu(&self) -> f64 {
+        self.mu_jump
+    }
+
+    /// Get jump size standard deviation (σ_j).
+    pub fn sigma(&self) -> f64 {
+        self.sigma_jump
+    }
+
+    /// Get expected jump variance contribution: E[J²] = μ² + σ².
+    pub fn expected_jump_variance(&self) -> f64 {
+        self.mu_jump.powi(2) + self.sigma_jump.powi(2)
+    }
+
+    /// Get total variance over horizon including jumps.
+    ///
+    /// Var[P(t+h) - P(t)] = σ_diffusion² × h + λ × h × E[J²]
+    pub fn total_variance(&self, sigma_diffusion: f64, horizon_secs: f64) -> f64 {
+        let diffusion_var = sigma_diffusion.powi(2) * horizon_secs;
+        let jump_var = self.lambda_jump * horizon_secs * self.expected_jump_variance();
+        diffusion_var + jump_var
+    }
+
+    /// Get total volatility (sqrt of total variance).
+    pub fn total_sigma(&self, sigma_diffusion: f64, horizon_secs: f64) -> f64 {
+        self.total_variance(sigma_diffusion, horizon_secs).sqrt()
+    }
+
+    /// Check if estimator has enough data.
+    pub fn is_warmed_up(&self) -> bool {
+        self.jump_count >= self.config.min_jumps
+    }
+
+    /// Get number of jumps in current window.
+    pub fn jump_count(&self) -> usize {
+        self.jump_count
+    }
+
+    /// Get fraction of recent returns that were jumps.
+    pub fn jump_fraction(&self, total_returns: usize) -> f64 {
+        if total_returns == 0 {
+            0.0
+        } else {
+            self.jump_count as f64 / total_returns as f64
+        }
+    }
+}
+
+impl Default for JumpEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Stochastic Volatility Parameters (First Principles Gap 2)
+// ============================================================================
+
+/// Stochastic volatility model parameters (Heston-style OU process).
+///
+/// Models volatility as a mean-reverting process:
+/// dσ² = κ(θ - σ²)dt + ξσ² dZ  with Corr(dW, dZ) = ρ
+///
+/// Key formulas:
+/// - Expected avg variance: E[∫₀ᵀ σ² dt]/T = θ + (σ₀² - θ)(1 - e^(-κT))/(κT)
+/// - Leverage effect: Vol increases when returns are negative (ρ < 0)
+#[derive(Debug, Clone)]
+pub struct StochasticVolParams {
+    /// Current instantaneous variance (σ²)
+    v_t: f64,
+    /// Mean-reversion speed (κ)
+    kappa_vol: f64,
+    /// Long-run variance (θ)
+    theta_vol: f64,
+    /// Vol-of-vol (ξ)
+    xi_vol: f64,
+    /// Price-vol correlation (ρ, typically negative "leverage effect")
+    rho: f64,
+    /// Variance history for calibration: (timestamp_ms, variance)
+    variance_history: VecDeque<(u64, f64)>,
+    /// Return history for correlation estimation
+    return_history: VecDeque<(u64, f64)>,
+    /// EWMA alpha for updates
+    alpha: f64,
+    /// History window (ms)
+    window_ms: u64,
+    /// Minimum observations for calibration
+    min_observations: usize,
+}
+
+impl StochasticVolParams {
+    /// Create with default parameters.
+    pub fn new(default_sigma: f64) -> Self {
+        let default_var = default_sigma.powi(2);
+        Self {
+            v_t: default_var,
+            kappa_vol: 0.5,         // Moderate mean-reversion
+            theta_vol: default_var, // Long-run = current
+            xi_vol: 0.1,            // 10% vol-of-vol
+            rho: -0.3,              // Typical leverage effect
+            variance_history: VecDeque::with_capacity(500),
+            return_history: VecDeque::with_capacity(500),
+            alpha: 0.05,
+            window_ms: 300_000, // 5 minutes
+            min_observations: 20,
+        }
+    }
+
+    /// Update with new variance observation.
+    pub fn on_variance(&mut self, timestamp_ms: u64, variance: f64, log_return: f64) {
+        // Update current variance with EWMA
+        self.v_t = self.alpha * variance + (1.0 - self.alpha) * self.v_t;
+
+        // Store history
+        self.variance_history.push_back((timestamp_ms, variance));
+        self.return_history.push_back((timestamp_ms, log_return));
+
+        // Expire old entries
+        let cutoff = timestamp_ms.saturating_sub(self.window_ms);
+        while self
+            .variance_history
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
+            self.variance_history.pop_front();
+        }
+        while self
+            .return_history
+            .front()
+            .map(|(t, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
+            self.return_history.pop_front();
+        }
+
+        // Periodically calibrate parameters
+        if self.variance_history.len() >= self.min_observations
+            && self.variance_history.len().is_multiple_of(10)
+        {
+            self.calibrate();
+        }
+    }
+
+    /// Calibrate κ, θ, ξ, ρ from history.
+    fn calibrate(&mut self) {
+        let n = self.variance_history.len();
+        if n < self.min_observations {
+            return;
+        }
+
+        // Theta: long-run mean of variance
+        let sum_var: f64 = self.variance_history.iter().map(|(_, v)| v).sum();
+        self.theta_vol = sum_var / n as f64;
+
+        // Xi (vol-of-vol): std dev of variance changes
+        let var_changes: Vec<f64> = self
+            .variance_history
+            .iter()
+            .zip(self.variance_history.iter().skip(1))
+            .map(|((_, v1), (_, v2))| v2 - v1)
+            .collect();
+        if var_changes.len() > 1 {
+            let mean_change: f64 = var_changes.iter().sum::<f64>() / var_changes.len() as f64;
+            let sum_sq: f64 = var_changes.iter().map(|c| (c - mean_change).powi(2)).sum();
+            self.xi_vol = (sum_sq / var_changes.len() as f64).sqrt();
+        }
+
+        // Kappa: estimate from autocorrelation decay
+        // Simplified: use ratio of consecutive variance changes
+        let mean_var = self.theta_vol;
+        let deviations: Vec<f64> = self
+            .variance_history
+            .iter()
+            .map(|(_, v)| v - mean_var)
+            .collect();
+        if deviations.len() > 1 {
+            let autocov: f64 = deviations
+                .iter()
+                .zip(deviations.iter().skip(1))
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
+                / (deviations.len() - 1) as f64;
+            let variance: f64 =
+                deviations.iter().map(|d| d.powi(2)).sum::<f64>() / deviations.len() as f64;
+            if variance > 1e-12 {
+                let autocorr = autocov / variance;
+                // For OU process: autocorr ≈ exp(-κ × Δt)
+                // Assuming Δt ≈ 1 second average between observations
+                if autocorr > 0.0 && autocorr < 1.0 {
+                    self.kappa_vol = -autocorr.ln().clamp(0.01, 5.0);
+                }
+            }
+        }
+
+        // Rho: correlation between returns and variance changes
+        if self.return_history.len() == self.variance_history.len() && n > 2 {
+            let returns: Vec<f64> = self.return_history.iter().map(|(_, r)| *r).collect();
+            let var_deltas: Vec<f64> = self
+                .variance_history
+                .iter()
+                .zip(self.variance_history.iter().skip(1))
+                .map(|((_, v1), (_, v2))| v2 - v1)
+                .collect();
+
+            if !var_deltas.is_empty() {
+                let n_pairs = var_deltas.len().min(returns.len() - 1);
+                let mean_r: f64 = returns[..n_pairs].iter().sum::<f64>() / n_pairs as f64;
+                let mean_dv: f64 = var_deltas[..n_pairs].iter().sum::<f64>() / n_pairs as f64;
+
+                let cov: f64 = returns[..n_pairs]
+                    .iter()
+                    .zip(var_deltas[..n_pairs].iter())
+                    .map(|(r, dv)| (r - mean_r) * (dv - mean_dv))
+                    .sum::<f64>()
+                    / n_pairs as f64;
+
+                let std_r = (returns[..n_pairs]
+                    .iter()
+                    .map(|r| (r - mean_r).powi(2))
+                    .sum::<f64>()
+                    / n_pairs as f64)
+                    .sqrt();
+                let std_dv = (var_deltas[..n_pairs]
+                    .iter()
+                    .map(|dv| (dv - mean_dv).powi(2))
+                    .sum::<f64>()
+                    / n_pairs as f64)
+                    .sqrt();
+
+                if std_r > 1e-12 && std_dv > 1e-12 {
+                    self.rho = (cov / (std_r * std_dv)).clamp(-0.95, 0.95);
+                }
+            }
+        }
+    }
+
+    /// Get expected average variance over horizon using OU dynamics.
+    ///
+    /// E[∫₀ᵀ σ² dt]/T = θ + (σ₀² - θ)(1 - e^(-κT))/(κT)
+    pub fn expected_avg_variance(&self, horizon_secs: f64) -> f64 {
+        if horizon_secs < 1e-9 || self.kappa_vol < 1e-9 {
+            return self.v_t;
+        }
+
+        let kt = self.kappa_vol * horizon_secs;
+        let decay = 1.0 - (-kt).exp();
+        self.theta_vol + (self.v_t - self.theta_vol) * decay / kt
+    }
+
+    /// Get expected average volatility (sqrt of variance).
+    pub fn expected_avg_sigma(&self, horizon_secs: f64) -> f64 {
+        self.expected_avg_variance(horizon_secs).sqrt()
+    }
+
+    /// Get leverage-adjusted volatility.
+    ///
+    /// When returns are negative and ρ < 0, volatility increases.
+    pub fn leverage_adjusted_vol(&self, recent_return: f64) -> f64 {
+        let base_vol = self.v_t.sqrt();
+
+        // If return and rho have same sign, vol decreases
+        // If opposite signs, vol increases (leverage effect)
+        let adjustment = if recent_return * self.rho < 0.0 {
+            // Return is negative, rho is negative: vol increases
+            0.2 * recent_return.abs() / base_vol.max(1e-9)
+        } else {
+            0.0
+        };
+
+        base_vol * (1.0 + adjustment.clamp(0.0, 0.5))
+    }
+
+    // === Getters ===
+
+    /// Current instantaneous variance.
+    pub fn v_t(&self) -> f64 {
+        self.v_t
+    }
+
+    /// Current instantaneous volatility.
+    pub fn sigma_t(&self) -> f64 {
+        self.v_t.sqrt()
+    }
+
+    /// Mean-reversion speed.
+    pub fn kappa(&self) -> f64 {
+        self.kappa_vol
+    }
+
+    /// Long-run variance.
+    pub fn theta(&self) -> f64 {
+        self.theta_vol
+    }
+
+    /// Long-run volatility.
+    pub fn theta_sigma(&self) -> f64 {
+        self.theta_vol.sqrt()
+    }
+
+    /// Vol-of-vol.
+    pub fn xi(&self) -> f64 {
+        self.xi_vol
+    }
+
+    /// Price-vol correlation (leverage effect).
+    pub fn rho(&self) -> f64 {
+        self.rho
+    }
+
+    /// Check if calibrated.
+    pub fn is_calibrated(&self) -> bool {
+        self.variance_history.len() >= self.min_observations
+    }
+}
+
+// ============================================================================
+// Noise Filter (First Principles Gap 9)
+// ============================================================================
+
+/// Filters bid-ask bounce noise from price series.
+///
+/// Uses the Roll model: Cov(r_t, r_{t-1}) = -noise_var
+/// to estimate microstructure noise and provide cleaner price signals.
+#[derive(Debug)]
+pub struct NoiseFilter {
+    /// Estimated noise variance (from autocovariance)
+    noise_variance: f64,
+    /// Recent returns for autocovariance calculation
+    returns: VecDeque<f64>,
+    /// Maximum history size
+    max_history: usize,
+    /// EWMA alpha for noise estimation
+    alpha: f64,
+}
+
+impl NoiseFilter {
+    /// Create a new noise filter.
+    pub fn new(max_history: usize, alpha: f64) -> Self {
+        Self {
+            noise_variance: 0.0,
+            returns: VecDeque::with_capacity(max_history),
+            max_history,
+            alpha,
+        }
+    }
+
+    /// Create with default parameters.
+    pub fn default_config() -> Self {
+        Self::new(100, 0.05)
+    }
+
+    /// Record a new return observation.
+    pub fn on_return(&mut self, log_return: f64) {
+        self.returns.push_back(log_return);
+
+        // Trim to max size
+        while self.returns.len() > self.max_history {
+            self.returns.pop_front();
+        }
+
+        // Update noise variance from autocovariance
+        if self.returns.len() >= 2 {
+            self.update_noise_estimate();
+        }
+    }
+
+    /// Update noise estimate using Roll model.
+    ///
+    /// Roll model: Cov(r_t, r_{t-1}) = -noise_var
+    fn update_noise_estimate(&mut self) {
+        if self.returns.len() < 2 {
+            return;
+        }
+
+        // Calculate lag-1 autocovariance
+        let n = self.returns.len();
+        let returns_vec: Vec<f64> = self.returns.iter().cloned().collect();
+
+        let mean = returns_vec.iter().sum::<f64>() / n as f64;
+
+        let mut cov = 0.0;
+        for i in 1..n {
+            cov += (returns_vec[i] - mean) * (returns_vec[i - 1] - mean);
+        }
+        cov /= (n - 1) as f64;
+
+        // Roll model: noise_var = -Cov(r_t, r_{t-1})
+        // Only update if covariance is negative (expected from bid-ask bounce)
+        if cov < 0.0 {
+            let new_estimate = -cov;
+            self.noise_variance =
+                self.alpha * new_estimate + (1.0 - self.alpha) * self.noise_variance;
+        }
+    }
+
+    /// Get estimated noise standard deviation.
+    pub fn noise_sigma(&self) -> f64 {
+        self.noise_variance.sqrt()
+    }
+
+    /// Get estimated noise variance.
+    pub fn noise_variance(&self) -> f64 {
+        self.noise_variance
+    }
+
+    /// Clean a return by removing estimated noise component.
+    ///
+    /// Returns a filtered return with reduced microstructure noise.
+    pub fn filter_return(&self, raw_return: f64) -> f64 {
+        if self.noise_variance < 1e-20 {
+            return raw_return;
+        }
+
+        // Simple shrinkage toward 0 based on signal-to-noise ratio
+        let total_var = raw_return.powi(2);
+        let signal_var = (total_var - self.noise_variance).max(0.0);
+
+        if total_var < 1e-20 {
+            return 0.0;
+        }
+
+        let shrinkage = signal_var / total_var;
+        raw_return * shrinkage.sqrt()
+    }
+
+    /// Check if filter is warmed up.
+    pub fn is_warmed_up(&self) -> bool {
+        self.returns.len() >= 20
+    }
+}
+
+// ============================================================================
+// Probabilistic Momentum Model (First Principles Gap 10)
+// ============================================================================
+
+/// Probabilistic momentum model for continuation/reversal prediction.
+///
+/// Replaces heuristic knife scores with Bayesian probability estimates
+/// of momentum continuation.
+#[derive(Debug)]
+pub struct MomentumModel {
+    /// Prior probability of momentum continuation
+    prior_continuation: f64,
+    /// Likelihood ratio observations: (timestamp_ms, momentum_bps, continued)
+    observations: VecDeque<(u64, f64, bool)>,
+    /// Learned continuation probability by momentum magnitude
+    continuation_by_magnitude: [f64; 10], // Buckets: 0-10, 10-20, ..., 90+ bps
+    /// Observation counts per bucket
+    counts_by_magnitude: [usize; 10],
+    /// Window for observations (ms)
+    window_ms: u64,
+    /// Minimum observations per bucket
+    min_observations: usize,
+    /// EWMA alpha for updates
+    alpha: f64,
+}
+
+impl MomentumModel {
+    /// Create a new momentum model.
+    pub fn new(window_ms: u64, alpha: f64) -> Self {
+        Self {
+            prior_continuation: 0.5, // 50% prior
+            observations: VecDeque::with_capacity(1000),
+            continuation_by_magnitude: [0.5; 10], // Start at 50%
+            counts_by_magnitude: [0; 10],
+            window_ms,
+            min_observations: 10,
+            alpha,
+        }
+    }
+
+    /// Create with default parameters.
+    pub fn default_config() -> Self {
+        Self::new(300_000, 0.1) // 5 minute window
+    }
+
+    /// Record an observation of momentum and whether it continued.
+    ///
+    /// # Arguments
+    /// - `timestamp_ms`: Current timestamp
+    /// - `momentum_bps`: Momentum in basis points (can be negative)
+    /// - `continued`: Whether the momentum continued (same sign return)
+    pub fn record_observation(&mut self, timestamp_ms: u64, momentum_bps: f64, continued: bool) {
+        self.observations
+            .push_back((timestamp_ms, momentum_bps, continued));
+
+        // Update bucket statistics
+        let bucket = self.magnitude_to_bucket(momentum_bps.abs());
+        self.counts_by_magnitude[bucket] += 1;
+
+        let obs = if continued { 1.0 } else { 0.0 };
+        self.continuation_by_magnitude[bucket] =
+            self.alpha * obs + (1.0 - self.alpha) * self.continuation_by_magnitude[bucket];
+
+        // Expire old observations
+        let cutoff = timestamp_ms.saturating_sub(self.window_ms);
+        while self
+            .observations
+            .front()
+            .map(|(t, _, _)| *t < cutoff)
+            .unwrap_or(false)
+        {
+            self.observations.pop_front();
+        }
+    }
+
+    /// Map momentum magnitude to bucket index.
+    fn magnitude_to_bucket(&self, abs_momentum_bps: f64) -> usize {
+        ((abs_momentum_bps / 10.0) as usize).min(9)
+    }
+
+    /// Get probability of momentum continuation.
+    ///
+    /// Returns P(next_return has same sign as momentum).
+    pub fn continuation_probability(&self, momentum_bps: f64) -> f64 {
+        let bucket = self.magnitude_to_bucket(momentum_bps.abs());
+
+        // Use learned probability if we have enough data
+        if self.counts_by_magnitude[bucket] >= self.min_observations {
+            self.continuation_by_magnitude[bucket]
+        } else {
+            self.prior_continuation
+        }
+    }
+
+    /// Get bid protection factor based on momentum.
+    ///
+    /// Returns multiplier > 1 if we should protect bids (falling market).
+    pub fn bid_protection_factor(&self, momentum_bps: f64) -> f64 {
+        if momentum_bps >= 0.0 {
+            return 1.0; // Not falling, no protection needed
+        }
+
+        let p_continue = self.continuation_probability(momentum_bps);
+        let magnitude_factor = (momentum_bps.abs() / 50.0).min(1.0); // Scale by magnitude
+
+        // Protection factor: 1.0 to 2.0 based on continuation prob and magnitude
+        1.0 + p_continue * magnitude_factor
+    }
+
+    /// Get ask protection factor based on momentum.
+    ///
+    /// Returns multiplier > 1 if we should protect asks (rising market).
+    pub fn ask_protection_factor(&self, momentum_bps: f64) -> f64 {
+        if momentum_bps <= 0.0 {
+            return 1.0; // Not rising, no protection needed
+        }
+
+        let p_continue = self.continuation_probability(momentum_bps);
+        let magnitude_factor = (momentum_bps.abs() / 50.0).min(1.0);
+
+        1.0 + p_continue * magnitude_factor
+    }
+
+    /// Get overall momentum strength [0, 1].
+    pub fn momentum_strength(&self, momentum_bps: f64) -> f64 {
+        let p_continue = self.continuation_probability(momentum_bps);
+        let magnitude = (momentum_bps.abs() / 100.0).min(1.0);
+
+        p_continue * magnitude
+    }
+
+    /// Check if model is calibrated.
+    pub fn is_calibrated(&self) -> bool {
+        self.observations.len() >= self.min_observations * 3
+    }
+}
+
+// ============================================================================
 // Trade Flow Tracker (Buy/Sell Imbalance)
 // ============================================================================
 
@@ -796,7 +1523,7 @@ impl FillRateKappaEstimator {
             alpha: (2.0_f64.ln() / half_life_ticks).clamp(0.001, 0.5),
             update_count: 0,
             default_kappa,
-            cv: 1.0, // For exponential, CV = 1.0 exactly
+            cv: 1.0,        // For exponential, CV = 1.0 exactly
             fit_score: 0.5, // Start neutral
         }
     }
@@ -1498,7 +2225,7 @@ impl VolumeTickArrivalEstimator {
 /// - Normal: Standard market conditions
 /// - High: Elevated volatility (σ > 1.5 × baseline)
 /// - Extreme: Crisis/toxic conditions (σ > 3 × baseline OR high jump ratio)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VolatilityRegime {
     /// Very quiet market - can tighten spreads
     Low,
@@ -1562,8 +2289,8 @@ struct VolatilityRegimeTracker {
     /// Minimum transitions before state change (hysteresis parameter)
     min_transitions: u32,
     /// Thresholds relative to baseline
-    low_threshold: f64,    // σ < baseline × low_threshold → Low
-    high_threshold: f64,   // σ > baseline × high_threshold → High
+    low_threshold: f64, // σ < baseline × low_threshold → Low
+    high_threshold: f64,    // σ > baseline × high_threshold → High
     extreme_threshold: f64, // σ > baseline × extreme_threshold → Extreme
     /// Jump ratio threshold for Extreme regime
     jump_threshold: f64,
@@ -1699,6 +2426,10 @@ pub struct ParameterEstimator {
     current_time_ms: u64,
     /// 4-state volatility regime tracker with hysteresis
     volatility_regime: VolatilityRegimeTracker,
+    /// Jump process estimator (λ, μ_j, σ_j)
+    jump_estimator: JumpEstimator,
+    /// Stochastic volatility parameters (κ_vol, θ_vol, ξ, ρ)
+    stoch_vol: StochasticVolParams,
 }
 
 impl ParameterEstimator {
@@ -1738,6 +2469,12 @@ impl ParameterEstimator {
         // Volatility regime tracker with baseline from config
         let volatility_regime = VolatilityRegimeTracker::new(config.default_sigma);
 
+        // Jump process estimator (First Principles Gap 1)
+        let jump_estimator = JumpEstimator::new();
+
+        // Stochastic volatility params (First Principles Gap 2)
+        let stoch_vol = StochasticVolParams::new(config.default_sigma);
+
         Self {
             config,
             bucket_accumulator,
@@ -1752,6 +2489,8 @@ impl ParameterEstimator {
             current_mid: 0.0,
             current_time_ms: 0,
             volatility_regime,
+            jump_estimator,
+            stoch_vol,
         }
     }
 
@@ -1800,6 +2539,16 @@ impl ParameterEstimator {
             // Update momentum detector with signed return
             if let Some(ret) = log_return {
                 self.momentum.on_bucket(bucket.end_time_ms, ret);
+
+                // Update jump estimator with return (detects jumps > 3σ)
+                let sigma_clean = self.multi_scale.sigma_clean();
+                self.jump_estimator
+                    .on_return(bucket.end_time_ms, ret, sigma_clean);
+
+                // Update stochastic vol with current variance observation
+                let variance = self.multi_scale.sigma_total().powi(2);
+                self.stoch_vol
+                    .on_variance(bucket.end_time_ms, variance, ret);
             }
 
             // Update volatility regime with current sigma and jump ratio
@@ -1809,7 +2558,8 @@ impl ParameterEstimator {
 
             // Slowly update baseline from slow sigma (long-term anchor)
             // Using slow sigma as the stable reference for regime thresholds
-            self.volatility_regime.update_baseline(self.multi_scale.sigma_clean());
+            self.volatility_regime
+                .update_baseline(self.multi_scale.sigma_clean());
 
             debug!(
                 vwap = %format!("{:.4}", bucket.vwap),
@@ -2030,6 +2780,90 @@ impl ParameterEstimator {
     /// Negative = sell pressure, Positive = buy pressure.
     pub fn flow_imbalance(&self) -> f64 {
         self.flow.imbalance()
+    }
+
+    // === Jump Process Accessors (First Principles Gap 1) ===
+
+    /// Get jump intensity (λ) - expected jumps per second.
+    pub fn lambda_jump(&self) -> f64 {
+        self.jump_estimator.lambda()
+    }
+
+    /// Get mean jump size (μ_j) in log-return units.
+    pub fn mu_jump(&self) -> f64 {
+        self.jump_estimator.mu()
+    }
+
+    /// Get jump size standard deviation (σ_j).
+    pub fn sigma_jump(&self) -> f64 {
+        self.jump_estimator.sigma()
+    }
+
+    /// Get total variance including jumps over horizon.
+    ///
+    /// Var[P(t+h) - P(t)] = σ²h + λh×E[J²]
+    pub fn total_variance(&self, horizon_secs: f64) -> f64 {
+        let sigma_diffusion = self.multi_scale.sigma_clean();
+        self.jump_estimator
+            .total_variance(sigma_diffusion, horizon_secs)
+    }
+
+    /// Get total volatility including jumps (sqrt of total variance).
+    pub fn total_sigma(&self, horizon_secs: f64) -> f64 {
+        let sigma_diffusion = self.multi_scale.sigma_clean();
+        self.jump_estimator
+            .total_sigma(sigma_diffusion, horizon_secs)
+    }
+
+    /// Check if jump estimator has enough data.
+    pub fn jump_estimator_warmed_up(&self) -> bool {
+        self.jump_estimator.is_warmed_up()
+    }
+
+    // === Stochastic Volatility Accessors (First Principles Gap 2) ===
+
+    /// Get current instantaneous volatility from stochastic vol model.
+    pub fn sigma_stoch_vol(&self) -> f64 {
+        self.stoch_vol.sigma_t()
+    }
+
+    /// Get volatility mean-reversion speed (κ_vol).
+    pub fn kappa_vol(&self) -> f64 {
+        self.stoch_vol.kappa()
+    }
+
+    /// Get long-run volatility (√θ_vol).
+    pub fn theta_vol_sigma(&self) -> f64 {
+        self.stoch_vol.theta_sigma()
+    }
+
+    /// Get vol-of-vol (ξ).
+    pub fn xi_vol(&self) -> f64 {
+        self.stoch_vol.xi()
+    }
+
+    /// Get price-vol correlation (ρ, typically negative - leverage effect).
+    pub fn rho_price_vol(&self) -> f64 {
+        self.stoch_vol.rho()
+    }
+
+    /// Get expected average volatility over horizon using OU dynamics.
+    ///
+    /// Accounts for mean-reversion: if σ > θ, vol will decrease toward θ.
+    pub fn expected_avg_sigma(&self, horizon_secs: f64) -> f64 {
+        self.stoch_vol.expected_avg_sigma(horizon_secs)
+    }
+
+    /// Get leverage-adjusted volatility based on recent return.
+    ///
+    /// When returns are negative and ρ < 0, volatility increases.
+    pub fn leverage_adjusted_vol(&self, recent_return: f64) -> f64 {
+        self.stoch_vol.leverage_adjusted_vol(recent_return)
+    }
+
+    /// Check if stochastic vol is calibrated.
+    pub fn stoch_vol_calibrated(&self) -> bool {
+        self.stoch_vol.is_calibrated()
     }
 
     // === Warmup ===

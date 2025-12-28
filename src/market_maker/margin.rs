@@ -28,8 +28,8 @@ pub struct MarginConfig {
 impl Default for MarginConfig {
     fn default() -> Self {
         Self {
-            max_leverage: 3.0,       // Conservative 3x max leverage
-            margin_buffer: 0.8,      // Use 80% of available margin
+            max_leverage: 3.0,                // Conservative 3x max leverage
+            margin_buffer: 0.8,               // Use 80% of available margin
             max_notional_position: 100_000.0, // $100k max position
             max_order_notional: 10_000.0,     // $10k max per order
             refresh_interval: Duration::from_secs(10),

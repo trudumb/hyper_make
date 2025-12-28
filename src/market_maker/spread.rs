@@ -65,10 +65,10 @@ impl Default for SpreadConfig {
 /// A single spread observation.
 #[derive(Debug, Clone, Copy)]
 struct SpreadObservation {
-    spread: f64,      // As a fraction of mid
+    spread: f64, // As a fraction of mid
     #[allow(dead_code)]
     timestamp: Instant,
-    volatility: f64,  // Current volatility when observed
+    volatility: f64, // Current volatility when observed
 }
 
 /// Spread process estimator.
@@ -139,9 +139,8 @@ impl SpreadProcessEstimator {
         if self.observation_count == 0 {
             self.ewma_spread = spread;
         } else {
-            self.ewma_spread =
-                self.config.ewma_lambda * self.ewma_spread
-                    + (1.0 - self.config.ewma_lambda) * spread;
+            self.ewma_spread = self.config.ewma_lambda * self.ewma_spread
+                + (1.0 - self.config.ewma_lambda) * spread;
         }
 
         // Track min/max
@@ -230,6 +229,96 @@ impl SpreadProcessEstimator {
         self.current_spread * decay + theta * (1.0 - decay)
     }
 
+    /// Predicted spread - alias for expected_spread (First Principles Gap 4).
+    pub fn predicted_spread(&self, horizon_secs: f64) -> f64 {
+        self.expected_spread(horizon_secs)
+    }
+
+    /// Should we defer placing a quote because spread will improve?
+    ///
+    /// Returns (should_defer, expected_improvement_fraction) where:
+    /// - should_defer: True if we should wait before quoting
+    /// - expected_improvement: Fraction of current spread we expect to save
+    ///
+    /// Logic: If the spread is significantly wider than fair value and
+    /// expected to improve by more than `improvement_threshold` within
+    /// `horizon_secs`, we should defer.
+    ///
+    /// # Arguments
+    /// - `horizon_secs`: How far to look ahead (default: 10 seconds)
+    /// - `improvement_threshold`: Minimum improvement to defer (default: 0.2 = 20%)
+    pub fn should_defer_quote(&self, horizon_secs: f64, improvement_threshold: f64) -> (bool, f64) {
+        let current = self.current_spread;
+        let expected = self.expected_spread(horizon_secs);
+
+        if current <= 0.0 {
+            return (false, 0.0);
+        }
+
+        // Calculate expected improvement (positive = spread will tighten)
+        let improvement = (current - expected) / current;
+
+        // Defer if:
+        // 1. Spread is wide (above fair)
+        // 2. Expected improvement exceeds threshold
+        let should_defer = self.is_spread_wide() && improvement > improvement_threshold;
+
+        (should_defer, improvement)
+    }
+
+    /// Should defer with default parameters.
+    /// Uses 10 second horizon and 20% improvement threshold.
+    pub fn should_defer_quote_default(&self) -> (bool, f64) {
+        self.should_defer_quote(10.0, 0.2)
+    }
+
+    /// Get the optimal time to wait before quoting.
+    ///
+    /// Returns the time in seconds at which spread is expected to be
+    /// closest to fair value, up to max_wait_secs.
+    pub fn optimal_wait_time(&self, max_wait_secs: f64) -> f64 {
+        // For OU process, spread converges monotonically to fair
+        // If current > fair, waiting is always better (up to max)
+        // If current < fair, don't wait at all
+        let fair = self.fair_spread();
+
+        if self.current_spread <= fair {
+            return 0.0; // Already at or below fair
+        }
+
+        // Find time when expected spread = fair (solving for T)
+        // S(t) × e^(-κT) + θ × (1 - e^(-κT)) = fair
+        // Since fair = θ (by definition), this would take infinite time
+        // Instead, find time when we're within 10% of fair
+
+        let target = fair * 1.1; // Within 10% of fair
+        let kappa = self.config.mean_reversion_speed;
+
+        if kappa <= 1e-9 {
+            return max_wait_secs;
+        }
+
+        // Solve: S(t) × e^(-κT) + θ × (1 - e^(-κT)) = target
+        // S(t) × e^(-κT) - θ × e^(-κT) = target - θ
+        // (S(t) - θ) × e^(-κT) = target - θ
+        // e^(-κT) = (target - θ) / (S(t) - θ)
+
+        let s0 = self.current_spread;
+        let theta = fair;
+
+        if (s0 - theta).abs() < 1e-12 {
+            return 0.0; // Already at fair
+        }
+
+        let ratio = (target - theta) / (s0 - theta);
+        if ratio <= 0.0 || ratio >= 1.0 {
+            return max_wait_secs;
+        }
+
+        let t = -ratio.ln() / kappa;
+        t.min(max_wait_secs).max(0.0)
+    }
+
     /// Get spread volatility from recent history.
     pub fn spread_volatility(&self) -> f64 {
         if self.spread_history.len() < 2 {
@@ -239,8 +328,8 @@ impl SpreadProcessEstimator {
         let spreads: Vec<f64> = self.spread_history.iter().map(|o| o.spread).collect();
         let mean = spreads.iter().sum::<f64>() / spreads.len() as f64;
 
-        let variance = spreads.iter().map(|s| (s - mean).powi(2)).sum::<f64>()
-            / spreads.len() as f64;
+        let variance =
+            spreads.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / spreads.len() as f64;
 
         variance.sqrt()
     }

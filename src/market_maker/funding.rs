@@ -96,6 +96,14 @@ pub struct FundingRateEstimator {
     /// Start time for warmup tracking
     #[allow(dead_code)]
     start_time: Instant,
+
+    // === Premium Tracking (First Principles Gap 6) ===
+    /// Current mark-index premium (as a fraction)
+    current_premium: f64,
+    /// EWMA of premium
+    ewma_premium: f64,
+    /// Premium history for analysis
+    premium_history: VecDeque<(Instant, f64)>,
 }
 
 impl FundingRateEstimator {
@@ -113,6 +121,10 @@ impl FundingRateEstimator {
             next_funding_time: None,
             observation_count: 0,
             start_time: Instant::now(),
+            // Premium tracking
+            current_premium: 0.0,
+            ewma_premium: 0.0,
+            premium_history: VecDeque::with_capacity(500),
         }
     }
 
@@ -322,6 +334,122 @@ impl FundingRateEstimator {
 
         variance.sqrt()
     }
+
+    // === Premium Tracking Methods (First Principles Gap 6) ===
+
+    /// Update premium from mark and index prices.
+    ///
+    /// Premium = (mark - index) / index
+    ///
+    /// A positive premium indicates perpetual trading above spot (bullish bias),
+    /// which typically leads to positive funding (longs pay shorts).
+    pub fn update_from_prices(&mut self, mark: f64, index: f64) {
+        if index <= 0.0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let premium = (mark - index) / index;
+
+        self.current_premium = premium;
+
+        // Update EWMA
+        if self.premium_history.is_empty() {
+            self.ewma_premium = premium;
+        } else {
+            self.ewma_premium =
+                self.ewma_lambda * self.ewma_premium + (1.0 - self.ewma_lambda) * premium;
+        }
+
+        // Store history
+        self.premium_history.push_back((now, premium));
+
+        // Trim old entries (keep ~1 hour at 1-second intervals)
+        while self.premium_history.len() > 3600 {
+            self.premium_history.pop_front();
+        }
+    }
+
+    /// Get current premium (mark vs index).
+    pub fn current_premium(&self) -> f64 {
+        self.current_premium
+    }
+
+    /// Get EWMA smoothed premium.
+    pub fn ewma_premium(&self) -> f64 {
+        self.ewma_premium
+    }
+
+    /// Detect if there's an arbitrage opportunity.
+    ///
+    /// Returns Some(ArbitrageSignal) if premium is extreme enough to warrant action.
+    pub fn arbitrage_opportunity(&self) -> Option<ArbitrageSignal> {
+        // Threshold for considering arbitrage (50 bps premium)
+        let arb_threshold = 0.005;
+
+        if self.current_premium > arb_threshold {
+            // Perp trading above spot: go short perp, long spot
+            Some(ArbitrageSignal {
+                direction: ArbitrageDirection::ShortPerp,
+                premium: self.current_premium,
+                expected_convergence: self.ewma_premium,
+            })
+        } else if self.current_premium < -arb_threshold {
+            // Perp trading below spot: go long perp, short spot
+            Some(ArbitrageSignal {
+                direction: ArbitrageDirection::LongPerp,
+                premium: self.current_premium,
+                expected_convergence: self.ewma_premium,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get alpha signal from premium.
+    ///
+    /// The premium often predicts short-term price direction:
+    /// - High premium → expect funding to push prices down
+    /// - Low premium → expect funding to push prices up
+    ///
+    /// Returns adjustment to apply to microprice (in same units as premium).
+    pub fn premium_alpha(&self) -> f64 {
+        // Premium mean-reverts, so current premium predicts negative return
+        // Scale by a factor based on typical premium-to-return relationship
+        let alpha_scale = 0.1; // 10% of premium predicts return
+        -self.current_premium * alpha_scale
+    }
+
+    /// Check if premium is elevated (indicating market stress).
+    pub fn is_premium_elevated(&self) -> bool {
+        self.current_premium.abs() > 0.002 // 20 bps
+    }
+
+    /// Get premium direction (-1 to 1).
+    pub fn premium_direction(&self) -> f64 {
+        // Normalize to -1 to 1 range
+        (self.current_premium / 0.01).clamp(-1.0, 1.0)
+    }
+}
+
+/// Signal from arbitrage opportunity detection.
+#[derive(Debug, Clone)]
+pub struct ArbitrageSignal {
+    /// Direction to take on perpetual
+    pub direction: ArbitrageDirection,
+    /// Current premium level
+    pub premium: f64,
+    /// Expected convergence (EWMA)
+    pub expected_convergence: f64,
+}
+
+/// Arbitrage direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbitrageDirection {
+    /// Short perpetual (premium too high)
+    ShortPerp,
+    /// Long perpetual (premium too low)
+    LongPerp,
 }
 
 /// Summary of funding rate status.

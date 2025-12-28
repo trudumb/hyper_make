@@ -9,8 +9,49 @@
 //!
 //! This helps diagnose what's driving performance and optimize strategy.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+
+// Import VolatilityRegime from estimator for use in fills
+use super::estimator::VolatilityRegime;
+
+/// Snapshot of inventory state at a point in time.
+/// Used to calculate inventory carry P&L properly.
+#[derive(Debug, Clone, Copy)]
+pub struct InventorySnapshot {
+    /// When this snapshot was taken
+    pub timestamp: Instant,
+    /// Position at this time
+    pub position: f64,
+    /// Mid price at this time
+    pub mid_price: f64,
+}
+
+/// A funding payment record.
+#[derive(Debug, Clone, Copy)]
+pub struct FundingPayment {
+    /// When funding was paid/received
+    pub timestamp: Instant,
+    /// Amount (positive = paid, negative = received)
+    pub amount: f64,
+    /// Position at time of funding
+    pub position: f64,
+}
+
+/// Statistics for fills at a specific level or regime.
+#[derive(Debug, Clone, Default)]
+pub struct LevelStats {
+    /// Number of fills
+    pub count: usize,
+    /// Total size filled
+    pub total_size: f64,
+    /// Total adverse selection cost
+    pub total_as: f64,
+    /// Total P&L from fills at this level
+    pub total_pnl: f64,
+    /// Win rate (fills with positive P&L)
+    pub win_rate: f64,
+}
 
 /// Configuration for P&L attribution.
 #[derive(Debug, Clone)]
@@ -47,6 +88,10 @@ pub struct FillRecord {
     pub mid_after_1s: Option<f64>,
     /// Timestamp
     pub timestamp: Instant,
+    /// Distance from mid at fill time (in bps)
+    pub depth_from_mid_bps: f64,
+    /// Volatility regime at time of fill
+    pub vol_regime: VolatilityRegime,
 }
 
 /// Decomposed P&L components.
@@ -116,11 +161,21 @@ pub struct PnLTracker {
 
     /// Start time
     start_time: Instant,
+
+    /// Inventory snapshots for carry calculation
+    inventory_snapshots: VecDeque<InventorySnapshot>,
+
+    /// Funding payment history
+    funding_payments: VecDeque<FundingPayment>,
+
+    /// Maximum snapshots to keep
+    max_snapshots: usize,
 }
 
 impl PnLTracker {
     /// Create a new P&L tracker.
     pub fn new(config: PnLConfig) -> Self {
+        let max_history = config.max_history;
         Self {
             config,
             fills: VecDeque::with_capacity(1000),
@@ -134,10 +189,13 @@ impl PnLTracker {
             total_realized_pnl: 0.0,
             fill_count: 0,
             start_time: Instant::now(),
+            inventory_snapshots: VecDeque::with_capacity(1000),
+            funding_payments: VecDeque::with_capacity(100),
+            max_snapshots: max_history,
         }
     }
 
-    /// Record a fill.
+    /// Record a fill with full context.
     ///
     /// # Arguments
     /// - `tid`: Trade ID
@@ -145,13 +203,18 @@ impl PnLTracker {
     /// - `size`: Fill size (always positive)
     /// - `is_buy`: Was this a buy?
     /// - `mid_at_fill`: Mid price at time of fill
-    pub fn record_fill(
+    /// - `depth_from_mid_bps`: Distance from mid in basis points
+    /// - `vol_regime`: Volatility regime at fill time
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_fill_with_context(
         &mut self,
         tid: u64,
         price: f64,
         size: f64,
         is_buy: bool,
         mid_at_fill: f64,
+        depth_from_mid_bps: f64,
+        vol_regime: VolatilityRegime,
     ) {
         let now = Instant::now();
 
@@ -235,6 +298,8 @@ impl PnLTracker {
             is_buy,
             mid_at_fill,
             mid_after_1s: None, // Will be updated later
+            depth_from_mid_bps,
+            vol_regime,
             timestamp: now,
         };
         self.fills.push_back(fill);
@@ -244,6 +309,33 @@ impl PnLTracker {
         while self.fills.len() > self.config.max_history {
             self.fills.pop_front();
         }
+    }
+
+    /// Record a fill (backwards-compatible, uses default regime).
+    ///
+    /// # Arguments
+    /// - `tid`: Trade ID
+    /// - `price`: Fill price
+    /// - `size`: Fill size (always positive)
+    /// - `is_buy`: Was this a buy?
+    /// - `mid_at_fill`: Mid price at time of fill
+    pub fn record_fill(&mut self, tid: u64, price: f64, size: f64, is_buy: bool, mid_at_fill: f64) {
+        // Calculate depth from mid in bps
+        let depth_bps = if mid_at_fill > 0.0 {
+            ((price - mid_at_fill).abs() / mid_at_fill) * 10000.0
+        } else {
+            0.0
+        };
+
+        self.record_fill_with_context(
+            tid,
+            price,
+            size,
+            is_buy,
+            mid_at_fill,
+            depth_bps,
+            VolatilityRegime::Normal,
+        );
     }
 
     /// Update adverse selection measurement for a fill.
@@ -273,6 +365,205 @@ impl PnLTracker {
     /// Positive = paid (cost), Negative = received (revenue)
     pub fn record_funding(&mut self, amount: f64) {
         self.total_funding += amount;
+    }
+
+    /// Record a funding payment with full context.
+    pub fn record_funding_payment(&mut self, payment: FundingPayment) {
+        self.total_funding += payment.amount;
+        self.funding_payments.push_back(payment);
+
+        // Trim history
+        while self.funding_payments.len() > 100 {
+            self.funding_payments.pop_front();
+        }
+    }
+
+    /// Record an inventory snapshot for carry calculation.
+    ///
+    /// Should be called periodically (e.g., every position change or every N seconds).
+    pub fn record_inventory_snapshot(&mut self, mid_price: f64) {
+        let snapshot = InventorySnapshot {
+            timestamp: Instant::now(),
+            position: self.position,
+            mid_price,
+        };
+        self.inventory_snapshots.push_back(snapshot);
+
+        // Trim history
+        while self.inventory_snapshots.len() > self.max_snapshots {
+            self.inventory_snapshots.pop_front();
+        }
+    }
+
+    /// Calculate inventory carry P&L from snapshots.
+    ///
+    /// Uses the formula: sum of (avg_position * price_change) between consecutive snapshots.
+    /// This measures how much P&L came from holding inventory as prices moved.
+    pub fn calculate_inventory_carry(&self) -> f64 {
+        if self.inventory_snapshots.len() < 2 {
+            return 0.0;
+        }
+
+        let mut carry = 0.0;
+        let snapshots: Vec<_> = self.inventory_snapshots.iter().collect();
+
+        for i in 1..snapshots.len() {
+            let prev = snapshots[i - 1];
+            let curr = snapshots[i];
+
+            let price_change = curr.mid_price - prev.mid_price;
+            let avg_inv = (prev.position + curr.position) / 2.0;
+            carry += price_change * avg_inv;
+        }
+
+        carry
+    }
+
+    /// Analyze fills grouped by depth level (in bps buckets).
+    ///
+    /// Returns statistics for each depth bucket (0-5bps, 5-10bps, etc.).
+    pub fn analyze_fills_by_level(&self) -> HashMap<usize, LevelStats> {
+        let mut by_level: HashMap<usize, Vec<&FillRecord>> = HashMap::new();
+
+        for fill in &self.fills {
+            // Bucket by 5 bps increments
+            let bucket = (fill.depth_from_mid_bps / 5.0).floor() as usize;
+            by_level.entry(bucket).or_default().push(fill);
+        }
+
+        let mut result = HashMap::new();
+        for (level, fills) in by_level {
+            let count = fills.len();
+            let total_size: f64 = fills.iter().map(|f| f.size).sum();
+
+            // Calculate AS and PnL for this level
+            let mut total_as = 0.0;
+            let mut total_pnl = 0.0;
+            let mut wins = 0;
+
+            for fill in &fills {
+                // Calculate spread capture for this fill
+                let spread_capture = if fill.is_buy {
+                    (fill.mid_at_fill - fill.price) * fill.size
+                } else {
+                    (fill.price - fill.mid_at_fill) * fill.size
+                };
+
+                // Calculate AS if we have the post-fill mid
+                if let Some(mid_after) = fill.mid_after_1s {
+                    let price_move = mid_after - fill.mid_at_fill;
+                    let as_cost = if fill.is_buy {
+                        -price_move * fill.size
+                    } else {
+                        price_move * fill.size
+                    };
+                    total_as += as_cost.max(0.0);
+
+                    let fill_pnl = spread_capture - as_cost.max(0.0);
+                    total_pnl += fill_pnl;
+                    if fill_pnl > 0.0 {
+                        wins += 1;
+                    }
+                } else {
+                    total_pnl += spread_capture;
+                    if spread_capture > 0.0 {
+                        wins += 1;
+                    }
+                }
+            }
+
+            result.insert(
+                level,
+                LevelStats {
+                    count,
+                    total_size,
+                    total_as,
+                    total_pnl,
+                    win_rate: if count > 0 {
+                        wins as f64 / count as f64
+                    } else {
+                        0.0
+                    },
+                },
+            );
+        }
+
+        result
+    }
+
+    /// Analyze fills grouped by volatility regime.
+    pub fn analyze_fills_by_regime(&self) -> HashMap<VolatilityRegime, LevelStats> {
+        let mut by_regime: HashMap<VolatilityRegime, Vec<&FillRecord>> = HashMap::new();
+
+        for fill in &self.fills {
+            by_regime.entry(fill.vol_regime).or_default().push(fill);
+        }
+
+        let mut result = HashMap::new();
+        for (regime, fills) in by_regime {
+            let count = fills.len();
+            let total_size: f64 = fills.iter().map(|f| f.size).sum();
+
+            let mut total_as = 0.0;
+            let mut total_pnl = 0.0;
+            let mut wins = 0;
+
+            for fill in &fills {
+                let spread_capture = if fill.is_buy {
+                    (fill.mid_at_fill - fill.price) * fill.size
+                } else {
+                    (fill.price - fill.mid_at_fill) * fill.size
+                };
+
+                if let Some(mid_after) = fill.mid_after_1s {
+                    let price_move = mid_after - fill.mid_at_fill;
+                    let as_cost = if fill.is_buy {
+                        -price_move * fill.size
+                    } else {
+                        price_move * fill.size
+                    };
+                    total_as += as_cost.max(0.0);
+
+                    let fill_pnl = spread_capture - as_cost.max(0.0);
+                    total_pnl += fill_pnl;
+                    if fill_pnl > 0.0 {
+                        wins += 1;
+                    }
+                } else {
+                    total_pnl += spread_capture;
+                    if spread_capture > 0.0 {
+                        wins += 1;
+                    }
+                }
+            }
+
+            result.insert(
+                regime,
+                LevelStats {
+                    count,
+                    total_size,
+                    total_as,
+                    total_pnl,
+                    win_rate: if count > 0 {
+                        wins as f64 / count as f64
+                    } else {
+                        0.0
+                    },
+                },
+            );
+        }
+
+        result
+    }
+
+    /// Get funding payments history.
+    pub fn funding_payments(&self) -> &VecDeque<FundingPayment> {
+        &self.funding_payments
+    }
+
+    /// Get inventory snapshots history.
+    pub fn inventory_snapshots(&self) -> &VecDeque<InventorySnapshot> {
+        &self.inventory_snapshots
     }
 
     /// Get unrealized P&L at current mid price.
@@ -350,6 +641,27 @@ impl PnLTracker {
         self.total_realized_pnl = 0.0;
         self.fill_count = 0;
         self.start_time = Instant::now();
+        self.inventory_snapshots.clear();
+        self.funding_payments.clear();
+    }
+
+    /// Get full attribution using calculated inventory carry.
+    ///
+    /// This is the correct formula from the manual:
+    /// total = spread_capture - adverse_selection + inventory_carry + funding - fees
+    pub fn full_attribution(&self, current_mid: f64) -> PnLComponents {
+        let inventory_carry = self.calculate_inventory_carry();
+        let unrealized = self.unrealized_pnl(current_mid);
+
+        PnLComponents {
+            spread_capture: self.total_spread_capture,
+            adverse_selection: self.total_adverse_selection,
+            inventory_carry,
+            funding: self.total_funding,
+            fees: self.total_fees,
+            realized_pnl: self.total_realized_pnl,
+            unrealized_pnl: unrealized,
+        }
     }
 }
 

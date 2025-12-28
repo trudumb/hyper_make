@@ -29,39 +29,100 @@ pub use helpers::{bps_diff, round_to_significant_and_decimal, truncate_float, Ba
 pub use info::info_client::*;
 pub use info::response_structs::*;
 pub use market_maker::{
-    // Core types
-    EstimatorConfig, GLFTStrategy, HyperliquidExecutor, InventoryAwareStrategy, MarketMaker,
-    MarketMakerConfig, MarketMakerMetricsRecorder, MarketParams, MetricsRecorder, ModifyResult,
-    OrderExecutor, OrderManager, OrderResult, ParameterEstimator, PositionTracker, Quote,
-    QuoteConfig, QuotingStrategy, RiskConfig, Side, SymmetricStrategy, TrackedOrder,
-    // Ladder quoting
-    Ladder, LadderAction, LadderConfig, LadderLevel, LadderParams, LadderStrategy,
     // Tier 1: Adverse Selection
-    AdverseSelectionConfig, AdverseSelectionEstimator, AdverseSelectionSummary,
-    // Tier 1: Queue Position
-    QueueConfig, QueuePositionTracker, QueueSummary,
+    AdverseSelectionConfig,
+    AdverseSelectionEstimator,
+    AdverseSelectionSummary,
+    // Data Quality Monitoring
+    AnomalyType,
     // Tier 1: Liquidation Cascade
-    CascadeDirection, LiquidationCascadeDetector, LiquidationConfig, LiquidationSummary,
-    // Production Safety: Kill Switch
-    KillReason, KillSwitch, KillSwitchConfig, KillSwitchState, KillSwitchSummary,
+    CascadeDirection,
+    // WebSocket Reconnection
+    ConnectionHealthMonitor,
+    ConnectionState,
+    // Multi-Asset Correlation
+    CorrelationConfig,
+    CorrelationEstimator,
+    CorrelationHorizon,
+    CorrelationSummary,
+    DataQualityConfig,
+    DataQualityMonitor,
+    // Core types
+    EstimatorConfig,
     // Tier 2: Funding Rate
-    FundingConfig, FundingRateEstimator, FundingSummary,
+    FundingConfig,
+    FundingRateEstimator,
+    FundingSummary,
+    GLFTStrategy,
     // Tier 2: Hawkes Order Flow
-    HawkesConfig, HawkesOrderFlowEstimator, HawkesSummary,
-    // Tier 2: Spread Process
-    SpreadConfig, SpreadProcessEstimator, SpreadRegime, SpreadSummary,
-    // Tier 2: P&L Attribution
-    PnLComponents, PnLConfig, PnLSummary, PnLTracker,
+    HawkesConfig,
+    HawkesOrderFlowEstimator,
+    HawkesSummary,
+    HealthSummary,
+    HyperliquidExecutor,
+    InventoryAwareStrategy,
+    // Production Safety: Kill Switch
+    KillReason,
+    KillSwitch,
+    KillSwitchConfig,
+    KillSwitchState,
+    KillSwitchSummary,
+    // Ladder quoting
+    Ladder,
+    LadderAction,
+    LadderConfig,
+    LadderLevel,
+    LadderParams,
+    LadderStrategy,
+    LiquidationCascadeDetector,
+    LiquidationConfig,
+    LiquidationSummary,
     // Production: Margin-Aware Sizing
-    MarginAwareSizer, MarginConfig, MarginState, MarginSummary as MarginSizerSummary, SizingResult,
+    MarginAwareSizer,
+    MarginConfig,
+    MarginState,
+    MarginSummary as MarginSizerSummary,
+    MarketMaker,
+    MarketMakerConfig,
+    MarketMakerMetricsRecorder,
+    MarketParams,
+    MetricsRecorder,
+    // Prometheus Metrics
+    MetricsSummary,
+    ModifyResult,
+    // Configuration
+    MonitoringConfig,
+    OrderExecutor,
+    OrderManager,
+    OrderResult,
+    ParameterEstimator,
+    // Tier 2: P&L Attribution
+    PnLComponents,
+    PnLConfig,
+    PnLSummary,
+    PnLTracker,
+    PositionTracker,
+    PrometheusMetrics,
+    // Tier 1: Queue Position
+    QueueConfig,
+    QueuePositionTracker,
+    QueueSummary,
+    Quote,
+    QuoteConfig,
+    QuotingStrategy,
+    ReconnectionConfig,
+    RiskConfig,
+    Side,
+    SizingResult,
+    // Tier 2: Spread Process
+    SpreadConfig,
+    SpreadProcessEstimator,
+    SpreadRegime,
+    SpreadSummary,
+    SymmetricStrategy,
+    TrackedOrder,
     // Volatility Regime
     VolatilityRegime,
-    // Multi-Asset Correlation
-    CorrelationConfig, CorrelationEstimator, CorrelationHorizon, CorrelationSummary,
-    // Prometheus Metrics
-    MetricsSummary, PrometheusMetrics,
-    // WebSocket Reconnection
-    ConnectionHealthMonitor, ConnectionState, HealthSummary, ReconnectionConfig,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;

@@ -322,7 +322,10 @@ impl OrderManager {
         if let Some(order) = self.orders.get_mut(&oid) {
             if order.state == OrderState::CancelPending {
                 order.transition_to(OrderState::CancelConfirmed);
-                debug!(oid = oid, "Order transitioned to CancelConfirmed, starting fill window");
+                debug!(
+                    oid = oid,
+                    "Order transitioned to CancelConfirmed, starting fill window"
+                );
             }
         }
     }
@@ -521,9 +524,7 @@ impl OrderManager {
         self.orders
             .values()
             .filter_map(|o| {
-                if o.state == OrderState::CancelPending
-                    && o.state_changed_at.elapsed() > timeout
-                {
+                if o.state == OrderState::CancelPending && o.state_changed_at.elapsed() > timeout {
                     Some(o.oid)
                 } else {
                     None
@@ -670,10 +671,7 @@ mod tests {
 
         // Initiate cancel
         assert!(mgr.initiate_cancel(1));
-        assert_eq!(
-            mgr.get_order(1).unwrap().state,
-            OrderState::CancelPending
-        );
+        assert_eq!(mgr.get_order(1).unwrap().state, OrderState::CancelPending);
 
         // Fill arrives during cancel
         let (found, is_new, complete) = mgr.process_fill(1, 101, 1.0);
@@ -893,7 +891,7 @@ mod tests {
     fn test_reconcile_ladder_partial_match() {
         let mut mgr = OrderManager::new();
         mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0)); // Matches first level
-        // No ask order
+                                                                   // No ask order
 
         let ladder = Ladder {
             bids: vec![

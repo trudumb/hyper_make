@@ -29,9 +29,9 @@ pub struct CorrelationConfig {
 impl Default for CorrelationConfig {
     fn default() -> Self {
         Self {
-            fast_alpha: 0.05,    // ~20 observations half-life
-            medium_alpha: 0.01,  // ~70 observations half-life
-            slow_alpha: 0.002,   // ~350 observations half-life
+            fast_alpha: 0.05,   // ~20 observations half-life
+            medium_alpha: 0.01, // ~70 observations half-life
+            slow_alpha: 0.002,  // ~350 observations half-life
             min_observations: 30,
             breakdown_threshold: 0.4, // 40% correlation change = breakdown
         }
@@ -98,12 +98,12 @@ impl PairCorrelation {
         // (actual correlation requires variance tracking, simplified here)
         let instant_corr = product.signum() * product.abs().sqrt().min(1.0);
 
-        self.fast_correlation = config.fast_alpha * instant_corr
-            + (1.0 - config.fast_alpha) * self.fast_correlation;
+        self.fast_correlation =
+            config.fast_alpha * instant_corr + (1.0 - config.fast_alpha) * self.fast_correlation;
         self.medium_correlation = config.medium_alpha * instant_corr
             + (1.0 - config.medium_alpha) * self.medium_correlation;
-        self.slow_correlation = config.slow_alpha * instant_corr
-            + (1.0 - config.slow_alpha) * self.slow_correlation;
+        self.slow_correlation =
+            config.slow_alpha * instant_corr + (1.0 - config.slow_alpha) * self.slow_correlation;
     }
 
     /// Get correlation for specified horizon.
@@ -345,11 +345,7 @@ impl CorrelationEstimator {
         // Weighted sum of individual volatilities
         let mut weighted_vol = 0.0;
         for (asset, w) in weights.iter() {
-            let sigma = self
-                .variances
-                .get(asset)
-                .map(|v| v.sigma())
-                .unwrap_or(0.01);
+            let sigma = self.variances.get(asset).map(|v| v.sigma()).unwrap_or(0.01);
             weighted_vol += w.abs() * sigma;
         }
 
@@ -564,8 +560,8 @@ mod tests {
     #[test]
     fn test_breakdown_detection() {
         let config = CorrelationConfig {
-            fast_alpha: 0.5,     // Very fast update
-            slow_alpha: 0.001,   // Very slow update
+            fast_alpha: 0.5,   // Very fast update
+            slow_alpha: 0.001, // Very slow update
             breakdown_threshold: 0.3,
             ..Default::default()
         };

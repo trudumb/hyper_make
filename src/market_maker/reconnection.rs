@@ -167,9 +167,7 @@ impl ConnectionHealthMonitor {
     /// Record start of reconnection attempt.
     pub fn start_reconnection(&self) {
         self.inner.is_reconnecting.store(true, Ordering::Relaxed);
-        self.inner
-            .current_attempt
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.current_attempt.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record successful reconnection.
@@ -184,7 +182,11 @@ impl ConnectionHealthMonitor {
     ///
     /// Returns `true` if should continue trying, `false` if max retries exceeded.
     pub fn reconnection_failed(&self) -> bool {
-        let failures = self.inner.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let failures = self
+            .inner
+            .consecutive_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let max = self.inner.config.max_consecutive_failures;
 
         if max > 0 && failures >= max as u64 {

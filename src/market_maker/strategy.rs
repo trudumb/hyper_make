@@ -142,27 +142,67 @@ pub struct MarketParams {
     // === Volatility Regime ===
     /// Volatility regime (Low/Normal/High/Extreme)
     pub volatility_regime: super::VolatilityRegime,
+
+    // === First Principles Extensions (Gaps 1-10) ===
+
+    // Jump-Diffusion (Gap 1)
+    /// Jump intensity λ (expected jumps per second)
+    pub lambda_jump: f64,
+    /// Mean jump size μ_j
+    pub mu_jump: f64,
+    /// Jump size standard deviation σ_j
+    pub sigma_jump: f64,
+
+    // Stochastic Volatility (Gap 2)
+    /// Vol mean-reversion speed κ_vol
+    pub kappa_vol: f64,
+    /// Long-run volatility θ_vol
+    pub theta_vol: f64,
+    /// Vol-of-vol ξ
+    pub xi_vol: f64,
+    /// Price-vol correlation ρ (leverage effect)
+    pub rho_price_vol: f64,
+
+    // Queue Model (Gap 3)
+    /// Calibrated volume at touch rate (units/sec)
+    pub calibrated_volume_rate: f64,
+    /// Calibrated cancel rate (fraction/sec)
+    pub calibrated_cancel_rate: f64,
+
+    // Funding Enhancement (Gap 6)
+    /// Mark-index premium
+    pub premium: f64,
+    /// Premium alpha signal
+    pub premium_alpha: f64,
+
+    // Momentum Protection (Gap 10)
+    /// Bid protection factor (>= 1.0 when market falling)
+    pub bid_protection_factor: f64,
+    /// Ask protection factor (>= 1.0 when market rising)
+    pub ask_protection_factor: f64,
+    /// Probability momentum continues
+    pub p_momentum_continue: f64,
 }
 
 impl Default for MarketParams {
     fn default() -> Self {
         Self {
-            sigma: 0.0001,            // 0.01% per-second volatility (clean)
-            sigma_total: 0.0001,      // Same initially
-            sigma_effective: 0.0001,  // Same initially
-            kappa: 100.0,             // Moderate depth decay
-            arrival_intensity: 0.5,   // 0.5 volume ticks per second
-            is_toxic_regime: false,   // Default: not toxic
-            jump_ratio: 1.0,          // Default: normal diffusion
-            momentum_bps: 0.0,        // Default: no momentum
-            flow_imbalance: 0.0,      // Default: balanced flow
-            falling_knife_score: 0.0, // Default: no falling knife
-            rising_knife_score: 0.0,  // Default: no rising knife
-            book_imbalance: 0.0,      // Default: balanced book
+            sigma: 0.0001,             // 0.01% per-second volatility (clean)
+            sigma_total: 0.0001,       // Same initially
+            sigma_effective: 0.0001,   // Same initially
+            kappa: 100.0,              // Moderate depth decay
+            arrival_intensity: 0.5,    // 0.5 volume ticks per second
+            is_toxic_regime: false,    // Default: not toxic
+            jump_ratio: 1.0,           // Default: normal diffusion
+            momentum_bps: 0.0,         // Default: no momentum
+            flow_imbalance: 0.0,       // Default: balanced flow
+            falling_knife_score: 0.0,  // Default: no falling knife
+            rising_knife_score: 0.0,   // Default: no rising knife
+            book_imbalance: 0.0,       // Default: balanced book
             liquidity_gamma_mult: 1.0, // Default: normal liquidity
-            microprice: 0.0,          // Will be set from estimator
-            beta_book: 0.0,           // Will be learned from data
-            beta_flow: 0.0,           // Will be learned from data
+            microprice: 0.0,           // Will be set from estimator
+            beta_book: 0.0,            // Will be learned from data
+            beta_flow: 0.0,            // Will be learned from data
             // Tier 1: Adverse Selection
             as_spread_adjustment: 0.0, // No adjustment until warmed up
             predicted_alpha: 0.0,      // Default: no informed flow detected
@@ -185,6 +225,21 @@ impl Default for MarketParams {
             spread_regime: super::SpreadRegime::Normal,
             // Volatility Regime
             volatility_regime: super::VolatilityRegime::Normal,
+            // First Principles Extensions
+            lambda_jump: 0.0,
+            mu_jump: 0.0,
+            sigma_jump: 0.0001,
+            kappa_vol: 0.5,
+            theta_vol: 0.0001_f64.powi(2), // Default variance
+            xi_vol: 0.1,
+            rho_price_vol: -0.3,
+            calibrated_volume_rate: 1.0,
+            calibrated_cancel_rate: 0.2,
+            premium: 0.0,
+            premium_alpha: 0.0,
+            bid_protection_factor: 1.0,
+            ask_protection_factor: 1.0,
+            p_momentum_continue: 0.5,
         }
     }
 }
@@ -262,7 +317,13 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> Ladder {
-        (**self).calculate_ladder(config, position, max_position, target_liquidity, market_params)
+        (**self).calculate_ladder(
+            config,
+            position,
+            max_position,
+            target_liquidity,
+            market_params,
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -500,7 +561,7 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             gamma_base: 0.3,
-            sigma_baseline: 0.0002,           // 20bp per-second
+            sigma_baseline: 0.0002, // 20bp per-second
             volatility_weight: 0.5,
             max_volatility_multiplier: 3.0,
             toxicity_threshold: 1.5,
@@ -509,8 +570,8 @@ impl Default for RiskConfig {
             inventory_sensitivity: 2.0,
             gamma_min: 0.05,
             gamma_max: 5.0,
-            min_spread_floor: 0.0001,         // 1 bps
-            max_holding_time: 120.0,          // 2 minutes
+            min_spread_floor: 0.0001, // 1 bps
+            max_holding_time: 120.0,  // 2 minutes
         }
     }
 }
@@ -612,10 +673,10 @@ impl GLFTStrategy {
         // === VOLATILITY REGIME SCALING (Tier 2) ===
         // Explicit regime detection provides additional safety layer
         let regime_scalar = match market_params.volatility_regime {
-            super::VolatilityRegime::Low => 0.8,      // Slightly less conservative
+            super::VolatilityRegime::Low => 0.8, // Slightly less conservative
             super::VolatilityRegime::Normal => 1.0,
-            super::VolatilityRegime::High => 1.5,     // More conservative
-            super::VolatilityRegime::Extreme => 2.5,  // Much more conservative
+            super::VolatilityRegime::High => 1.5, // More conservative
+            super::VolatilityRegime::Extreme => 2.5, // Much more conservative
         };
 
         // === HAWKES ACTIVITY SCALING (Tier 2) ===
@@ -630,8 +691,12 @@ impl GLFTStrategy {
         };
 
         // === COMBINE AND CLAMP ===
-        let gamma_effective =
-            cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar * regime_scalar * hawkes_scalar;
+        let gamma_effective = cfg.gamma_base
+            * vol_scalar
+            * toxicity_scalar
+            * inventory_scalar
+            * regime_scalar
+            * hawkes_scalar;
         let gamma_clamped = gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max);
 
         // Log gamma component breakdown for debugging strategy behavior
@@ -742,8 +807,8 @@ impl QuotingStrategy for GLFTStrategy {
             super::SpreadRegime::VeryTight => 1.3, // Widen - tight spreads = competition/manipulation
             super::SpreadRegime::Tight => 1.1,     // Slightly widen
             super::SpreadRegime::Normal => 1.0,
-            super::SpreadRegime::Wide => 0.95,     // Can tighten slightly to capture
-            super::SpreadRegime::VeryWide => 0.9,  // Tighten more - opportunity
+            super::SpreadRegime::Wide => 0.95, // Can tighten slightly to capture
+            super::SpreadRegime::VeryWide => 0.9, // Tighten more - opportunity
         };
         half_spread *= spread_regime_mult;
 
@@ -1015,8 +1080,12 @@ impl LadderStrategy {
             1.0
         };
 
-        let gamma_effective =
-            cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar * regime_scalar * hawkes_scalar;
+        let gamma_effective = cfg.gamma_base
+            * vol_scalar
+            * toxicity_scalar
+            * inventory_scalar
+            * regime_scalar
+            * hawkes_scalar;
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
@@ -1096,7 +1165,13 @@ impl QuotingStrategy for LadderStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        let ladder = self.generate_ladder(config, position, max_position, target_liquidity, market_params);
+        let ladder = self.generate_ladder(
+            config,
+            position,
+            max_position,
+            target_liquidity,
+            market_params,
+        );
 
         // Return just the best bid/ask for backward compatibility
         let bid = ladder.bids.first().map(|l| Quote::new(l.price, l.size));
@@ -1113,7 +1188,13 @@ impl QuotingStrategy for LadderStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> Ladder {
-        self.generate_ladder(config, position, max_position, target_liquidity, market_params)
+        self.generate_ladder(
+            config,
+            position,
+            max_position,
+            target_liquidity,
+            market_params,
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -1643,11 +1724,11 @@ mod tests {
         };
 
         let stress_params = MarketParams {
-            sigma: 0.0006,           // 3x vol
+            sigma: 0.0006, // 3x vol
             sigma_effective: 0.0006,
-            kappa: 50.0,             // Thinner book
-            arrival_intensity: 0.2,  // Slower fills
-            jump_ratio: 3.0,         // Toxic
+            kappa: 50.0,            // Thinner book
+            arrival_intensity: 0.2, // Slower fills
+            jump_ratio: 3.0,        // Toxic
             is_toxic_regime: true,
             microprice: 100.0, // Must match mid_price for fair quoting
             ..Default::default()

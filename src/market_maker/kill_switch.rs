@@ -66,7 +66,10 @@ pub enum KillReason {
     /// Position value exceeded configured maximum
     MaxPosition { value: f64, limit: f64 },
     /// Market data is stale (no updates within threshold)
-    StaleData { elapsed: Duration, threshold: Duration },
+    StaleData {
+        elapsed: Duration,
+        threshold: Duration,
+    },
     /// Too many rate limit errors from exchange
     RateLimit { count: u32, limit: u32 },
     /// Liquidation cascade detected with high severity

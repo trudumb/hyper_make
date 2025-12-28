@@ -9,6 +9,7 @@
 mod adverse_selection;
 mod config;
 mod correlation;
+mod data_quality;
 mod estimator;
 mod executor;
 mod funding;
@@ -29,6 +30,7 @@ mod strategy;
 pub use adverse_selection::*;
 pub use config::*;
 pub use correlation::*;
+pub use data_quality::*;
 pub use estimator::*;
 pub use executor::*;
 pub use funding::*;
@@ -117,6 +119,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     prometheus: PrometheusMetrics,
     /// Connection health monitor - WS staleness tracking
     connection_health: ConnectionHealthMonitor,
+    /// Data quality monitor - validates incoming market data
+    data_quality: DataQualityMonitor,
 
     // === Multi-Asset (optional) ===
     /// Correlation estimator - portfolio risk (None for single-asset)
@@ -146,6 +150,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// - `spread_config`: Spread process estimator configuration
     /// - `pnl_config`: P&L tracker configuration
     /// - `margin_config`: Margin-aware sizer configuration
+    /// - `data_quality_config`: Data quality monitor configuration
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: MarketMakerConfig,
@@ -165,7 +170,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         spread_config: SpreadConfig,
         pnl_config: PnLConfig,
         margin_config: MarginConfig,
+        data_quality_config: data_quality::DataQualityConfig,
     ) -> Self {
+        // Capture multi_asset flag before moving config
+        let enable_correlation = config.multi_asset;
+
         Self {
             config,
             strategy,
@@ -193,8 +202,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             margin_sizer: MarginAwareSizer::new(margin_config),
             prometheus: PrometheusMetrics::new(),
             connection_health: ConnectionHealthMonitor::new(),
-            // Multi-asset (optional - disabled by default)
-            correlation: None,
+            data_quality: DataQualityMonitor::new(data_quality_config),
+            // Multi-asset correlation tracking (First Principles Gap 5)
+            correlation: if enable_correlation {
+                Some(CorrelationEstimator::new(CorrelationConfig::default()))
+            } else {
+                None
+            },
         }
     }
 
@@ -348,6 +362,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.liquidation_detector.tail_risk_multiplier(),
                     );
 
+                    // === Update connection health metrics ===
+                    let connected = self.connection_health.state() == ConnectionState::Healthy;
+                    self.prometheus.set_websocket_connected(connected);
+                    self.prometheus.set_last_trade_age_ms(
+                        self.connection_health.time_since_last_data().as_millis() as u64
+                    );
+                    // L2 book uses the same connection health tracker
+                    self.prometheus.set_last_book_age_ms(
+                        self.connection_health.time_since_last_data().as_millis() as u64
+                    );
+
+                    // === Update P&L inventory snapshot for carry calculation ===
+                    if self.latest_mid > 0.0 {
+                        self.pnl_tracker.record_inventory_snapshot(self.latest_mid);
+                    }
+
                     // Log Prometheus output (for scraping or debugging)
                     debug!(
                         prometheus_output = %self.prometheus.to_prometheus_text(&self.config.asset),
@@ -423,6 +453,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .sz
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
+
+                    // === Data Quality: Validate trade price and size ===
+                    if let Err(anomaly) = self.data_quality.check_trade(
+                        &self.config.asset,
+                        0, // No sequence number available
+                        trade.time,
+                        price,
+                        size,
+                        self.latest_mid,
+                    ) {
+                        warn!(anomaly = %anomaly, price = %price, size = %size, "Trade quality issue");
+                        self.prometheus.record_data_quality_issue();
+                        continue; // Skip this trade
+                    }
+
                     // Determine aggressor side from trade.side: "B" = buy aggressor, "S" = sell
                     let is_buy_aggressor = trade.side == "B";
                     // Pass price, size, and aggressor side for volume clock + flow tracking
@@ -546,7 +591,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                         // Position milestone warnings
                         let current_position = self.position.position();
-                        let utilization = (current_position.abs() / self.config.max_position).min(1.0);
+                        let utilization =
+                            (current_position.abs() / self.config.max_position).min(1.0);
                         let utilization_pct = utilization * 100.0;
 
                         // Warn at 50%, 75%, 90% thresholds (only when crossing upward)
@@ -608,6 +654,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                 Some((px, sz))
                             })
                             .collect();
+
+                        // === Data Quality: Check for crossed book ===
+                        if let (Some((best_bid, _)), Some((best_ask, _))) =
+                            (bids.first(), asks.first())
+                        {
+                            if let Err(anomaly) = self.data_quality.check_l2_book(
+                                &self.config.asset,
+                                0,
+                                *best_bid,
+                                *best_ask,
+                            ) {
+                                warn!(anomaly = %anomaly, "L2 book quality issue");
+                                self.prometheus.record_data_quality_issue();
+                                if matches!(anomaly, AnomalyType::CrossedBook) {
+                                    self.prometheus.record_crossed_book();
+                                    // Skip processing crossed book
+                                    return Ok(());
+                                }
+                            }
+                        }
 
                         self.estimator.on_l2_book(&bids, &asks, self.latest_mid);
 
@@ -701,6 +767,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             spread_regime: self.spread_tracker.spread_regime(),
             // === Volatility Regime ===
             volatility_regime: self.estimator.volatility_regime(),
+            // === First Principles Extensions (Gaps 1-10) ===
+            // Jump-Diffusion (Gap 1)
+            lambda_jump: self.estimator.lambda_jump(),
+            mu_jump: self.estimator.mu_jump(),
+            sigma_jump: self.estimator.sigma_jump(),
+            // Stochastic Volatility (Gap 2)
+            kappa_vol: self.estimator.kappa_vol(),
+            theta_vol: self.estimator.theta_vol_sigma().powi(2), // Store as variance
+            xi_vol: self.estimator.xi_vol(),
+            rho_price_vol: self.estimator.rho_price_vol(),
+            // Queue Model (Gap 3) - use defaults until CalibratedQueueModel integrated
+            calibrated_volume_rate: 1.0,
+            calibrated_cancel_rate: 0.2,
+            // Funding Enhancement (Gap 6)
+            premium: self.funding.current_premium(),
+            premium_alpha: self.funding.premium_alpha(),
+            // Momentum Protection (Gap 10) - use defaults until MomentumModel integrated
+            bid_protection_factor: 1.0,
+            ask_protection_factor: 1.0,
+            p_momentum_continue: 0.5,
         };
 
         debug!(
@@ -870,7 +956,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .orders
             .get_all_by_side_including_pending(side)
             .iter()
-            .filter(|o| matches!(o.state, OrderState::CancelPending | OrderState::CancelConfirmed))
+            .filter(|o| {
+                matches!(
+                    o.state,
+                    OrderState::CancelPending | OrderState::CancelConfirmed
+                )
+            })
             .map(|o| o.oid)
             .collect();
 
@@ -1010,7 +1101,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
 
             // Place all orders in a single API call
-            let results = self.executor.place_bulk_orders(&self.config.asset, order_specs.clone()).await;
+            let results = self
+                .executor
+                .place_bulk_orders(&self.config.asset, order_specs.clone())
+                .await;
 
             // Track placed orders
             for (i, result) in results.iter().enumerate() {
@@ -1264,10 +1358,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "Some orders failed to cancel - may need manual cleanup"
                 );
             } else {
-                info!(
-                    cancelled = cancelled,
-                    "All orders cancelled successfully"
-                );
+                info!(cancelled = cancelled, "All orders cancelled successfully");
             }
         }
 
@@ -1289,10 +1380,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // === Check for stuck cancels ===
         let stuck = self.orders.check_stuck_cancels();
         if !stuck.is_empty() {
-            warn!(
-                "[SafetySync] Stuck cancel orders detected: {:?}",
-                stuck
-            );
+            warn!("[SafetySync] Stuck cancel orders detected: {:?}", stuck);
         }
 
         // === Update margin state from user account ===
@@ -1331,10 +1419,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     order.state,
                     OrderState::CancelPending | OrderState::CancelConfirmed
                 ) {
-                    debug!(
-                        "[SafetySync] Order {} in cancel window - not removing",
-                        oid
-                    );
+                    debug!("[SafetySync] Order {} in cancel window - not removing", oid);
                     continue;
                 }
             }
@@ -1423,6 +1508,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         &self.kill_switch
     }
 
+    /// Get prometheus metrics for external monitoring.
+    pub fn prometheus(&self) -> &PrometheusMetrics {
+        &self.prometheus
+    }
+
+    /// Get asset name for metrics labeling.
+    pub fn asset(&self) -> &str {
+        &self.config.asset
+    }
+
     /// Check kill switch conditions and update state.
     /// Called after each message and periodically.
     fn check_kill_switch(&self) {
@@ -1435,8 +1530,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Build current state for kill switch check using actual P&L
         let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
         let state = KillSwitchState {
-            daily_pnl: pnl_summary.total_pnl,   // Using total as daily for now
-            peak_pnl: pnl_summary.total_pnl,    // Simplified (actual peak needs tracking)
+            daily_pnl: pnl_summary.total_pnl, // Using total as daily for now
+            peak_pnl: pnl_summary.total_pnl,  // Simplified (actual peak needs tracking)
             position: self.position.position(),
             mid_price: self.latest_mid,
             last_data_time,

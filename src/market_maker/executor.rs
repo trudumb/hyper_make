@@ -98,7 +98,10 @@ impl CancelResult {
     /// Returns true if it's safe to remove the order from tracking
     /// (i.e., the order won't generate any more fill notifications)
     pub fn safe_to_remove_tracking(&self) -> bool {
-        matches!(self, CancelResult::Cancelled | CancelResult::AlreadyCancelled)
+        matches!(
+            self,
+            CancelResult::Cancelled | CancelResult::AlreadyCancelled
+        )
     }
 }
 
@@ -298,10 +301,7 @@ impl OrderExecutor for HyperliquidExecutor {
 
                             match status {
                                 ExchangeDataStatus::Filled(order) => {
-                                    info!(
-                                        "Bulk order {} filled immediately: oid={}",
-                                        i, order.oid
-                                    );
+                                    info!("Bulk order {} filled immediately: oid={}", i, order.oid);
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -389,7 +389,9 @@ impl OrderExecutor for HyperliquidExecutor {
                                         info!("Order already filled: oid={} - keeping in tracking for fill", oid);
                                         return CancelResult::AlreadyFilled;
                                     }
-                                    if e.contains("already canceled") || e.contains("does not exist") {
+                                    if e.contains("already canceled")
+                                        || e.contains("does not exist")
+                                    {
                                         info!("Order already cancelled: oid={}", oid);
                                         return CancelResult::AlreadyCancelled;
                                     }
@@ -448,10 +450,7 @@ impl OrderExecutor for HyperliquidExecutor {
                         if !data.statuses.is_empty() {
                             match data.statuses[0].clone() {
                                 ExchangeDataStatus::Filled(order) => {
-                                    info!(
-                                        "Modified order filled immediately: oid={}",
-                                        order.oid
-                                    );
+                                    info!("Modified order filled immediately: oid={}", order.oid);
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }

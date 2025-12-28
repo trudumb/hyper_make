@@ -58,16 +58,16 @@ pub struct LiquidationConfig {
 impl Default for LiquidationConfig {
     fn default() -> Self {
         Self {
-            baseline_intensity: 0.01,    // 1 liquidation per 100 seconds baseline
-            alpha: 0.5,                  // Moderate self-excitation
-            beta: 0.1,                   // 10-second decay half-life
-            size_scale: 10000.0,         // Normalize by $10k
-            cascade_threshold: 3.0,      // 3× baseline = cascade
-            quote_pull_threshold: 5.0,   // 5× baseline = pull quotes
-            gamma_min: 1.0,              // No reduction below 1.0
-            gamma_max: 5.0,              // Max 5× gamma increase
-            max_events: 500,             // Track last 500 events
-            warmup_seconds: 60.0,        // 1 minute warmup
+            baseline_intensity: 0.01,  // 1 liquidation per 100 seconds baseline
+            alpha: 0.5,                // Moderate self-excitation
+            beta: 0.1,                 // 10-second decay half-life
+            size_scale: 10000.0,       // Normalize by $10k
+            cascade_threshold: 3.0,    // 3× baseline = cascade
+            quote_pull_threshold: 5.0, // 5× baseline = pull quotes
+            gamma_min: 1.0,            // No reduction below 1.0
+            gamma_max: 5.0,            // Max 5× gamma increase
+            max_events: 500,           // Track last 500 events
+            warmup_seconds: 60.0,      // 1 minute warmup
         }
     }
 }
@@ -214,8 +214,8 @@ impl LiquidationCascadeDetector {
     /// Update cached intensity and cascade state.
     fn update_intensity(&mut self) {
         self.cached_intensity = self.compute_intensity(Instant::now());
-        self.cached_cascade_active = self.cached_intensity
-            > self.config.baseline_intensity * self.config.cascade_threshold;
+        self.cached_cascade_active =
+            self.cached_intensity > self.config.baseline_intensity * self.config.cascade_threshold;
     }
 
     /// Compute current Hawkes intensity.
@@ -331,8 +331,8 @@ impl LiquidationCascadeDetector {
         let severity = self.cascade_severity();
 
         // Linear interpolation from gamma_min to gamma_max
-        let multiplier = self.config.gamma_min
-            + severity * (self.config.gamma_max - self.config.gamma_min);
+        let multiplier =
+            self.config.gamma_min + severity * (self.config.gamma_max - self.config.gamma_min);
 
         multiplier.clamp(self.config.gamma_min, self.config.gamma_max)
     }
@@ -386,6 +386,55 @@ impl LiquidationCascadeDetector {
         // Simple approximation: intensity × horizon
         // More accurate would integrate the decaying intensity
         self.cached_intensity * horizon_seconds
+    }
+
+    // === Cascade Hedging Cost Feedback (First Principles Gap 7) ===
+
+    /// Calculate expected hedging cost during a cascade.
+    ///
+    /// During liquidation cascades, slippage increases due to:
+    /// 1. Reduced liquidity (MMs pull quotes)
+    /// 2. Increased volatility
+    /// 3. Order book imbalance from forced liquidations
+    ///
+    /// Returns the expected additional slippage cost in USD.
+    pub fn cascade_hedging_cost(&self, size: f64, mid_price: f64) -> f64 {
+        if !self.is_warmed_up() || !self.cascade_active() {
+            return 0.0;
+        }
+
+        let severity = self.cascade_severity();
+        let notional = size.abs() * mid_price;
+
+        // Base slippage assumption: 5 bps in normal conditions
+        // Cascade increases slippage by up to 10x at max severity
+        let base_slippage_bps = 5.0;
+        let cascade_multiplier = 1.0 + 9.0 * severity; // 1x to 10x
+
+        let slippage_bps = base_slippage_bps * cascade_multiplier;
+        notional * slippage_bps / 10000.0
+    }
+
+    /// Get cascade-adjusted maximum position.
+    ///
+    /// Reduces max position based on cascade severity to limit
+    /// exposure during volatile periods.
+    pub fn cascade_adjusted_max_position(&self, base_max: f64) -> f64 {
+        base_max * self.size_reduction_factor()
+    }
+
+    /// Get spread adjustment factor during cascade.
+    ///
+    /// Returns a multiplier (>= 1.0) to widen spreads by.
+    /// Accounts for increased adverse selection during cascades.
+    pub fn cascade_spread_multiplier(&self) -> f64 {
+        if !self.is_warmed_up() || !self.cascade_active() {
+            return 1.0;
+        }
+
+        let severity = self.cascade_severity();
+        // Widen spreads by up to 3x during severe cascades
+        1.0 + 2.0 * severity
     }
 
     /// Get diagnostic summary.

@@ -101,6 +101,22 @@ struct MetricsInner {
     /// Current volatility regime (0=Low, 1=Normal, 2=High, 3=Extreme)
     volatility_regime: AtomicU64,
 
+    // === Connection Health Metrics ===
+    /// WebSocket connected (1 = connected, 0 = disconnected)
+    websocket_connected: AtomicU64,
+    /// Time since last trade update (ms)
+    last_trade_age_ms: AtomicU64,
+    /// Time since last L2 book update (ms)
+    last_book_age_ms: AtomicU64,
+
+    // === Data Quality Metrics ===
+    /// Total data quality issues detected
+    data_quality_issues_total: AtomicU64,
+    /// Cumulative sequence gaps detected
+    message_loss_count: AtomicU64,
+    /// Crossed book incidents
+    crossed_book_incidents: AtomicU64,
+
     /// Start time for uptime calculation
     start_time: Instant,
 }
@@ -141,6 +157,12 @@ impl PrometheusMetrics {
                 data_staleness_secs: AtomicF64::new(0.0),
                 quote_cycle_latency_ms: AtomicF64::new(0.0),
                 volatility_regime: AtomicU64::new(1), // Normal
+                websocket_connected: AtomicU64::new(0),
+                last_trade_age_ms: AtomicU64::new(0),
+                last_book_age_ms: AtomicU64::new(0),
+                data_quality_issues_total: AtomicU64::new(0),
+                message_loss_count: AtomicU64::new(0),
+                crossed_book_incidents: AtomicU64::new(0),
                 start_time: Instant::now(),
             }),
         }
@@ -202,7 +224,14 @@ impl PrometheusMetrics {
     // === Market Updates ===
 
     /// Update market metrics.
-    pub fn update_market(&self, mid_price: f64, spread_bps: f64, sigma: f64, jump_ratio: f64, kappa: f64) {
+    pub fn update_market(
+        &self,
+        mid_price: f64,
+        spread_bps: f64,
+        sigma: f64,
+        jump_ratio: f64,
+        kappa: f64,
+    ) {
         self.inner.mid_price.store(mid_price);
         self.inner.spread_bps.store(spread_bps);
         self.inner.sigma.store(sigma);
@@ -221,7 +250,9 @@ impl PrometheusMetrics {
         beta_book: f64,
         beta_flow: f64,
     ) {
-        self.inner.microprice_deviation_bps.store(microprice_deviation_bps);
+        self.inner
+            .microprice_deviation_bps
+            .store(microprice_deviation_bps);
         self.inner.book_imbalance.store(book_imbalance);
         self.inner.flow_imbalance.store(flow_imbalance);
         self.inner.beta_book.store(beta_book);
@@ -242,13 +273,61 @@ impl PrometheusMetrics {
             .kill_switch_triggered
             .store(if kill_switch_triggered { 1 } else { 0 }, Ordering::Relaxed);
         self.inner.cascade_severity.store(cascade_severity);
-        self.inner.adverse_selection_bps.store(adverse_selection_bps);
+        self.inner
+            .adverse_selection_bps
+            .store(adverse_selection_bps);
         self.inner.tail_risk_multiplier.store(tail_risk_multiplier);
     }
 
     /// Update volatility regime.
     pub fn update_volatility_regime(&self, regime: u64) {
-        self.inner.volatility_regime.store(regime, Ordering::Relaxed);
+        self.inner
+            .volatility_regime
+            .store(regime, Ordering::Relaxed);
+    }
+
+    // === Connection Health Updates ===
+
+    /// Set WebSocket connection status.
+    pub fn set_websocket_connected(&self, connected: bool) {
+        self.inner
+            .websocket_connected
+            .store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Update last trade age in milliseconds.
+    pub fn set_last_trade_age_ms(&self, age_ms: u64) {
+        self.inner
+            .last_trade_age_ms
+            .store(age_ms, Ordering::Relaxed);
+    }
+
+    /// Update last book age in milliseconds.
+    pub fn set_last_book_age_ms(&self, age_ms: u64) {
+        self.inner.last_book_age_ms.store(age_ms, Ordering::Relaxed);
+    }
+
+    // === Data Quality Updates ===
+
+    /// Record a data quality issue.
+    pub fn record_data_quality_issue(&self) {
+        self.inner
+            .data_quality_issues_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record sequence gaps (message loss).
+    pub fn record_message_loss(&self, gap_count: u64) {
+        self.inner
+            .message_loss_count
+            .fetch_add(gap_count, Ordering::Relaxed);
+    }
+
+    /// Record a crossed book incident.
+    pub fn record_crossed_book(&self) {
+        self.inner
+            .crossed_book_incidents
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // === Timing Updates ===
@@ -256,7 +335,9 @@ impl PrometheusMetrics {
     /// Update timing metrics.
     pub fn update_timing(&self, data_staleness_secs: f64, quote_cycle_latency_ms: f64) {
         self.inner.data_staleness_secs.store(data_staleness_secs);
-        self.inner.quote_cycle_latency_ms.store(quote_cycle_latency_ms);
+        self.inner
+            .quote_cycle_latency_ms
+            .store(quote_cycle_latency_ms);
     }
 
     // === Getters ===
@@ -419,6 +500,56 @@ impl PrometheusMetrics {
             self.inner.volatility_regime.load(Ordering::Relaxed)
         ));
 
+        // Connection health metrics
+        output.push_str(&format!(
+            "# HELP mm_websocket_connected WebSocket connection status (1=connected)\n\
+             # TYPE mm_websocket_connected gauge\n\
+             mm_websocket_connected{{{}}} {}\n",
+            labels,
+            self.inner.websocket_connected.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_last_trade_age_ms Time since last trade update in ms\n\
+             # TYPE mm_last_trade_age_ms gauge\n\
+             mm_last_trade_age_ms{{{}}} {}\n",
+            labels,
+            self.inner.last_trade_age_ms.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_last_book_age_ms Time since last L2 book update in ms\n\
+             # TYPE mm_last_book_age_ms gauge\n\
+             mm_last_book_age_ms{{{}}} {}\n",
+            labels,
+            self.inner.last_book_age_ms.load(Ordering::Relaxed)
+        ));
+
+        // Data quality metrics
+        output.push_str(&format!(
+            "# HELP mm_data_quality_issues_total Total data quality issues detected\n\
+             # TYPE mm_data_quality_issues_total counter\n\
+             mm_data_quality_issues_total{{{}}} {}\n",
+            labels,
+            self.inner.data_quality_issues_total.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_message_loss_count Cumulative sequence gaps detected\n\
+             # TYPE mm_message_loss_count counter\n\
+             mm_message_loss_count{{{}}} {}\n",
+            labels,
+            self.inner.message_loss_count.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_crossed_book_incidents Crossed book incidents detected\n\
+             # TYPE mm_crossed_book_incidents counter\n\
+             mm_crossed_book_incidents{{{}}} {}\n",
+            labels,
+            self.inner.crossed_book_incidents.load(Ordering::Relaxed)
+        ));
+
         output
     }
 
@@ -467,6 +598,30 @@ impl PrometheusMetrics {
             "uptime_secs".to_string(),
             self.inner.start_time.elapsed().as_secs_f64(),
         );
+        map.insert(
+            "websocket_connected".to_string(),
+            self.inner.websocket_connected.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "last_trade_age_ms".to_string(),
+            self.inner.last_trade_age_ms.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "last_book_age_ms".to_string(),
+            self.inner.last_book_age_ms.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "data_quality_issues_total".to_string(),
+            self.inner.data_quality_issues_total.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "message_loss_count".to_string(),
+            self.inner.message_loss_count.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "crossed_book_incidents".to_string(),
+            self.inner.crossed_book_incidents.load(Ordering::Relaxed) as f64,
+        );
 
         map
     }
@@ -490,6 +645,12 @@ impl PrometheusMetrics {
             cascade_severity: self.inner.cascade_severity.load(),
             adverse_selection_bps: self.inner.adverse_selection_bps.load(),
             uptime_secs: self.inner.start_time.elapsed().as_secs_f64(),
+            websocket_connected: self.inner.websocket_connected.load(Ordering::Relaxed) == 1,
+            last_trade_age_ms: self.inner.last_trade_age_ms.load(Ordering::Relaxed),
+            last_book_age_ms: self.inner.last_book_age_ms.load(Ordering::Relaxed),
+            data_quality_issues_total: self.inner.data_quality_issues_total.load(Ordering::Relaxed),
+            message_loss_count: self.inner.message_loss_count.load(Ordering::Relaxed),
+            crossed_book_incidents: self.inner.crossed_book_incidents.load(Ordering::Relaxed),
         }
     }
 }
@@ -551,6 +712,14 @@ pub struct MetricsSummary {
     pub cascade_severity: f64,
     pub adverse_selection_bps: f64,
     pub uptime_secs: f64,
+    // Connection health
+    pub websocket_connected: bool,
+    pub last_trade_age_ms: u64,
+    pub last_book_age_ms: u64,
+    // Data quality
+    pub data_quality_issues_total: u64,
+    pub message_loss_count: u64,
+    pub crossed_book_incidents: u64,
 }
 
 // ============================================================================
