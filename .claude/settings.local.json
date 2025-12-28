@@ -29,7 +29,8 @@
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 120 cargo run:*)",
       "Bash(tee:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 330 cargo run:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(python3 -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\)[''fields''][''prometheus_output'']; lines=[l for l in d.split\\(''\\\\n''\\) if l.startswith\\(''mm_''\\) and ''{'' in l]; print\\(''\\\\n''.join\\(lines\\)\\)\")"
     ]
   }
 }

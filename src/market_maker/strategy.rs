@@ -34,6 +34,16 @@ pub struct MarketParams {
     /// Estimated order book depth decay (κ) - from weighted L2 book regression
     pub kappa: f64,
 
+    /// Directional kappa for bid side (our buy fills).
+    /// Theory: When informed flow is selling, κ_bid < κ_ask → wider bid spread.
+    /// Use for asymmetric GLFT: δ_bid = (1/γ) × ln(1 + γ/κ_bid)
+    pub kappa_bid: f64,
+
+    /// Directional kappa for ask side (our sell fills).
+    /// Theory: When informed flow is buying, κ_ask < κ_bid → wider ask spread.
+    /// Use for asymmetric GLFT: δ_ask = (1/γ) × ln(1 + γ/κ_ask)
+    pub kappa_ask: f64,
+
     /// Order arrival intensity (A) - volume ticks per second
     pub arrival_intensity: f64,
 
@@ -191,6 +201,8 @@ impl Default for MarketParams {
             sigma_total: 0.0001,       // Same initially
             sigma_effective: 0.0001,   // Same initially
             kappa: 100.0,              // Moderate depth decay
+            kappa_bid: 100.0,          // Same as kappa initially
+            kappa_ask: 100.0,          // Same as kappa initially
             arrival_intensity: 0.5,    // 0.5 volume ticks per second
             is_toxic_regime: false,    // Default: not toxic
             jump_ratio: 1.0,           // Default: normal diffusion
@@ -549,7 +561,8 @@ pub struct RiskConfig {
     /// Maximum γ ceiling
     pub gamma_max: f64,
 
-    /// Minimum spread floor (as fraction, e.g., 0.0001 = 1 bps)
+    /// Minimum spread floor (as fraction, e.g., 0.00015 = 1.5 bps)
+    /// Should be >= maker_fee_rate to ensure profitability at minimum spread
     pub min_spread_floor: f64,
 
     /// Maximum holding time cap (seconds)
@@ -564,6 +577,14 @@ pub struct RiskConfig {
     ///
     /// Derived from information theory (exponential link function).
     pub flow_sensitivity: f64,
+
+    /// Maker fee rate as fraction of notional.
+    /// This is added to the GLFT half-spread to ensure profitability.
+    /// The HJB equation with fees: dW = (δ - f_maker) × dN
+    /// Therefore optimal spread: δ* = δ_GLFT + f_maker
+    ///
+    /// Hyperliquid maker fee: 0.00015 (1.5 bps)
+    pub maker_fee_rate: f64,
 }
 
 impl Default for RiskConfig {
@@ -579,9 +600,10 @@ impl Default for RiskConfig {
             inventory_sensitivity: 2.0,
             gamma_min: 0.05,
             gamma_max: 5.0,
-            min_spread_floor: 0.0001, // 1 bps
-            max_holding_time: 120.0,  // 2 minutes
-            flow_sensitivity: 0.5,    // exp(-0.5) ≈ 0.61 at perfect alignment
+            min_spread_floor: 0.00015, // 1.5 bps - matches maker fee for guaranteed profitability
+            max_holding_time: 120.0,   // 2 minutes
+            flow_sensitivity: 0.5,     // exp(-0.5) ≈ 0.61 at perfect alignment
+            maker_fee_rate: 0.00015,   // 1.5 bps Hyperliquid maker fee
         }
     }
 }
@@ -734,19 +756,27 @@ impl GLFTStrategy {
         (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
     }
 
-    /// Correct GLFT half-spread formula: δ = (1/γ) × ln(1 + γ/κ)
+    /// Correct GLFT half-spread formula with fee recovery:
+    ///
+    /// δ* = (1/γ) × ln(1 + γ/κ) + f_maker
+    ///
+    /// The fee term comes from the modified HJB equation:
+    /// dW = (δ - f_maker) × dN, so optimal δ* = δ_GLFT + f_maker
     ///
     /// This is market-driven: when κ drops (thin book), spread widens automatically.
-    /// When κ rises (deep book), spread tightens.
+    /// When κ rises (deep book), spread tightens. Fee ensures minimum profitable spread.
     fn half_spread(&self, gamma: f64, kappa: f64) -> f64 {
         let ratio = gamma / kappa;
-        if ratio > 1e-9 && gamma > 1e-9 {
+        let glft_spread = if ratio > 1e-9 && gamma > 1e-9 {
             (1.0 / gamma) * (1.0 + ratio).ln()
         } else {
             // When γ/κ → 0, use Taylor expansion: ln(1+x) ≈ x
             // δ ≈ (1/γ) × (γ/κ) = 1/κ
             1.0 / kappa.max(1.0)
-        }
+        };
+
+        // Add maker fee to ensure profitability (first-principles HJB modification)
+        glft_spread + self.risk_config.maker_fee_rate
     }
 
     /// Flow-adjusted inventory skew with exponential regularization.
@@ -821,18 +851,46 @@ impl QuotingStrategy for GLFTStrategy {
         let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
         // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
         let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
-        let kappa = market_params.kappa;
+
+        // === 1a. ADVERSE SELECTION-ADJUSTED KAPPA (Fix 1 + Fix 2: Directional) ===
+        // Theory: Informed flow reduces effective supply of uninformed liquidity.
+        // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
+        //
+        // In GLFT, κ is the order book depth decay. But when our fills are adversely
+        // selected (informed traders hit us first), the effective κ for OUR orders
+        // is lower than the market-wide κ. Lower κ → wider spreads (correct response).
+        //
+        // Fix 2: Directional kappa estimation - use separate κ_bid and κ_ask
+        // When informed flow is selling, our bids get hit → lower κ_bid → wider bid spread
+        // When informed flow is buying, our asks get lifted → lower κ_ask → wider ask spread
+        //
+        // Example: α = 0.5 → kappa halves → spread widens by ~30%
+        let alpha = market_params.predicted_alpha.min(0.5); // Cap at 50% AS
+
+        // Symmetric kappa (for skew and logging)
+        let kappa = market_params.kappa * (1.0 - alpha);
+
+        // Directional kappas for asymmetric GLFT spreads
+        let kappa_bid = market_params.kappa_bid * (1.0 - alpha);
+        let kappa_ask = market_params.kappa_ask * (1.0 - alpha);
 
         // Time horizon from arrival intensity: T = 1/λ (with max cap)
         let time_horizon = self.holding_time(market_params.arrival_intensity);
 
-        // === 2. CORRECT GLFT HALF-SPREAD: δ = (1/γ) × ln(1 + γ/κ) ===
-        // This is market-driven: thin book (low κ) → wider spread
-        let mut half_spread = self.half_spread(gamma, kappa);
+        // === 2. ASYMMETRIC GLFT HALF-SPREADS (First-Principles Fix 2) ===
+        // δ_bid = (1/γ) × ln(1 + γ/κ_bid) - wider if κ_bid < κ_ask (sell pressure)
+        // δ_ask = (1/γ) × ln(1 + γ/κ_ask) - wider if κ_ask < κ_bid (buy pressure)
+        let mut half_spread_bid = self.half_spread(gamma, kappa_bid);
+        let mut half_spread_ask = self.half_spread(gamma, kappa_ask);
+
+        // Symmetric half-spread for logging (average of bid/ask)
+        let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
 
         // === 2a. ADVERSE SELECTION SPREAD ADJUSTMENT ===
-        // Add measured AS cost to half-spread (only when warmed up)
+        // Add measured AS cost to half-spreads (only when warmed up)
         if market_params.as_warmed_up && market_params.as_spread_adjustment > 0.0 {
+            half_spread_bid += market_params.as_spread_adjustment;
+            half_spread_ask += market_params.as_spread_adjustment;
             half_spread += market_params.as_spread_adjustment;
             debug!(
                 as_adj_bps = %format!("{:.2}", market_params.as_spread_adjustment * 10000.0),
@@ -841,7 +899,45 @@ impl QuotingStrategy for GLFTStrategy {
             );
         }
 
-        // === 2b. SPREAD REGIME ADJUSTMENT (Tier 2) ===
+        // === 2b. JUMP PREMIUM (First-Principles) ===
+        // Theory: Under jump-diffusion dP = σ dW + J dN, total risk exceeds diffusion risk.
+        // GLFT assumes continuous diffusion, but crypto has discrete jumps.
+        //
+        // Jump premium formula (from jump-diffusion optimal MM theory):
+        //   jump_premium = λ × E[J²] / (γ × κ)
+        // where λ = jump intensity, E[J²] = expected squared jump size
+        //
+        // We estimate this from jump_ratio = RV/BV:
+        //   - RV captures total variance (diffusion + jumps)
+        //   - BV captures diffusion variance only
+        //   - Jump contribution ≈ (jump_ratio - 1) × σ²
+        if market_params.jump_ratio > 1.5 {
+            // Estimate jump component from the ratio
+            // RV/BV - 1 ≈ (λ × E[J²]) / σ²_diffusion
+            let jump_component = (market_params.jump_ratio - 1.0) * market_params.sigma.powi(2);
+
+            // Jump premium: spread compensation for jump risk
+            // Scaled by 1/(γ × κ) like the GLFT formula
+            let jump_premium = if gamma * kappa > 1e-9 {
+                (jump_component / (gamma * kappa)).clamp(0.0, 0.005) // Max 50 bps
+            } else {
+                0.0
+            };
+
+            half_spread_bid += jump_premium;
+            half_spread_ask += jump_premium;
+            half_spread += jump_premium;
+
+            if jump_premium > 0.0001 {
+                debug!(
+                    jump_ratio = %format!("{:.2}", market_params.jump_ratio),
+                    jump_premium_bps = %format!("{:.2}", jump_premium * 10000.0),
+                    "Jump premium applied"
+                );
+            }
+        }
+
+        // === 2c. SPREAD REGIME ADJUSTMENT (Tier 2) ===
         // Adjust spread based on current market spread dynamics
         let spread_regime_mult = match market_params.spread_regime {
             super::SpreadRegime::VeryTight => 1.3, // Widen - tight spreads = competition/manipulation
@@ -850,9 +946,13 @@ impl QuotingStrategy for GLFTStrategy {
             super::SpreadRegime::Wide => 0.95, // Can tighten slightly to capture
             super::SpreadRegime::VeryWide => 0.9, // Tighten more - opportunity
         };
+        half_spread_bid *= spread_regime_mult;
+        half_spread_ask *= spread_regime_mult;
         half_spread *= spread_regime_mult;
 
         // Apply minimum spread floor
+        half_spread_bid = half_spread_bid.max(self.risk_config.min_spread_floor);
+        half_spread_ask = half_spread_ask.max(self.risk_config.min_spread_floor);
         half_spread = half_spread.max(self.risk_config.min_spread_floor);
 
         // === 3. USE SIGMA_EFFECTIVE FOR INVENTORY SKEW ===
@@ -923,26 +1023,89 @@ impl QuotingStrategy for GLFTStrategy {
         // This replaces all ad-hoc adjustments with data-driven signal integration.
         let fair_price = market_params.microprice;
 
+        // === 5a. MOMENTUM-CONDITIONAL SKEW AMPLIFICATION ===
+        // Theory: When position opposes strong momentum, increase skew to exit faster.
+        //
+        // Falling knife: market falling + long position = urgent need to sell
+        // Rising knife: market rising + short position = urgent need to cover
+        //
+        // The flow-dampened skew handles mild flow opposition, but during strong
+        // momentum (falling/rising knife), we need MORE aggressive inventory reduction.
+        // This is a first-principles response to autocorrelated momentum.
+        let momentum_skew_multiplier = {
+            // Position direction: positive = long, negative = short
+            let pos_direction = position.signum();
+
+            // Momentum direction: falling_knife > rising_knife = falling
+            let momentum_direction = if market_params.falling_knife_score
+                > market_params.rising_knife_score
+            {
+                -1.0 // Falling
+            } else if market_params.rising_knife_score > market_params.falling_knife_score {
+                1.0 // Rising
+            } else {
+                0.0 // Neutral
+            };
+
+            // Momentum severity: max of falling/rising knife scores
+            let momentum_severity = market_params
+                .falling_knife_score
+                .max(market_params.rising_knife_score);
+
+            // Opposition: position and momentum in opposite directions
+            let is_opposed = pos_direction * momentum_direction < 0.0;
+
+            if is_opposed && momentum_severity > 0.5 {
+                // Amplify skew when opposed to strong momentum
+                // Up to 2x amplification at maximum momentum severity (score = 3)
+                let amplification = 1.0 + (momentum_severity / 3.0).min(1.0);
+
+                if momentum_severity > 1.0 {
+                    debug!(
+                        position = %format!("{:.4}", position),
+                        falling_knife = %format!("{:.2}", market_params.falling_knife_score),
+                        rising_knife = %format!("{:.2}", market_params.rising_knife_score),
+                        skew_amplifier = %format!("{:.2}x", amplification),
+                        "Momentum-opposed position: amplifying inventory skew"
+                    );
+                }
+
+                amplification
+            } else {
+                1.0 // No amplification
+            }
+        };
+
         // === 6. COMBINED SKEW WITH TIER 2 ADJUSTMENTS ===
         // Combine all skew components:
         // - base_skew: GLFT inventory skew × flow modifier (exp(-β × alignment))
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
-        let skew = base_skew + hawkes_skew + funding_skew;
+        // - momentum amplification: when opposed to strong momentum
+        let skew = (base_skew + hawkes_skew + funding_skew) * momentum_skew_multiplier;
 
         // Calculate flow modifier for logging (same as in inventory_skew_with_flow)
         let flow_alignment = inventory_ratio.signum() * market_params.flow_imbalance;
         let flow_modifier = (-self.risk_config.flow_sensitivity * flow_alignment).exp();
-        let bid_delta = half_spread + skew;
-        let ask_delta = (half_spread - skew).max(0.0);
+
+        // === 6a. ASYMMETRIC BID/ASK DELTAS ===
+        // Use directional half-spreads: κ_bid ≠ κ_ask when flow is directional
+        // - Bid delta uses half_spread_bid (wider when sell pressure = low κ_bid)
+        // - Ask delta uses half_spread_ask (wider when buy pressure = low κ_ask)
+        let bid_delta = half_spread_bid + skew;
+        let ask_delta = (half_spread_ask - skew).max(0.0);
 
         debug!(
             inv_ratio = %format!("{:.4}", inventory_ratio),
             gamma = %format!("{:.4}", gamma),
             liq_mult = %format!("{:.2}", market_params.liquidity_gamma_mult),
-            kappa = %format!("{:.2}", kappa),
+            kappa = %format!("{:.0}", kappa),
+            kappa_bid = %format!("{:.0}", kappa_bid),
+            kappa_ask = %format!("{:.0}", kappa_ask),
             time_horizon = %format!("{:.2}", time_horizon),
             half_spread_bps = %format!("{:.1}", half_spread * 10000.0),
+            half_spread_bid_bps = %format!("{:.1}", half_spread_bid * 10000.0),
+            half_spread_ask_bps = %format!("{:.1}", half_spread_ask * 10000.0),
             flow_imb = %format!("{:.3}", market_params.flow_imbalance),
             flow_mod = %format!("{:.3}", flow_modifier),
             base_skew_bps = %format!("{:.4}", base_skew * 10000.0),
@@ -957,7 +1120,7 @@ impl QuotingStrategy for GLFTStrategy {
             bid_delta_bps = %format!("{:.1}", bid_delta * 10000.0),
             ask_delta_bps = %format!("{:.1}", ask_delta * 10000.0),
             is_toxic = market_params.is_toxic_regime,
-            "GLFT spread components with flow-dampened skew"
+            "GLFT spread components with asymmetric kappa"
         );
 
         // Convert to absolute price offsets using fair_price (microprice)
@@ -1170,6 +1333,11 @@ impl LadderStrategy {
         let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
         let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
 
+        // AS-adjusted kappa: same logic as GLFTStrategy
+        // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
+        let alpha = market_params.predicted_alpha.min(0.5);
+        let kappa = market_params.kappa * (1.0 - alpha);
+
         let time_horizon = self.holding_time(market_params.arrival_intensity);
 
         let inventory_ratio = if max_position > EPSILON {
@@ -1191,7 +1359,7 @@ impl LadderStrategy {
         let params = LadderParams {
             mid_price: market_params.microprice,
             sigma: market_params.sigma,
-            kappa: market_params.kappa,
+            kappa,  // Use AS-adjusted kappa
             arrival_intensity: market_params.arrival_intensity,
             as_at_touch_bps,
             total_size: adjusted_size,
@@ -1452,15 +1620,18 @@ mod tests {
 
     #[test]
     fn test_glft_half_spread_formula() {
-        // Test the correct half-spread formula: δ = (1/γ) × ln(1 + γ/κ)
+        // Test the correct half-spread formula with fee recovery:
+        // δ* = (1/γ) × ln(1 + γ/κ) + f_maker
         let strategy = GLFTStrategy::new(0.5);
 
         let gamma = 0.5;
         let kappa = 100.0;
+        let maker_fee = strategy.risk_config.maker_fee_rate; // 0.00015 (1.5 bps)
 
-        // Expected: δ = (1/0.5) * ln(1 + 0.5/100) = 2 * ln(1.005) ≈ 2 * 0.00499 ≈ 0.00998
+        // Expected: δ = (1/0.5) * ln(1 + 0.5/100) + 0.00015 ≈ 0.00998 + 0.00015 ≈ 0.01013
         let half_spread = strategy.half_spread(gamma, kappa);
-        let expected = (1.0 / gamma) * (1.0 + gamma / kappa).ln();
+        let glft_spread = (1.0 / gamma) * (1.0 + gamma / kappa).ln();
+        let expected = glft_spread + maker_fee;
 
         assert!(
             (half_spread - expected).abs() < 1e-6,
@@ -1469,10 +1640,10 @@ mod tests {
             expected
         );
 
-        // Verify the numerical example from GLFT_CORRECTIONS.md
+        // Verify the numerical example: GLFT ~0.998% + fee 0.015% ≈ 1.013%
         assert!(
-            (half_spread - 0.00998).abs() < 0.0001,
-            "Half-spread should be ~0.998%: got {}",
+            (half_spread - 0.01013).abs() < 0.0001,
+            "Half-spread should be ~1.013%: got {}",
             half_spread
         );
     }
@@ -1553,6 +1724,8 @@ mod tests {
         // Deep book (high kappa) - should have tighter spread
         let deep_book = MarketParams {
             kappa: 200.0,
+            kappa_bid: 200.0,  // Match kappa for symmetric test
+            kappa_ask: 200.0,
             microprice: 100.0, // Must match mid_price for fair quoting
             ..Default::default()
         };
@@ -1560,6 +1733,8 @@ mod tests {
         // Thin book (low kappa) - should have wider spread
         let thin_book = MarketParams {
             kappa: 20.0,
+            kappa_bid: 20.0,  // Match kappa for symmetric test
+            kappa_ask: 20.0,
             microprice: 100.0, // Must match mid_price for fair quoting
             ..Default::default()
         };
@@ -1815,6 +1990,8 @@ mod tests {
             sigma: 0.0002,
             sigma_effective: 0.0002,
             kappa: 100.0,
+            kappa_bid: 100.0,  // Match kappa for symmetric test
+            kappa_ask: 100.0,
             arrival_intensity: 0.5,
             jump_ratio: 1.0,
             is_toxic_regime: false,
@@ -1826,6 +2003,8 @@ mod tests {
             sigma: 0.0006, // 3x vol
             sigma_effective: 0.0006,
             kappa: 50.0,            // Thinner book
+            kappa_bid: 50.0,        // Match kappa for symmetric test
+            kappa_ask: 50.0,
             arrival_intensity: 0.2, // Slower fills
             jump_ratio: 3.0,        // Toxic
             is_toxic_regime: true,

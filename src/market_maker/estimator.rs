@@ -1767,6 +1767,21 @@ struct MicropriceObservation {
     mid: f64,
 }
 
+/// Mode for handling correlation between book and flow signals.
+///
+/// When signals are highly correlated (common in thin markets), we switch
+/// from two-variable regression to more robust alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum CorrelationMode {
+    /// Use both signals independently (correlation < 0.80)
+    #[default]
+    Independent,
+    /// Orthogonalize flow onto book (0.80 <= correlation < 0.95)
+    Orthogonalized,
+    /// Use combined net_pressure signal (correlation >= 0.95)
+    Combined,
+}
+
 /// Estimates microprice by learning how book/flow imbalance predict returns.
 ///
 /// Uses rolling online regression to estimate:
@@ -1823,6 +1838,17 @@ struct MicropriceEstimator {
 
     /// Correlation between book and flow signals (for multicollinearity detection)
     signal_correlation: f64,
+
+    /// Mode for handling correlated signals
+    correlation_mode: CorrelationMode,
+
+    /// Combined signal coefficient (for high-correlation mode)
+    beta_net: f64,
+
+    /// Sum statistics for net_pressure signal (book - flow)
+    sum_x_net: f64,
+    sum_xx_net: f64,
+    sum_xy_net: f64,
 }
 
 impl MicropriceEstimator {
@@ -1845,13 +1871,23 @@ impl MicropriceEstimator {
             beta_flow: 0.0,
             r_squared: 0.0,
             min_observations,
-            // Ridge regularization: λ = 0.01 provides moderate regularization
+            // Ridge regularization: λ = 0.001 (reduced from 0.01)
+            // Lower regularization allows coefficients to learn from sparse data
             // This adds λI to X'X, shrinking coefficients toward zero
-            lambda: 0.01,
-            // Minimum R² threshold: below 1% explained variance, revert to mid
-            min_r_squared: 0.01,
+            lambda: 0.001,
+            // Minimum R² threshold: 0.01% explained variance (reduced from 1%)
+            // Lower threshold allows microprice to deviate even with weak signals
+            min_r_squared: 0.0001,
             // Initialize correlation to 0 (no correlation assumed)
             signal_correlation: 0.0,
+            // Start in Independent mode
+            correlation_mode: CorrelationMode::Independent,
+            // Combined signal coefficient
+            beta_net: 0.0,
+            // Net pressure statistics (book - flow)
+            sum_x_net: 0.0,
+            sum_xx_net: 0.0,
+            sum_xy_net: 0.0,
         }
     }
 
@@ -1915,6 +1951,12 @@ impl MicropriceEstimator {
         self.sum_xy_flow += x_flow * y;
         self.sum_yy += y * y;
 
+        // Track net_pressure = book - flow for combined mode
+        let x_net = x_book - x_flow;
+        self.sum_x_net += x_net;
+        self.sum_xx_net += x_net * x_net;
+        self.sum_xy_net += x_net * y;
+
         // Log when microprice warmup completes
         if !was_warmed_up && self.is_warmed_up() {
             debug!(
@@ -1943,6 +1985,10 @@ impl MicropriceEstimator {
             self.sum_xy_book *= decay;
             self.sum_xy_flow *= decay;
             self.sum_yy *= decay;
+            // Decay net_pressure stats too
+            self.sum_x_net *= decay;
+            self.sum_xx_net *= decay;
+            self.sum_xy_net *= decay;
             // Effective n decays too
             self.n = ((self.n as f64) * decay) as usize;
         }
@@ -1996,6 +2042,142 @@ impl MicropriceEstimator {
             self.signal_correlation = (sx_cross / (std_book * std_flow)).clamp(-1.0, 1.0);
         }
 
+        // Determine correlation mode based on signal correlation
+        let abs_corr = self.signal_correlation.abs();
+        self.correlation_mode = if abs_corr >= 0.95 {
+            CorrelationMode::Combined
+        } else if abs_corr >= 0.80 {
+            CorrelationMode::Orthogonalized
+        } else {
+            CorrelationMode::Independent
+        };
+
+        match self.correlation_mode {
+            CorrelationMode::Combined => {
+                // Single-variable regression on net_pressure = book - flow
+                // When correlation is extreme, the two signals collapse into one dimension
+                let mean_x_net = self.sum_x_net / n;
+                let sxx_net = self.sum_xx_net - n * mean_x_net * mean_x_net;
+                let sxy_net = self.sum_xy_net - n * mean_x_net * mean_y;
+
+                // Ridge regularization to prevent overfitting in sparse data
+                // Scale lambda by variance for scale-invariance
+                let lambda_scaled = self.lambda * sxx_net.max(1e-6);
+                let sxx_net_reg = sxx_net + lambda_scaled;
+
+                if sxx_net_reg > 1e-9 {
+                    // Regularized OLS estimate
+                    let beta_raw = sxy_net / sxx_net_reg;
+
+                    // Tight clamp: ±10 bps max coefficient
+                    // net_pressure ranges [-2, +2], so max adjustment is ±20 bps
+                    // This is economically reasonable for microprice
+                    let beta_clamped = beta_raw.clamp(-0.001, 0.001);
+
+                    // Sample-size based confidence: shrink toward 0 when n is small
+                    // Full confidence at n = min_observations + 200
+                    let confidence =
+                        ((n - self.min_observations as f64) / 200.0).clamp(0.0, 1.0);
+                    self.beta_net = beta_clamped * confidence;
+
+                    // R² calculation (use regularized estimate)
+                    if syy > 1e-12 {
+                        let y_pred_var = self.beta_net * self.beta_net * sxx_net;
+                        self.r_squared = (y_pred_var / syy).clamp(0.0, 1.0);
+                    }
+                }
+
+                // Log periodically
+                if self.n.is_multiple_of(100) {
+                    let confidence =
+                        ((n - self.min_observations as f64) / 200.0).clamp(0.0, 1.0);
+                    debug!(
+                        n = self.n,
+                        beta_net_bps = %format!("{:.2}", self.beta_net * 10000.0),
+                        r_squared = %format!("{:.4}", self.r_squared),
+                        correlation = %format!("{:.3}", self.signal_correlation),
+                        confidence = %format!("{:.2}", confidence),
+                        mode = "Combined",
+                        "Microprice using net_pressure signal"
+                    );
+                }
+                return;
+            }
+            CorrelationMode::Orthogonalized => {
+                // Project flow onto orthogonal space of book
+                // flow_residual = flow - proj_coef * book
+                let proj_coef = if sxx_book > 1e-9 {
+                    sx_cross / sxx_book
+                } else {
+                    0.0
+                };
+
+                // Residual variance and covariance
+                let sxx_flow_ortho = sxx_flow - proj_coef * proj_coef * sxx_book;
+                let sxy_flow_ortho = sxy_flow - proj_coef * sxy_book;
+
+                // Ridge regularization for book regression
+                let lambda_book = self.lambda * sxx_book.max(1e-6);
+                let sxx_book_reg = sxx_book + lambda_book;
+
+                // Regress on book first with regularization
+                if sxx_book_reg > 1e-9 {
+                    // Tight clamp: ±10 bps
+                    self.beta_book = (sxy_book / sxx_book_reg).clamp(-0.001, 0.001);
+                }
+
+                // Ridge regularization for orthogonalized flow
+                let lambda_flow = self.lambda * sxx_flow_ortho.max(1e-6);
+                let sxx_flow_ortho_reg = sxx_flow_ortho + lambda_flow;
+
+                // Regress on orthogonalized flow with regularization
+                if sxx_flow_ortho_reg > 1e-9 {
+                    // Tight clamp: ±10 bps
+                    let beta_flow_ortho = (sxy_flow_ortho / sxx_flow_ortho_reg).clamp(-0.001, 0.001);
+                    // Transform back: y = beta_book*book + beta_flow_ortho*(flow - proj*book)
+                    // y = (beta_book - beta_flow_ortho*proj)*book + beta_flow_ortho*flow
+                    self.beta_flow = beta_flow_ortho;
+                    self.beta_book -= beta_flow_ortho * proj_coef;
+                }
+
+                // Sample-size based confidence scaling
+                let confidence =
+                    ((n - self.min_observations as f64) / 200.0).clamp(0.0, 1.0);
+                self.beta_book *= confidence;
+                self.beta_flow *= confidence;
+
+                // Final clamp after transformation (transformation can amplify)
+                self.beta_book = self.beta_book.clamp(-0.001, 0.001);
+                self.beta_flow = self.beta_flow.clamp(-0.001, 0.001);
+
+                // Calculate R²
+                if syy > 1e-12 {
+                    let y_pred_var = self.beta_book.powi(2) * sxx_book
+                        + self.beta_flow.powi(2) * sxx_flow
+                        + 2.0 * self.beta_book * self.beta_flow * sx_cross;
+                    self.r_squared = (y_pred_var / syy).clamp(0.0, 1.0);
+                }
+
+                // Log periodically
+                if self.n.is_multiple_of(100) {
+                    debug!(
+                        n = self.n,
+                        beta_book_bps = %format!("{:.2}", self.beta_book * 10000.0),
+                        beta_flow_bps = %format!("{:.2}", self.beta_flow * 10000.0),
+                        r_squared = %format!("{:.4}", self.r_squared),
+                        correlation = %format!("{:.3}", self.signal_correlation),
+                        confidence = %format!("{:.2}", confidence),
+                        mode = "Orthogonalized",
+                        "Microprice coefficients updated"
+                    );
+                }
+                return;
+            }
+            CorrelationMode::Independent => {
+                // Continue with standard ridge regression below
+            }
+        }
+
         // Ridge regularization: add λ to diagonal of X'X
         // Scale λ by the average variance to make it scale-invariant
         let avg_var = (sxx_book + sxx_flow) / 2.0;
@@ -2018,13 +2200,18 @@ impl MicropriceEstimator {
         }
 
         // Solve using Cramer's rule with regularized matrix
-        self.beta_book = (sxy_book * sxx_flow_reg - sxy_flow * sx_cross) / det;
-        self.beta_flow = (sxy_flow * sxx_book_reg - sxy_book * sx_cross) / det;
+        let beta_book_raw = (sxy_book * sxx_flow_reg - sxy_flow * sx_cross) / det;
+        let beta_flow_raw = (sxy_flow * sxx_book_reg - sxy_book * sx_cross) / det;
 
-        // Clamp betas to reasonable range (prevent explosion)
-        // Expected range: ~0.0001-0.01 (0.1-10 bps per unit signal)
-        self.beta_book = self.beta_book.clamp(-0.05, 0.05);
-        self.beta_flow = self.beta_flow.clamp(-0.05, 0.05);
+        // Tight clamp: ±10 bps max coefficient (prevents overfitting)
+        let beta_book_clamped = beta_book_raw.clamp(-0.001, 0.001);
+        let beta_flow_clamped = beta_flow_raw.clamp(-0.001, 0.001);
+
+        // Sample-size based confidence: shrink toward 0 when n is small
+        // Full confidence after 200+ observations beyond minimum
+        let confidence = ((n - self.min_observations as f64) / 200.0).clamp(0.0, 1.0);
+        self.beta_book = beta_book_clamped * confidence;
+        self.beta_flow = beta_flow_clamped * confidence;
 
         // Calculate R² = 1 - SSE/SST
         if syy > 1e-12 {
@@ -2032,14 +2219,6 @@ impl MicropriceEstimator {
                 + self.beta_flow * self.beta_flow * sxx_flow
                 + 2.0 * self.beta_book * self.beta_flow * sx_cross;
             self.r_squared = (y_pred_var / syy).clamp(0.0, 1.0);
-        }
-
-        // Warn about high multicollinearity
-        if self.signal_correlation.abs() > 0.8 && self.n.is_multiple_of(1000) {
-            warn!(
-                correlation = %format!("{:.3}", self.signal_correlation),
-                "High multicollinearity between book and flow signals"
-            );
         }
 
         // Log periodically (every 100 observations for better visibility)
@@ -2050,6 +2229,7 @@ impl MicropriceEstimator {
                 beta_flow_bps = %format!("{:.2}", self.beta_flow * 10000.0),
                 r_squared = %format!("{:.4}", self.r_squared),
                 correlation = %format!("{:.3}", self.signal_correlation),
+                mode = "Independent",
                 "Microprice coefficients updated"
             );
         }
@@ -2060,7 +2240,10 @@ impl MicropriceEstimator {
     /// Returns mid price if:
     /// - Not warmed up (insufficient data)
     /// - R² below threshold (model has no predictive power)
-    /// - Signals are highly collinear (unreliable coefficients)
+    ///
+    /// Uses mode-based adjustment depending on signal correlation:
+    /// - Combined: uses net_pressure = book - flow when correlation >= 0.95
+    /// - Orthogonalized/Independent: uses both signals
     fn microprice(&self, mid: f64, book_imbalance: f64, flow_imbalance: f64) -> f64 {
         if !self.is_warmed_up() {
             return mid;
@@ -2071,13 +2254,18 @@ impl MicropriceEstimator {
             return mid;
         }
 
-        // If signals are extremely collinear (|ρ| > 0.95), coefficients are unreliable
-        if self.signal_correlation.abs() > 0.95 {
-            return mid;
-        }
-
-        // microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
-        let adjustment = self.beta_book * book_imbalance + self.beta_flow * flow_imbalance;
+        // Mode-based adjustment (correlation handling is now built into mode selection)
+        let adjustment = match self.correlation_mode {
+            CorrelationMode::Combined => {
+                // Use net_pressure signal when correlation is extreme
+                let net_pressure = book_imbalance - flow_imbalance;
+                self.beta_net * net_pressure
+            }
+            CorrelationMode::Orthogonalized | CorrelationMode::Independent => {
+                // Standard two-signal adjustment
+                self.beta_book * book_imbalance + self.beta_flow * flow_imbalance
+            }
+        };
 
         // Clamp adjustment to ±50 bps for safety
         let adjustment_clamped = adjustment.clamp(-0.005, 0.005);
@@ -2342,6 +2530,11 @@ pub struct ParameterEstimator {
     flow: TradeFlowTracker,
     /// Bayesian kappa from OUR order fills (PRIMARY - correct GLFT semantics)
     own_kappa: BayesianKappaEstimator,
+    /// Bayesian kappa from OUR BID fills (buy fills = bid got hit)
+    /// Theory: Separate bid/ask kappas capture asymmetric informed flow
+    own_kappa_bid: BayesianKappaEstimator,
+    /// Bayesian kappa from OUR ASK fills (sell fills = ask got lifted)
+    own_kappa_ask: BayesianKappaEstimator,
     /// Bayesian kappa from market-wide trades (FALLBACK during warmup)
     market_kappa: BayesianKappaEstimator,
     /// Volume tick arrival estimator
@@ -2370,11 +2563,22 @@ impl ParameterEstimator {
         let momentum = MomentumDetector::new(config.momentum_window_ms);
         let flow = TradeFlowTracker::new(config.trade_flow_window_ms, config.trade_flow_alpha);
 
-        // Dual Bayesian kappa estimators with Gamma conjugate prior:
-        // 1. own_kappa: Fed by our order fills (PRIMARY - correct GLFT semantics)
-        // 2. market_kappa: Fed by market-wide trades (FALLBACK during warmup)
-        // Both use same prior and window configuration.
+        // Bayesian kappa estimators with Gamma conjugate prior:
+        // 1. own_kappa: Fed by ALL our order fills (PRIMARY - correct GLFT semantics)
+        // 2. own_kappa_bid/ask: Fed by our fills split by side (for asymmetric spreads)
+        // 3. market_kappa: Fed by market-wide trades (FALLBACK during warmup)
+        // All use same prior and window configuration.
         let own_kappa = BayesianKappaEstimator::new(
+            config.kappa_prior_mean,
+            config.kappa_prior_strength,
+            config.kappa_window_ms,
+        );
+        let own_kappa_bid = BayesianKappaEstimator::new(
+            config.kappa_prior_mean,
+            config.kappa_prior_strength,
+            config.kappa_window_ms,
+        );
+        let own_kappa_ask = BayesianKappaEstimator::new(
             config.kappa_prior_mean,
             config.kappa_prior_strength,
             config.kappa_window_ms,
@@ -2411,6 +2615,8 @@ impl ParameterEstimator {
             momentum,
             flow,
             own_kappa,
+            own_kappa_bid,
+            own_kappa_ask,
             market_kappa,
             arrival,
             book_structure,
@@ -2511,20 +2717,42 @@ impl ParameterEstimator {
     /// This provides the TRUE fill rate decay for our orders (correct GLFT semantics),
     /// not market-wide proxy data. Call this when we receive a fill notification.
     ///
+    /// # Theory (First Principles Fix 2):
+    /// Order book depth is asymmetric during flow imbalance. When informed traders
+    /// are selling, our bids get hit more (lower κ_bid). When they're buying, our
+    /// asks get lifted (lower κ_ask). By tracking bid/ask fills separately, we can
+    /// compute asymmetric GLFT spreads:
+    ///   δ_bid = (1/γ) × ln(1 + γ/κ_bid)
+    ///   δ_ask = (1/γ) × ln(1 + γ/κ_ask)
+    ///
     /// # Arguments
     /// * `timestamp_ms` - Fill timestamp
     /// * `placement_price` - Where we originally placed the order
     /// * `fill_price` - Where the order actually filled
     /// * `fill_size` - Size of the fill
+    /// * `is_buy` - True if this was a buy order (our bid got hit)
     pub fn on_own_fill(
         &mut self,
         timestamp_ms: u64,
         placement_price: f64,
         fill_price: f64,
         fill_size: f64,
+        is_buy: bool,
     ) {
+        // Feed ALL fills into aggregate kappa (for backward compatibility)
         self.own_kappa
             .record_fill_distance(timestamp_ms, placement_price, fill_price, fill_size);
+
+        // Feed into directional kappa estimator:
+        // - is_buy=true means our BID was filled (we bought)
+        // - is_buy=false means our ASK was filled (we sold)
+        if is_buy {
+            self.own_kappa_bid
+                .record_fill_distance(timestamp_ms, placement_price, fill_price, fill_size);
+        } else {
+            self.own_kappa_ask
+                .record_fill_distance(timestamp_ms, placement_price, fill_price, fill_size);
+        }
     }
 
     /// Legacy on_trade without aggressor info (backward compatibility).
@@ -2590,11 +2818,26 @@ impl ParameterEstimator {
     pub fn kappa(&self) -> f64 {
         let own_conf = self.own_kappa.confidence();
 
-        // Blend: as own confidence grows, phase out market data
         let own = self.own_kappa.posterior_mean();
         let market = self.market_kappa.posterior_mean();
 
-        own_conf * own + (1.0 - own_conf) * market
+        // Conservative blending: when confidence is low, assume adverse selection
+        // is high and use a lower kappa (which widens spreads).
+        //
+        // Theory: Low confidence means few own fills observed. In GLFT, κ from
+        // market trades is too HIGH because market trades include uninformed flow,
+        // while our fills are adversely selected (informed traders hit us first).
+        //
+        // Fix: Apply a 50% discount to market kappa when confidence < 0.3
+        // This assumes ~50% adverse selection until we have enough data to know better.
+        if own_conf < 0.3 {
+            // Low confidence: be conservative, assume 50% adverse selection
+            let market_discounted = market * 0.5;
+            own_conf * own + (1.0 - own_conf) * market_discounted
+        } else {
+            // Higher confidence: trust the blend more
+            own_conf * own + (1.0 - own_conf) * market
+        }
     }
 
     /// Get kappa from our own order fills only (no blending).
@@ -2651,6 +2894,56 @@ impl ParameterEstimator {
         let market_cv = self.market_kappa.cv();
 
         own_conf * own_cv + (1.0 - own_conf) * market_cv
+    }
+
+    /// Get directional kappa for bid side (our buy fills).
+    ///
+    /// Theory: When informed flow is selling, our bids get hit more often
+    /// and at worse prices → lower κ_bid → wider bid spread.
+    ///
+    /// Uses same conservative blending as main kappa() when confidence is low.
+    pub fn kappa_bid(&self) -> f64 {
+        let own_conf = self.own_kappa_bid.confidence();
+        let own = self.own_kappa_bid.posterior_mean();
+        let market = self.market_kappa.posterior_mean();
+
+        // Conservative blending: discount market kappa when confidence low
+        if own_conf < 0.3 {
+            let market_discounted = market * 0.5;
+            own_conf * own + (1.0 - own_conf) * market_discounted
+        } else {
+            own_conf * own + (1.0 - own_conf) * market
+        }
+    }
+
+    /// Get directional kappa for ask side (our sell fills).
+    ///
+    /// Theory: When informed flow is buying, our asks get lifted more often
+    /// and at worse prices → lower κ_ask → wider ask spread.
+    ///
+    /// Uses same conservative blending as main kappa() when confidence is low.
+    pub fn kappa_ask(&self) -> f64 {
+        let own_conf = self.own_kappa_ask.confidence();
+        let own = self.own_kappa_ask.posterior_mean();
+        let market = self.market_kappa.posterior_mean();
+
+        // Conservative blending: discount market kappa when confidence low
+        if own_conf < 0.3 {
+            let market_discounted = market * 0.5;
+            own_conf * own + (1.0 - own_conf) * market_discounted
+        } else {
+            own_conf * own + (1.0 - own_conf) * market
+        }
+    }
+
+    /// Get confidence for directional kappa estimates.
+    pub fn kappa_bid_confidence(&self) -> f64 {
+        self.own_kappa_bid.confidence()
+    }
+
+    /// Get confidence for directional kappa estimates.
+    pub fn kappa_ask_confidence(&self) -> f64 {
+        self.own_kappa_ask.confidence()
     }
 
     /// Get current order arrival intensity (volume ticks per second).
@@ -3243,9 +3536,10 @@ mod tests {
     // === Dual-Source Kappa Blending Tests ===
 
     #[test]
-    fn test_dual_kappa_startup_uses_market() {
+    fn test_dual_kappa_startup_uses_conservative_market() {
         // At startup, own_kappa has no data (0% confidence)
-        // Should use 100% market_kappa
+        // With Fix 5 (conservative blending), we discount market_kappa by 50%
+        // when confidence < 0.3 to account for likely adverse selection
         let config = make_config();
         let mut estimator = ParameterEstimator::new(config);
 
@@ -3264,12 +3558,14 @@ mod tests {
             own_conf
         );
 
-        // Blended kappa should equal market_kappa
+        // With conservative blending: when confidence < 0.3, market_kappa is discounted by 50%
+        // This widens spreads to protect against adverse selection until we have own-fill data
         let blended = estimator.kappa();
         let market = estimator.kappa_market();
+        let expected_conservative = market * 0.5;
         assert!(
-            (blended - market).abs() < 1.0,
-            "Blended kappa {} should equal market kappa {} at startup",
+            (blended - expected_conservative).abs() < 1.0,
+            "Blended kappa {} should equal 50% of market kappa {} at startup (conservative AS protection)",
             blended,
             market
         );
@@ -3289,11 +3585,11 @@ mod tests {
 
         let initial_conf = estimator.own_kappa.confidence();
 
-        // Now feed own fills
+        // Now feed own fills (alternating buy/sell)
         let placement_price = 99.5; // 50bps below mid
         let fill_price = 99.6; // Filled 10bps above placement
         for i in 0..50 {
-            estimator.on_own_fill(10000 + i * 100, placement_price, fill_price, 1.0);
+            estimator.on_own_fill(10000 + i * 100, placement_price, fill_price, 1.0, i % 2 == 0);
         }
 
         let final_conf = estimator.own_kappa.confidence();
@@ -3324,11 +3620,11 @@ mod tests {
         }
         let market_kappa = estimator.kappa_market();
 
-        // Feed own fills at different distance
+        // Feed own fills at different distance (alternating buy/sell)
         let placement = 100.0;
         let fill = 100.05; // 5bps = distance 0.0005 (tighter fills = higher kappa)
         for i in 0..100 {
-            estimator.on_own_fill(20000 + i * 100, placement, fill, 1.0);
+            estimator.on_own_fill(20000 + i * 100, placement, fill, 1.0, i % 2 == 0);
         }
         let own_kappa = estimator.kappa_own();
         let own_conf = estimator.own_kappa.confidence();

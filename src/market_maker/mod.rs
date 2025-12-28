@@ -593,6 +593,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                     placement_price,
                                     fill_price,
                                     amount,
+                                    is_buy,
                                 );
 
                                 // === Tier 2: Record fill in P&L tracker ===
@@ -776,6 +777,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             sigma_effective: self.estimator.sigma_effective(), // Blended for skew
             // Order book
             kappa: self.estimator.kappa(), // Fill-rate kappa from trade distances
+            kappa_bid: self.estimator.kappa_bid(), // Directional kappa for bid side
+            kappa_ask: self.estimator.kappa_ask(), // Directional kappa for ask side
             arrival_intensity: self.estimator.arrival_intensity(), // Volume ticks/sec
             // Regime detection
             is_toxic_regime: self.estimator.is_toxic_regime(), // RV/BV > 1.5
