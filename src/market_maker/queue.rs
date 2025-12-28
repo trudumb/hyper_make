@@ -176,6 +176,25 @@ impl QueuePositionTracker {
         }
     }
 
+    /// Update order after a partial fill - reduce tracked size.
+    ///
+    /// This is called when an order is partially filled but still has remaining size.
+    /// We reduce our tracked size and assume we moved up in the queue.
+    pub fn order_partially_filled(&mut self, oid: u64, filled_amount: f64) {
+        if let Some(position) = self.positions.get_mut(&oid) {
+            position.size = (position.size - filled_amount).max(0.0);
+            // Assume we moved up in the queue by the filled amount
+            position.depth_ahead = (position.depth_ahead - filled_amount)
+                .max(self.config.min_queue_position);
+            debug!(
+                oid = oid,
+                new_size = %format!("{:.6}", position.size),
+                new_depth = %format!("{:.6}", position.depth_ahead),
+                "Queue: Partial fill processed"
+            );
+        }
+    }
+
     /// Update tracker with new L2 book data.
     ///
     /// This decays queue positions and updates best bid/ask.

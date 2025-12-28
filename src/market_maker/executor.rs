@@ -67,6 +67,41 @@ impl ModifyResult {
     }
 }
 
+/// Result of cancelling an order.
+///
+/// Distinguishes between different cancel outcomes to allow proper order tracking:
+/// - `Cancelled`: Order was successfully cancelled (safe to remove from tracking)
+/// - `AlreadyCancelled`: Order was already cancelled (safe to remove from tracking)
+/// - `AlreadyFilled`: Order was already filled (DO NOT remove - fill notification will handle it)
+/// - `Failed`: Cancel failed for other reasons (keep in tracking, may retry)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelResult {
+    /// Order was successfully cancelled
+    Cancelled,
+    /// Order was already cancelled (no longer exists)
+    AlreadyCancelled,
+    /// Order was already filled before cancel arrived
+    AlreadyFilled,
+    /// Cancel failed for other reasons
+    Failed,
+}
+
+impl CancelResult {
+    /// Returns true if the order is gone (cancelled, already cancelled, or already filled)
+    pub fn order_is_gone(&self) -> bool {
+        matches!(
+            self,
+            CancelResult::Cancelled | CancelResult::AlreadyCancelled | CancelResult::AlreadyFilled
+        )
+    }
+
+    /// Returns true if it's safe to remove the order from tracking
+    /// (i.e., the order won't generate any more fill notifications)
+    pub fn safe_to_remove_tracking(&self) -> bool {
+        matches!(self, CancelResult::Cancelled | CancelResult::AlreadyCancelled)
+    }
+}
+
 /// Order specification for bulk placement.
 #[derive(Debug, Clone)]
 pub struct OrderSpec {
@@ -93,8 +128,13 @@ pub trait OrderExecutor: Send + Sync {
     async fn place_bulk_orders(&self, asset: &str, orders: Vec<OrderSpec>) -> Vec<OrderResult>;
 
     /// Cancel an order.
-    /// Returns `true` if cancel was successful, `false` otherwise.
-    async fn cancel_order(&self, asset: &str, oid: u64) -> bool;
+    ///
+    /// Returns a `CancelResult` indicating what happened:
+    /// - `Cancelled`: Order was cancelled successfully
+    /// - `AlreadyCancelled`: Order was already cancelled
+    /// - `AlreadyFilled`: Order was filled before cancel arrived (keep tracking!)
+    /// - `Failed`: Cancel failed for other reasons
+    async fn cancel_order(&self, asset: &str, oid: u64) -> CancelResult;
 
     /// Modify an existing order.
     ///
@@ -318,7 +358,7 @@ impl OrderExecutor for HyperliquidExecutor {
         vec![OrderResult::failed(); num_orders]
     }
 
-    async fn cancel_order(&self, asset: &str, oid: u64) -> bool {
+    async fn cancel_order(&self, asset: &str, oid: u64) -> CancelResult {
         let cancel = self
             .client
             .cancel(
@@ -340,13 +380,18 @@ impl OrderExecutor for HyperliquidExecutor {
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_cancelled();
                                     }
-                                    return true;
+                                    return CancelResult::Cancelled;
                                 }
                                 ExchangeDataStatus::Error(e) => {
-                                    // "already canceled or filled" means the order is gone - that's success
-                                    if e.contains("already canceled") || e.contains("filled") {
-                                        info!("Order already gone: {e}");
-                                        return true;
+                                    // Distinguish between "already cancelled" and "already filled"
+                                    // CRITICAL: If filled, DO NOT remove from tracking - fill will arrive via WebSocket
+                                    if e.contains("filled") {
+                                        info!("Order already filled: oid={} - keeping in tracking for fill", oid);
+                                        return CancelResult::AlreadyFilled;
+                                    }
+                                    if e.contains("already canceled") || e.contains("does not exist") {
+                                        info!("Order already cancelled: oid={}", oid);
+                                        return CancelResult::AlreadyCancelled;
                                     }
                                     error!("Cancel error: {e}");
                                 }
@@ -366,7 +411,7 @@ impl OrderExecutor for HyperliquidExecutor {
             Err(e) => error!("Cancel request failed: {e}"),
         }
 
-        false
+        CancelResult::Failed
     }
 
     async fn modify_order(

@@ -1246,6 +1246,7 @@ impl MicropriceEstimator {
 
     /// Add a completed observation to regression.
     fn add_observation(&mut self, x_book: f64, x_flow: f64, y: f64) {
+        let was_warmed_up = self.is_warmed_up();
         self.n += 1;
         self.sum_x_book += x_book;
         self.sum_x_flow += x_flow;
@@ -1256,6 +1257,15 @@ impl MicropriceEstimator {
         self.sum_xy_book += x_book * y;
         self.sum_xy_flow += x_flow * y;
         self.sum_yy += y * y;
+
+        // Log when microprice warmup completes
+        if !was_warmed_up && self.is_warmed_up() {
+            debug!(
+                n = self.n,
+                min_observations = self.min_observations,
+                "Microprice estimator warmup complete"
+            );
+        }
     }
 
     /// Expire observations outside the regression window.
@@ -1375,15 +1385,15 @@ impl MicropriceEstimator {
             );
         }
 
-        // Log periodically
-        if self.n.is_multiple_of(500) {
+        // Log periodically (every 100 observations for better visibility)
+        if self.n.is_multiple_of(100) {
             debug!(
                 n = self.n,
                 beta_book_bps = %format!("{:.2}", self.beta_book * 10000.0),
                 beta_flow_bps = %format!("{:.2}", self.beta_flow * 10000.0),
                 r_squared = %format!("{:.4}", self.r_squared),
                 correlation = %format!("{:.3}", self.signal_correlation),
-                "Microprice coefficients updated (Ridge regularized)"
+                "Microprice coefficients updated"
             );
         }
     }

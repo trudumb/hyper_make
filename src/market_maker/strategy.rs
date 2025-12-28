@@ -632,7 +632,22 @@ impl GLFTStrategy {
         // === COMBINE AND CLAMP ===
         let gamma_effective =
             cfg.gamma_base * vol_scalar * toxicity_scalar * inventory_scalar * regime_scalar * hawkes_scalar;
-        gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
+        let gamma_clamped = gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max);
+
+        // Log gamma component breakdown for debugging strategy behavior
+        debug!(
+            gamma_base = %format!("{:.3}", cfg.gamma_base),
+            vol_scalar = %format!("{:.3}", vol_scalar),
+            tox_scalar = %format!("{:.3}", toxicity_scalar),
+            inv_scalar = %format!("{:.3}", inventory_scalar),
+            regime_scalar = %format!("{:.3}", regime_scalar),
+            hawkes_scalar = %format!("{:.3}", hawkes_scalar),
+            gamma_raw = %format!("{:.4}", gamma_effective),
+            gamma_clamped = %format!("{:.4}", gamma_clamped),
+            "Gamma component breakdown"
+        );
+
+        gamma_clamped
     }
 
     /// Calculate expected holding time from arrival intensity.

@@ -469,67 +469,119 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
                     let is_buy = fill.side.eq("B");
+                    let tid = fill.tid;
+                    let oid = fill.oid;
 
-                    // Process fill (handles dedup internally)
-                    if self.position.process_fill(fill.tid, amount, is_buy) {
-                        // === Tier 1: Record fill for AS measurement ===
-                        self.adverse_selection.record_fill(
-                            fill.tid,
-                            amount,
-                            is_buy,
-                            self.latest_mid,
-                        );
+                    // Step 1: Always update position first (handles tid dedup internally)
+                    if self.position.process_fill(tid, amount, is_buy) {
+                        // Step 2: Update order tracking with proper state management
+                        let (order_found, is_new_fill, is_complete) =
+                            self.orders.process_fill(oid, tid, amount);
 
-                        // === Tier 1: Remove order from queue tracker ===
-                        self.queue_tracker.order_removed(fill.oid);
-
-                        // === Tier 2: Record fill in P&L tracker ===
-                        let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
-                        self.pnl_tracker.record_fill(
-                            fill.tid,
-                            fill_price,
-                            amount,
-                            is_buy,
-                            self.latest_mid, // mid_at_fill
-                        );
-
-                        // === Production: Update Prometheus metrics ===
-                        self.prometheus.record_fill(amount, is_buy);
-
-                        // Use fill.oid for exact order matching (not side-based guessing)
-                        if self.orders.update_fill(fill.oid, amount) {
-                            let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
-                            info!(
-                                "[Fill] {} {} {} | oid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
+                        if !order_found {
+                            // Order not in tracking - log warning for investigation
+                            // Position is still correct (updated above)
+                            warn!(
+                                "[Fill] Untracked order filled: oid={} tid={} {} {} {} | position updated to {}",
+                                oid,
+                                tid,
                                 if is_buy { "bought" } else { "sold" },
                                 amount,
                                 self.config.asset,
-                                fill.oid,
+                                self.position.position()
+                            );
+                        } else if is_new_fill {
+                            // New fill on tracked order - record in all systems
+                            let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
+
+                            // === Tier 1: Record fill for AS measurement ===
+                            self.adverse_selection.record_fill(
+                                tid,
+                                amount,
+                                is_buy,
+                                self.latest_mid,
+                            );
+
+                            // === Tier 2: Record fill in P&L tracker ===
+                            self.pnl_tracker.record_fill(
+                                tid,
+                                fill_price,
+                                amount,
+                                is_buy,
+                                self.latest_mid, // mid_at_fill
+                            );
+
+                            // === Production: Update Prometheus metrics ===
+                            self.prometheus.record_fill(amount, is_buy);
+
+                            let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
+                            info!(
+                                "[Fill] {} {} {} | oid={} tid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
+                                if is_buy { "bought" } else { "sold" },
+                                amount,
+                                self.config.asset,
+                                oid,
+                                tid,
                                 self.position.position(),
                                 self.adverse_selection.realized_as_bps(),
                                 pnl_summary.total_pnl
                             );
-                        } else {
-                            // Order not in tracking - log warning for investigation
-                            warn!(
-                                "[Fill] Untracked order filled: oid={} {} {} {}",
-                                fill.oid,
-                                if is_buy { "bought" } else { "sold" },
-                                amount,
-                                self.config.asset
-                            );
-                        }
 
-                        // Record metrics
-                        if let Some(ref m) = self.metrics {
-                            m.record_fill(amount, is_buy);
-                            m.update_position(self.position.position());
+                            // Record metrics
+                            if let Some(ref m) = self.metrics {
+                                m.record_fill(amount, is_buy);
+                                m.update_position(self.position.position());
+                            }
+
+                            // Update queue tracker based on fill completeness
+                            if is_complete {
+                                // Order fully filled - will be removed via cleanup()
+                                // Don't remove from queue tracker here; let cleanup() handle it
+                            } else {
+                                // Partial fill - update queue position
+                                self.queue_tracker.order_partially_filled(oid, amount);
+                            }
+                        }
+                        // else: duplicate fill at order level - already processed
+
+                        // Position milestone warnings
+                        let current_position = self.position.position();
+                        let utilization = (current_position.abs() / self.config.max_position).min(1.0);
+                        let utilization_pct = utilization * 100.0;
+
+                        // Warn at 50%, 75%, 90% thresholds (only when crossing upward)
+                        if utilization >= 0.90 {
+                            warn!(
+                                position = %format!("{:.6}", current_position),
+                                max_position = %format!("{:.6}", self.config.max_position),
+                                utilization = %format!("{:.1}%", utilization_pct),
+                                "Position at 90%+ of max - approaching reduce-only mode"
+                            );
+                        } else if utilization >= 0.75 {
+                            warn!(
+                                position = %format!("{:.6}", current_position),
+                                max_position = %format!("{:.6}", self.config.max_position),
+                                utilization = %format!("{:.1}%", utilization_pct),
+                                "Position at 75%+ of max"
+                            );
+                        } else if utilization >= 0.50 {
+                            debug!(
+                                position = %format!("{:.6}", current_position),
+                                max_position = %format!("{:.6}", self.config.max_position),
+                                utilization = %format!("{:.1}%", utilization_pct),
+                                "Position at 50%+ of max"
+                            );
                         }
                     }
                 }
 
-                // Cleanup filled orders
-                self.orders.cleanup_filled();
+                // Run cleanup cycle - deferred removal of terminal orders
+                // This handles the fill window for cancelled orders
+                let removed_oids = self.orders.cleanup();
+                for oid in removed_oids {
+                    // Now safe to remove from QueueTracker
+                    self.queue_tracker.order_removed(oid);
+                }
 
                 // Update quotes after fills
                 self.update_quotes().await?;
@@ -772,16 +824,63 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Ok(())
     }
 
+    /// Initiate cancel and update order state appropriately.
+    /// Does NOT remove order from tracking - that happens via cleanup cycle.
+    async fn initiate_and_track_cancel(&mut self, oid: u64) {
+        // Mark as CancelPending before sending request
+        if !self.orders.initiate_cancel(oid) {
+            debug!("Order {} not in cancellable state", oid);
+            return;
+        }
+
+        let cancel_result = self.cancel_with_retry(&self.config.asset, oid, 3).await;
+
+        match cancel_result {
+            CancelResult::Cancelled | CancelResult::AlreadyCancelled => {
+                // Cancel confirmed - start fill window (DO NOT REMOVE YET)
+                self.orders.on_cancel_confirmed(oid);
+                info!("Cancel confirmed for oid={}, waiting for fill window", oid);
+            }
+            CancelResult::AlreadyFilled => {
+                // Order was filled - mark appropriately
+                self.orders.on_cancel_already_filled(oid);
+                info!("Order {} was already filled when cancelled", oid);
+            }
+            CancelResult::Failed => {
+                // Cancel failed - revert state
+                self.orders.on_cancel_failed(oid);
+                warn!("Cancel failed for oid={}, reverted to active", oid);
+            }
+        }
+    }
+
     /// Reconcile orders on one side.
     /// Cancels ALL orders on a side (not just first) with retry logic.
     async fn reconcile_side(&mut self, side: Side, new_quote: Option<Quote>) -> Result<()> {
-        // Get ALL resting orders on this side (not just first)
+        // Get ALL active orders on this side (excludes those being cancelled)
         let current_orders: Vec<u64> = self
             .orders
             .get_all_by_side(side)
             .iter()
             .map(|o| o.oid)
             .collect();
+
+        // Check for orders in cancel process (for logging/debugging)
+        let pending_cancels: Vec<u64> = self
+            .orders
+            .get_all_by_side_including_pending(side)
+            .iter()
+            .filter(|o| matches!(o.state, OrderState::CancelPending | OrderState::CancelConfirmed))
+            .map(|o| o.oid)
+            .collect();
+
+        if !pending_cancels.is_empty() {
+            debug!(
+                side = %side_str(side),
+                pending_cancel_count = pending_cancels.len(),
+                "Orders still in cancel window on this side"
+            );
+        }
 
         debug!(
             side = %side_str(side),
@@ -795,22 +894,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Have orders, no quote -> cancel all
             (false, None) => {
                 for oid in current_orders {
-                    // Mark as cancelling before attempting cancel
-                    self.orders.set_state(oid, OrderState::Cancelling);
-
-                    if self.cancel_with_retry(&self.config.asset, oid, 3).await {
-                        info!("Cancelled {} order: oid={}", side_str(side), oid);
-                        self.orders.remove_order(oid);
-                        self.queue_tracker.order_removed(oid); // Tier 1: Remove from queue tracking
-                    } else {
-                        // Revert to resting if cancel failed
-                        self.orders.set_state(oid, OrderState::Resting);
-                        warn!(
-                            "Failed to cancel {} order after retries: oid={}",
-                            side_str(side),
-                            oid
-                        );
-                    }
+                    self.initiate_and_track_cancel(oid).await;
                 }
             }
             // Have orders, have quote -> check if needs update, cancel all if so
@@ -822,20 +906,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 if needs_update {
                     // Cancel all orders on this side
                     for oid in current_orders {
-                        self.orders.set_state(oid, OrderState::Cancelling);
-
-                        if self.cancel_with_retry(&self.config.asset, oid, 3).await {
-                            info!("Cancelled {} order for update: oid={}", side_str(side), oid);
-                            self.orders.remove_order(oid);
-                            self.queue_tracker.order_removed(oid); // Tier 1: Remove from queue tracking
-                        } else {
-                            self.orders.set_state(oid, OrderState::Resting);
-                            warn!(
-                                "Failed to cancel {} order after retries: oid={}",
-                                side_str(side),
-                                oid
-                            );
-                        }
+                        self.initiate_and_track_cancel(oid).await;
                     }
                     // Place new order
                     self.place_new_order(side, &quote).await?;
@@ -857,7 +928,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Manages multiple orders per side for ladder quoting strategy.
     /// Uses bulk order placement for efficiency (single API call for all levels).
     async fn reconcile_ladder_side(&mut self, side: Side, new_quotes: Vec<Quote>) -> Result<()> {
-        // Get all current orders on this side
+        // Get all active orders on this side (excludes those being cancelled)
         let current_orders: Vec<u64> = self
             .orders
             .get_all_by_side(side)
@@ -875,19 +946,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // If no new quotes, cancel all existing orders
         if new_quotes.is_empty() {
             for oid in current_orders {
-                self.orders.set_state(oid, OrderState::Cancelling);
-                if self.cancel_with_retry(&self.config.asset, oid, 3).await {
-                    info!("Cancelled {} ladder order: oid={}", side_str(side), oid);
-                    self.orders.remove_order(oid);
-                    self.queue_tracker.order_removed(oid);
-                } else {
-                    self.orders.set_state(oid, OrderState::Resting);
-                    warn!(
-                        "Failed to cancel {} ladder order after retries: oid={}",
-                        side_str(side),
-                        oid
-                    );
-                }
+                self.initiate_and_track_cancel(oid).await;
             }
             return Ok(());
         }
@@ -898,23 +957,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if needs_update || current_orders.is_empty() {
             // Cancel all existing orders on this side first
             for oid in &current_orders {
-                self.orders.set_state(*oid, OrderState::Cancelling);
-                if self.cancel_with_retry(&self.config.asset, *oid, 3).await {
-                    debug!(
-                        "Cancelled {} ladder order for update: oid={}",
-                        side_str(side),
-                        oid
-                    );
-                    self.orders.remove_order(*oid);
-                    self.queue_tracker.order_removed(*oid);
-                } else {
-                    self.orders.set_state(*oid, OrderState::Resting);
-                    warn!(
-                        "Failed to cancel {} ladder order after retries: oid={}",
-                        side_str(side),
-                        oid
-                    );
-                }
+                self.initiate_and_track_cancel(*oid).await;
             }
 
             // Build order specs for bulk placement
@@ -1103,12 +1146,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     }
 
     /// Cancel an order with retry logic.
-    /// Returns true if cancel succeeded, false if all retries failed.
-    async fn cancel_with_retry(&self, asset: &str, oid: u64, max_attempts: u32) -> bool {
+    ///
+    /// Returns `CancelResult` indicating what happened:
+    /// - `Cancelled`: Order was cancelled successfully
+    /// - `AlreadyCancelled`: Order was already cancelled
+    /// - `AlreadyFilled`: Order was filled before cancel (DO NOT remove from tracking!)
+    /// - `Failed`: Cancel failed after all retries
+    async fn cancel_with_retry(&self, asset: &str, oid: u64, max_attempts: u32) -> CancelResult {
         for attempt in 0..max_attempts {
-            if self.executor.cancel_order(asset, oid).await {
-                return true;
+            let result = self.executor.cancel_order(asset, oid).await;
+
+            // If order is gone (any reason), stop retrying
+            if result.order_is_gone() {
+                return result;
             }
+
+            // Only retry on Failed
             if attempt < max_attempts - 1 {
                 let delay = Duration::from_millis(100 * 2_u64.pow(attempt));
                 debug!(
@@ -1121,7 +1174,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 tokio::time::sleep(delay).await;
             }
         }
-        false
+        CancelResult::Failed
     }
 
     /// Graceful shutdown - cancel all resting orders and log final state.
@@ -1189,8 +1242,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let mut failed = 0;
 
             for oid in oids {
-                if self.cancel_with_retry(&self.config.asset, oid, 3).await {
-                    info!("Cancelled order: oid={}", oid);
+                let cancel_result = self.cancel_with_retry(&self.config.asset, oid, 3).await;
+                if cancel_result.order_is_gone() {
+                    // Order is gone (cancelled, already cancelled, or already filled)
+                    if cancel_result == CancelResult::AlreadyFilled {
+                        info!("Order already filled during shutdown: oid={}", oid);
+                    } else {
+                        info!("Cancelled order: oid={}", oid);
+                    }
                     cancelled += 1;
                 } else {
                     warn!("Failed to cancel order after retries: oid={}", oid);
@@ -1221,6 +1280,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     async fn safety_sync(&mut self) -> Result<()> {
         debug!("Running safety sync...");
 
+        // === Run cleanup first to expire any fill windows ===
+        let cleaned = self.orders.cleanup();
+        for oid in cleaned {
+            self.queue_tracker.order_removed(oid);
+        }
+
+        // === Check for stuck cancels ===
+        let stuck = self.orders.check_stuck_cancels();
+        if !stuck.is_empty() {
+            warn!(
+                "[SafetySync] Stuck cancel orders detected: {:?}",
+                stuck
+            );
+        }
+
         // === Update margin state from user account ===
         if let Err(e) = self.refresh_margin_state().await {
             warn!("Failed to refresh margin state: {e}");
@@ -1242,13 +1316,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "[SafetySync] Orphan order detected on exchange: oid={} - cancelling",
                 oid
             );
-            if self.executor.cancel_order(&self.config.asset, *oid).await {
+            let cancel_result = self.executor.cancel_order(&self.config.asset, *oid).await;
+            if cancel_result.order_is_gone() {
                 info!("[SafetySync] Cancelled orphan order: oid={}", oid);
             }
         }
 
         // Check for stale orders in tracking (exist locally but not on exchange)
+        // IMPORTANT: Don't remove orders that are in cancel/fill window - they may be waiting for late fills
         for oid in local_oids.difference(&exchange_oids) {
+            if let Some(order) = self.orders.get_order(*oid) {
+                // Don't remove if still in cancel/fill window
+                if matches!(
+                    order.state,
+                    OrderState::CancelPending | OrderState::CancelConfirmed
+                ) {
+                    debug!(
+                        "[SafetySync] Order {} in cancel window - not removing",
+                        oid
+                    );
+                    continue;
+                }
+            }
+
             warn!(
                 "[SafetySync] Stale order in tracking (not on exchange): oid={} - removing",
                 oid
@@ -1257,11 +1347,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.queue_tracker.order_removed(*oid); // Tier 1: Remove from queue tracking
         }
 
-        // Log if everything is in sync
-        if exchange_oids == local_oids {
+        // Log if everything is in sync (excluding orders in cancel window)
+        let active_local_oids: HashSet<u64> = self
+            .orders
+            .order_ids()
+            .into_iter()
+            .filter(|oid| {
+                self.orders
+                    .get_order(*oid)
+                    .map(|o| o.is_active())
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if exchange_oids == active_local_oids {
             debug!(
-                "[SafetySync] State in sync: {} orders (exchange matches local)",
-                local_oids.len()
+                "[SafetySync] State in sync: {} active orders (exchange matches local)",
+                active_local_oids.len()
             );
         }
 

@@ -207,3 +207,213 @@ impl QuotingStrategy for MyStrategy {
 - Minimum order notional: $10 USD
 - Price precision: 5 significant figures, max `6 - sz_decimals` decimals (perps)
 - Size precision: truncate to `sz_decimals` (from asset metadata)
+
+### Tier 1 Features (Production-Critical)
+
+The market maker includes advanced features beyond basic quoting:
+
+**Adverse Selection Measurement** (`adverse_selection.rs`):
+- Ground truth measurement: E[Δp | fill] at 1-second horizon
+- Tracks realized adverse selection separately for buy/sell fills (EWMA)
+- Calculates predicted α (probability of informed flow)
+- Provides spread adjustment recommendations
+- Fill deduplication by trade ID prevents double-counting
+
+```
+Key metrics:
+- realized_as_bps: Actual adverse selection experienced (0.5-2 bps typical)
+- spread_adjustment: Recommended spread widening based on AS
+- alpha: Probability of trading against informed flow
+```
+
+**Liquidation Cascade Detection** (`liquidation.rs`):
+- Size-weighted Hawkes process models self-exciting liquidation events
+- Cascade severity scoring (0.0 = calm, 1.0+ = extreme)
+- Quote-pulling circuit breaker when severity exceeds threshold
+- Tail risk multiplier scales γ from 1.0 to 5.0 during cascades
+- Tracks cascade direction (long/short/both liquidations)
+
+```
+Configuration:
+- cascade_pull_threshold: Severity level to pull all quotes (default 0.8)
+- tail_risk_multiplier: γ scaling factor during cascades (1.0-5.0)
+- cascade_decay: Half-life of cascade intensity decay
+```
+
+**Queue Position Tracking** (`queue.rs`):
+- Estimates depth-ahead for resting orders
+- Fill probability calculation: P(fill) = P(touch) × P(execute|touch)
+- Queue decay modeling (20% per-second default)
+- Refresh decision logic (cancel/replace vs hold)
+- Order age tracking for stale order detection
+
+```
+Key outputs:
+- queue_position: Estimated contracts ahead of our order
+- fill_probability: Likelihood of execution before cancellation
+- should_refresh: Boolean signal for order refresh
+```
+
+### Ladder Quoting System
+
+Multi-level ladder quoting for deeper liquidity provision:
+
+**Structure:**
+- Default 5 levels per side (configurable via `ladder_levels`)
+- Geometric size decay across levels (e.g., 0.022 → 0.01165 → 0.00557 → 0.00256 → 0.00116)
+- Price spacing increases with distance from mid
+- Inventory-aware sizing reduces exposed side
+
+**Bulk Order Placement:**
+- All ladder levels placed in single API call (`BulkOrder`)
+- Bulk cancellation for efficient order management
+- Level-by-level margin constraint checking
+- Reconciliation detects changed levels, only updates necessary orders
+
+**Ladder Reconciliation Logic:**
+```
+1. Calculate new ladder from strategy
+2. Compare against current resting orders (by price/size)
+3. Cancel orders at levels that changed
+4. Place new orders at updated levels
+5. Track all order IDs for fill association
+```
+
+**Size Allocation Formula:**
+```
+size[i] = base_size × decay_factor^i
+where:
+  base_size = target_liquidity / sum(decay_factor^i for i in 0..levels)
+  decay_factor = 0.53 (default, yields ~50% size reduction per level)
+```
+
+### Kill Switch System
+
+Production safety mechanisms to prevent catastrophic losses:
+
+**Position Value Limit:**
+- Maximum USD value of position (default $10,000)
+- Triggers graceful shutdown when exceeded
+- Formula: `position_value = |position| × mid_price`
+
+**Drawdown Limits:**
+- Maximum intraday drawdown percentage (default 5%)
+- Tracks peak P&L and current P&L
+- Formula: `drawdown_pct = (peak_pnl - current_pnl) / account_value`
+
+**Data Staleness:**
+- Maximum age of market data before quoting stops (default 5 seconds)
+- Separate thresholds for L2 book, trades, and user events
+- Stale data triggers quote cancellation, not full shutdown
+
+**Cascade Severity:**
+- When liquidation cascade severity exceeds threshold, quotes pulled
+- Does not trigger full shutdown, resumes when cascade subsides
+
+**Graceful Shutdown Protocol:**
+```
+1. Kill switch condition detected
+2. Log ERROR with reason and metrics
+3. Cancel all resting orders (bulk cancel)
+4. Confirm all cancellations received
+5. Log final state (position, P&L, adverse selection summary)
+6. Exit process
+```
+
+### Prometheus Metrics
+
+Full observability via Prometheus metrics endpoint:
+
+**Position Metrics:**
+- `mm_position`: Current position in contracts
+- `mm_max_position`: Maximum allowed position
+- `mm_inventory_utilization`: position / max_position ratio
+
+**P&L Metrics:**
+- `mm_daily_pnl`: Realized + unrealized P&L for session
+- `mm_peak_pnl`: Highest P&L reached during session
+- `mm_drawdown_pct`: Current drawdown from peak
+- `mm_realized_pnl`: Sum of closed trade P&L
+- `mm_unrealized_pnl`: Mark-to-market of open position
+
+**Order Metrics:**
+- `mm_orders_placed`: Total orders placed
+- `mm_orders_filled`: Total orders filled
+- `mm_orders_cancelled`: Total orders cancelled
+- `mm_fill_volume_buy`: Total buy volume filled
+- `mm_fill_volume_sell`: Total sell volume filled
+
+**Market Metrics:**
+- `mm_mid_price`: Current mid price
+- `mm_spread_bps`: Current bid-ask spread in basis points
+- `mm_sigma`: Current volatility estimate (σ)
+- `mm_jump_ratio`: Current RV/BV ratio
+- `mm_kappa`: Current order flow intensity (κ)
+
+**Estimator Metrics:**
+- `mm_microprice_deviation_bps`: Microprice vs mid deviation
+- `mm_book_imbalance`: Current L2 book imbalance (-1 to 1)
+- `mm_flow_imbalance`: Current trade flow imbalance (-1 to 1)
+- `mm_beta_book`: Learned book imbalance coefficient
+- `mm_beta_flow`: Learned flow imbalance coefficient
+
+**Risk Metrics:**
+- `mm_kill_switch_triggered`: Boolean (0/1) for kill switch status
+- `mm_cascade_severity`: Current liquidation cascade severity
+- `mm_adverse_selection_bps`: Running adverse selection estimate
+- `mm_tail_risk_multiplier`: Current gamma scaling from tail risk
+
+**Infrastructure Metrics:**
+- `mm_data_staleness_secs`: Age of most recent market data
+- `mm_quote_cycle_latency_ms`: Time to complete quote cycle
+- `mm_volatility_regime`: Current regime (0=Normal, 1=High, 2=Extreme)
+
+### Extended RiskConfig Parameters
+
+Additional parameters beyond basic gamma scaling:
+
+**Cascade/Tail Risk:**
+- `cascade_pull_threshold`: Cascade severity to pull all quotes (default 0.8)
+- `tail_risk_base`: Base tail risk multiplier (default 1.0)
+- `tail_risk_sensitivity`: How fast multiplier increases with cascade severity
+- `max_tail_risk_multiplier`: Cap on tail risk gamma scaling (default 5.0)
+
+**Hawkes Order Flow:**
+- `hawkes_decay`: Decay rate for self-exciting intensity (default 0.1)
+- `hawkes_activity_weight`: Weight of Hawkes activity in gamma scaling
+- `hawkes_baseline`: Baseline intensity for Hawkes process
+
+**Funding Rate:**
+- `funding_rate_weight`: Impact of funding on inventory target
+- `funding_rate_horizon`: Lookahead for funding cost estimation (default 1 hour)
+
+**Spread Regime:**
+- `spread_regime_tight_mult`: Gamma multiplier in tight spread regime (default 0.8)
+- `spread_regime_wide_mult`: Gamma multiplier in wide spread regime (default 1.5)
+- `spread_percentile_window`: Rolling window for spread percentile (default 300s)
+
+### Production Infrastructure
+
+**Margin-Aware Sizer** (`mod.rs`):
+- Pre-flight margin checks before order placement
+- Reduces order size if margin insufficient
+- Respects leverage constraints from account settings
+- Prevents order rejections from margin failures
+
+**Connection Health Monitoring:**
+- Tracks last update time for each data feed
+- Detects WebSocket disconnections via staleness
+- Triggers reconnection or quote cancellation
+- Logged every 60 seconds in safety sync
+
+**Safety State Sync:**
+- Periodic reconciliation with exchange state (every 60s)
+- Detects orphaned orders (on exchange but not tracked locally)
+- Cancels stale orders (tracked locally but gone from exchange)
+- Logs sync status and any discrepancies
+
+**Reduce-Only Mode:**
+- Activated when position exceeds max_position
+- Cancels all orders that would increase position
+- Only allows orders that reduce exposure
+- Logged as WARN when triggered
