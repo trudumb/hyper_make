@@ -32,11 +32,13 @@
 mod consumer;
 mod dedup;
 mod pipeline;
+mod processor;
 pub mod consumers;
 
 pub use consumer::{FillConsumer, FillConsumerBox};
 pub use dedup::FillDeduplicator;
 pub use pipeline::FillPipeline;
+pub use processor::{FillProcessor, FillProcessingResult, FillState};
 pub use consumers::*;
 
 use std::time::Instant;

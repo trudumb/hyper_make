@@ -34,7 +34,9 @@
       "WebFetch(domain:github.com)",
       "Bash(sort:*)",
       "Skill(sc:design)",
-      "Skill(sc:implement)"
+      "Skill(sc:implement)",
+      "mcp__sequential-thinking__sequentialthinking",
+      "Bash(cargo check:*)"
     ]
   }
 }

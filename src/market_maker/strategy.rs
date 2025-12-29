@@ -311,6 +311,130 @@ impl Default for MarketParams {
     }
 }
 
+impl MarketParams {
+    /// Extract volatility parameters as a focused struct.
+    pub fn volatility(&self) -> super::params::VolatilityParams {
+        super::params::VolatilityParams {
+            sigma: self.sigma,
+            sigma_total: self.sigma_total,
+            sigma_effective: self.sigma_effective,
+            regime: self.volatility_regime,
+            kappa_vol: self.kappa_vol,
+            theta_vol: self.theta_vol,
+            xi_vol: self.xi_vol,
+            rho_price_vol: self.rho_price_vol,
+        }
+    }
+
+    /// Extract liquidity parameters as a focused struct.
+    pub fn liquidity(&self) -> super::params::LiquidityParams {
+        super::params::LiquidityParams {
+            kappa: self.kappa,
+            kappa_bid: self.kappa_bid,
+            kappa_ask: self.kappa_ask,
+            arrival_intensity: self.arrival_intensity,
+            liquidity_gamma_mult: self.liquidity_gamma_mult,
+            calibrated_volume_rate: self.calibrated_volume_rate,
+            calibrated_cancel_rate: self.calibrated_cancel_rate,
+        }
+    }
+
+    /// Extract flow parameters as a focused struct.
+    pub fn flow(&self) -> super::params::FlowParams {
+        super::params::FlowParams {
+            flow_imbalance: self.flow_imbalance,
+            book_imbalance: self.book_imbalance,
+            momentum_bps: self.momentum_bps,
+            falling_knife_score: self.falling_knife_score,
+            rising_knife_score: self.rising_knife_score,
+            hawkes_buy_intensity: self.hawkes_buy_intensity,
+            hawkes_sell_intensity: self.hawkes_sell_intensity,
+            hawkes_imbalance: self.hawkes_imbalance,
+            hawkes_activity_percentile: self.hawkes_activity_percentile,
+            bid_protection_factor: self.bid_protection_factor,
+            ask_protection_factor: self.ask_protection_factor,
+            p_momentum_continue: self.p_momentum_continue,
+        }
+    }
+
+    /// Extract regime parameters as a focused struct.
+    pub fn regime(&self) -> super::params::RegimeParams {
+        super::params::RegimeParams {
+            is_toxic_regime: self.is_toxic_regime,
+            jump_ratio: self.jump_ratio,
+            spread_regime: self.spread_regime,
+            spread_percentile: self.spread_percentile,
+            fair_spread: self.fair_spread,
+            lambda_jump: self.lambda_jump,
+            mu_jump: self.mu_jump,
+            sigma_jump: self.sigma_jump,
+        }
+    }
+
+    /// Extract fair price parameters as a focused struct.
+    pub fn fair_price(&self) -> super::params::FairPriceParams {
+        super::params::FairPriceParams {
+            microprice: self.microprice,
+            beta_book: self.beta_book,
+            beta_flow: self.beta_flow,
+            use_kalman_filter: self.use_kalman_filter,
+            kalman_fair_price: self.kalman_fair_price,
+            kalman_uncertainty: self.kalman_uncertainty,
+            kalman_spread_widening: self.kalman_spread_widening,
+            kalman_warmed_up: self.kalman_warmed_up,
+        }
+    }
+
+    /// Extract adverse selection parameters as a focused struct.
+    pub fn adverse_selection(&self) -> super::params::AdverseSelectionParams {
+        super::params::AdverseSelectionParams {
+            as_spread_adjustment: self.as_spread_adjustment,
+            predicted_alpha: self.predicted_alpha,
+            as_warmed_up: self.as_warmed_up,
+            depth_decay_as: self.depth_decay_as.clone(),
+        }
+    }
+
+    /// Extract cascade parameters as a focused struct.
+    pub fn cascade(&self) -> super::params::CascadeParams {
+        super::params::CascadeParams {
+            tail_risk_multiplier: self.tail_risk_multiplier,
+            should_pull_quotes: self.should_pull_quotes,
+            cascade_size_factor: self.cascade_size_factor,
+        }
+    }
+
+    /// Extract funding parameters as a focused struct.
+    pub fn funding(&self) -> super::params::FundingParams {
+        super::params::FundingParams {
+            funding_rate: self.funding_rate,
+            predicted_funding_cost: self.predicted_funding_cost,
+            premium: self.premium,
+            premium_alpha: self.premium_alpha,
+        }
+    }
+
+    /// Extract HJB controller parameters as a focused struct.
+    pub fn hjb(&self) -> super::params::HJBParams {
+        super::params::HJBParams {
+            use_hjb_skew: self.use_hjb_skew,
+            hjb_optimal_skew: self.hjb_optimal_skew,
+            hjb_gamma_multiplier: self.hjb_gamma_multiplier,
+            hjb_inventory_target: self.hjb_inventory_target,
+            hjb_is_terminal_zone: self.hjb_is_terminal_zone,
+        }
+    }
+
+    /// Extract margin constraint parameters as a focused struct.
+    pub fn margin_constraints(&self) -> super::params::MarginConstraintParams {
+        super::params::MarginConstraintParams {
+            use_constrained_optimizer: self.use_constrained_optimizer,
+            margin_available: self.margin_available,
+            leverage: self.leverage,
+        }
+    }
+}
+
 /// Trait for quoting strategies.
 /// Strategies calculate bid and ask quotes based on market conditions and position.
 pub trait QuotingStrategy: Send + Sync {
@@ -2290,5 +2414,46 @@ mod tests {
             "Gamma should be floored at gamma_min: got {}",
             gamma
         );
+    }
+
+    #[test]
+    fn test_market_params_accessor_methods() {
+        let params = MarketParams {
+            sigma: 0.001,
+            sigma_total: 0.002,
+            sigma_effective: 0.0015,
+            kappa: 150.0,
+            microprice: 50000.0,
+            funding_rate: 0.0001,
+            tail_risk_multiplier: 1.5,
+            use_hjb_skew: true,
+            ..Default::default()
+        };
+
+        // Test volatility accessor
+        let vol = params.volatility();
+        assert!((vol.sigma - 0.001).abs() < f64::EPSILON);
+        assert!((vol.sigma_total - 0.002).abs() < f64::EPSILON);
+        assert!((vol.sigma_effective - 0.0015).abs() < f64::EPSILON);
+
+        // Test liquidity accessor
+        let liq = params.liquidity();
+        assert!((liq.kappa - 150.0).abs() < f64::EPSILON);
+
+        // Test fair_price accessor
+        let fp = params.fair_price();
+        assert!((fp.microprice - 50000.0).abs() < f64::EPSILON);
+
+        // Test funding accessor
+        let fund = params.funding();
+        assert!((fund.funding_rate - 0.0001).abs() < f64::EPSILON);
+
+        // Test cascade accessor
+        let cascade = params.cascade();
+        assert!((cascade.tail_risk_multiplier - 1.5).abs() < f64::EPSILON);
+
+        // Test hjb accessor
+        let hjb = params.hjb();
+        assert!(hjb.use_hjb_skew);
     }
 }

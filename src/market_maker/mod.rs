@@ -20,6 +20,7 @@ mod liquidation;
 mod margin;
 mod metrics;
 mod order_manager;
+mod params;
 mod pnl;
 mod position;
 mod queue;
@@ -28,6 +29,7 @@ mod spread;
 mod strategy;
 pub mod fills;
 pub mod messages;
+pub mod quoting;
 pub mod risk;
 
 pub use adverse_selection::*;
@@ -46,6 +48,7 @@ pub use metrics::*;
 pub use order_manager::*;
 pub use pnl::*;
 pub use position::*;
+pub use params::*;
 pub use queue::*;
 pub use reconnection::*;
 pub use spread::*;
@@ -139,8 +142,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     stochastic_config: StochasticConfig,
 
     // === Fill Processing Pipeline ===
-    /// Centralized fill deduplication - single source of truth for processed TIDs
-    fill_dedup: fills::FillDeduplicator,
+    /// Fill processor - orchestrates fill handling across all modules
+    fill_processor: fills::FillProcessor,
 
     // === Margin Refresh Tracking ===
     /// Last time margin was refreshed (for throttling)
@@ -234,8 +237,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Stochastic module integration
             hjb_controller: HJBInventoryController::new(hjb_config),
             stochastic_config,
-            // Fill processing pipeline - centralized deduplication
-            fill_dedup: fills::FillDeduplicator::new(),
+            // Fill processing pipeline - orchestrates all fill handling
+            fill_processor: fills::FillProcessor::new(),
             // Margin refresh tracking
             last_margin_refresh: std::time::Instant::now(),
         }
@@ -551,151 +554,53 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     return Ok(()); // Haven't seen mid price yet
                 }
 
+                // Process fills through FillProcessor
                 for fill in user_fills.data.fills {
                     if fill.coin != self.config.asset {
                         continue;
                     }
 
+                    // Parse fill data
                     let amount: f64 = fill
                         .sz
                         .parse()
                         .map_err(|_| crate::Error::FloatStringParse)?;
+                    let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
                     let is_buy = fill.side.eq("B");
-                    let tid = fill.tid;
-                    let oid = fill.oid;
 
-                    // Step 1: Centralized deduplication via fill_dedup (single source of truth)
-                    // This replaces the scattered dedup logic in PositionTracker and other modules
-                    if self.fill_dedup.check_and_mark(tid) {
-                        // Update position (dedup already done by fill_dedup)
-                        self.position.process_fill(amount, is_buy);
-                        // Step 2: Update order tracking with proper state management
-                        let (order_found, is_new_fill, is_complete) =
-                            self.orders.process_fill(oid, tid, amount);
+                    // Create FillEvent
+                    let fill_event = fills::FillEvent::new(
+                        fill.tid,
+                        fill.oid,
+                        amount,
+                        fill_price,
+                        is_buy,
+                        self.latest_mid,
+                        None, // Placement price determined by processor
+                        self.config.asset.clone(),
+                    );
 
-                        // Parse fill price early - needed for pending order lookup
-                        let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
+                    // Build FillState bundle with mutable references to all modules
+                    let mut fill_state = fills::FillState {
+                        position: &mut self.position,
+                        orders: &mut self.orders,
+                        adverse_selection: &mut self.adverse_selection,
+                        depth_decay_as: &mut self.depth_decay_as,
+                        queue_tracker: &mut self.queue_tracker,
+                        estimator: &mut self.estimator,
+                        pnl_tracker: &mut self.pnl_tracker,
+                        prometheus: &mut self.prometheus,
+                        metrics: &self.metrics,
+                        latest_mid: self.latest_mid,
+                        asset: &self.config.asset,
+                        max_position: self.config.max_position,
+                        calibrate_depth_as: self.stochastic_config.calibrate_depth_as,
+                    };
 
-                        // Determine placement price - either from tracked order or pending order
-                        let placement_price: Option<f64> = if order_found {
-                            // Order found by OID - get placement price directly
-                            self.orders.get_order(oid).map(|o| o.price)
-                        } else {
-                            // Order not found by OID - check pending orders by (side, fill_price)
-                            // This handles the race condition when fill arrives before OID is registered
-                            let side = if is_buy { Side::Buy } else { Side::Sell };
-                            if let Some(pending) = self.orders.get_pending(side, fill_price) {
-                                debug!(
-                                    oid = oid,
-                                    tid = tid,
-                                    fill_price = fill_price,
-                                    placement_price = pending.price,
-                                    "Fill matched to pending order (immediate fill race condition)"
-                                );
-                                Some(pending.price)
-                            } else {
-                                // Truly untracked - not in orders or pending
-                                warn!(
-                                    "[Fill] Untracked order filled: oid={} tid={} {} {} {} | position updated to {}",
-                                    oid,
-                                    tid,
-                                    if is_buy { "bought" } else { "sold" },
-                                    amount,
-                                    self.config.asset,
-                                    self.position.position()
-                                );
-                                None
-                            }
-                        };
-
-                        // Process fill if we have placement info (tracked or pending order)
-                        if let Some(placement_price) = placement_price {
-                            if !order_found || is_new_fill {
-                                // === Tier 1: Record fill for AS measurement ===
-                                self.adverse_selection.record_fill(
-                                    tid,
-                                    amount,
-                                    is_buy,
-                                    self.latest_mid,
-                                );
-
-                                // === Stochastic Module: Record fill for depth-aware AS calibration ===
-                                if self.stochastic_config.calibrate_depth_as {
-                                    self.depth_decay_as.record_pending_fill(
-                                        tid,
-                                        fill_price,
-                                        amount,
-                                        is_buy,
-                                        self.latest_mid,
-                                    );
-                                }
-
-                                // === Kappa Estimation: Feed own fill rate ===
-                                let timestamp_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-
-                                self.estimator.on_own_fill(
-                                    timestamp_ms,
-                                    placement_price,
-                                    fill_price,
-                                    amount,
-                                    is_buy,
-                                );
-
-                                // === Tier 2: Record fill in P&L tracker ===
-                                self.pnl_tracker.record_fill(
-                                    tid,
-                                    fill_price,
-                                    amount,
-                                    is_buy,
-                                    self.latest_mid, // mid_at_fill
-                                );
-
-                                // === Production: Update Prometheus metrics ===
-                                self.prometheus.record_fill(amount, is_buy);
-
-                                let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
-                                info!(
-                                    "[Fill] {} {} {} | oid={} tid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
-                                    if is_buy { "bought" } else { "sold" },
-                                    amount,
-                                    self.config.asset,
-                                    oid,
-                                    tid,
-                                    self.position.position(),
-                                    self.adverse_selection.realized_as_bps(),
-                                    pnl_summary.total_pnl
-                                );
-
-                                // Record metrics
-                                if let Some(ref m) = self.metrics {
-                                    m.record_fill(amount, is_buy);
-                                    m.update_position(self.position.position());
-                                }
-
-                                // Update queue tracker based on fill completeness
-                                if order_found && is_complete {
-                                    // Order fully filled - will be removed via cleanup()
-                                    // Don't remove from queue tracker here; let cleanup() handle it
-                                } else if order_found {
-                                    // Partial fill - update queue position
-                                    self.queue_tracker.order_partially_filled(oid, amount);
-                                }
-                                // Note: For pending-matched fills, queue tracking is handled
-                                // when the order is finalized with its OID
-                            }
-                        }
-                        // else: placement_price is None - truly untracked (warning logged above)
-
-                        // Position milestone warnings (extracted to messages module)
-                        messages::check_position_thresholds(
-                            self.position.position(),
-                            self.config.max_position,
-                            &self.config.asset,
-                        );
-                    }
+                    // Process fill through the unified processor
+                    // This handles: dedup, position, order tracking, AS, depth AS,
+                    // estimator, P&L, metrics, queue tracking, and threshold warnings
+                    self.fill_processor.process(&fill_event, &mut fill_state);
                 }
 
                 // Run cleanup cycle - deferred removal of terminal orders
@@ -805,102 +710,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             min_notional: MIN_ORDER_NOTIONAL,
         };
 
-        // Build market params from econometric estimates
-        let market_params = MarketParams {
-            // Volatility (dual-sigma architecture)
-            sigma: self.estimator.sigma_clean(), // √BV (jump-robust) for spread
-            sigma_total: self.estimator.sigma_total(), // √RV (includes jumps) for risk
-            sigma_effective: self.estimator.sigma_effective(), // Blended for skew
-            // Order book
-            kappa: self.estimator.kappa(), // Fill-rate kappa from trade distances
-            kappa_bid: self.estimator.kappa_bid(), // Directional kappa for bid side
-            kappa_ask: self.estimator.kappa_ask(), // Directional kappa for ask side
-            arrival_intensity: self.estimator.arrival_intensity(), // Volume ticks/sec
-            // Regime detection
-            is_toxic_regime: self.estimator.is_toxic_regime(), // RV/BV > 1.5
-            jump_ratio: self.estimator.jump_ratio(),           // Fast RV/BV ratio
-            // Directional flow (for diagnostics)
-            momentum_bps: self.estimator.momentum_bps(), // Signed momentum
-            flow_imbalance: self.estimator.flow_imbalance(), // Buy/sell imbalance
-            falling_knife_score: self.estimator.falling_knife_score(), // Downward momentum
-            rising_knife_score: self.estimator.rising_knife_score(), // Upward momentum
-            // L2 book structure
-            book_imbalance: self.estimator.book_imbalance(), // Bid/ask depth asymmetry
-            liquidity_gamma_mult: self.estimator.liquidity_gamma_multiplier(), // Thin book scaling
-            // Microprice: data-driven fair price incorporating signal predictions
-            microprice: self.estimator.microprice(), // mid × (1 + β_book×imb + β_flow×flow)
-            beta_book: self.estimator.beta_book(),   // Learned coefficient for book imbalance
-            beta_flow: self.estimator.beta_flow(),   // Learned coefficient for flow imbalance
-            // === Tier 1: Adverse Selection ===
-            as_spread_adjustment: self.adverse_selection.spread_adjustment(),
-            predicted_alpha: self.adverse_selection.predicted_alpha(),
-            as_warmed_up: self.adverse_selection.is_warmed_up(),
-            depth_decay_as: Some(self.depth_decay_as.clone()),
-            // === Tier 1: Liquidation Cascade ===
-            tail_risk_multiplier: self.liquidation_detector.tail_risk_multiplier(),
-            should_pull_quotes: self.liquidation_detector.should_pull_quotes(),
-            cascade_size_factor: self.liquidation_detector.size_reduction_factor(),
-            // === Tier 2: Hawkes Order Flow ===
-            hawkes_buy_intensity: self.hawkes.lambda_buy(),
-            hawkes_sell_intensity: self.hawkes.lambda_sell(),
-            hawkes_imbalance: self.hawkes.flow_imbalance(),
-            hawkes_activity_percentile: self.hawkes.intensity_percentile(),
-            // === Tier 2: Funding Rate ===
-            funding_rate: self.funding.current_rate(),
-            predicted_funding_cost: self.funding.funding_cost(
-                self.position.position(),
-                self.latest_mid,
-                3600.0, // 1 hour holding period in seconds
-            ),
-            // === Tier 2: Spread Process ===
-            fair_spread: self.spread_tracker.fair_spread(),
-            spread_percentile: self.spread_tracker.spread_percentile(),
-            spread_regime: self.spread_tracker.spread_regime(),
-            // === Volatility Regime ===
-            volatility_regime: self.estimator.volatility_regime(),
-            // === First Principles Extensions (Gaps 1-10) ===
-            // Jump-Diffusion (Gap 1)
-            lambda_jump: self.estimator.lambda_jump(),
-            mu_jump: self.estimator.mu_jump(),
-            sigma_jump: self.estimator.sigma_jump(),
-            // Stochastic Volatility (Gap 2)
-            kappa_vol: self.estimator.kappa_vol(),
-            theta_vol: self.estimator.theta_vol_sigma().powi(2), // Store as variance
-            xi_vol: self.estimator.xi_vol(),
-            rho_price_vol: self.estimator.rho_price_vol(),
-            // Queue Model (Gap 3) - use defaults until CalibratedQueueModel integrated
-            calibrated_volume_rate: 1.0,
-            calibrated_cancel_rate: 0.2,
-            // Funding Enhancement (Gap 6)
-            premium: self.funding.current_premium(),
-            premium_alpha: self.funding.premium_alpha(),
-            // Momentum Protection (Gap 10) - use defaults until MomentumModel integrated
-            bid_protection_factor: 1.0,
-            ask_protection_factor: 1.0,
-            p_momentum_continue: 0.5,
-            // === Stochastic Module: HJB Controller ===
-            use_hjb_skew: self.stochastic_config.use_hjb_skew,
-            hjb_optimal_skew: self.hjb_controller.optimal_skew(
-                self.position.position(),
-                self.config.max_position,
-            ),
-            hjb_gamma_multiplier: self.hjb_controller.gamma_multiplier(),
-            hjb_inventory_target: self.hjb_controller.optimal_inventory_target(),
-            hjb_is_terminal_zone: self.hjb_controller.is_terminal_zone(),
-            // === Stochastic Module: Kalman Filter ===
-            use_kalman_filter: self.stochastic_config.use_kalman_filter,
-            kalman_fair_price: self.estimator.kalman_fair_price(),
-            kalman_uncertainty: self.estimator.kalman_uncertainty(),
-            kalman_spread_widening: self.estimator.kalman_spread_widening(
-                self.config.risk_aversion,
-                1.0 / self.estimator.arrival_intensity().max(0.01), // T = 1/λ
-            ),
-            kalman_warmed_up: self.estimator.kalman_warmed_up(),
-            // === Stochastic Module: Constrained Optimizer ===
-            use_constrained_optimizer: self.stochastic_config.use_constrained_optimizer,
-            margin_available: self.margin_sizer.state().available_margin,
-            leverage: self.margin_sizer.state().current_leverage,
+        // Build market params from econometric estimates via ParameterAggregator
+        let sources = ParameterSources {
+            estimator: &self.estimator,
+            adverse_selection: &self.adverse_selection,
+            depth_decay_as: &self.depth_decay_as,
+            liquidation_detector: &self.liquidation_detector,
+            hawkes: &self.hawkes,
+            funding: &self.funding,
+            spread_tracker: &self.spread_tracker,
+            hjb_controller: &self.hjb_controller,
+            margin_sizer: &self.margin_sizer,
+            stochastic_config: &self.stochastic_config,
+            position: self.position.position(),
+            max_position: self.config.max_position,
+            latest_mid: self.latest_mid,
+            risk_aversion: self.config.risk_aversion,
         };
+        let market_params = ParameterAggregator::build(&sources);
 
         debug!(
             mid = self.latest_mid,
@@ -943,50 +770,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .collect();
 
             // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
-            let position = self.position.position();
-            let position_value = position.abs() * self.latest_mid;
-            let max_position_value = self.kill_switch.max_position_value();
-
-            let over_position_limit = position.abs() > self.config.max_position;
-            let over_value_limit = position_value > max_position_value;
-
-            if over_position_limit || over_value_limit {
-                if position > 0.0 {
-                    // Long position over max: only allow sells (no bids)
-                    bid_quotes.clear();
-                    if over_value_limit {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            position_value = %format!("${:.2}", position_value),
-                            limit = %format!("${:.2}", max_position_value),
-                            "Position value over limit (long) - reduce-only mode, cancelling all bids"
-                        );
-                    } else {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            max_position = %format!("{:.6}", self.config.max_position),
-                            "Over max position (long) - reduce-only mode, cancelling all bids"
-                        );
-                    }
-                } else {
-                    // Short position over max: only allow buys (no asks)
-                    ask_quotes.clear();
-                    if over_value_limit {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            position_value = %format!("${:.2}", position_value),
-                            limit = %format!("${:.2}", max_position_value),
-                            "Position value over limit (short) - reduce-only mode, cancelling all asks"
-                        );
-                    } else {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            max_position = %format!("{:.6}", self.config.max_position),
-                            "Over max position (short) - reduce-only mode, cancelling all asks"
-                        );
-                    }
-                }
-            }
+            let reduce_only_config = quoting::ReduceOnlyConfig {
+                position: self.position.position(),
+                max_position: self.config.max_position,
+                mid_price: self.latest_mid,
+                max_position_value: self.kill_switch.max_position_value(),
+                asset: self.config.asset.clone(),
+            };
+            quoting::QuoteFilter::apply_reduce_only_ladder(
+                &mut bid_quotes,
+                &mut ask_quotes,
+                &reduce_only_config,
+            );
 
             debug!(
                 bid_levels = bid_quotes.len(),
@@ -1010,50 +805,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
 
             // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
-            let position = self.position.position();
-            let position_value = position.abs() * self.latest_mid;
-            let max_position_value = self.kill_switch.max_position_value();
-
-            let over_position_limit = position.abs() > self.config.max_position;
-            let over_value_limit = position_value > max_position_value;
-
-            if over_position_limit || over_value_limit {
-                if position > 0.0 {
-                    // Long position over max: only allow sells (no bids)
-                    bid = None;
-                    if over_value_limit {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            position_value = %format!("${:.2}", position_value),
-                            limit = %format!("${:.2}", max_position_value),
-                            "Position value over limit (long) - reduce-only mode, cancelling bids"
-                        );
-                    } else {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            max_position = %format!("{:.6}", self.config.max_position),
-                            "Over max position (long) - reduce-only mode, cancelling bids"
-                        );
-                    }
-                } else {
-                    // Short position over max: only allow buys (no asks)
-                    ask = None;
-                    if over_value_limit {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            position_value = %format!("${:.2}", position_value),
-                            limit = %format!("${:.2}", max_position_value),
-                            "Position value over limit (short) - reduce-only mode, cancelling asks"
-                        );
-                    } else {
-                        warn!(
-                            position = %format!("{:.6}", position),
-                            max_position = %format!("{:.6}", self.config.max_position),
-                            "Over max position (short) - reduce-only mode, cancelling asks"
-                        );
-                    }
-                }
-            }
+            let reduce_only_config = quoting::ReduceOnlyConfig {
+                position: self.position.position(),
+                max_position: self.config.max_position,
+                mid_price: self.latest_mid,
+                max_position_value: self.kill_switch.max_position_value(),
+                asset: self.config.asset.clone(),
+            };
+            quoting::QuoteFilter::apply_reduce_only_single(
+                &mut bid,
+                &mut ask,
+                &reduce_only_config,
+            );
 
             debug!(
                 bid = ?bid.as_ref().map(|q| (q.price, q.size)),
