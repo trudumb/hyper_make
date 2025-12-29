@@ -36,8 +36,6 @@ struct PendingDepthFill {
     fill_time: Instant,
     /// Mid price at fill time (for AS calculation)
     fill_mid: f64,
-    /// Fill price
-    fill_price: f64,
     /// Fill size
     size: f64,
     /// True if this was a buy fill
@@ -376,7 +374,6 @@ impl DepthDecayAS {
             tid,
             fill_time: Instant::now(),
             fill_mid: current_mid,
-            fill_price,
             size,
             is_buy,
             depth_bps,

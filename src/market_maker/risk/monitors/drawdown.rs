@@ -1,0 +1,152 @@
+//! Drawdown monitor.
+
+use crate::market_maker::risk::{RiskAssessment, RiskMonitor, RiskState};
+
+/// Monitors peak-to-trough drawdown.
+pub struct DrawdownMonitor {
+    /// Maximum allowed drawdown (fraction, 0.05 = 5%)
+    max_drawdown: f64,
+    /// Warning threshold (fraction of limit)
+    warning_threshold: f64,
+}
+
+impl DrawdownMonitor {
+    /// Create a new drawdown monitor.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_drawdown` - Maximum allowed drawdown fraction (e.g., 0.05 = 5%)
+    pub fn new(max_drawdown: f64) -> Self {
+        Self {
+            max_drawdown: max_drawdown.clamp(0.0, 1.0),
+            warning_threshold: 0.7,
+        }
+    }
+
+    /// Create with custom warning threshold.
+    pub fn with_warning_threshold(mut self, threshold: f64) -> Self {
+        self.warning_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+}
+
+impl RiskMonitor for DrawdownMonitor {
+    fn evaluate(&self, state: &RiskState) -> RiskAssessment {
+        // No drawdown if no peak or at peak
+        if state.peak_pnl <= 0.0 || state.daily_pnl >= state.peak_pnl {
+            return RiskAssessment::ok(self.name());
+        }
+
+        let drawdown = state.drawdown();
+
+        if drawdown > self.max_drawdown {
+            return RiskAssessment::critical(
+                self.name(),
+                format!(
+                    "Drawdown {:.1}% exceeds limit {:.1}%",
+                    drawdown * 100.0,
+                    self.max_drawdown * 100.0
+                ),
+            )
+            .with_metric(drawdown)
+            .with_threshold(self.max_drawdown);
+        }
+
+        let drawdown_ratio = drawdown / self.max_drawdown;
+        if drawdown_ratio > self.warning_threshold {
+            return RiskAssessment::warn(
+                self.name(),
+                format!(
+                    "Drawdown {:.1}% is {:.0}% of limit {:.1}%",
+                    drawdown * 100.0,
+                    drawdown_ratio * 100.0,
+                    self.max_drawdown * 100.0
+                ),
+            )
+            .with_metric(drawdown)
+            .with_threshold(self.max_drawdown);
+        }
+
+        RiskAssessment::ok(self.name())
+    }
+
+    fn name(&self) -> &'static str {
+        "DrawdownMonitor"
+    }
+
+    fn priority(&self) -> u32 {
+        5 // High priority - drawdown is critical
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_maker::risk::RiskSeverity;
+
+    #[test]
+    fn test_no_peak() {
+        let monitor = DrawdownMonitor::new(0.05);
+        let state = RiskState {
+            peak_pnl: 0.0,
+            daily_pnl: -100.0,
+            ..Default::default()
+        };
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::None);
+    }
+
+    #[test]
+    fn test_at_peak() {
+        let monitor = DrawdownMonitor::new(0.05);
+        let state = RiskState {
+            peak_pnl: 100.0,
+            daily_pnl: 100.0,
+            ..Default::default()
+        };
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::None);
+    }
+
+    #[test]
+    fn test_small_drawdown() {
+        let monitor = DrawdownMonitor::new(0.10); // 10% limit
+        let state = RiskState {
+            peak_pnl: 1000.0,
+            daily_pnl: 980.0, // 2% drawdown
+            ..Default::default()
+        };
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::None);
+    }
+
+    #[test]
+    fn test_warning_drawdown() {
+        let monitor = DrawdownMonitor::new(0.10).with_warning_threshold(0.7); // 10% limit
+        let state = RiskState {
+            peak_pnl: 1000.0,
+            daily_pnl: 920.0, // 8% drawdown = 80% of limit
+            ..Default::default()
+        };
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::Medium);
+    }
+
+    #[test]
+    fn test_over_limit() {
+        let monitor = DrawdownMonitor::new(0.05); // 5% limit
+        let state = RiskState {
+            peak_pnl: 1000.0,
+            daily_pnl: 900.0, // 10% drawdown
+            ..Default::default()
+        };
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::Critical);
+        assert!(assessment.should_kill());
+    }
+}

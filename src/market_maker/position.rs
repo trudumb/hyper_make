@@ -1,14 +1,15 @@
-//! Position tracking with fill deduplication.
+//! Position tracking.
+//!
+//! Simple position state management. Fill deduplication is handled
+//! centrally by `FillDeduplicator` in the fills module.
 
-use std::collections::HashSet;
-
-/// Tracks current position and deduplicates fills by trade ID.
+/// Tracks current position state.
 #[derive(Debug)]
 pub struct PositionTracker {
     /// Current position (positive = long, negative = short)
     position: f64,
-    /// Set of processed trade IDs to avoid double-counting
-    processed_tids: HashSet<u64>,
+    /// Total fills processed
+    fill_count: usize,
 }
 
 impl PositionTracker {
@@ -16,7 +17,7 @@ impl PositionTracker {
     pub fn new(initial_position: f64) -> Self {
         Self {
             position: initial_position,
-            processed_tids: HashSet::new(),
+            fill_count: 0,
         }
     }
 
@@ -31,29 +32,20 @@ impl PositionTracker {
     }
 
     /// Process a fill and update position.
-    /// Returns `true` if this is a new fill, `false` if duplicate.
-    pub fn process_fill(&mut self, tid: u64, amount: f64, is_buy: bool) -> bool {
-        if self.processed_tids.contains(&tid) {
-            return false; // Duplicate fill
-        }
-        self.processed_tids.insert(tid);
-
+    ///
+    /// Note: Caller is responsible for deduplication via FillDeduplicator.
+    pub fn process_fill(&mut self, amount: f64, is_buy: bool) {
         if is_buy {
             self.position += amount;
         } else {
             self.position -= amount;
         }
-        true
+        self.fill_count += 1;
     }
 
-    /// Check if a trade ID has already been processed.
-    pub fn is_processed(&self, tid: u64) -> bool {
-        self.processed_tids.contains(&tid)
-    }
-
-    /// Get the number of processed fills.
-    pub fn processed_count(&self) -> usize {
-        self.processed_tids.len()
+    /// Get the number of fills processed.
+    pub fn fill_count(&self) -> usize {
+        self.fill_count
     }
 }
 
@@ -76,24 +68,25 @@ mod tests {
     #[test]
     fn test_process_buy_fill() {
         let mut tracker = PositionTracker::new(0.0);
-        let result = tracker.process_fill(1, 0.5, true);
-        assert!(result);
+        tracker.process_fill(0.5, true);
         assert!((tracker.position() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(tracker.fill_count(), 1);
     }
 
     #[test]
     fn test_process_sell_fill() {
         let mut tracker = PositionTracker::new(1.0);
-        let result = tracker.process_fill(1, 0.3, false);
-        assert!(result);
+        tracker.process_fill(0.3, false);
         assert!((tracker.position() - 0.7).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_duplicate_fill_rejected() {
+    fn test_multiple_fills() {
         let mut tracker = PositionTracker::new(0.0);
-        assert!(tracker.process_fill(1, 0.5, true));
-        assert!(!tracker.process_fill(1, 0.5, true)); // Duplicate
-        assert!((tracker.position() - 0.5).abs() < f64::EPSILON); // Position unchanged
+        tracker.process_fill(1.0, true);
+        tracker.process_fill(0.5, false);
+        tracker.process_fill(0.2, true);
+        assert!((tracker.position() - 0.7).abs() < f64::EPSILON);
+        assert_eq!(tracker.fill_count(), 3);
     }
 }

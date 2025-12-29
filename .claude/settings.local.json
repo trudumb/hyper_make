@@ -30,7 +30,11 @@
       "Bash(tee:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 330 cargo run:*)",
       "Bash(pkill:*)",
-      "Bash(python3 -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\)[''fields''][''prometheus_output'']; lines=[l for l in d.split\\(''\\\\n''\\) if l.startswith\\(''mm_''\\) and ''{'' in l]; print\\(''\\\\n''.join\\(lines\\)\\)\")"
+      "Bash(python3 -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\)[''fields''][''prometheus_output'']; lines=[l for l in d.split\\(''\\\\n''\\) if l.startswith\\(''mm_''\\) and ''{'' in l]; print\\(''\\\\n''.join\\(lines\\)\\)\")",
+      "WebFetch(domain:github.com)",
+      "Bash(sort:*)",
+      "Skill(sc:design)",
+      "Skill(sc:implement)"
     ]
   }
 }

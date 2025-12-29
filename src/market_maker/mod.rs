@@ -8,7 +8,6 @@
 
 mod adverse_selection;
 mod config;
-mod correlation;
 mod data_quality;
 mod estimator;
 mod executor;
@@ -22,16 +21,17 @@ mod margin;
 mod metrics;
 mod order_manager;
 mod pnl;
-mod portfolio;
 mod position;
 mod queue;
 mod reconnection;
 mod spread;
 mod strategy;
+pub mod fills;
+pub mod messages;
+pub mod risk;
 
 pub use adverse_selection::*;
 pub use config::*;
-pub use correlation::*;
 pub use hjb_control::*;
 pub use data_quality::*;
 pub use estimator::*;
@@ -45,7 +45,6 @@ pub use margin::*;
 pub use metrics::*;
 pub use order_manager::*;
 pub use pnl::*;
-pub use portfolio::*;
 pub use position::*;
 pub use queue::*;
 pub use reconnection::*;
@@ -129,12 +128,6 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Data quality monitor - validates incoming market data
     data_quality: DataQualityMonitor,
 
-    // === Multi-Asset (optional) ===
-    /// Correlation estimator - portfolio risk (None for single-asset)
-    /// Reserved for future multi-asset support
-    #[allow(dead_code)]
-    correlation: Option<CorrelationEstimator>,
-
     // === First-Principles Risk ===
     /// Dynamic risk configuration for adaptive position limits
     dynamic_risk_config: DynamicRiskConfig,
@@ -144,6 +137,14 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     hjb_controller: HJBInventoryController,
     /// Stochastic module configuration (feature flags)
     stochastic_config: StochasticConfig,
+
+    // === Fill Processing Pipeline ===
+    /// Centralized fill deduplication - single source of truth for processed TIDs
+    fill_dedup: fills::FillDeduplicator,
+
+    // === Margin Refresh Tracking ===
+    /// Last time margin was refreshed (for throttling)
+    last_margin_refresh: std::time::Instant,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -190,7 +191,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         data_quality_config: data_quality::DataQualityConfig,
     ) -> Self {
         // Capture config values before moving config
-        let enable_correlation = config.multi_asset;
         let stochastic_config = config.stochastic.clone();
         let hjb_config = HJBConfig {
             session_duration_secs: stochastic_config.hjb_session_duration,
@@ -229,17 +229,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             prometheus: PrometheusMetrics::new(),
             connection_health: ConnectionHealthMonitor::new(),
             data_quality: DataQualityMonitor::new(data_quality_config),
-            // Multi-asset correlation tracking (First Principles Gap 5)
-            correlation: if enable_correlation {
-                Some(CorrelationEstimator::new(CorrelationConfig::default()))
-            } else {
-                None
-            },
             // First-principles dynamic risk
             dynamic_risk_config: DynamicRiskConfig::default(),
             // Stochastic module integration
             hjb_controller: HJBInventoryController::new(hjb_config),
             stochastic_config,
+            // Fill processing pipeline - centralized deduplication
+            fill_dedup: fills::FillDeduplicator::new(),
+            // Margin refresh tracking
+            last_margin_refresh: std::time::Instant::now(),
         }
     }
 
@@ -566,8 +564,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     let tid = fill.tid;
                     let oid = fill.oid;
 
-                    // Step 1: Always update position first (handles tid dedup internally)
-                    if self.position.process_fill(tid, amount, is_buy) {
+                    // Step 1: Centralized deduplication via fill_dedup (single source of truth)
+                    // This replaces the scattered dedup logic in PositionTracker and other modules
+                    if self.fill_dedup.check_and_mark(tid) {
+                        // Update position (dedup already done by fill_dedup)
+                        self.position.process_fill(amount, is_buy);
                         // Step 2: Update order tracking with proper state management
                         let (order_found, is_new_fill, is_complete) =
                             self.orders.process_fill(oid, tid, amount);
@@ -688,35 +689,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         }
                         // else: placement_price is None - truly untracked (warning logged above)
 
-                        // Position milestone warnings
-                        let current_position = self.position.position();
-                        let utilization =
-                            (current_position.abs() / self.config.max_position).min(1.0);
-                        let utilization_pct = utilization * 100.0;
-
-                        // Warn at 50%, 75%, 90% thresholds (only when crossing upward)
-                        if utilization >= 0.90 {
-                            warn!(
-                                position = %format!("{:.6}", current_position),
-                                max_position = %format!("{:.6}", self.config.max_position),
-                                utilization = %format!("{:.1}%", utilization_pct),
-                                "Position at 90%+ of max - approaching reduce-only mode"
-                            );
-                        } else if utilization >= 0.75 {
-                            warn!(
-                                position = %format!("{:.6}", current_position),
-                                max_position = %format!("{:.6}", self.config.max_position),
-                                utilization = %format!("{:.1}%", utilization_pct),
-                                "Position at 75%+ of max"
-                            );
-                        } else if utilization >= 0.50 {
-                            debug!(
-                                position = %format!("{:.6}", current_position),
-                                max_position = %format!("{:.6}", self.config.max_position),
-                                utilization = %format!("{:.1}%", utilization_pct),
-                                "Position at 50%+ of max"
-                            );
-                        }
+                        // Position milestone warnings (extracted to messages module)
+                        messages::check_position_thresholds(
+                            self.position.position(),
+                            self.config.max_position,
+                            &self.config.asset,
+                        );
                     }
                 }
 
@@ -726,6 +704,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 for oid in removed_oids {
                     // Now safe to remove from QueueTracker
                     self.queue_tracker.order_removed(oid);
+                }
+
+                // Throttled margin refresh after fills (every 10 seconds max)
+                // Fixes critical bug: margin was only refreshed at startup and every 60s
+                const MARGIN_REFRESH_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(10);
+                if self.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
+                    if let Err(e) = self.refresh_margin_state().await {
+                        warn!(error = %e, "Failed to refresh margin after fill");
+                    }
+                    self.last_margin_refresh = std::time::Instant::now();
                 }
 
                 // Update quotes after fills
@@ -1609,6 +1598,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if let Err(e) = self.refresh_margin_state().await {
             warn!("Failed to refresh margin state: {e}");
         }
+        // Reset throttle timer to avoid double-refresh from fill handler
+        self.last_margin_refresh = std::time::Instant::now();
 
         // Query open orders from exchange
         let exchange_orders = self.info_client.open_orders(self.user_address).await?;
@@ -1798,6 +1789,48 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Get asset name for metrics labeling.
     pub fn asset(&self) -> &str {
         &self.config.asset
+    }
+
+    /// Build a unified RiskState snapshot from current MarketMaker state.
+    ///
+    /// This provides a single point-in-time view of all risk-relevant data
+    /// for use with the RiskAggregator system.
+    pub fn build_risk_state(&self) -> risk::RiskState {
+        let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
+        let data_age = self.connection_health.time_since_last_data();
+        let last_data_time = std::time::Instant::now()
+            .checked_sub(data_age)
+            .unwrap_or_else(std::time::Instant::now);
+
+        let position = self.position.position();
+
+        risk::RiskState::new(
+            pnl_summary.total_pnl,
+            pnl_summary.total_pnl.max(0.0), // Peak PnL tracking simplified
+            position,
+            self.config.max_position,
+            self.latest_mid,
+            self.kill_switch.max_position_value(),
+            self.margin_sizer.state().account_value,
+            self.estimator.sigma_clean(),
+            self.liquidation_detector.cascade_severity(),
+            last_data_time,
+        )
+        .with_pnl_breakdown(pnl_summary.realized_pnl, pnl_summary.unrealized_pnl)
+        .with_volatility(
+            self.estimator.sigma_clean(),
+            self.estimator.sigma_confidence(),
+            self.estimator.jump_ratio(),
+        )
+        .with_cascade(
+            self.liquidation_detector.cascade_severity(),
+            self.liquidation_detector.tail_risk_multiplier(),
+            self.liquidation_detector.should_pull_quotes(),
+        )
+        .with_adverse_selection(
+            self.adverse_selection.realized_as_bps(),
+            self.adverse_selection.predicted_alpha(),
+        )
     }
 
     /// Check kill switch conditions and update state.

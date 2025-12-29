@@ -40,11 +40,6 @@ pub use market_maker::{
     // WebSocket Reconnection
     ConnectionHealthMonitor,
     ConnectionState,
-    // Multi-Asset Correlation
-    CorrelationConfig,
-    CorrelationEstimator,
-    CorrelationHorizon,
-    CorrelationSummary,
     DataQualityConfig,
     DataQualityMonitor,
     // Dynamic Risk Configuration
