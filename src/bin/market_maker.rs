@@ -26,7 +26,8 @@ use hyperliquid_rust_sdk::{
     ExchangeClient, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient,
     InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
     MarginConfig, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
-    PnLConfig, QueueConfig, QuotingStrategy, RiskConfig, SpreadConfig, SymmetricStrategy,
+    PnLConfig, QueueConfig, QuotingStrategy, RiskConfig, SpreadConfig, StochasticConfig,
+    SymmetricStrategy,
 };
 
 // ============================================================================
@@ -742,6 +743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decimals,
         sz_decimals,
         multi_asset: false, // Single-asset mode by default
+        stochastic: StochasticConfig::default(),
     };
 
     // Create strategy based on config

@@ -14,6 +14,7 @@ mod estimator;
 mod executor;
 mod funding;
 mod hawkes;
+mod hjb_control;
 mod kill_switch;
 mod ladder;
 mod liquidation;
@@ -21,6 +22,7 @@ mod margin;
 mod metrics;
 mod order_manager;
 mod pnl;
+mod portfolio;
 mod position;
 mod queue;
 mod reconnection;
@@ -30,6 +32,7 @@ mod strategy;
 pub use adverse_selection::*;
 pub use config::*;
 pub use correlation::*;
+pub use hjb_control::*;
 pub use data_quality::*;
 pub use estimator::*;
 pub use executor::*;
@@ -42,6 +45,7 @@ pub use margin::*;
 pub use metrics::*;
 pub use order_manager::*;
 pub use pnl::*;
+pub use portfolio::*;
 pub use position::*;
 pub use queue::*;
 pub use reconnection::*;
@@ -94,6 +98,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     // === Tier 1: Production Resilience Modules ===
     /// Adverse selection estimator - measures E[Δp|fill] and provides spread adjustment
     adverse_selection: AdverseSelectionEstimator,
+    /// Depth-dependent AS model - calibrated from fills: AS(δ) = AS₀ × exp(-δ/δ_char)
+    depth_decay_as: DepthDecayAS,
     /// Queue position tracker - estimates P(fill) for each order
     queue_tracker: QueuePositionTracker,
     /// Liquidation cascade detector - tail risk management with Hawkes process
@@ -132,6 +138,12 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     // === First-Principles Risk ===
     /// Dynamic risk configuration for adaptive position limits
     dynamic_risk_config: DynamicRiskConfig,
+
+    // === Stochastic Module Integration ===
+    /// HJB inventory controller - optimal skew from Avellaneda-Stoikov HJB solution
+    hjb_controller: HJBInventoryController,
+    /// Stochastic module configuration (feature flags)
+    stochastic_config: StochasticConfig,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -177,8 +189,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         margin_config: MarginConfig,
         data_quality_config: data_quality::DataQualityConfig,
     ) -> Self {
-        // Capture multi_asset flag before moving config
+        // Capture config values before moving config
         let enable_correlation = config.multi_asset;
+        let stochastic_config = config.stochastic.clone();
+        let hjb_config = HJBConfig {
+            session_duration_secs: stochastic_config.hjb_session_duration,
+            terminal_penalty: stochastic_config.hjb_terminal_penalty,
+            gamma_base: config.risk_aversion,
+            funding_ewma_half_life: stochastic_config.hjb_funding_half_life,
+            ..HJBConfig::default()
+        };
 
         Self {
             config,
@@ -194,6 +214,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_warmup_log: 0,
             // Tier 1 modules
             adverse_selection: AdverseSelectionEstimator::new(as_config),
+            depth_decay_as: DepthDecayAS::default(),
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
             // Production safety
@@ -216,6 +237,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             },
             // First-principles dynamic risk
             dynamic_risk_config: DynamicRiskConfig::default(),
+            // Stochastic module integration
+            hjb_controller: HJBInventoryController::new(hjb_config),
+            stochastic_config,
         }
     }
 
@@ -306,6 +330,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.strategy.name()
         );
         info!("Warming up parameter estimator...");
+
+        // === Start HJB session (stochastic module integration) ===
+        self.hjb_controller.start_session();
+        debug!("HJB inventory controller session started");
 
         // Safety sync interval (60 seconds) - fallback to catch any state divergence
         let mut sync_interval = tokio::time::interval(Duration::from_secs(60));
@@ -449,6 +477,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // === Tier 1: Periodic update of liquidation detector ===
                     self.liquidation_detector.update();
 
+                    // === Stochastic Module: Update HJB controller with current sigma ===
+                    self.hjb_controller.update_sigma(self.estimator.sigma_clean());
+
+                    // === Stochastic Module: Resolve pending fills for depth-aware AS calibration ===
+                    if self.stochastic_config.calibrate_depth_as {
+                        self.depth_decay_as.resolve_pending_fills(mid);
+                    }
+
                     self.update_quotes().await?;
                 }
             }
@@ -581,6 +617,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                     is_buy,
                                     self.latest_mid,
                                 );
+
+                                // === Stochastic Module: Record fill for depth-aware AS calibration ===
+                                if self.stochastic_config.calibrate_depth_as {
+                                    self.depth_decay_as.record_pending_fill(
+                                        tid,
+                                        fill_price,
+                                        amount,
+                                        is_buy,
+                                        self.latest_mid,
+                                    );
+                                }
 
                                 // === Kappa Estimation: Feed own fill rate ===
                                 let timestamp_ms = std::time::SystemTime::now()
@@ -799,6 +846,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             as_spread_adjustment: self.adverse_selection.spread_adjustment(),
             predicted_alpha: self.adverse_selection.predicted_alpha(),
             as_warmed_up: self.adverse_selection.is_warmed_up(),
+            depth_decay_as: Some(self.depth_decay_as.clone()),
             // === Tier 1: Liquidation Cascade ===
             tail_risk_multiplier: self.liquidation_detector.tail_risk_multiplier(),
             should_pull_quotes: self.liquidation_detector.should_pull_quotes(),
@@ -841,6 +889,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             bid_protection_factor: 1.0,
             ask_protection_factor: 1.0,
             p_momentum_continue: 0.5,
+            // === Stochastic Module: HJB Controller ===
+            use_hjb_skew: self.stochastic_config.use_hjb_skew,
+            hjb_optimal_skew: self.hjb_controller.optimal_skew(
+                self.position.position(),
+                self.config.max_position,
+            ),
+            hjb_gamma_multiplier: self.hjb_controller.gamma_multiplier(),
+            hjb_inventory_target: self.hjb_controller.optimal_inventory_target(),
+            hjb_is_terminal_zone: self.hjb_controller.is_terminal_zone(),
+            // === Stochastic Module: Kalman Filter ===
+            use_kalman_filter: self.stochastic_config.use_kalman_filter,
+            kalman_fair_price: self.estimator.kalman_fair_price(),
+            kalman_uncertainty: self.estimator.kalman_uncertainty(),
+            kalman_spread_widening: self.estimator.kalman_spread_widening(
+                self.config.risk_aversion,
+                1.0 / self.estimator.arrival_intensity().max(0.01), // T = 1/λ
+            ),
+            kalman_warmed_up: self.estimator.kalman_warmed_up(),
+            // === Stochastic Module: Constrained Optimizer ===
+            use_constrained_optimizer: self.stochastic_config.use_constrained_optimizer,
+            margin_available: self.margin_sizer.state().available_margin,
+            leverage: self.margin_sizer.state().current_leverage,
         };
 
         debug!(

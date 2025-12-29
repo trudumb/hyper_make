@@ -121,6 +121,8 @@ pub use market_maker::{
     SpreadProcessEstimator,
     SpreadRegime,
     SpreadSummary,
+    // Stochastic Module Integration
+    StochasticConfig,
     SymmetricStrategy,
     TrackedOrder,
     // Volatility Regime

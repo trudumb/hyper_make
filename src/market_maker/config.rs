@@ -37,6 +37,9 @@ pub struct MarketMakerConfig {
     /// Enable multi-asset correlation tracking (First Principles Gap 5)
     /// When true, tracks correlations for portfolio risk management
     pub multi_asset: bool,
+    /// Stochastic module integration settings.
+    /// Controls HJB skew, Kalman filter, constrained optimizer, and depth AS calibration.
+    pub stochastic: StochasticConfig,
 }
 
 /// Configuration passed to strategy for quote calculation.
@@ -160,6 +163,145 @@ impl DynamicRiskConfig {
     /// Create a new dynamic risk config with custom max leverage.
     pub fn with_max_leverage(mut self, max_leverage: f64) -> Self {
         self.max_leverage = max_leverage;
+        self
+    }
+}
+
+// ============================================================================
+// Stochastic Module Integration Configuration
+// ============================================================================
+
+/// Configuration for stochastic module integration.
+///
+/// Controls feature flags for first-principles stochastic components:
+/// - HJB optimal inventory skew
+/// - Kalman filter for price denoising
+/// - Constrained variational ladder optimization
+/// - Depth-dependent adverse selection calibration
+#[derive(Debug, Clone)]
+pub struct StochasticConfig {
+    /// Use HJB optimal_skew instead of heuristic inventory_skew_with_flow.
+    /// When true: skew = γσ²qT + terminal_penalty × q × urgency + funding_bias
+    /// When false: skew = inventory_ratio × γ × σ² × T × flow_modifier (existing)
+    pub use_hjb_skew: bool,
+
+    /// Use Kalman-filtered price for microprice base and spread widening.
+    /// Adds uncertainty-based spread widening: half_spread += γ × σ_kalman × √T
+    pub use_kalman_filter: bool,
+
+    /// Use ConstrainedLadderOptimizer for ladder sizing.
+    /// Optimizes: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ s.t. margin/position constraints
+    /// When false: uses geometric decay allocation
+    pub use_constrained_optimizer: bool,
+
+    /// Feed fills to DepthDecayAS for calibration.
+    /// Records fill depth and realized AS for exponential decay model fitting.
+    /// Safe to enable - passive data collection only.
+    pub calibrate_depth_as: bool,
+
+    /// Use calibrated DepthDecayAS model in ladder generation.
+    /// When true and calibrated: AS(δ) = AS₀ × exp(-δ/δ_char)
+    /// When false: uses config-based flat AS adjustment
+    pub use_calibrated_as: bool,
+
+    /// Kalman filter process noise Q (price variance per tick).
+    /// Higher Q = trust observations more (reactive).
+    /// Typical: 1e-8 (1 bp² per tick)
+    pub kalman_q: f64,
+
+    /// Kalman filter observation noise R (bid-ask bounce variance).
+    /// Higher R = trust model more (smooth).
+    /// Typical: 2.5e-9 (0.5 bp²)
+    pub kalman_r: f64,
+
+    /// HJB controller session duration (seconds).
+    /// For 24/7 markets, use daily session (86400) or shorter sub-sessions.
+    pub hjb_session_duration: f64,
+
+    /// HJB terminal inventory penalty ($/unit²).
+    /// Higher = more aggressive position reduction near session end.
+    pub hjb_terminal_penalty: f64,
+
+    /// HJB funding rate EWMA half-life (seconds).
+    pub hjb_funding_half_life: f64,
+}
+
+impl Default for StochasticConfig {
+    fn default() -> Self {
+        Self {
+            // Feature flags - all ON by default
+            use_hjb_skew: true,
+            use_kalman_filter: true,
+            use_constrained_optimizer: true,
+
+            // Calibration flags - ON by default (passive, safe)
+            calibrate_depth_as: true,
+            use_calibrated_as: true,
+
+            // Kalman parameters
+            kalman_q: 1e-8,   // 1 bp² per tick
+            kalman_r: 2.5e-9, // 0.5 bp² observation noise
+
+            // HJB parameters
+            hjb_session_duration: 86400.0, // 24 hour session
+            hjb_terminal_penalty: 0.0005,  // 0.05% per unit²
+            hjb_funding_half_life: 3600.0, // 1 hour
+        }
+    }
+}
+
+impl StochasticConfig {
+    /// Create config with all stochastic features enabled.
+    pub fn all_enabled() -> Self {
+        Self {
+            use_hjb_skew: true,
+            use_kalman_filter: true,
+            use_constrained_optimizer: true,
+            calibrate_depth_as: true,
+            use_calibrated_as: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create config with only passive calibration (no quote changes).
+    pub fn passive_only() -> Self {
+        Self {
+            use_hjb_skew: false,
+            use_kalman_filter: false,
+            use_constrained_optimizer: false,
+            calibrate_depth_as: true,
+            use_calibrated_as: false,
+            ..Default::default()
+        }
+    }
+
+    /// Builder: enable HJB skew.
+    pub fn with_hjb_skew(mut self) -> Self {
+        self.use_hjb_skew = true;
+        self
+    }
+
+    /// Builder: enable Kalman filter.
+    pub fn with_kalman_filter(mut self) -> Self {
+        self.use_kalman_filter = true;
+        self
+    }
+
+    /// Builder: enable constrained optimizer.
+    pub fn with_constrained_optimizer(mut self) -> Self {
+        self.use_constrained_optimizer = true;
+        self
+    }
+
+    /// Builder: set Kalman Q (process noise).
+    pub fn with_kalman_q(mut self, q: f64) -> Self {
+        self.kalman_q = q;
+        self
+    }
+
+    /// Builder: set Kalman R (observation noise).
+    pub fn with_kalman_r(mut self, r: f64) -> Self {
+        self.kalman_r = r;
         self
     }
 }

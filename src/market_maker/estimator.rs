@@ -2291,6 +2291,207 @@ impl MicropriceEstimator {
 }
 
 // ============================================================================
+// Kalman Filter for Latent True Price (Phase 3)
+// ============================================================================
+
+/// Kalman filter for estimating the latent "true" price from noisy observations.
+///
+/// State-space model:
+/// - State equation: x_t = x_{t-1} + σ_true × ε_t (random walk)
+/// - Observation: y_t = x_t + η_t (observed mid with bid-ask bounce noise)
+///
+/// Posterior: x_t | y_{1:t} ~ N(μ_t, Σ_t)
+///
+/// This provides:
+/// 1. Filtered estimate of true price (μ)
+/// 2. Uncertainty measure (σ = √Σ) for adaptive spread widening
+/// 3. Signal smoothing that filters bid-ask bounce
+///
+/// Theory from the manual:
+/// - Process noise Q comes from actual volatility
+/// - Observation noise R comes from bid-ask bounce (~25% of spread typical)
+/// - When uncertain (high Σ), widen spreads
+#[derive(Debug, Clone)]
+pub struct KalmanPriceFilter {
+    /// Posterior mean of true price
+    mu: f64,
+    /// Posterior variance
+    sigma_sq: f64,
+    /// Process noise variance (true price volatility per tick)
+    q: f64,
+    /// Observation noise variance (bid-ask bounce)
+    r: f64,
+    /// EWMA smoothing factor for Q estimation
+    q_alpha: f64,
+    /// Estimated process noise from price changes
+    q_estimate: f64,
+    /// Count of updates for warmup
+    update_count: usize,
+    /// Last observation for noise estimation
+    last_observation: Option<f64>,
+}
+
+impl KalmanPriceFilter {
+    /// Create a new Kalman filter.
+    ///
+    /// # Arguments
+    /// * `initial_price` - Initial price estimate
+    /// * `initial_variance` - Initial uncertainty (σ²)
+    /// * `process_noise` - Process noise Q (volatility per tick)
+    /// * `observation_noise` - Observation noise R (bid-ask bounce)
+    pub fn new(
+        initial_price: f64,
+        initial_variance: f64,
+        process_noise: f64,
+        observation_noise: f64,
+    ) -> Self {
+        Self {
+            mu: initial_price,
+            sigma_sq: initial_variance,
+            q: process_noise,
+            r: observation_noise,
+            q_alpha: 0.05, // 20-tick half-life for Q estimation
+            q_estimate: process_noise,
+            update_count: 0,
+            last_observation: None,
+        }
+    }
+
+    /// Create with sensible defaults for crypto.
+    ///
+    /// Uses:
+    /// - Q = (0.0001)² = 1 bp per tick variance
+    /// - R = (0.00005)² = 0.5 bp observation noise
+    pub fn default_crypto() -> Self {
+        Self::new(
+            0.0,           // Will be set on first observation
+            1e-6,          // Initial σ² = 10 bp²
+            1e-8,          // Q = 1 bp² per tick
+            2.5e-9,        // R = 0.5 bp² (bid-ask bounce)
+        )
+    }
+
+    /// Predict step: propagate state forward in time.
+    ///
+    /// μ_{t|t-1} = μ_{t-1} (random walk)
+    /// Σ_{t|t-1} = Σ_{t-1} + Q (uncertainty grows)
+    pub fn predict(&mut self) {
+        // Mean stays same (random walk has no drift)
+        // Variance grows by process noise
+        self.sigma_sq += self.q;
+    }
+
+    /// Update step: incorporate new observation.
+    ///
+    /// K = Σ_{t|t-1} / (Σ_{t|t-1} + R) (Kalman gain)
+    /// μ_t = μ_{t|t-1} + K × (y_t - μ_{t|t-1}) (update mean)
+    /// Σ_t = (1 - K) × Σ_{t|t-1} (update variance)
+    pub fn update(&mut self, observation: f64) {
+        // Handle first observation specially
+        if self.update_count == 0 {
+            self.mu = observation;
+            self.last_observation = Some(observation);
+            self.update_count = 1;
+            return;
+        }
+
+        // Kalman gain: K = Σ / (Σ + R)
+        let k = self.sigma_sq / (self.sigma_sq + self.r);
+
+        // Innovation (measurement residual)
+        let innovation = observation - self.mu;
+
+        // State update: μ = μ + K × innovation
+        self.mu += k * innovation;
+
+        // Variance update: Σ = (1 - K) × Σ
+        self.sigma_sq *= 1.0 - k;
+
+        // Adaptive Q estimation from squared innovations
+        if let Some(last) = self.last_observation {
+            let price_change = (observation - last).powi(2);
+            self.q_estimate = self.q_alpha * price_change + (1.0 - self.q_alpha) * self.q_estimate;
+
+            // Slowly adapt Q to observed volatility
+            if self.update_count > 20 {
+                self.q = 0.9 * self.q + 0.1 * self.q_estimate;
+            }
+        }
+
+        self.last_observation = Some(observation);
+        self.update_count += 1;
+    }
+
+    /// Combined predict + update for time-series filtering.
+    pub fn filter(&mut self, observation: f64) {
+        self.predict();
+        self.update(observation);
+    }
+
+    /// Get fair price estimate (posterior mean).
+    pub fn fair_price(&self) -> f64 {
+        self.mu
+    }
+
+    /// Get uncertainty (posterior standard deviation).
+    pub fn uncertainty(&self) -> f64 {
+        self.sigma_sq.sqrt()
+    }
+
+    /// Get uncertainty in basis points (relative to price).
+    pub fn uncertainty_bps(&self) -> f64 {
+        if self.mu.abs() > 1e-10 {
+            (self.sigma_sq.sqrt() / self.mu) * 10000.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Get fair price with uncertainty bounds.
+    ///
+    /// Returns (fair_price, uncertainty) where uncertainty is σ (std dev).
+    pub fn fair_price_with_uncertainty(&self) -> (f64, f64) {
+        (self.mu, self.sigma_sq.sqrt())
+    }
+
+    /// Compute recommended spread widening from uncertainty.
+    ///
+    /// Uses: spread_add = γ × σ × √(time_horizon)
+    /// Higher uncertainty → wider spreads
+    pub fn uncertainty_spread(&self, gamma: f64, time_horizon: f64) -> f64 {
+        gamma * self.sigma_sq.sqrt() * time_horizon.sqrt()
+    }
+
+    /// Check if filter is warmed up.
+    pub fn is_warmed_up(&self) -> bool {
+        self.update_count >= 10
+    }
+
+    /// Get update count.
+    pub fn update_count(&self) -> usize {
+        self.update_count
+    }
+
+    /// Get estimated process noise Q.
+    pub fn estimated_q(&self) -> f64 {
+        self.q_estimate
+    }
+
+    /// Get current Kalman gain (for diagnostics).
+    pub fn current_kalman_gain(&self) -> f64 {
+        self.sigma_sq / (self.sigma_sq + self.r)
+    }
+
+    /// Reset filter with new initial conditions.
+    pub fn reset(&mut self, initial_price: f64, initial_variance: f64) {
+        self.mu = initial_price;
+        self.sigma_sq = initial_variance;
+        self.update_count = 0;
+        self.last_observation = None;
+    }
+}
+
+// ============================================================================
 // Volume Tick Arrival Estimator
 // ============================================================================
 
@@ -2553,6 +2754,8 @@ pub struct ParameterEstimator {
     jump_estimator: JumpEstimator,
     /// Stochastic volatility parameters (κ_vol, θ_vol, ξ, ρ)
     stoch_vol: StochasticVolParams,
+    /// Kalman filter for denoising mid price (stochastic module integration)
+    kalman_filter: KalmanPriceFilter,
 }
 
 impl ParameterEstimator {
@@ -2608,6 +2811,10 @@ impl ParameterEstimator {
         // Stochastic volatility params (First Principles Gap 2)
         let stoch_vol = StochasticVolParams::new(config.default_sigma);
 
+        // Kalman filter for denoising mid price (Stochastic Module Integration)
+        // Uses sensible defaults for crypto markets (Q=1bp², R=0.5bp²)
+        let kalman_filter = KalmanPriceFilter::default_crypto();
+
         Self {
             config,
             bucket_accumulator,
@@ -2626,12 +2833,15 @@ impl ParameterEstimator {
             volatility_regime,
             jump_estimator,
             stoch_vol,
+            kalman_filter,
         }
     }
 
     /// Update current mid price.
     pub fn on_mid_update(&mut self, mid_price: f64) {
         self.current_mid = mid_price;
+        // Feed Kalman filter (stochastic module integration)
+        self.kalman_filter.filter(mid_price);
     }
 
     /// Process a new trade (feeds into volume clock, flow tracker, AND market kappa).
@@ -3200,6 +3410,46 @@ impl ParameterEstimator {
     pub fn warmup_progress_simple(&self) -> (usize, usize) {
         (self.multi_scale.tick_count(), self.config.min_volume_ticks)
     }
+
+    // === Stochastic Module: Kalman Filter ===
+
+    /// Get Kalman-filtered fair price (posterior mean).
+    ///
+    /// The Kalman filter denoises the mid price by separating true price
+    /// movements from bid-ask bounce noise. Use this for:
+    /// - Fair price base in microprice calculation
+    /// - Position valuation (more stable than raw mid)
+    pub fn kalman_fair_price(&self) -> f64 {
+        self.kalman_filter.fair_price()
+    }
+
+    /// Get Kalman filter uncertainty (posterior standard deviation).
+    ///
+    /// Higher uncertainty means less confidence in the fair price estimate.
+    /// Use this for spread widening when uncertain.
+    pub fn kalman_uncertainty(&self) -> f64 {
+        self.kalman_filter.uncertainty()
+    }
+
+    /// Get Kalman filter uncertainty in basis points.
+    pub fn kalman_uncertainty_bps(&self) -> f64 {
+        self.kalman_filter.uncertainty_bps()
+    }
+
+    /// Compute Kalman-based spread widening.
+    ///
+    /// Formula: spread_add = γ × σ_kalman × √T
+    /// where σ_kalman is the Kalman filter uncertainty.
+    ///
+    /// Higher uncertainty → wider spreads (protecting against fair price misestimation).
+    pub fn kalman_spread_widening(&self, gamma: f64, time_horizon: f64) -> f64 {
+        self.kalman_filter.uncertainty_spread(gamma, time_horizon)
+    }
+
+    /// Check if Kalman filter is warmed up (enough observations).
+    pub fn kalman_warmed_up(&self) -> bool {
+        self.kalman_filter.is_warmed_up()
+    }
 }
 
 // ============================================================================
@@ -3675,6 +3925,180 @@ mod tests {
             kappa_val > prior_mean * 0.5,
             "Kappa {} should not collapse with small distances",
             kappa_val
+        );
+    }
+
+    // ========================================================================
+    // Kalman Filter Tests
+    // ========================================================================
+
+    #[test]
+    fn test_kalman_filter_basic() {
+        let mut filter = KalmanPriceFilter::new(100.0, 1e-6, 1e-8, 2.5e-9);
+
+        // Filter should initialize properly
+        assert_eq!(filter.update_count(), 0);
+        assert!(!filter.is_warmed_up());
+
+        // First observation sets the mean
+        filter.update(100.0);
+        assert!((filter.fair_price() - 100.0).abs() < 0.001);
+        assert_eq!(filter.update_count(), 1);
+
+        // Second observation updates the mean
+        filter.filter(100.1);
+        assert!(filter.fair_price() > 100.0);
+        assert!(filter.fair_price() < 100.1); // Should be smoothed
+    }
+
+    #[test]
+    fn test_kalman_filter_warmup() {
+        let mut filter = KalmanPriceFilter::default_crypto();
+
+        // Not warmed up initially
+        assert!(!filter.is_warmed_up());
+
+        // Feed observations
+        for i in 0..15 {
+            filter.filter(100.0 + (i as f64) * 0.01);
+        }
+
+        // Should be warmed up after 10+ updates
+        assert!(filter.is_warmed_up());
+        assert!(filter.update_count() >= 10);
+    }
+
+    #[test]
+    fn test_kalman_filter_uncertainty_grows() {
+        let mut filter = KalmanPriceFilter::new(100.0, 1e-8, 1e-8, 2.5e-9);
+
+        // Initialize
+        filter.update(100.0);
+        let initial_uncertainty = filter.uncertainty();
+
+        // Predict without observation (uncertainty grows)
+        for _ in 0..5 {
+            filter.predict();
+        }
+
+        // Uncertainty should have grown
+        assert!(
+            filter.uncertainty() > initial_uncertainty,
+            "Uncertainty should grow with predictions: {} > {}",
+            filter.uncertainty(),
+            initial_uncertainty
+        );
+    }
+
+    #[test]
+    fn test_kalman_filter_uncertainty_shrinks_with_data() {
+        let mut filter = KalmanPriceFilter::new(100.0, 1e-4, 1e-10, 1e-10);
+
+        // Start with high uncertainty
+        filter.update(100.0);
+        let initial_uncertainty = filter.uncertainty();
+
+        // Feed consistent observations (uncertainty should shrink)
+        for _ in 0..20 {
+            filter.filter(100.0); // Same price, very low noise
+        }
+
+        // Uncertainty should have shrunk
+        assert!(
+            filter.uncertainty() < initial_uncertainty,
+            "Uncertainty should shrink with consistent data: {} < {}",
+            filter.uncertainty(),
+            initial_uncertainty
+        );
+    }
+
+    #[test]
+    fn test_kalman_filter_smoothing() {
+        let mut filter = KalmanPriceFilter::new(100.0, 1e-6, 1e-8, 1e-7);
+
+        // Initialize
+        filter.update(100.0);
+
+        // Feed noisy observations oscillating around 100
+        let observations = [100.05, 99.95, 100.03, 99.97, 100.02, 99.98];
+        for obs in observations {
+            filter.filter(obs);
+        }
+
+        // Fair price should be close to mean (100), not the last observation
+        let fp = filter.fair_price();
+        assert!(
+            (fp - 100.0).abs() < 0.03,
+            "Fair price {} should be smoothed close to 100.0",
+            fp
+        );
+    }
+
+    #[test]
+    fn test_kalman_filter_uncertainty_spread() {
+        let mut filter = KalmanPriceFilter::new(100.0, 1e-6, 1e-8, 2.5e-9);
+        filter.update(100.0);
+
+        let gamma = 0.5;
+        let time_horizon = 1.0;
+
+        let spread = filter.uncertainty_spread(gamma, time_horizon);
+
+        // Spread should be positive and reasonable
+        assert!(spread >= 0.0);
+        assert!(spread < 1.0); // Shouldn't be huge
+    }
+
+    #[test]
+    fn test_kalman_filter_kalman_gain() {
+        let filter = KalmanPriceFilter::new(100.0, 1e-6, 1e-8, 2.5e-9);
+
+        let k = filter.current_kalman_gain();
+
+        // Kalman gain should be between 0 and 1
+        assert!(k >= 0.0 && k <= 1.0, "Kalman gain {} out of bounds", k);
+    }
+
+    #[test]
+    fn test_kalman_filter_reset() {
+        let mut filter = KalmanPriceFilter::default_crypto();
+
+        // Use the filter
+        for i in 0..20 {
+            filter.filter(100.0 + (i as f64) * 0.1);
+        }
+
+        assert!(filter.is_warmed_up());
+
+        // Reset
+        filter.reset(50.0, 1e-4);
+
+        // Should be reset
+        assert!(!filter.is_warmed_up());
+        assert_eq!(filter.update_count(), 0);
+        assert!((filter.fair_price() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_kalman_filter_adaptive_q() {
+        let mut filter = KalmanPriceFilter::new(100.0, 1e-6, 1e-10, 1e-10);
+
+        // Initialize
+        filter.update(100.0);
+
+        let initial_q = filter.estimated_q();
+
+        // Feed highly volatile observations
+        for i in 0..30 {
+            let price = if i % 2 == 0 { 100.5 } else { 99.5 };
+            filter.filter(price);
+        }
+
+        // Q estimate should have increased due to high volatility
+        assert!(
+            filter.estimated_q() > initial_q,
+            "Q estimate {} should increase with volatility",
+            filter.estimated_q()
         );
     }
 }

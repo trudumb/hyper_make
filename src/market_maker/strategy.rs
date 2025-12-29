@@ -15,7 +15,7 @@ use super::ladder::Ladder;
 /// - arrival_intensity: volume ticks per second
 /// - Regime detection: jump_ratio > 1.5 = toxic
 /// - Directional flow: momentum_bps, flow_imbalance, falling/rising knife scores
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MarketParams {
     // === Volatility (all per-second, NOT annualized) ===
     /// Clean volatility (σ_clean) - √BV, robust to jumps
@@ -107,6 +107,11 @@ pub struct MarketParams {
     /// Is AS estimator warmed up with enough fills?
     pub as_warmed_up: bool,
 
+    /// Depth-dependent AS model (calibrated from fills).
+    /// First-principles: AS(δ) = AS₀ × exp(-δ/δ_char)
+    /// Used by ladder for depth-aware spread capture.
+    pub depth_decay_as: Option<super::adverse_selection::DepthDecayAS>,
+
     // === Tier 1: Liquidation Cascade ===
     /// Tail risk multiplier for gamma [1.0, 5.0].
     /// Multiply gamma by this during cascade conditions.
@@ -192,6 +197,39 @@ pub struct MarketParams {
     pub ask_protection_factor: f64,
     /// Probability momentum continues
     pub p_momentum_continue: f64,
+
+    // === Stochastic Module Integration (HJB Controller) ===
+    /// Whether to use HJB optimal skew instead of heuristic inventory_skew_with_flow
+    pub use_hjb_skew: bool,
+    /// HJB optimal inventory skew (from Avellaneda-Stoikov HJB solution)
+    /// Formula: γσ²qT + terminal_penalty × q × urgency + funding_bias
+    pub hjb_optimal_skew: f64,
+    /// HJB gamma multiplier (for logging/diagnostics)
+    pub hjb_gamma_multiplier: f64,
+    /// HJB inventory target (optimal q* for current session state)
+    pub hjb_inventory_target: f64,
+    /// Whether HJB controller is in terminal zone (near session end)
+    pub hjb_is_terminal_zone: bool,
+
+    // === Stochastic Module Integration (Kalman Filter) ===
+    /// Whether to use Kalman filter spread widening
+    pub use_kalman_filter: bool,
+    /// Kalman-filtered fair price (denoised mid)
+    pub kalman_fair_price: f64,
+    /// Kalman filter uncertainty (posterior std dev)
+    pub kalman_uncertainty: f64,
+    /// Kalman-based spread widening: γ × σ_kalman × √T
+    pub kalman_spread_widening: f64,
+    /// Whether Kalman filter is warmed up
+    pub kalman_warmed_up: bool,
+
+    // === Stochastic Module Integration (Constrained Optimizer) ===
+    /// Whether to use constrained ladder optimizer
+    pub use_constrained_optimizer: bool,
+    /// Available margin for order placement (USD)
+    pub margin_available: f64,
+    /// Current leverage ratio
+    pub leverage: f64,
 }
 
 impl Default for MarketParams {
@@ -219,6 +257,7 @@ impl Default for MarketParams {
             as_spread_adjustment: 0.0, // No adjustment until warmed up
             predicted_alpha: 0.0,      // Default: no informed flow detected
             as_warmed_up: false,       // Starts not warmed up
+            depth_decay_as: None,      // No calibrated model initially
             // Tier 1: Liquidation Cascade
             tail_risk_multiplier: 1.0, // Default: no tail risk scaling
             should_pull_quotes: false, // Default: don't pull quotes
@@ -252,6 +291,22 @@ impl Default for MarketParams {
             bid_protection_factor: 1.0,
             ask_protection_factor: 1.0,
             p_momentum_continue: 0.5,
+            // HJB Controller (stochastic integration)
+            use_hjb_skew: false,          // Default OFF for safety
+            hjb_optimal_skew: 0.0,        // Will be computed from HJB controller
+            hjb_gamma_multiplier: 1.0,    // No multiplier by default
+            hjb_inventory_target: 0.0,    // Zero inventory target
+            hjb_is_terminal_zone: false,  // Not in terminal zone
+            // Kalman Filter (stochastic integration)
+            use_kalman_filter: false,     // Default OFF for safety
+            kalman_fair_price: 0.0,       // Will be computed from Kalman filter
+            kalman_uncertainty: 0.0,      // Will be computed from Kalman filter
+            kalman_spread_widening: 0.0,  // Will be computed from Kalman filter
+            kalman_warmed_up: false,      // Not warmed up initially
+            // Constrained Optimizer (stochastic integration)
+            use_constrained_optimizer: false, // Default OFF for safety
+            margin_available: 0.0,        // Will be fetched from margin sizer
+            leverage: 1.0,                // Default 1x leverage
         }
     }
 }
@@ -899,6 +954,25 @@ impl QuotingStrategy for GLFTStrategy {
             );
         }
 
+        // === 2a'. KALMAN UNCERTAINTY SPREAD WIDENING (Stochastic Module) ===
+        // When use_kalman_filter is enabled, add uncertainty-based spread widening
+        // Formula: spread_add = γ × σ_kalman × √T
+        // Higher Kalman uncertainty → wider spreads (protects against fair price misestimation)
+        if market_params.use_kalman_filter
+            && market_params.kalman_warmed_up
+            && market_params.kalman_spread_widening > 0.0
+        {
+            half_spread_bid += market_params.kalman_spread_widening;
+            half_spread_ask += market_params.kalman_spread_widening;
+            half_spread += market_params.kalman_spread_widening;
+            debug!(
+                kalman_widening_bps = %format!("{:.2}", market_params.kalman_spread_widening * 10000.0),
+                kalman_uncertainty_bps = %format!("{:.2}", market_params.kalman_uncertainty * 10000.0),
+                kalman_fair_price = %format!("{:.4}", market_params.kalman_fair_price),
+                "Kalman uncertainty spread widening applied"
+            );
+        }
+
         // === 2b. JUMP PREMIUM (First-Principles) ===
         // Theory: Under jump-diffusion dP = σ dW + J dN, total risk exceeds diffusion risk.
         // GLFT assumes continuous diffusion, but crypto has discrete jumps.
@@ -966,16 +1040,33 @@ impl QuotingStrategy for GLFTStrategy {
             0.0
         };
 
-        // Flow-dampened inventory skew: base_skew × exp(-β × flow_alignment)
-        // Uses flow_imbalance to dampen skew when aligned with flow (don't fight momentum)
-        // and amplify skew when opposed to flow (reduce risk faster)
-        let base_skew = self.inventory_skew_with_flow(
-            inventory_ratio,
-            sigma_for_skew,
-            gamma,
-            time_horizon,
-            market_params.flow_imbalance,
-        );
+        // === STOCHASTIC MODULE: HJB vs Heuristic Skew ===
+        // When use_hjb_skew is true, use optimal skew from HJB controller
+        // When false, use flow-dampened heuristic (existing behavior)
+        let base_skew = if market_params.use_hjb_skew {
+            // HJB optimal skew from Avellaneda-Stoikov HJB solution:
+            // skew = γσ²qT + terminal_penalty × q × urgency + funding_bias
+            // This is pre-computed by HJBInventoryController in mod.rs
+            if market_params.hjb_is_terminal_zone {
+                debug!(
+                    hjb_skew = %format!("{:.6}", market_params.hjb_optimal_skew),
+                    hjb_inv_target = %format!("{:.4}", market_params.hjb_inventory_target),
+                    "HJB TERMINAL ZONE: Aggressive inventory reduction"
+                );
+            }
+            market_params.hjb_optimal_skew
+        } else {
+            // Flow-dampened inventory skew: base_skew × exp(-β × flow_alignment)
+            // Uses flow_imbalance to dampen skew when aligned with flow (don't fight momentum)
+            // and amplify skew when opposed to flow (reduce risk faster)
+            self.inventory_skew_with_flow(
+                inventory_ratio,
+                sigma_for_skew,
+                gamma,
+                time_horizon,
+                market_params.flow_imbalance,
+            )
+        };
 
         // === 3a. HAWKES FLOW SKEWING (Tier 2) ===
         // Use Hawkes-derived flow imbalance for additional directional adjustment
@@ -1369,9 +1460,111 @@ impl LadderStrategy {
             decimals: config.decimals,
             sz_decimals: config.sz_decimals,
             min_notional: config.min_notional,
+            depth_decay_as: market_params.depth_decay_as.clone(),
         };
 
-        Ladder::generate(&self.ladder_config, &params)
+        // === STOCHASTIC MODULE: Constrained Ladder Optimization ===
+        // Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ  (expected profit)
+        // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
+        //      Σ sᵢ ≤ max_position (position constraint)
+        if market_params.use_constrained_optimizer {
+            // 1. Account for margin used by current position
+            let leverage = market_params.leverage.max(1.0);
+            let position_margin_cost = position.abs() * (market_params.microprice / leverage);
+            let available_margin = (market_params.margin_available - position_margin_cost).max(0.0);
+            let available_position = (max_position - position.abs()).max(0.0);
+
+            // 2. Generate ladder to get depth levels and prices
+            let mut ladder = Ladder::generate(&self.ladder_config, &params);
+
+            // 3. Create constrained optimizer
+            let optimizer = super::ladder::ConstrainedLadderOptimizer::new(
+                available_margin,
+                available_position,
+                self.ladder_config.min_level_size,
+                config.min_notional,
+                market_params.microprice,
+                leverage,
+            );
+
+            // 4. Build LevelOptimizationParams for bids
+            let bid_level_params: Vec<_> = ladder
+                .bids
+                .iter()
+                .map(|level| {
+                    let fill_intensity =
+                        fill_intensity_at_depth(level.depth_bps, params.sigma, params.kappa);
+                    let spread_capture =
+                        spread_capture_at_depth(level.depth_bps, &params, self.ladder_config.fees_bps);
+                    super::ladder::LevelOptimizationParams {
+                        depth_bps: level.depth_bps,
+                        fill_intensity,
+                        spread_capture,
+                        margin_per_unit: market_params.microprice / leverage,
+                    }
+                })
+                .collect();
+
+            // 5. Optimize bid sizes
+            if !bid_level_params.is_empty() {
+                let allocation = optimizer.optimize(&bid_level_params);
+                for (i, &size) in allocation.sizes.iter().enumerate() {
+                    if i < ladder.bids.len() {
+                        ladder.bids[i].size = size;
+                    }
+                }
+                debug!(
+                    binding = ?allocation.binding_constraint,
+                    margin_used = %format!("{:.2}", allocation.margin_used),
+                    position_used = %format!("{:.4}", allocation.position_used),
+                    shadow_price = %format!("{:.6}", allocation.shadow_price),
+                    "Constrained optimizer applied to bids"
+                );
+            }
+
+            // 6. Build LevelOptimizationParams for asks
+            let ask_level_params: Vec<_> = ladder
+                .asks
+                .iter()
+                .map(|level| {
+                    let fill_intensity =
+                        fill_intensity_at_depth(level.depth_bps, params.sigma, params.kappa);
+                    let spread_capture =
+                        spread_capture_at_depth(level.depth_bps, &params, self.ladder_config.fees_bps);
+                    super::ladder::LevelOptimizationParams {
+                        depth_bps: level.depth_bps,
+                        fill_intensity,
+                        spread_capture,
+                        margin_per_unit: market_params.microprice / leverage,
+                    }
+                })
+                .collect();
+
+            // 7. Optimize ask sizes
+            if !ask_level_params.is_empty() {
+                let allocation = optimizer.optimize(&ask_level_params);
+                for (i, &size) in allocation.sizes.iter().enumerate() {
+                    if i < ladder.asks.len() {
+                        ladder.asks[i].size = size;
+                    }
+                }
+                debug!(
+                    binding = ?allocation.binding_constraint,
+                    margin_used = %format!("{:.2}", allocation.margin_used),
+                    position_used = %format!("{:.4}", allocation.position_used),
+                    shadow_price = %format!("{:.6}", allocation.shadow_price),
+                    "Constrained optimizer applied to asks"
+                );
+            }
+
+            // 8. Filter out zero-size levels
+            ladder.bids.retain(|l| l.size > EPSILON);
+            ladder.asks.retain(|l| l.size > EPSILON);
+
+            ladder
+        } else {
+            Ladder::generate(&self.ladder_config, &params)
+        }
     }
 }
 
@@ -1422,6 +1615,45 @@ impl QuotingStrategy for LadderStrategy {
     fn name(&self) -> &'static str {
         "LadderGLFT"
     }
+}
+
+// ============================================================================
+// Constrained Optimizer Helper Functions
+// ============================================================================
+
+/// Fill intensity at depth: λ(δ) = σ²/δ² × κ
+///
+/// Models probability of price reaching depth δ based on diffusion.
+/// At touch (δ → 0), returns kappa as baseline intensity.
+fn fill_intensity_at_depth(depth_bps: f64, sigma: f64, kappa: f64) -> f64 {
+    if depth_bps < EPSILON {
+        return kappa; // At touch, use kappa as baseline
+    }
+    let depth_frac = depth_bps / 10000.0;
+    // σ² / δ² gives diffusion-driven fill probability
+    // Scale by kappa for market activity level
+    let diffusion_term = sigma.powi(2) / depth_frac.powi(2);
+    (diffusion_term * kappa).min(kappa) // Cap at kappa
+}
+
+/// Spread capture at depth: SC(δ) = δ - AS(δ) - fees
+///
+/// Expected profit from capturing spread at depth δ.
+/// Uses calibrated depth-dependent AS model if available.
+fn spread_capture_at_depth(
+    depth_bps: f64,
+    params: &super::ladder::LadderParams,
+    fees_bps: f64,
+) -> f64 {
+    let as_at_depth = if let Some(ref decay) = params.depth_decay_as {
+        // Use calibrated first-principles model: AS(δ) = AS₀ × exp(-δ/δ_char)
+        decay.as_at_depth(depth_bps)
+    } else {
+        // Legacy fallback: exponential decay with 10bp characteristic depth
+        params.as_at_touch_bps * (-depth_bps / 10.0).exp()
+    };
+    // Spread capture = depth - adverse selection - fees
+    (depth_bps - as_at_depth - fees_bps).max(0.0)
 }
 
 #[cfg(test)]
