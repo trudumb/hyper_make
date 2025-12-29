@@ -1,0 +1,198 @@
+//! Component bundles for MarketMaker.
+//!
+//! Groups related modules into logical bundles for cleaner organization.
+
+use crate::market_maker::{
+    adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
+    config::MetricsRecorder,
+    data_quality::{DataQualityConfig, DataQualityMonitor},
+    fills::FillProcessor,
+    funding::{FundingConfig, FundingRateEstimator},
+    hawkes::{HawkesConfig, HawkesOrderFlowEstimator},
+    hjb_control::{HJBConfig, HJBInventoryController},
+    kill_switch::{KillSwitch, KillSwitchConfig},
+    liquidation::{LiquidationCascadeDetector, LiquidationConfig},
+    margin::{MarginAwareSizer, MarginConfig},
+    metrics::PrometheusMetrics,
+    pnl::{PnLConfig, PnLTracker},
+    queue::{QueueConfig, QueuePositionTracker},
+    reconnection::ConnectionHealthMonitor,
+    risk::RiskAggregator,
+    spread::{SpreadConfig, SpreadProcessEstimator},
+    DynamicRiskConfig, StochasticConfig,
+};
+
+/// Tier 1 components: Production resilience modules.
+///
+/// These modules are critical for production trading:
+/// - Adverse selection measurement
+/// - Queue position tracking
+/// - Liquidation cascade detection
+pub struct Tier1Components {
+    /// Adverse selection estimator
+    pub adverse_selection: AdverseSelectionEstimator,
+    /// Depth-dependent AS model
+    pub depth_decay_as: DepthDecayAS,
+    /// Queue position tracker
+    pub queue_tracker: QueuePositionTracker,
+    /// Liquidation cascade detector
+    pub liquidation_detector: LiquidationCascadeDetector,
+}
+
+impl Tier1Components {
+    /// Create Tier 1 components from configs.
+    pub fn new(
+        as_config: AdverseSelectionConfig,
+        queue_config: QueueConfig,
+        liquidation_config: LiquidationConfig,
+    ) -> Self {
+        Self {
+            adverse_selection: AdverseSelectionEstimator::new(as_config),
+            depth_decay_as: DepthDecayAS::default(),
+            queue_tracker: QueuePositionTracker::new(queue_config),
+            liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
+        }
+    }
+}
+
+/// Tier 2 components: Process models.
+///
+/// These modules provide market process estimation:
+/// - Hawkes order flow
+/// - Funding rate
+/// - Spread dynamics
+/// - P&L tracking
+pub struct Tier2Components {
+    /// Hawkes order flow estimator
+    pub hawkes: HawkesOrderFlowEstimator,
+    /// Funding rate estimator
+    pub funding: FundingRateEstimator,
+    /// Spread process estimator
+    pub spread_tracker: SpreadProcessEstimator,
+    /// P&L tracker
+    pub pnl_tracker: PnLTracker,
+}
+
+impl Tier2Components {
+    /// Create Tier 2 components from configs.
+    pub fn new(
+        hawkes_config: HawkesConfig,
+        funding_config: FundingConfig,
+        spread_config: SpreadConfig,
+        pnl_config: PnLConfig,
+    ) -> Self {
+        Self {
+            hawkes: HawkesOrderFlowEstimator::new(hawkes_config),
+            funding: FundingRateEstimator::new(funding_config),
+            spread_tracker: SpreadProcessEstimator::new(spread_config),
+            pnl_tracker: PnLTracker::new(pnl_config),
+        }
+    }
+}
+
+/// Safety components: Risk management and kill switch.
+pub struct SafetyComponents {
+    /// Kill switch
+    pub kill_switch: KillSwitch,
+    /// Risk aggregator
+    pub risk_aggregator: RiskAggregator,
+    /// Fill processor
+    pub fill_processor: FillProcessor,
+}
+
+impl SafetyComponents {
+    /// Create safety components from config.
+    pub fn new(kill_switch_config: KillSwitchConfig, risk_aggregator: RiskAggregator) -> Self {
+        Self {
+            kill_switch: KillSwitch::new(kill_switch_config),
+            risk_aggregator,
+            fill_processor: FillProcessor::new(),
+        }
+    }
+}
+
+/// Infrastructure components: Monitoring and execution infrastructure.
+pub struct InfraComponents {
+    /// Margin-aware sizer
+    pub margin_sizer: MarginAwareSizer,
+    /// Prometheus metrics
+    pub prometheus: PrometheusMetrics,
+    /// Connection health monitor
+    pub connection_health: ConnectionHealthMonitor,
+    /// Data quality monitor
+    pub data_quality: DataQualityMonitor,
+    /// Optional metrics recorder
+    pub metrics: MetricsRecorder,
+    /// Last margin refresh time
+    pub last_margin_refresh: std::time::Instant,
+}
+
+impl InfraComponents {
+    /// Create infrastructure components from configs.
+    pub fn new(
+        margin_config: MarginConfig,
+        data_quality_config: DataQualityConfig,
+        metrics: MetricsRecorder,
+    ) -> Self {
+        Self {
+            margin_sizer: MarginAwareSizer::new(margin_config),
+            prometheus: PrometheusMetrics::new(),
+            connection_health: ConnectionHealthMonitor::new(),
+            data_quality: DataQualityMonitor::new(data_quality_config),
+            metrics,
+            last_margin_refresh: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Stochastic module components: First-principles risk and HJB control.
+#[derive(Debug, Clone)]
+pub struct StochasticComponents {
+    /// HJB inventory controller
+    pub hjb_controller: HJBInventoryController,
+    /// Stochastic module configuration
+    pub stochastic_config: StochasticConfig,
+    /// Dynamic risk configuration
+    pub dynamic_risk_config: DynamicRiskConfig,
+}
+
+impl StochasticComponents {
+    /// Create stochastic components from configs.
+    pub fn new(
+        hjb_config: HJBConfig,
+        stochastic_config: StochasticConfig,
+        dynamic_risk_config: DynamicRiskConfig,
+    ) -> Self {
+        Self {
+            hjb_controller: HJBInventoryController::new(hjb_config),
+            stochastic_config,
+            dynamic_risk_config,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tier1_construction() {
+        let tier1 = Tier1Components::new(
+            AdverseSelectionConfig::default(),
+            QueueConfig::default(),
+            LiquidationConfig::default(),
+        );
+        assert!(!tier1.adverse_selection.is_warmed_up());
+    }
+
+    #[test]
+    fn test_tier2_construction() {
+        let tier2 = Tier2Components::new(
+            HawkesConfig::default(),
+            FundingConfig::default(),
+            SpreadConfig::default(),
+            PnLConfig::default(),
+        );
+        assert!((tier2.pnl_tracker.summary(50000.0).total_pnl).abs() < f64::EPSILON);
+    }
+}

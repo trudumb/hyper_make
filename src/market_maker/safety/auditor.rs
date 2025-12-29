@@ -1,0 +1,290 @@
+//! Safety auditor - extracts safety sync responsibilities into focused methods.
+//!
+//! The auditor provides utility methods for:
+//! - Order cleanup (expired fill windows)
+//! - Stale pending order detection
+//! - Stuck cancel detection
+//! - Exchange state reconciliation
+//! - Dynamic limit updates
+//! - Reduce-only mode status reporting
+
+use std::collections::HashSet;
+use tracing::{debug, warn};
+
+/// Result of a safety audit run.
+#[derive(Debug, Clone)]
+pub struct AuditResult {
+    /// Number of orders cleaned up (expired fill windows)
+    pub orders_cleaned: usize,
+    /// Number of stale pending orders removed
+    pub stale_pending_removed: usize,
+    /// Number of stuck cancel orders detected
+    pub stuck_cancels: usize,
+    /// Number of orphan orders found on exchange (not in local tracking)
+    pub orphan_orders: usize,
+    /// Number of stale local orders removed (not on exchange)
+    pub stale_local_removed: usize,
+    /// Whether local and exchange state are in sync
+    pub is_synced: bool,
+    /// Whether reduce-only mode is active
+    pub reduce_only_active: bool,
+    /// Reason for reduce-only mode (if active)
+    pub reduce_only_reason: Option<String>,
+}
+
+impl Default for AuditResult {
+    fn default() -> Self {
+        Self {
+            orders_cleaned: 0,
+            stale_pending_removed: 0,
+            stuck_cancels: 0,
+            orphan_orders: 0,
+            stale_local_removed: 0,
+            is_synced: true, // Default to synced (no issues)
+            reduce_only_active: false,
+            reduce_only_reason: None,
+        }
+    }
+}
+
+impl AuditResult {
+    /// Create a new audit result.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if any issues were found.
+    pub fn has_issues(&self) -> bool {
+        self.stuck_cancels > 0
+            || self.orphan_orders > 0
+            || self.stale_local_removed > 0
+            || !self.is_synced
+    }
+}
+
+/// Safety auditor - provides utility methods for safety sync.
+///
+/// This struct holds no state - it provides pure functions that operate
+/// on the data passed to them, making them easily testable.
+pub struct SafetyAuditor;
+
+impl SafetyAuditor {
+    /// Analyze reduce-only status.
+    ///
+    /// Returns (is_active, reason) tuple.
+    pub fn check_reduce_only(
+        position: f64,
+        position_value: f64,
+        max_position: f64,
+        max_position_value: f64,
+    ) -> (bool, Option<String>) {
+        let over_position_limit = position.abs() > max_position;
+        let over_value_limit = position_value > max_position_value;
+
+        if !over_position_limit && !over_value_limit {
+            return (false, None);
+        }
+
+        let direction = if position > 0.0 { "long" } else { "short" };
+        let reason = if over_value_limit && over_position_limit {
+            format!(
+                "{}: position={:.4} > {:.4} AND value ${:.2} > ${:.2}",
+                direction,
+                position.abs(),
+                max_position,
+                position_value,
+                max_position_value
+            )
+        } else if over_value_limit {
+            format!(
+                "{}: value ${:.2} > ${:.2} limit",
+                direction, position_value, max_position_value
+            )
+        } else {
+            format!(
+                "{}: position={:.4} > {:.4} limit",
+                direction,
+                position.abs(),
+                max_position
+            )
+        };
+
+        (true, Some(reason))
+    }
+
+    /// Find orphan orders (on exchange but not in local tracking).
+    pub fn find_orphans(exchange_oids: &HashSet<u64>, local_oids: &HashSet<u64>) -> Vec<u64> {
+        exchange_oids
+            .difference(local_oids)
+            .copied()
+            .collect()
+    }
+
+    /// Find stale local orders (in local tracking but not on exchange).
+    ///
+    /// Returns OIDs of orders that should be removed from local tracking.
+    /// Excludes orders in cancel window (CancelPending/CancelConfirmed).
+    pub fn find_stale_local<F>(
+        exchange_oids: &HashSet<u64>,
+        local_oids: &HashSet<u64>,
+        is_in_cancel_window: F,
+    ) -> Vec<u64>
+    where
+        F: Fn(u64) -> bool,
+    {
+        local_oids
+            .difference(exchange_oids)
+            .filter(|oid| !is_in_cancel_window(**oid))
+            .copied()
+            .collect()
+    }
+
+    /// Log orphan orders being cancelled.
+    pub fn log_orphan_cancellation(oid: u64, success: bool) {
+        if success {
+            debug!("[SafetySync] Cancelled orphan order: oid={}", oid);
+        } else {
+            warn!(
+                "[SafetySync] Failed to cancel orphan order: oid={}",
+                oid
+            );
+        }
+    }
+
+    /// Log stale local order removal.
+    pub fn log_stale_removal(oid: u64) {
+        warn!(
+            "[SafetySync] Stale order in tracking (not on exchange): oid={} - removing",
+            oid
+        );
+    }
+
+    /// Log sync status.
+    pub fn log_sync_status(exchange_count: usize, local_active_count: usize, is_synced: bool) {
+        if is_synced {
+            debug!(
+                "[SafetySync] State in sync: {} active orders (exchange matches local)",
+                local_active_count
+            );
+        } else {
+            warn!(
+                "[SafetySync] State mismatch: exchange={}, local_active={}",
+                exchange_count, local_active_count
+            );
+        }
+    }
+
+    /// Log dynamic limit update.
+    pub fn log_dynamic_limit(
+        new_limit: f64,
+        account_value: f64,
+        sigma: f64,
+        sigma_confidence: f64,
+        time_horizon: f64,
+    ) {
+        debug!(
+            "[SafetySync] Dynamic limit: ${:.2} (equity=${:.2}, σ={:.6}, conf={:.2}, T={:.1}s)",
+            new_limit, account_value, sigma, sigma_confidence, time_horizon
+        );
+    }
+
+    /// Log reduce-only mode status.
+    pub fn log_reduce_only_status(is_active: bool, reason: Option<&str>) {
+        if is_active {
+            if let Some(r) = reason {
+                warn!("[SafetySync] REDUCE-ONLY MODE ACTIVE - {}", r);
+            } else {
+                warn!("[SafetySync] REDUCE-ONLY MODE ACTIVE");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reduce_only_under_limits() {
+        let (is_active, reason) = SafetyAuditor::check_reduce_only(
+            0.5,      // position
+            5000.0,   // position_value
+            1.0,      // max_position
+            10000.0,  // max_position_value
+        );
+        assert!(!is_active);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn test_reduce_only_over_position() {
+        let (is_active, reason) = SafetyAuditor::check_reduce_only(
+            1.5,      // position > max
+            7500.0,   // position_value
+            1.0,      // max_position
+            10000.0,  // max_position_value
+        );
+        assert!(is_active);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("position"));
+    }
+
+    #[test]
+    fn test_reduce_only_over_value() {
+        let (is_active, reason) = SafetyAuditor::check_reduce_only(
+            0.5,      // position
+            15000.0,  // position_value > max
+            1.0,      // max_position
+            10000.0,  // max_position_value
+        );
+        assert!(is_active);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("value"));
+    }
+
+    #[test]
+    fn test_reduce_only_both_limits() {
+        let (is_active, reason) = SafetyAuditor::check_reduce_only(
+            -2.0,     // position > max (short)
+            20000.0,  // position_value > max
+            1.0,      // max_position
+            10000.0,  // max_position_value
+        );
+        assert!(is_active);
+        let reason_str = reason.unwrap();
+        assert!(reason_str.contains("short"));
+        assert!(reason_str.contains("AND"));
+    }
+
+    #[test]
+    fn test_find_orphans() {
+        let exchange: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        let local: HashSet<u64> = [2, 3].into_iter().collect();
+
+        let orphans = SafetyAuditor::find_orphans(&exchange, &local);
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.contains(&1) || orphans.contains(&4));
+    }
+
+    #[test]
+    fn test_find_stale_local() {
+        let exchange: HashSet<u64> = [1, 2].into_iter().collect();
+        let local: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+
+        // Simulate order 3 being in cancel window
+        let is_cancel = |oid: u64| oid == 3;
+
+        let stale = SafetyAuditor::find_stale_local(&exchange, &local, is_cancel);
+        assert_eq!(stale.len(), 1);
+        assert!(stale.contains(&4)); // 3 is excluded (in cancel window)
+    }
+
+    #[test]
+    fn test_audit_result_has_issues() {
+        let mut result = AuditResult::new();
+        assert!(!result.has_issues());
+
+        result.stuck_cancels = 1;
+        assert!(result.has_issues());
+    }
+}

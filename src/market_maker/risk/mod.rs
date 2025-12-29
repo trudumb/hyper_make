@@ -31,6 +31,6 @@ mod monitor;
 pub mod monitors;
 mod state;
 
-pub use aggregator::RiskAggregator;
+pub use aggregator::{AggregatedRisk, RiskAggregator};
 pub use monitor::{RiskAction, RiskAssessment, RiskMonitor, RiskMonitorBox, RiskSeverity};
 pub use state::RiskState;

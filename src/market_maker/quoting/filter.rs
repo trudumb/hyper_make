@@ -205,18 +205,20 @@ mod tests {
     use super::*;
 
     fn make_config(position: f64) -> ReduceOnlyConfig {
+        // Set value limit high enough that it won't trigger by default
+        // Position 10 * 50000 = $500k, so set limit to $1M
         ReduceOnlyConfig {
             position,
             max_position: 10.0,
             mid_price: 50000.0,
-            max_position_value: 100000.0, // $100k
+            max_position_value: 1_000_000.0, // $1M (high enough to not trigger)
             asset: "BTC".to_string(),
         }
     }
 
     #[test]
     fn test_no_filtering_when_within_limits() {
-        let config = make_config(5.0); // 5 BTC, value $250k but max_position is 10
+        let config = make_config(5.0); // 5 BTC, under max_position of 10
         let mut bids = vec![Quote::new(49000.0, 0.1)];
         let mut asks = vec![Quote::new(51000.0, 0.1)];
 
@@ -261,19 +263,18 @@ mod tests {
 
     #[test]
     fn test_value_limit_takes_precedence() {
-        // Position value: 5 * 50000 = $250k, over $100k limit
-        let config = make_config(5.0);
+        // Position value: 5 * 50000 = $250k
+        // Set value limit to $100k so it triggers
+        let mut config = make_config(5.0);
+        config.max_position_value = 100_000.0; // Lower than position value
+
         let mut bids = vec![Quote::new(49000.0, 0.1)];
         let mut asks = vec![Quote::new(51000.0, 0.1)];
-
-        // Position value 5 * 50000 = 250k > 100k limit
-        let mut config_over_value = config;
-        config_over_value.max_position_value = 100000.0;
 
         let result = QuoteFilter::apply_reduce_only_ladder(
             &mut bids,
             &mut asks,
-            &config_over_value,
+            &config,
         );
 
         assert!(result.was_filtered);
@@ -282,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_single_quote_filtering() {
-        let config = make_config(15.0);
+        let config = make_config(15.0); // Over max_position of 10
         let mut bid = Some(Quote::new(49000.0, 0.1));
         let mut ask = Some(Quote::new(51000.0, 0.1));
 

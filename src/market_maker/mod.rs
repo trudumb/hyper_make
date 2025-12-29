@@ -27,10 +27,12 @@ mod queue;
 mod reconnection;
 mod spread;
 mod strategy;
+pub mod core;
 pub mod fills;
 pub mod messages;
 pub mod quoting;
 pub mod risk;
+pub mod safety;
 
 pub use adverse_selection::*;
 pub use config::*;
@@ -110,6 +112,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     // === Production Safety ===
     /// Kill switch - emergency shutdown on drawdown/loss/stale data
     kill_switch: KillSwitch,
+    /// Risk aggregator - unified risk evaluation from multiple monitors
+    risk_aggregator: risk::RiskAggregator,
 
     // === Tier 2: Process Models ===
     /// Hawkes order flow estimator - self-exciting trade intensity
@@ -221,7 +225,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
             // Production safety
-            kill_switch: KillSwitch::new(kill_switch_config),
+            kill_switch: KillSwitch::new(kill_switch_config.clone()),
+            // Risk aggregator with monitors from config
+            risk_aggregator: Self::build_risk_aggregator(&kill_switch_config),
             // Tier 2: Process models
             hawkes: HawkesOrderFlowEstimator::new(hawkes_config),
             funding: FundingRateEstimator::new(funding_config),
@@ -452,245 +458,236 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     }
 
     /// Handle a message from subscriptions.
+    /// Main message dispatcher - routes to focused handlers.
     async fn handle_message(&mut self, message: Message) -> Result<()> {
         match message {
-            Message::AllMids(all_mids) => {
-                let mids = all_mids.data.mids;
-                if let Some(mid) = mids.get(&self.config.asset) {
-                    let mid: f64 = mid.parse().map_err(|_| crate::Error::FloatStringParse)?;
-                    self.latest_mid = mid;
-                    self.estimator.on_mid_update(mid);
+            Message::AllMids(all_mids) => self.handle_all_mids(all_mids).await,
+            Message::Trades(trades) => self.handle_trades(trades),
+            Message::UserFills(user_fills) => self.handle_user_fills(user_fills).await,
+            Message::L2Book(l2_book) => self.handle_l2_book(l2_book),
+            _ => Ok(()),
+        }
+    }
 
-                    // === Connection Health: Record data received ===
-                    self.connection_health.record_data_received();
+    /// Handle AllMids message - updates mid price and triggers quote refresh.
+    async fn handle_all_mids(&mut self, all_mids: crate::ws::message_types::AllMids) -> Result<()> {
+        let mids = all_mids.data.mids;
+        let Some(mid) = mids.get(&self.config.asset) else {
+            return Ok(());
+        };
 
-                    // === Tier 1: Update AS estimator (resolves pending fills) ===
-                    self.adverse_selection.update(mid);
+        let mid: f64 = mid.parse().map_err(|_| crate::Error::FloatStringParse)?;
+        self.latest_mid = mid;
+        self.estimator.on_mid_update(mid);
 
-                    // === Tier 1: Update AS signals from estimator ===
-                    self.adverse_selection.update_signals(
-                        self.estimator.sigma_total(),
-                        self.estimator.sigma_clean(),
-                        self.estimator.flow_imbalance(),
-                        self.estimator.jump_ratio(),
-                    );
+        // Connection health tracking
+        self.connection_health.record_data_received();
 
-                    // === Tier 1: Periodic update of liquidation detector ===
-                    self.liquidation_detector.update();
+        // Tier 1: Update AS estimator (resolves pending fills)
+        self.adverse_selection.update(mid);
+        self.adverse_selection.update_signals(
+            self.estimator.sigma_total(),
+            self.estimator.sigma_clean(),
+            self.estimator.flow_imbalance(),
+            self.estimator.jump_ratio(),
+        );
 
-                    // === Stochastic Module: Update HJB controller with current sigma ===
-                    self.hjb_controller.update_sigma(self.estimator.sigma_clean());
+        // Tier 1: Periodic update of liquidation detector
+        self.liquidation_detector.update();
 
-                    // === Stochastic Module: Resolve pending fills for depth-aware AS calibration ===
-                    if self.stochastic_config.calibrate_depth_as {
-                        self.depth_decay_as.resolve_pending_fills(mid);
-                    }
+        // Stochastic modules
+        self.hjb_controller.update_sigma(self.estimator.sigma_clean());
+        if self.stochastic_config.calibrate_depth_as {
+            self.depth_decay_as.resolve_pending_fills(mid);
+        }
 
-                    self.update_quotes().await?;
+        self.update_quotes().await
+    }
+
+    /// Handle Trades message - updates volatility and flow estimates.
+    fn handle_trades(&mut self, trades: crate::ws::message_types::Trades) -> Result<()> {
+        for trade in &trades.data {
+            if trade.coin != self.config.asset {
+                continue;
+            }
+
+            let price: f64 = trade.px.parse().map_err(|_| crate::Error::FloatStringParse)?;
+            let size: f64 = trade.sz.parse().map_err(|_| crate::Error::FloatStringParse)?;
+
+            // Data quality validation
+            if let Err(anomaly) = self.data_quality.check_trade(
+                &self.config.asset,
+                0,
+                trade.time,
+                price,
+                size,
+                self.latest_mid,
+            ) {
+                warn!(anomaly = %anomaly, price = %price, size = %size, "Trade quality issue");
+                self.prometheus.record_data_quality_issue();
+                continue;
+            }
+
+            let is_buy_aggressor = trade.side == "B";
+            self.estimator.on_trade(trade.time, price, size, Some(is_buy_aggressor));
+            self.hawkes.record_trade(is_buy_aggressor, size);
+        }
+
+        // Warmup progress logging
+        self.log_warmup_progress();
+
+        Ok(())
+    }
+
+    /// Log estimator warmup progress (throttled).
+    fn log_warmup_progress(&mut self) {
+        if self.estimator.is_warmed_up() {
+            return;
+        }
+
+        let (vol_ticks, min_vol, l2_updates, min_l2) = self.estimator.warmup_progress();
+
+        if vol_ticks >= self.last_warmup_log + 5 {
+            info!(
+                "Warming up: {}/{} volume ticks, {}/{} L2 updates",
+                vol_ticks, min_vol, l2_updates, min_l2
+            );
+            self.last_warmup_log = vol_ticks;
+        }
+
+        if vol_ticks >= min_vol && l2_updates >= min_l2 {
+            info!(
+                "Warmup complete! σ={:.6}, κ={:.2}, jump_ratio={:.2}",
+                self.estimator.sigma(),
+                self.estimator.kappa(),
+                self.estimator.jump_ratio()
+            );
+        }
+    }
+
+    /// Handle UserFills message - processes fills through FillProcessor.
+    async fn handle_user_fills(&mut self, user_fills: crate::ws::message_types::UserFills) -> Result<()> {
+        if self.latest_mid < 0.0 {
+            return Ok(()); // Haven't seen mid price yet
+        }
+
+        // Process each fill through the unified processor
+        for fill in user_fills.data.fills {
+            if fill.coin != self.config.asset {
+                continue;
+            }
+
+            let amount: f64 = fill.sz.parse().map_err(|_| crate::Error::FloatStringParse)?;
+            let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
+            let is_buy = fill.side.eq("B");
+
+            let fill_event = fills::FillEvent::new(
+                fill.tid,
+                fill.oid,
+                amount,
+                fill_price,
+                is_buy,
+                self.latest_mid,
+                None,
+                self.config.asset.clone(),
+            );
+
+            let mut fill_state = fills::FillState {
+                position: &mut self.position,
+                orders: &mut self.orders,
+                adverse_selection: &mut self.adverse_selection,
+                depth_decay_as: &mut self.depth_decay_as,
+                queue_tracker: &mut self.queue_tracker,
+                estimator: &mut self.estimator,
+                pnl_tracker: &mut self.pnl_tracker,
+                prometheus: &mut self.prometheus,
+                metrics: &self.metrics,
+                latest_mid: self.latest_mid,
+                asset: &self.config.asset,
+                max_position: self.config.max_position,
+                calibrate_depth_as: self.stochastic_config.calibrate_depth_as,
+            };
+
+            self.fill_processor.process(&fill_event, &mut fill_state);
+        }
+
+        // Cleanup and margin refresh
+        let removed_oids = self.orders.cleanup();
+        for oid in removed_oids {
+            self.queue_tracker.order_removed(oid);
+        }
+
+        const MARGIN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        if self.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
+            if let Err(e) = self.refresh_margin_state().await {
+                warn!(error = %e, "Failed to refresh margin after fill");
+            }
+            self.last_margin_refresh = std::time::Instant::now();
+        }
+
+        self.update_quotes().await
+    }
+
+    /// Handle L2Book message - updates order book metrics.
+    fn handle_l2_book(&mut self, l2_book: crate::ws::message_types::L2Book) -> Result<()> {
+        if l2_book.data.coin != self.config.asset || self.latest_mid <= 0.0 {
+            return Ok(());
+        }
+
+        if l2_book.data.levels.len() < 2 {
+            return Ok(());
+        }
+
+        // Parse L2 levels
+        let bids: Vec<(f64, f64)> = l2_book.data.levels[0]
+            .iter()
+            .filter_map(|level| {
+                let px: f64 = level.px.parse().ok()?;
+                let sz: f64 = level.sz.parse().ok()?;
+                Some((px, sz))
+            })
+            .collect();
+
+        let asks: Vec<(f64, f64)> = l2_book.data.levels[1]
+            .iter()
+            .filter_map(|level| {
+                let px: f64 = level.px.parse().ok()?;
+                let sz: f64 = level.sz.parse().ok()?;
+                Some((px, sz))
+            })
+            .collect();
+
+        // Data quality check for crossed book
+        if let (Some((best_bid, _)), Some((best_ask, _))) = (bids.first(), asks.first()) {
+            if let Err(anomaly) = self.data_quality.check_l2_book(
+                &self.config.asset,
+                0,
+                *best_bid,
+                *best_ask,
+            ) {
+                warn!(anomaly = %anomaly, "L2 book quality issue");
+                self.prometheus.record_data_quality_issue();
+                if matches!(anomaly, AnomalyType::CrossedBook) {
+                    self.prometheus.record_crossed_book();
+                    return Ok(());
                 }
             }
-            Message::Trades(trades) => {
-                // Update volatility estimate from trades (feeds volume clock + flow tracker)
-                for trade in &trades.data {
-                    if trade.coin != self.config.asset {
-                        continue;
-                    }
-                    let price: f64 = trade
-                        .px
-                        .parse()
-                        .map_err(|_| crate::Error::FloatStringParse)?;
-                    let size: f64 = trade
-                        .sz
-                        .parse()
-                        .map_err(|_| crate::Error::FloatStringParse)?;
+        }
 
-                    // === Data Quality: Validate trade price and size ===
-                    if let Err(anomaly) = self.data_quality.check_trade(
-                        &self.config.asset,
-                        0, // No sequence number available
-                        trade.time,
-                        price,
-                        size,
-                        self.latest_mid,
-                    ) {
-                        warn!(anomaly = %anomaly, price = %price, size = %size, "Trade quality issue");
-                        self.prometheus.record_data_quality_issue();
-                        continue; // Skip this trade
-                    }
+        // Update estimator and trackers
+        self.estimator.on_l2_book(&bids, &asks, self.latest_mid);
 
-                    // Determine aggressor side from trade.side: "B" = buy aggressor, "S" = sell
-                    let is_buy_aggressor = trade.side == "B";
-                    // Pass price, size, and aggressor side for volume clock + flow tracking
-                    self.estimator
-                        .on_trade(trade.time, price, size, Some(is_buy_aggressor));
-
-                    // === Tier 2: Feed Hawkes order flow estimator ===
-                    self.hawkes.record_trade(is_buy_aggressor, size);
-                }
-
-                // Log warmup progress (throttled)
-                if !self.estimator.is_warmed_up() {
-                    let (vol_ticks, min_vol, l2_updates, min_l2) = self.estimator.warmup_progress();
-                    // Log every 5 volume ticks
-                    if vol_ticks >= self.last_warmup_log + 5 {
-                        info!(
-                            "Warming up: {}/{} volume ticks, {}/{} L2 updates",
-                            vol_ticks, min_vol, l2_updates, min_l2
-                        );
-                        self.last_warmup_log = vol_ticks;
-                    }
-                    if vol_ticks >= min_vol && l2_updates >= min_l2 {
-                        info!(
-                            "Warmup complete! σ={:.6}, κ={:.2}, jump_ratio={:.2}",
-                            self.estimator.sigma(),
-                            self.estimator.kappa(),
-                            self.estimator.jump_ratio()
-                        );
-                    }
-                }
-            }
-            Message::UserFills(user_fills) => {
-                if self.latest_mid < 0.0 {
-                    return Ok(()); // Haven't seen mid price yet
-                }
-
-                // Process fills through FillProcessor
-                for fill in user_fills.data.fills {
-                    if fill.coin != self.config.asset {
-                        continue;
-                    }
-
-                    // Parse fill data
-                    let amount: f64 = fill
-                        .sz
-                        .parse()
-                        .map_err(|_| crate::Error::FloatStringParse)?;
-                    let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
-                    let is_buy = fill.side.eq("B");
-
-                    // Create FillEvent
-                    let fill_event = fills::FillEvent::new(
-                        fill.tid,
-                        fill.oid,
-                        amount,
-                        fill_price,
-                        is_buy,
-                        self.latest_mid,
-                        None, // Placement price determined by processor
-                        self.config.asset.clone(),
-                    );
-
-                    // Build FillState bundle with mutable references to all modules
-                    let mut fill_state = fills::FillState {
-                        position: &mut self.position,
-                        orders: &mut self.orders,
-                        adverse_selection: &mut self.adverse_selection,
-                        depth_decay_as: &mut self.depth_decay_as,
-                        queue_tracker: &mut self.queue_tracker,
-                        estimator: &mut self.estimator,
-                        pnl_tracker: &mut self.pnl_tracker,
-                        prometheus: &mut self.prometheus,
-                        metrics: &self.metrics,
-                        latest_mid: self.latest_mid,
-                        asset: &self.config.asset,
-                        max_position: self.config.max_position,
-                        calibrate_depth_as: self.stochastic_config.calibrate_depth_as,
-                    };
-
-                    // Process fill through the unified processor
-                    // This handles: dedup, position, order tracking, AS, depth AS,
-                    // estimator, P&L, metrics, queue tracking, and threshold warnings
-                    self.fill_processor.process(&fill_event, &mut fill_state);
-                }
-
-                // Run cleanup cycle - deferred removal of terminal orders
-                // This handles the fill window for cancelled orders
-                let removed_oids = self.orders.cleanup();
-                for oid in removed_oids {
-                    // Now safe to remove from QueueTracker
-                    self.queue_tracker.order_removed(oid);
-                }
-
-                // Throttled margin refresh after fills (every 10 seconds max)
-                // Fixes critical bug: margin was only refreshed at startup and every 60s
-                const MARGIN_REFRESH_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_secs(10);
-                if self.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
-                    if let Err(e) = self.refresh_margin_state().await {
-                        warn!(error = %e, "Failed to refresh margin after fill");
-                    }
-                    self.last_margin_refresh = std::time::Instant::now();
-                }
-
-                // Update quotes after fills
-                self.update_quotes().await?;
-            }
-            Message::L2Book(l2_book) => {
-                // Update kappa estimate from L2 order book
-                if l2_book.data.coin == self.config.asset && self.latest_mid > 0.0 {
-                    // Parse L2 levels: levels[0] = bids, levels[1] = asks
-                    if l2_book.data.levels.len() >= 2 {
-                        let bids: Vec<(f64, f64)> = l2_book.data.levels[0]
-                            .iter()
-                            .filter_map(|level| {
-                                let px: f64 = level.px.parse().ok()?;
-                                let sz: f64 = level.sz.parse().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect();
-
-                        let asks: Vec<(f64, f64)> = l2_book.data.levels[1]
-                            .iter()
-                            .filter_map(|level| {
-                                let px: f64 = level.px.parse().ok()?;
-                                let sz: f64 = level.sz.parse().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect();
-
-                        // === Data Quality: Check for crossed book ===
-                        if let (Some((best_bid, _)), Some((best_ask, _))) =
-                            (bids.first(), asks.first())
-                        {
-                            if let Err(anomaly) = self.data_quality.check_l2_book(
-                                &self.config.asset,
-                                0,
-                                *best_bid,
-                                *best_ask,
-                            ) {
-                                warn!(anomaly = %anomaly, "L2 book quality issue");
-                                self.prometheus.record_data_quality_issue();
-                                if matches!(anomaly, AnomalyType::CrossedBook) {
-                                    self.prometheus.record_crossed_book();
-                                    // Skip processing crossed book
-                                    return Ok(());
-                                }
-                            }
-                        }
-
-                        self.estimator.on_l2_book(&bids, &asks, self.latest_mid);
-
-                        // === Tier 1: Update queue tracker with best bid/ask ===
-                        if let (Some((best_bid, _)), Some((best_ask, _))) =
-                            (bids.first(), asks.first())
-                        {
-                            self.queue_tracker.update_from_book(
-                                *best_bid,
-                                *best_ask,
-                                self.estimator.sigma_clean(),
-                            );
-
-                            // === Tier 2: Update spread tracker from L2 book ===
-                            self.spread_tracker.update(
-                                *best_bid,
-                                *best_ask,
-                                self.estimator.sigma_clean(), // volatility
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {}
+        if let (Some((best_bid, _)), Some((best_ask, _))) = (bids.first(), asks.first()) {
+            self.queue_tracker.update_from_book(
+                *best_bid,
+                *best_ask,
+                self.estimator.sigma_clean(),
+            );
+            self.spread_tracker.update(
+                *best_bid,
+                *best_ask,
+                self.estimator.sigma_clean(),
+            );
         }
 
         Ok(())
@@ -1332,104 +1329,78 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     async fn safety_sync(&mut self) -> Result<()> {
         debug!("Running safety sync...");
 
-        // === Run cleanup first to expire any fill windows ===
+        // === Step 1: Order cleanup ===
         let cleaned = self.orders.cleanup();
         for oid in cleaned {
             self.queue_tracker.order_removed(oid);
         }
 
-        // === Cleanup stale pending orders ===
-        // Pending orders should be finalized within milliseconds. If they're still
-        // pending after 5 seconds, the API call failed or something went wrong.
+        // === Step 2: Stale pending cleanup ===
         let stale_pending = self
             .orders
             .cleanup_stale_pending(std::time::Duration::from_secs(5));
         if stale_pending > 0 {
-            warn!(
-                "[SafetySync] Cleaned up {} stale pending orders",
-                stale_pending
-            );
+            warn!("[SafetySync] Cleaned up {} stale pending orders", stale_pending);
         }
 
-        // === Check for stuck cancels ===
+        // === Step 3: Stuck cancel check ===
         let stuck = self.orders.check_stuck_cancels();
         if !stuck.is_empty() {
             warn!("[SafetySync] Stuck cancel orders detected: {:?}", stuck);
         }
 
-        // === Update margin state from user account ===
+        // === Step 4: Margin refresh ===
         if let Err(e) = self.refresh_margin_state().await {
             warn!("Failed to refresh margin state: {e}");
         }
-        // Reset throttle timer to avoid double-refresh from fill handler
         self.last_margin_refresh = std::time::Instant::now();
 
-        // Query open orders from exchange
+        // === Step 5: Exchange reconciliation ===
         let exchange_orders = self.info_client.open_orders(self.user_address).await?;
         let exchange_oids: HashSet<u64> = exchange_orders
             .iter()
             .filter(|o| o.coin == self.config.asset)
             .map(|o| o.oid)
             .collect();
-
         let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
 
-        // Check for orphaned orders on exchange (exist on exchange but not in local tracking)
-        for oid in exchange_oids.difference(&local_oids) {
-            warn!(
-                "[SafetySync] Orphan order detected on exchange: oid={} - cancelling",
-                oid
-            );
-            let cancel_result = self.executor.cancel_order(&self.config.asset, *oid).await;
-            if cancel_result.order_is_gone() {
-                info!("[SafetySync] Cancelled orphan order: oid={}", oid);
-            }
+        // Cancel orphan orders (on exchange but not tracked locally)
+        let orphans = safety::SafetyAuditor::find_orphans(&exchange_oids, &local_oids);
+        for oid in orphans {
+            warn!("[SafetySync] Orphan order detected: oid={} - cancelling", oid);
+            let cancel_result = self.executor.cancel_order(&self.config.asset, oid).await;
+            safety::SafetyAuditor::log_orphan_cancellation(oid, cancel_result.order_is_gone());
         }
 
-        // Check for stale orders in tracking (exist locally but not on exchange)
-        // IMPORTANT: Don't remove orders that are in cancel/fill window - they may be waiting for late fills
-        for oid in local_oids.difference(&exchange_oids) {
-            if let Some(order) = self.orders.get_order(*oid) {
-                // Don't remove if still in cancel/fill window
-                if matches!(
-                    order.state,
-                    OrderState::CancelPending | OrderState::CancelConfirmed
-                ) {
-                    debug!("[SafetySync] Order {} in cancel window - not removing", oid);
-                    continue;
-                }
-            }
-
-            warn!(
-                "[SafetySync] Stale order in tracking (not on exchange): oid={} - removing",
-                oid
-            );
-            self.orders.remove_order(*oid);
-            self.queue_tracker.order_removed(*oid); // Tier 1: Remove from queue tracking
+        // Remove stale local orders (tracked but not on exchange)
+        let is_in_cancel_window = |oid: u64| {
+            self.orders
+                .get_order(oid)
+                .map(|o| matches!(o.state, OrderState::CancelPending | OrderState::CancelConfirmed))
+                .unwrap_or(false)
+        };
+        let stale_local = safety::SafetyAuditor::find_stale_local(
+            &exchange_oids,
+            &local_oids,
+            is_in_cancel_window,
+        );
+        for oid in stale_local {
+            safety::SafetyAuditor::log_stale_removal(oid);
+            self.orders.remove_order(oid);
+            self.queue_tracker.order_removed(oid);
         }
 
-        // Log if everything is in sync (excluding orders in cancel window)
+        // Log sync status
         let active_local_oids: HashSet<u64> = self
             .orders
             .order_ids()
             .into_iter()
-            .filter(|oid| {
-                self.orders
-                    .get_order(*oid)
-                    .map(|o| o.is_active())
-                    .unwrap_or(false)
-            })
+            .filter(|oid| self.orders.get_order(*oid).map(|o| o.is_active()).unwrap_or(false))
             .collect();
+        let is_synced = exchange_oids == active_local_oids;
+        safety::SafetyAuditor::log_sync_status(exchange_oids.len(), active_local_oids.len(), is_synced);
 
-        if exchange_oids == active_local_oids {
-            debug!(
-                "[SafetySync] State in sync: {} active orders (exchange matches local)",
-                active_local_oids.len()
-            );
-        }
-
-        // === Dynamic Position Limit Update ===
-        // Update max_position_value based on current equity, volatility, and confidence
+        // === Step 6: Dynamic limit update ===
         let account_value = self.margin_sizer.state().account_value;
         let sigma = self.estimator.sigma_clean();
         let sigma_confidence = self.estimator.sigma_confidence();
@@ -1443,50 +1414,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 sigma_confidence,
                 &self.dynamic_risk_config,
             );
-
             self.kill_switch.update_dynamic_limit(new_limit);
-
-            debug!(
-                "[SafetySync] Dynamic limit: ${:.2} (equity=${:.2}, σ={:.6}, conf={:.2}, T={:.1}s)",
-                new_limit, account_value, sigma, sigma_confidence, time_horizon
+            safety::SafetyAuditor::log_dynamic_limit(
+                new_limit,
+                account_value,
+                sigma,
+                sigma_confidence,
+                time_horizon,
             );
         }
 
-        // Log reduce-only mode status
+        // === Step 7: Reduce-only status ===
         let position = self.position.position();
         let position_value = position.abs() * self.latest_mid;
         let max_position_value = self.kill_switch.max_position_value();
 
-        let over_position_limit = position.abs() > self.config.max_position;
-        let over_value_limit = position_value > max_position_value;
-
-        if over_position_limit || over_value_limit {
-            let direction = if position > 0.0 { "long" } else { "short" };
-            let reason = if over_value_limit && over_position_limit {
-                format!(
-                    "position={:.4} > {:.4} contracts AND value ${:.2} > ${:.2}",
-                    position.abs(),
-                    self.config.max_position,
-                    position_value,
-                    max_position_value
-                )
-            } else if over_value_limit {
-                format!(
-                    "value ${:.2} > ${:.2} limit",
-                    position_value, max_position_value
-                )
-            } else {
-                format!(
-                    "position={:.4} > {:.4} limit",
-                    position.abs(),
-                    self.config.max_position
-                )
-            };
-            warn!(
-                "[SafetySync] REDUCE-ONLY MODE ACTIVE ({}) - {}",
-                direction, reason
-            );
-        }
+        let (reduce_only, reason) = safety::SafetyAuditor::check_reduce_only(
+            position,
+            position_value,
+            self.config.max_position,
+            max_position_value,
+        );
+        safety::SafetyAuditor::log_reduce_only_status(reduce_only, reason.as_deref());
 
         Ok(())
     }
@@ -1637,6 +1586,47 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if let Some(reason) = self.kill_switch.check(&state) {
             warn!("Kill switch condition detected: {}", reason);
         }
+
+        // Evaluate using RiskAggregator for unified risk assessment
+        let risk_state = self.build_risk_state();
+        let aggregated = self.risk_aggregator.evaluate(&risk_state);
+
+        if aggregated.should_kill() {
+            error!(
+                reasons = ?aggregated.kill_reasons,
+                "RiskAggregator kill condition triggered"
+            );
+        } else if aggregated.max_severity >= risk::RiskSeverity::High {
+            warn!(
+                summary = %aggregated.summary(),
+                "High risk detected by RiskAggregator"
+            );
+        }
+    }
+
+    /// Build RiskAggregator with monitors from kill switch configuration.
+    fn build_risk_aggregator(config: &KillSwitchConfig) -> risk::RiskAggregator {
+        use risk::monitors::*;
+
+        // Default cascade thresholds (pull at 0.8, kill at 0.95)
+        const DEFAULT_CASCADE_PULL: f64 = 0.8;
+        const DEFAULT_CASCADE_KILL: f64 = 0.95;
+
+        risk::RiskAggregator::new()
+            .with_monitor(Box::new(LossMonitor::new(config.max_daily_loss)))
+            .with_monitor(Box::new(DrawdownMonitor::new(config.max_drawdown / 100.0)))
+            .with_monitor(Box::new(PositionMonitor::new()))
+            .with_monitor(Box::new(DataStalenessMonitor::new(config.stale_data_threshold)))
+            .with_monitor(Box::new(CascadeMonitor::new(DEFAULT_CASCADE_PULL, DEFAULT_CASCADE_KILL)))
+            .with_monitor(Box::new(RateLimitMonitor::new(config.max_rate_limit_errors)))
+    }
+
+    /// Evaluate risk using the unified RiskAggregator.
+    ///
+    /// Returns an aggregated risk assessment from all monitors.
+    pub fn evaluate_risk(&self) -> risk::AggregatedRisk {
+        let state = self.build_risk_state();
+        self.risk_aggregator.evaluate(&state)
     }
 }
 
