@@ -30,6 +30,16 @@ struct MetricsInner {
     max_position: AtomicF64,
     /// Inventory utilization (position / max_position)
     inventory_utilization: AtomicF64,
+    /// Pending bid exposure (total remaining size on buy orders)
+    pending_bid_exposure: AtomicF64,
+    /// Pending ask exposure (total remaining size on sell orders)
+    pending_ask_exposure: AtomicF64,
+    /// Net pending change (bid - ask exposure)
+    net_pending_change: AtomicF64,
+    /// Worst-case max position if all bids fill
+    worst_case_max_position: AtomicF64,
+    /// Worst-case min position if all asks fill
+    worst_case_min_position: AtomicF64,
 
     // === P&L Metrics ===
     /// Daily P&L in USD
@@ -157,6 +167,11 @@ impl PrometheusMetrics {
                 position: AtomicF64::new(0.0),
                 max_position: AtomicF64::new(0.0),
                 inventory_utilization: AtomicF64::new(0.0),
+                pending_bid_exposure: AtomicF64::new(0.0),
+                pending_ask_exposure: AtomicF64::new(0.0),
+                net_pending_change: AtomicF64::new(0.0),
+                worst_case_max_position: AtomicF64::new(0.0),
+                worst_case_min_position: AtomicF64::new(0.0),
                 daily_pnl: AtomicF64::new(0.0),
                 peak_pnl: AtomicF64::new(0.0),
                 drawdown_pct: AtomicF64::new(0.0),
@@ -222,6 +237,24 @@ impl PrometheusMetrics {
             0.0
         };
         self.inner.inventory_utilization.store(utilization);
+    }
+
+    /// Update pending exposure metrics.
+    ///
+    /// # Arguments
+    /// - `bid_exposure`: Total remaining size on buy orders
+    /// - `ask_exposure`: Total remaining size on sell orders
+    /// - `position`: Current position (for worst-case calculation)
+    pub fn update_pending_exposure(&self, bid_exposure: f64, ask_exposure: f64, position: f64) {
+        self.inner.pending_bid_exposure.store(bid_exposure);
+        self.inner.pending_ask_exposure.store(ask_exposure);
+        self.inner.net_pending_change.store(bid_exposure - ask_exposure);
+        self.inner
+            .worst_case_max_position
+            .store(position + bid_exposure);
+        self.inner
+            .worst_case_min_position
+            .store(position - ask_exposure);
     }
 
     // === P&L Updates ===
@@ -452,6 +485,47 @@ impl PrometheusMetrics {
              mm_inventory_utilization{{{}}} {}\n",
             labels,
             self.inner.inventory_utilization.load()
+        ));
+
+        // Pending exposure metrics
+        output.push_str(&format!(
+            "# HELP mm_pending_bid_exposure Total remaining size on buy orders\n\
+             # TYPE mm_pending_bid_exposure gauge\n\
+             mm_pending_bid_exposure{{{}}} {}\n",
+            labels,
+            self.inner.pending_bid_exposure.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_pending_ask_exposure Total remaining size on sell orders\n\
+             # TYPE mm_pending_ask_exposure gauge\n\
+             mm_pending_ask_exposure{{{}}} {}\n",
+            labels,
+            self.inner.pending_ask_exposure.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_net_pending_change Net pending exposure (bid - ask)\n\
+             # TYPE mm_net_pending_change gauge\n\
+             mm_net_pending_change{{{}}} {}\n",
+            labels,
+            self.inner.net_pending_change.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_worst_case_max_position Worst-case max position if all bids fill\n\
+             # TYPE mm_worst_case_max_position gauge\n\
+             mm_worst_case_max_position{{{}}} {}\n",
+            labels,
+            self.inner.worst_case_max_position.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_worst_case_min_position Worst-case min position if all asks fill\n\
+             # TYPE mm_worst_case_min_position gauge\n\
+             mm_worst_case_min_position{{{}}} {}\n",
+            labels,
+            self.inner.worst_case_min_position.load()
         ));
 
         // P&L metrics

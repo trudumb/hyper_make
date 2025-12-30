@@ -479,6 +479,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.tier1.adverse_selection.realized_as_bps(),
                         self.tier1.liquidation_detector.tail_risk_multiplier(),
                     );
+                    let (bid_exp, ask_exp) = self.orders.pending_exposure();
+                    self.infra.prometheus.update_pending_exposure(
+                        bid_exp,
+                        ask_exp,
+                        self.position.position(),
+                    );
 
                     // === Update connection health metrics ===
                     let connected = self.infra.connection_health.state() == ConnectionState::Healthy;
@@ -1654,6 +1660,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         .with_adverse_selection(
             self.tier1.adverse_selection.realized_as_bps(),
             self.tier1.adverse_selection.predicted_alpha(),
+        )
+        .with_pending_exposure(
+            self.orders.pending_exposure().0,
+            self.orders.pending_exposure().1,
         )
     }
 

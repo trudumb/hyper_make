@@ -116,6 +116,34 @@ impl RiskMonitor for PositionMonitor {
             .with_threshold(state.max_position);
         }
 
+        // Check worst-case positions from pending exposure
+        // This warns if all resting orders filling would breach limits
+        if state.worst_case_exceeds_limits() {
+            let breach_side = if state.worst_case_exceeds_long_limit() {
+                "long"
+            } else {
+                "short"
+            };
+            let worst_position = if state.worst_case_exceeds_long_limit() {
+                state.worst_case_max_position
+            } else {
+                state.worst_case_min_position
+            };
+            return RiskAssessment::warn(
+                self.name(),
+                format!(
+                    "Worst-case {} position {:.6} would exceed limit {:.6} (pending bid={:.6}, ask={:.6})",
+                    breach_side,
+                    worst_position.abs(),
+                    state.max_position,
+                    state.pending_bid_exposure,
+                    state.pending_ask_exposure
+                ),
+            )
+            .with_metric(worst_position.abs())
+            .with_threshold(state.max_position);
+        }
+
         RiskAssessment::ok(self.name())
     }
 
@@ -193,5 +221,41 @@ mod tests {
         let assessment = monitor.evaluate(&state);
         assert_eq!(assessment.severity, RiskSeverity::Critical);
         assert!(assessment.should_kill());
+    }
+
+    #[test]
+    fn test_worst_case_position_warning() {
+        let monitor = PositionMonitor::new();
+        // Currently at 50% utilization but pending orders would exceed
+        let state = RiskState {
+            position: 0.5,
+            max_position: 1.0,
+            position_value: 5000.0,
+            max_position_value: 10000.0,
+            ..Default::default()
+        }
+        .with_pending_exposure(0.7, 0.2); // Would go to 1.2 long if all bids fill
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::Medium);
+        assert!(assessment.description.contains("Worst-case"));
+        assert!(assessment.description.contains("long"));
+    }
+
+    #[test]
+    fn test_worst_case_position_ok() {
+        let monitor = PositionMonitor::new();
+        // Pending orders won't exceed limits
+        let state = RiskState {
+            position: 0.5,
+            max_position: 1.0,
+            position_value: 5000.0,
+            max_position_value: 10000.0,
+            ..Default::default()
+        }
+        .with_pending_exposure(0.3, 0.2); // Would go to 0.8 long max
+
+        let assessment = monitor.evaluate(&state);
+        assert_eq!(assessment.severity, RiskSeverity::None);
     }
 }

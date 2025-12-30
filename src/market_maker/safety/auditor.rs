@@ -192,6 +192,53 @@ impl SafetyAuditor {
             }
         }
     }
+
+    /// Analyze pending exposure risk.
+    ///
+    /// Returns a warning message if worst-case positions would breach limits.
+    pub fn check_pending_exposure_risk(
+        position: f64,
+        pending_bid_exposure: f64,
+        pending_ask_exposure: f64,
+        max_position: f64,
+    ) -> Option<String> {
+        let worst_case_long = position + pending_bid_exposure;
+        let worst_case_short = position - pending_ask_exposure;
+
+        let exceeds_long = worst_case_long > max_position;
+        let exceeds_short = worst_case_short < -max_position;
+
+        if exceeds_long && exceeds_short {
+            Some(format!(
+                "Worst-case positions would breach limits on BOTH sides: \
+                 long={:.4} short={:.4} (limit=±{:.4})",
+                worst_case_long,
+                worst_case_short.abs(),
+                max_position
+            ))
+        } else if exceeds_long {
+            Some(format!(
+                "Worst-case LONG position {:.4} would exceed limit {:.4} \
+                 (pending_bid={:.4})",
+                worst_case_long, max_position, pending_bid_exposure
+            ))
+        } else if exceeds_short {
+            Some(format!(
+                "Worst-case SHORT position {:.4} would exceed limit {:.4} \
+                 (pending_ask={:.4})",
+                worst_case_short.abs(),
+                max_position,
+                pending_ask_exposure
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Log pending exposure risk warning.
+    pub fn log_pending_exposure_warning(warning: &str) {
+        warn!("[SafetySync] PENDING EXPOSURE WARNING: {}", warning);
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +327,59 @@ mod tests {
 
         result.stuck_cancels = 1;
         assert!(result.has_issues());
+    }
+
+    // === Pending Exposure Tests ===
+
+    #[test]
+    fn test_pending_exposure_within_limits() {
+        let warning = SafetyAuditor::check_pending_exposure_risk(
+            0.5,  // position
+            0.3,  // pending_bid
+            0.2,  // pending_ask
+            1.0,  // max_position
+        );
+        assert!(warning.is_none()); // 0.5 + 0.3 = 0.8 < 1.0
+    }
+
+    #[test]
+    fn test_pending_exposure_exceeds_long() {
+        let warning = SafetyAuditor::check_pending_exposure_risk(
+            0.5,  // position
+            0.7,  // pending_bid - would exceed
+            0.2,  // pending_ask
+            1.0,  // max_position
+        );
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("LONG"));
+        assert!(msg.contains("1.2")); // 0.5 + 0.7
+    }
+
+    #[test]
+    fn test_pending_exposure_exceeds_short() {
+        let warning = SafetyAuditor::check_pending_exposure_risk(
+            -0.5, // position (short)
+            0.2,  // pending_bid
+            0.7,  // pending_ask - would exceed
+            1.0,  // max_position
+        );
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("SHORT"));
+        assert!(msg.contains("1.2")); // |-0.5 - 0.7| = 1.2
+    }
+
+    #[test]
+    fn test_pending_exposure_exceeds_both() {
+        let warning = SafetyAuditor::check_pending_exposure_risk(
+            0.0,  // neutral position
+            1.5,  // pending_bid - would exceed long
+            1.5,  // pending_ask - would exceed short
+            1.0,  // max_position
+        );
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("BOTH"));
     }
 }
