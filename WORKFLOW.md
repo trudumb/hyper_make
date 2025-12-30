@@ -207,12 +207,12 @@ base_url = "testnet"  # mainnet, testnet, localhost
 # private_key = "..."  # Prefer env var HYPERLIQUID_PRIVATE_KEY
 
 [trading]
-asset = "ETH"
-target_liquidity = 0.25          # Size per side
-risk_aversion = 0.5              # γ: 0.1 (aggressive) to 2.0 (conservative)
-max_bps_diff = 2                 # Max deviation before requoting
-max_absolute_position_size = 0.5 # Position limit
-leverage = 20                    # Optional: uses max if not set
+asset = "BTC"                         # Most liquid, tightest spreads
+target_liquidity = 0.01               # ~$1K per side (capped by equity)
+risk_aversion = 0.3                   # γ: 0.1 (aggressive) to 1.0 (conservative)
+max_bps_diff = 5                      # Requote threshold (5 bps reduces churn)
+max_absolute_position_size = 0.05     # ~$5K max (capped by equity)
+# leverage = 20                       # Optional: uses max available if not set
 
 [strategy]
 strategy_type = "ladder"         # symmetric, inventory_aware, glft, ladder
@@ -239,11 +239,16 @@ enable_http_metrics = true
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `risk_aversion` | 0.5 | γ - controls spread width and inventory skew |
-| `target_liquidity` | 0.25 | Order size per side |
-| `max_absolute_position_size` | 0.5 | Position limit (triggers reduce-only mode) |
-| `max_bps_diff` | 2 | Price deviation threshold for requoting |
+| `asset` | BTC | Most liquid crypto, best for market making |
+| `target_liquidity` | 0.01 | Order size per side (~$1K notional) |
+| `risk_aversion` | 0.3 | γ - matches RiskConfig.gamma_base |
+| `max_bps_diff` | 5 | Price deviation threshold (5 bps reduces churn) |
+| `max_absolute_position_size` | 0.05 | Position limit (~$5K, below kill switch) |
 | `min_trades` | 50 | Warmup trades before quoting begins |
+
+**Note**: `target_liquidity` and `max_position` are **maximums** capped at runtime:
+- `max_position` ≤ `(account_value × leverage × 0.5) / price`
+- `target_liquidity` ≤ `max_position × 0.4`
 
 ---
 
@@ -252,18 +257,24 @@ enable_http_metrics = true
 ### Basic Commands
 
 ```bash
-# Run with defaults (reads market_maker.toml)
+# Run with defaults (BTC on testnet, reads market_maker.toml)
 cargo run --bin market_maker
 
 # Run with specific asset
-cargo run --bin market_maker -- --asset BTC
+cargo run --bin market_maker -- --asset ETH
 
 # Run with debug logging
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker
 
 # Run with debug logging and log file
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker -- \
-  --asset BTC --log-file mm.log
+  --log-file mm.log
+
+# Check account status (position, balance, orders)
+cargo run --bin market_maker -- status
+
+# Dry run - validate everything without placing orders
+cargo run --bin market_maker -- --dry-run
 
 # Validate configuration without running
 cargo run --bin market_maker -- validate-config
@@ -272,12 +283,21 @@ cargo run --bin market_maker -- validate-config
 cargo run --bin market_maker -- --help
 ```
 
+### Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `status` | Show account status (position, balance, open orders) |
+| `validate-config` | Validate configuration file without running |
+| `generate-config` | Generate sample configuration file |
+| `run` | Run the market maker (default) |
+
 ### CLI Options
 
 | Option | Description |
 |--------|-------------|
 | `--config <path>` | Config file path (default: market_maker.toml) |
-| `--asset <symbol>` | Override asset (e.g., BTC, ETH) |
+| `--asset <symbol>` | Override asset (default: BTC) |
 | `--target-liquidity <f64>` | Override liquidity per side |
 | `--risk-aversion <f64>` | Override gamma parameter |
 | `--max-position <f64>` | Override position limit |
@@ -286,6 +306,7 @@ cargo run --bin market_maker -- --help
 | `--log-level <level>` | trace, debug, info, warn, error |
 | `--log-file <path>` | Log to file (also logs to stdout) |
 | `--metrics-port <port>` | Prometheus metrics port (0 to disable) |
+| `--dry-run` | Validate everything without placing orders |
 
 ### Production Run Example
 
@@ -294,7 +315,7 @@ cargo run --bin market_maker -- --help
 RUST_LOG=hyperliquid_rust_sdk::market_maker=info \
 cargo run --release --bin market_maker -- \
   --config production.toml \
-  --asset ETH \
+  --asset BTC \
   --network mainnet \
   --log-file /var/log/market_maker.log \
   --metrics-port 9090
@@ -569,8 +590,17 @@ cargo run --bin market_maker -- generate-config
 # Validate config
 cargo run --bin market_maker -- validate-config
 
-# Run testnet
-cargo run --bin market_maker -- --asset ETH --network testnet
+# Check account status
+cargo run --bin market_maker -- status
+
+# Dry run (validate without trading)
+cargo run --bin market_maker -- --dry-run
+
+# Run (default: BTC on testnet)
+cargo run --bin market_maker
+
+# Run with specific asset
+cargo run --bin market_maker -- --asset ETH
 
 # Run mainnet (production)
 RUST_LOG=info cargo run --release --bin market_maker -- \

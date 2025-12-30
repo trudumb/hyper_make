@@ -39,7 +39,10 @@
       "Bash(cargo check:*)",
       "Bash(tree:*)",
       "Skill(sc:analyze)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 180 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk=debug timeout 90 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=info timeout 90 cargo run:*)"
     ]
   }
 }

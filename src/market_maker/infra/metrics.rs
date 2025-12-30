@@ -101,6 +101,16 @@ struct MetricsInner {
     /// Current volatility regime (0=Low, 1=Normal, 2=High, 3=Extreme)
     volatility_regime: AtomicU64,
 
+    // === Kelly-Stochastic Metrics ===
+    /// Whether Kelly-Stochastic allocation is enabled (1 = enabled, 0 = disabled)
+    kelly_stochastic_enabled: AtomicU64,
+    /// Calibrated alpha (informed probability) at touch [0, 1]
+    kelly_alpha_touch: AtomicF64,
+    /// Current Kelly fraction being used [0, 1]
+    kelly_fraction: AtomicF64,
+    /// Characteristic depth for alpha decay in bps
+    kelly_alpha_decay_bps: AtomicF64,
+
     // === Connection Health Metrics ===
     /// WebSocket connected (1 = connected, 0 = disconnected)
     websocket_connected: AtomicU64,
@@ -157,6 +167,11 @@ impl PrometheusMetrics {
                 data_staleness_secs: AtomicF64::new(0.0),
                 quote_cycle_latency_ms: AtomicF64::new(0.0),
                 volatility_regime: AtomicU64::new(1), // Normal
+                // Kelly-Stochastic defaults
+                kelly_stochastic_enabled: AtomicU64::new(0),
+                kelly_alpha_touch: AtomicF64::new(0.15),    // Default 15%
+                kelly_fraction: AtomicF64::new(0.25),       // Default quarter Kelly
+                kelly_alpha_decay_bps: AtomicF64::new(10.0), // Default 10 bps
                 websocket_connected: AtomicU64::new(0),
                 last_trade_age_ms: AtomicU64::new(0),
                 last_book_age_ms: AtomicU64::new(0),
@@ -284,6 +299,24 @@ impl PrometheusMetrics {
         self.inner
             .volatility_regime
             .store(regime, Ordering::Relaxed);
+    }
+
+    // === Kelly-Stochastic Updates ===
+
+    /// Update Kelly-Stochastic allocation metrics.
+    pub fn update_kelly_stochastic(
+        &self,
+        enabled: bool,
+        alpha_touch: f64,
+        kelly_fraction: f64,
+        alpha_decay_bps: f64,
+    ) {
+        self.inner
+            .kelly_stochastic_enabled
+            .store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
+        self.inner.kelly_alpha_touch.store(alpha_touch);
+        self.inner.kelly_fraction.store(kelly_fraction);
+        self.inner.kelly_alpha_decay_bps.store(alpha_decay_bps);
     }
 
     // === Connection Health Updates ===
@@ -500,6 +533,39 @@ impl PrometheusMetrics {
             self.inner.volatility_regime.load(Ordering::Relaxed)
         ));
 
+        // Kelly-Stochastic metrics
+        output.push_str(&format!(
+            "# HELP mm_kelly_stochastic_enabled Kelly-Stochastic allocation enabled (1=enabled)\n\
+             # TYPE mm_kelly_stochastic_enabled gauge\n\
+             mm_kelly_stochastic_enabled{{{}}} {}\n",
+            labels,
+            self.inner.kelly_stochastic_enabled.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_kelly_alpha_touch Calibrated informed probability at touch [0,1]\n\
+             # TYPE mm_kelly_alpha_touch gauge\n\
+             mm_kelly_alpha_touch{{{}}} {:.4}\n",
+            labels,
+            self.inner.kelly_alpha_touch.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_kelly_fraction Current Kelly fraction [0,1]\n\
+             # TYPE mm_kelly_fraction gauge\n\
+             mm_kelly_fraction{{{}}} {:.4}\n",
+            labels,
+            self.inner.kelly_fraction.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_kelly_alpha_decay_bps Alpha decay characteristic depth in bps\n\
+             # TYPE mm_kelly_alpha_decay_bps gauge\n\
+             mm_kelly_alpha_decay_bps{{{}}} {:.2}\n",
+            labels,
+            self.inner.kelly_alpha_decay_bps.load()
+        ));
+
         // Connection health metrics
         output.push_str(&format!(
             "# HELP mm_websocket_connected WebSocket connection status (1=connected)\n\
@@ -622,6 +688,23 @@ impl PrometheusMetrics {
             "crossed_book_incidents".to_string(),
             self.inner.crossed_book_incidents.load(Ordering::Relaxed) as f64,
         );
+        // Kelly-Stochastic metrics
+        map.insert(
+            "kelly_stochastic_enabled".to_string(),
+            self.inner.kelly_stochastic_enabled.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "kelly_alpha_touch".to_string(),
+            self.inner.kelly_alpha_touch.load(),
+        );
+        map.insert(
+            "kelly_fraction".to_string(),
+            self.inner.kelly_fraction.load(),
+        );
+        map.insert(
+            "kelly_alpha_decay_bps".to_string(),
+            self.inner.kelly_alpha_decay_bps.load(),
+        );
 
         map
     }
@@ -651,6 +734,12 @@ impl PrometheusMetrics {
             data_quality_issues_total: self.inner.data_quality_issues_total.load(Ordering::Relaxed),
             message_loss_count: self.inner.message_loss_count.load(Ordering::Relaxed),
             crossed_book_incidents: self.inner.crossed_book_incidents.load(Ordering::Relaxed),
+            // Kelly-Stochastic
+            kelly_stochastic_enabled: self.inner.kelly_stochastic_enabled.load(Ordering::Relaxed)
+                == 1,
+            kelly_alpha_touch: self.inner.kelly_alpha_touch.load(),
+            kelly_fraction: self.inner.kelly_fraction.load(),
+            kelly_alpha_decay_bps: self.inner.kelly_alpha_decay_bps.load(),
         }
     }
 }
@@ -720,6 +809,11 @@ pub struct MetricsSummary {
     pub data_quality_issues_total: u64,
     pub message_loss_count: u64,
     pub crossed_book_incidents: u64,
+    // Kelly-Stochastic
+    pub kelly_stochastic_enabled: bool,
+    pub kelly_alpha_touch: f64,
+    pub kelly_fraction: f64,
+    pub kelly_alpha_decay_bps: f64,
 }
 
 // ============================================================================

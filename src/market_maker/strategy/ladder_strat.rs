@@ -7,7 +7,8 @@ use crate::EPSILON;
 use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
 use crate::market_maker::quoting::{
-    ConstrainedLadderOptimizer, Ladder, LadderConfig, LadderParams, LevelOptimizationParams,
+    ConstrainedLadderOptimizer, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
+    LevelOptimizationParams,
 };
 
 use super::{MarketParams, QuotingStrategy, RiskConfig};
@@ -217,28 +218,56 @@ impl LadderStrategy {
                         &params,
                         self.ladder_config.fees_bps,
                     );
+                    let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
                     LevelOptimizationParams {
                         depth_bps: level.depth_bps,
                         fill_intensity,
                         spread_capture,
                         margin_per_unit: market_params.microprice / leverage,
+                        adverse_selection,
                     }
                 })
                 .collect();
 
-            // 5. Optimize bid sizes
+            // 5. Optimize bid sizes (use Kelly-Stochastic if enabled)
             if !bid_level_params.is_empty() {
-                let allocation = optimizer.optimize(&bid_level_params);
+                let allocation = if market_params.use_kelly_stochastic {
+                    // Apply volatility regime adjustment to Kelly fraction
+                    // High vol → more conservative (lower Kelly)
+                    // Low vol → more aggressive (higher Kelly)
+                    let regime_multiplier = market_params.volatility_regime.kelly_fraction_multiplier();
+                    let dynamic_kelly = (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
+
+                    let kelly_params = KellyStochasticParams {
+                        sigma: market_params.sigma,
+                        time_horizon: params.time_horizon,
+                        alpha_touch: market_params.kelly_alpha_touch,
+                        alpha_decay_bps: market_params.kelly_alpha_decay_bps,
+                        kelly_fraction: dynamic_kelly,
+                    };
+                    optimizer.optimize_kelly_stochastic(&bid_level_params, &kelly_params)
+                } else {
+                    optimizer.optimize(&bid_level_params)
+                };
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.bids.len() {
                         ladder.bids[i].size = size;
                     }
                 }
+                let effective_kelly = if market_params.use_kelly_stochastic {
+                    let regime_mult = market_params.volatility_regime.kelly_fraction_multiplier();
+                    (market_params.kelly_fraction * regime_mult).clamp(0.05, 0.75)
+                } else {
+                    0.0
+                };
                 debug!(
                     binding = ?allocation.binding_constraint,
                     margin_used = %format!("{:.2}", allocation.margin_used),
                     position_used = %format!("{:.4}", allocation.position_used),
                     shadow_price = %format!("{:.6}", allocation.shadow_price),
+                    kelly_stochastic = market_params.use_kelly_stochastic,
+                    kelly_fraction = %format!("{:.3}", effective_kelly),
+                    regime = ?market_params.volatility_regime,
                     "Constrained optimizer applied to bids"
                 );
             }
@@ -255,28 +284,56 @@ impl LadderStrategy {
                         &params,
                         self.ladder_config.fees_bps,
                     );
+                    let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
                     LevelOptimizationParams {
                         depth_bps: level.depth_bps,
                         fill_intensity,
                         spread_capture,
                         margin_per_unit: market_params.microprice / leverage,
+                        adverse_selection,
                     }
                 })
                 .collect();
 
-            // 7. Optimize ask sizes
+            // 7. Optimize ask sizes (use Kelly-Stochastic if enabled)
             if !ask_level_params.is_empty() {
-                let allocation = optimizer.optimize(&ask_level_params);
+                let allocation = if market_params.use_kelly_stochastic {
+                    // Apply volatility regime adjustment to Kelly fraction
+                    // High vol → more conservative (lower Kelly)
+                    // Low vol → more aggressive (higher Kelly)
+                    let regime_multiplier = market_params.volatility_regime.kelly_fraction_multiplier();
+                    let dynamic_kelly = (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
+
+                    let kelly_params = KellyStochasticParams {
+                        sigma: market_params.sigma,
+                        time_horizon: params.time_horizon,
+                        alpha_touch: market_params.kelly_alpha_touch,
+                        alpha_decay_bps: market_params.kelly_alpha_decay_bps,
+                        kelly_fraction: dynamic_kelly,
+                    };
+                    optimizer.optimize_kelly_stochastic(&ask_level_params, &kelly_params)
+                } else {
+                    optimizer.optimize(&ask_level_params)
+                };
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.asks.len() {
                         ladder.asks[i].size = size;
                     }
                 }
+                let effective_kelly = if market_params.use_kelly_stochastic {
+                    let regime_mult = market_params.volatility_regime.kelly_fraction_multiplier();
+                    (market_params.kelly_fraction * regime_mult).clamp(0.05, 0.75)
+                } else {
+                    0.0
+                };
                 debug!(
                     binding = ?allocation.binding_constraint,
                     margin_used = %format!("{:.2}", allocation.margin_used),
                     position_used = %format!("{:.4}", allocation.position_used),
                     shadow_price = %format!("{:.6}", allocation.shadow_price),
+                    kelly_stochastic = market_params.use_kelly_stochastic,
+                    kelly_fraction = %format!("{:.3}", effective_kelly),
+                    regime = ?market_params.volatility_regime,
                     "Constrained optimizer applied to asks"
                 );
             }
@@ -365,13 +422,21 @@ fn fill_intensity_at_depth(depth_bps: f64, sigma: f64, kappa: f64) -> f64 {
 /// Expected profit from capturing spread at depth δ.
 /// Uses calibrated depth-dependent AS model if available.
 fn spread_capture_at_depth(depth_bps: f64, params: &LadderParams, fees_bps: f64) -> f64 {
-    let as_at_depth = if let Some(ref decay) = params.depth_decay_as {
+    let as_at_depth = adverse_selection_at_depth(depth_bps, params);
+    // Spread capture = depth - adverse selection - fees
+    (depth_bps - as_at_depth - fees_bps).max(0.0)
+}
+
+/// Adverse selection at depth: AS(δ) = AS₀ × exp(-δ/δ_char)
+///
+/// Returns the expected adverse selection cost at a given depth.
+/// Uses calibrated depth-dependent AS model if available.
+fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
+    if let Some(ref decay) = params.depth_decay_as {
         // Use calibrated first-principles model: AS(δ) = AS₀ × exp(-δ/δ_char)
         decay.as_at_depth(depth_bps)
     } else {
         // Legacy fallback: exponential decay with 10bp characteristic depth
         params.as_at_touch_bps * (-depth_bps / 10.0).exp()
-    };
-    // Spread capture = depth - adverse selection - fees
-    (depth_bps - as_at_depth - fees_bps).max(0.0)
+    }
 }

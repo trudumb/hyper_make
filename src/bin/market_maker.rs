@@ -42,7 +42,7 @@ struct Cli {
     #[arg(short, long, default_value = "market_maker.toml")]
     config: String,
 
-    /// Override asset from config
+    /// Override asset from config (default: BTC)
     #[arg(long)]
     asset: Option<String>,
 
@@ -63,7 +63,7 @@ struct Cli {
     #[arg(long)]
     max_position: Option<f64>,
 
-    /// Set leverage for the asset (default: 20)
+    /// Set leverage for the asset (default: max available)
     #[arg(long)]
     leverage: Option<u32>,
 
@@ -95,6 +95,10 @@ struct Cli {
     #[arg(long)]
     metrics_port: Option<u16>,
 
+    /// Dry run mode: validate config and connect but don't place orders
+    #[arg(long)]
+    dry_run: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -109,6 +113,8 @@ enum Commands {
     },
     /// Validate config without running
     ValidateConfig,
+    /// Show account status (position, balance, open orders)
+    Status,
     /// Run the market maker (default)
     Run,
 }
@@ -181,48 +187,90 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Trading configuration with evidence-based defaults.
+///
+/// **Important**: These values are MAXIMUMS that get capped at runtime based on account equity:
+/// - `max_position` capped by: `(account_value × leverage × 0.5) / price`
+/// - `target_liquidity` capped by: `min(target_liquidity, max_position × 0.4)`
+///
+/// This ensures safe operation regardless of configured values.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TradingConfig {
-    /// Asset to market make on (e.g., "ETH", "BTC")
+    /// Asset to market make on (e.g., "BTC", "ETH", "SOL")
+    /// Default: BTC (most liquid, tightest spreads)
     #[serde(default = "default_asset")]
     pub asset: String,
-    /// Amount of liquidity to target on each side
+
+    /// Target liquidity per side in asset units.
+    /// Default: 0.01 BTC (~$1K notional) - conservative, safe for any account.
+    /// Capped at runtime to 40% of max_position based on account equity.
     #[serde(default = "default_target_liquidity")]
     pub target_liquidity: f64,
-    /// Risk aversion parameter (gamma) - controls spread and inventory skew
-    /// Typical values: 0.1 (aggressive) to 2.0 (conservative)
-    /// The market (kappa, sigma) determines actual spread via GLFT formula
+
+    /// Risk aversion parameter (gamma) - controls spread width and inventory skew.
+    /// Default: 0.3 (matches RiskConfig.gamma_base for consistency)
+    /// Range: 0.1 (aggressive, tight spreads) to 1.0+ (conservative, wide spreads)
+    /// GLFT formula: δ = (1/γ) × ln(1 + γ/κ)
     #[serde(default = "default_risk_aversion")]
     pub risk_aversion: f64,
-    /// Max deviation before requoting (in BPS)
+
+    /// Maximum price deviation (in basis points) before requoting.
+    /// Default: 5 bps - balances tight quoting with reduced order churn.
+    /// Lower values (2 bps) cause excessive cancels in volatile crypto markets.
     #[serde(default = "default_max_bps_diff")]
     pub max_bps_diff: u16,
-    /// Maximum absolute position size
+
+    /// Maximum position size in asset units.
+    /// Default: 0.05 BTC (~$5K notional) - below kill switch limit.
+    /// Capped at runtime by: (account_value × leverage × 0.5) / price
     #[serde(default = "default_max_position")]
     pub max_absolute_position_size: f64,
-    /// Leverage to use (will be set on exchange at startup)
-    /// If not specified, uses max available leverage for the asset
+
+    /// Leverage to use (set on exchange at startup).
+    /// Default: max available for the asset (from exchange metadata).
+    /// Higher leverage = larger position capacity but more liquidation risk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leverage: Option<u32>,
-    /// Decimals for price rounding (auto-calculated from asset metadata if not set)
+
+    /// Decimals for price rounding.
+    /// Default: auto-calculated from asset metadata.
+    /// Hyperliquid: price_decimals + sz_decimals = 6 (perps) or 8 (spot)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decimals: Option<u32>,
 }
 
+/// Default asset: BTC - most liquid crypto, tightest spreads, best for market making
 fn default_asset() -> String {
-    "ETH".to_string()
+    "BTC".to_string()
 }
+
+/// Default target liquidity: 0.01 BTC (~$1K at $100K BTC)
+/// Conservative default safe for any account size.
+/// Will be capped at runtime to 40% of max_position based on account equity.
 fn default_target_liquidity() -> f64 {
-    0.25
+    0.01
 }
+
+/// Default risk aversion (gamma): 0.3
+/// Matches RiskConfig.gamma_base for consistency.
+/// Range: 0.1 (aggressive) to 1.0+ (conservative)
+/// In GLFT: δ = (1/γ) × ln(1 + γ/κ) - higher γ means wider spreads
 fn default_risk_aversion() -> f64 {
-    0.5 // Moderate risk aversion
+    0.3
 }
+
+/// Default max BPS diff before requoting: 5 bps
+/// Crypto markets are volatile - 2 bps causes excessive order churn.
+/// 5 bps balances tight quoting with practical order management.
 fn default_max_bps_diff() -> u16 {
-    2
+    5
 }
+
+/// Default max position: 0.05 BTC (~$5K at $100K BTC)
+/// Conservative default below kill switch limit ($10K).
+/// Will be capped at runtime by (account_value × leverage × 0.5) / price.
 fn default_max_position() -> f64 {
-    0.5
+    0.05
 }
 
 impl Default for TradingConfig {
@@ -510,6 +558,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Configuration is valid:\n{:#?}", config);
             return Ok(());
         }
+        Some(Commands::Status) => {
+            return show_account_status(&cli).await;
+        }
         Some(Commands::Run) | None => {
             // Continue to run the market maker
         }
@@ -603,6 +654,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Print startup banner
+    print_startup_banner(&asset, &base_url, cli.dry_run);
+
     info!(
         asset = %asset,
         target_liquidity = %target_liquidity,
@@ -613,6 +667,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decimals = %decimals,
         strategy = ?config.strategy.strategy_type,
         network = ?base_url,
+        dry_run = cli.dry_run,
         "Starting market maker"
     );
 
@@ -897,6 +952,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Dry-run mode: validate everything but don't start trading
+    if cli.dry_run {
+        info!("=== DRY RUN MODE ===");
+        info!("Configuration validated successfully");
+        info!("Exchange connection established");
+        info!(
+            position = %initial_position,
+            open_orders = market_maker.orders_count(),
+            "Account state verified"
+        );
+        info!("Exiting dry-run mode (no orders placed)");
+        return Ok(());
+    }
+
     info!("Market maker initialized, starting main loop...");
     market_maker
         .start()
@@ -1022,5 +1091,127 @@ fn generate_sample_config(path: &str) -> Result<(), Box<dyn std::error::Error>> 
 
     std::fs::write(path, with_comments)?;
     println!("Sample config written to: {}", path);
+    Ok(())
+}
+
+/// Print startup banner with version and configuration summary.
+fn print_startup_banner(asset: &str, network: &BaseUrl, dry_run: bool) {
+    let version = env!("CARGO_PKG_VERSION");
+    let mode = if dry_run { " [DRY RUN]" } else { "" };
+    let network_str = match network {
+        BaseUrl::Mainnet => "MAINNET",
+        BaseUrl::Testnet => "testnet",
+        BaseUrl::Localhost => "localhost",
+    };
+
+    eprintln!();
+    eprintln!("╔═══════════════════════════════════════════════════════════╗");
+    eprintln!("║     Hyperliquid Market Maker v{:<10}{}              ║", version, mode);
+    eprintln!("║                                                           ║");
+    eprintln!("║  Asset:   {:<15}  Network: {:<15}   ║", asset, network_str);
+    eprintln!("╚═══════════════════════════════════════════════════════════╝");
+    eprintln!();
+}
+
+/// Show account status without starting the market maker.
+async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(cli)?;
+
+    // Get private key
+    let private_key = cli
+        .private_key
+        .clone()
+        .or(config.network.private_key.clone())
+        .ok_or("Private key required for status command")?;
+
+    let wallet: PrivateKeySigner = private_key
+        .parse()
+        .map_err(|_| "Invalid private key format")?;
+
+    let base_url = parse_base_url(cli.network.as_ref().unwrap_or(&config.network.base_url))?;
+    let asset = cli.asset.clone().unwrap_or(config.trading.asset.clone());
+
+    println!("Connecting to {:?}...", base_url);
+
+    let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
+    let user_address = wallet.address();
+
+    // Get user state
+    let user_state = info_client.user_state(user_address).await?;
+
+    // Get open orders
+    let open_orders = info_client.open_orders(user_address).await?;
+    let asset_orders: Vec<_> = open_orders.iter().filter(|o| o.coin == asset).collect();
+
+    // Get asset-specific data
+    let asset_data = info_client
+        .active_asset_data(user_address, asset.clone())
+        .await
+        .ok();
+
+    // Print status
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  Account Status for {}", asset);
+    println!("═══════════════════════════════════════════════════════════");
+    println!();
+    println!("  Wallet:          {}", user_address);
+    println!();
+
+    // Account summary
+    println!("  Account Value:   ${}", user_state.margin_summary.account_value);
+    println!(
+        "  Total Notional:  ${}",
+        user_state.cross_margin_summary.total_ntl_pos
+    );
+    println!(
+        "  Margin Used:     ${}",
+        user_state.cross_margin_summary.total_margin_used
+    );
+    println!();
+
+    // Position
+    let position = user_state
+        .asset_positions
+        .iter()
+        .find(|p| p.position.coin == asset);
+
+    if let Some(pos) = position {
+        println!("  Position:        {} {}", pos.position.szi, asset);
+        if let Some(ref entry_px) = pos.position.entry_px {
+            println!("  Entry Price:     ${}", entry_px);
+        }
+        println!(
+            "  Unrealized PnL:  ${}",
+            pos.position.unrealized_pnl
+        );
+        println!("  Leverage:        {}x", pos.position.leverage.value);
+    } else {
+        println!("  Position:        None");
+    }
+    println!();
+
+    // Mark price
+    if let Some(data) = asset_data {
+        println!("  Mark Price:      ${}", data.mark_px);
+    }
+
+    // Open orders
+    println!("  Open Orders:     {}", asset_orders.len());
+    if !asset_orders.is_empty() {
+        println!();
+        for order in &asset_orders {
+            let side = if order.side == "B" { "BUY " } else { "SELL" };
+            println!(
+                "    {} {} {} @ ${}",
+                side, order.sz, asset, order.limit_px
+            );
+        }
+    }
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!();
+
     Ok(())
 }

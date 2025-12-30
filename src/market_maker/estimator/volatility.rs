@@ -241,6 +241,25 @@ impl VolatilityRegime {
         }
     }
 
+    /// Get Kelly fraction multiplier for this regime.
+    ///
+    /// In high volatility, we want to be more conservative (lower Kelly fraction).
+    /// In low volatility, we can be more aggressive (higher Kelly fraction).
+    ///
+    /// Returns a multiplier to apply to the base Kelly fraction (0.25 default):
+    /// - Low: 1.5x → 0.375 effective (can be more aggressive in quiet markets)
+    /// - Normal: 1.0x → 0.25 effective (standard quarter Kelly)
+    /// - High: 0.5x → 0.125 effective (more conservative)
+    /// - Extreme: 0.25x → 0.0625 effective (very conservative, near flat)
+    pub fn kelly_fraction_multiplier(&self) -> f64 {
+        match self {
+            Self::Low => 1.5,     // More aggressive in quiet markets
+            Self::Normal => 1.0,  // Standard
+            Self::High => 0.5,    // More conservative
+            Self::Extreme => 0.25, // Very conservative
+        }
+    }
+
     /// Check if quotes should be pulled (extreme regime).
     #[allow(dead_code)]
     pub(crate) fn should_consider_pulling_quotes(&self) -> bool {

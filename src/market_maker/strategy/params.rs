@@ -351,6 +351,39 @@ impl Default for MarginConstraintParams {
     }
 }
 
+// === Kelly-Stochastic Parameters ===
+
+/// Kelly-Stochastic config parameters (for MarketParams extraction).
+///
+/// This is a view type for extracting Kelly parameters from MarketParams.
+/// The actual optimization parameters are in `quoting::ladder::optimizer::KellyStochasticParams`.
+#[derive(Debug, Clone)]
+pub struct KellyStochasticConfigParams {
+    /// Whether to use Kelly-Stochastic allocation.
+    pub use_kelly_stochastic: bool,
+
+    /// Informed trader probability at the touch (0.0-1.0).
+    pub alpha_touch: f64,
+
+    /// Characteristic depth for alpha decay in bps.
+    /// α(δ) = α_touch × exp(-δ/alpha_decay_bps).
+    pub alpha_decay_bps: f64,
+
+    /// Kelly fraction (0.25 = quarter Kelly).
+    pub kelly_fraction: f64,
+}
+
+impl Default for KellyStochasticConfigParams {
+    fn default() -> Self {
+        Self {
+            use_kelly_stochastic: false,
+            alpha_touch: 0.15,
+            alpha_decay_bps: 10.0,
+            kelly_fraction: 0.25,
+        }
+    }
+}
+
 // === Parameter Aggregation ===
 
 use crate::market_maker::adverse_selection::AdverseSelectionEstimator;
@@ -517,6 +550,12 @@ impl ParameterAggregator {
             use_constrained_optimizer: sources.stochastic_config.use_constrained_optimizer,
             margin_available: sources.margin_sizer.state().available_margin,
             leverage: sources.margin_sizer.state().current_leverage,
+
+            // === Stochastic Module: Kelly-Stochastic Allocation ===
+            use_kelly_stochastic: sources.stochastic_config.use_kelly_stochastic,
+            kelly_alpha_touch: sources.stochastic_config.kelly_alpha_touch,
+            kelly_alpha_decay_bps: sources.stochastic_config.kelly_alpha_decay_bps,
+            kelly_fraction: sources.stochastic_config.kelly_fraction,
         }
     }
 }

@@ -1,6 +1,13 @@
-//! Constrained variational ladder optimization.
+//! Constrained ladder optimization with multiple allocation strategies.
 //!
-//! Implements greedy allocation by marginal value subject to margin and position constraints.
+//! Supports two allocation methods:
+//! 1. **Proportional MV**: Sizes proportional to marginal value λ(δ) × SC(δ)
+//! 2. **Kelly-Stochastic**: Uses first-passage fill probability and Kelly criterion
+//!
+//! The Kelly-Stochastic approach is more sophisticated and mathematically grounded:
+//! - Fill probability: P(δ,τ) = 2Φ(-δ/(σ√τ)) from Brownian first-passage time
+//! - Kelly sizing: f*(δ) = E[R|fill] / Var[R|fill]
+//! - Properly accounts for the intuition that "closer to mid = higher fill probability"
 
 use crate::EPSILON;
 
@@ -9,15 +16,50 @@ use crate::EPSILON;
 pub struct LevelOptimizationParams {
     /// Depth in basis points
     pub depth_bps: f64,
-    /// Fill intensity λ(δ) at this depth
+    /// Fill intensity λ(δ) at this depth (used by proportional allocation)
     pub fill_intensity: f64,
     /// Spread capture SC(δ) at this depth
     pub spread_capture: f64,
     /// Margin required per unit size at this level
     pub margin_per_unit: f64,
+    /// Adverse selection at this depth (bps)
+    pub adverse_selection: f64,
 }
 
-/// Constrained ladder optimizer implementing the variational calculus solution.
+/// Parameters for Kelly-Stochastic allocation.
+///
+/// This is a more sophisticated allocation method based on:
+/// - First-passage time theory for fill probability
+/// - Kelly criterion for optimal sizing under uncertainty
+#[derive(Debug, Clone)]
+pub struct KellyStochasticParams {
+    /// Volatility per second (e.g., 0.0001 = 1bp/sec)
+    pub sigma: f64,
+    /// Time horizon in seconds for fill probability calculation
+    pub time_horizon: f64,
+    /// Informed trader probability at the touch (0.0-1.0)
+    pub alpha_touch: f64,
+    /// Characteristic depth for alpha decay in bps
+    /// α(δ) = α_touch × exp(-δ/alpha_decay_bps)
+    pub alpha_decay_bps: f64,
+    /// Kelly fraction (0.25 = quarter Kelly, recommended 0.25-0.5)
+    /// Lower values are more conservative
+    pub kelly_fraction: f64,
+}
+
+impl Default for KellyStochasticParams {
+    fn default() -> Self {
+        Self {
+            sigma: 0.0001,        // 1bp/sec volatility (typical for BTC)
+            time_horizon: 10.0,   // 10 second holding period
+            alpha_touch: 0.15,    // 15% informed probability at touch
+            alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
+            kelly_fraction: 0.25, // Quarter Kelly (conservative)
+        }
+    }
+}
+
+/// Constrained ladder optimizer implementing proportional allocation.
 ///
 /// Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ
 /// subject to:
@@ -25,8 +67,8 @@ pub struct LevelOptimizationParams {
 ///   - sᵢ ≥ min_notional (minimum order size)
 ///   - Σ sᵢ ≤ max_position (position limit)
 ///
-/// The Lagrangian gives: λ(δ) × SC(δ) = λ* (constant) at optimum.
-/// Uses greedy allocation ranked by marginal value.
+/// Uses proportional allocation: sizes proportional to marginal value MV(δ) = λ(δ) × SC(δ).
+/// This distributes capital across all profitable levels for robust ladder quoting.
 #[derive(Debug, Clone)]
 pub struct ConstrainedLadderOptimizer {
     /// Available margin for placing orders
@@ -65,11 +107,14 @@ impl ConstrainedLadderOptimizer {
 
     /// Compute optimal size allocation across levels.
     ///
-    /// Implements greedy allocation by marginal value:
+    /// Implements proportional allocation by marginal value:
     /// 1. Compute MV(δ) = λ(δ) × SC(δ) for each level
-    /// 2. Sort levels by marginal value (descending)
-    /// 3. Allocate capital greedily until constraints bind
+    /// 2. Allocate sizes proportional to MV, respecting margin/position constraints
+    /// 3. Filter out levels below min_size or min_notional thresholds
     /// 4. Return sizes and shadow price λ* for diagnostics
+    ///
+    /// This distributes capital across ALL profitable levels for robust ladder quoting,
+    /// rather than concentrating in a single level.
     pub fn optimize(&self, levels: &[LevelOptimizationParams]) -> ConstrainedAllocation {
         if levels.is_empty() {
             return ConstrainedAllocation {
@@ -87,80 +132,71 @@ impl ConstrainedLadderOptimizer {
             .map(|l| (l.fill_intensity * l.spread_capture).max(0.0))
             .collect();
 
-        // 2. Sort levels by marginal value (greedy allocation order)
-        let mut sorted_indices: Vec<(usize, f64)> = marginal_values
+        let total_mv: f64 = marginal_values.iter().sum();
+        if total_mv <= EPSILON {
+            // No profitable levels
+            return ConstrainedAllocation {
+                sizes: vec![0.0; levels.len()],
+                shadow_price: 0.0,
+                margin_used: 0.0,
+                position_used: 0.0,
+                binding_constraint: BindingConstraint::None,
+            };
+        }
+
+        // 2. Determine maximum allocable position from constraints
+        // Use first level's margin_per_unit (they should all be the same)
+        let margin_per_unit = levels[0].margin_per_unit;
+        let max_by_margin = if margin_per_unit > EPSILON {
+            self.margin_available / margin_per_unit
+        } else {
+            f64::MAX
+        };
+        let max_position_total = max_by_margin.min(self.max_position);
+
+        // Determine binding constraint
+        let binding_constraint = if max_by_margin < self.max_position {
+            BindingConstraint::Margin
+        } else if self.max_position < max_by_margin {
+            BindingConstraint::Position
+        } else {
+            BindingConstraint::None
+        };
+
+        // 3. Allocate sizes proportional to marginal value
+        let mut raw_sizes: Vec<f64> = marginal_values
             .iter()
-            .enumerate()
-            .map(|(i, &mv)| (i, mv))
+            .map(|&mv| max_position_total * mv / total_mv)
             .collect();
-        sorted_indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // 3. Greedy allocation until constraints bind
-        let mut sizes = vec![0.0; levels.len()];
-        let mut margin_used = 0.0;
-        let mut position_used = 0.0;
-        let mut shadow_price = 0.0;
-        let mut binding_constraint = BindingConstraint::None;
-
-        for &(idx, mv) in &sorted_indices {
-            if mv <= EPSILON {
-                // No more profitable levels
-                break;
-            }
-
-            // Margin per unit at this level
-            let margin_per_unit = levels[idx].margin_per_unit;
-
-            // How much size can we allocate at this level?
-            let max_by_margin = if margin_per_unit > EPSILON {
-                (self.margin_available - margin_used) / margin_per_unit
-            } else {
-                f64::MAX
-            };
-            let max_by_position = self.max_position - position_used;
-
-            // The size we can allocate (respecting both constraints)
-            let max_allocable = max_by_margin.min(max_by_position);
-
-            if max_allocable <= EPSILON {
-                // Constraints are binding
-                shadow_price = mv;
-                binding_constraint = if max_by_margin < max_by_position {
-                    BindingConstraint::Margin
-                } else {
-                    BindingConstraint::Position
-                };
-                break;
-            }
-
-            // Allocate up to max_allocable, respecting min_size and min_notional
-            let notional = max_allocable * self.price;
-            let size = if max_allocable < self.min_size || notional < self.min_notional {
-                0.0 // Skip this level (too small)
-            } else {
-                max_allocable
-            };
-
-            if size > EPSILON {
-                sizes[idx] = size;
-                margin_used += size * margin_per_unit;
-                position_used += size;
+        // 4. Filter out levels below min_size or min_notional thresholds
+        // Set sizes to 0 for levels that don't meet thresholds
+        for size in raw_sizes.iter_mut() {
+            let notional = *size * self.price;
+            if *size < self.min_size || notional < self.min_notional {
+                *size = 0.0;
             }
         }
 
-        // If we exhausted all levels without binding, shadow price is 0
-        if binding_constraint == BindingConstraint::None {
-            // Find the lowest MV of allocated levels (marginal value of last allocated)
-            shadow_price = sorted_indices
-                .iter()
-                .filter(|(idx, _)| sizes[*idx] > EPSILON)
-                .map(|(_, mv)| *mv)
-                .next_back()
-                .unwrap_or(0.0);
-        }
+        // 5. Compute actual margin and position used
+        let position_used: f64 = raw_sizes.iter().sum();
+        let margin_used = position_used * margin_per_unit;
+
+        // 6. Compute shadow price (marginal value of lowest allocated level)
+        let shadow_price = marginal_values
+            .iter()
+            .zip(raw_sizes.iter())
+            .filter(|(_, &sz)| sz > EPSILON)
+            .map(|(&mv, _)| mv)
+            .fold(f64::MAX, f64::min); // Minimum MV among allocated levels
+        let shadow_price = if shadow_price == f64::MAX {
+            0.0
+        } else {
+            shadow_price
+        };
 
         ConstrainedAllocation {
-            sizes,
+            sizes: raw_sizes,
             shadow_price,
             margin_used,
             position_used,
@@ -174,6 +210,7 @@ impl ConstrainedLadderOptimizer {
         depths: &[f64],
         intensities: &[f64],
         spreads: &[f64],
+        adverse_selections: &[f64],
     ) -> Vec<LevelOptimizationParams> {
         let margin_per_unit = self.price / self.leverage;
 
@@ -181,14 +218,221 @@ impl ConstrainedLadderOptimizer {
             .iter()
             .zip(intensities.iter())
             .zip(spreads.iter())
-            .map(|((&depth, &intensity), &spread)| LevelOptimizationParams {
+            .zip(adverse_selections.iter())
+            .map(|(((&depth, &intensity), &spread), &as_bps)| LevelOptimizationParams {
                 depth_bps: depth,
                 fill_intensity: intensity,
                 spread_capture: spread,
                 margin_per_unit,
+                adverse_selection: as_bps,
             })
             .collect()
     }
+
+    /// Kelly-Stochastic allocation using first-passage fill probability and Kelly criterion.
+    ///
+    /// This is a more sophisticated allocation than proportional MV:
+    /// 1. Fill probability from Brownian first-passage time: P(δ,τ) = 2Φ(-δ/(σ√τ))
+    /// 2. Kelly sizing: f*(δ) = E[R|fill] / Var[R|fill]
+    /// 3. Depth-dependent informed probability: α(δ) = α₀ × exp(-δ/δ_char)
+    ///
+    /// The result properly captures the intuition that closer to mid = higher fill probability,
+    /// and allocates more capital where fills are likely AND profitable.
+    pub fn optimize_kelly_stochastic(
+        &self,
+        levels: &[LevelOptimizationParams],
+        kelly_params: &KellyStochasticParams,
+    ) -> ConstrainedAllocation {
+        if levels.is_empty() {
+            return ConstrainedAllocation {
+                sizes: vec![],
+                shadow_price: 0.0,
+                margin_used: 0.0,
+                position_used: 0.0,
+                binding_constraint: BindingConstraint::None,
+            };
+        }
+
+        // 1. Compute Kelly-weighted values for each level
+        let kelly_values: Vec<f64> = levels
+            .iter()
+            .map(|level| {
+                // Fill probability from first-passage time: P = 2Φ(-δ/(σ√τ))
+                let p_fill = fill_probability_stochastic(
+                    level.depth_bps,
+                    kelly_params.sigma,
+                    kelly_params.time_horizon,
+                );
+
+                // Informed probability decays with depth: α(δ) = α₀ × exp(-δ/δ_char)
+                let alpha = kelly_params.alpha_touch
+                    * (-level.depth_bps / kelly_params.alpha_decay_bps).exp();
+
+                // Kelly fraction: f* = E[R|fill] / Var[R|fill]
+                let kelly_f = kelly_fraction_at_level(
+                    level.spread_capture,
+                    level.adverse_selection,
+                    alpha,
+                );
+
+                // Weight by fill probability and fractional Kelly
+                let weighted = p_fill * kelly_f * kelly_params.kelly_fraction;
+                weighted.max(0.0)
+            })
+            .collect();
+
+        let total_kelly: f64 = kelly_values.iter().sum();
+        if total_kelly <= EPSILON {
+            return ConstrainedAllocation {
+                sizes: vec![0.0; levels.len()],
+                shadow_price: 0.0,
+                margin_used: 0.0,
+                position_used: 0.0,
+                binding_constraint: BindingConstraint::None,
+            };
+        }
+
+        // 2. Determine maximum allocable position from constraints
+        let margin_per_unit = levels[0].margin_per_unit;
+        let max_by_margin = if margin_per_unit > EPSILON {
+            self.margin_available / margin_per_unit
+        } else {
+            f64::MAX
+        };
+        let max_position_total = max_by_margin.min(self.max_position);
+
+        let binding_constraint = if max_by_margin < self.max_position {
+            BindingConstraint::Margin
+        } else if self.max_position < max_by_margin {
+            BindingConstraint::Position
+        } else {
+            BindingConstraint::None
+        };
+
+        // 3. Allocate sizes proportional to Kelly-weighted values
+        let mut raw_sizes: Vec<f64> = kelly_values
+            .iter()
+            .map(|&kv| max_position_total * kv / total_kelly)
+            .collect();
+
+        // 4. Filter out levels below min_size or min_notional thresholds
+        for size in raw_sizes.iter_mut() {
+            let notional = *size * self.price;
+            if *size < self.min_size || notional < self.min_notional {
+                *size = 0.0;
+            }
+        }
+
+        // 5. Compute actual margin and position used
+        let position_used: f64 = raw_sizes.iter().sum();
+        let margin_used = position_used * margin_per_unit;
+
+        // 6. Shadow price is the minimum Kelly value among allocated levels
+        let shadow_price = kelly_values
+            .iter()
+            .zip(raw_sizes.iter())
+            .filter(|(_, &sz)| sz > EPSILON)
+            .map(|(&kv, _)| kv)
+            .fold(f64::MAX, f64::min);
+        let shadow_price = if shadow_price == f64::MAX {
+            0.0
+        } else {
+            shadow_price
+        };
+
+        ConstrainedAllocation {
+            sizes: raw_sizes,
+            shadow_price,
+            margin_used,
+            position_used,
+            binding_constraint,
+        }
+    }
+}
+
+// ============================================================================
+// Stochastic Fill Probability Functions
+// ============================================================================
+
+/// First-passage time fill probability for Brownian motion.
+///
+/// For a Brownian motion with volatility σ, the probability of reaching
+/// depth δ before time τ is: P(τ_δ < τ) = 2Φ(-δ/(σ√τ))
+///
+/// This properly captures the intuition that:
+/// - Closer to mid = higher fill probability
+/// - Higher volatility = higher fill probability at all depths
+/// - Longer time horizon = higher fill probability
+pub(crate) fn fill_probability_stochastic(depth_bps: f64, sigma: f64, time_horizon: f64) -> f64 {
+    let depth = depth_bps / 10000.0; // Convert bps to fraction
+    let sigma_sqrt_t = sigma * time_horizon.sqrt();
+
+    if sigma_sqrt_t < 1e-12 || depth < EPSILON {
+        return if depth < EPSILON { 1.0 } else { 0.0 };
+    }
+
+    // P(τ_δ < τ) = 2Φ(-δ/(σ√τ))
+    2.0 * normal_cdf(-depth / sigma_sqrt_t)
+}
+
+/// Standard normal CDF approximation.
+///
+/// Uses Abramowitz and Stegun approximation (formula 7.1.26) with error < 1.5e-7.
+fn normal_cdf(x: f64) -> f64 {
+    // Handle extreme values
+    if x < -8.0 {
+        return 0.0;
+    }
+    if x > 8.0 {
+        return 1.0;
+    }
+
+    // Abramowitz and Stegun approximation for erf
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x_abs = x.abs() / std::f64::consts::SQRT_2;
+
+    // A&S formula 7.1.26
+    let t = 1.0 / (1.0 + p * x_abs);
+    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x_abs * x_abs).exp();
+
+    0.5 * (1.0 + sign * y)
+}
+
+/// Kelly fraction at a given level.
+///
+/// f*(δ) = E[R|fill] / Var[R|fill]
+///
+/// Where:
+/// - E[R|fill] = (1-α) × SC - α × AS
+/// - Var[R|fill] = (SC + AS)² × α × (1-α)
+///
+/// This tells us the optimal fraction of capital to allocate at this level.
+fn kelly_fraction_at_level(spread_capture: f64, adverse_selection: f64, alpha: f64) -> f64 {
+    // Expected return given fill:
+    // If noise trader: profit = spread_capture
+    // If informed trader: loss = adverse_selection
+    // E[R] = (1-α) × SC - α × AS
+    let expected = (1.0 - alpha) * spread_capture - alpha * adverse_selection;
+
+    // Variance of return given fill:
+    // Two outcomes with probabilities (1-α) and α
+    // Var = (SC + AS)² × α × (1-α)
+    let total_range = spread_capture + adverse_selection;
+    let variance = total_range.powi(2) * alpha * (1.0 - alpha);
+
+    // Kelly: f* = E[R] / Var[R]
+    if variance < 1e-10 || expected <= 0.0 {
+        return 0.0;
+    }
+
+    (expected / variance).max(0.0)
 }
 
 /// Result of constrained optimization.
@@ -222,6 +466,17 @@ pub enum BindingConstraint {
 mod tests {
     use super::*;
 
+    /// Helper to create level params with default adverse_selection
+    fn level(depth: f64, fill_int: f64, spread_cap: f64, margin: f64) -> LevelOptimizationParams {
+        LevelOptimizationParams {
+            depth_bps: depth,
+            fill_intensity: fill_int,
+            spread_capture: spread_cap,
+            margin_per_unit: margin,
+            adverse_selection: 1.0, // Default AS of 1bp
+        }
+    }
+
     #[test]
     fn test_constrained_optimizer_basic() {
         let optimizer = ConstrainedLadderOptimizer::new(
@@ -234,24 +489,9 @@ mod tests {
         );
 
         let levels = vec![
-            LevelOptimizationParams {
-                depth_bps: 5.0,
-                fill_intensity: 10.0,
-                spread_capture: 2.0,
-                margin_per_unit: 10.0, // 100 / 10 leverage
-            },
-            LevelOptimizationParams {
-                depth_bps: 10.0,
-                fill_intensity: 5.0,
-                spread_capture: 5.0,
-                margin_per_unit: 10.0,
-            },
-            LevelOptimizationParams {
-                depth_bps: 20.0,
-                fill_intensity: 2.0,
-                spread_capture: 10.0,
-                margin_per_unit: 10.0,
-            },
+            level(5.0, 10.0, 2.0, 10.0),
+            level(10.0, 5.0, 5.0, 10.0),
+            level(20.0, 2.0, 10.0, 10.0),
         ];
 
         let result = optimizer.optimize(&levels);
@@ -274,20 +514,7 @@ mod tests {
             10.0,  // leverage (margin_per_unit = 10)
         );
 
-        let levels = vec![
-            LevelOptimizationParams {
-                depth_bps: 5.0,
-                fill_intensity: 10.0,
-                spread_capture: 5.0,
-                margin_per_unit: 10.0,
-            },
-            LevelOptimizationParams {
-                depth_bps: 10.0,
-                fill_intensity: 5.0,
-                spread_capture: 10.0,
-                margin_per_unit: 10.0,
-            },
-        ];
+        let levels = vec![level(5.0, 10.0, 5.0, 10.0), level(10.0, 5.0, 10.0, 10.0)];
 
         let result = optimizer.optimize(&levels);
 
@@ -309,12 +536,7 @@ mod tests {
             10.0,    // leverage
         );
 
-        let levels = vec![LevelOptimizationParams {
-            depth_bps: 5.0,
-            fill_intensity: 10.0,
-            spread_capture: 5.0,
-            margin_per_unit: 10.0,
-        }];
+        let levels = vec![level(5.0, 10.0, 5.0, 10.0)];
 
         let result = optimizer.optimize(&levels);
 
@@ -325,47 +547,72 @@ mod tests {
     }
 
     #[test]
-    fn test_constrained_optimizer_greedy_ordering() {
+    fn test_constrained_optimizer_proportional_allocation() {
         let optimizer = ConstrainedLadderOptimizer::new(
             100.0, // margin_available
             1.0,   // max_position
             0.01,  // min_size
-            10.0,  // min_notional
+            1.0,   // min_notional (lowered to allow small allocations)
             100.0, // price
             10.0,  // leverage (margin_per_unit = 10)
         );
 
-        // Level 1 has highest marginal value (10 * 10 = 100)
-        // Level 2 has lower marginal value (5 * 5 = 25)
-        // Level 3 has lowest marginal value (2 * 2 = 4)
+        // Level 0: MV = 5 * 5 = 25
+        // Level 1: MV = 10 * 10 = 100 (highest)
+        // Level 2: MV = 5 * 5 = 25
+        // Total MV = 150, proportions: 16.7%, 66.7%, 16.7%
         let levels = vec![
-            LevelOptimizationParams {
-                depth_bps: 20.0,
-                fill_intensity: 2.0,
-                spread_capture: 2.0,
-                margin_per_unit: 10.0,
-            },
-            LevelOptimizationParams {
-                depth_bps: 5.0,
-                fill_intensity: 10.0,
-                spread_capture: 10.0, // Highest MV
-                margin_per_unit: 10.0,
-            },
-            LevelOptimizationParams {
-                depth_bps: 10.0,
-                fill_intensity: 5.0,
-                spread_capture: 5.0,
-                margin_per_unit: 10.0,
-            },
+            level(20.0, 5.0, 5.0, 10.0),
+            level(5.0, 10.0, 10.0, 10.0), // Highest MV
+            level(10.0, 5.0, 5.0, 10.0),
         ];
 
         let result = optimizer.optimize(&levels);
 
-        // Level 1 (index 1) should get allocation first due to highest MV
-        // With margin = 100 and margin_per_unit = 10, can allocate up to 10 units total
-        // But position limit is 1.0, so only 1 unit total
-        assert!(result.sizes[1] > 0.0); // Highest MV level
-        assert!((result.position_used - 1.0).abs() < 0.1); // Should hit position limit
+        // With proportional allocation, ALL levels should get some size
+        // Size proportional to MV: level[1] should get most (100/150 ≈ 67%)
+        assert!(result.sizes[0] > 0.0, "Level 0 should have allocation");
+        assert!(result.sizes[1] > 0.0, "Level 1 should have allocation");
+        assert!(result.sizes[2] > 0.0, "Level 2 should have allocation");
+
+        // Level 1 should have the most (highest MV)
+        assert!(result.sizes[1] > result.sizes[0]);
+        assert!(result.sizes[1] > result.sizes[2]);
+
+        // Total position should be at the limit (1.0) since margin allows it
+        // margin_available/margin_per_unit = 100/10 = 10, but max_position = 1.0
+        assert!((result.position_used - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_constrained_optimizer_distributes_across_levels() {
+        // Key test: verify we get MULTIPLE levels allocated, not just one
+        let optimizer = ConstrainedLadderOptimizer::new(
+            1000.0, // margin_available
+            0.5,    // max_position
+            0.01,   // min_size
+            1.0,    // min_notional (low to allow small sizes)
+            100.0,  // price
+            10.0,   // leverage
+        );
+
+        let levels = vec![
+            level(5.0, 10.0, 5.0, 10.0),
+            level(10.0, 5.0, 8.0, 10.0),
+            level(20.0, 3.0, 10.0, 10.0),
+        ];
+
+        let result = optimizer.optimize(&levels);
+
+        // Count non-zero allocations
+        let allocated_levels = result.sizes.iter().filter(|&&s| s > EPSILON).count();
+
+        // Should have allocated to ALL 3 levels (the key fix!)
+        assert_eq!(
+            allocated_levels, 3,
+            "Expected 3 levels allocated, got {}. Sizes: {:?}",
+            allocated_levels, result.sizes
+        );
     }
 
     #[test]
@@ -390,6 +637,7 @@ mod tests {
             fill_intensity: 10.0,
             spread_capture: -5.0, // Negative!
             margin_per_unit: 10.0,
+            adverse_selection: 1.0,
         }];
 
         let result = optimizer.optimize(&levels);
@@ -408,12 +656,117 @@ mod tests {
         let depths = vec![5.0, 10.0, 20.0];
         let intensities = vec![10.0, 5.0, 2.0];
         let spreads = vec![2.0, 5.0, 10.0];
+        let adverse = vec![1.0, 0.5, 0.2];
 
-        let params = optimizer.build_level_params(&depths, &intensities, &spreads);
+        let params = optimizer.build_level_params(&depths, &intensities, &spreads, &adverse);
 
         assert_eq!(params.len(), 3);
         assert!((params[0].margin_per_unit - 20.0).abs() < 0.01); // 100 / 5
         assert!((params[1].depth_bps - 10.0).abs() < 0.01);
         assert!((params[2].spread_capture - 10.0).abs() < 0.01);
+        assert!((params[2].adverse_selection - 0.2).abs() < 0.01);
+    }
+
+    // ==================== Kelly-Stochastic Tests ====================
+
+    #[test]
+    fn test_fill_probability_stochastic() {
+        // At touch (0 depth), fill probability should be 1
+        let p_touch = fill_probability_stochastic(0.0, 0.0001, 10.0);
+        assert!((p_touch - 1.0).abs() < 0.01);
+
+        // Tight depth (2 bps) with typical volatility
+        let p_tight = fill_probability_stochastic(2.0, 0.0001, 10.0);
+        assert!(p_tight > 0.1); // Should have decent probability
+
+        // Wide depth (20 bps) should have very low probability
+        let p_wide = fill_probability_stochastic(20.0, 0.0001, 10.0);
+        assert!(p_wide < 0.01); // Should be near zero
+
+        // Higher volatility increases fill probability
+        let p_high_vol = fill_probability_stochastic(10.0, 0.001, 10.0);
+        let p_low_vol = fill_probability_stochastic(10.0, 0.0001, 10.0);
+        assert!(p_high_vol > p_low_vol);
+    }
+
+    #[test]
+    fn test_kelly_fraction_at_level() {
+        // With zero alpha (no informed traders), variance = 0, so Kelly returns 0
+        // This is a degenerate case - in practice alpha should never be exactly 0
+        let kelly_no_informed = kelly_fraction_at_level(5.0, 1.0, 0.0);
+        assert!(kelly_no_informed == 0.0); // Variance is 0 when alpha = 0
+
+        // With very small alpha (1%), should be positive (realistic case)
+        let kelly_tiny_alpha = kelly_fraction_at_level(5.0, 1.0, 0.01);
+        assert!(kelly_tiny_alpha > 0.0);
+
+        // With 100% alpha (all informed), expected return is negative
+        let kelly_all_informed = kelly_fraction_at_level(5.0, 10.0, 1.0);
+        assert!(kelly_all_informed <= 0.0);
+
+        // With moderate alpha and good spread capture, should be positive
+        let kelly_moderate = kelly_fraction_at_level(10.0, 2.0, 0.15);
+        assert!(kelly_moderate > 0.0);
+
+        // Negative spread capture should give zero
+        let kelly_unprofitable = kelly_fraction_at_level(-5.0, 1.0, 0.1);
+        assert!(kelly_unprofitable <= 0.0);
+    }
+
+    #[test]
+    fn test_kelly_stochastic_concentrates_at_touch() {
+        let optimizer = ConstrainedLadderOptimizer::new(
+            1000.0, 0.5, 0.001, 1.0, 100.0, 10.0,
+        );
+
+        // Create levels at increasing depths
+        let levels = vec![
+            LevelOptimizationParams {
+                depth_bps: 2.0,
+                fill_intensity: 0.0, // Ignored by Kelly-Stochastic
+                spread_capture: 2.0,
+                margin_per_unit: 10.0,
+                adverse_selection: 1.0,
+            },
+            LevelOptimizationParams {
+                depth_bps: 10.0,
+                fill_intensity: 0.0,
+                spread_capture: 8.0,
+                margin_per_unit: 10.0,
+                adverse_selection: 0.5,
+            },
+            LevelOptimizationParams {
+                depth_bps: 20.0,
+                fill_intensity: 0.0,
+                spread_capture: 15.0,
+                margin_per_unit: 10.0,
+                adverse_selection: 0.2,
+            },
+        ];
+
+        let kelly_params = KellyStochasticParams::default();
+        let result = optimizer.optimize_kelly_stochastic(&levels, &kelly_params);
+
+        // Tightest level should get most size (highest fill probability)
+        // Even though spread capture is lower
+        assert!(
+            result.sizes[0] > result.sizes[2],
+            "Tight level should get more than deep level. Sizes: {:?}",
+            result.sizes
+        );
+    }
+
+    #[test]
+    fn test_normal_cdf_accuracy() {
+        // Test known values
+        assert!((normal_cdf(0.0) - 0.5).abs() < 0.001);
+        assert!((normal_cdf(1.0) - 0.8413).abs() < 0.01);
+        assert!((normal_cdf(-1.0) - 0.1587).abs() < 0.01);
+        assert!((normal_cdf(2.0) - 0.9772).abs() < 0.01);
+        assert!((normal_cdf(-2.0) - 0.0228).abs() < 0.01);
+
+        // Extreme values
+        assert!(normal_cdf(10.0) > 0.999);
+        assert!(normal_cdf(-10.0) < 0.001);
     }
 }

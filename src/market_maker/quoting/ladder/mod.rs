@@ -7,17 +7,19 @@
 //! - Size allocation proportional to marginal value: λ(δ) × SC(δ)
 //! - GLFT inventory skew applied to entire ladder
 //! - **Constrained variational optimization** for capital-efficient allocation
+//! - **Kelly-Stochastic optimization** using first-passage fill probability
 //!
 //! # Module Structure
 //!
 //! - `generator`: Ladder generation logic and depth/size calculation
-//! - `optimizer`: Constrained variational optimization for capital allocation
+//! - `optimizer`: Constrained optimization with multiple allocation strategies
 
 mod generator;
 mod optimizer;
 
 pub use optimizer::{
-    BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, LevelOptimizationParams,
+    BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, KellyStochasticParams,
+    LevelOptimizationParams,
 };
 
 use serde::{Deserialize, Serialize};

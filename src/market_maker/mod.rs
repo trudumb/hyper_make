@@ -1359,6 +1359,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         &self.config.asset
     }
 
+    /// Get count of tracked orders.
+    pub fn orders_count(&self) -> usize {
+        self.orders.order_ids().len()
+    }
+
     /// Build a unified RiskState snapshot from current MarketMaker state.
     ///
     /// This provides a single point-in-time view of all risk-relevant data

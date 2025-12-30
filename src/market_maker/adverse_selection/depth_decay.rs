@@ -59,6 +59,10 @@ pub struct FillWithDepth {
 /// This model captures the empirical fact that informed traders prioritize
 /// execution speed over price improvement, so they hit the touch more than
 /// deep levels.
+///
+/// Additionally calibrates `alpha_touch` for Kelly-Stochastic allocation:
+/// - alpha_touch = P(informed) at the touch (0-1)
+/// - Measured as fraction of fills with significant adverse movement
 #[derive(Debug, Clone)]
 pub struct DepthDecayAS {
     /// AS at touch in basis points (calibrated from fills at depth 0-2bp)
@@ -84,6 +88,20 @@ pub struct DepthDecayAS {
     measurement_horizon_ms: u64,
     /// Maximum pending fills to track
     max_pending_fills: usize,
+
+    // === Kelly-Stochastic Alpha Calibration ===
+    /// Calibrated alpha (informed probability) at touch (0-1)
+    /// Measured as fraction of fills showing significant adverse movement
+    pub alpha_touch: f64,
+    /// EWMA of alpha per bucket (for alpha decay estimation)
+    bucket_alpha_ewma: [f64; 4],
+    /// Count of "informed" fills per bucket (AS > threshold)
+    bucket_informed_count: [usize; 4],
+    /// Total fills per bucket for alpha calculation
+    bucket_total_count: [usize; 4],
+    /// Threshold for classifying a fill as "informed" (bps)
+    /// Fills with |AS| > threshold are counted as informed
+    informed_threshold_bps: f64,
 }
 
 impl Default for DepthDecayAS {
@@ -102,6 +120,12 @@ impl Default for DepthDecayAS {
             pending_fills: VecDeque::new(),
             measurement_horizon_ms: 1000, // 1 second AS measurement horizon
             max_pending_fills: 100,       // Track up to 100 pending fills
+            // Kelly-Stochastic alpha calibration
+            alpha_touch: 0.15,           // Conservative default: 15% informed at touch
+            bucket_alpha_ewma: [0.15, 0.10, 0.05, 0.02], // Decay with depth
+            bucket_informed_count: [0; 4],
+            bucket_total_count: [0; 4],
+            informed_threshold_bps: 1.0, // 1 bp threshold for "informed" classification
         }
     }
 }
@@ -174,6 +198,22 @@ impl DepthDecayAS {
             self.bucket_fills[bucket_idx].remove(0);
         }
         self.bucket_fills[bucket_idx].push(fill.realized_as.abs());
+
+        // === Kelly-Stochastic Alpha Tracking ===
+        // Track whether this fill was "informed" (AS > threshold)
+        self.bucket_total_count[bucket_idx] += 1;
+        if fill.realized_as.abs() > self.informed_threshold_bps {
+            self.bucket_informed_count[bucket_idx] += 1;
+        }
+
+        // Update alpha EWMA for this bucket
+        let is_informed = if fill.realized_as.abs() > self.informed_threshold_bps {
+            1.0
+        } else {
+            0.0
+        };
+        self.bucket_alpha_ewma[bucket_idx] =
+            alpha * is_informed + (1.0 - alpha) * self.bucket_alpha_ewma[bucket_idx];
 
         self.total_calibration_fills += 1;
 
@@ -306,9 +346,21 @@ impl DepthDecayAS {
             self.delta_char_bps = smooth * new_delta_char + (1.0 - smooth) * self.delta_char_bps;
             self.confidence = r_squared.sqrt(); // sqrt(R²) as confidence
 
+            // === Kelly-Stochastic: Update alpha_touch from calibrated data ===
+            // Alpha at touch = fraction of fills at touch that are informed
+            let touch_total = self.bucket_total_count[0];
+            if touch_total >= self.min_fills_per_bucket {
+                let touch_informed = self.bucket_informed_count[0] as f64;
+                let new_alpha_touch = touch_informed / touch_total as f64;
+                // Smooth update and clamp to [0.01, 0.5] range
+                self.alpha_touch =
+                    (smooth * new_alpha_touch + (1.0 - smooth) * self.alpha_touch).clamp(0.01, 0.5);
+            }
+
             debug!(
                 as_touch = self.as_touch_bps,
                 delta_char = self.delta_char_bps,
+                alpha_touch = self.alpha_touch,
                 confidence = self.confidence,
                 r_squared = r_squared,
                 fills = self.total_calibration_fills,
@@ -322,15 +374,30 @@ impl DepthDecayAS {
         self.confidence > 0.5 && self.total_calibration_fills >= 40
     }
 
+    /// Get calibrated alpha at touch for Kelly-Stochastic allocation.
+    /// Returns the fraction of fills at touch that show significant adverse selection.
+    pub fn calibrated_alpha_touch(&self) -> f64 {
+        self.alpha_touch
+    }
+
+    /// Get alpha at arbitrary depth using exponential decay.
+    /// α(δ) = α_touch × exp(-δ/δ_char)
+    /// Uses the same characteristic depth as AS decay for consistency.
+    pub fn alpha_at_depth(&self, depth_bps: f64) -> f64 {
+        self.alpha_touch * (-depth_bps / self.delta_char_bps).exp()
+    }
+
     /// Get summary for diagnostics.
     pub fn summary(&self) -> DepthDecayASSummary {
         DepthDecayASSummary {
             as_touch_bps: self.as_touch_bps,
             delta_char_bps: self.delta_char_bps,
+            alpha_touch: self.alpha_touch,
             confidence: self.confidence,
             total_fills: self.total_calibration_fills,
             bucket_counts: self.bucket_fills.iter().map(|b| b.len()).collect(),
             bucket_as_bps: self.bucket_as_ewma.to_vec(),
+            bucket_alpha: self.bucket_alpha_ewma.to_vec(),
         }
     }
 
@@ -456,10 +523,14 @@ impl DepthDecayAS {
 pub struct DepthDecayASSummary {
     pub as_touch_bps: f64,
     pub delta_char_bps: f64,
+    /// Calibrated alpha (informed probability) at touch for Kelly-Stochastic
+    pub alpha_touch: f64,
     pub confidence: f64,
     pub total_fills: usize,
     pub bucket_counts: Vec<usize>,
     pub bucket_as_bps: Vec<f64>,
+    /// EWMA alpha (informed probability) per bucket
+    pub bucket_alpha: Vec<f64>,
 }
 
 #[cfg(test)]
@@ -595,5 +666,23 @@ mod tests {
         assert!((summary.delta_char_bps - 12.0).abs() < 0.01);
         assert_eq!(summary.total_fills, 0);
         assert_eq!(summary.bucket_counts.len(), 4);
+        assert_eq!(summary.bucket_alpha.len(), 4);
+        // Default alpha_touch is 0.15
+        assert!((summary.alpha_touch - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_alpha_at_depth() {
+        let model = DepthDecayAS::new(5.0, 10.0);
+        // Default alpha_touch is 0.15
+
+        // At touch: alpha = 0.15
+        assert!((model.alpha_at_depth(0.0) - 0.15).abs() < 0.01);
+
+        // At characteristic depth: alpha = 0.15 * exp(-1) ≈ 0.055
+        assert!((model.alpha_at_depth(10.0) - 0.15 * (-1.0_f64).exp()).abs() < 0.01);
+
+        // Deep: alpha approaches 0
+        assert!(model.alpha_at_depth(50.0) < 0.01);
     }
 }

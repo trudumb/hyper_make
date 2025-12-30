@@ -229,6 +229,16 @@ pub struct MarketParams {
     pub margin_available: f64,
     /// Current leverage ratio
     pub leverage: f64,
+
+    // === Stochastic Module Integration (Kelly-Stochastic Allocation) ===
+    /// Whether to use Kelly-Stochastic allocation (requires use_constrained_optimizer=true)
+    pub use_kelly_stochastic: bool,
+    /// Informed trader probability at the touch (0.0-1.0)
+    pub kelly_alpha_touch: f64,
+    /// Characteristic depth for alpha decay in bps
+    pub kelly_alpha_decay_bps: f64,
+    /// Kelly fraction (0.25 = quarter Kelly)
+    pub kelly_fraction: f64,
 }
 
 impl Default for MarketParams {
@@ -306,6 +316,11 @@ impl Default for MarketParams {
             use_constrained_optimizer: false, // Default OFF for safety
             margin_available: 0.0,            // Will be fetched from margin sizer
             leverage: 1.0,                    // Default 1x leverage
+            // Kelly-Stochastic Allocation (stochastic integration)
+            use_kelly_stochastic: false,  // Default OFF for safety
+            kelly_alpha_touch: 0.15,      // 15% informed at touch
+            kelly_alpha_decay_bps: 10.0,  // Alpha decays with 10bp characteristic
+            kelly_fraction: 0.25,         // Quarter Kelly (conservative)
         }
     }
 }
@@ -430,6 +445,16 @@ impl MarketParams {
             use_constrained_optimizer: self.use_constrained_optimizer,
             margin_available: self.margin_available,
             leverage: self.leverage,
+        }
+    }
+
+    /// Extract Kelly-Stochastic parameters as a focused struct.
+    pub fn kelly_stochastic(&self) -> params::KellyStochasticConfigParams {
+        params::KellyStochasticConfigParams {
+            use_kelly_stochastic: self.use_kelly_stochastic,
+            alpha_touch: self.kelly_alpha_touch,
+            alpha_decay_bps: self.kelly_alpha_decay_bps,
+            kelly_fraction: self.kelly_fraction,
         }
     }
 }

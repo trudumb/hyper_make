@@ -178,6 +178,7 @@ impl DynamicRiskConfig {
 /// - Kalman filter for price denoising
 /// - Constrained variational ladder optimization
 /// - Depth-dependent adverse selection calibration
+/// - Kelly-Stochastic optimal allocation
 #[derive(Debug, Clone)]
 pub struct StochasticConfig {
     /// Use HJB optimal_skew instead of heuristic inventory_skew_with_flow.
@@ -193,6 +194,12 @@ pub struct StochasticConfig {
     /// Optimizes: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ s.t. margin/position constraints
     /// When false: uses geometric decay allocation
     pub use_constrained_optimizer: bool,
+
+    /// Use Kelly-Stochastic allocation instead of proportional MV allocation.
+    /// Only active when use_constrained_optimizer is true.
+    /// When true: uses first-passage fill probability and Kelly criterion
+    /// When false: uses proportional allocation by marginal value (λ × SC)
+    pub use_kelly_stochastic: bool,
 
     /// Feed fills to DepthDecayAS for calibration.
     /// Records fill depth and realized AS for exponential decay model fitting.
@@ -224,6 +231,23 @@ pub struct StochasticConfig {
 
     /// HJB funding rate EWMA half-life (seconds).
     pub hjb_funding_half_life: f64,
+
+    // ==================== Kelly-Stochastic Parameters ====================
+
+    /// Informed trader probability at the touch (0.0-1.0).
+    /// Estimated from fill data or set conservatively.
+    /// Default: 0.15 (15% of trades at touch are informed)
+    pub kelly_alpha_touch: f64,
+
+    /// Characteristic depth for alpha decay in bps.
+    /// α(δ) = α_touch × exp(-δ/alpha_decay_bps)
+    /// Default: 10 bps
+    pub kelly_alpha_decay_bps: f64,
+
+    /// Kelly fraction (0.25 = quarter Kelly, recommended 0.25-0.5).
+    /// Lower values are more conservative.
+    /// Default: 0.25
+    pub kelly_fraction: f64,
 }
 
 impl Default for StochasticConfig {
@@ -233,6 +257,7 @@ impl Default for StochasticConfig {
             use_hjb_skew: true,
             use_kalman_filter: true,
             use_constrained_optimizer: true,
+            use_kelly_stochastic: true, // Use Kelly-Stochastic by default
 
             // Calibration flags - ON by default (passive, safe)
             calibrate_depth_as: true,
@@ -246,6 +271,11 @@ impl Default for StochasticConfig {
             hjb_session_duration: 86400.0, // 24 hour session
             hjb_terminal_penalty: 0.0005,  // 0.05% per unit²
             hjb_funding_half_life: 3600.0, // 1 hour
+
+            // Kelly-Stochastic parameters
+            kelly_alpha_touch: 0.15,      // 15% informed at touch
+            kelly_alpha_decay_bps: 10.0,  // Alpha decays with 10bp characteristic
+            kelly_fraction: 0.25,         // Quarter Kelly (conservative)
         }
     }
 }
@@ -257,6 +287,7 @@ impl StochasticConfig {
             use_hjb_skew: true,
             use_kalman_filter: true,
             use_constrained_optimizer: true,
+            use_kelly_stochastic: true,
             calibrate_depth_as: true,
             use_calibrated_as: true,
             ..Default::default()
@@ -269,6 +300,7 @@ impl StochasticConfig {
             use_hjb_skew: false,
             use_kalman_filter: false,
             use_constrained_optimizer: false,
+            use_kelly_stochastic: false,
             calibrate_depth_as: true,
             use_calibrated_as: false,
             ..Default::default()
@@ -290,6 +322,24 @@ impl StochasticConfig {
     /// Builder: enable constrained optimizer.
     pub fn with_constrained_optimizer(mut self) -> Self {
         self.use_constrained_optimizer = true;
+        self
+    }
+
+    /// Builder: enable Kelly-Stochastic allocation.
+    pub fn with_kelly_stochastic(mut self) -> Self {
+        self.use_kelly_stochastic = true;
+        self
+    }
+
+    /// Builder: set Kelly alpha at touch.
+    pub fn with_kelly_alpha_touch(mut self, alpha: f64) -> Self {
+        self.kelly_alpha_touch = alpha;
+        self
+    }
+
+    /// Builder: set Kelly fraction.
+    pub fn with_kelly_fraction(mut self, fraction: f64) -> Self {
+        self.kelly_fraction = fraction;
         self
     }
 
