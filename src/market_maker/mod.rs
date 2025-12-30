@@ -100,6 +100,22 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     infra: core::InfraComponents,
     /// Stochastic: HJB control, dynamic risk
     stochastic: core::StochasticComponents,
+
+    // === First-Principles Position Limit ===
+    /// Effective max position SIZE (contracts), updated each quote cycle.
+    ///
+    /// Derived from first principles:
+    /// - During warmup: Uses config.max_position as fallback
+    /// - After warmup: Uses dynamic_max_position_value / mid_price
+    ///
+    /// Formula: max_position = min(leverage_limit, volatility_limit) / mid_price
+    /// where:
+    ///   leverage_limit = account_value × max_leverage
+    ///   volatility_limit = (equity × risk_fraction) / (num_sigmas × σ × √T)
+    ///
+    /// This is THE source of truth for all position limit checks.
+    /// NEVER use config.max_position directly for runtime decisions.
+    effective_max_position: f64,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -183,6 +199,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             DynamicRiskConfig::default(),
         );
 
+        // Initialize effective_max_position to static fallback (used during warmup)
+        let effective_max_position = config.max_position;
+
         Self {
             config,
             strategy,
@@ -199,6 +218,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             safety,
             infra,
             stochastic,
+            effective_max_position,
         }
     }
 
@@ -488,9 +508,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // === Update Prometheus metrics ===
                     let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+                    // HARMONIZED: Use effective_max_position for accurate utilization metrics
                     self.infra.prometheus.update_position(
                         self.position.position(),
-                        self.config.max_position,
+                        self.effective_max_position, // First-principles limit
                     );
                     self.infra.prometheus.update_pnl(
                         pnl_summary.total_pnl,      // daily_pnl (total for now)
@@ -579,11 +600,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Handle AllMids message - updates mid price and triggers quote refresh.
     async fn handle_all_mids(&mut self, all_mids: crate::ws::message_types::AllMids) -> Result<()> {
+        // HARMONIZED: Use effective_max_position for position utilization calculations
         let ctx = messages::MessageContext::new(
             self.config.asset.clone(),
             self.latest_mid,
             self.position.position(),
-            self.config.max_position,
+            self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
         );
 
@@ -609,11 +631,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Handle Trades message - updates volatility and flow estimates.
     fn handle_trades(&mut self, trades: crate::ws::message_types::Trades) -> Result<()> {
+        // HARMONIZED: Use effective_max_position for position utilization calculations
         let ctx = messages::MessageContext::new(
             self.config.asset.clone(),
             self.latest_mid,
             self.position.position(),
-            self.config.max_position,
+            self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
         );
 
@@ -634,15 +657,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         &mut self,
         user_fills: crate::ws::message_types::UserFills,
     ) -> Result<()> {
+        // HARMONIZED: Use effective_max_position for position utilization calculations
         let ctx = messages::MessageContext::new(
             self.config.asset.clone(),
             self.latest_mid,
             self.position.position(),
-            self.config.max_position,
+            self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
         );
 
         // Create fill state for the processor
+        // HARMONIZED: Use effective_max_position for position threshold warnings
         let mut fill_state = fills::FillState {
             position: &mut self.position,
             orders: &mut self.orders,
@@ -655,7 +680,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             metrics: &self.infra.metrics,
             latest_mid: self.latest_mid,
             asset: &self.config.asset,
-            max_position: self.config.max_position,
+            max_position: self.effective_max_position, // First-principles limit
             calibrate_depth_as: self.stochastic.stochastic_config.calibrate_depth_as,
         };
 
@@ -694,11 +719,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Handle L2Book message - updates order book metrics.
     fn handle_l2_book(&mut self, l2_book: crate::ws::message_types::L2Book) -> Result<()> {
+        // HARMONIZED: Use effective_max_position for position utilization calculations
         let ctx = messages::MessageContext::new(
             self.config.asset.clone(),
             self.latest_mid,
             self.position.position(),
-            self.config.max_position,
+            self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
         );
 
@@ -774,8 +800,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
         let market_params = ParameterAggregator::build(&sources);
 
-        // Compute effective max_position for logging (dynamic if valid, else static)
-        let effective_max_pos = market_params.effective_max_position(self.config.max_position);
+        // CRITICAL: Update cached effective max_position from first principles
+        // This is THE source of truth for all position limit checks
+        let new_effective = market_params.effective_max_position(self.config.max_position);
+        if (new_effective - self.effective_max_position).abs() > 0.001 {
+            debug!(
+                old = %format!("{:.6}", self.effective_max_position),
+                new = %format!("{:.6}", new_effective),
+                dynamic_valid = market_params.dynamic_limit_valid,
+                "Effective max position updated from first principles"
+            );
+        }
+        self.effective_max_position = new_effective;
 
         debug!(
             mid = self.latest_mid,
@@ -783,7 +819,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position = self.position.position(),
             static_max_pos = self.config.max_position,
             dynamic_max_pos = %format!("{:.6}", market_params.dynamic_max_position),
-            effective_max_pos = %format!("{:.6}", effective_max_pos),
+            effective_max_pos = %format!("{:.6}", self.effective_max_position),
             dynamic_valid = market_params.dynamic_limit_valid,
             target_liq = self.config.target_liquidity,
             sigma_clean = %format!("{:.6}", market_params.sigma),
@@ -822,9 +858,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
             // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
+            // HARMONIZED: Use effective_max_position (first-principles derived) instead of static config
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
-                max_position: self.config.max_position,
+                max_position: self.effective_max_position, // First-principles limit
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.clone(),
@@ -866,9 +903,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
 
             // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
+            // HARMONIZED: Use effective_max_position (first-principles derived) instead of static config
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
-                max_position: self.config.max_position,
+                max_position: self.effective_max_position, // First-principles limit
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.clone(),
@@ -1791,6 +1829,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // === Step 7: Reduce-only status ===
+        // HARMONIZED: Use effective_max_position for reduce-only check
         let position = self.position.position();
         let position_value = position.abs() * self.latest_mid;
         let max_position_value = self.safety.kill_switch.max_position_value();
@@ -1798,7 +1837,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let (reduce_only, reason) = safety::SafetyAuditor::check_reduce_only(
             position,
             position_value,
-            self.config.max_position,
+            self.effective_max_position, // First-principles limit
             max_position_value,
         );
         safety::SafetyAuditor::log_reduce_only_status(reduce_only, reason.as_deref());
@@ -1888,18 +1927,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
 
         // Warn if available capacity is low
+        // HARMONIZED: Use effective_max_position for capacity threshold
         let position = self.position.position();
-        if position > 0.0 && summary.available_sell < self.config.max_position * 0.1 {
+        if position > 0.0 && summary.available_sell < self.effective_max_position * 0.1 {
             warn!(
                 available_sell = %format!("{:.6}", summary.available_sell),
                 position = %format!("{:.6}", position),
+                effective_max = %format!("{:.6}", self.effective_max_position),
                 "Low sell capacity - near exchange position limit"
             );
         }
-        if position < 0.0 && summary.available_buy < self.config.max_position * 0.1 {
+        if position < 0.0 && summary.available_buy < self.effective_max_position * 0.1 {
             warn!(
                 available_buy = %format!("{:.6}", summary.available_buy),
                 position = %format!("{:.6}", position),
+                effective_max = %format!("{:.6}", self.effective_max_position),
                 "Low buy capacity - near exchange position limit"
             );
         }
@@ -1950,11 +1992,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let position = self.position.position();
 
+        // HARMONIZED: Use effective_max_position for risk state calculations
         risk::RiskState::new(
             pnl_summary.total_pnl,
             pnl_summary.total_pnl.max(0.0), // Peak PnL tracking simplified
             position,
-            self.config.max_position,
+            self.effective_max_position, // First-principles limit
             self.latest_mid,
             self.safety.kill_switch.max_position_value(),
             self.infra.margin_sizer.state().account_value,
