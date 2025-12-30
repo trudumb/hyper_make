@@ -28,8 +28,10 @@
 //! └── estimator
 //! ```
 
-mod state;
 mod components;
+mod state;
 
+pub use components::{
+    InfraComponents, SafetyComponents, StochasticComponents, Tier1Components, Tier2Components,
+};
 pub use state::CoreState;
-pub use components::{Tier1Components, Tier2Components, InfraComponents, StochasticComponents, SafetyComponents};

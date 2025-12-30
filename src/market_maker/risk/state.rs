@@ -131,12 +131,7 @@ impl RiskState {
     }
 
     /// Builder-style method to set cascade metrics.
-    pub fn with_cascade(
-        mut self,
-        severity: f64,
-        tail_risk_mult: f64,
-        should_pull: bool,
-    ) -> Self {
+    pub fn with_cascade(mut self, severity: f64, tail_risk_mult: f64, should_pull: bool) -> Self {
         self.cascade_severity = severity;
         self.tail_risk_multiplier = tail_risk_mult;
         self.should_pull_quotes = should_pull;

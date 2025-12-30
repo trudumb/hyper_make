@@ -47,14 +47,82 @@ This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data
 **`signature/`** - EIP-712 cryptographic signing
 - `sign_l1_action()`, `sign_typed_data()`: Transaction signing for Ethereum compatibility
 
-**`market_maker/`** - Modular market making system
-- `mod.rs`: `MarketMaker<S, E>` orchestrator - coordinates strategy, orders, position, execution
-- `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`, `MarketMakerMetricsRecorder` trait
-- `strategy.rs`: `QuotingStrategy` trait + `SymmetricStrategy` + `InventoryAwareStrategy` + `GLFTStrategy`
-- `estimator.rs`: `ParameterEstimator` - econometric pipeline with volume clock, bipower variation, regime detection, microprice estimation
-- `order_manager.rs`: `OrderManager`, `TrackedOrder`, `Side` - tracks resting orders by oid
-- `position.rs`: `PositionTracker` - position state with fill deduplication by tid
-- `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor` - abstracts order placement/cancellation
+**`market_maker/`** - Modular market making system (~24K lines, 74 files)
+
+**Core:**
+- `mod.rs`: `MarketMaker<S, E>` orchestrator (1,500 lines)
+- `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`
+- `core/`: Component bundles (Tier1, Tier2, Safety, Infra, Stochastic)
+
+**Estimator Pipeline** (`estimator/` - 10 files):
+- `parameter_estimator.rs`: Main orchestrator with `MarketEstimator` trait
+- `volatility.rs`: Bipower variation, regime detection, stochastic vol
+- `kappa.rs`: Bayesian order flow intensity estimation
+- `microprice.rs`: Ridge regression fair price from signals
+- `volume.rs`: Volume clock, bucket accumulation
+- `momentum.rs`: Trade flow tracking, falling knife detection
+- `kalman.rs`: Noise filtering
+- `jump.rs`: Poisson jump process estimation
+
+**Strategies** (`strategy/` - 6 files):
+- `mod.rs`: `QuotingStrategy` trait definition
+- `glft.rs`: GLFT optimal control strategy
+- `ladder_strat.rs`: Multi-level ladder quoting
+- `simple.rs`: `SymmetricStrategy`, `InventoryAwareStrategy`
+- `risk_config.rs`: Dynamic gamma configuration
+- `market_params.rs`, `params.rs`: Parameter aggregation
+
+**Quoting** (`quoting/`):
+- `ladder/`: Pure computation module
+  - `generator.rs`: Depth spacing, fill intensity, spread capture
+  - `optimizer.rs`: Constrained variational allocation
+  - `mod.rs`: `Ladder`, `LadderLevel`, `LadderConfig` types
+- `filter.rs`: Reduce-only mode enforcement
+
+**Risk Management** (`risk/`):
+- `kill_switch.rs`: Emergency shutdown triggers
+- `aggregator.rs`: Unified `RiskAggregator` evaluation
+- `state.rs`: `RiskState` snapshot
+- `monitor.rs`: `RiskMonitor` trait
+- `monitors/`: Loss, Drawdown, Position, Cascade, DataStaleness, RateLimit
+
+**Process Models** (`process_models/`):
+- `hawkes.rs`: Self-exciting order flow intensity
+- `liquidation.rs`: Cascade detection and tail risk
+- `funding.rs`: Funding rate estimation
+- `spread.rs`: Bid-ask spread dynamics
+- `hjb_control.rs`: Hamilton-Jacobi-Bellman inventory control
+
+**Infrastructure** (`infra/`):
+- `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor`
+- `margin.rs`: `MarginAwareSizer` for pre-flight checks
+- `metrics.rs`: Prometheus metrics (846 lines)
+- `reconnection.rs`: Connection health monitoring
+- `data_quality.rs`: Market data validation
+
+**Tracking** (`tracking/`):
+- `order_manager.rs`: `OrderManager`, `TrackedOrder`, `OrderState`
+- `position.rs`: `PositionTracker` with fill deduplication
+- `pnl.rs`: P&L attribution and tracking
+- `queue.rs`: Queue position estimation
+
+**Adverse Selection** (`adverse_selection/` - 3 files):
+- `estimator.rs`: E[Δp|fill] measurement, EWMA tracking
+- `depth_decay.rs`: AS(δ) = AS₀ × exp(-δ/δ_char) model
+- `mod.rs`: `AdverseSelectionConfig`
+
+**Fill Processing** (`fills/`):
+- `processor.rs`: `FillProcessor` orchestration
+- `consumer.rs`: `FillConsumer` trait for extensibility
+- `dedup.rs`: Centralized deduplication by trade ID
+
+**Message Handlers** (`messages/`):
+- Focused handlers: `all_mids.rs`, `trades.rs`, `l2_book.rs`, `user_fills.rs`
+- `context.rs`: Shared `MessageContext`
+- `processors.rs`: Processing utilities
+
+**Safety** (`safety/`):
+- `auditor.rs`: `SafetyAuditor` for state reconciliation
 
 ### Supporting Files
 
@@ -88,19 +156,58 @@ Production tools in `src/bin/` (run with `cargo run --bin <name>`):
 
 ### Market Maker Architecture
 
-The market maker uses a modular, trait-based design for extensibility:
+The market maker uses a modular, trait-based design with component bundles:
 
 ```
 MarketMaker<S: QuotingStrategy, E: OrderExecutor>
-    ├── QuotingStrategy (trait)     # Pluggable pricing logic
-    │   ├── SymmetricStrategy       # Equal spread both sides
-    │   ├── InventoryAwareStrategy  # Position-based skew
-    │   └── GLFTStrategy            # Optimal MM (Guéant-Lehalle-Fernandez-Tapia)
-    ├── OrderExecutor (trait)       # Abstracted execution (testable)
-    │   └── HyperliquidExecutor     # Real exchange client
-    ├── ParameterEstimator          # Live σ, κ, τ estimation from market data
-    ├── OrderManager                # Tracks resting orders
-    └── PositionTracker             # Fill dedup + position state
+    │
+    ├── Core Fields
+    │   ├── config: MarketMakerConfig
+    │   ├── strategy: S                    # Pluggable pricing logic
+    │   ├── executor: E                    # Abstracted execution
+    │   ├── estimator: ParameterEstimator  # Live σ, κ, τ estimation
+    │   ├── orders: OrderManager           # Tracks resting orders
+    │   └── position: PositionTracker      # Fill dedup + position state
+    │
+    ├── tier1: Tier1Components             # Production resilience
+    │   ├── adverse_selection              # E[Δp|fill] measurement
+    │   ├── depth_decay_as                 # Depth-dependent AS model
+    │   ├── queue_tracker                  # Queue position estimation
+    │   └── liquidation_detector           # Cascade detection
+    │
+    ├── tier2: Tier2Components             # Process models
+    │   ├── hawkes                         # Self-exciting order flow
+    │   ├── funding                        # Funding rate tracking
+    │   ├── spread_tracker                 # Spread dynamics
+    │   └── pnl_tracker                    # P&L attribution
+    │
+    ├── safety: SafetyComponents           # Risk management
+    │   ├── kill_switch                    # Emergency shutdown
+    │   ├── risk_aggregator                # Unified risk evaluation
+    │   └── fill_processor                 # Centralized fill handling
+    │
+    ├── infra: InfraComponents             # Infrastructure
+    │   ├── margin_sizer                   # Pre-flight margin checks
+    │   ├── prometheus                     # Metrics endpoint
+    │   ├── connection_health              # WebSocket health
+    │   └── data_quality                   # Data validation
+    │
+    └── stochastic: StochasticComponents   # Optimal control
+        ├── hjb_controller                 # HJB inventory control
+        ├── stochastic_config              # Stochastic parameters
+        └── dynamic_risk_config            # Dynamic γ scaling
+```
+
+**Strategies:**
+```
+QuotingStrategy (trait)
+    ├── SymmetricStrategy       # Equal spread both sides
+    ├── InventoryAwareStrategy  # Position-based skew
+    ├── GLFTStrategy            # Optimal MM (Guéant-Lehalle-Fernandez-Tapia)
+    └── LadderStrategy          # Multi-level ladder quoting
+
+OrderExecutor (trait)
+    └── HyperliquidExecutor     # Real exchange client
 ```
 
 **GLFT Strategy (default):**
@@ -212,7 +319,7 @@ impl QuotingStrategy for MyStrategy {
 
 The market maker includes advanced features beyond basic quoting:
 
-**Adverse Selection Measurement** (`adverse_selection.rs`):
+**Adverse Selection Measurement** (`adverse_selection/`):
 - Ground truth measurement: E[Δp | fill] at 1-second horizon
 - Tracks realized adverse selection separately for buy/sell fills (EWMA)
 - Calculates predicted α (probability of informed flow)
@@ -226,7 +333,7 @@ Key metrics:
 - alpha: Probability of trading against informed flow
 ```
 
-**Liquidation Cascade Detection** (`liquidation.rs`):
+**Liquidation Cascade Detection** (`process_models/liquidation.rs`):
 - Size-weighted Hawkes process models self-exciting liquidation events
 - Cascade severity scoring (0.0 = calm, 1.0+ = extreme)
 - Quote-pulling circuit breaker when severity exceeds threshold
@@ -240,7 +347,7 @@ Configuration:
 - cascade_decay: Half-life of cascade intensity decay
 ```
 
-**Queue Position Tracking** (`queue.rs`):
+**Queue Position Tracking** (`tracking/queue.rs`):
 - Estimates depth-ahead for resting orders
 - Fill probability calculation: P(fill) = P(touch) × P(execute|touch)
 - Queue decay modeling (20% per-second default)
@@ -394,7 +501,7 @@ Additional parameters beyond basic gamma scaling:
 
 ### Production Infrastructure
 
-**Margin-Aware Sizer** (`mod.rs`):
+**Margin-Aware Sizer** (`infra/margin.rs`):
 - Pre-flight margin checks before order placement
 - Reduces order size if margin insufficient
 - Respects leverage constraints from account settings

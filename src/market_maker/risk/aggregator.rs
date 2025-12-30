@@ -59,7 +59,10 @@ impl AggregatedRisk {
         } else if self.max_severity >= RiskSeverity::High {
             format!(
                 "HIGH RISK: {} actionable, reduce_only={}, pull_quotes={}, spread_factor={:.2}",
-                self.assessments.iter().filter(|a| a.is_actionable()).count(),
+                self.assessments
+                    .iter()
+                    .filter(|a| a.is_actionable())
+                    .count(),
                 self.reduce_only,
                 self.pull_quotes,
                 self.spread_factor
@@ -280,8 +283,7 @@ mod tests {
 
     #[test]
     fn test_reduce_only() {
-        let aggregator =
-            RiskAggregator::new().with_monitor(Box::new(ReduceOnlyMonitor));
+        let aggregator = RiskAggregator::new().with_monitor(Box::new(ReduceOnlyMonitor));
 
         let result = aggregator.evaluate(&RiskState::default());
 
@@ -293,9 +295,7 @@ mod tests {
     fn test_priority_ordering() {
         let aggregator = RiskAggregator::new()
             .with_monitor(Box::new(OkMonitor)) // priority 100
-            .with_monitor(Box::new(CriticalMonitor {
-                reason: "Test",
-            })); // priority 0
+            .with_monitor(Box::new(CriticalMonitor { reason: "Test" })); // priority 0
 
         // Critical should be first due to lower priority
         let names = aggregator.monitor_names();

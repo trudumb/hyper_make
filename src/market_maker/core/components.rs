@@ -5,20 +5,18 @@
 use crate::market_maker::{
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::MetricsRecorder,
-    data_quality::{DataQualityConfig, DataQualityMonitor},
     fills::FillProcessor,
-    funding::{FundingConfig, FundingRateEstimator},
-    hawkes::{HawkesConfig, HawkesOrderFlowEstimator},
-    hjb_control::{HJBConfig, HJBInventoryController},
-    kill_switch::{KillSwitch, KillSwitchConfig},
-    liquidation::{LiquidationCascadeDetector, LiquidationConfig},
-    margin::{MarginAwareSizer, MarginConfig},
-    metrics::PrometheusMetrics,
-    pnl::{PnLConfig, PnLTracker},
-    queue::{QueueConfig, QueuePositionTracker},
-    reconnection::ConnectionHealthMonitor,
-    risk::RiskAggregator,
-    spread::{SpreadConfig, SpreadProcessEstimator},
+    infra::{
+        ConnectionHealthMonitor, DataQualityConfig, DataQualityMonitor, MarginAwareSizer,
+        MarginConfig, PrometheusMetrics,
+    },
+    process_models::{
+        FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
+        HawkesOrderFlowEstimator, LiquidationCascadeDetector, LiquidationConfig, SpreadConfig,
+        SpreadProcessEstimator,
+    },
+    risk::{KillSwitch, KillSwitchConfig, RiskAggregator},
+    tracking::{PnLConfig, PnLTracker, QueueConfig, QueuePositionTracker},
     DynamicRiskConfig, StochasticConfig,
 };
 

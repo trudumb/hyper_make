@@ -27,10 +27,12 @@
 //! - **Testable**: Monitors can be tested in isolation
 
 mod aggregator;
+mod kill_switch;
 mod monitor;
 pub mod monitors;
 mod state;
 
 pub use aggregator::{AggregatedRisk, RiskAggregator};
+pub use kill_switch::*;
 pub use monitor::{RiskAction, RiskAssessment, RiskMonitor, RiskMonitorBox, RiskSeverity};
 pub use state::RiskState;

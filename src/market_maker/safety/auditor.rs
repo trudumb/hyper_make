@@ -114,10 +114,7 @@ impl SafetyAuditor {
 
     /// Find orphan orders (on exchange but not in local tracking).
     pub fn find_orphans(exchange_oids: &HashSet<u64>, local_oids: &HashSet<u64>) -> Vec<u64> {
-        exchange_oids
-            .difference(local_oids)
-            .copied()
-            .collect()
+        exchange_oids.difference(local_oids).copied().collect()
     }
 
     /// Find stale local orders (in local tracking but not on exchange).
@@ -144,10 +141,7 @@ impl SafetyAuditor {
         if success {
             debug!("[SafetySync] Cancelled orphan order: oid={}", oid);
         } else {
-            warn!(
-                "[SafetySync] Failed to cancel orphan order: oid={}",
-                oid
-            );
+            warn!("[SafetySync] Failed to cancel orphan order: oid={}", oid);
         }
     }
 
@@ -207,10 +201,10 @@ mod tests {
     #[test]
     fn test_reduce_only_under_limits() {
         let (is_active, reason) = SafetyAuditor::check_reduce_only(
-            0.5,      // position
-            5000.0,   // position_value
-            1.0,      // max_position
-            10000.0,  // max_position_value
+            0.5,     // position
+            5000.0,  // position_value
+            1.0,     // max_position
+            10000.0, // max_position_value
         );
         assert!(!is_active);
         assert!(reason.is_none());
@@ -219,10 +213,10 @@ mod tests {
     #[test]
     fn test_reduce_only_over_position() {
         let (is_active, reason) = SafetyAuditor::check_reduce_only(
-            1.5,      // position > max
-            7500.0,   // position_value
-            1.0,      // max_position
-            10000.0,  // max_position_value
+            1.5,     // position > max
+            7500.0,  // position_value
+            1.0,     // max_position
+            10000.0, // max_position_value
         );
         assert!(is_active);
         assert!(reason.is_some());
@@ -232,10 +226,10 @@ mod tests {
     #[test]
     fn test_reduce_only_over_value() {
         let (is_active, reason) = SafetyAuditor::check_reduce_only(
-            0.5,      // position
-            15000.0,  // position_value > max
-            1.0,      // max_position
-            10000.0,  // max_position_value
+            0.5,     // position
+            15000.0, // position_value > max
+            1.0,     // max_position
+            10000.0, // max_position_value
         );
         assert!(is_active);
         assert!(reason.is_some());
@@ -245,10 +239,10 @@ mod tests {
     #[test]
     fn test_reduce_only_both_limits() {
         let (is_active, reason) = SafetyAuditor::check_reduce_only(
-            -2.0,     // position > max (short)
-            20000.0,  // position_value > max
-            1.0,      // max_position
-            10000.0,  // max_position_value
+            -2.0,    // position > max (short)
+            20000.0, // position_value > max
+            1.0,     // max_position
+            10000.0, // max_position_value
         );
         assert!(is_active);
         let reason_str = reason.unwrap();

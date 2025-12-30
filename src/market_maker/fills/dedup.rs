@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn test_check_and_mark() {
         let mut dedup = FillDeduplicator::new();
-        assert!(dedup.check_and_mark(1));  // New
+        assert!(dedup.check_and_mark(1)); // New
         assert!(!dedup.check_and_mark(1)); // Duplicate
     }
 

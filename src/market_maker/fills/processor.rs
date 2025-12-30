@@ -19,14 +19,13 @@
 use super::dedup::FillDeduplicator;
 use super::{FillEvent, FillResult};
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
-use crate::market_maker::estimator::ParameterEstimator;
-use crate::market_maker::messages;
-use crate::market_maker::metrics::PrometheusMetrics;
-use crate::market_maker::order_manager::{OrderManager, Side};
-use crate::market_maker::pnl::PnLTracker;
-use crate::market_maker::position::PositionTracker;
-use crate::market_maker::queue::QueuePositionTracker;
 use crate::market_maker::config::MetricsRecorder;
+use crate::market_maker::estimator::ParameterEstimator;
+use crate::market_maker::infra::PrometheusMetrics;
+use crate::market_maker::messages;
+use crate::market_maker::tracking::{
+    OrderManager, PnLTracker, PositionTracker, QueuePositionTracker, Side,
+};
 use tracing::{debug, info, warn};
 
 /// Fill processing result with additional context.
@@ -146,9 +145,8 @@ impl FillProcessor {
         state.position.process_fill(fill.size, fill.is_buy);
 
         // Step 3: Update order tracking
-        let (order_found, is_new_fill, is_complete) = state
-            .orders
-            .process_fill(fill.oid, fill.tid, fill.size);
+        let (order_found, is_new_fill, is_complete) =
+            state.orders.process_fill(fill.oid, fill.tid, fill.size);
 
         // Step 4: Determine placement price
         let placement_price = if order_found {
@@ -214,12 +212,9 @@ impl FillProcessor {
         let placement = placement_price.unwrap_or(fill.price);
 
         // Tier 1: Adverse selection measurement
-        state.adverse_selection.record_fill(
-            fill.tid,
-            fill.size,
-            fill.is_buy,
-            state.latest_mid,
-        );
+        state
+            .adverse_selection
+            .record_fill(fill.tid, fill.size, fill.is_buy, state.latest_mid);
 
         // Stochastic: Depth-aware AS calibration
         if state.calibrate_depth_as {
@@ -234,13 +229,9 @@ impl FillProcessor {
 
         // Estimator: Feed own fill rate for kappa
         let timestamp_ms = fill.timestamp_ms();
-        state.estimator.on_own_fill(
-            timestamp_ms,
-            placement,
-            fill.price,
-            fill.size,
-            fill.is_buy,
-        );
+        state
+            .estimator
+            .on_own_fill(timestamp_ms, placement, fill.price, fill.size, fill.is_buy);
 
         // Tier 2: P&L tracking
         state.pnl_tracker.record_fill(
@@ -285,7 +276,9 @@ impl FillProcessor {
     ) {
         if order_found && !is_complete {
             // Partial fill - update queue position
-            state.queue_tracker.order_partially_filled(fill.oid, fill.size);
+            state
+                .queue_tracker
+                .order_partially_filled(fill.oid, fill.size);
         }
         // Note: For complete fills, cleanup() in mod.rs handles removal
         // Note: For pending-matched fills, queue tracking is handled when order is finalized
@@ -319,8 +312,7 @@ impl Default for FillProcessor {
 mod tests {
     use super::*;
     use crate::market_maker::adverse_selection::AdverseSelectionConfig;
-    use crate::market_maker::pnl::PnLConfig;
-    use crate::market_maker::queue::QueueConfig;
+    use crate::market_maker::tracking::{PnLConfig, QueueConfig};
     use crate::market_maker::EstimatorConfig;
 
     fn make_fill(tid: u64, oid: u64, size: f64, price: f64, is_buy: bool) -> FillEvent {
@@ -330,7 +322,7 @@ mod tests {
             size,
             price,
             is_buy,
-            price, // mid_at_fill = price for simplicity
+            price,       // mid_at_fill = price for simplicity
             Some(price), // placement_price = price
             "BTC".to_string(),
         )
@@ -369,7 +361,8 @@ mod tests {
         let mut processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);
         let mut orders = OrderManager::new();
-        let mut adverse_selection = AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
+        let mut adverse_selection =
+            AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
         let mut depth_decay_as = DepthDecayAS::default();
         let mut queue_tracker = QueuePositionTracker::new(QueueConfig::default());
         let mut estimator = ParameterEstimator::new(EstimatorConfig::default());
@@ -402,7 +395,8 @@ mod tests {
         let mut processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);
         let mut orders = OrderManager::new();
-        let mut adverse_selection = AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
+        let mut adverse_selection =
+            AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
         let mut depth_decay_as = DepthDecayAS::default();
         let mut queue_tracker = QueuePositionTracker::new(QueueConfig::default());
         let mut estimator = ParameterEstimator::new(EstimatorConfig::default());

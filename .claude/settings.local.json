@@ -36,7 +36,10 @@
       "Skill(sc:design)",
       "Skill(sc:implement)",
       "mcp__sequential-thinking__sequentialthinking",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(tree:*)",
+      "Skill(sc:analyze)",
+      "Bash(git stash:*)"
     ]
   }
 }

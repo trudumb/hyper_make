@@ -104,12 +104,12 @@ impl QuoteFilter {
         if position > 0.0 {
             // Long position over max: only allow sells (no bids)
             bids.clear();
-            Self::log_reduce_only(position, &config, reason, true);
+            Self::log_reduce_only(position, config, reason, true);
             ReduceOnlyResult::filtered_bids(reason)
         } else {
             // Short position over max: only allow buys (no asks)
             asks.clear();
-            Self::log_reduce_only(position, &config, reason, false);
+            Self::log_reduce_only(position, config, reason, false);
             ReduceOnlyResult::filtered_asks(reason)
         }
     }
@@ -142,12 +142,12 @@ impl QuoteFilter {
         if position > 0.0 {
             // Long position over max: only allow sells (no bids)
             *bid = None;
-            Self::log_reduce_only(position, &config, reason, true);
+            Self::log_reduce_only(position, config, reason, true);
             ReduceOnlyResult::filtered_bids(reason)
         } else {
             // Short position over max: only allow buys (no asks)
             *ask = None;
-            Self::log_reduce_only(position, &config, reason, false);
+            Self::log_reduce_only(position, config, reason, false);
             ReduceOnlyResult::filtered_asks(reason)
         }
     }
@@ -271,11 +271,7 @@ mod tests {
         let mut bids = vec![Quote::new(49000.0, 0.1)];
         let mut asks = vec![Quote::new(51000.0, 0.1)];
 
-        let result = QuoteFilter::apply_reduce_only_ladder(
-            &mut bids,
-            &mut asks,
-            &config,
-        );
+        let result = QuoteFilter::apply_reduce_only_ladder(&mut bids, &mut asks, &config);
 
         assert!(result.was_filtered);
         assert_eq!(result.reason, Some(ReduceOnlyReason::OverValueLimit));

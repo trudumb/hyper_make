@@ -8,53 +8,28 @@
 
 mod adverse_selection;
 mod config;
-mod data_quality;
-mod estimator;
-mod executor;
-mod funding;
-mod hawkes;
-mod hjb_control;
-mod kill_switch;
-mod ladder;
-mod liquidation;
-mod margin;
-mod metrics;
-mod order_manager;
-mod params;
-mod pnl;
-mod position;
-mod queue;
-mod reconnection;
-mod spread;
-mod strategy;
 pub mod core;
+mod estimator;
+pub mod events;
 pub mod fills;
+pub mod infra;
 pub mod messages;
+pub mod process_models;
 pub mod quoting;
 pub mod risk;
 pub mod safety;
+mod strategy;
+pub mod tracking;
 
 pub use adverse_selection::*;
 pub use config::*;
-pub use hjb_control::*;
-pub use data_quality::*;
 pub use estimator::*;
-pub use executor::*;
-pub use funding::*;
-pub use hawkes::*;
-pub use kill_switch::*;
-pub use ladder::*;
-pub use liquidation::*;
-pub use margin::*;
-pub use metrics::*;
-pub use order_manager::*;
-pub use pnl::*;
-pub use position::*;
-pub use params::*;
-pub use queue::*;
-pub use reconnection::*;
-pub use spread::*;
+pub use infra::*;
+pub use process_models::*;
+pub use quoting::*;
+pub use risk::*;
 pub use strategy::*;
+pub use tracking::*;
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -75,7 +50,18 @@ const MIN_ORDER_NOTIONAL: f64 = 10.0;
 /// Coordinates strategy, order management, position tracking, and execution.
 /// Includes live parameter estimation for GLFT strategy (σ from trades, κ from L2 book).
 /// Tier 1 modules provide adverse selection measurement, queue tracking, and cascade detection.
+///
+/// # Component Organization
+///
+/// Fields are organized into logical bundles:
+/// - **Core**: config, strategy, executor, orders, position, estimator
+/// - **Tier1**: adverse selection, queue tracking, liquidation detection
+/// - **Tier2**: hawkes, funding, spread, P&L
+/// - **Safety**: kill switch, risk aggregator, fill processor
+/// - **Infra**: margin, prometheus, connection health, data quality
+/// - **Stochastic**: HJB controller, stochastic config, dynamic risk
 pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
+    // === Core Fields ===
     /// Configuration
     config: MarketMakerConfig,
     /// Quoting strategy
@@ -92,66 +78,22 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     user_address: Address,
     /// Latest mid price
     latest_mid: f64,
-    /// Metrics recorder
-    metrics: MetricsRecorder,
     /// Parameter estimator for σ and κ
     estimator: ParameterEstimator,
     /// Last logged warmup progress (to avoid spam)
     last_warmup_log: usize,
 
-    // === Tier 1: Production Resilience Modules ===
-    /// Adverse selection estimator - measures E[Δp|fill] and provides spread adjustment
-    adverse_selection: AdverseSelectionEstimator,
-    /// Depth-dependent AS model - calibrated from fills: AS(δ) = AS₀ × exp(-δ/δ_char)
-    depth_decay_as: DepthDecayAS,
-    /// Queue position tracker - estimates P(fill) for each order
-    queue_tracker: QueuePositionTracker,
-    /// Liquidation cascade detector - tail risk management with Hawkes process
-    liquidation_detector: LiquidationCascadeDetector,
-
-    // === Production Safety ===
-    /// Kill switch - emergency shutdown on drawdown/loss/stale data
-    kill_switch: KillSwitch,
-    /// Risk aggregator - unified risk evaluation from multiple monitors
-    risk_aggregator: risk::RiskAggregator,
-
-    // === Tier 2: Process Models ===
-    /// Hawkes order flow estimator - self-exciting trade intensity
-    hawkes: HawkesOrderFlowEstimator,
-    /// Funding rate estimator - perpetual funding cost modeling
-    funding: FundingRateEstimator,
-    /// Spread process estimator - spread dynamics and regime detection
-    spread_tracker: SpreadProcessEstimator,
-    /// P&L tracker - attribution breakdown (fills, funding, unrealized)
-    pnl_tracker: PnLTracker,
-
-    // === Production Infrastructure ===
-    /// Margin-aware sizer - pre-flight checks for leverage constraints
-    margin_sizer: MarginAwareSizer,
-    /// Prometheus metrics - production monitoring
-    prometheus: PrometheusMetrics,
-    /// Connection health monitor - WS staleness tracking
-    connection_health: ConnectionHealthMonitor,
-    /// Data quality monitor - validates incoming market data
-    data_quality: DataQualityMonitor,
-
-    // === First-Principles Risk ===
-    /// Dynamic risk configuration for adaptive position limits
-    dynamic_risk_config: DynamicRiskConfig,
-
-    // === Stochastic Module Integration ===
-    /// HJB inventory controller - optimal skew from Avellaneda-Stoikov HJB solution
-    hjb_controller: HJBInventoryController,
-    /// Stochastic module configuration (feature flags)
-    stochastic_config: StochasticConfig,
-
-    // === Fill Processing Pipeline ===
-    /// Fill processor - orchestrates fill handling across all modules
-    fill_processor: fills::FillProcessor,
-
-    // === Margin Refresh Tracking ===
-    /// Last time margin was refreshed (for throttling)
-    last_margin_refresh: std::time::Instant,
+    // === Component Bundles ===
+    /// Tier 1: Production resilience (AS, queue, liquidation)
+    tier1: core::Tier1Components,
+    /// Tier 2: Process models (hawkes, funding, spread, P&L)
+    tier2: core::Tier2Components,
+    /// Safety: Kill switch, risk aggregation, fill processing
+    safety: core::SafetyComponents,
+    /// Infrastructure: Margin, metrics, health, data quality
+    infra: core::InfraComponents,
+    /// Stochastic: HJB control, dynamic risk
+    stochastic: core::StochasticComponents,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -195,7 +137,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         spread_config: SpreadConfig,
         pnl_config: PnLConfig,
         margin_config: MarginConfig,
-        data_quality_config: data_quality::DataQualityConfig,
+        data_quality_config: infra::DataQualityConfig,
     ) -> Self {
         // Capture config values before moving config
         let stochastic_config = config.stochastic.clone();
@@ -207,6 +149,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             ..HJBConfig::default()
         };
 
+        // Build component bundles
+        let tier1 = core::Tier1Components::new(as_config, queue_config, liquidation_config);
+        let tier2 =
+            core::Tier2Components::new(hawkes_config, funding_config, spread_config, pnl_config);
+        let safety = core::SafetyComponents::new(
+            kill_switch_config.clone(),
+            Self::build_risk_aggregator(&kill_switch_config),
+        );
+        let infra = core::InfraComponents::new(margin_config, data_quality_config, metrics);
+        let stochastic = core::StochasticComponents::new(
+            hjb_config,
+            stochastic_config,
+            DynamicRiskConfig::default(),
+        );
+
         Self {
             config,
             strategy,
@@ -216,43 +173,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             info_client,
             user_address,
             latest_mid: -1.0,
-            metrics,
             estimator: ParameterEstimator::new(estimator_config),
             last_warmup_log: 0,
-            // Tier 1 modules
-            adverse_selection: AdverseSelectionEstimator::new(as_config),
-            depth_decay_as: DepthDecayAS::default(),
-            queue_tracker: QueuePositionTracker::new(queue_config),
-            liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
-            // Production safety
-            kill_switch: KillSwitch::new(kill_switch_config.clone()),
-            // Risk aggregator with monitors from config
-            risk_aggregator: Self::build_risk_aggregator(&kill_switch_config),
-            // Tier 2: Process models
-            hawkes: HawkesOrderFlowEstimator::new(hawkes_config),
-            funding: FundingRateEstimator::new(funding_config),
-            spread_tracker: SpreadProcessEstimator::new(spread_config),
-            pnl_tracker: PnLTracker::new(pnl_config),
-            // Production infrastructure
-            margin_sizer: MarginAwareSizer::new(margin_config),
-            prometheus: PrometheusMetrics::new(),
-            connection_health: ConnectionHealthMonitor::new(),
-            data_quality: DataQualityMonitor::new(data_quality_config),
-            // First-principles dynamic risk
-            dynamic_risk_config: DynamicRiskConfig::default(),
-            // Stochastic module integration
-            hjb_controller: HJBInventoryController::new(hjb_config),
-            stochastic_config,
-            // Fill processing pipeline - orchestrates all fill handling
-            fill_processor: fills::FillProcessor::new(),
-            // Margin refresh tracking
-            last_margin_refresh: std::time::Instant::now(),
+            tier1,
+            tier2,
+            safety,
+            infra,
+            stochastic,
         }
     }
 
     /// Set the dynamic risk configuration.
     pub fn with_dynamic_risk_config(mut self, config: DynamicRiskConfig) -> Self {
-        self.dynamic_risk_config = config;
+        self.stochastic.dynamic_risk_config = config;
         self
     }
 
@@ -339,7 +272,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         info!("Warming up parameter estimator...");
 
         // === Start HJB session (stochastic module integration) ===
-        self.hjb_controller.start_session();
+        self.stochastic.hjb_controller.start_session();
         debug!("HJB inventory controller session started");
 
         // Safety sync interval (60 seconds) - fallback to catch any state divergence
@@ -353,8 +286,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         loop {
             // === Kill Switch Check (before processing any message) ===
-            if self.kill_switch.is_triggered() {
-                let reasons = self.kill_switch.trigger_reasons();
+            if self.safety.kill_switch.is_triggered() {
+                let reasons = self.safety.kill_switch.trigger_reasons();
                 error!(
                     "KILL SWITCH TRIGGERED: {:?}",
                     reasons.iter().map(|r| r.to_string()).collect::<Vec<_>>()
@@ -385,55 +318,55 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     }
 
                     // === Update Prometheus metrics ===
-                    let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
-                    self.prometheus.update_position(
+                    let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+                    self.infra.prometheus.update_position(
                         self.position.position(),
                         self.config.max_position,
                     );
-                    self.prometheus.update_pnl(
+                    self.infra.prometheus.update_pnl(
                         pnl_summary.total_pnl,      // daily_pnl (total for now)
                         pnl_summary.total_pnl,      // peak_pnl (simplified)
                         pnl_summary.realized_pnl,
                         pnl_summary.unrealized_pnl,
                     );
-                    self.prometheus.update_market(
+                    self.infra.prometheus.update_market(
                         self.latest_mid,
-                        self.spread_tracker.current_spread_bps(),
+                        self.tier2.spread_tracker.current_spread_bps(),
                         self.estimator.sigma_clean(),
                         self.estimator.jump_ratio(),
                         self.estimator.kappa(),
                     );
-                    self.prometheus.update_risk(
-                        self.kill_switch.is_triggered(),
-                        self.liquidation_detector.cascade_severity(),
-                        self.adverse_selection.realized_as_bps(),
-                        self.liquidation_detector.tail_risk_multiplier(),
+                    self.infra.prometheus.update_risk(
+                        self.safety.kill_switch.is_triggered(),
+                        self.tier1.liquidation_detector.cascade_severity(),
+                        self.tier1.adverse_selection.realized_as_bps(),
+                        self.tier1.liquidation_detector.tail_risk_multiplier(),
                     );
 
                     // === Update connection health metrics ===
-                    let connected = self.connection_health.state() == ConnectionState::Healthy;
-                    self.prometheus.set_websocket_connected(connected);
-                    self.prometheus.set_last_trade_age_ms(
-                        self.connection_health.time_since_last_data().as_millis() as u64
+                    let connected = self.infra.connection_health.state() == ConnectionState::Healthy;
+                    self.infra.prometheus.set_websocket_connected(connected);
+                    self.infra.prometheus.set_last_trade_age_ms(
+                        self.infra.connection_health.time_since_last_data().as_millis() as u64
                     );
                     // L2 book uses the same connection health tracker
-                    self.prometheus.set_last_book_age_ms(
-                        self.connection_health.time_since_last_data().as_millis() as u64
+                    self.infra.prometheus.set_last_book_age_ms(
+                        self.infra.connection_health.time_since_last_data().as_millis() as u64
                     );
 
                     // === Update P&L inventory snapshot for carry calculation ===
                     if self.latest_mid > 0.0 {
-                        self.pnl_tracker.record_inventory_snapshot(self.latest_mid);
+                        self.tier2.pnl_tracker.record_inventory_snapshot(self.latest_mid);
                     }
 
                     // Log Prometheus output (for scraping or debugging)
                     debug!(
-                        prometheus_output = %self.prometheus.to_prometheus_text(&self.config.asset),
+                        prometheus_output = %self.infra.prometheus.to_prometheus_text(&self.config.asset),
                         "Prometheus metrics snapshot"
                     );
 
                     // Log kill switch status periodically
-                    let summary = self.kill_switch.summary();
+                    let summary = self.safety.kill_switch.summary();
                     debug!(
                         daily_pnl = %format!("${:.2}", summary.daily_pnl),
                         drawdown = %format!("{:.1}%", summary.drawdown_pct),
@@ -471,225 +404,131 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Handle AllMids message - updates mid price and triggers quote refresh.
     async fn handle_all_mids(&mut self, all_mids: crate::ws::message_types::AllMids) -> Result<()> {
-        let mids = all_mids.data.mids;
-        let Some(mid) = mids.get(&self.config.asset) else {
-            return Ok(());
-        };
-
-        let mid: f64 = mid.parse().map_err(|_| crate::Error::FloatStringParse)?;
-        self.latest_mid = mid;
-        self.estimator.on_mid_update(mid);
-
-        // Connection health tracking
-        self.connection_health.record_data_received();
-
-        // Tier 1: Update AS estimator (resolves pending fills)
-        self.adverse_selection.update(mid);
-        self.adverse_selection.update_signals(
-            self.estimator.sigma_total(),
-            self.estimator.sigma_clean(),
-            self.estimator.flow_imbalance(),
-            self.estimator.jump_ratio(),
+        let ctx = messages::MessageContext::new(
+            self.config.asset.clone(),
+            self.latest_mid,
+            self.position.position(),
+            self.config.max_position,
+            self.estimator.is_warmed_up(),
         );
 
-        // Tier 1: Periodic update of liquidation detector
-        self.liquidation_detector.update();
+        let mut state = messages::AllMidsState {
+            estimator: &mut self.estimator,
+            connection_health: &mut self.infra.connection_health,
+            adverse_selection: &mut self.tier1.adverse_selection,
+            depth_decay_as: &mut self.tier1.depth_decay_as,
+            liquidation_detector: &mut self.tier1.liquidation_detector,
+            hjb_controller: &mut self.stochastic.hjb_controller,
+            stochastic_config: &self.stochastic.stochastic_config,
+            latest_mid: &mut self.latest_mid,
+        };
 
-        // Stochastic modules
-        self.hjb_controller.update_sigma(self.estimator.sigma_clean());
-        if self.stochastic_config.calibrate_depth_as {
-            self.depth_decay_as.resolve_pending_fills(mid);
+        let result = messages::process_all_mids(&all_mids, &ctx, &mut state)?;
+
+        if result.is_some() {
+            self.update_quotes().await
+        } else {
+            Ok(())
         }
-
-        self.update_quotes().await
     }
 
     /// Handle Trades message - updates volatility and flow estimates.
     fn handle_trades(&mut self, trades: crate::ws::message_types::Trades) -> Result<()> {
-        for trade in &trades.data {
-            if trade.coin != self.config.asset {
-                continue;
-            }
+        let ctx = messages::MessageContext::new(
+            self.config.asset.clone(),
+            self.latest_mid,
+            self.position.position(),
+            self.config.max_position,
+            self.estimator.is_warmed_up(),
+        );
 
-            let price: f64 = trade.px.parse().map_err(|_| crate::Error::FloatStringParse)?;
-            let size: f64 = trade.sz.parse().map_err(|_| crate::Error::FloatStringParse)?;
+        let mut state = messages::TradesState {
+            estimator: &mut self.estimator,
+            hawkes: &mut self.tier2.hawkes,
+            data_quality: &mut self.infra.data_quality,
+            prometheus: &mut self.infra.prometheus,
+            last_warmup_log: &mut self.last_warmup_log,
+        };
 
-            // Data quality validation
-            if let Err(anomaly) = self.data_quality.check_trade(
-                &self.config.asset,
-                0,
-                trade.time,
-                price,
-                size,
-                self.latest_mid,
-            ) {
-                warn!(anomaly = %anomaly, price = %price, size = %size, "Trade quality issue");
-                self.prometheus.record_data_quality_issue();
-                continue;
-            }
-
-            let is_buy_aggressor = trade.side == "B";
-            self.estimator.on_trade(trade.time, price, size, Some(is_buy_aggressor));
-            self.hawkes.record_trade(is_buy_aggressor, size);
-        }
-
-        // Warmup progress logging
-        self.log_warmup_progress();
-
+        let _result = messages::process_trades(&trades, &ctx, &mut state)?;
         Ok(())
     }
 
-    /// Log estimator warmup progress (throttled).
-    fn log_warmup_progress(&mut self) {
-        if self.estimator.is_warmed_up() {
-            return;
-        }
-
-        let (vol_ticks, min_vol, l2_updates, min_l2) = self.estimator.warmup_progress();
-
-        if vol_ticks >= self.last_warmup_log + 5 {
-            info!(
-                "Warming up: {}/{} volume ticks, {}/{} L2 updates",
-                vol_ticks, min_vol, l2_updates, min_l2
-            );
-            self.last_warmup_log = vol_ticks;
-        }
-
-        if vol_ticks >= min_vol && l2_updates >= min_l2 {
-            info!(
-                "Warmup complete! σ={:.6}, κ={:.2}, jump_ratio={:.2}",
-                self.estimator.sigma(),
-                self.estimator.kappa(),
-                self.estimator.jump_ratio()
-            );
-        }
-    }
-
     /// Handle UserFills message - processes fills through FillProcessor.
-    async fn handle_user_fills(&mut self, user_fills: crate::ws::message_types::UserFills) -> Result<()> {
-        if self.latest_mid < 0.0 {
-            return Ok(()); // Haven't seen mid price yet
-        }
+    async fn handle_user_fills(
+        &mut self,
+        user_fills: crate::ws::message_types::UserFills,
+    ) -> Result<()> {
+        let ctx = messages::MessageContext::new(
+            self.config.asset.clone(),
+            self.latest_mid,
+            self.position.position(),
+            self.config.max_position,
+            self.estimator.is_warmed_up(),
+        );
 
-        // Process each fill through the unified processor
-        for fill in user_fills.data.fills {
-            if fill.coin != self.config.asset {
-                continue;
-            }
+        // Create fill state for the processor
+        let mut fill_state = fills::FillState {
+            position: &mut self.position,
+            orders: &mut self.orders,
+            adverse_selection: &mut self.tier1.adverse_selection,
+            depth_decay_as: &mut self.tier1.depth_decay_as,
+            queue_tracker: &mut self.tier1.queue_tracker,
+            estimator: &mut self.estimator,
+            pnl_tracker: &mut self.tier2.pnl_tracker,
+            prometheus: &mut self.infra.prometheus,
+            metrics: &self.infra.metrics,
+            latest_mid: self.latest_mid,
+            asset: &self.config.asset,
+            max_position: self.config.max_position,
+            calibrate_depth_as: self.stochastic.stochastic_config.calibrate_depth_as,
+        };
 
-            let amount: f64 = fill.sz.parse().map_err(|_| crate::Error::FloatStringParse)?;
-            let fill_price: f64 = fill.px.parse().unwrap_or(self.latest_mid);
-            let is_buy = fill.side.eq("B");
+        let result = messages::process_user_fills(
+            &user_fills,
+            &ctx,
+            &mut self.safety.fill_processor,
+            &mut fill_state,
+        )?;
 
-            let fill_event = fills::FillEvent::new(
-                fill.tid,
-                fill.oid,
-                amount,
-                fill_price,
-                is_buy,
-                self.latest_mid,
-                None,
-                self.config.asset.clone(),
-            );
+        // Post-processing: cleanup completed orders
+        messages::cleanup_orders(&mut self.orders, &mut self.tier1.queue_tracker);
 
-            let mut fill_state = fills::FillState {
-                position: &mut self.position,
-                orders: &mut self.orders,
-                adverse_selection: &mut self.adverse_selection,
-                depth_decay_as: &mut self.depth_decay_as,
-                queue_tracker: &mut self.queue_tracker,
-                estimator: &mut self.estimator,
-                pnl_tracker: &mut self.pnl_tracker,
-                prometheus: &mut self.prometheus,
-                metrics: &self.metrics,
-                latest_mid: self.latest_mid,
-                asset: &self.config.asset,
-                max_position: self.config.max_position,
-                calibrate_depth_as: self.stochastic_config.calibrate_depth_as,
-            };
-
-            self.fill_processor.process(&fill_event, &mut fill_state);
-        }
-
-        // Cleanup and margin refresh
-        let removed_oids = self.orders.cleanup();
-        for oid in removed_oids {
-            self.queue_tracker.order_removed(oid);
-        }
-
+        // Margin refresh on fills
         const MARGIN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        if self.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
+        if self.infra.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
             if let Err(e) = self.refresh_margin_state().await {
                 warn!(error = %e, "Failed to refresh margin after fill");
             }
-            self.last_margin_refresh = std::time::Instant::now();
+            self.infra.last_margin_refresh = std::time::Instant::now();
         }
 
-        self.update_quotes().await
+        if result.should_update_quotes {
+            self.update_quotes().await
+        } else {
+            Ok(())
+        }
     }
 
     /// Handle L2Book message - updates order book metrics.
     fn handle_l2_book(&mut self, l2_book: crate::ws::message_types::L2Book) -> Result<()> {
-        if l2_book.data.coin != self.config.asset || self.latest_mid <= 0.0 {
-            return Ok(());
-        }
+        let ctx = messages::MessageContext::new(
+            self.config.asset.clone(),
+            self.latest_mid,
+            self.position.position(),
+            self.config.max_position,
+            self.estimator.is_warmed_up(),
+        );
 
-        if l2_book.data.levels.len() < 2 {
-            return Ok(());
-        }
+        let mut state = messages::L2BookState {
+            estimator: &mut self.estimator,
+            queue_tracker: &mut self.tier1.queue_tracker,
+            spread_tracker: &mut self.tier2.spread_tracker,
+            data_quality: &mut self.infra.data_quality,
+            prometheus: &mut self.infra.prometheus,
+        };
 
-        // Parse L2 levels
-        let bids: Vec<(f64, f64)> = l2_book.data.levels[0]
-            .iter()
-            .filter_map(|level| {
-                let px: f64 = level.px.parse().ok()?;
-                let sz: f64 = level.sz.parse().ok()?;
-                Some((px, sz))
-            })
-            .collect();
-
-        let asks: Vec<(f64, f64)> = l2_book.data.levels[1]
-            .iter()
-            .filter_map(|level| {
-                let px: f64 = level.px.parse().ok()?;
-                let sz: f64 = level.sz.parse().ok()?;
-                Some((px, sz))
-            })
-            .collect();
-
-        // Data quality check for crossed book
-        if let (Some((best_bid, _)), Some((best_ask, _))) = (bids.first(), asks.first()) {
-            if let Err(anomaly) = self.data_quality.check_l2_book(
-                &self.config.asset,
-                0,
-                *best_bid,
-                *best_ask,
-            ) {
-                warn!(anomaly = %anomaly, "L2 book quality issue");
-                self.prometheus.record_data_quality_issue();
-                if matches!(anomaly, AnomalyType::CrossedBook) {
-                    self.prometheus.record_crossed_book();
-                    return Ok(());
-                }
-            }
-        }
-
-        // Update estimator and trackers
-        self.estimator.on_l2_book(&bids, &asks, self.latest_mid);
-
-        if let (Some((best_bid, _)), Some((best_ask, _))) = (bids.first(), asks.first()) {
-            self.queue_tracker.update_from_book(
-                *best_bid,
-                *best_ask,
-                self.estimator.sigma_clean(),
-            );
-            self.spread_tracker.update(
-                *best_bid,
-                *best_ask,
-                self.estimator.sigma_clean(),
-            );
-        }
-
+        let _result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
         Ok(())
     }
 
@@ -710,15 +549,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Build market params from econometric estimates via ParameterAggregator
         let sources = ParameterSources {
             estimator: &self.estimator,
-            adverse_selection: &self.adverse_selection,
-            depth_decay_as: &self.depth_decay_as,
-            liquidation_detector: &self.liquidation_detector,
-            hawkes: &self.hawkes,
-            funding: &self.funding,
-            spread_tracker: &self.spread_tracker,
-            hjb_controller: &self.hjb_controller,
-            margin_sizer: &self.margin_sizer,
-            stochastic_config: &self.stochastic_config,
+            adverse_selection: &self.tier1.adverse_selection,
+            depth_decay_as: &self.tier1.depth_decay_as,
+            liquidation_detector: &self.tier1.liquidation_detector,
+            hawkes: &self.tier2.hawkes,
+            funding: &self.tier2.funding,
+            spread_tracker: &self.tier2.spread_tracker,
+            hjb_controller: &self.stochastic.hjb_controller,
+            margin_sizer: &self.infra.margin_sizer,
+            stochastic_config: &self.stochastic.stochastic_config,
             position: self.position.position(),
             max_position: self.config.max_position,
             latest_mid: self.latest_mid,
@@ -771,7 +610,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 position: self.position.position(),
                 max_position: self.config.max_position,
                 mid_price: self.latest_mid,
-                max_position_value: self.kill_switch.max_position_value(),
+                max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.clone(),
             };
             quoting::QuoteFilter::apply_reduce_only_ladder(
@@ -806,14 +645,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 position: self.position.position(),
                 max_position: self.config.max_position,
                 mid_price: self.latest_mid,
-                max_position_value: self.kill_switch.max_position_value(),
+                max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.clone(),
             };
-            quoting::QuoteFilter::apply_reduce_only_single(
-                &mut bid,
-                &mut ask,
-                &reduce_only_config,
-            );
+            quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
 
             debug!(
                 bid = ?bid.as_ref().map(|q| (q.price, q.size)),
@@ -982,7 +817,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
 
                 // Apply margin check to each level
-                let sizing_result = self.margin_sizer.adjust_size(
+                let sizing_result = self.infra.margin_sizer.adjust_size(
                     quote.size,
                     quote.price,
                     self.position.position(),
@@ -1069,7 +904,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Initialize queue tracking for this order
                     // depth_ahead is 0.0 initially; will be updated on L2 book updates
-                    self.queue_tracker.order_placed(
+                    self.tier1.queue_tracker.order_placed(
                         result.oid,
                         spec.price,
                         result.resting_size,
@@ -1131,7 +966,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // === Margin Pre-Flight Check ===
         // Verify order meets margin requirements before placing
-        let sizing_result = self.margin_sizer.adjust_size(
+        let sizing_result = self.infra.margin_sizer.adjust_size(
             quote.size,
             quote.price,
             self.position.position(),
@@ -1185,7 +1020,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // === Tier 1: Register with queue tracker ===
             // Estimate depth ahead conservatively (2x our target liquidity)
             let depth_ahead = self.config.target_liquidity * 2.0;
-            self.queue_tracker.order_placed(
+            self.tier1.queue_tracker.order_placed(
                 result.oid,
                 quote.price,
                 result.resting_size,
@@ -1242,7 +1077,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let final_position = self.position.position();
         let final_mid = self.latest_mid;
         let position_value = final_position.abs() * final_mid;
-        let kill_switch_summary = self.kill_switch.summary();
+        let kill_switch_summary = self.safety.kill_switch.summary();
 
         info!(
             position = %format!("{:.6}", final_position),
@@ -1266,7 +1101,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Log Tier 1 module summaries
-        let as_summary = self.adverse_selection.summary();
+        let as_summary = self.tier1.adverse_selection.summary();
         info!(
             fills_measured = as_summary.fills_measured,
             realized_as_bps = %format!("{:.4}", as_summary.realized_as_bps),
@@ -1274,7 +1109,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             "Adverse selection summary"
         );
 
-        let liq_summary = self.liquidation_detector.summary();
+        let liq_summary = self.tier1.liquidation_detector.summary();
         info!(
             total_liquidations = liq_summary.total_liquidations,
             cascade_severity = %format!("{:.2}", liq_summary.cascade_severity),
@@ -1332,7 +1167,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // === Step 1: Order cleanup ===
         let cleaned = self.orders.cleanup();
         for oid in cleaned {
-            self.queue_tracker.order_removed(oid);
+            self.tier1.queue_tracker.order_removed(oid);
         }
 
         // === Step 2: Stale pending cleanup ===
@@ -1340,7 +1175,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .orders
             .cleanup_stale_pending(std::time::Duration::from_secs(5));
         if stale_pending > 0 {
-            warn!("[SafetySync] Cleaned up {} stale pending orders", stale_pending);
+            warn!(
+                "[SafetySync] Cleaned up {} stale pending orders",
+                stale_pending
+            );
         }
 
         // === Step 3: Stuck cancel check ===
@@ -1353,7 +1191,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if let Err(e) = self.refresh_margin_state().await {
             warn!("Failed to refresh margin state: {e}");
         }
-        self.last_margin_refresh = std::time::Instant::now();
+        self.infra.last_margin_refresh = std::time::Instant::now();
 
         // === Step 5: Exchange reconciliation ===
         let exchange_orders = self.info_client.open_orders(self.user_address).await?;
@@ -1367,7 +1205,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Cancel orphan orders (on exchange but not tracked locally)
         let orphans = safety::SafetyAuditor::find_orphans(&exchange_oids, &local_oids);
         for oid in orphans {
-            warn!("[SafetySync] Orphan order detected: oid={} - cancelling", oid);
+            warn!(
+                "[SafetySync] Orphan order detected: oid={} - cancelling",
+                oid
+            );
             let cancel_result = self.executor.cancel_order(&self.config.asset, oid).await;
             safety::SafetyAuditor::log_orphan_cancellation(oid, cancel_result.order_is_gone());
         }
@@ -1376,7 +1217,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let is_in_cancel_window = |oid: u64| {
             self.orders
                 .get_order(oid)
-                .map(|o| matches!(o.state, OrderState::CancelPending | OrderState::CancelConfirmed))
+                .map(|o| {
+                    matches!(
+                        o.state,
+                        OrderState::CancelPending | OrderState::CancelConfirmed
+                    )
+                })
                 .unwrap_or(false)
         };
         let stale_local = safety::SafetyAuditor::find_stale_local(
@@ -1387,7 +1233,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         for oid in stale_local {
             safety::SafetyAuditor::log_stale_removal(oid);
             self.orders.remove_order(oid);
-            self.queue_tracker.order_removed(oid);
+            self.tier1.queue_tracker.order_removed(oid);
         }
 
         // Log sync status
@@ -1395,13 +1241,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .orders
             .order_ids()
             .into_iter()
-            .filter(|oid| self.orders.get_order(*oid).map(|o| o.is_active()).unwrap_or(false))
+            .filter(|oid| {
+                self.orders
+                    .get_order(*oid)
+                    .map(|o| o.is_active())
+                    .unwrap_or(false)
+            })
             .collect();
         let is_synced = exchange_oids == active_local_oids;
-        safety::SafetyAuditor::log_sync_status(exchange_oids.len(), active_local_oids.len(), is_synced);
+        safety::SafetyAuditor::log_sync_status(
+            exchange_oids.len(),
+            active_local_oids.len(),
+            is_synced,
+        );
 
         // === Step 6: Dynamic limit update ===
-        let account_value = self.margin_sizer.state().account_value;
+        let account_value = self.infra.margin_sizer.state().account_value;
         let sigma = self.estimator.sigma_clean();
         let sigma_confidence = self.estimator.sigma_confidence();
         let time_horizon = (1.0 / self.estimator.arrival_intensity()).min(120.0);
@@ -1412,9 +1267,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 sigma,
                 time_horizon,
                 sigma_confidence,
-                &self.dynamic_risk_config,
+                &self.stochastic.dynamic_risk_config,
             );
-            self.kill_switch.update_dynamic_limit(new_limit);
+            self.safety.kill_switch.update_dynamic_limit(new_limit);
             safety::SafetyAuditor::log_dynamic_limit(
                 new_limit,
                 account_value,
@@ -1427,7 +1282,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // === Step 7: Reduce-only status ===
         let position = self.position.position();
         let position_value = position.abs() * self.latest_mid;
-        let max_position_value = self.kill_switch.max_position_value();
+        let max_position_value = self.safety.kill_switch.max_position_value();
 
         let (reduce_only, reason) = safety::SafetyAuditor::check_reduce_only(
             position,
@@ -1464,7 +1319,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .unwrap_or(0.0);
 
         // Update the margin sizer with fresh values
-        self.margin_sizer
+        self.infra
+            .margin_sizer
             .update_state(account_value, margin_used, total_notional);
 
         debug!(
@@ -1490,12 +1346,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Get kill switch reference for monitoring.
     pub fn kill_switch(&self) -> &KillSwitch {
-        &self.kill_switch
+        &self.safety.kill_switch
     }
 
     /// Get prometheus metrics for external monitoring.
     pub fn prometheus(&self) -> &PrometheusMetrics {
-        &self.prometheus
+        &self.infra.prometheus
     }
 
     /// Get asset name for metrics labeling.
@@ -1508,8 +1364,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// This provides a single point-in-time view of all risk-relevant data
     /// for use with the RiskAggregator system.
     pub fn build_risk_state(&self) -> risk::RiskState {
-        let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
-        let data_age = self.connection_health.time_since_last_data();
+        let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+        let data_age = self.infra.connection_health.time_since_last_data();
         let last_data_time = std::time::Instant::now()
             .checked_sub(data_age)
             .unwrap_or_else(std::time::Instant::now);
@@ -1522,10 +1378,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position,
             self.config.max_position,
             self.latest_mid,
-            self.kill_switch.max_position_value(),
-            self.margin_sizer.state().account_value,
+            self.safety.kill_switch.max_position_value(),
+            self.infra.margin_sizer.state().account_value,
             self.estimator.sigma_clean(),
-            self.liquidation_detector.cascade_severity(),
+            self.tier1.liquidation_detector.cascade_severity(),
             last_data_time,
         )
         .with_pnl_breakdown(pnl_summary.realized_pnl, pnl_summary.unrealized_pnl)
@@ -1535,13 +1391,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.estimator.jump_ratio(),
         )
         .with_cascade(
-            self.liquidation_detector.cascade_severity(),
-            self.liquidation_detector.tail_risk_multiplier(),
-            self.liquidation_detector.should_pull_quotes(),
+            self.tier1.liquidation_detector.cascade_severity(),
+            self.tier1.liquidation_detector.tail_risk_multiplier(),
+            self.tier1.liquidation_detector.should_pull_quotes(),
         )
         .with_adverse_selection(
-            self.adverse_selection.realized_as_bps(),
-            self.adverse_selection.predicted_alpha(),
+            self.tier1.adverse_selection.realized_as_bps(),
+            self.tier1.adverse_selection.predicted_alpha(),
         )
     }
 
@@ -1549,13 +1405,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Called after each message and periodically.
     fn check_kill_switch(&self) {
         // Calculate data age from connection health
-        let data_age = self.connection_health.time_since_last_data();
+        let data_age = self.infra.connection_health.time_since_last_data();
         let last_data_time = std::time::Instant::now()
             .checked_sub(data_age)
             .unwrap_or_else(std::time::Instant::now);
 
         // Build current state for kill switch check using actual P&L
-        let pnl_summary = self.pnl_tracker.summary(self.latest_mid);
+        let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
         let state = KillSwitchState {
             daily_pnl: pnl_summary.total_pnl, // Using total as daily for now
             peak_pnl: pnl_summary.total_pnl,  // Simplified (actual peak needs tracking)
@@ -1563,19 +1419,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             mid_price: self.latest_mid,
             last_data_time,
             rate_limit_errors: 0, // TODO: Track rate limit errors
-            cascade_severity: self.liquidation_detector.cascade_severity(),
+            cascade_severity: self.tier1.liquidation_detector.cascade_severity(),
         };
 
         // Update position in kill switch (for value calculation)
-        self.kill_switch
+        self.safety
+            .kill_switch
             .update_position(self.position.position(), self.latest_mid);
 
         // Update cascade severity
-        self.kill_switch
-            .update_cascade_severity(self.liquidation_detector.cascade_severity());
+        self.safety
+            .kill_switch
+            .update_cascade_severity(self.tier1.liquidation_detector.cascade_severity());
 
         // Warn if data is stale
-        if self.connection_health.is_data_stale() {
+        if self.infra.connection_health.is_data_stale() {
             warn!(
                 data_age_secs = %format!("{:.1}", data_age.as_secs_f64()),
                 "WebSocket data is stale - connection may be unhealthy"
@@ -1583,13 +1441,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Check all conditions
-        if let Some(reason) = self.kill_switch.check(&state) {
+        if let Some(reason) = self.safety.kill_switch.check(&state) {
             warn!("Kill switch condition detected: {}", reason);
         }
 
         // Evaluate using RiskAggregator for unified risk assessment
         let risk_state = self.build_risk_state();
-        let aggregated = self.risk_aggregator.evaluate(&risk_state);
+        let aggregated = self.safety.risk_aggregator.evaluate(&risk_state);
 
         if aggregated.should_kill() {
             error!(
@@ -1616,9 +1474,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .with_monitor(Box::new(LossMonitor::new(config.max_daily_loss)))
             .with_monitor(Box::new(DrawdownMonitor::new(config.max_drawdown / 100.0)))
             .with_monitor(Box::new(PositionMonitor::new()))
-            .with_monitor(Box::new(DataStalenessMonitor::new(config.stale_data_threshold)))
-            .with_monitor(Box::new(CascadeMonitor::new(DEFAULT_CASCADE_PULL, DEFAULT_CASCADE_KILL)))
-            .with_monitor(Box::new(RateLimitMonitor::new(config.max_rate_limit_errors)))
+            .with_monitor(Box::new(DataStalenessMonitor::new(
+                config.stale_data_threshold,
+            )))
+            .with_monitor(Box::new(CascadeMonitor::new(
+                DEFAULT_CASCADE_PULL,
+                DEFAULT_CASCADE_KILL,
+            )))
+            .with_monitor(Box::new(RateLimitMonitor::new(
+                config.max_rate_limit_errors,
+            )))
     }
 
     /// Evaluate risk using the unified RiskAggregator.
@@ -1626,7 +1491,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Returns an aggregated risk assessment from all monitors.
     pub fn evaluate_risk(&self) -> risk::AggregatedRisk {
         let state = self.build_risk_state();
-        self.risk_aggregator.evaluate(&state)
+        self.safety.risk_aggregator.evaluate(&state)
     }
 }
 

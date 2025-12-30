@@ -1,0 +1,444 @@
+//! Order manager implementation.
+//!
+//! The `OrderManager` struct tracks all resting orders with proper lifecycle handling.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use tracing::debug;
+
+use crate::{bps_diff, EPSILON};
+
+use super::reconcile::reconcile_side;
+use super::types::{
+    price_to_key, LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder,
+};
+use crate::market_maker::config::Quote;
+use crate::market_maker::quoting::Ladder;
+
+/// Manages tracked orders for the market maker with proper lifecycle handling.
+///
+/// Key invariants:
+/// 1. Orders are never removed immediately after cancel - they wait for fill window
+/// 2. Position updates happen regardless of tracking (position is always correct)
+/// 3. Cleanup is centralized through the `cleanup()` method
+/// 4. Pending orders bridge the race between placement and fill notification
+#[derive(Debug)]
+pub struct OrderManager {
+    /// Orders indexed by order ID
+    orders: HashMap<u64, TrackedOrder>,
+    /// Pending orders awaiting OID assignment, indexed by (side, price_key).
+    /// Used to handle immediate fills that arrive before OID is known.
+    pending: HashMap<(Side, u64), PendingOrder>,
+    /// Configuration
+    config: OrderManagerConfig,
+}
+
+impl Default for OrderManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OrderManager {
+    /// Create a new order manager with default configuration.
+    pub fn new() -> Self {
+        Self {
+            orders: HashMap::new(),
+            pending: HashMap::new(),
+            config: OrderManagerConfig::default(),
+        }
+    }
+
+    /// Create a new order manager with custom configuration.
+    pub fn with_config(config: OrderManagerConfig) -> Self {
+        Self {
+            orders: HashMap::new(),
+            pending: HashMap::new(),
+            config,
+        }
+    }
+
+    /// Add an order to track.
+    pub fn add_order(&mut self, order: TrackedOrder) {
+        self.orders.insert(order.oid, order);
+    }
+
+    /// Remove an order by ID (use cleanup() for normal removal).
+    pub fn remove_order(&mut self, oid: u64) -> Option<TrackedOrder> {
+        self.orders.remove(&oid)
+    }
+
+    /// Get an order by ID.
+    pub fn get_order(&self, oid: u64) -> Option<&TrackedOrder> {
+        self.orders.get(&oid)
+    }
+
+    /// Get a mutable order by ID.
+    pub fn get_order_mut(&mut self, oid: u64) -> Option<&mut TrackedOrder> {
+        self.orders.get_mut(&oid)
+    }
+
+    /// Get the first active order on a given side (for single-order-per-side strategies).
+    /// Only returns orders that are actively quoting (Resting or PartialFilled).
+    pub fn get_by_side(&self, side: Side) -> Option<&TrackedOrder> {
+        self.orders
+            .values()
+            .find(|o| o.side == side && !o.is_filled() && o.is_active())
+    }
+
+    /// Get all active orders on a given side.
+    /// Only returns orders that are actively quoting (Resting or PartialFilled).
+    pub fn get_all_by_side(&self, side: Side) -> Vec<&TrackedOrder> {
+        self.orders
+            .values()
+            .filter(|o| o.side == side && !o.is_filled() && o.is_active())
+            .collect()
+    }
+
+    /// Get all non-terminal orders on a side, including those being cancelled.
+    /// Use this when you need to know about pending cancels.
+    pub fn get_all_by_side_including_pending(&self, side: Side) -> Vec<&TrackedOrder> {
+        self.orders
+            .values()
+            .filter(|o| o.side == side && !o.is_terminal())
+            .collect()
+    }
+
+    // === Pending Order Management ===
+    // These methods handle the race condition between order placement and fill notification.
+    // When a bulk order is placed, we register it as "pending" by (side, price) before the
+    // API call returns. This allows fills that arrive before the OID is known to still
+    // find the placement price.
+
+    /// Register a pending order before placing it on the exchange.
+    ///
+    /// Call this BEFORE the bulk order API call. When the API returns with OIDs,
+    /// call `finalize_pending()` to convert to a tracked order.
+    pub fn add_pending(&mut self, side: Side, price: f64, size: f64) {
+        let key = (side, price_to_key(price));
+        self.pending
+            .insert(key, PendingOrder::new(side, price, size));
+    }
+
+    /// Finalize a pending order by assigning it a real OID.
+    ///
+    /// Call this when the bulk order API returns with the assigned OID.
+    /// Moves the order from pending to tracked.
+    /// Returns the pending order if found, None if not found (shouldn't happen).
+    pub fn finalize_pending(&mut self, side: Side, price: f64, oid: u64, resting_size: f64) {
+        let key = (side, price_to_key(price));
+        if self.pending.remove(&key).is_some() {
+            // Create tracked order with the real OID and resting size from exchange
+            self.add_order(TrackedOrder::new(oid, side, price, resting_size));
+        }
+        // Note: If pending not found, order may have been cleaned up or never registered.
+        // This is fine - the order will be tracked when we see it in responses.
+    }
+
+    /// Get a pending order by side and price.
+    ///
+    /// Used when a fill arrives but the order isn't tracked by OID yet.
+    /// Returns the placement price so we can feed the kappa estimator.
+    pub fn get_pending(&self, side: Side, price: f64) -> Option<&PendingOrder> {
+        let key = (side, price_to_key(price));
+        self.pending.get(&key)
+    }
+
+    /// Remove a pending order by side and price.
+    ///
+    /// Used when an order fills immediately and we don't want to track it.
+    pub fn remove_pending(&mut self, side: Side, price: f64) -> Option<PendingOrder> {
+        let key = (side, price_to_key(price));
+        self.pending.remove(&key)
+    }
+
+    /// Remove stale pending orders that have been waiting too long.
+    ///
+    /// Pending orders should be finalized within milliseconds. If they're still
+    /// pending after max_age, something went wrong (e.g., API error, disconnection).
+    /// Returns the number of stale orders removed.
+    pub fn cleanup_stale_pending(&mut self, max_age: Duration) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|_, p| p.placed_at.elapsed() < max_age);
+        before - self.pending.len()
+    }
+
+    /// Get the number of pending orders (for debugging/metrics).
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Set the state of an order (legacy method - prefer transition methods).
+    /// Returns true if the order was found and updated.
+    #[deprecated(note = "Use initiate_cancel, on_cancel_confirmed, etc. instead")]
+    pub fn set_state(&mut self, oid: u64, state: OrderState) -> bool {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            order.transition_to(state);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Initiate a cancel on an order. Marks it as CancelPending.
+    /// Returns true if the order was found and transitioned.
+    pub fn initiate_cancel(&mut self, oid: u64) -> bool {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            if order.is_active() {
+                order.transition_to(OrderState::CancelPending);
+                debug!(oid = oid, "Order transitioned to CancelPending");
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handle cancel confirmation from exchange.
+    /// Transitions to CancelConfirmed to start fill window.
+    pub fn on_cancel_confirmed(&mut self, oid: u64) {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            if order.state == OrderState::CancelPending {
+                order.transition_to(OrderState::CancelConfirmed);
+                debug!(
+                    oid = oid,
+                    "Order transitioned to CancelConfirmed, starting fill window"
+                );
+            }
+        }
+    }
+
+    /// Handle "already filled" response from cancel attempt.
+    /// Transitions to FilledDuringCancel.
+    pub fn on_cancel_already_filled(&mut self, oid: u64) {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            order.transition_to(OrderState::FilledDuringCancel);
+            debug!(oid = oid, "Order marked as FilledDuringCancel");
+        }
+    }
+
+    /// Handle cancel failure - revert to previous active state.
+    pub fn on_cancel_failed(&mut self, oid: u64) {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            if order.state == OrderState::CancelPending {
+                // Revert based on fill status
+                if order.filled > EPSILON {
+                    order.transition_to(OrderState::PartialFilled);
+                    debug!(oid = oid, "Cancel failed, reverted to PartialFilled");
+                } else {
+                    order.transition_to(OrderState::Resting);
+                    debug!(oid = oid, "Cancel failed, reverted to Resting");
+                }
+            }
+        }
+    }
+
+    /// Process a fill for an order.
+    /// Returns (order_found, is_new_fill, is_order_complete).
+    pub fn process_fill(&mut self, oid: u64, tid: u64, amount: f64) -> (bool, bool, bool) {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            // Check if we already processed this tid for this order
+            if !order.record_fill(tid, amount) {
+                return (true, false, false); // Duplicate fill
+            }
+
+            let is_complete = order.is_filled();
+
+            // Update state based on current state
+            match order.state {
+                OrderState::Resting => {
+                    if is_complete {
+                        order.transition_to(OrderState::Filled);
+                    } else {
+                        order.transition_to(OrderState::PartialFilled);
+                    }
+                }
+                OrderState::PartialFilled => {
+                    if is_complete {
+                        order.transition_to(OrderState::Filled);
+                    }
+                    // else stay in PartialFilled
+                }
+                OrderState::CancelPending | OrderState::CancelConfirmed => {
+                    // Fill arrived during cancel window - this is expected!
+                    order.transition_to(OrderState::FilledDuringCancel);
+                    debug!(
+                        oid = oid,
+                        tid = tid,
+                        amount = amount,
+                        "Fill arrived during cancel window"
+                    );
+                }
+                _ => {
+                    // Unexpected state - still process
+                    debug!(
+                        oid = oid,
+                        state = ?order.state,
+                        "Fill arrived in unexpected state"
+                    );
+                }
+            }
+
+            (true, true, is_complete)
+        } else {
+            (false, false, false) // Order not found
+        }
+    }
+
+    /// Update an order with a fill amount (legacy method).
+    /// Returns `true` if the order was found and updated.
+    #[deprecated(note = "Use process_fill() instead for proper state management")]
+    pub fn update_fill(&mut self, oid: u64, filled_amount: f64) -> bool {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            order.filled += filled_amount;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if an order on the given side needs to be updated based on a new quote.
+    pub fn needs_update(&self, side: Side, new_quote: &Quote, max_bps_diff: u16) -> bool {
+        match self.get_by_side(side) {
+            Some(order) => {
+                // Check if size changed significantly
+                let size_changed = (new_quote.size - order.remaining()).abs() > EPSILON;
+                // Check if price deviated too much
+                let price_deviated = bps_diff(new_quote.price, order.price) > max_bps_diff;
+                size_changed || price_deviated
+            }
+            None => {
+                // No order on this side, need to place one if quote has size
+                new_quote.size > EPSILON
+            }
+        }
+    }
+
+    /// Run cleanup cycle - remove orders that are safe to remove.
+    /// Returns list of removed order IDs for external cleanup (QueueTracker, etc.)
+    pub fn cleanup(&mut self) -> Vec<u64> {
+        let fill_window = self.config.fill_window_duration;
+        let mut to_remove = Vec::new();
+
+        for (&oid, order) in &mut self.orders {
+            let should_remove = match order.state {
+                // Terminal states - always safe to remove
+                OrderState::Filled | OrderState::FilledDuringCancel => {
+                    debug!(
+                        oid = oid,
+                        state = ?order.state,
+                        filled = order.filled,
+                        "Cleanup: removing filled order"
+                    );
+                    true
+                }
+                // Cancelled is terminal
+                OrderState::Cancelled => {
+                    debug!(oid = oid, "Cleanup: removing cancelled order");
+                    true
+                }
+                // CancelConfirmed - check if fill window expired
+                OrderState::CancelConfirmed => {
+                    if order.fill_window_expired(fill_window) {
+                        // Transition to Cancelled before removal
+                        order.transition_to(OrderState::Cancelled);
+                        debug!(
+                            oid = oid,
+                            window_ms = fill_window.as_millis(),
+                            "Cleanup: fill window expired, removing cancelled order"
+                        );
+                        true
+                    } else {
+                        let elapsed = order.state_changed_at.elapsed();
+                        debug!(
+                            oid = oid,
+                            elapsed_ms = elapsed.as_millis(),
+                            window_ms = fill_window.as_millis(),
+                            "Cleanup: order in fill window, not removing yet"
+                        );
+                        false
+                    }
+                }
+                // Active states - don't remove
+                _ => false,
+            };
+
+            if should_remove {
+                to_remove.push(oid);
+            }
+        }
+
+        for oid in &to_remove {
+            self.orders.remove(oid);
+        }
+
+        to_remove
+    }
+
+    /// Remove fully filled orders (legacy method - prefer cleanup()).
+    #[deprecated(note = "Use cleanup() for proper lifecycle management")]
+    pub fn cleanup_filled(&mut self) {
+        self.orders.retain(|_, order| !order.is_filled());
+    }
+
+    /// Get all order IDs.
+    pub fn order_ids(&self) -> Vec<u64> {
+        self.orders.keys().copied().collect()
+    }
+
+    /// Check if there are any orders.
+    pub fn is_empty(&self) -> bool {
+        self.orders.is_empty()
+    }
+
+    /// Get the number of orders.
+    pub fn len(&self) -> usize {
+        self.orders.len()
+    }
+
+    /// Check for stuck orders (cancel timeout exceeded).
+    pub fn check_stuck_cancels(&self) -> Vec<u64> {
+        let timeout = self.config.cancel_timeout;
+        self.orders
+            .values()
+            .filter_map(|o| {
+                if o.state == OrderState::CancelPending && o.state_changed_at.elapsed() > timeout {
+                    Some(o.oid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Compute actions to reconcile current orders with target ladder.
+    ///
+    /// Returns a list of `LadderAction`s to execute:
+    /// - `Cancel` for orders that don't match any target level
+    /// - `Place` for target levels that don't have matching orders
+    pub fn reconcile_ladder(&self, ladder: &Ladder, max_bps_diff: u16) -> Vec<LadderAction> {
+        let mut actions = Vec::new();
+
+        // Get current orders by side
+        let current_bids = self.get_all_by_side(Side::Buy);
+        let current_asks = self.get_all_by_side(Side::Sell);
+
+        // Reconcile bids
+        actions.extend(reconcile_side(
+            &current_bids,
+            &ladder.bids,
+            Side::Buy,
+            max_bps_diff,
+        ));
+
+        // Reconcile asks
+        actions.extend(reconcile_side(
+            &current_asks,
+            &ladder.asks,
+            Side::Sell,
+            max_bps_diff,
+        ));
+
+        actions
+    }
+}

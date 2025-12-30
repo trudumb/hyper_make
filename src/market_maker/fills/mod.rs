@@ -1,7 +1,7 @@
 //! Unified fill processing pipeline.
 //!
 //! This module provides a single source of truth for fill deduplication and
-//! a consumer-based pipeline for processing fills.
+//! the FillProcessor for orchestrating fill handling across modules.
 //!
 //! # Architecture
 //!
@@ -10,42 +10,44 @@
 //!          |
 //!          v
 //! +------------------+
-//! |   FillPipeline   |
+//! |   FillProcessor  |
 //! |  (single dedup)  |
 //! +------------------+
 //!          |
-//!     Broadcast to all FillConsumers
-//!     +----+----+----+----+----+
-//!     |    |    |    |    |    |
-//!     v    v    v    v    v    v
-//! Position PnL   AS  Queue Metrics Estimator
-//! Consumer Cons  Cons Cons  Cons   Consumer
+//!     Updates all modules via FillState bundle:
+//!     +----+----+----+----+----+----+
+//!     |    |    |    |    |    |    |
+//!     v    v    v    v    v    v    v
+//! Position Orders AS   Queue PnL  Estimator Metrics
+//! Tracker  Manager     Tracker    Tracker
 //! ```
+//!
+//! # Key Components
+//!
+//! - **FillEvent**: Unified fill data structure with helper methods
+//! - **FillProcessor**: Orchestrates fill handling with centralized deduplication
+//! - **FillState**: Bundle of mutable references for processing
+//! - **FillDeduplicator**: Tracks seen trade IDs to prevent double-processing
 //!
 //! # Benefits
 //!
-//! - **Single deduplication**: No duplicate `pending_fills` VecDeques
-//! - **Clear data flow**: Each consumer receives the same FillEvent
-//! - **Extensible**: Add new consumers without modifying core logic
-//! - **Testable**: Consumers can be tested in isolation
+//! - **Single deduplication**: No duplicate tracking across modules
+//! - **Clear data flow**: All modules updated through FillState bundle
+//! - **Testable**: Processor can be tested in isolation
 
 mod consumer;
 mod dedup;
-mod pipeline;
 mod processor;
-pub mod consumers;
 
 pub use consumer::{FillConsumer, FillConsumerBox};
 pub use dedup::FillDeduplicator;
-pub use pipeline::FillPipeline;
-pub use processor::{FillProcessor, FillProcessingResult, FillState};
-pub use consumers::*;
+pub use processor::{FillProcessingResult, FillProcessor, FillState};
 
 use std::time::Instant;
 
-/// A unified fill event containing all data needed by consumers.
+/// A unified fill event containing all data needed by modules.
 ///
-/// This is the single source of truth for fill data, passed to all consumers.
+/// This is the single source of truth for fill data, passed to the FillProcessor.
 #[derive(Debug, Clone)]
 pub struct FillEvent {
     /// Trade ID (unique identifier for deduplication)
@@ -71,6 +73,7 @@ pub struct FillEvent {
 
 impl FillEvent {
     /// Create a new fill event.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tid: u64,
         oid: u64,
@@ -184,10 +187,10 @@ mod tests {
             1,
             100,
             1.0,
-            50000.0,        // fill price
-            true,           // is_buy
-            50010.0,        // mid
-            Some(50005.0),  // placement price
+            50000.0,       // fill price
+            true,          // is_buy
+            50010.0,       // mid
+            Some(50005.0), // placement price
             "BTC".to_string(),
         );
 
@@ -235,7 +238,30 @@ mod tests {
         let buy_fill = FillEvent::new(1, 100, 1.0, 50000.0, true, 50000.0, None, "BTC".to_string());
         assert!((buy_fill.signed_size() - 1.0).abs() < f64::EPSILON);
 
-        let sell_fill = FillEvent::new(2, 101, 1.0, 50000.0, false, 50000.0, None, "BTC".to_string());
+        let sell_fill = FillEvent::new(
+            2,
+            101,
+            1.0,
+            50000.0,
+            false,
+            50000.0,
+            None,
+            "BTC".to_string(),
+        );
         assert!((sell_fill.signed_size() - (-1.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_fill_result_duplicate() {
+        let result = FillResult::duplicate();
+        assert!(!result.is_new);
+        assert_eq!(result.consumers_notified, 0);
+    }
+
+    #[test]
+    fn test_fill_result_new() {
+        let result = FillResult::new_fill(5);
+        assert!(result.is_new);
+        assert_eq!(result.consumers_notified, 5);
     }
 }

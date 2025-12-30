@@ -26,21 +26,12 @@ pub struct FillProcessingResult {
 }
 
 /// Result of processing a trade message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TradeProcessingResult {
     /// Number of trades processed
     pub trades_processed: usize,
     /// Number of trades skipped (wrong asset or quality issue)
     pub trades_skipped: usize,
-}
-
-impl Default for TradeProcessingResult {
-    fn default() -> Self {
-        Self {
-            trades_processed: 0,
-            trades_skipped: 0,
-        }
-    }
 }
 
 /// Result of processing an L2 book message.
@@ -65,11 +56,7 @@ impl Default for L2BookProcessingResult {
 }
 
 /// Check position utilization and log warnings at thresholds.
-pub fn check_position_thresholds(
-    position: f64,
-    max_position: f64,
-    asset: &str,
-) {
+pub fn check_position_thresholds(position: f64, max_position: f64, asset: &str) {
     let utilization = (position.abs() / max_position).min(1.0);
     let utilization_pct = utilization * 100.0;
 
@@ -103,9 +90,7 @@ pub fn check_position_thresholds(
 /// Parse L2 book level strings to (price, size) tuples.
 ///
 /// Takes vectors of (price_string, size_string) pairs.
-pub fn parse_l2_level_strings(
-    levels: &[(String, String)],
-) -> Vec<(f64, f64)> {
+pub fn parse_l2_level_strings(levels: &[(String, String)]) -> Vec<(f64, f64)> {
     levels
         .iter()
         .filter_map(|(px_str, sz_str)| {

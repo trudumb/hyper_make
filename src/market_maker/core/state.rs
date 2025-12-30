@@ -2,8 +2,7 @@
 //!
 //! Groups frequently-accessed state fields.
 
-use crate::market_maker::order_manager::OrderManager;
-use crate::market_maker::position::PositionTracker;
+use crate::market_maker::tracking::{OrderManager, PositionTracker};
 
 /// Core trading state (position, orders, mid price).
 ///

@@ -113,11 +113,7 @@ impl RiskAssessment {
     }
 
     /// Create a high-severity assessment.
-    pub fn high(
-        monitor: &'static str,
-        action: RiskAction,
-        description: impl Into<String>,
-    ) -> Self {
+    pub fn high(monitor: &'static str, action: RiskAction, description: impl Into<String>) -> Self {
         Self {
             monitor,
             severity: RiskSeverity::High,
