@@ -58,6 +58,18 @@ pub struct RiskState {
     /// Probability of informed flow (α)
     pub alpha: f64,
 
+    // === Pending Exposure Metrics ===
+    /// Pending bid exposure (total remaining size on buy orders)
+    pub pending_bid_exposure: f64,
+    /// Pending ask exposure (total remaining size on sell orders)
+    pub pending_ask_exposure: f64,
+    /// Net pending change (bid - ask; positive = net long if all fill)
+    pub net_pending_change: f64,
+    /// Worst-case max position if all bids fill and no asks fill
+    pub worst_case_max_position: f64,
+    /// Worst-case min position if all asks fill and no bids fill
+    pub worst_case_min_position: f64,
+
     // === Data Freshness ===
     /// Time since last market data update
     pub data_age: Duration,
@@ -107,6 +119,11 @@ impl RiskState {
             should_pull_quotes: false,
             adverse_selection_bps: 0.0,
             alpha: 0.0,
+            pending_bid_exposure: 0.0,
+            pending_ask_exposure: 0.0,
+            net_pending_change: 0.0,
+            worst_case_max_position: position,
+            worst_case_min_position: position,
             data_age: now.duration_since(last_data_time),
             last_data_time,
             rate_limit_errors: 0,
@@ -148,6 +165,20 @@ impl RiskState {
     /// Builder-style method to set rate limit errors.
     pub fn with_rate_limit_errors(mut self, errors: u32) -> Self {
         self.rate_limit_errors = errors;
+        self
+    }
+
+    /// Builder-style method to set pending exposure metrics.
+    ///
+    /// # Arguments
+    /// - `bid_exposure`: Total remaining size on buy orders
+    /// - `ask_exposure`: Total remaining size on sell orders
+    pub fn with_pending_exposure(mut self, bid_exposure: f64, ask_exposure: f64) -> Self {
+        self.pending_bid_exposure = bid_exposure;
+        self.pending_ask_exposure = ask_exposure;
+        self.net_pending_change = bid_exposure - ask_exposure;
+        self.worst_case_max_position = self.position + bid_exposure;
+        self.worst_case_min_position = self.position - ask_exposure;
         self
     }
 
@@ -199,6 +230,47 @@ impl RiskState {
     pub fn should_reduce_only(&self) -> bool {
         self.is_over_position_limit() || self.is_over_value_limit()
     }
+
+    // === Pending Exposure Properties ===
+
+    /// Would worst-case max position exceed limits?
+    ///
+    /// Returns true if all buy orders filling would exceed max_position.
+    pub fn worst_case_exceeds_long_limit(&self) -> bool {
+        self.worst_case_max_position > self.max_position
+    }
+
+    /// Would worst-case min position exceed limits (short)?
+    ///
+    /// Returns true if all sell orders filling would exceed max_position on short side.
+    pub fn worst_case_exceeds_short_limit(&self) -> bool {
+        self.worst_case_min_position < -self.max_position
+    }
+
+    /// Would worst-case position on either side exceed limits?
+    pub fn worst_case_exceeds_limits(&self) -> bool {
+        self.worst_case_exceeds_long_limit() || self.worst_case_exceeds_short_limit()
+    }
+
+    /// Get the worst-case position value (max absolute position × mid_price).
+    pub fn worst_case_position_value(&self) -> f64 {
+        let max_abs = self
+            .worst_case_max_position
+            .abs()
+            .max(self.worst_case_min_position.abs());
+        max_abs * self.mid_price
+    }
+
+    /// Is the book balanced (roughly equal bid/ask exposure)?
+    ///
+    /// Returns true if net pending change is within 10% of total exposure.
+    pub fn is_book_balanced(&self) -> bool {
+        let total_exposure = self.pending_bid_exposure + self.pending_ask_exposure;
+        if total_exposure < 1e-9 {
+            return true; // No orders, considered balanced
+        }
+        (self.net_pending_change.abs() / total_exposure) < 0.1
+    }
 }
 
 impl Default for RiskState {
@@ -224,6 +296,11 @@ impl Default for RiskState {
             should_pull_quotes: false,
             adverse_selection_bps: 0.0,
             alpha: 0.0,
+            pending_bid_exposure: 0.0,
+            pending_ask_exposure: 0.0,
+            net_pending_change: 0.0,
+            worst_case_max_position: 0.0,
+            worst_case_min_position: 0.0,
             data_age: Duration::ZERO,
             last_data_time: now,
             rate_limit_errors: 0,
@@ -277,5 +354,82 @@ mod tests {
 
         state.position = 1.5; // Over limit
         assert!(state.should_reduce_only());
+    }
+
+    // === Pending Exposure Tests ===
+
+    #[test]
+    fn test_with_pending_exposure() {
+        let state = RiskState::default()
+            .with_pending_exposure(1.0, 0.5);
+
+        assert!((state.pending_bid_exposure - 1.0).abs() < f64::EPSILON);
+        assert!((state.pending_ask_exposure - 0.5).abs() < f64::EPSILON);
+        assert!((state.net_pending_change - 0.5).abs() < f64::EPSILON); // 1.0 - 0.5
+        // Default position is 0, so worst case:
+        assert!((state.worst_case_max_position - 1.0).abs() < f64::EPSILON); // 0 + 1.0
+        assert!((state.worst_case_min_position - (-0.5)).abs() < f64::EPSILON); // 0 - 0.5
+    }
+
+    #[test]
+    fn test_worst_case_exceeds_long_limit() {
+        let mut state = RiskState::default();
+        state.position = 0.5;
+        state.max_position = 1.0;
+
+        // Within limits
+        let state = state.with_pending_exposure(0.3, 0.2);
+        assert!(!state.worst_case_exceeds_long_limit()); // 0.5 + 0.3 = 0.8 < 1.0
+
+        // Exceeds limits
+        let state = RiskState {
+            position: 0.5,
+            max_position: 1.0,
+            ..Default::default()
+        }.with_pending_exposure(0.6, 0.2); // 0.5 + 0.6 = 1.1 > 1.0
+        assert!(state.worst_case_exceeds_long_limit());
+    }
+
+    #[test]
+    fn test_worst_case_exceeds_short_limit() {
+        let state = RiskState {
+            position: -0.5,
+            max_position: 1.0,
+            ..Default::default()
+        }.with_pending_exposure(0.2, 0.6); // -0.5 - 0.6 = -1.1 < -1.0
+        assert!(state.worst_case_exceeds_short_limit());
+    }
+
+    #[test]
+    fn test_worst_case_position_value() {
+        let state = RiskState {
+            position: 0.5,
+            mid_price: 100.0,
+            ..Default::default()
+        }.with_pending_exposure(1.0, 0.5);
+
+        // worst_case_max_position = 0.5 + 1.0 = 1.5
+        // worst_case_min_position = 0.5 - 0.5 = 0.0
+        // max absolute = max(|1.5|, |0.0|) = 1.5
+        // value = 1.5 * 100 = 150
+        assert!((state.worst_case_position_value() - 150.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_is_book_balanced() {
+        // Balanced book (within 10%)
+        let state = RiskState::default()
+            .with_pending_exposure(1.0, 0.95);
+        assert!(state.is_book_balanced()); // net = 0.05, total = 1.95, ratio = 2.5% < 10%
+
+        // Unbalanced book
+        let state = RiskState::default()
+            .with_pending_exposure(1.0, 0.5);
+        assert!(!state.is_book_balanced()); // net = 0.5, total = 1.5, ratio = 33% > 10%
+
+        // Empty book is balanced
+        let state = RiskState::default()
+            .with_pending_exposure(0.0, 0.0);
+        assert!(state.is_book_balanced());
     }
 }

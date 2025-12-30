@@ -332,4 +332,142 @@ mod tests {
             .count();
         assert_eq!(place_count, 2);
     }
+
+    // === Pending Exposure Tests ===
+
+    #[test]
+    fn test_pending_exposure_empty() {
+        let mgr = OrderManager::new();
+        let (bids, asks) = mgr.pending_exposure();
+        assert!((bids - 0.0).abs() < f64::EPSILON);
+        assert!((asks - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pending_exposure_with_orders() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Buy, 98.0, 0.5));
+        mgr.add_order(TrackedOrder::new(3, Side::Sell, 101.0, 0.8));
+
+        let (bids, asks) = mgr.pending_exposure();
+        assert!((bids - 1.5).abs() < f64::EPSILON); // 1.0 + 0.5
+        assert!((asks - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pending_exposure_excludes_partial_fills() {
+        let mut mgr = OrderManager::new();
+        let mut order = TrackedOrder::new(1, Side::Buy, 99.0, 1.0);
+        order.record_fill(100, 0.3); // Partial fill
+        mgr.add_order(order);
+
+        let (bids, _) = mgr.pending_exposure();
+        assert!((bids - 0.7).abs() < f64::EPSILON); // Only remaining
+    }
+
+    #[test]
+    fn test_net_pending_change() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 0.3));
+
+        let net = mgr.net_pending_change();
+        assert!((net - 0.7).abs() < f64::EPSILON); // 1.0 - 0.3 = 0.7 (net long)
+    }
+
+    #[test]
+    fn test_worst_case_positions() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 99.0, 1.0));
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 0.5));
+
+        let current_position = 0.2;
+        let (min, max) = mgr.worst_case_positions(current_position);
+
+        // max = 0.2 + 1.0 = 1.2 (all buys fill, no sells)
+        assert!((max - 1.2).abs() < f64::EPSILON);
+        // min = 0.2 - 0.5 = -0.3 (all sells fill, no buys)
+        assert!((min - (-0.3)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_resting_notional() {
+        let mut mgr = OrderManager::new();
+        mgr.add_order(TrackedOrder::new(1, Side::Buy, 100.0, 1.0)); // $100 notional
+        mgr.add_order(TrackedOrder::new(2, Side::Sell, 200.0, 0.5)); // $100 notional
+
+        let (bid_notional, ask_notional) = mgr.resting_notional();
+        assert!((bid_notional - 100.0).abs() < f64::EPSILON);
+        assert!((ask_notional - 100.0).abs() < f64::EPSILON);
+    }
+
+    // === TrackedOrder Enhancement Tests ===
+
+    #[test]
+    fn test_tracked_order_with_cloid() {
+        let order = TrackedOrder::with_cloid(1, "my-client-id".to_string(), Side::Buy, 100.0, 1.0);
+        assert_eq!(order.cloid, Some("my-client-id".to_string()));
+        assert_eq!(order.oid, 1);
+    }
+
+    #[test]
+    fn test_tracked_order_average_fill_price() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 2.0);
+
+        // No fills yet - should return placement price
+        assert!((order.average_fill_price() - 100.0).abs() < f64::EPSILON);
+
+        // First fill at 99.0
+        order.record_fill_with_price(101, 1.0, 99.0);
+        assert!((order.average_fill_price() - 99.0).abs() < f64::EPSILON);
+
+        // Second fill at 98.0 - average should be (99 + 98) / 2 = 98.5
+        order.record_fill_with_price(102, 1.0, 98.0);
+        // fill_value = 99 * 1 + 98 * 1 = 197, filled = 2
+        // average = 197 / 2 = 98.5
+        assert!((order.average_fill_price() - 98.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_tracked_order_last_fill_at() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 1.0);
+
+        // No fills yet
+        assert!(order.last_fill_at.is_none());
+        assert!(order.time_since_last_fill().is_none());
+
+        // Record a fill
+        order.record_fill(101, 0.5);
+        assert!(order.last_fill_at.is_some());
+        assert!(order.time_since_last_fill().is_some());
+
+        // Time since fill should be very small (just happened)
+        let elapsed = order.time_since_last_fill().unwrap();
+        assert!(elapsed.as_millis() < 100);
+    }
+
+    #[test]
+    fn test_tracked_order_fill_count() {
+        let mut order = TrackedOrder::new(1, Side::Buy, 100.0, 2.0);
+        assert_eq!(order.fill_count(), 0);
+
+        order.record_fill(101, 0.5);
+        assert_eq!(order.fill_count(), 1);
+
+        order.record_fill(102, 0.5);
+        assert_eq!(order.fill_count(), 2);
+
+        // Duplicate should not increase count
+        order.record_fill(101, 0.5);
+        assert_eq!(order.fill_count(), 2);
+    }
+
+    #[test]
+    fn test_tracked_order_age() {
+        let order = TrackedOrder::new(1, Side::Buy, 100.0, 1.0);
+        let age = order.age();
+        // Should be very small (just created)
+        assert!(age.as_millis() < 100);
+    }
 }

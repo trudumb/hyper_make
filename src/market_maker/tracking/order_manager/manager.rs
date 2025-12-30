@@ -411,6 +411,69 @@ impl OrderManager {
             .collect()
     }
 
+    // === Pending Exposure Calculation ===
+    // These methods calculate the potential position change if all resting orders execute.
+    // Critical for risk management - knowing worst-case position exposure.
+
+    /// Calculate pending exposure for each side.
+    ///
+    /// Returns (bid_exposure, ask_exposure) where:
+    /// - bid_exposure: Total remaining size on buy orders (would increase position if filled)
+    /// - ask_exposure: Total remaining size on sell orders (would decrease position if filled)
+    pub fn pending_exposure(&self) -> (f64, f64) {
+        let bid_exposure: f64 = self
+            .get_all_by_side(Side::Buy)
+            .iter()
+            .map(|o| o.remaining())
+            .sum();
+        let ask_exposure: f64 = self
+            .get_all_by_side(Side::Sell)
+            .iter()
+            .map(|o| o.remaining())
+            .sum();
+        (bid_exposure, ask_exposure)
+    }
+
+    /// Calculate net pending inventory change.
+    ///
+    /// Positive = net long exposure if all orders fill
+    /// Negative = net short exposure if all orders fill
+    ///
+    /// Formula: bid_exposure - ask_exposure
+    pub fn net_pending_change(&self) -> f64 {
+        let (bids, asks) = self.pending_exposure();
+        bids - asks
+    }
+
+    /// Calculate worst-case position if all orders on one side fill.
+    ///
+    /// Given current position, returns (min_position, max_position):
+    /// - max_position: current + all bid exposure (all buys fill, no sells)
+    /// - min_position: current - all ask exposure (all sells fill, no buys)
+    pub fn worst_case_positions(&self, current_position: f64) -> (f64, f64) {
+        let (bid_exposure, ask_exposure) = self.pending_exposure();
+        let max_position = current_position + bid_exposure;
+        let min_position = current_position - ask_exposure;
+        (min_position, max_position)
+    }
+
+    /// Get total resting notional value (for risk monitoring).
+    ///
+    /// Returns (bid_notional, ask_notional) in USD.
+    pub fn resting_notional(&self) -> (f64, f64) {
+        let bid_notional: f64 = self
+            .get_all_by_side(Side::Buy)
+            .iter()
+            .map(|o| o.remaining() * o.price)
+            .sum();
+        let ask_notional: f64 = self
+            .get_all_by_side(Side::Sell)
+            .iter()
+            .map(|o| o.remaining() * o.price)
+            .sum();
+        (bid_notional, ask_notional)
+    }
+
     /// Compute actions to reconcile current orders with target ladder.
     ///
     /// Returns a list of `LadderAction`s to execute:

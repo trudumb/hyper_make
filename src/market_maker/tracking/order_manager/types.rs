@@ -132,6 +132,8 @@ pub(crate) fn price_to_key(price: f64) -> u64 {
 pub struct TrackedOrder {
     /// Order ID from the exchange
     pub oid: u64,
+    /// Client order ID (optional, for CLOID tracking)
+    pub cloid: Option<String>,
     /// Side of the order
     pub side: Side,
     /// Limit price
@@ -140,12 +142,17 @@ pub struct TrackedOrder {
     pub size: f64,
     /// Amount filled so far
     pub filled: f64,
+    /// Total fill value (for average price calculation)
+    /// Sum of (fill_price × fill_size) for all fills
+    fill_value: f64,
     /// Order lifecycle state
     pub state: OrderState,
     /// When the order was placed (for age tracking)
     pub placed_at: Instant,
     /// When the order entered its current state (for fill window timing)
     pub state_changed_at: Instant,
+    /// When the last fill occurred (for activity tracking)
+    pub last_fill_at: Option<Instant>,
     /// Trade IDs of fills processed for this order (for dedup at order level)
     pub fill_tids: Vec<u64>,
 }
@@ -156,15 +163,25 @@ impl TrackedOrder {
         let now = Instant::now();
         Self {
             oid,
+            cloid: None,
             side,
             price,
             size,
             filled: 0.0,
+            fill_value: 0.0,
             state: OrderState::Resting,
             placed_at: now,
             state_changed_at: now,
+            last_fill_at: None,
             fill_tids: Vec::new(),
         }
+    }
+
+    /// Create a new tracked order with a client order ID.
+    pub fn with_cloid(oid: u64, cloid: String, side: Side, price: f64, size: f64) -> Self {
+        let mut order = Self::new(oid, side, price, size);
+        order.cloid = Some(cloid);
+        order
     }
 
     /// Get remaining size (unfilled).
@@ -183,15 +200,49 @@ impl TrackedOrder {
         self.state_changed_at = Instant::now();
     }
 
-    /// Record a fill on this order.
+    /// Record a fill on this order (without price for backward compatibility).
     /// Returns true if this is a new fill, false if duplicate (already processed).
     pub fn record_fill(&mut self, tid: u64, amount: f64) -> bool {
+        // Use placement price as fill price (conservative estimate)
+        self.record_fill_with_price(tid, amount, self.price)
+    }
+
+    /// Record a fill on this order with the actual fill price.
+    /// Returns true if this is a new fill, false if duplicate (already processed).
+    pub fn record_fill_with_price(&mut self, tid: u64, amount: f64, fill_price: f64) -> bool {
         if self.fill_tids.contains(&tid) {
             return false; // Duplicate fill
         }
         self.fill_tids.push(tid);
         self.filled += amount;
+        self.fill_value += fill_price * amount;
+        self.last_fill_at = Some(Instant::now());
         true
+    }
+
+    /// Get the average fill price for this order.
+    /// Returns the placement price if no fills yet.
+    pub fn average_fill_price(&self) -> f64 {
+        if self.filled > EPSILON {
+            self.fill_value / self.filled
+        } else {
+            self.price // No fills yet, return placement price
+        }
+    }
+
+    /// Get time since last fill (if any).
+    pub fn time_since_last_fill(&self) -> Option<Duration> {
+        self.last_fill_at.map(|t| t.elapsed())
+    }
+
+    /// Get order age (time since placement).
+    pub fn age(&self) -> Duration {
+        self.placed_at.elapsed()
+    }
+
+    /// Get fill count.
+    pub fn fill_count(&self) -> usize {
+        self.fill_tids.len()
     }
 
     /// Check if the fill window has expired (for CancelConfirmed state).
