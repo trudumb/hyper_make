@@ -737,6 +737,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Build market params from econometric estimates via ParameterAggregator
         let exchange_limits = &self.infra.exchange_limits;
+        // Get pending exposure from resting orders (prevents position breach from multiple fills)
+        let (pending_bid_exposure, pending_ask_exposure) = self.orders.pending_exposure();
+
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
@@ -757,6 +760,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             exchange_effective_bid_limit: exchange_limits.effective_bid_limit(),
             exchange_effective_ask_limit: exchange_limits.effective_ask_limit(),
             exchange_limits_age_ms: exchange_limits.age_ms(),
+            // Pending exposure from resting orders
+            pending_bid_exposure,
+            pending_ask_exposure,
         };
         let market_params = ParameterAggregator::build(&sources);
 

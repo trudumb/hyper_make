@@ -505,6 +505,10 @@ pub struct ParameterSources<'a> {
     pub exchange_effective_bid_limit: f64,
     pub exchange_effective_ask_limit: f64,
     pub exchange_limits_age_ms: u64,
+
+    // Pending exposure from resting orders
+    pub pending_bid_exposure: f64,
+    pub pending_ask_exposure: f64,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -683,6 +687,11 @@ impl ParameterAggregator {
             exchange_effective_bid_limit: sources.exchange_effective_bid_limit,
             exchange_effective_ask_limit: sources.exchange_effective_ask_limit,
             exchange_limits_age_ms: sources.exchange_limits_age_ms,
+
+            // === Pending Exposure ===
+            // Resting orders that would change position if filled
+            pending_bid_exposure: sources.pending_bid_exposure,
+            pending_ask_exposure: sources.pending_ask_exposure,
         }
     }
 }

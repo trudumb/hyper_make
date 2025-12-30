@@ -197,25 +197,47 @@ impl LadderStrategy {
             // CRITICAL BUG FIX: When over max position, we need to allow reduce-only orders
             // on the opposite side, not block both sides.
             //
-            // For bids (buying): Can buy up to (max_position - position) when long or flat
-            //                    Can buy up to (max_position + |position|) when short (reducing)
-            // For asks (selling): Can sell up to (max_position + position) when long (reducing)
-            //                     Can sell up to (max_position - |position|) when short or flat
+            // PENDING EXPOSURE FIX: Account for resting orders that would change position if filled.
+            // Available capacity = max_position - current_position - pending_exposure_on_same_side
+            //
+            // For bids (buying): Can buy up to (max_position - position - pending_bid_exposure) when long or flat
+            //                    Can buy up to (max_position + |position| - pending_bid_exposure) when short (reducing)
+            // For asks (selling): Can sell up to (max_position + position - pending_ask_exposure) when long (reducing)
+            //                     Can sell up to (max_position - |position| - pending_ask_exposure) when short or flat
+            let pending_bids = market_params.pending_bid_exposure;
+            let pending_asks = market_params.pending_ask_exposure;
+
             let (local_available_bids, local_available_asks) = if position >= 0.0 {
                 // Long or flat position
-                // Bids: limited by how much more long we can go
-                // Asks: can sell entire position + go max short (reducing is always allowed)
-                let bid_limit = (max_position - position).max(0.0);
-                let ask_limit = position + max_position; // Can sell entire position + go max short
+                // Bids: limited by how much more long we can go (minus pending bid exposure)
+                // Asks: can sell entire position + go max short (minus pending ask exposure)
+                let bid_limit = (max_position - position - pending_bids).max(0.0);
+                let ask_limit = (position + max_position - pending_asks).max(0.0);
                 (bid_limit, ask_limit)
             } else {
                 // Short position
-                // Bids: can buy to cover position + go max long (reducing is always allowed)
-                // Asks: limited by how much more short we can go
-                let bid_limit = position.abs() + max_position; // Can buy to cover + go max long
-                let ask_limit = (max_position - position.abs()).max(0.0);
+                // Bids: can buy to cover position + go max long (minus pending bid exposure)
+                // Asks: limited by how much more short we can go (minus pending ask exposure)
+                let bid_limit = (position.abs() + max_position - pending_bids).max(0.0);
+                let ask_limit = (max_position - position.abs() - pending_asks).max(0.0);
                 (bid_limit, ask_limit)
             };
+
+            // Log if pending exposure is constraining sizing
+            if pending_bids > EPSILON && local_available_bids < max_position {
+                tracing::debug!(
+                    pending_bids = %format!("{:.6}", pending_bids),
+                    effective_bid_limit = %format!("{:.6}", local_available_bids),
+                    "Bid sizing reduced by pending exposure"
+                );
+            }
+            if pending_asks > EPSILON && local_available_asks < max_position {
+                tracing::debug!(
+                    pending_asks = %format!("{:.6}", pending_asks),
+                    effective_ask_limit = %format!("{:.6}", local_available_asks),
+                    "Ask sizing reduced by pending exposure"
+                );
+            }
 
             // 3. Apply exchange-enforced limits (prevents order rejections)
             // Exchange limits are direction-specific: available_buy for bids, available_sell for asks

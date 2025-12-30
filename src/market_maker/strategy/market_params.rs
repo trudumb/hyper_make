@@ -255,6 +255,12 @@ pub struct MarketParams {
     pub exchange_effective_ask_limit: f64,
     /// Age of exchange limits in milliseconds (for staleness warnings)
     pub exchange_limits_age_ms: u64,
+
+    // === Pending Exposure (Resting Order State) ===
+    /// Total remaining size on resting buy orders (would increase long if filled)
+    pub pending_bid_exposure: f64,
+    /// Total remaining size on resting sell orders (would increase short if filled)
+    pub pending_ask_exposure: f64,
 }
 
 impl Default for MarketParams {
@@ -343,7 +349,17 @@ impl Default for MarketParams {
             exchange_effective_bid_limit: f64::MAX, // No constraint until fetched
             exchange_effective_ask_limit: f64::MAX, // No constraint until fetched
             exchange_limits_age_ms: u64::MAX,       // Never fetched
+            // Pending Exposure
+            pending_bid_exposure: 0.0, // No resting orders initially
+            pending_ask_exposure: 0.0, // No resting orders initially
         }
+    }
+}
+
+impl MarketParams {
+    /// Get net pending exposure (positive = net long exposure from resting orders).
+    pub fn net_pending_exposure(&self) -> f64 {
+        self.pending_bid_exposure - self.pending_ask_exposure
     }
 }
 
