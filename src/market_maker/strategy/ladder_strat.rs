@@ -187,10 +187,10 @@ impl LadderStrategy {
         // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
         //      Σ sᵢ ≤ max_position (position constraint)
         if market_params.use_constrained_optimizer {
-            // 1. Account for margin used by current position
+            // 1. Available margin comes from the exchange (already accounts for position margin)
+            // NOTE: margin_available is already net of position margin, don't double-count!
             let leverage = market_params.leverage.max(1.0);
-            let position_margin_cost = position.abs() * (market_params.microprice / leverage);
-            let available_margin = (market_params.margin_available - position_margin_cost).max(0.0);
+            let available_margin = market_params.margin_available;
             let available_position = (max_position - position.abs()).max(0.0);
 
             // 2. Generate ladder to get depth levels and prices
@@ -240,7 +240,7 @@ impl LadderStrategy {
 
                     let kelly_params = KellyStochasticParams {
                         sigma: market_params.sigma,
-                        time_horizon: params.time_horizon,
+                        time_horizon: market_params.kelly_time_horizon, // Diffusion-based tau for correct P(fill)
                         alpha_touch: market_params.kelly_alpha_touch,
                         alpha_decay_bps: market_params.kelly_alpha_decay_bps,
                         kelly_fraction: dynamic_kelly,
@@ -306,7 +306,7 @@ impl LadderStrategy {
 
                     let kelly_params = KellyStochasticParams {
                         sigma: market_params.sigma,
-                        time_horizon: params.time_horizon,
+                        time_horizon: market_params.kelly_time_horizon, // Diffusion-based tau for correct P(fill)
                         alpha_touch: market_params.kelly_alpha_touch,
                         alpha_decay_bps: market_params.kelly_alpha_decay_bps,
                         kelly_fraction: dynamic_kelly,

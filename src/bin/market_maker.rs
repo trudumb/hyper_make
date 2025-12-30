@@ -888,7 +888,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let funding_config = FundingConfig::default();
     let spread_config = SpreadConfig::default();
     let pnl_config = PnLConfig::default();
-    let margin_config = MarginConfig::default();
+    // Use API-derived leverage from asset metadata (first-principles: exchange sets limits)
+    let margin_config = MarginConfig::from_asset_meta(asset_meta);
+    info!(
+        asset = %asset,
+        max_leverage = margin_config.max_leverage,
+        isolated_only = margin_config.leverage_config.as_ref().map(|c| c.isolated_only).unwrap_or(false),
+        "Margin config from API metadata"
+    );
     let data_quality_config = DataQualityConfig::default();
 
     // Create and start market maker

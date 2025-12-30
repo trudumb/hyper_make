@@ -4,17 +4,42 @@
 //!
 //! Key features:
 //! - **Available Margin Tracking**: Monitors account margin for sizing decisions
-//! - **Leverage Limits**: Respects configured maximum leverage
+//! - **Leverage Limits**: Respects configured maximum leverage from API
+//! - **Tiered Leverage**: Supports position-based leverage reduction
 //! - **Position Limits**: Enforces notional position limits
 //! - **Order Size Adjustment**: Dynamically adjusts order sizes to fit within margin
+//!
+//! # First-Principles Design
+//!
+//! Leverage limits are determined by the exchange, not the trader. This module
+//! enforces API-derived limits rather than arbitrary hardcoded defaults.
+//!
+//! The `AssetLeverageConfig` from `meta.rs` provides:
+//! - Base max leverage from asset metadata
+//! - Optional tiered leverage (reduced max at higher notional)
 
 use std::time::{Duration, Instant};
 
+use crate::meta::{AssetLeverageConfig, AssetMeta};
+
 /// Configuration for margin-aware position sizing.
+///
+/// # Leverage Configuration
+///
+/// **Preferred**: Use `from_asset_meta()` or `from_leverage_config()` to derive
+/// leverage from the exchange API. This ensures you're using the actual limits
+/// for the asset being traded.
+///
+/// **Fallback**: `Default` provides a conservative 3x limit, but this should be
+/// replaced with API-derived values in production.
 #[derive(Debug, Clone)]
 pub struct MarginConfig {
     /// Maximum leverage to use (e.g., 5.0 = 5x)
+    /// Derived from exchange API metadata for the specific asset.
     pub max_leverage: f64,
+    /// Optional tiered leverage config (for large position limits)
+    /// When present, `leverage_at_notional()` should be used instead of `max_leverage`.
+    pub leverage_config: Option<AssetLeverageConfig>,
     /// Buffer factor for margin (0.8 = use only 80% of available)
     pub margin_buffer: f64,
     /// Maximum notional position value in USD
@@ -25,10 +50,108 @@ pub struct MarginConfig {
     pub refresh_interval: Duration,
 }
 
+impl MarginConfig {
+    /// Create margin config from asset metadata (preferred method).
+    ///
+    /// This derives leverage limits from the exchange API, ensuring you're
+    /// using the actual maximum allowed for this asset.
+    ///
+    /// # Arguments
+    /// - `asset_meta`: Asset metadata from the exchange API
+    ///
+    /// # Example
+    /// ```ignore
+    /// let meta = info_client.meta().await?;
+    /// let btc_meta = meta.universe.iter().find(|a| a.name == "BTC").unwrap();
+    /// let config = MarginConfig::from_asset_meta(btc_meta);
+    /// // config.max_leverage == 50.0 (for BTC)
+    /// ```
+    pub fn from_asset_meta(asset_meta: &AssetMeta) -> Self {
+        let leverage_config = AssetLeverageConfig::from_asset_meta(asset_meta);
+        Self {
+            max_leverage: leverage_config.max_leverage,
+            leverage_config: Some(leverage_config),
+            margin_buffer: 0.8,
+            max_notional_position: 100_000.0,
+            max_order_notional: 10_000.0,
+            refresh_interval: Duration::from_secs(10),
+        }
+    }
+
+    /// Create margin config from full leverage config (with tiered support).
+    ///
+    /// Use this when you have parsed margin tables from the API and
+    /// want position-based leverage limits.
+    pub fn from_leverage_config(leverage_config: AssetLeverageConfig) -> Self {
+        Self {
+            max_leverage: leverage_config.max_leverage,
+            leverage_config: Some(leverage_config),
+            margin_buffer: 0.8,
+            max_notional_position: 100_000.0,
+            max_order_notional: 10_000.0,
+            refresh_interval: Duration::from_secs(10),
+        }
+    }
+
+    /// Create margin config with explicit leverage (for testing or override).
+    ///
+    /// Prefer `from_asset_meta()` in production code.
+    pub fn with_leverage(max_leverage: f64) -> Self {
+        Self {
+            max_leverage,
+            leverage_config: None,
+            margin_buffer: 0.8,
+            max_notional_position: 100_000.0,
+            max_order_notional: 10_000.0,
+            refresh_interval: Duration::from_secs(10),
+        }
+    }
+
+    /// Get effective max leverage at a given notional position.
+    ///
+    /// For tiered assets, this returns the reduced leverage limit for large positions.
+    /// For non-tiered assets, returns `max_leverage`.
+    pub fn leverage_at_notional(&self, notional: f64) -> f64 {
+        match &self.leverage_config {
+            Some(config) => config.leverage_at_notional(notional),
+            None => self.max_leverage,
+        }
+    }
+
+    /// Builder: set margin buffer
+    pub fn with_margin_buffer(mut self, buffer: f64) -> Self {
+        self.margin_buffer = buffer;
+        self
+    }
+
+    /// Builder: set max notional position
+    pub fn with_max_notional_position(mut self, max: f64) -> Self {
+        self.max_notional_position = max;
+        self
+    }
+
+    /// Builder: set max order notional
+    pub fn with_max_order_notional(mut self, max: f64) -> Self {
+        self.max_order_notional = max;
+        self
+    }
+
+    /// Builder: set refresh interval
+    pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = interval;
+        self
+    }
+}
+
 impl Default for MarginConfig {
+    /// Conservative default with 3x leverage.
+    ///
+    /// **Note**: This should be replaced with `from_asset_meta()` in production
+    /// to use the actual exchange limits for the asset being traded.
     fn default() -> Self {
         Self {
-            max_leverage: 3.0,                // Conservative 3x max leverage
+            max_leverage: 3.0,                // Conservative default
+            leverage_config: None,
             margin_buffer: 0.8,               // Use 80% of available margin
             max_notional_position: 100_000.0, // $100k max position
             max_order_notional: 10_000.0,     // $10k max per order
@@ -162,10 +285,13 @@ impl MarginAwareSizer {
             // Available margin with buffer
             let usable_margin = self.state.available_margin * self.config.margin_buffer;
 
+            // Get effective leverage at current notional (tiered support)
+            let effective_leverage = self.config.leverage_at_notional(self.state.total_notional);
+
             // Notional we can add based on available margin and leverage
             // margin_required = notional / leverage
             // notional = margin_required * leverage
-            let margin_based_notional = usable_margin * self.config.max_leverage;
+            let margin_based_notional = usable_margin * effective_leverage;
             max_notional = max_notional.min(margin_based_notional);
 
             // Also respect max notional position limit
@@ -287,7 +413,7 @@ impl MarginAwareSizer {
         };
 
         if is_increasing {
-            // Check leverage limit
+            // Check leverage limit (with tiered support)
             let new_notional = self.state.total_notional + order_notional;
             let new_leverage = if self.state.account_value > 0.0 {
                 new_notional / self.state.account_value
@@ -295,12 +421,15 @@ impl MarginAwareSizer {
                 f64::INFINITY
             };
 
-            if new_leverage > self.config.max_leverage {
+            // Get effective max leverage at the new notional (tiered)
+            let max_allowed_leverage = self.config.leverage_at_notional(new_notional);
+
+            if new_leverage > max_allowed_leverage {
                 return (
                     false,
                     Some(format!(
-                        "Would exceed max leverage: {:.2}x > {:.2}x",
-                        new_leverage, self.config.max_leverage
+                        "Would exceed max leverage: {:.2}x > {:.2}x (at ${:.0} notional)",
+                        new_leverage, max_allowed_leverage, new_notional
                     )),
                 );
             }
@@ -316,8 +445,8 @@ impl MarginAwareSizer {
                 );
             }
 
-            // Check margin
-            let required_margin = order_notional / self.config.max_leverage;
+            // Check margin (using effective leverage at new notional)
+            let required_margin = order_notional / max_allowed_leverage;
             let usable_margin = self.state.available_margin * self.config.margin_buffer;
             if required_margin > usable_margin {
                 return (
@@ -373,14 +502,12 @@ pub struct MarginSummary {
 mod tests {
     use super::*;
 
+    use crate::meta::LeverageTier;
+
     fn create_sizer() -> MarginAwareSizer {
-        let config = MarginConfig {
-            max_leverage: 5.0,
-            margin_buffer: 0.8,
-            max_notional_position: 50_000.0,
-            max_order_notional: 10_000.0,
-            refresh_interval: Duration::from_secs(10),
-        };
+        let config = MarginConfig::with_leverage(5.0)
+            .with_max_notional_position(50_000.0)
+            .with_max_order_notional(10_000.0);
         let mut sizer = MarginAwareSizer::new(config);
         // Set initial state: $10k account, $2k margin used, $10k notional position
         sizer.update_state(10_000.0, 2_000.0, 10_000.0);
@@ -489,13 +616,9 @@ mod tests {
 
     #[test]
     fn test_can_place_order_exceeds_leverage() {
-        let config = MarginConfig {
-            max_leverage: 2.0, // Lower leverage limit
-            margin_buffer: 0.8,
-            max_notional_position: 100_000.0,
-            max_order_notional: 100_000.0, // High limit
-            refresh_interval: Duration::from_secs(10),
-        };
+        let config = MarginConfig::with_leverage(2.0) // Lower leverage limit
+            .with_max_notional_position(100_000.0)
+            .with_max_order_notional(100_000.0); // High limit
         let mut sizer = MarginAwareSizer::new(config);
         sizer.update_state(10_000.0, 0.0, 15_000.0); // Already at 1.5x
 
@@ -511,13 +634,9 @@ mod tests {
 
     #[test]
     fn test_can_place_order_reducing_position() {
-        let config = MarginConfig {
-            max_leverage: 1.0, // Very low leverage
-            margin_buffer: 0.8,
-            max_notional_position: 50_000.0,
-            max_order_notional: 100_000.0,
-            refresh_interval: Duration::from_secs(10),
-        };
+        let config = MarginConfig::with_leverage(1.0) // Very low leverage
+            .with_max_notional_position(50_000.0)
+            .with_max_order_notional(100_000.0);
         let mut sizer = MarginAwareSizer::new(config);
         sizer.update_state(10_000.0, 8_000.0, 40_000.0); // Almost at max
 
@@ -547,10 +666,8 @@ mod tests {
 
     #[test]
     fn test_is_stale() {
-        let config = MarginConfig {
-            refresh_interval: Duration::from_millis(10),
-            ..Default::default()
-        };
+        let config = MarginConfig::default()
+            .with_refresh_interval(Duration::from_millis(10));
         let sizer = MarginAwareSizer::new(config);
 
         // Initially stale (no state set)
@@ -567,5 +684,134 @@ mod tests {
 
         let summary = sizer.summary();
         assert_eq!(summary.margin_utilization, 0.0);
+    }
+
+    // ========================================================================
+    // New tests for API-based leverage and tiered support
+    // ========================================================================
+
+    #[test]
+    fn test_from_asset_meta() {
+        let asset_meta = AssetMeta {
+            name: "BTC".to_string(),
+            sz_decimals: 5,
+            max_leverage: 50,
+            only_isolated: None,
+            margin_mode: None,
+            is_delisted: None,
+        };
+        let config = MarginConfig::from_asset_meta(&asset_meta);
+
+        assert_eq!(config.max_leverage, 50.0);
+        assert!(config.leverage_config.is_some());
+        assert_eq!(config.leverage_config.as_ref().unwrap().asset, "BTC");
+    }
+
+    #[test]
+    fn test_leverage_at_notional_no_tiers() {
+        // Without tiers, leverage_at_notional always returns max_leverage
+        let config = MarginConfig::with_leverage(10.0);
+
+        assert_eq!(config.leverage_at_notional(0.0), 10.0);
+        assert_eq!(config.leverage_at_notional(1_000_000.0), 10.0);
+        assert_eq!(config.leverage_at_notional(10_000_000.0), 10.0);
+    }
+
+    #[test]
+    fn test_leverage_at_notional_with_tiers() {
+        // Create tiered leverage: 10x up to $3M, then 5x
+        let tiers = vec![
+            LeverageTier {
+                lower_bound: 0.0,
+                max_leverage: 10.0,
+            },
+            LeverageTier {
+                lower_bound: 3_000_000.0,
+                max_leverage: 5.0,
+            },
+        ];
+        let leverage_config = AssetLeverageConfig {
+            asset: "TEST".to_string(),
+            max_leverage: 10.0,
+            isolated_only: false,
+            tiers,
+        };
+        let config = MarginConfig::from_leverage_config(leverage_config);
+
+        // Below $3M threshold
+        assert_eq!(config.leverage_at_notional(0.0), 10.0);
+        assert_eq!(config.leverage_at_notional(1_000_000.0), 10.0);
+        assert_eq!(config.leverage_at_notional(2_999_999.0), 10.0);
+
+        // At and above $3M threshold
+        assert_eq!(config.leverage_at_notional(3_000_000.0), 5.0);
+        assert_eq!(config.leverage_at_notional(5_000_000.0), 5.0);
+        assert_eq!(config.leverage_at_notional(10_000_000.0), 5.0);
+    }
+
+    #[test]
+    fn test_can_place_order_with_tiered_leverage() {
+        // Tiered: 10x up to $50k, 5x above
+        let tiers = vec![
+            LeverageTier {
+                lower_bound: 0.0,
+                max_leverage: 10.0,
+            },
+            LeverageTier {
+                lower_bound: 50_000.0,
+                max_leverage: 5.0,
+            },
+        ];
+        let leverage_config = AssetLeverageConfig {
+            asset: "TEST".to_string(),
+            max_leverage: 10.0,
+            isolated_only: false,
+            tiers,
+        };
+        let config = MarginConfig::from_leverage_config(leverage_config)
+            .with_max_notional_position(200_000.0)
+            .with_max_order_notional(100_000.0);
+
+        let mut sizer = MarginAwareSizer::new(config);
+        // $10k account, $40k notional position (4x leverage, within 10x tier)
+        sizer.update_state(10_000.0, 4_000.0, 40_000.0);
+
+        let price = 50_000.0;
+
+        // Order that would push to $55k notional - crosses into 5x tier
+        // New notional: $55k, new leverage: 5.5x
+        // At $55k, max leverage is 5x, so 5.5x exceeds limit
+        let size = 0.3; // $15k order
+        let (can_place, reason) = sizer.can_place_order(size, price, 0.5, true);
+        assert!(!can_place);
+        assert!(reason.unwrap().contains("leverage"));
+
+        // Smaller order staying in 10x tier: $45k notional, 4.5x leverage
+        let size = 0.1; // $5k order
+        let (can_place, reason) = sizer.can_place_order(size, price, 0.5, true);
+        assert!(can_place);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn test_asset_leverage_config_validate() {
+        let config = AssetLeverageConfig {
+            asset: "BTC".to_string(),
+            max_leverage: 50.0,
+            isolated_only: false,
+            tiers: vec![],
+        };
+
+        // Valid: 2x leverage with 50x max
+        let (valid, effective, max) = config.validate_leverage(20_000.0, 10_000.0);
+        assert!(valid);
+        assert_eq!(effective, 2.0);
+        assert_eq!(max, 50.0);
+
+        // Invalid: 60x leverage with 50x max
+        let (valid, effective, max) = config.validate_leverage(600_000.0, 10_000.0);
+        assert!(!valid);
+        assert_eq!(effective, 60.0);
+        assert_eq!(max, 50.0);
     }
 }

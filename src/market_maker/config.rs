@@ -171,6 +171,29 @@ impl DynamicRiskConfig {
 // Stochastic Module Integration Configuration
 // ============================================================================
 
+/// Method for calculating Kelly time horizon for first-passage fill probability.
+///
+/// The Kelly-Stochastic optimizer needs a time horizon τ to compute fill probabilities.
+/// This is semantically different from the GLFT inventory time horizon T = 1/λ.
+///
+/// For first-passage probability P(fill) = 2Φ(-δ/(σ√τ)) to be meaningful:
+/// - τ must be long enough for price to diffuse to quote depth
+/// - τ = (δ/σ)² gives P(fill at δ) ≈ 15.9%
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum KellyTimeHorizonMethod {
+    /// Fixed time horizon in seconds.
+    /// Use when you want predictable behavior regardless of volatility.
+    Fixed,
+    /// Diffusion-based: τ = (δ_char / σ)² clamped to [τ_min, τ_max].
+    /// Automatically scales with volatility to maintain meaningful fill probabilities.
+    /// This is the recommended default for first-principles correctness.
+    #[default]
+    DiffusionBased,
+    /// Use arrival intensity (1/λ) - legacy behavior.
+    /// WARNING: This typically produces τ ~milliseconds, causing P(fill) ≈ 0.
+    ArrivalIntensity,
+}
+
 /// Configuration for stochastic module integration.
 ///
 /// Controls feature flags for first-principles stochastic components:
@@ -248,6 +271,32 @@ pub struct StochasticConfig {
     /// Lower values are more conservative.
     /// Default: 0.25
     pub kelly_fraction: f64,
+
+    // ==================== Kelly Time Horizon Parameters ====================
+
+    /// Method for calculating Kelly time horizon.
+    /// Default: DiffusionBased (scales τ with volatility for correct fill probabilities)
+    pub kelly_time_horizon_method: KellyTimeHorizonMethod,
+
+    /// Fixed tau value in seconds (used when method = Fixed).
+    /// Default: 60.0 (1 minute)
+    pub kelly_tau_fixed: f64,
+
+    /// Minimum tau in seconds (clamp floor for DiffusionBased).
+    /// Prevents τ from becoming too short in high-vol regimes.
+    /// Default: 10.0 (10 seconds)
+    pub kelly_tau_min: f64,
+
+    /// Maximum tau in seconds (clamp ceiling for DiffusionBased/ArrivalIntensity).
+    /// Prevents τ from becoming too long in low-vol regimes.
+    /// Default: 600.0 (10 minutes)
+    pub kelly_tau_max: f64,
+
+    /// Characteristic depth in bps for diffusion-based tau calculation.
+    /// τ = (kelly_char_depth_bps / σ)² gives P(fill at δ_char) ≈ 15.9%.
+    /// Should be set to mid-ladder depth for balanced allocation.
+    /// Default: 25.0 bps
+    pub kelly_char_depth_bps: f64,
 }
 
 impl Default for StochasticConfig {
@@ -276,6 +325,13 @@ impl Default for StochasticConfig {
             kelly_alpha_touch: 0.15,      // 15% informed at touch
             kelly_alpha_decay_bps: 10.0,  // Alpha decays with 10bp characteristic
             kelly_fraction: 0.25,         // Quarter Kelly (conservative)
+
+            // Kelly time horizon parameters
+            kelly_time_horizon_method: KellyTimeHorizonMethod::DiffusionBased,
+            kelly_tau_fixed: 60.0,        // 1 minute (for Fixed method)
+            kelly_tau_min: 10.0,          // 10 seconds floor
+            kelly_tau_max: 600.0,         // 10 minutes ceiling
+            kelly_char_depth_bps: 25.0,   // Mid-ladder characteristic depth
         }
     }
 }
@@ -352,6 +408,36 @@ impl StochasticConfig {
     /// Builder: set Kalman R (observation noise).
     pub fn with_kalman_r(mut self, r: f64) -> Self {
         self.kalman_r = r;
+        self
+    }
+
+    /// Builder: set Kelly time horizon method.
+    pub fn with_kelly_time_horizon_method(mut self, method: KellyTimeHorizonMethod) -> Self {
+        self.kelly_time_horizon_method = method;
+        self
+    }
+
+    /// Builder: set Kelly characteristic depth for diffusion-based tau.
+    pub fn with_kelly_char_depth_bps(mut self, depth: f64) -> Self {
+        self.kelly_char_depth_bps = depth;
+        self
+    }
+
+    /// Builder: set Kelly tau min (floor for diffusion-based).
+    pub fn with_kelly_tau_min(mut self, tau_min: f64) -> Self {
+        self.kelly_tau_min = tau_min;
+        self
+    }
+
+    /// Builder: set Kelly tau max (ceiling).
+    pub fn with_kelly_tau_max(mut self, tau_max: f64) -> Self {
+        self.kelly_tau_max = tau_max;
+        self
+    }
+
+    /// Builder: set fixed Kelly tau (for Fixed method).
+    pub fn with_kelly_tau_fixed(mut self, tau: f64) -> Self {
+        self.kelly_tau_fixed = tau;
         self
     }
 }

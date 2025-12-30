@@ -92,6 +92,125 @@ pub struct AssetMeta {
     pub max_leverage: usize,
     #[serde(default)]
     pub only_isolated: Option<bool>,
+    /// Margin mode: "strictIsolated" = margin cannot be removed, "noCross" = only isolated allowed
+    #[serde(default)]
+    pub margin_mode: Option<String>,
+    /// Whether the asset is delisted
+    #[serde(default)]
+    pub is_delisted: Option<bool>,
+}
+
+// ============================================================================
+// Asset Leverage Configuration
+// ============================================================================
+
+/// Leverage configuration derived from exchange API metadata.
+///
+/// This is the **single source of truth** for leverage limits.
+/// Never use hardcoded defaults - always derive from API response.
+///
+/// # First-Principles Design
+/// - Leverage limits are set by the exchange, not the trader
+/// - Different assets have different max leverage (BTC: 50x, memecoins: 3x)
+/// - Some assets have tiered leverage (lower max at higher notional)
+/// - Trading without knowing the real limits is dangerous
+#[derive(Debug, Clone)]
+pub struct AssetLeverageConfig {
+    /// Asset name (e.g., "BTC", "ETH")
+    pub asset: String,
+    /// Maximum leverage at the base tier (from API metadata)
+    pub max_leverage: f64,
+    /// Whether this asset only supports isolated margin
+    pub isolated_only: bool,
+    /// Tiered leverage tiers (optional, for assets with position-based limits)
+    pub tiers: Vec<LeverageTier>,
+}
+
+/// A single tier in a tiered leverage schedule.
+///
+/// Hyperliquid reduces max leverage at higher position notional values.
+/// Example: 10x up to $3M, then 5x above $3M.
+#[derive(Debug, Clone)]
+pub struct LeverageTier {
+    /// Lower bound of notional position for this tier (USD)
+    pub lower_bound: f64,
+    /// Max leverage allowed in this tier
+    pub max_leverage: f64,
+}
+
+impl AssetLeverageConfig {
+    /// Create leverage config from asset metadata.
+    ///
+    /// This is the primary constructor - always use API-derived data.
+    pub fn from_asset_meta(meta: &AssetMeta) -> Self {
+        Self {
+            asset: meta.name.clone(),
+            max_leverage: meta.max_leverage as f64,
+            isolated_only: meta.only_isolated.unwrap_or(false),
+            tiers: vec![], // No tiered data in basic metadata
+        }
+    }
+
+    /// Create leverage config with tiered schedule.
+    ///
+    /// Use when margin table data is available from the API.
+    pub fn with_tiers(mut self, tiers: Vec<LeverageTier>) -> Self {
+        // Sort tiers by lower_bound ascending
+        self.tiers = tiers;
+        self.tiers
+            .sort_by(|a, b| a.lower_bound.partial_cmp(&b.lower_bound).unwrap());
+        self
+    }
+
+    /// Get effective max leverage at a given position notional.
+    ///
+    /// For tiered assets, leverage decreases at higher notional values.
+    /// This returns the applicable leverage limit for the given position size.
+    ///
+    /// # Arguments
+    /// - `notional`: Current position notional in USD
+    ///
+    /// # Returns
+    /// Maximum leverage allowed at this position size
+    pub fn leverage_at_notional(&self, notional: f64) -> f64 {
+        if self.tiers.is_empty() {
+            return self.max_leverage;
+        }
+
+        // Find the highest tier where notional >= lower_bound
+        for tier in self.tiers.iter().rev() {
+            if notional >= tier.lower_bound {
+                return tier.max_leverage;
+            }
+        }
+
+        // Default to max leverage if below all tiers
+        self.max_leverage
+    }
+
+    /// Check if a position at given notional exceeds leverage limits.
+    ///
+    /// # Arguments
+    /// - `notional`: Position notional in USD
+    /// - `account_value`: Account equity in USD
+    ///
+    /// # Returns
+    /// (is_valid, effective_leverage, max_allowed)
+    pub fn validate_leverage(
+        &self,
+        notional: f64,
+        account_value: f64,
+    ) -> (bool, f64, f64) {
+        if account_value <= 0.0 {
+            return (false, f64::INFINITY, self.max_leverage);
+        }
+
+        let effective_leverage = notional / account_value;
+        let max_allowed = self.leverage_at_notional(notional);
+        let is_valid = effective_leverage <= max_allowed;
+
+        (is_valid, effective_leverage, max_allowed)
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

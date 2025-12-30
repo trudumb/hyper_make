@@ -371,6 +371,10 @@ pub struct KellyStochasticConfigParams {
 
     /// Kelly fraction (0.25 = quarter Kelly).
     pub kelly_fraction: f64,
+
+    /// Kelly-specific time horizon for first-passage probability (seconds).
+    /// Semantically different from GLFT inventory time horizon.
+    pub time_horizon: f64,
 }
 
 impl Default for KellyStochasticConfigParams {
@@ -380,6 +384,7 @@ impl Default for KellyStochasticConfigParams {
             alpha_touch: 0.15,
             alpha_decay_bps: 10.0,
             kelly_fraction: 0.25,
+            time_horizon: 60.0,
         }
     }
 }
@@ -387,7 +392,7 @@ impl Default for KellyStochasticConfigParams {
 // === Parameter Aggregation ===
 
 use crate::market_maker::adverse_selection::AdverseSelectionEstimator;
-use crate::market_maker::config::StochasticConfig;
+use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::MarginAwareSizer;
 use crate::market_maker::process_models::{
@@ -425,6 +430,34 @@ pub struct ParameterSources<'a> {
     pub max_position: f64,
     pub latest_mid: f64,
     pub risk_aversion: f64,
+}
+
+/// Calculate Kelly time horizon based on config method.
+///
+/// For first-passage fill probability P(fill) = 2Φ(-δ/(σ√τ)) to be meaningful,
+/// τ must be long enough for price to diffuse to quote depth.
+///
+/// # Methods
+/// - **Fixed**: Use config-specified fixed tau
+/// - **DiffusionBased**: τ = (δ_char / σ)² gives P(δ_char) ≈ 15.9%
+/// - **ArrivalIntensity**: τ = 1/λ (legacy, typically too short)
+fn calculate_kelly_time_horizon(config: &StochasticConfig, sigma: f64, arrival_intensity: f64) -> f64 {
+    match config.kelly_time_horizon_method {
+        KellyTimeHorizonMethod::Fixed => config.kelly_tau_fixed,
+        KellyTimeHorizonMethod::DiffusionBased => {
+            // τ = (δ_char / σ)² gives P(fill at δ_char) ≈ 15.9%
+            // This scales with volatility: low vol → longer tau, high vol → shorter tau
+            let depth_frac = config.kelly_char_depth_bps / 10000.0;
+            let safe_sigma = sigma.max(1e-9);
+            let tau = (depth_frac / safe_sigma).powi(2);
+            tau.clamp(config.kelly_tau_min, config.kelly_tau_max)
+        }
+        KellyTimeHorizonMethod::ArrivalIntensity => {
+            // Legacy behavior: τ = 1/λ
+            // WARNING: This typically produces τ ~milliseconds, causing P(fill) ≈ 0
+            (1.0 / arrival_intensity.max(0.01)).min(config.kelly_tau_max)
+        }
+    }
 }
 
 /// Aggregates parameters from multiple sources into MarketParams.
@@ -549,13 +582,20 @@ impl ParameterAggregator {
             // === Stochastic Module: Constrained Optimizer ===
             use_constrained_optimizer: sources.stochastic_config.use_constrained_optimizer,
             margin_available: sources.margin_sizer.state().available_margin,
-            leverage: sources.margin_sizer.state().current_leverage,
+            // NOTE: Use max_leverage (allowed leverage) not current_leverage (how levered we are)
+            // This determines how much margin is needed per unit of position
+            leverage: sources.margin_sizer.summary().max_leverage,
 
             // === Stochastic Module: Kelly-Stochastic Allocation ===
             use_kelly_stochastic: sources.stochastic_config.use_kelly_stochastic,
             kelly_alpha_touch: sources.stochastic_config.kelly_alpha_touch,
             kelly_alpha_decay_bps: sources.stochastic_config.kelly_alpha_decay_bps,
             kelly_fraction: sources.stochastic_config.kelly_fraction,
+            kelly_time_horizon: calculate_kelly_time_horizon(
+                sources.stochastic_config,
+                est.sigma_clean(),
+                arrival_intensity,
+            ),
         }
     }
 }

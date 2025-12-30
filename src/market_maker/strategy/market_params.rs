@@ -239,6 +239,10 @@ pub struct MarketParams {
     pub kelly_alpha_decay_bps: f64,
     /// Kelly fraction (0.25 = quarter Kelly)
     pub kelly_fraction: f64,
+    /// Kelly-specific time horizon for first-passage probability (seconds).
+    /// Semantically different from GLFT inventory time horizon T = 1/λ.
+    /// Computed from KellyTimeHorizonMethod in config.
+    pub kelly_time_horizon: f64,
 }
 
 impl Default for MarketParams {
@@ -321,6 +325,7 @@ impl Default for MarketParams {
             kelly_alpha_touch: 0.15,      // 15% informed at touch
             kelly_alpha_decay_bps: 10.0,  // Alpha decays with 10bp characteristic
             kelly_fraction: 0.25,         // Quarter Kelly (conservative)
+            kelly_time_horizon: 60.0,     // Default 60s (will be computed from config method)
         }
     }
 }
@@ -455,6 +460,7 @@ impl MarketParams {
             alpha_touch: self.kelly_alpha_touch,
             alpha_decay_bps: self.kelly_alpha_decay_bps,
             kelly_fraction: self.kelly_fraction,
+            time_horizon: self.kelly_time_horizon,
         }
     }
 }
