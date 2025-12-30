@@ -138,8 +138,22 @@ impl LadderStrategy {
             return Ladder::default();
         }
 
+        // FIRST PRINCIPLES: Use dynamic max_position derived from equity/volatility
+        // Falls back to static max_position if margin state hasn't been refreshed yet
+        let effective_max_position = market_params.effective_max_position(max_position);
+
+        // Log when using dynamic limit
+        if market_params.dynamic_limit_valid && (effective_max_position - max_position).abs() > EPSILON
+        {
+            tracing::debug!(
+                static_limit = %format!("{:.6}", max_position),
+                dynamic_limit = %format!("{:.6}", effective_max_position),
+                "Using first-principles dynamic position limit"
+            );
+        }
+
         // Calculate effective gamma (includes all scaling factors)
-        let base_gamma = self.effective_gamma(market_params, position, max_position);
+        let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
         let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
         let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
 
@@ -150,8 +164,8 @@ impl LadderStrategy {
 
         let time_horizon = self.holding_time(market_params.arrival_intensity);
 
-        let inventory_ratio = if max_position > EPSILON {
-            (position / max_position).clamp(-1.0, 1.0)
+        let inventory_ratio = if effective_max_position > EPSILON {
+            (position / effective_max_position).clamp(-1.0, 1.0)
         } else {
             0.0
         };
@@ -185,7 +199,7 @@ impl LadderStrategy {
         // === STOCHASTIC MODULE: Constrained Ladder Optimization ===
         // Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ  (expected profit)
         // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
-        //      Σ sᵢ ≤ max_position (position constraint)
+        //      Σ sᵢ ≤ effective_max_position (position constraint - first principles)
         //      Σ sᵢ ≤ exchange_limit (exchange-enforced constraint)
         if market_params.use_constrained_optimizer {
             // 1. Available margin comes from the exchange (already accounts for position margin)
@@ -198,12 +212,12 @@ impl LadderStrategy {
             // on the opposite side, not block both sides.
             //
             // PENDING EXPOSURE FIX: Account for resting orders that would change position if filled.
-            // Available capacity = max_position - current_position - pending_exposure_on_same_side
+            // Available capacity = effective_max_position - current_position - pending_exposure_on_same_side
             //
-            // For bids (buying): Can buy up to (max_position - position - pending_bid_exposure) when long or flat
-            //                    Can buy up to (max_position + |position| - pending_bid_exposure) when short (reducing)
-            // For asks (selling): Can sell up to (max_position + position - pending_ask_exposure) when long (reducing)
-            //                     Can sell up to (max_position - |position| - pending_ask_exposure) when short or flat
+            // For bids (buying): Can buy up to (effective_max_position - position - pending_bid_exposure) when long or flat
+            //                    Can buy up to (effective_max_position + |position| - pending_bid_exposure) when short (reducing)
+            // For asks (selling): Can sell up to (effective_max_position + position - pending_ask_exposure) when long (reducing)
+            //                     Can sell up to (effective_max_position - |position| - pending_ask_exposure) when short or flat
             let pending_bids = market_params.pending_bid_exposure;
             let pending_asks = market_params.pending_ask_exposure;
 
@@ -211,27 +225,27 @@ impl LadderStrategy {
                 // Long or flat position
                 // Bids: limited by how much more long we can go (minus pending bid exposure)
                 // Asks: can sell entire position + go max short (minus pending ask exposure)
-                let bid_limit = (max_position - position - pending_bids).max(0.0);
-                let ask_limit = (position + max_position - pending_asks).max(0.0);
+                let bid_limit = (effective_max_position - position - pending_bids).max(0.0);
+                let ask_limit = (position + effective_max_position - pending_asks).max(0.0);
                 (bid_limit, ask_limit)
             } else {
                 // Short position
                 // Bids: can buy to cover position + go max long (minus pending bid exposure)
                 // Asks: limited by how much more short we can go (minus pending ask exposure)
-                let bid_limit = (position.abs() + max_position - pending_bids).max(0.0);
-                let ask_limit = (max_position - position.abs() - pending_asks).max(0.0);
+                let bid_limit = (position.abs() + effective_max_position - pending_bids).max(0.0);
+                let ask_limit = (effective_max_position - position.abs() - pending_asks).max(0.0);
                 (bid_limit, ask_limit)
             };
 
             // Log if pending exposure is constraining sizing
-            if pending_bids > EPSILON && local_available_bids < max_position {
+            if pending_bids > EPSILON && local_available_bids < effective_max_position {
                 tracing::debug!(
                     pending_bids = %format!("{:.6}", pending_bids),
                     effective_bid_limit = %format!("{:.6}", local_available_bids),
                     "Bid sizing reduced by pending exposure"
                 );
             }
-            if pending_asks > EPSILON && local_available_asks < max_position {
+            if pending_asks > EPSILON && local_available_asks < effective_max_position {
                 tracing::debug!(
                     pending_asks = %format!("{:.6}", pending_asks),
                     effective_ask_limit = %format!("{:.6}", local_available_asks),
@@ -276,12 +290,12 @@ impl LadderStrategy {
             }
 
             // Log reduce-only mode detection
-            let over_limit = position.abs() > max_position;
+            let over_limit = position.abs() > effective_max_position;
             if over_limit {
                 if position > 0.0 {
                     tracing::debug!(
                         position = %format!("{:.6}", position),
-                        max_position = %format!("{:.6}", max_position),
+                        effective_max_position = %format!("{:.6}", effective_max_position),
                         available_bids = %format!("{:.6}", available_for_bids),
                         available_asks = %format!("{:.6}", available_for_asks),
                         "Over max position (LONG) - bids blocked, asks allowed for reducing"
@@ -289,7 +303,7 @@ impl LadderStrategy {
                 } else {
                     tracing::debug!(
                         position = %format!("{:.6}", position),
-                        max_position = %format!("{:.6}", max_position),
+                        effective_max_position = %format!("{:.6}", effective_max_position),
                         available_bids = %format!("{:.6}", available_for_bids),
                         available_asks = %format!("{:.6}", available_for_asks),
                         "Over max position (SHORT) - asks blocked, bids allowed for reducing"

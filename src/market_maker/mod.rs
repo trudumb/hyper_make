@@ -740,6 +740,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Get pending exposure from resting orders (prevents position breach from multiple fills)
         let (pending_bid_exposure, pending_ask_exposure) = self.orders.pending_exposure();
 
+        // Get dynamic position VALUE limit from kill switch (first-principles derived)
+        let dynamic_max_position_value = self.safety.kill_switch.max_position_value();
+        // Margin state is valid if we've refreshed margin at least once
+        let dynamic_limit_valid = self.infra.margin_sizer.state().account_value > 0.0;
+
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
@@ -763,14 +768,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Pending exposure from resting orders
             pending_bid_exposure,
             pending_ask_exposure,
+            // Dynamic position limits (first principles)
+            dynamic_max_position_value,
+            dynamic_limit_valid,
         };
         let market_params = ParameterAggregator::build(&sources);
+
+        // Compute effective max_position for logging (dynamic if valid, else static)
+        let effective_max_pos = market_params.effective_max_position(self.config.max_position);
 
         debug!(
             mid = self.latest_mid,
             microprice = %format!("{:.4}", market_params.microprice),
             position = self.position.position(),
-            max_pos = self.config.max_position,
+            static_max_pos = self.config.max_position,
+            dynamic_max_pos = %format!("{:.6}", market_params.dynamic_max_position),
+            effective_max_pos = %format!("{:.6}", effective_max_pos),
+            dynamic_valid = market_params.dynamic_limit_valid,
             target_liq = self.config.target_liquidity,
             sigma_clean = %format!("{:.6}", market_params.sigma),
             sigma_effective = %format!("{:.6}", market_params.sigma_effective),

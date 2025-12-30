@@ -261,6 +261,21 @@ pub struct MarketParams {
     pub pending_bid_exposure: f64,
     /// Total remaining size on resting sell orders (would increase short if filled)
     pub pending_ask_exposure: f64,
+
+    // === Dynamic Position Limits (First Principles) ===
+    /// Dynamic max position SIZE derived from first-principles VALUE limit.
+    /// Formula: dynamic_max_position = max_position_value / mid_price
+    /// where max_position_value = min(leverage_limit, volatility_limit)
+    /// - leverage_limit = account_value × max_leverage
+    /// - volatility_limit = (equity × risk_fraction) / (num_sigmas × σ × √T)
+    ///
+    /// This replaces the arbitrary static max_position with an equity/volatility-derived limit.
+    /// Use this for all sizing calculations instead of config.max_position.
+    pub dynamic_max_position: f64,
+
+    /// Whether the dynamic limit is valid (has been calculated from margin state).
+    /// If false, strategies should fall back to config.max_position.
+    pub dynamic_limit_valid: bool,
 }
 
 impl Default for MarketParams {
@@ -352,6 +367,9 @@ impl Default for MarketParams {
             // Pending Exposure
             pending_bid_exposure: 0.0, // No resting orders initially
             pending_ask_exposure: 0.0, // No resting orders initially
+            // Dynamic Position Limits
+            dynamic_max_position: 0.0,   // Will be set from kill switch
+            dynamic_limit_valid: false,  // Not valid until margin state refreshed
         }
     }
 }
@@ -360,6 +378,19 @@ impl MarketParams {
     /// Get net pending exposure (positive = net long exposure from resting orders).
     pub fn net_pending_exposure(&self) -> f64 {
         self.pending_bid_exposure - self.pending_ask_exposure
+    }
+
+    /// Get effective max_position for sizing calculations.
+    ///
+    /// Returns dynamic_max_position if valid, otherwise falls back to provided static limit.
+    /// This ensures sizing adapts to equity/volatility when margin state is available,
+    /// while maintaining safe defaults during warmup.
+    pub fn effective_max_position(&self, static_fallback: f64) -> f64 {
+        if self.dynamic_limit_valid && self.dynamic_max_position > 0.0 {
+            self.dynamic_max_position
+        } else {
+            static_fallback
+        }
     }
 }
 

@@ -509,6 +509,13 @@ pub struct ParameterSources<'a> {
     // Pending exposure from resting orders
     pub pending_bid_exposure: f64,
     pub pending_ask_exposure: f64,
+
+    // Dynamic position limits (first principles)
+    /// Dynamic max position VALUE from kill switch (USD).
+    /// Derived from: min(leverage_limit, volatility_limit)
+    pub dynamic_max_position_value: f64,
+    /// Whether dynamic limit has been calculated from valid margin state.
+    pub dynamic_limit_valid: bool,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -692,6 +699,15 @@ impl ParameterAggregator {
             // Resting orders that would change position if filled
             pending_bid_exposure: sources.pending_bid_exposure,
             pending_ask_exposure: sources.pending_ask_exposure,
+
+            // === Dynamic Position Limits (First Principles) ===
+            // Convert VALUE limit to SIZE limit: max_position = max_value / price
+            dynamic_max_position: if sources.dynamic_limit_valid && sources.latest_mid > 0.0 {
+                sources.dynamic_max_position_value / sources.latest_mid
+            } else {
+                sources.max_position // Fall back to static limit
+            },
+            dynamic_limit_valid: sources.dynamic_limit_valid,
         }
     }
 }

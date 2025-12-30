@@ -246,9 +246,13 @@ impl QuotingStrategy for GLFTStrategy {
             return (None, None);
         }
 
+        // FIRST PRINCIPLES: Use dynamic max_position derived from equity/volatility
+        // Falls back to static max_position if margin state hasn't been refreshed yet
+        let effective_max_position = market_params.effective_max_position(max_position);
+
         // === 1. DYNAMIC GAMMA with Tail Risk ===
         // γ scales with volatility, toxicity, inventory utilization, liquidity, AND cascade severity
-        let base_gamma = self.effective_gamma(market_params, position, max_position);
+        let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
         // Apply liquidity multiplier: thin book → higher gamma → wider spread
         let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
         // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
@@ -381,8 +385,8 @@ impl QuotingStrategy for GLFTStrategy {
         let sigma_for_skew = market_params.sigma_effective;
 
         // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
-        let inventory_ratio = if max_position > EPSILON {
-            (position / max_position).clamp(-1.0, 1.0)
+        let inventory_ratio = if effective_max_position > EPSILON {
+            (position / effective_max_position).clamp(-1.0, 1.0)
         } else {
             0.0
         };
@@ -591,9 +595,9 @@ impl QuotingStrategy for GLFTStrategy {
             "GLFT prices (microprice-based)"
         );
 
-        // Calculate sizes based on position limits
-        let buy_size_raw = (max_position - position).min(target_liquidity).max(0.0);
-        let sell_size_raw = (max_position + position).min(target_liquidity).max(0.0);
+        // Calculate sizes based on position limits (using first-principles dynamic limit)
+        let buy_size_raw = (effective_max_position - position).min(target_liquidity).max(0.0);
+        let sell_size_raw = (effective_max_position + position).min(target_liquidity).max(0.0);
 
         // === Apply cascade size reduction for graceful degradation ===
         // During moderate cascade (before quote pulling), reduce size gradually
