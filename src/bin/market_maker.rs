@@ -26,8 +26,8 @@ use hyperliquid_rust_sdk::{
     ExchangeClient, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient,
     InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
     MarginConfig, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
-    PnLConfig, QueueConfig, QuotingStrategy, RiskConfig, SpreadConfig, StochasticConfig,
-    SymmetricStrategy,
+    PnLConfig, QueueConfig, QuotingStrategy, ReconciliationConfig, RecoveryConfig,
+    RejectionRateLimitConfig, RiskConfig, SpreadConfig, StochasticConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -901,6 +901,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Margin config from API metadata"
     );
     let data_quality_config = DataQualityConfig::default();
+    let recovery_config = RecoveryConfig::default();
+    let reconciliation_config = ReconciliationConfig::default();
+    let rate_limit_config = RejectionRateLimitConfig::default();
 
     // Create and start market maker
     let mut market_maker = MarketMaker::new(
@@ -922,6 +925,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pnl_config,
         margin_config,
         data_quality_config,
+        recovery_config,
+        reconciliation_config,
+        rate_limit_config,
     )
     .with_dynamic_risk_config(dynamic_risk_config);
 

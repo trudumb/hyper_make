@@ -94,8 +94,19 @@ pub enum LadderAction {
 /// A pending order awaiting OID from exchange.
 ///
 /// Used to bridge the race condition between order placement and fill notification.
-/// When an order is placed, we store it by (side, price_key) so that if a fill
-/// arrives before the OID is known, we can still find the placement price.
+/// When an order is placed, we store it by CLOID (primary) and (side, price_key) (fallback)
+/// so that if a fill arrives before the OID is known, we can still find the placement price.
+///
+/// # CLOID Tracking (Primary)
+///
+/// Client Order IDs (CLOIDs) are generated before placement and provide deterministic
+/// order matching. The SDK returns CLOIDs in fill notifications via `TradeInfo.cloid`.
+/// This eliminates the timing-dependent race condition between REST response and WebSocket fills.
+///
+/// # Price-Based Fallback
+///
+/// For backward compatibility and edge cases, we also store by (side, price_key).
+/// This handles fills where CLOID might be missing from the exchange response.
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
     /// Side of the order
@@ -106,16 +117,30 @@ pub struct PendingOrder {
     pub size: f64,
     /// When the order was submitted
     pub placed_at: Instant,
+    /// Client Order ID (UUID) - generated before placement for deterministic tracking
+    pub cloid: Option<String>,
 }
 
 impl PendingOrder {
-    /// Create a new pending order.
+    /// Create a new pending order (legacy, without CLOID).
     pub fn new(side: Side, price: f64, size: f64) -> Self {
         Self {
             side,
             price,
             size,
             placed_at: Instant::now(),
+            cloid: None,
+        }
+    }
+
+    /// Create a new pending order with CLOID tracking.
+    pub fn with_cloid(side: Side, price: f64, size: f64, cloid: String) -> Self {
+        Self {
+            side,
+            price,
+            size,
+            placed_at: Instant::now(),
+            cloid: Some(cloid),
         }
     }
 }

@@ -251,6 +251,59 @@ impl ExchangePositionLimits {
         self.age_ms() > 300_000 // 5 minutes
     }
 
+    /// Calculate safe order size that won't exceed exchange limits.
+    ///
+    /// This is the key pre-flight check that prevents order rejections (Phase 2 Fix).
+    ///
+    /// # Arguments
+    /// - `requested_size`: Desired order size
+    /// - `is_buy`: Whether this is a buy order
+    /// - `current_position`: Current position (positive = long)
+    ///
+    /// # Returns
+    /// `(safe_size, was_clamped, reason)` where:
+    /// - `safe_size`: Size that is safe to place (may be 0 if no capacity)
+    /// - `was_clamped`: Whether the size was reduced
+    /// - `reason`: Why the size was clamped (if applicable)
+    pub fn calculate_safe_order_size(
+        &self,
+        requested_size: f64,
+        is_buy: bool,
+        current_position: f64,
+    ) -> (f64, bool, Option<String>) {
+        if !self.is_initialized() {
+            // Not initialized - allow optimistically but warn
+            return (requested_size, false, None);
+        }
+
+        let available = if is_buy {
+            self.inner.available_buy.load()
+        } else {
+            self.inner.available_sell.load()
+        };
+
+        // Clamp to available capacity
+        if requested_size <= available {
+            (requested_size, false, None)
+        } else if available > 0.0 {
+            let reason = format!(
+                "{} size {:.6} clamped to available {:.6} (position: {:.6})",
+                if is_buy { "Buy" } else { "Sell" },
+                requested_size,
+                available,
+                current_position
+            );
+            (available, true, Some(reason))
+        } else {
+            let reason = format!(
+                "{} blocked: no available capacity (position: {:.6})",
+                if is_buy { "Buy" } else { "Sell" },
+                current_position
+            );
+            (0.0, true, Some(reason))
+        }
+    }
+
     /// Check if a proposed order would likely be rejected.
     ///
     /// # Arguments

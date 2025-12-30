@@ -23,6 +23,16 @@ use crate::market_maker::quoting::Ladder;
 /// 2. Position updates happen regardless of tracking (position is always correct)
 /// 3. Cleanup is centralized through the `cleanup()` method
 /// 4. Pending orders bridge the race between placement and fill notification
+///
+/// # CLOID Tracking (Phase 1 Fix)
+///
+/// The primary lookup for pending orders is now by CLOID (Client Order ID).
+/// CLOIDs are UUIDs generated before order placement, making fill matching deterministic.
+/// This eliminates the race condition where fills arrived before REST returned the OID.
+///
+/// Lookup priority:
+/// 1. CLOID (primary) - always available, deterministic
+/// 2. Price-based (fallback) - for edge cases where CLOID is missing
 #[derive(Debug)]
 pub struct OrderManager {
     /// Orders indexed by order ID
@@ -30,6 +40,9 @@ pub struct OrderManager {
     /// Pending orders awaiting OID assignment, indexed by (side, price_key).
     /// Used to handle immediate fills that arrive before OID is known.
     pending: HashMap<(Side, u64), PendingOrder>,
+    /// Pending orders indexed by CLOID (primary lookup).
+    /// CLOID is generated before placement and returned in fill notifications.
+    pending_by_cloid: HashMap<String, PendingOrder>,
     /// Configuration
     config: OrderManagerConfig,
 }
@@ -46,6 +59,7 @@ impl OrderManager {
         Self {
             orders: HashMap::new(),
             pending: HashMap::new(),
+            pending_by_cloid: HashMap::new(),
             config: OrderManagerConfig::default(),
         }
     }
@@ -55,6 +69,7 @@ impl OrderManager {
         Self {
             orders: HashMap::new(),
             pending: HashMap::new(),
+            pending_by_cloid: HashMap::new(),
             config,
         }
     }
@@ -107,50 +122,148 @@ impl OrderManager {
 
     // === Pending Order Management ===
     // These methods handle the race condition between order placement and fill notification.
-    // When a bulk order is placed, we register it as "pending" by (side, price) before the
-    // API call returns. This allows fills that arrive before the OID is known to still
-    // find the placement price.
+    // When a bulk order is placed, we register it as "pending" by CLOID (primary) and
+    // (side, price) (fallback) before the API call returns.
+    //
+    // CLOID-FIRST LOOKUP (Phase 1 Fix):
+    // - CLOID is a UUID generated BEFORE placement
+    // - Fill notifications include the CLOID
+    // - Lookup is deterministic - no timing race condition
+    // - Price-based lookup is kept as fallback for edge cases
 
-    /// Register a pending order before placing it on the exchange.
+    /// Register a pending order before placing it on the exchange (legacy, without CLOID).
     ///
     /// Call this BEFORE the bulk order API call. When the API returns with OIDs,
     /// call `finalize_pending()` to convert to a tracked order.
+    ///
+    /// NOTE: Prefer `add_pending_with_cloid()` for deterministic fill tracking.
     pub fn add_pending(&mut self, side: Side, price: f64, size: f64) {
         let key = (side, price_to_key(price));
         self.pending
             .insert(key, PendingOrder::new(side, price, size));
     }
 
-    /// Finalize a pending order by assigning it a real OID.
+    /// Register a pending order with CLOID before placing it on the exchange.
+    ///
+    /// This is the preferred method - CLOID provides deterministic fill matching.
+    /// Call this BEFORE the bulk order API call. When the API returns with OIDs,
+    /// call `finalize_pending_by_cloid()` to convert to a tracked order.
+    ///
+    /// # Arguments
+    /// - `side`: Buy or Sell
+    /// - `price`: Limit price
+    /// - `size`: Order size
+    /// - `cloid`: Client Order ID (UUID string, generated before placement)
+    pub fn add_pending_with_cloid(&mut self, side: Side, price: f64, size: f64, cloid: String) {
+        // Store in CLOID map (primary lookup)
+        let pending = PendingOrder::with_cloid(side, price, size, cloid.clone());
+        self.pending_by_cloid.insert(cloid, pending.clone());
+
+        // Also store by price (fallback lookup)
+        let key = (side, price_to_key(price));
+        self.pending.insert(key, pending);
+    }
+
+    /// Finalize a pending order by assigning it a real OID (legacy, price-based).
     ///
     /// Call this when the bulk order API returns with the assigned OID.
     /// Moves the order from pending to tracked.
     /// Returns the pending order if found, None if not found (shouldn't happen).
     pub fn finalize_pending(&mut self, side: Side, price: f64, oid: u64, resting_size: f64) {
         let key = (side, price_to_key(price));
-        if self.pending.remove(&key).is_some() {
+        if let Some(pending) = self.pending.remove(&key) {
+            // Also remove from CLOID map if it was stored there
+            if let Some(ref cloid) = pending.cloid {
+                self.pending_by_cloid.remove(cloid);
+            }
             // Create tracked order with the real OID and resting size from exchange
-            self.add_order(TrackedOrder::new(oid, side, price, resting_size));
+            let mut order = TrackedOrder::new(oid, side, price, resting_size);
+            order.cloid = pending.cloid; // Preserve CLOID for future lookup
+            self.add_order(order);
         }
         // Note: If pending not found, order may have been cleaned up or never registered.
         // This is fine - the order will be tracked when we see it in responses.
     }
 
-    /// Get a pending order by side and price.
+    /// Finalize a pending order by CLOID (preferred method).
+    ///
+    /// Call this when the bulk order API returns with the assigned OID.
+    /// Moves the order from pending to tracked.
+    ///
+    /// # Returns
+    /// `true` if the pending order was found and finalized, `false` otherwise.
+    pub fn finalize_pending_by_cloid(
+        &mut self,
+        cloid: &str,
+        oid: u64,
+        resting_size: f64,
+    ) -> bool {
+        if let Some(pending) = self.pending_by_cloid.remove(cloid) {
+            // Also remove from price-based map
+            let key = (pending.side, price_to_key(pending.price));
+            self.pending.remove(&key);
+
+            // Create tracked order with the real OID, preserving CLOID
+            let order = TrackedOrder::with_cloid(
+                oid,
+                cloid.to_string(),
+                pending.side,
+                pending.price,
+                resting_size,
+            );
+            self.add_order(order);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get a pending order by CLOID (primary lookup).
+    ///
+    /// This is the preferred lookup method - CLOID is deterministic.
+    pub fn get_pending_by_cloid(&self, cloid: &str) -> Option<&PendingOrder> {
+        self.pending_by_cloid.get(cloid)
+    }
+
+    /// Get a pending order by side and price (fallback lookup).
     ///
     /// Used when a fill arrives but the order isn't tracked by OID yet.
     /// Returns the placement price so we can feed the kappa estimator.
+    ///
+    /// NOTE: Prefer `get_pending_by_cloid()` when CLOID is available in the fill.
     pub fn get_pending(&self, side: Side, price: f64) -> Option<&PendingOrder> {
         let key = (side, price_to_key(price));
         self.pending.get(&key)
     }
 
-    /// Remove a pending order by side and price.
+    /// Remove a pending order by CLOID.
+    ///
+    /// Used when an order fills immediately and we don't want to track it.
+    pub fn remove_pending_by_cloid(&mut self, cloid: &str) -> Option<PendingOrder> {
+        if let Some(pending) = self.pending_by_cloid.remove(cloid) {
+            // Also remove from price-based map
+            let key = (pending.side, price_to_key(pending.price));
+            self.pending.remove(&key);
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    /// Remove a pending order by side and price (legacy).
     ///
     /// Used when an order fills immediately and we don't want to track it.
     pub fn remove_pending(&mut self, side: Side, price: f64) -> Option<PendingOrder> {
         let key = (side, price_to_key(price));
-        self.pending.remove(&key)
+        if let Some(pending) = self.pending.remove(&key) {
+            // Also remove from CLOID map if present
+            if let Some(ref cloid) = pending.cloid {
+                self.pending_by_cloid.remove(cloid);
+            }
+            Some(pending)
+        } else {
+            None
+        }
     }
 
     /// Remove stale pending orders that have been waiting too long.
@@ -159,14 +272,27 @@ impl OrderManager {
     /// pending after max_age, something went wrong (e.g., API error, disconnection).
     /// Returns the number of stale orders removed.
     pub fn cleanup_stale_pending(&mut self, max_age: Duration) -> usize {
-        let before = self.pending.len();
+        // Clean both maps
+        let before_price = self.pending.len();
         self.pending.retain(|_, p| p.placed_at.elapsed() < max_age);
-        before - self.pending.len()
+
+        let before_cloid = self.pending_by_cloid.len();
+        self.pending_by_cloid
+            .retain(|_, p| p.placed_at.elapsed() < max_age);
+
+        // Return max removed (they should be in sync, but just in case)
+        (before_price - self.pending.len()).max(before_cloid - self.pending_by_cloid.len())
     }
 
     /// Get the number of pending orders (for debugging/metrics).
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        // Return CLOID count as it's the primary tracking
+        self.pending_by_cloid.len().max(self.pending.len())
+    }
+
+    /// Get the number of pending orders by CLOID (for debugging/metrics).
+    pub fn pending_by_cloid_count(&self) -> usize {
+        self.pending_by_cloid.len()
     }
 
     /// Set the state of an order (legacy method - prefer transition methods).

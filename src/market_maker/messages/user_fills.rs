@@ -21,6 +21,8 @@ pub struct UserFillsResult {
     pub cleaned_oids: Vec<u64>,
     /// Whether quotes should be updated after fills
     pub should_update_quotes: bool,
+    /// Number of fills for untracked orders (Phase 4: triggers reconciliation)
+    pub unmatched_fills: usize,
 }
 
 /// Process UserFills through the FillProcessor.
@@ -81,6 +83,10 @@ pub fn process_user_fills<'a>(
 
         if process_result.fill_result.is_new {
             result.fills_processed += 1;
+            // Phase 4: Track unmatched fills for reconciliation triggering
+            if !process_result.order_found {
+                result.unmatched_fills += 1;
+            }
         } else {
             result.fills_skipped += 1;
         }

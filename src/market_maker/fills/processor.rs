@@ -201,36 +201,66 @@ impl FillProcessor {
         let (order_found, is_new_fill, is_complete) =
             state.orders.process_fill(fill.oid, fill.tid, fill.size);
 
-        // Step 5: Determine placement price
+        // Step 5: Determine placement price using CLOID-first lookup (Phase 1 Fix)
+        //
+        // Lookup priority:
+        // 1. By OID (if order already tracked)
+        // 2. By CLOID (primary - deterministic, eliminates timing race)
+        // 3. By (side, price) (fallback - for edge cases where CLOID missing)
         let placement_price = if order_found {
             // Order found by OID - get placement price directly
             state.orders.get_order(fill.oid).map(|o| o.price)
         } else {
-            // Order not found by OID - check pending orders by (side, fill_price)
-            // This handles the race condition when fill arrives before OID is registered
+            // Order not found by OID - try CLOID lookup first (Phase 1 Fix)
             let side = if fill.is_buy { Side::Buy } else { Side::Sell };
-            if let Some(pending) = state.orders.get_pending(side, fill.price) {
-                debug!(
-                    oid = fill.oid,
-                    tid = fill.tid,
-                    fill_price = fill.price,
-                    placement_price = pending.price,
-                    "Fill matched to pending order (immediate fill race condition)"
-                );
-                Some(pending.price)
+
+            // Check if fill has CLOID (TradeInfo.cloid field)
+            if let Some(ref cloid) = fill.cloid {
+                if let Some(pending) = state.orders.get_pending_by_cloid(cloid) {
+                    debug!(
+                        oid = fill.oid,
+                        tid = fill.tid,
+                        cloid = %cloid,
+                        fill_price = fill.price,
+                        placement_price = pending.price,
+                        "Fill matched to pending order by CLOID (deterministic lookup)"
+                    );
+                    Some(pending.price)
+                } else {
+                    // CLOID provided but not found in pending - fall through to price lookup
+                    None
+                }
             } else {
-                // Truly untracked - not in orders or pending
-                warn!(
-                    "[Fill] Untracked order filled: oid={} tid={} {} {} {} | position updated to {}",
-                    fill.oid,
-                    fill.tid,
-                    if fill.is_buy { "bought" } else { "sold" },
-                    fill.size,
-                    state.asset,
-                    state.position.position()
-                );
                 None
             }
+            .or_else(|| {
+                // Fallback: Check pending orders by (side, fill_price)
+                // This handles the race condition when fill arrives before OID is registered
+                // or when CLOID is not provided in the fill
+                if let Some(pending) = state.orders.get_pending(side, fill.price) {
+                    debug!(
+                        oid = fill.oid,
+                        tid = fill.tid,
+                        fill_price = fill.price,
+                        placement_price = pending.price,
+                        "Fill matched to pending order by price (fallback lookup)"
+                    );
+                    Some(pending.price)
+                } else {
+                    // Truly untracked - not in orders, not by CLOID, not by price
+                    warn!(
+                        "[Fill] Untracked order filled: oid={} tid={} cloid={:?} {} {} {} | position updated to {}",
+                        fill.oid,
+                        fill.tid,
+                        fill.cloid,
+                        if fill.is_buy { "bought" } else { "sold" },
+                        fill.size,
+                        state.asset,
+                        state.position.position()
+                    );
+                    None
+                }
+            })
         };
 
         // Step 6: Process fill if we have placement info

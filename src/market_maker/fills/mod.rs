@@ -54,6 +54,9 @@ pub struct FillEvent {
     pub tid: u64,
     /// Order ID
     pub oid: u64,
+    /// Client Order ID (for deterministic fill matching - Phase 1 Fix)
+    /// This is the UUID we generated before order placement.
+    pub cloid: Option<String>,
     /// Fill size (always positive)
     pub size: f64,
     /// Fill price
@@ -72,7 +75,7 @@ pub struct FillEvent {
 }
 
 impl FillEvent {
-    /// Create a new fill event.
+    /// Create a new fill event (legacy, without CLOID).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tid: u64,
@@ -87,6 +90,34 @@ impl FillEvent {
         Self {
             tid,
             oid,
+            cloid: None,
+            size,
+            price,
+            is_buy,
+            mid_at_fill,
+            placement_price,
+            timestamp: Instant::now(),
+            asset,
+        }
+    }
+
+    /// Create a new fill event with CLOID for deterministic tracking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_cloid(
+        tid: u64,
+        oid: u64,
+        cloid: Option<String>,
+        size: f64,
+        price: f64,
+        is_buy: bool,
+        mid_at_fill: f64,
+        placement_price: Option<f64>,
+        asset: String,
+    ) -> Self {
+        Self {
+            tid,
+            oid,
+            cloid,
             size,
             price,
             is_buy,

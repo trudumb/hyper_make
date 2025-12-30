@@ -45,6 +45,12 @@ use crate::{InfoClient, Message, Subscription, EPSILON};
 /// Minimum order notional value in USD (Hyperliquid requirement)
 const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
+/// Result of recovery check - indicates what action was taken.
+struct RecoveryAction {
+    /// Whether to skip normal quoting this cycle
+    skip_normal_quoting: bool,
+}
+
 /// Market maker orchestrator.
 ///
 /// Coordinates strategy, order management, position tracking, and execution.
@@ -118,6 +124,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// - `pnl_config`: P&L tracker configuration
     /// - `margin_config`: Margin-aware sizer configuration
     /// - `data_quality_config`: Data quality monitor configuration
+    /// - `recovery_config`: Recovery manager configuration (Phase 3)
+    /// - `reconciliation_config`: Position reconciler configuration (Phase 4)
+    /// - `rate_limit_config`: Rejection rate limiter configuration (Phase 5)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: MarketMakerConfig,
@@ -138,6 +147,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         pnl_config: PnLConfig,
         margin_config: MarginConfig,
         data_quality_config: infra::DataQualityConfig,
+        recovery_config: infra::RecoveryConfig,
+        reconciliation_config: infra::ReconciliationConfig,
+        rate_limit_config: infra::RejectionRateLimitConfig,
     ) -> Self {
         // Capture config values before moving config
         let stochastic_config = config.stochastic.clone();
@@ -157,7 +169,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             kill_switch_config.clone(),
             Self::build_risk_aggregator(&kill_switch_config),
         );
-        let infra = core::InfraComponents::new(margin_config, data_quality_config, metrics);
+        let infra = core::InfraComponents::new(
+            margin_config,
+            data_quality_config,
+            metrics,
+            recovery_config,
+            reconciliation_config,
+            rate_limit_config,
+        );
         let stochastic = core::StochasticComponents::new(
             hjb_config,
             stochastic_config,
@@ -442,6 +461,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                             // Check kill switch after each message
                             self.check_kill_switch();
+
+                            // Phase 4: Event-driven reconciliation check
+                            // The reconciler may have been triggered by order rejection,
+                            // unmatched fill, or large position change during message handling
+                            if let Some(trigger) = self.infra.reconciler.should_sync() {
+                                debug!(
+                                    trigger = ?trigger,
+                                    "Event-driven reconciliation triggered"
+                                );
+                                if let Err(e) = self.safety_sync().await {
+                                    warn!("Event-driven sync failed: {e}");
+                                }
+                            }
                         }
                         None => {
                             warn!("Message channel closed, stopping market maker");
@@ -634,6 +666,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &mut fill_state,
         )?;
 
+        // Phase 4: Trigger reconciliation for unmatched fills
+        if result.unmatched_fills > 0 {
+            for _ in 0..result.unmatched_fills {
+                self.infra.reconciler.on_unmatched_fill(0, 0.0); // OID/size unknown at this point
+            }
+        }
+
         // Post-processing: cleanup completed orders
         messages::cleanup_orders(&mut self.orders, &mut self.tier1.queue_tracker);
 
@@ -680,6 +719,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Don't place orders until estimator is warmed up
         if !self.estimator.is_warmed_up() {
             return Ok(());
+        }
+
+        // Phase 3: Check recovery state and handle IOC recovery if needed
+        if let Some(action) = self.check_and_handle_recovery().await? {
+            if action.skip_normal_quoting {
+                return Ok(());
+            }
         }
 
         let quote_config = QuoteConfig {
@@ -755,6 +801,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .collect();
 
             // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
+            // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
                 max_position: self.config.max_position,
@@ -762,11 +809,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.clone(),
             };
-            quoting::QuoteFilter::apply_reduce_only_ladder(
+            let reduce_only_result = quoting::QuoteFilter::apply_reduce_only_with_exchange_limits(
                 &mut bid_quotes,
                 &mut ask_quotes,
                 &reduce_only_config,
+                &self.infra.exchange_limits,
             );
+
+            // If escalation is needed, the recovery manager should be notified
+            // (This happens automatically via rate limiter when orders get rejected)
+            if reduce_only_result.needs_escalation {
+                debug!(
+                    "Reduce-only mode activated with potential escalation"
+                );
+            }
 
             debug!(
                 bid_levels = bid_quotes.len(),
@@ -924,6 +980,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Manages multiple orders per side for ladder quoting strategy.
     /// Uses bulk order placement for efficiency (single API call for all levels).
     async fn reconcile_ladder_side(&mut self, side: Side, new_quotes: Vec<Quote>) -> Result<()> {
+        let is_buy = side == Side::Buy;
+
+        // Phase 5: Check rate limiter before placing orders
+        if self.infra.rate_limiter.should_skip(is_buy) {
+            if let Some(remaining) = self.infra.rate_limiter.remaining_backoff(is_buy) {
+                debug!(
+                    side = %side_str(side),
+                    remaining_secs = %format!("{:.1}", remaining.as_secs_f64()),
+                    "Skipping ladder reconciliation due to rate limit backoff"
+                );
+            }
+            return Ok(());
+        }
+
         // Get all active orders on this side (excludes those being cancelled)
         let current_orders: Vec<u64> = self
             .orders
@@ -956,9 +1026,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.initiate_and_track_cancel(*oid).await;
             }
 
-            // Build order specs for bulk placement
+            // Build order specs for bulk placement WITH CLOIDs for deterministic tracking (Phase 1)
             let is_buy = side == Side::Buy;
             let mut order_specs: Vec<OrderSpec> = Vec::new();
+
+            // Track cumulative exposure for exchange limit checking (Phase 2 Fix)
+            let mut cumulative_size = 0.0;
 
             for quote in &new_quotes {
                 if quote.size <= 0.0 {
@@ -985,17 +1058,63 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
 
                 // Truncate size to sz_decimals to ensure valid order size
-                let truncated_size =
+                let mut truncated_size =
                     truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, false);
                 if truncated_size <= 0.0 {
                     continue;
                 }
 
-                order_specs.push(OrderSpec {
-                    price: quote.price,
-                    size: truncated_size,
+                // Phase 2 Fix: Pre-flight exchange limit check
+                // Check if this order (plus all orders we've already queued) would exceed limits
+                let total_exposure = cumulative_size + truncated_size;
+                let (safe_size, was_clamped, reason) = self
+                    .infra
+                    .exchange_limits
+                    .calculate_safe_order_size(total_exposure, is_buy, self.position.position());
+
+                if safe_size <= cumulative_size {
+                    // No additional capacity - skip this level
+                    if let Some(reason) = reason {
+                        debug!(
+                            side = %side_str(side),
+                            price = quote.price,
+                            requested_size = truncated_size,
+                            reason = %reason,
+                            "Ladder level blocked by exchange limits"
+                        );
+                    }
+                    continue;
+                }
+
+                // How much can we actually add?
+                let available_for_this_level = safe_size - cumulative_size;
+                if was_clamped && available_for_this_level < truncated_size {
+                    // Clamp this order size to what's available
+                    truncated_size =
+                        truncate_float(available_for_this_level, self.config.sz_decimals, false);
+                    if truncated_size <= 0.0 {
+                        continue;
+                    }
+                    debug!(
+                        side = %side_str(side),
+                        price = quote.price,
+                        original_size = sizing_result.adjusted_size,
+                        clamped_size = truncated_size,
+                        reason = ?reason,
+                        "Ladder level size clamped by exchange limits"
+                    );
+                }
+
+                cumulative_size += truncated_size;
+
+                // Generate CLOID for deterministic fill tracking (Phase 1 Fix)
+                let cloid = uuid::Uuid::new_v4().to_string();
+                order_specs.push(OrderSpec::with_cloid(
+                    quote.price,
+                    truncated_size,
                     is_buy,
-                });
+                    cloid,
+                ));
             }
 
             if order_specs.is_empty() {
@@ -1009,14 +1128,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             debug!(
                 side = %side_str(side),
                 levels = order_specs.len(),
-                "Placing ladder levels via bulk order"
+                "Placing ladder levels via bulk order with CLOIDs"
             );
 
-            // Pre-register orders as pending BEFORE the API call.
-            // This allows fill notifications (via WebSocket) that arrive before the
-            // API response to still find the placement price for kappa estimation.
+            // Pre-register orders as pending with CLOIDs BEFORE the API call (Phase 1 Fix).
+            // CLOID lookup is deterministic - eliminates timing race between REST and WebSocket.
             for spec in &order_specs {
-                self.orders.add_pending(side, spec.price, spec.size);
+                if let Some(ref cloid) = spec.cloid {
+                    self.orders
+                        .add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+                } else {
+                    // Fallback (shouldn't happen with new code)
+                    self.orders.add_pending(side, spec.price, spec.size);
+                }
             }
 
             // Place all orders in a single API call
@@ -1025,13 +1149,39 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .place_bulk_orders(&self.config.asset, order_specs.clone())
                 .await;
 
-            // Finalize pending orders with real OIDs
+            // Finalize pending orders with real OIDs (using CLOID for deterministic matching)
             for (i, result) in results.iter().enumerate() {
-                if result.oid > 0 {
-                    let spec = &order_specs[i];
+                let spec = &order_specs[i];
 
-                    // Remove from pending regardless of fill status
-                    // (pending is keyed by price, not OID)
+                // Phase 5: Record success/rejection for rate limiting
+                if result.oid > 0 {
+                    // Order placed successfully - reset rejection counter
+                    self.infra.rate_limiter.record_success(is_buy);
+                    self.infra.recovery_manager.record_success();
+                } else if let Some(ref err) = result.error {
+                    // Order rejected - record for rate limiting and reconciliation
+                    if let Some(backoff) = self.infra.rate_limiter.record_rejection(is_buy, err) {
+                        warn!(
+                            side = %side_str(side),
+                            backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+                            error = %err,
+                            "Rate limiter entering backoff due to rejection"
+                        );
+                    }
+                    // Phase 4: Trigger reconciliation for position-related rejections
+                    self.infra.reconciler.on_order_rejection(err);
+                    // Phase 3: Record rejection for recovery state machine
+                    // This may transition to IocRecovery if consecutive rejections exceed threshold
+                    if self.infra.recovery_manager.record_rejection(is_buy, err) {
+                        warn!(
+                            side = %side_str(side),
+                            "Recovery manager escalating to IOC recovery mode"
+                        );
+                    }
+                }
+
+                if result.oid > 0 {
+                    let cloid = spec.cloid.as_ref().or(result.cloid.as_ref());
 
                     if result.filled {
                         // CRITICAL FIX: Order filled immediately - update position NOW
@@ -1054,20 +1204,36 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                         // Track order as FilledImmediately for WebSocket deduplication
                         // When WebSocket fill arrives, it will find this order and deduplicate
-                        let mut tracked =
-                            TrackedOrder::new(result.oid, side, spec.price, spec.size);
+                        let mut tracked = if let Some(c) = cloid {
+                            TrackedOrder::with_cloid(
+                                result.oid,
+                                c.clone(),
+                                side,
+                                spec.price,
+                                spec.size,
+                            )
+                        } else {
+                            TrackedOrder::new(result.oid, side, spec.price, spec.size)
+                        };
                         tracked.filled = actual_fill;
                         tracked.transition_to(OrderState::FilledImmediately);
                         self.orders.add_order(tracked);
 
-                        // Remove from pending (it's now in orders)
-                        self.orders.remove_pending(side, spec.price);
+                        // Remove from pending using CLOID (Phase 1 Fix)
+                        if let Some(c) = cloid {
+                            self.orders.remove_pending_by_cloid(c);
+                        } else {
+                            self.orders.remove_pending(side, spec.price);
+                        }
 
                         // Record fill to safety components for analytics
-                        self.safety.fill_processor.pre_register_immediate_fill(result.oid);
+                        self.safety
+                            .fill_processor
+                            .pre_register_immediate_fill(result.oid);
 
                         info!(
                             oid = result.oid,
+                            cloid = ?cloid,
                             price = spec.price,
                             size = spec.size,
                             actual_fill = actual_fill,
@@ -1091,9 +1257,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         continue;
                     }
 
-                    // Move from pending to tracked with real OID
-                    self.orders
-                        .finalize_pending(side, spec.price, result.oid, result.resting_size);
+                    // Move from pending to tracked with real OID using CLOID (Phase 1 Fix)
+                    if let Some(c) = cloid {
+                        self.orders
+                            .finalize_pending_by_cloid(c, result.oid, result.resting_size);
+                    } else {
+                        self.orders
+                            .finalize_pending(side, spec.price, result.oid, result.resting_size);
+                    }
 
                     // Initialize queue tracking for this order
                     // depth_ahead is 0.0 initially; will be updated on L2 book updates
@@ -1151,6 +1322,128 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         false
+    }
+
+    /// Phase 3: Check recovery state and handle IOC recovery if needed.
+    ///
+    /// This method implements the recovery state machine for stuck reduce-only mode:
+    /// - Normal: No action needed
+    /// - ReduceOnlyStuck: Detected via consecutive rejections, handled by record_rejection()
+    /// - IocRecovery: Attempts aggressive IOC orders to reduce position
+    /// - Cooldown: Waiting before resuming normal quoting
+    async fn check_and_handle_recovery(&mut self) -> Result<Option<RecoveryAction>> {
+        use infra::RecoveryState;
+
+        match self.infra.recovery_manager.state().clone() {
+            RecoveryState::Normal => {
+                // Normal state - recovery manager handles transitions via record_rejection()
+                // which is called from the order placement results loop
+                Ok(None)
+            }
+            RecoveryState::ReduceOnlyStuck { is_buy_side, consecutive_rejections, .. } => {
+                // Already in stuck state - waiting for rejections to hit threshold
+                // The record_rejection() method will transition to IocRecovery when threshold is hit
+                debug!(
+                    is_buy_side = is_buy_side,
+                    consecutive_rejections = consecutive_rejections,
+                    threshold = self.infra.recovery_manager.config().rejection_threshold,
+                    "In reduce-only-stuck state, waiting for threshold"
+                );
+                Ok(None)  // Continue normal quoting until we hit threshold
+            }
+            RecoveryState::IocRecovery { is_buy_side, attempts, .. } => {
+                // Check if we should send an IOC
+                if let Some((ioc_is_buy, slippage_bps)) = self.infra.recovery_manager.should_send_ioc() {
+                    // Attempt IOC order to reduce position
+                    let position = self.position.position();
+                    let min_size = self.infra.recovery_manager.config().min_ioc_size;
+                    let reduce_size = position.abs().max(min_size);
+
+                    if reduce_size < min_size {
+                        // Position already near zero - recovery successful
+                        info!("Position reduced to near zero, recovery complete");
+                        self.infra.recovery_manager.record_success();
+                        return Ok(Some(RecoveryAction {
+                            skip_normal_quoting: false,
+                        }));
+                    }
+
+                    info!(
+                        position = position,
+                        reduce_size = reduce_size,
+                        is_buy = ioc_is_buy,
+                        slippage_bps = slippage_bps,
+                        attempt = attempts + 1,
+                        "Attempting IOC recovery order"
+                    );
+
+                    // Record that we're sending IOC (updates last_attempt time)
+                    self.infra.recovery_manager.record_ioc_sent();
+
+                    let result = self
+                        .executor
+                        .place_ioc_reduce_order(
+                            &self.config.asset,
+                            reduce_size,
+                            ioc_is_buy,
+                            slippage_bps,
+                            self.latest_mid,
+                        )
+                        .await;
+
+                    if result.oid > 0 && result.filled {
+                        // IOC filled - update position and record fill
+                        let fill_size = result.resting_size;
+                        self.position.process_fill(fill_size, ioc_is_buy);
+                        self.infra.recovery_manager.record_ioc_fill(fill_size);
+                        info!(
+                            oid = result.oid,
+                            filled_size = fill_size,
+                            new_position = self.position.position(),
+                            "IOC recovery order filled"
+                        );
+                        self.infra.recovery_manager.record_success();
+                    } else {
+                        // IOC failed or not filled
+                        warn!(
+                            oid = result.oid,
+                            filled = result.filled,
+                            "IOC recovery order not filled"
+                        );
+                    }
+                } else {
+                    // Either cooling down between attempts or max attempts reached
+                    // The record_rejection() method handles exhaustion
+                    debug!(
+                        is_buy_side = is_buy_side,
+                        attempts = attempts,
+                        "IOC recovery: waiting for cooldown or exhausted"
+                    );
+                }
+
+                Ok(Some(RecoveryAction {
+                    skip_normal_quoting: true,
+                }))
+            }
+            RecoveryState::Cooldown { until, reason, .. } => {
+                // In cooldown - check if we should exit
+                if std::time::Instant::now() >= until {
+                    debug!(?reason, "Cooldown complete, resuming normal quoting");
+                    self.infra.recovery_manager.reset();
+                    Ok(None)
+                } else {
+                    let remaining = until.saturating_duration_since(std::time::Instant::now());
+                    debug!(
+                        remaining_secs = %format!("{:.1}", remaining.as_secs_f64()),
+                        ?reason,
+                        "In cooldown, skipping quote cycle"
+                    );
+                    Ok(Some(RecoveryAction {
+                        skip_normal_quoting: true,
+                    }))
+                }
+            }
+        }
     }
 
     /// Place a new order.
@@ -1489,6 +1782,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             max_position_value,
         );
         safety::SafetyAuditor::log_reduce_only_status(reduce_only, reason.as_deref());
+
+        // Phase 4: Record sync completed for reconciler
+        self.infra.reconciler.record_sync_completed();
 
         Ok(())
     }

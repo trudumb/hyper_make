@@ -19,6 +19,10 @@ pub struct OrderResult {
     pub oid: u64,
     /// Whether the order was immediately filled
     pub filled: bool,
+    /// Client Order ID (echoed back for fill matching)
+    pub cloid: Option<String>,
+    /// Error message if order placement failed (Phase 5: for rate limiting)
+    pub error: Option<String>,
 }
 
 impl OrderResult {
@@ -28,6 +32,41 @@ impl OrderResult {
             resting_size: 0.0,
             oid: 0,
             filled: false,
+            cloid: None,
+            error: None,
+        }
+    }
+
+    /// Create a failed order result with error message.
+    pub fn failed_with_error(error: String) -> Self {
+        Self {
+            resting_size: 0.0,
+            oid: 0,
+            filled: false,
+            cloid: None,
+            error: Some(error),
+        }
+    }
+
+    /// Create a failed order result with CLOID preserved.
+    pub fn failed_with_cloid(cloid: Option<String>) -> Self {
+        Self {
+            resting_size: 0.0,
+            oid: 0,
+            filled: false,
+            cloid,
+            error: None,
+        }
+    }
+
+    /// Create a failed order result with CLOID and error.
+    pub fn failed_with_cloid_and_error(cloid: Option<String>, error: String) -> Self {
+        Self {
+            resting_size: 0.0,
+            oid: 0,
+            filled: false,
+            cloid,
+            error: Some(error),
         }
     }
 }
@@ -114,6 +153,31 @@ pub struct OrderSpec {
     pub size: f64,
     /// Whether this is a buy order
     pub is_buy: bool,
+    /// Client Order ID (UUID) for deterministic fill tracking.
+    /// If provided, this CLOID is sent to the exchange and returned in fill notifications.
+    pub cloid: Option<String>,
+}
+
+impl OrderSpec {
+    /// Create a new order spec without CLOID (legacy).
+    pub fn new(price: f64, size: f64, is_buy: bool) -> Self {
+        Self {
+            price,
+            size,
+            is_buy,
+            cloid: None,
+        }
+    }
+
+    /// Create a new order spec with CLOID for deterministic tracking.
+    pub fn with_cloid(price: f64, size: f64, is_buy: bool, cloid: String) -> Self {
+        Self {
+            price,
+            size,
+            is_buy,
+            cloid: Some(cloid),
+        }
+    }
 }
 
 /// Trait for order execution.
@@ -129,6 +193,29 @@ pub trait OrderExecutor: Send + Sync {
     /// multiple ladder levels. Returns results for each order in the same order
     /// as the input specs.
     async fn place_bulk_orders(&self, asset: &str, orders: Vec<OrderSpec>) -> Vec<OrderResult>;
+
+    /// Place an IOC (Immediate or Cancel) order for position reduction (Phase 3 Fix).
+    ///
+    /// This is used when reduce-only mode is stuck and we need to aggressively
+    /// reduce position with a market-like order that crosses the spread.
+    ///
+    /// # Arguments
+    /// - `asset`: Asset symbol
+    /// - `size`: Size to reduce (always positive, direction determined by `is_buy`)
+    /// - `is_buy`: Whether to buy (true) or sell (false)
+    /// - `slippage_bps`: Allowed slippage in basis points (e.g., 50 = 0.5%)
+    /// - `mid_price`: Current mid price (used to calculate limit price)
+    ///
+    /// # Returns
+    /// OrderResult with the outcome of the IOC order
+    async fn place_ioc_reduce_order(
+        &self,
+        asset: &str,
+        size: f64,
+        is_buy: bool,
+        slippage_bps: u32,
+        mid_price: f64,
+    ) -> OrderResult;
 
     /// Cancel an order.
     ///
@@ -181,6 +268,10 @@ impl OrderExecutor for HyperliquidExecutor {
     async fn place_order(&self, asset: &str, price: f64, size: f64, is_buy: bool) -> OrderResult {
         let side = if is_buy { "BUY" } else { "SELL" };
 
+        // Generate CLOID for single orders too (for consistency)
+        let cloid = uuid::Uuid::new_v4();
+        let cloid_str = cloid.to_string();
+
         let order = self
             .client
             .order(
@@ -190,7 +281,7 @@ impl OrderExecutor for HyperliquidExecutor {
                     reduce_only: false,
                     limit_px: price,
                     sz: size,
-                    cloid: None,
+                    cloid: Some(cloid),
                     order_type: ClientOrder::Limit(ClientLimit {
                         tif: "Gtc".to_string(),
                     }),
@@ -206,7 +297,7 @@ impl OrderExecutor for HyperliquidExecutor {
                         if !order.statuses.is_empty() {
                             match order.statuses[0].clone() {
                                 ExchangeDataStatus::Filled(order) => {
-                                    info!("Order filled immediately: oid={}", order.oid);
+                                    info!("Order filled immediately: oid={} cloid={}", order.oid, cloid_str);
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -214,10 +305,12 @@ impl OrderExecutor for HyperliquidExecutor {
                                         resting_size: size,
                                         oid: order.oid,
                                         filled: true,
+                                        cloid: Some(cloid_str),
+                                        error: None,
                                     };
                                 }
                                 ExchangeDataStatus::Resting(order) => {
-                                    info!("Order resting: oid={}", order.oid);
+                                    info!("Order resting: oid={} cloid={}", order.oid, cloid_str);
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -225,12 +318,14 @@ impl OrderExecutor for HyperliquidExecutor {
                                         resting_size: size,
                                         oid: order.oid,
                                         filled: false,
+                                        cloid: Some(cloid_str),
+                                        error: None,
                                     };
                                 }
                                 ExchangeDataStatus::Error(e) => {
                                     error!(
-                                        "Order rejected: asset={} side={} sz={} price={} error={}",
-                                        asset, side, size, price, e
+                                        "Order rejected: asset={} side={} sz={} price={} cloid={} error={}",
+                                        asset, side, size, price, cloid_str, e
                                     );
                                 }
                                 _ => {
@@ -246,20 +341,20 @@ impl OrderExecutor for HyperliquidExecutor {
                 }
                 ExchangeResponseStatus::Err(e) => {
                     error!(
-                        "Order failed: asset={} side={} sz={} price={} error={}",
-                        asset, side, size, price, e
+                        "Order failed: asset={} side={} sz={} price={} cloid={} error={}",
+                        asset, side, size, price, cloid_str, e
                     );
                 }
             },
             Err(e) => {
                 error!(
-                    "Order request failed: asset={} side={} sz={} price={} error={}",
-                    asset, side, size, price, e
+                    "Order request failed: asset={} side={} sz={} price={} cloid={} error={}",
+                    asset, side, size, price, cloid_str, e
                 );
             }
         }
 
-        OrderResult::failed()
+        OrderResult::failed_with_cloid(Some(cloid_str))
     }
 
     async fn place_bulk_orders(&self, asset: &str, orders: Vec<OrderSpec>) -> Vec<OrderResult> {
@@ -267,16 +362,26 @@ impl OrderExecutor for HyperliquidExecutor {
             return vec![];
         }
 
-        // Convert to ClientOrderRequest vec
+        // Generate CLOIDs for orders that don't have them
+        // Keep track of the CLOIDs we're using for each order
+        let cloids: Vec<Option<String>> = orders
+            .iter()
+            .map(|spec| {
+                spec.cloid.clone().or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+            })
+            .collect();
+
+        // Convert to ClientOrderRequest vec with CLOIDs
         let order_requests: Vec<ClientOrderRequest> = orders
             .iter()
-            .map(|spec| ClientOrderRequest {
+            .zip(cloids.iter())
+            .map(|(spec, cloid)| ClientOrderRequest {
                 asset: asset.to_string(),
                 is_buy: spec.is_buy,
                 reduce_only: false,
                 limit_px: spec.price,
                 sz: spec.size,
-                cloid: None,
+                cloid: cloid.as_ref().and_then(|c| uuid::Uuid::parse_str(c).ok()),
                 order_type: ClientOrder::Limit(ClientLimit {
                     tif: "Gtc".to_string(),
                 }),
@@ -284,7 +389,7 @@ impl OrderExecutor for HyperliquidExecutor {
             .collect();
 
         let num_orders = order_requests.len();
-        info!("Placing {} orders in bulk", num_orders);
+        info!("Placing {} orders in bulk with CLOIDs", num_orders);
 
         let result = self.client.bulk_order(order_requests, None).await;
 
@@ -297,11 +402,15 @@ impl OrderExecutor for HyperliquidExecutor {
                         // Each status corresponds to one order in sequence
                         for (i, status) in data.statuses.iter().enumerate() {
                             let spec = &orders[i];
+                            let cloid = cloids[i].clone();
                             let side = if spec.is_buy { "BUY" } else { "SELL" };
 
                             match status {
                                 ExchangeDataStatus::Filled(order) => {
-                                    info!("Bulk order {} filled immediately: oid={}", i, order.oid);
+                                    info!(
+                                        "Bulk order {} filled immediately: oid={} cloid={:?}",
+                                        i, order.oid, cloid
+                                    );
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -309,10 +418,15 @@ impl OrderExecutor for HyperliquidExecutor {
                                         resting_size: spec.size,
                                         oid: order.oid,
                                         filled: true,
+                                        cloid,
+                                        error: None,
                                     });
                                 }
                                 ExchangeDataStatus::Resting(order) => {
-                                    info!("Bulk order {} resting: oid={}", i, order.oid);
+                                    info!(
+                                        "Bulk order {} resting: oid={} cloid={:?}",
+                                        i, order.oid, cloid
+                                    );
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -320,25 +434,29 @@ impl OrderExecutor for HyperliquidExecutor {
                                         resting_size: spec.size,
                                         oid: order.oid,
                                         filled: false,
+                                        cloid,
+                                        error: None,
                                     });
                                 }
                                 ExchangeDataStatus::Error(e) => {
                                     error!(
-                                        "Bulk order {} rejected: asset={} side={} sz={} price={} error={}",
-                                        i, asset, side, spec.size, spec.price, e
+                                        "Bulk order {} rejected: asset={} side={} sz={} price={} cloid={:?} error={}",
+                                        i, asset, side, spec.size, spec.price, cloid, e
                                     );
-                                    results.push(OrderResult::failed());
+                                    // Phase 5: Capture error for rate limiter
+                                    results.push(OrderResult::failed_with_cloid_and_error(cloid, e.clone()));
                                 }
                                 _ => {
                                     warn!("Unexpected bulk order {} status: {:?}", i, status);
-                                    results.push(OrderResult::failed());
+                                    results.push(OrderResult::failed_with_cloid(cloid));
                                 }
                             }
                         }
 
                         // If we got fewer statuses than orders, fill remaining with failures
                         while results.len() < num_orders {
-                            results.push(OrderResult::failed());
+                            let cloid = cloids.get(results.len()).cloned().flatten();
+                            results.push(OrderResult::failed_with_cloid(cloid));
                         }
 
                         return results;
@@ -354,8 +472,140 @@ impl OrderExecutor for HyperliquidExecutor {
             }
         }
 
-        // All failed
-        vec![OrderResult::failed(); num_orders]
+        // All failed - preserve CLOIDs for cleanup
+        orders
+            .iter()
+            .zip(cloids.iter())
+            .map(|(_, cloid)| OrderResult::failed_with_cloid(cloid.clone()))
+            .collect()
+    }
+
+    async fn place_ioc_reduce_order(
+        &self,
+        asset: &str,
+        size: f64,
+        is_buy: bool,
+        slippage_bps: u32,
+        mid_price: f64,
+    ) -> OrderResult {
+        let side = if is_buy { "BUY" } else { "SELL" };
+
+        // Calculate aggressive limit price with slippage
+        // For buys: we're willing to pay up to slippage_bps above mid
+        // For sells: we're willing to accept down to slippage_bps below mid
+        let slippage_mult = slippage_bps as f64 / 10_000.0;
+        let limit_price = if is_buy {
+            mid_price * (1.0 + slippage_mult) // Pay more to buy
+        } else {
+            mid_price * (1.0 - slippage_mult) // Accept less to sell
+        };
+
+        let cloid = uuid::Uuid::new_v4();
+        let cloid_str = cloid.to_string();
+
+        info!(
+            side = %side,
+            size = %format!("{:.6}", size),
+            limit_price = %format!("{:.6}", limit_price),
+            mid_price = %format!("{:.6}", mid_price),
+            slippage_bps = slippage_bps,
+            cloid = %cloid_str,
+            "Placing IOC reduce order (Phase 3 recovery)"
+        );
+
+        let order = self
+            .client
+            .order(
+                ClientOrderRequest {
+                    asset: asset.to_string(),
+                    is_buy,
+                    reduce_only: true, // CRITICAL: reduce_only to avoid increasing position
+                    limit_px: limit_price,
+                    sz: size,
+                    cloid: Some(cloid),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(), // IOC = Immediate or Cancel
+                    }),
+                },
+                None,
+            )
+            .await;
+
+        match order {
+            Ok(order) => match order {
+                ExchangeResponseStatus::Ok(order) => {
+                    if let Some(order) = order.data {
+                        if !order.statuses.is_empty() {
+                            match order.statuses[0].clone() {
+                                ExchangeDataStatus::Filled(order) => {
+                                    info!(
+                                        "IOC reduce order filled: oid={} cloid={}",
+                                        order.oid, cloid_str
+                                    );
+                                    if let Some(ref m) = self.metrics {
+                                        m.record_order_placed();
+                                    }
+                                    return OrderResult {
+                                        resting_size: 0.0, // IOC won't rest
+                                        oid: order.oid,
+                                        filled: true,
+                                        cloid: Some(cloid_str),
+                                        error: None,
+                                    };
+                                }
+                                ExchangeDataStatus::Resting(order) => {
+                                    // Shouldn't happen for IOC, but handle it
+                                    warn!(
+                                        "IOC order resting (unexpected): oid={} cloid={}",
+                                        order.oid, cloid_str
+                                    );
+                                    if let Some(ref m) = self.metrics {
+                                        m.record_order_placed();
+                                    }
+                                    return OrderResult {
+                                        resting_size: size,
+                                        oid: order.oid,
+                                        filled: false,
+                                        cloid: Some(cloid_str),
+                                        error: None,
+                                    };
+                                }
+                                ExchangeDataStatus::Error(e) => {
+                                    error!(
+                                        "IOC reduce order rejected: asset={} side={} sz={} price={} cloid={} error={}",
+                                        asset, side, size, limit_price, cloid_str, e
+                                    );
+                                }
+                                _ => {
+                                    warn!(
+                                        "Unexpected IOC order status: {:?}",
+                                        order.statuses[0]
+                                    );
+                                }
+                            }
+                        } else {
+                            error!("IOC order response statuses empty");
+                        }
+                    } else {
+                        error!("IOC order response data is empty");
+                    }
+                }
+                ExchangeResponseStatus::Err(e) => {
+                    error!(
+                        "IOC reduce order failed: asset={} side={} sz={} price={} cloid={} error={}",
+                        asset, side, size, limit_price, cloid_str, e
+                    );
+                }
+            },
+            Err(e) => {
+                error!(
+                    "IOC reduce order request failed: asset={} side={} error={}",
+                    asset, side, e
+                );
+            }
+        }
+
+        OrderResult::failed_with_cloid(Some(cloid_str))
     }
 
     async fn cancel_order(&self, asset: &str, oid: u64) -> CancelResult {

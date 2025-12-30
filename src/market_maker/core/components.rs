@@ -8,7 +8,9 @@ use crate::market_maker::{
     fills::FillProcessor,
     infra::{
         ConnectionHealthMonitor, DataQualityConfig, DataQualityMonitor, ExchangePositionLimits,
-        MarginAwareSizer, MarginConfig, PrometheusMetrics,
+        MarginAwareSizer, MarginConfig, PositionReconciler, PrometheusMetrics,
+        ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
+        RejectionRateLimiter,
     },
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
@@ -125,6 +127,12 @@ pub struct InfraComponents {
     pub metrics: MetricsRecorder,
     /// Last margin refresh time
     pub last_margin_refresh: std::time::Instant,
+    /// Recovery manager for stuck reduce-only mode (Phase 3)
+    pub recovery_manager: RecoveryManager,
+    /// Position reconciler for drift detection (Phase 4)
+    pub reconciler: PositionReconciler,
+    /// Rejection-aware rate limiter (Phase 5)
+    pub rate_limiter: RejectionRateLimiter,
 }
 
 impl InfraComponents {
@@ -133,6 +141,9 @@ impl InfraComponents {
         margin_config: MarginConfig,
         data_quality_config: DataQualityConfig,
         metrics: MetricsRecorder,
+        recovery_config: RecoveryConfig,
+        reconciliation_config: ReconciliationConfig,
+        rate_limit_config: RejectionRateLimitConfig,
     ) -> Self {
         Self {
             margin_sizer: MarginAwareSizer::new(margin_config),
@@ -142,6 +153,9 @@ impl InfraComponents {
             data_quality: DataQualityMonitor::new(data_quality_config),
             metrics,
             last_margin_refresh: std::time::Instant::now(),
+            recovery_manager: RecoveryManager::with_config(recovery_config),
+            reconciler: PositionReconciler::with_config(reconciliation_config),
+            rate_limiter: RejectionRateLimiter::with_config(rate_limit_config),
         }
     }
 }

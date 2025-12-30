@@ -122,6 +122,17 @@ pub use market_maker::{
     TrackedOrder,
     // Volatility Regime
     VolatilityRegime,
+    // Phase 3: Recovery Manager
+    RecoveryConfig,
+    RecoveryManager,
+    RecoveryState,
+    // Phase 4: Position Reconciliation
+    PositionReconciler,
+    ReconciliationConfig,
+    ReconciliationTrigger,
+    // Phase 5: Rejection Rate Limiting
+    RejectionRateLimiter,
+    RejectionRateLimitConfig,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;

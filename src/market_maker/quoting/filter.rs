@@ -1,8 +1,21 @@
 //! Quote filtering for position limits and reduce-only mode.
 //!
 //! Extracts the duplicated reduce-only logic from mod.rs into a unified filter.
+//!
+//! # Phase 3 Fix: Exchange-Aware Reduce-Only
+//!
+//! The original reduce-only logic only considered local position limits.
+//! When position exceeded limits, it would allow orders to reduce exposure,
+//! but those orders could still be rejected by the exchange if there was
+//! no available capacity.
+//!
+//! The enhanced logic now:
+//! 1. Checks local position limits (original behavior)
+//! 2. Checks exchange available capacity
+//! 3. Signals when escalation to market orders may be needed
 
 use crate::market_maker::config::Quote;
+use crate::market_maker::infra::ExchangePositionLimits;
 use tracing::warn;
 
 /// Reason for entering reduce-only mode.
@@ -25,6 +38,10 @@ pub struct ReduceOnlyResult {
     pub filtered_bids: bool,
     /// Side that was filtered (true = ask, false = bid).
     pub filtered_asks: bool,
+    /// Whether escalation to market orders is needed (Phase 3 Fix).
+    /// True when reduce-only mode is active but exchange has no capacity
+    /// to place reducing limit orders.
+    pub needs_escalation: bool,
 }
 
 impl ReduceOnlyResult {
@@ -34,6 +51,7 @@ impl ReduceOnlyResult {
             reason: None,
             filtered_bids: false,
             filtered_asks: false,
+            needs_escalation: false,
         }
     }
 
@@ -43,6 +61,7 @@ impl ReduceOnlyResult {
             reason: Some(reason),
             filtered_bids: true,
             filtered_asks: false,
+            needs_escalation: false,
         }
     }
 
@@ -52,6 +71,27 @@ impl ReduceOnlyResult {
             reason: Some(reason),
             filtered_bids: false,
             filtered_asks: true,
+            needs_escalation: false,
+        }
+    }
+
+    fn filtered_bids_needs_escalation(reason: ReduceOnlyReason) -> Self {
+        Self {
+            was_filtered: true,
+            reason: Some(reason),
+            filtered_bids: true,
+            filtered_asks: false,
+            needs_escalation: true,
+        }
+    }
+
+    fn filtered_asks_needs_escalation(reason: ReduceOnlyReason) -> Self {
+        Self {
+            was_filtered: true,
+            reason: Some(reason),
+            filtered_bids: false,
+            filtered_asks: true,
+            needs_escalation: true,
         }
     }
 }
@@ -163,6 +203,84 @@ impl QuoteFilter {
             Some(ReduceOnlyReason::OverPositionLimit)
         } else {
             None
+        }
+    }
+
+    /// Apply reduce-only logic with exchange limit awareness (Phase 3 Fix).
+    ///
+    /// This enhanced version checks both local limits AND exchange capacity.
+    /// If we're in reduce-only mode but the exchange has no capacity to place
+    /// reducing orders, we signal that escalation (e.g., market orders) is needed.
+    ///
+    /// # Arguments
+    /// - `bids`: Mutable bid quotes to filter
+    /// - `asks`: Mutable ask quotes to filter
+    /// - `config`: Reduce-only configuration
+    /// - `exchange_limits`: Exchange position limits (for capacity check)
+    ///
+    /// # Returns
+    /// `ReduceOnlyResult` with `needs_escalation = true` if stuck
+    pub fn apply_reduce_only_with_exchange_limits(
+        bids: &mut Vec<Quote>,
+        asks: &mut Vec<Quote>,
+        config: &ReduceOnlyConfig,
+        exchange_limits: &ExchangePositionLimits,
+    ) -> ReduceOnlyResult {
+        let position = config.position;
+        let position_value = position.abs() * config.mid_price;
+
+        let over_position_limit = position.abs() > config.max_position;
+        let over_value_limit = position_value > config.max_position_value;
+
+        if !over_position_limit && !over_value_limit {
+            return ReduceOnlyResult::no_filtering();
+        }
+
+        let reason = if over_value_limit {
+            ReduceOnlyReason::OverValueLimit
+        } else {
+            ReduceOnlyReason::OverPositionLimit
+        };
+
+        // Minimum capacity to consider "usable" (avoid micro-orders)
+        const MIN_CAPACITY: f64 = 0.001;
+
+        if position > 0.0 {
+            // Long position over max: only allow sells (no bids)
+            bids.clear();
+
+            // Phase 3 Fix: Check if we can actually place asks (sells to reduce)
+            let available_sell = exchange_limits.available_sell();
+            if available_sell < MIN_CAPACITY && exchange_limits.is_initialized() {
+                warn!(
+                    position = %format!("{:.6}", position),
+                    available_sell = %format!("{:.6}", available_sell),
+                    "Reduce-only mode but no exchange capacity to sell - needs escalation"
+                );
+                Self::log_reduce_only(position, config, reason, true);
+                return ReduceOnlyResult::filtered_bids_needs_escalation(reason);
+            }
+
+            Self::log_reduce_only(position, config, reason, true);
+            ReduceOnlyResult::filtered_bids(reason)
+        } else {
+            // Short position over max: only allow buys (no asks)
+            asks.clear();
+
+            // Phase 3 Fix: Check if we can actually place bids (buys to reduce)
+            let available_buy = exchange_limits.available_buy();
+            if available_buy < MIN_CAPACITY && exchange_limits.is_initialized() {
+                warn!(
+                    position = %format!("{:.6}", position),
+                    available_buy = %format!("{:.6}", available_buy),
+                    "Reduce-only mode but no exchange capacity to buy - needs escalation"
+                );
+                Self::log_reduce_only(position, config, reason, false);
+                return ReduceOnlyResult::filtered_asks_needs_escalation(reason);
+            }
+
+            Self::log_reduce_only(position, config, reason, false);
+            ReduceOnlyResult::filtered_asks(reason)
         }
     }
 

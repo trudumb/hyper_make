@@ -7,17 +7,26 @@
 //! - **ExchangeLimits**: Exchange-enforced position limits from API
 //! - **Metrics**: Prometheus metrics for observability
 //! - **Executor**: Order execution abstraction
+//! - **Recovery**: Stuck position recovery state machine (Phase 3)
+//! - **Reconciliation**: Event-driven position sync (Phase 4)
+//! - **RateLimit**: Rejection-aware rate limiting (Phase 5)
 
 mod data_quality;
 mod exchange_limits;
 mod executor;
 mod margin;
 mod metrics;
+mod rate_limit;
+mod reconciliation;
 mod reconnection;
+mod recovery;
 
 pub use data_quality::*;
 pub use exchange_limits::*;
 pub use executor::*;
 pub use margin::*;
 pub use metrics::*;
+pub use rate_limit::*;
+pub use reconciliation::*;
 pub use reconnection::*;
+pub use recovery::*;
