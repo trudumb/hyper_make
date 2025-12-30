@@ -33,13 +33,28 @@ use crate::{
     Withdraw3,
 };
 
-#[derive(Debug)]
 pub struct ExchangeClient {
     pub http_client: HttpClient,
     pub wallet: PrivateKeySigner,
     pub meta: Meta,
     pub vault_address: Option<Address>,
     pub coin_to_asset: HashMap<String, u32>,
+}
+
+// Security: Custom Debug implementation to prevent private key leakage
+impl std::fmt::Debug for ExchangeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExchangeClient")
+            .field("http_client", &self.http_client)
+            .field("wallet", &"<redacted>")
+            .field("meta", &self.meta)
+            .field("vault_address", &self.vault_address)
+            .field(
+                "coin_to_asset",
+                &format!("{} entries", self.coin_to_asset.len()),
+            )
+            .finish()
+    }
 }
 
 fn serialize_sig<S>(sig: &Signature, s: S) -> std::result::Result<S::Ok, S::Error>

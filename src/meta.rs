@@ -196,11 +196,7 @@ impl AssetLeverageConfig {
     ///
     /// # Returns
     /// (is_valid, effective_leverage, max_allowed)
-    pub fn validate_leverage(
-        &self,
-        notional: f64,
-        account_value: f64,
-    ) -> (bool, f64, f64) {
+    pub fn validate_leverage(&self, notional: f64, account_value: f64) -> (bool, f64, f64) {
         if account_value <= 0.0 {
             return (false, f64::INFINITY, self.max_leverage);
         }

@@ -31,6 +31,10 @@ pub struct KillSwitchConfig {
     /// Example: 10000.0 means shutdown if position notional exceeds $10,000
     pub max_position_value: f64,
 
+    /// Maximum allowed position size in contracts
+    /// Example: 0.05 means soft limit at 0.05 contracts, kill at 0.10 (2x)
+    pub max_position_contracts: f64,
+
     /// Maximum time without market data before considering data stale
     pub stale_data_threshold: Duration,
 
@@ -47,6 +51,7 @@ impl Default for KillSwitchConfig {
             max_daily_loss: 500.0,
             max_drawdown: 0.05,
             max_position_value: 10_000.0,
+            max_position_contracts: 1.0, // Default 1.0 contracts, will be overridden by config
             // 30 seconds: allows time for ladder order placement (10 orders × ~1-2s each)
             // plus network latency and exchange processing
             stale_data_threshold: Duration::from_secs(30),
@@ -128,6 +133,8 @@ pub enum KillReason {
     MaxDrawdown { drawdown: f64, limit: f64 },
     /// Position value exceeded configured maximum
     MaxPosition { value: f64, limit: f64 },
+    /// Position contracts exceeded 2x configured maximum (runaway position)
+    PositionRunaway { contracts: f64, limit: f64 },
     /// Market data is stale (no updates within threshold)
     StaleData {
         elapsed: Duration,
@@ -160,6 +167,13 @@ impl std::fmt::Display for KillReason {
                     f,
                     "Max position value exceeded: ${:.2} > ${:.2}",
                     value, limit
+                )
+            }
+            KillReason::PositionRunaway { contracts, limit } => {
+                write!(
+                    f,
+                    "Position runaway: {:.6} contracts > {:.6} (2x limit)",
+                    contracts, limit
                 )
             }
             KillReason::StaleData { elapsed, threshold } => {
@@ -300,6 +314,11 @@ impl KillSwitch {
         }
 
         if let Some(reason) = self.check_position_value(state, &config) {
+            self.trigger(reason.clone());
+            return Some(reason);
+        }
+
+        if let Some(reason) = self.check_position_runaway(state, &config) {
             self.trigger(reason.clone());
             return Some(reason);
         }
@@ -445,6 +464,24 @@ impl KillSwitch {
         if value > hard_limit {
             return Some(KillReason::MaxPosition {
                 value,
+                limit: hard_limit,
+            });
+        }
+        None
+    }
+
+    fn check_position_runaway(
+        &self,
+        state: &KillSwitchState,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
+        // Position runaway: contracts exceed 2x the configured max_position
+        // This catches cases where reduce-only mode fails to control position growth
+        let contracts = state.position.abs();
+        let hard_limit = config.max_position_contracts * 2.0;
+        if contracts > hard_limit {
+            return Some(KillReason::PositionRunaway {
+                contracts,
                 limit: hard_limit,
             });
         }

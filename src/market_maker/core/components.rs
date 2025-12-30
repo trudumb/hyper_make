@@ -7,8 +7,8 @@ use crate::market_maker::{
     config::MetricsRecorder,
     fills::FillProcessor,
     infra::{
-        ConnectionHealthMonitor, DataQualityConfig, DataQualityMonitor, MarginAwareSizer,
-        MarginConfig, PrometheusMetrics,
+        ConnectionHealthMonitor, DataQualityConfig, DataQualityMonitor, ExchangePositionLimits,
+        MarginAwareSizer, MarginConfig, PrometheusMetrics,
     },
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
@@ -113,6 +113,8 @@ impl SafetyComponents {
 pub struct InfraComponents {
     /// Margin-aware sizer
     pub margin_sizer: MarginAwareSizer,
+    /// Exchange-enforced position limits (from active_asset_data API)
+    pub exchange_limits: ExchangePositionLimits,
     /// Prometheus metrics
     pub prometheus: PrometheusMetrics,
     /// Connection health monitor
@@ -134,6 +136,7 @@ impl InfraComponents {
     ) -> Self {
         Self {
             margin_sizer: MarginAwareSizer::new(margin_config),
+            exchange_limits: ExchangePositionLimits::new(),
             prometheus: PrometheusMetrics::new(),
             connection_health: ConnectionHealthMonitor::new(),
             data_quality: DataQualityMonitor::new(data_quality_config),

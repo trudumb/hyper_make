@@ -874,11 +874,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let liquidation_config = LiquidationConfig::default();
 
     // Create kill switch config (production safety)
-    let kill_switch_config = KillSwitchConfig::default();
+    let kill_switch_config = KillSwitchConfig {
+        max_position_contracts: max_position, // Use the configured max_position for runaway detection
+        ..Default::default()
+    };
     info!(
         max_daily_loss = %kill_switch_config.max_daily_loss,
         max_drawdown = %format!("{:.1}%", kill_switch_config.max_drawdown * 100.0),
         max_position_value = %kill_switch_config.max_position_value,
+        max_position_contracts = %kill_switch_config.max_position_contracts,
         stale_data_threshold = ?kill_switch_config.stale_data_threshold,
         "Kill switch enabled"
     );
@@ -943,8 +947,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             );
 
-            let addr = format!("0.0.0.0:{}", metrics_port);
-            info!(port = metrics_port, "Starting Prometheus metrics endpoint");
+            // Security: Bind to localhost only to prevent metrics exposure to network
+            let addr = format!("127.0.0.1:{}", metrics_port);
+            info!(
+                port = metrics_port,
+                bind = "127.0.0.1",
+                "Starting Prometheus metrics endpoint (localhost only)"
+            );
 
             match tokio::net::TcpListener::bind(&addr).await {
                 Ok(listener) => {
@@ -1113,9 +1122,15 @@ fn print_startup_banner(asset: &str, network: &BaseUrl, dry_run: bool) {
 
     eprintln!();
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
-    eprintln!("║     Hyperliquid Market Maker v{:<10}{}              ║", version, mode);
+    eprintln!(
+        "║     Hyperliquid Market Maker v{:<10}{}              ║",
+        version, mode
+    );
     eprintln!("║                                                           ║");
-    eprintln!("║  Asset:   {:<15}  Network: {:<15}   ║", asset, network_str);
+    eprintln!(
+        "║  Asset:   {:<15}  Network: {:<15}   ║",
+        asset, network_str
+    );
     eprintln!("╚═══════════════════════════════════════════════════════════╝");
     eprintln!();
 }
@@ -1166,7 +1181,10 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     println!();
 
     // Account summary
-    println!("  Account Value:   ${}", user_state.margin_summary.account_value);
+    println!(
+        "  Account Value:   ${}",
+        user_state.margin_summary.account_value
+    );
     println!(
         "  Total Notional:  ${}",
         user_state.cross_margin_summary.total_ntl_pos
@@ -1188,10 +1206,7 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
         if let Some(ref entry_px) = pos.position.entry_px {
             println!("  Entry Price:     ${}", entry_px);
         }
-        println!(
-            "  Unrealized PnL:  ${}",
-            pos.position.unrealized_pnl
-        );
+        println!("  Unrealized PnL:  ${}", pos.position.unrealized_pnl);
         println!("  Leverage:        {}x", pos.position.leverage.value);
     } else {
         println!("  Position:        None");
@@ -1209,10 +1224,7 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
         println!();
         for order in &asset_orders {
             let side = if order.side == "B" { "BUY " } else { "SELL" };
-            println!(
-                "    {} {} {} @ ${}",
-                side, order.sz, asset, order.limit_px
-            );
+            println!("    {} {} {} @ ${}", side, order.sz, asset, order.limit_px);
         }
     }
 

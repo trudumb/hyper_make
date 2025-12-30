@@ -14,6 +14,132 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 // ============================================================================
+// O(1) Incremental Hawkes Intensity Tracker
+// ============================================================================
+
+/// O(1) incremental Hawkes process intensity tracker.
+///
+/// Instead of iterating over all events for each intensity computation,
+/// we maintain a weighted sum that decays uniformly. The key insight is:
+///
+/// λ(t) = μ + Σᵢ α × sᵢ × exp(-β(t - tᵢ))
+///
+/// At time t₀, if we have:
+///   S = Σᵢ α × sᵢ × exp(-β(t₀ - tᵢ))
+///
+/// Then at time t₁ > t₀:
+///   S' = S × exp(-β(t₁ - t₀))  [all past events decay uniformly]
+///
+/// When new event arrives with size s:
+///   S' = S' + α × s
+///
+/// This gives us O(1) updates and queries instead of O(n).
+#[derive(Debug, Clone)]
+pub struct IncrementalHawkes {
+    /// Baseline intensity (μ)
+    baseline: f64,
+    /// Self-excitation parameter (α)
+    alpha: f64,
+    /// Decay parameter (β, per second)
+    beta: f64,
+    /// Size scaling factor
+    size_scale: f64,
+    /// Cumulative weighted intensity from past events (excludes baseline)
+    /// This is Σᵢ α × sᵢ × exp(-β(t_now - tᵢ)) at last update time
+    weighted_sum: f64,
+    /// Last update timestamp for decay calculation
+    last_update: Instant,
+}
+
+impl IncrementalHawkes {
+    /// Create a new incremental Hawkes tracker.
+    pub fn new(baseline: f64, alpha: f64, beta: f64, size_scale: f64) -> Self {
+        Self {
+            baseline,
+            alpha,
+            beta,
+            size_scale,
+            weighted_sum: 0.0,
+            last_update: Instant::now(),
+        }
+    }
+
+    /// Decay the weighted sum to current time.
+    #[inline]
+    fn decay_to_now(&mut self, now: Instant) {
+        let dt = now.duration_since(self.last_update).as_secs_f64();
+        if dt > 0.0 {
+            self.weighted_sum *= (-self.beta * dt).exp();
+            self.last_update = now;
+        }
+    }
+
+    /// Record a new event and return updated intensity.
+    ///
+    /// This is O(1) - just decay existing sum and add new contribution.
+    #[inline]
+    pub fn record_event(&mut self, size: f64) -> f64 {
+        let now = Instant::now();
+        self.decay_to_now(now);
+
+        // Add new event contribution
+        let normalized_size = (size / self.size_scale).max(0.01);
+        self.weighted_sum += self.alpha * normalized_size;
+
+        self.baseline + self.weighted_sum
+    }
+
+    /// Get current intensity without recording an event.
+    ///
+    /// This is O(1) - just decay and return.
+    #[inline]
+    pub fn intensity(&mut self) -> f64 {
+        let now = Instant::now();
+        self.decay_to_now(now);
+        self.baseline + self.weighted_sum
+    }
+
+    /// Get current intensity (const version using last known state).
+    ///
+    /// Note: This doesn't decay to current time, so may be slightly stale.
+    /// Use for queries where exact freshness isn't critical.
+    #[inline]
+    pub fn intensity_snapshot(&self) -> f64 {
+        let dt = self.last_update.elapsed().as_secs_f64();
+        let decayed_sum = self.weighted_sum * (-self.beta * dt).exp();
+        self.baseline + decayed_sum
+    }
+
+    /// Get intensity ratio (current / baseline).
+    #[inline]
+    pub fn intensity_ratio(&mut self) -> f64 {
+        let intensity = self.intensity();
+        if self.baseline > 0.0 {
+            intensity / self.baseline
+        } else {
+            1.0
+        }
+    }
+
+    /// Get intensity ratio from snapshot.
+    #[inline]
+    pub fn intensity_ratio_snapshot(&self) -> f64 {
+        let intensity = self.intensity_snapshot();
+        if self.baseline > 0.0 {
+            intensity / self.baseline
+        } else {
+            1.0
+        }
+    }
+
+    /// Reset to baseline (clears all event history).
+    pub fn reset(&mut self) {
+        self.weighted_sum = 0.0;
+        self.last_update = Instant::now();
+    }
+}
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -82,6 +208,9 @@ struct LiquidationEvent {
     /// Event timestamp
     time: Instant,
     /// Normalized size (size / size_scale)
+    /// NOTE: This field is used by compute_intensity_bruteforce() in tests
+    /// for numerical validation against the O(1) incremental tracker.
+    #[allow(dead_code)]
     normalized_size: f64,
     /// Direction: true = long liquidated (price dropping), false = short liquidated (price rising)
     is_long_liquidation: bool,
@@ -103,11 +232,16 @@ pub enum CascadeDirection {
 // ============================================================================
 
 /// Detects liquidation cascades using a size-weighted Hawkes process.
+///
+/// Uses O(1) incremental intensity tracking for performance.
 #[derive(Debug)]
 pub struct LiquidationCascadeDetector {
     config: LiquidationConfig,
 
-    /// Recent liquidation events for intensity calculation
+    /// O(1) incremental Hawkes intensity tracker
+    hawkes: IncrementalHawkes,
+
+    /// Recent liquidation events (kept for direction detection only, not intensity)
     events: VecDeque<LiquidationEvent>,
 
     /// Start time for warmup tracking
@@ -133,8 +267,15 @@ impl LiquidationCascadeDetector {
     /// Create a new liquidation cascade detector.
     pub fn new(config: LiquidationConfig) -> Self {
         let baseline = config.baseline_intensity;
+        let hawkes = IncrementalHawkes::new(
+            config.baseline_intensity,
+            config.alpha,
+            config.beta,
+            config.size_scale,
+        );
         Self {
             config,
+            hawkes,
             events: VecDeque::new(),
             start_time: Instant::now(),
             total_liquidations: 0,
@@ -160,8 +301,15 @@ impl LiquidationCascadeDetector {
     /// # Parameters
     /// - `size`: Notional value of the liquidation (in USD or base currency)
     /// - `is_long_liquidation`: true if a long position was liquidated
+    ///
+    /// Complexity: O(1) using incremental Hawkes tracker.
     pub fn record_liquidation(&mut self, size: f64, is_long_liquidation: bool) {
-        // Enforce max events
+        // Update O(1) incremental Hawkes intensity
+        self.cached_intensity = self.hawkes.record_event(size);
+        self.cached_cascade_active =
+            self.cached_intensity > self.config.baseline_intensity * self.config.cascade_threshold;
+
+        // Maintain event list for direction detection only (bounded by max_events)
         while self.events.len() >= self.config.max_events {
             let removed = self.events.pop_front();
             if let Some(ev) = removed {
@@ -190,9 +338,6 @@ impl LiquidationCascadeDetector {
             self.recent_short_count += 1;
         }
 
-        // Update cached intensity
-        self.update_intensity();
-
         debug!(
             size = size,
             normalized_size = normalized_size,
@@ -212,16 +357,22 @@ impl LiquidationCascadeDetector {
     }
 
     /// Update cached intensity and cascade state.
+    ///
+    /// Complexity: O(1) using incremental Hawkes tracker.
     fn update_intensity(&mut self) {
-        self.cached_intensity = self.compute_intensity(Instant::now());
+        self.cached_intensity = self.hawkes.intensity();
         self.cached_cascade_active =
             self.cached_intensity > self.config.baseline_intensity * self.config.cascade_threshold;
     }
 
-    /// Compute current Hawkes intensity.
+    /// Compute current Hawkes intensity using O(n) iteration (for testing/validation only).
     ///
     /// λ(t) = μ + Σ α × size_i × e^(-β × (t - t_i))
-    fn compute_intensity(&self, now: Instant) -> f64 {
+    ///
+    /// NOTE: This is the original O(n) implementation kept for numerical validation.
+    /// Production code uses the O(1) incremental tracker.
+    #[cfg(test)]
+    fn compute_intensity_bruteforce(&self, now: Instant) -> f64 {
         let mut intensity = self.config.baseline_intensity;
 
         for event in &self.events {
@@ -642,5 +793,150 @@ mod tests {
         // Expected should scale with horizon
         let expected_longer = detector.expected_liquidations(20.0);
         assert!((expected_longer - 2.0 * expected).abs() < 0.1);
+    }
+
+    // ========================================================================
+    // O(1) Incremental Hawkes Tests
+    // ========================================================================
+
+    #[test]
+    fn test_incremental_hawkes_baseline() {
+        let mut hawkes = IncrementalHawkes::new(0.1, 1.0, 1.0, 1000.0);
+
+        // With no events, intensity should be baseline
+        assert!((hawkes.intensity() - 0.1).abs() < 1e-9);
+        assert!((hawkes.intensity_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_incremental_hawkes_event_increases_intensity() {
+        let mut hawkes = IncrementalHawkes::new(0.1, 1.0, 1.0, 1000.0);
+        let initial = hawkes.intensity();
+
+        // Record an event
+        let new_intensity = hawkes.record_event(5000.0);
+
+        // Intensity should increase
+        assert!(new_intensity > initial);
+
+        // Contribution should be α × (size / scale) = 1.0 × 5.0 = 5.0
+        // So intensity = 0.1 + 5.0 = 5.1
+        assert!((new_intensity - 5.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_incremental_hawkes_decay() {
+        let mut hawkes = IncrementalHawkes::new(0.1, 1.0, 1.0, 1000.0);
+
+        // Record event
+        let peak = hawkes.record_event(5000.0);
+
+        // Wait for decay (with β=1.0, after 1 second, e^-1 ≈ 0.368)
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        let after_decay = hawkes.intensity();
+
+        // Should have decayed significantly
+        assert!(after_decay < peak);
+        // Expected: 0.1 + 5.0 * e^-1 ≈ 0.1 + 1.84 = 1.94
+        assert!((after_decay - 1.94).abs() < 0.2);
+    }
+
+    #[test]
+    fn test_incremental_hawkes_multiple_events() {
+        let mut hawkes = IncrementalHawkes::new(0.1, 1.0, 1.0, 1000.0);
+
+        // Add multiple events quickly
+        for _ in 0..10 {
+            hawkes.record_event(1000.0);
+        }
+
+        // Each event contributes α × 1.0 = 1.0
+        // Total should be approximately 0.1 + 10.0 = 10.1 (with minimal decay)
+        let intensity = hawkes.intensity();
+        assert!(intensity > 9.0); // At least 9 due to minimal decay
+        assert!(intensity < 11.0);
+    }
+
+    #[test]
+    fn test_incremental_hawkes_snapshot() {
+        let hawkes = IncrementalHawkes::new(0.1, 1.0, 1.0, 1000.0);
+
+        // Snapshot should return baseline for new tracker
+        assert!((hawkes.intensity_snapshot() - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_incremental_vs_bruteforce_numerical_equivalence() {
+        // This test validates that the O(1) incremental implementation
+        // produces the same results as the O(n) bruteforce implementation
+        let mut detector = make_detector();
+
+        // Record some events
+        for i in 0..20 {
+            detector.record_liquidation(1000.0 + i as f64 * 100.0, i % 2 == 0);
+        }
+
+        // Get both intensities
+        let incremental = detector.cached_intensity;
+        let bruteforce = detector.compute_intensity_bruteforce(Instant::now());
+
+        // They should be very close (within numerical precision)
+        let relative_error = (incremental - bruteforce).abs() / bruteforce.max(1e-9);
+        assert!(
+            relative_error < 0.01, // 1% tolerance for timing differences
+            "Incremental ({}) and bruteforce ({}) differ by {:.2}%",
+            incremental,
+            bruteforce,
+            relative_error * 100.0
+        );
+    }
+
+    #[test]
+    fn test_incremental_vs_bruteforce_after_decay() {
+        let mut detector = make_detector();
+
+        // Record events
+        for i in 0..10 {
+            detector.record_liquidation(2000.0, i % 2 == 0);
+        }
+
+        // Wait for some decay
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Update via periodic update (which uses incremental)
+        detector.update();
+
+        let now = Instant::now();
+        let incremental = detector.cached_intensity;
+        let bruteforce = detector.compute_intensity_bruteforce(now);
+
+        // Should still be close after decay
+        let relative_error = (incremental - bruteforce).abs() / bruteforce.max(1e-9);
+        assert!(
+            relative_error < 0.05, // 5% tolerance for timing variations
+            "After decay: incremental ({}) vs bruteforce ({}) differ by {:.2}%",
+            incremental,
+            bruteforce,
+            relative_error * 100.0
+        );
+    }
+
+    #[test]
+    fn test_incremental_reset() {
+        let mut hawkes = IncrementalHawkes::new(0.1, 1.0, 1.0, 1000.0);
+
+        // Add events
+        for _ in 0..10 {
+            hawkes.record_event(5000.0);
+        }
+
+        assert!(hawkes.intensity() > 10.0);
+
+        // Reset
+        hawkes.reset();
+
+        // Should be back to baseline
+        assert!((hawkes.intensity() - 0.1).abs() < 1e-9);
     }
 }

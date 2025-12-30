@@ -72,6 +72,14 @@ pub enum OrderState {
     /// Cancel confirmed and fill window has expired with no late fills.
     /// Terminal state - safe to remove immediately.
     Cancelled,
+    /// Order filled immediately on placement (API reported filled before WS).
+    ///
+    /// This state bridges the race condition between REST API response and WebSocket
+    /// fill notification. Position was already updated from API response; when WS
+    /// fill arrives, it will be deduplicated.
+    ///
+    /// Transitions to Filled when WS confirmation arrives (or after timeout).
+    FilledImmediately,
 }
 
 /// Action to take for ladder reconciliation.
@@ -199,7 +207,10 @@ impl TrackedOrder {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.state,
-            OrderState::Filled | OrderState::Cancelled | OrderState::FilledDuringCancel
+            OrderState::Filled
+                | OrderState::Cancelled
+                | OrderState::FilledDuringCancel
+                | OrderState::FilledImmediately
         )
     }
 

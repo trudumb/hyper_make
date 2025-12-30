@@ -186,27 +186,117 @@ impl LadderStrategy {
         // Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ  (expected profit)
         // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
         //      Σ sᵢ ≤ max_position (position constraint)
+        //      Σ sᵢ ≤ exchange_limit (exchange-enforced constraint)
         if market_params.use_constrained_optimizer {
             // 1. Available margin comes from the exchange (already accounts for position margin)
             // NOTE: margin_available is already net of position margin, don't double-count!
             let leverage = market_params.leverage.max(1.0);
             let available_margin = market_params.margin_available;
-            let available_position = (max_position - position.abs()).max(0.0);
 
-            // 2. Generate ladder to get depth levels and prices
+            // 2. Calculate ASYMMETRIC position limits per side
+            // CRITICAL BUG FIX: When over max position, we need to allow reduce-only orders
+            // on the opposite side, not block both sides.
+            //
+            // For bids (buying): Can buy up to (max_position - position) when long or flat
+            //                    Can buy up to (max_position + |position|) when short (reducing)
+            // For asks (selling): Can sell up to (max_position + position) when long (reducing)
+            //                     Can sell up to (max_position - |position|) when short or flat
+            let (local_available_bids, local_available_asks) = if position >= 0.0 {
+                // Long or flat position
+                // Bids: limited by how much more long we can go
+                // Asks: can sell entire position + go max short (reducing is always allowed)
+                let bid_limit = (max_position - position).max(0.0);
+                let ask_limit = position + max_position; // Can sell entire position + go max short
+                (bid_limit, ask_limit)
+            } else {
+                // Short position
+                // Bids: can buy to cover position + go max long (reducing is always allowed)
+                // Asks: limited by how much more short we can go
+                let bid_limit = position.abs() + max_position; // Can buy to cover + go max long
+                let ask_limit = (max_position - position.abs()).max(0.0);
+                (bid_limit, ask_limit)
+            };
+
+            // 3. Apply exchange-enforced limits (prevents order rejections)
+            // Exchange limits are direction-specific: available_buy for bids, available_sell for asks
+            let exchange_limits = market_params.exchange_limits();
+            let available_for_bids = if exchange_limits.valid {
+                local_available_bids.min(exchange_limits.safe_bid_limit())
+            } else {
+                local_available_bids
+            };
+            let available_for_asks = if exchange_limits.valid {
+                local_available_asks.min(exchange_limits.safe_ask_limit())
+            } else {
+                local_available_asks
+            };
+
+            // Log warning if exchange limits are constraining us or stale
+            if exchange_limits.valid && exchange_limits.is_stale() {
+                tracing::warn!(
+                    age_ms = exchange_limits.age_ms,
+                    "Exchange limits are stale - sizing may be reduced"
+                );
+            }
+            if exchange_limits.valid && available_for_bids < local_available_bids {
+                tracing::debug!(
+                    local = %format!("{:.6}", local_available_bids),
+                    exchange = %format!("{:.6}", available_for_bids),
+                    "Bid sizing constrained by exchange limit"
+                );
+            }
+            if exchange_limits.valid && available_for_asks < local_available_asks {
+                tracing::debug!(
+                    local = %format!("{:.6}", local_available_asks),
+                    exchange = %format!("{:.6}", available_for_asks),
+                    "Ask sizing constrained by exchange limit"
+                );
+            }
+
+            // Log reduce-only mode detection
+            let over_limit = position.abs() > max_position;
+            if over_limit {
+                if position > 0.0 {
+                    tracing::debug!(
+                        position = %format!("{:.6}", position),
+                        max_position = %format!("{:.6}", max_position),
+                        available_bids = %format!("{:.6}", available_for_bids),
+                        available_asks = %format!("{:.6}", available_for_asks),
+                        "Over max position (LONG) - bids blocked, asks allowed for reducing"
+                    );
+                } else {
+                    tracing::debug!(
+                        position = %format!("{:.6}", position),
+                        max_position = %format!("{:.6}", max_position),
+                        available_bids = %format!("{:.6}", available_for_bids),
+                        available_asks = %format!("{:.6}", available_for_asks),
+                        "Over max position (SHORT) - asks blocked, bids allowed for reducing"
+                    );
+                }
+            }
+
+            // 4. Generate ladder to get depth levels and prices
             let mut ladder = Ladder::generate(&self.ladder_config, &params);
 
-            // 3. Create constrained optimizer
-            let optimizer = ConstrainedLadderOptimizer::new(
+            // 5. Create separate optimizers for bids and asks with their respective limits
+            let optimizer_bids = ConstrainedLadderOptimizer::new(
                 available_margin,
-                available_position,
+                available_for_bids,
+                self.ladder_config.min_level_size,
+                config.min_notional,
+                market_params.microprice,
+                leverage,
+            );
+            let optimizer_asks = ConstrainedLadderOptimizer::new(
+                available_margin,
+                available_for_asks,
                 self.ladder_config.min_level_size,
                 config.min_notional,
                 market_params.microprice,
                 leverage,
             );
 
-            // 4. Build LevelOptimizationParams for bids
+            // 5. Build LevelOptimizationParams for bids
             let bid_level_params: Vec<_> = ladder
                 .bids
                 .iter()
@@ -229,14 +319,16 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 5. Optimize bid sizes (use Kelly-Stochastic if enabled)
+            // 6. Optimize bid sizes (use Kelly-Stochastic if enabled)
             if !bid_level_params.is_empty() {
                 let allocation = if market_params.use_kelly_stochastic {
                     // Apply volatility regime adjustment to Kelly fraction
                     // High vol → more conservative (lower Kelly)
                     // Low vol → more aggressive (higher Kelly)
-                    let regime_multiplier = market_params.volatility_regime.kelly_fraction_multiplier();
-                    let dynamic_kelly = (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
+                    let regime_multiplier =
+                        market_params.volatility_regime.kelly_fraction_multiplier();
+                    let dynamic_kelly =
+                        (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
 
                     let kelly_params = KellyStochasticParams {
                         sigma: market_params.sigma,
@@ -245,9 +337,9 @@ impl LadderStrategy {
                         alpha_decay_bps: market_params.kelly_alpha_decay_bps,
                         kelly_fraction: dynamic_kelly,
                     };
-                    optimizer.optimize_kelly_stochastic(&bid_level_params, &kelly_params)
+                    optimizer_bids.optimize_kelly_stochastic(&bid_level_params, &kelly_params)
                 } else {
-                    optimizer.optimize(&bid_level_params)
+                    optimizer_bids.optimize(&bid_level_params)
                 };
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.bids.len() {
@@ -272,7 +364,7 @@ impl LadderStrategy {
                 );
             }
 
-            // 6. Build LevelOptimizationParams for asks
+            // 7. Build LevelOptimizationParams for asks
             let ask_level_params: Vec<_> = ladder
                 .asks
                 .iter()
@@ -295,14 +387,16 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 7. Optimize ask sizes (use Kelly-Stochastic if enabled)
+            // 8. Optimize ask sizes (use Kelly-Stochastic if enabled)
             if !ask_level_params.is_empty() {
                 let allocation = if market_params.use_kelly_stochastic {
                     // Apply volatility regime adjustment to Kelly fraction
                     // High vol → more conservative (lower Kelly)
                     // Low vol → more aggressive (higher Kelly)
-                    let regime_multiplier = market_params.volatility_regime.kelly_fraction_multiplier();
-                    let dynamic_kelly = (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
+                    let regime_multiplier =
+                        market_params.volatility_regime.kelly_fraction_multiplier();
+                    let dynamic_kelly =
+                        (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
 
                     let kelly_params = KellyStochasticParams {
                         sigma: market_params.sigma,
@@ -311,9 +405,9 @@ impl LadderStrategy {
                         alpha_decay_bps: market_params.kelly_alpha_decay_bps,
                         kelly_fraction: dynamic_kelly,
                     };
-                    optimizer.optimize_kelly_stochastic(&ask_level_params, &kelly_params)
+                    optimizer_asks.optimize_kelly_stochastic(&ask_level_params, &kelly_params)
                 } else {
-                    optimizer.optimize(&ask_level_params)
+                    optimizer_asks.optimize(&ask_level_params)
                 };
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.asks.len() {
@@ -338,7 +432,7 @@ impl LadderStrategy {
                 );
             }
 
-            // 8. Filter out zero-size levels
+            // 9. Filter out zero-size levels
             ladder.bids.retain(|l| l.size > EPSILON);
             ladder.asks.retain(|l| l.size > EPSILON);
 

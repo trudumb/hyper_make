@@ -82,7 +82,9 @@ mod tests {
         let actions = reconcile_side(&current, &target, Side::Buy, 5);
 
         assert_eq!(actions.len(), 2);
-        assert!(actions.iter().all(|a| matches!(a, LadderAction::Place { .. })));
+        assert!(actions
+            .iter()
+            .all(|a| matches!(a, LadderAction::Place { .. })));
     }
 
     #[test]
@@ -125,7 +127,11 @@ mod tests {
 
         // Should cancel old and place new
         assert_eq!(actions.len(), 2);
-        assert!(actions.iter().any(|a| matches!(a, LadderAction::Cancel { oid: 1 })));
-        assert!(actions.iter().any(|a| matches!(a, LadderAction::Place { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, LadderAction::Cancel { oid: 1 })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, LadderAction::Place { .. })));
     }
 }

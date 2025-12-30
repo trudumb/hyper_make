@@ -243,6 +243,18 @@ pub struct MarketParams {
     /// Semantically different from GLFT inventory time horizon T = 1/λ.
     /// Computed from KellyTimeHorizonMethod in config.
     pub kelly_time_horizon: f64,
+
+    // === Exchange Position Limits (Pre-flight Rejection Prevention) ===
+    /// Whether exchange limits have been fetched and are valid
+    pub exchange_limits_valid: bool,
+    /// Effective bid limit: min(local_max, exchange_available_buy)
+    /// Use this to cap bid ladder sizes
+    pub exchange_effective_bid_limit: f64,
+    /// Effective ask limit: min(local_max, exchange_available_sell)
+    /// Use this to cap ask ladder sizes
+    pub exchange_effective_ask_limit: f64,
+    /// Age of exchange limits in milliseconds (for staleness warnings)
+    pub exchange_limits_age_ms: u64,
 }
 
 impl Default for MarketParams {
@@ -321,11 +333,16 @@ impl Default for MarketParams {
             margin_available: 0.0,            // Will be fetched from margin sizer
             leverage: 1.0,                    // Default 1x leverage
             // Kelly-Stochastic Allocation (stochastic integration)
-            use_kelly_stochastic: false,  // Default OFF for safety
-            kelly_alpha_touch: 0.15,      // 15% informed at touch
-            kelly_alpha_decay_bps: 10.0,  // Alpha decays with 10bp characteristic
-            kelly_fraction: 0.25,         // Quarter Kelly (conservative)
-            kelly_time_horizon: 60.0,     // Default 60s (will be computed from config method)
+            use_kelly_stochastic: false, // Default OFF for safety
+            kelly_alpha_touch: 0.15,     // 15% informed at touch
+            kelly_alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
+            kelly_fraction: 0.25,        // Quarter Kelly (conservative)
+            kelly_time_horizon: 60.0,    // Default 60s (will be computed from config method)
+            // Exchange Position Limits
+            exchange_limits_valid: false,           // Not fetched yet
+            exchange_effective_bid_limit: f64::MAX, // No constraint until fetched
+            exchange_effective_ask_limit: f64::MAX, // No constraint until fetched
+            exchange_limits_age_ms: u64::MAX,       // Never fetched
         }
     }
 }
@@ -461,6 +478,16 @@ impl MarketParams {
             alpha_decay_bps: self.kelly_alpha_decay_bps,
             kelly_fraction: self.kelly_fraction,
             time_horizon: self.kelly_time_horizon,
+        }
+    }
+
+    /// Extract exchange position limit parameters as a focused struct.
+    pub fn exchange_limits(&self) -> params::ExchangeLimitsParams {
+        params::ExchangeLimitsParams {
+            valid: self.exchange_limits_valid,
+            effective_bid_limit: self.exchange_effective_bid_limit,
+            effective_ask_limit: self.exchange_effective_ask_limit,
+            age_ms: self.exchange_limits_age_ms,
         }
     }
 }

@@ -150,7 +150,7 @@ impl Default for MarginConfig {
     /// to use the actual exchange limits for the asset being traded.
     fn default() -> Self {
         Self {
-            max_leverage: 3.0,                // Conservative default
+            max_leverage: 3.0, // Conservative default
             leverage_config: None,
             margin_buffer: 0.8,               // Use 80% of available margin
             max_notional_position: 100_000.0, // $100k max position
@@ -666,8 +666,7 @@ mod tests {
 
     #[test]
     fn test_is_stale() {
-        let config = MarginConfig::default()
-            .with_refresh_interval(Duration::from_millis(10));
+        let config = MarginConfig::default().with_refresh_interval(Duration::from_millis(10));
         let sizer = MarginAwareSizer::new(config);
 
         // Initially stale (no state set)

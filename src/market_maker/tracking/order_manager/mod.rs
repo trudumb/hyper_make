@@ -17,9 +17,7 @@ mod reconcile;
 mod types;
 
 pub use manager::OrderManager;
-pub use types::{
-    LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder,
-};
+pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder};
 
 #[cfg(test)]
 mod tests {

@@ -389,6 +389,75 @@ impl Default for KellyStochasticConfigParams {
     }
 }
 
+/// Exchange position limit parameters (from active_asset_data API).
+///
+/// Used to prevent order rejections due to exchange-enforced position limits.
+#[derive(Debug, Clone, Copy)]
+pub struct ExchangeLimitsParams {
+    /// Whether exchange limits have been fetched and are valid.
+    pub valid: bool,
+
+    /// Effective bid limit: min(local_max, exchange_available_buy).
+    /// Use this to cap bid ladder sizes.
+    pub effective_bid_limit: f64,
+
+    /// Effective ask limit: min(local_max, exchange_available_sell).
+    /// Use this to cap ask ladder sizes.
+    pub effective_ask_limit: f64,
+
+    /// Age of exchange limits in milliseconds.
+    /// > 120,000 (2 min) = stale, consider reducing sizes.
+    /// > 300,000 (5 min) = critically stale, pause quoting.
+    pub age_ms: u64,
+}
+
+impl Default for ExchangeLimitsParams {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            effective_bid_limit: f64::MAX,
+            effective_ask_limit: f64::MAX,
+            age_ms: u64::MAX,
+        }
+    }
+}
+
+impl ExchangeLimitsParams {
+    /// Check if limits are stale (> 2 minutes old).
+    pub fn is_stale(&self) -> bool {
+        self.age_ms > 120_000
+    }
+
+    /// Check if limits are critically stale (> 5 minutes old).
+    pub fn is_critically_stale(&self) -> bool {
+        self.age_ms > 300_000
+    }
+
+    /// Get effective bid limit with staleness factor applied.
+    pub fn safe_bid_limit(&self) -> f64 {
+        if !self.valid {
+            return f64::MAX;
+        }
+        match self.age_ms {
+            0..=120_000 => self.effective_bid_limit,
+            120_001..=300_000 => self.effective_bid_limit * 0.5,
+            _ => 0.0,
+        }
+    }
+
+    /// Get effective ask limit with staleness factor applied.
+    pub fn safe_ask_limit(&self) -> f64 {
+        if !self.valid {
+            return f64::MAX;
+        }
+        match self.age_ms {
+            0..=120_000 => self.effective_ask_limit,
+            120_001..=300_000 => self.effective_ask_limit * 0.5,
+            _ => 0.0,
+        }
+    }
+}
+
 // === Parameter Aggregation ===
 
 use crate::market_maker::adverse_selection::AdverseSelectionEstimator;
@@ -430,6 +499,12 @@ pub struct ParameterSources<'a> {
     pub max_position: f64,
     pub latest_mid: f64,
     pub risk_aversion: f64,
+
+    // Exchange position limits
+    pub exchange_limits_valid: bool,
+    pub exchange_effective_bid_limit: f64,
+    pub exchange_effective_ask_limit: f64,
+    pub exchange_limits_age_ms: u64,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -441,7 +516,11 @@ pub struct ParameterSources<'a> {
 /// - **Fixed**: Use config-specified fixed tau
 /// - **DiffusionBased**: τ = (δ_char / σ)² gives P(δ_char) ≈ 15.9%
 /// - **ArrivalIntensity**: τ = 1/λ (legacy, typically too short)
-fn calculate_kelly_time_horizon(config: &StochasticConfig, sigma: f64, arrival_intensity: f64) -> f64 {
+fn calculate_kelly_time_horizon(
+    config: &StochasticConfig,
+    sigma: f64,
+    arrival_intensity: f64,
+) -> f64 {
     match config.kelly_time_horizon_method {
         KellyTimeHorizonMethod::Fixed => config.kelly_tau_fixed,
         KellyTimeHorizonMethod::DiffusionBased => {
@@ -596,6 +675,14 @@ impl ParameterAggregator {
                 est.sigma_clean(),
                 arrival_intensity,
             ),
+
+            // === Exchange Position Limits ===
+            // These are populated from infra.exchange_limits in the MarketMaker
+            // Default to "not valid" - will be set explicitly when exchange limits are fetched
+            exchange_limits_valid: sources.exchange_limits_valid,
+            exchange_effective_bid_limit: sources.exchange_effective_bid_limit,
+            exchange_effective_ask_limit: sources.exchange_effective_ask_limit,
+            exchange_limits_age_ms: sources.exchange_limits_age_ms,
         }
     }
 }

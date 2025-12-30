@@ -256,7 +256,6 @@ pub struct StochasticConfig {
     pub hjb_funding_half_life: f64,
 
     // ==================== Kelly-Stochastic Parameters ====================
-
     /// Informed trader probability at the touch (0.0-1.0).
     /// Estimated from fill data or set conservatively.
     /// Default: 0.15 (15% of trades at touch are informed)
@@ -273,7 +272,6 @@ pub struct StochasticConfig {
     pub kelly_fraction: f64,
 
     // ==================== Kelly Time Horizon Parameters ====================
-
     /// Method for calculating Kelly time horizon.
     /// Default: DiffusionBased (scales τ with volatility for correct fill probabilities)
     pub kelly_time_horizon_method: KellyTimeHorizonMethod,
@@ -322,16 +320,16 @@ impl Default for StochasticConfig {
             hjb_funding_half_life: 3600.0, // 1 hour
 
             // Kelly-Stochastic parameters
-            kelly_alpha_touch: 0.15,      // 15% informed at touch
-            kelly_alpha_decay_bps: 10.0,  // Alpha decays with 10bp characteristic
-            kelly_fraction: 0.25,         // Quarter Kelly (conservative)
+            kelly_alpha_touch: 0.15,     // 15% informed at touch
+            kelly_alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
+            kelly_fraction: 0.25,        // Quarter Kelly (conservative)
 
             // Kelly time horizon parameters
             kelly_time_horizon_method: KellyTimeHorizonMethod::DiffusionBased,
-            kelly_tau_fixed: 60.0,        // 1 minute (for Fixed method)
-            kelly_tau_min: 10.0,          // 10 seconds floor
-            kelly_tau_max: 600.0,         // 10 minutes ceiling
-            kelly_char_depth_bps: 25.0,   // Mid-ladder characteristic depth
+            kelly_tau_fixed: 60.0,      // 1 minute (for Fixed method)
+            kelly_tau_min: 10.0,        // 10 seconds floor
+            kelly_tau_max: 600.0,       // 10 minutes ceiling
+            kelly_char_depth_bps: 25.0, // Mid-ladder characteristic depth
         }
     }
 }

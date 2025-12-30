@@ -127,6 +127,24 @@ struct MetricsInner {
     /// Crossed book incidents
     crossed_book_incidents: AtomicU64,
 
+    // === Exchange Position Limits Metrics ===
+    /// Exchange max long position allowed
+    exchange_max_long: AtomicF64,
+    /// Exchange max short position allowed
+    exchange_max_short: AtomicF64,
+    /// Exchange available capacity to buy
+    exchange_available_buy: AtomicF64,
+    /// Exchange available capacity to sell
+    exchange_available_sell: AtomicF64,
+    /// Effective bid limit (min of local and exchange)
+    exchange_effective_bid: AtomicF64,
+    /// Effective ask limit (min of local and exchange)
+    exchange_effective_ask: AtomicF64,
+    /// Age of exchange limits data in milliseconds
+    exchange_limits_age_ms: AtomicU64,
+    /// Whether exchange limits are valid (1 = valid, 0 = not fetched)
+    exchange_limits_valid: AtomicU64,
+
     /// Start time for uptime calculation
     start_time: Instant,
 }
@@ -169,14 +187,23 @@ impl PrometheusMetrics {
                 volatility_regime: AtomicU64::new(1), // Normal
                 // Kelly-Stochastic defaults
                 kelly_stochastic_enabled: AtomicU64::new(0),
-                kelly_alpha_touch: AtomicF64::new(0.15),    // Default 15%
-                kelly_fraction: AtomicF64::new(0.25),       // Default quarter Kelly
+                kelly_alpha_touch: AtomicF64::new(0.15), // Default 15%
+                kelly_fraction: AtomicF64::new(0.25),    // Default quarter Kelly
                 kelly_alpha_decay_bps: AtomicF64::new(10.0), // Default 10 bps
                 websocket_connected: AtomicU64::new(0),
                 last_trade_age_ms: AtomicU64::new(0),
                 last_book_age_ms: AtomicU64::new(0),
                 data_quality_issues_total: AtomicU64::new(0),
                 message_loss_count: AtomicU64::new(0),
+                // Exchange Position Limits defaults
+                exchange_max_long: AtomicF64::new(f64::MAX),
+                exchange_max_short: AtomicF64::new(f64::MAX),
+                exchange_available_buy: AtomicF64::new(f64::MAX),
+                exchange_available_sell: AtomicF64::new(f64::MAX),
+                exchange_effective_bid: AtomicF64::new(f64::MAX),
+                exchange_effective_ask: AtomicF64::new(f64::MAX),
+                exchange_limits_age_ms: AtomicU64::new(u64::MAX),
+                exchange_limits_valid: AtomicU64::new(0),
                 crossed_book_incidents: AtomicU64::new(0),
                 start_time: Instant::now(),
             }),
@@ -361,6 +388,34 @@ impl PrometheusMetrics {
         self.inner
             .crossed_book_incidents
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // === Exchange Position Limits Updates ===
+
+    /// Update exchange position limits metrics.
+    pub fn update_exchange_limits(
+        &self,
+        max_long: f64,
+        max_short: f64,
+        available_buy: f64,
+        available_sell: f64,
+        effective_bid: f64,
+        effective_ask: f64,
+        age_ms: u64,
+        valid: bool,
+    ) {
+        self.inner.exchange_max_long.store(max_long);
+        self.inner.exchange_max_short.store(max_short);
+        self.inner.exchange_available_buy.store(available_buy);
+        self.inner.exchange_available_sell.store(available_sell);
+        self.inner.exchange_effective_bid.store(effective_bid);
+        self.inner.exchange_effective_ask.store(effective_ask);
+        self.inner
+            .exchange_limits_age_ms
+            .store(age_ms, Ordering::Relaxed);
+        self.inner
+            .exchange_limits_valid
+            .store(if valid { 1 } else { 0 }, Ordering::Relaxed);
     }
 
     // === Timing Updates ===
@@ -614,6 +669,74 @@ impl PrometheusMetrics {
              mm_crossed_book_incidents{{{}}} {}\n",
             labels,
             self.inner.crossed_book_incidents.load(Ordering::Relaxed)
+        ));
+
+        // Exchange Position Limits metrics
+        let limits_valid = self.inner.exchange_limits_valid.load(Ordering::Relaxed) == 1;
+        if limits_valid {
+            output.push_str(&format!(
+                "# HELP mm_exchange_max_long Maximum long position allowed by exchange\n\
+                 # TYPE mm_exchange_max_long gauge\n\
+                 mm_exchange_max_long{{{}}} {}\n",
+                labels,
+                self.inner.exchange_max_long.load()
+            ));
+
+            output.push_str(&format!(
+                "# HELP mm_exchange_max_short Maximum short position allowed by exchange\n\
+                 # TYPE mm_exchange_max_short gauge\n\
+                 mm_exchange_max_short{{{}}} {}\n",
+                labels,
+                self.inner.exchange_max_short.load()
+            ));
+
+            output.push_str(&format!(
+                "# HELP mm_exchange_available_buy Available capacity to buy\n\
+                 # TYPE mm_exchange_available_buy gauge\n\
+                 mm_exchange_available_buy{{{}}} {}\n",
+                labels,
+                self.inner.exchange_available_buy.load()
+            ));
+
+            output.push_str(&format!(
+                "# HELP mm_exchange_available_sell Available capacity to sell\n\
+                 # TYPE mm_exchange_available_sell gauge\n\
+                 mm_exchange_available_sell{{{}}} {}\n",
+                labels,
+                self.inner.exchange_available_sell.load()
+            ));
+
+            output.push_str(&format!(
+                "# HELP mm_exchange_effective_bid Effective bid limit (min of local and exchange)\n\
+                 # TYPE mm_exchange_effective_bid gauge\n\
+                 mm_exchange_effective_bid{{{}}} {}\n",
+                labels,
+                self.inner.exchange_effective_bid.load()
+            ));
+
+            output.push_str(&format!(
+                "# HELP mm_exchange_effective_ask Effective ask limit (min of local and exchange)\n\
+                 # TYPE mm_exchange_effective_ask gauge\n\
+                 mm_exchange_effective_ask{{{}}} {}\n",
+                labels,
+                self.inner.exchange_effective_ask.load()
+            ));
+
+            output.push_str(&format!(
+                "# HELP mm_exchange_limits_age_ms Age of exchange limits data in milliseconds\n\
+                 # TYPE mm_exchange_limits_age_ms gauge\n\
+                 mm_exchange_limits_age_ms{{{}}} {}\n",
+                labels,
+                self.inner.exchange_limits_age_ms.load(Ordering::Relaxed)
+            ));
+        }
+
+        output.push_str(&format!(
+            "# HELP mm_exchange_limits_valid Whether exchange limits are valid (1=yes, 0=no)\n\
+             # TYPE mm_exchange_limits_valid gauge\n\
+             mm_exchange_limits_valid{{{}}} {}\n",
+            labels,
+            if limits_valid { 1 } else { 0 }
         ));
 
         output

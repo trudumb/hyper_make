@@ -121,7 +121,7 @@ impl Default for DepthDecayAS {
             measurement_horizon_ms: 1000, // 1 second AS measurement horizon
             max_pending_fills: 100,       // Track up to 100 pending fills
             // Kelly-Stochastic alpha calibration
-            alpha_touch: 0.15,           // Conservative default: 15% informed at touch
+            alpha_touch: 0.15, // Conservative default: 15% informed at touch
             bucket_alpha_ewma: [0.15, 0.10, 0.05, 0.02], // Decay with depth
             bucket_informed_count: [0; 4],
             bucket_total_count: [0; 4],

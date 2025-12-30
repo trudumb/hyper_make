@@ -50,11 +50,11 @@ pub struct KellyStochasticParams {
 impl Default for KellyStochasticParams {
     fn default() -> Self {
         Self {
-            sigma: 0.0001,        // 1bp/sec volatility (typical for BTC)
-            time_horizon: 10.0,   // 10 second holding period
-            alpha_touch: 0.15,    // 15% informed probability at touch
+            sigma: 0.0001,         // 1bp/sec volatility (typical for BTC)
+            time_horizon: 10.0,    // 10 second holding period
+            alpha_touch: 0.15,     // 15% informed probability at touch
             alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
-            kelly_fraction: 0.25, // Quarter Kelly (conservative)
+            kelly_fraction: 0.25,  // Quarter Kelly (conservative)
         }
     }
 }
@@ -219,13 +219,15 @@ impl ConstrainedLadderOptimizer {
             .zip(intensities.iter())
             .zip(spreads.iter())
             .zip(adverse_selections.iter())
-            .map(|(((&depth, &intensity), &spread), &as_bps)| LevelOptimizationParams {
-                depth_bps: depth,
-                fill_intensity: intensity,
-                spread_capture: spread,
-                margin_per_unit,
-                adverse_selection: as_bps,
-            })
+            .map(
+                |(((&depth, &intensity), &spread), &as_bps)| LevelOptimizationParams {
+                    depth_bps: depth,
+                    fill_intensity: intensity,
+                    spread_capture: spread,
+                    margin_per_unit,
+                    adverse_selection: as_bps,
+                },
+            )
             .collect()
     }
 
@@ -270,11 +272,8 @@ impl ConstrainedLadderOptimizer {
                     * (-level.depth_bps / kelly_params.alpha_decay_bps).exp();
 
                 // Kelly fraction: f* = E[R|fill] / Var[R|fill]
-                let kelly_f = kelly_fraction_at_level(
-                    level.spread_capture,
-                    level.adverse_selection,
-                    alpha,
-                );
+                let kelly_f =
+                    kelly_fraction_at_level(level.spread_capture, level.adverse_selection, alpha);
 
                 // Weight by fill probability and fractional Kelly
                 let weighted = p_fill * kelly_f * kelly_params.kelly_fraction;
@@ -716,9 +715,7 @@ mod tests {
 
     #[test]
     fn test_kelly_stochastic_concentrates_at_touch() {
-        let optimizer = ConstrainedLadderOptimizer::new(
-            1000.0, 0.5, 0.001, 1.0, 100.0, 10.0,
-        );
+        let optimizer = ConstrainedLadderOptimizer::new(1000.0, 0.5, 0.001, 1.0, 100.0, 10.0);
 
         // Create levels at increasing depths
         let levels = vec![

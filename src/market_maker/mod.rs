@@ -40,7 +40,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::helpers::truncate_float;
 use crate::prelude::Result;
-use crate::{InfoClient, Message, Subscription};
+use crate::{InfoClient, Message, Subscription, EPSILON};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
 const MIN_ORDER_NOTIONAL: f64 = 10.0;
@@ -191,12 +191,42 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Sync open orders from the exchange.
     /// Call this after creating the market maker to recover state.
+    ///
+    /// This method performs critical startup safety checks:
+    /// 1. Syncs position from exchange (authoritative source of truth)
+    /// 2. Cancels ALL existing orders to prevent untracked fills
+    /// 3. Refreshes margin and exchange limit state
     pub async fn sync_open_orders(&mut self) -> Result<()> {
+        // === CRITICAL: Sync position from exchange first ===
+        // Exchange position is authoritative - detect any drift from local state
+        if let Err(e) = self.sync_position_from_exchange().await {
+            warn!("Failed to sync position from exchange: {e}");
+        }
+
+        // === CRITICAL: Cancel ALL existing orders before starting ===
+        // This prevents untracked fills from orders placed in previous sessions
+        if let Err(e) = self.cancel_all_orders_on_startup().await {
+            error!("Failed to cancel existing orders on startup: {e}");
+            // Continue anyway - orders will be tracked if we find them below
+        }
+
         // === Refresh margin state on startup ===
         if let Err(e) = self.refresh_margin_state().await {
             warn!("Failed to refresh margin state on startup: {e}");
         }
 
+        // === Refresh exchange position limits on startup ===
+        if let Err(e) = self.refresh_exchange_limits().await {
+            warn!("Failed to refresh exchange limits on startup: {e}");
+        } else {
+            info!(
+                "Exchange limits initialized: bid={:.6}, ask={:.6}",
+                self.infra.exchange_limits.effective_bid_limit(),
+                self.infra.exchange_limits.effective_ask_limit()
+            );
+        }
+
+        // Track any remaining orders (should be empty after cancel-all, but be safe)
         let open_orders = self.info_client.open_orders(self.user_address).await?;
 
         for order in open_orders.iter().filter(|o| o.coin == self.config.asset) {
@@ -208,8 +238,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 Side::Sell
             };
 
-            info!(
-                "[MarketMaker] Found resting {}: oid={} sz={} px={}",
+            warn!(
+                "[MarketMaker] Unexpected order still resting after cancel-all: {} oid={} sz={} px={}",
                 if side == Side::Buy { "BUY" } else { "SELL" },
                 order.oid,
                 sz,
@@ -218,6 +248,113 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             self.orders
                 .add_order(TrackedOrder::new(order.oid, side, px, sz));
+        }
+
+        Ok(())
+    }
+
+    /// Sync position from exchange - the exchange is the authoritative source.
+    async fn sync_position_from_exchange(&mut self) -> Result<()> {
+        let user_state = self.info_client.user_state(self.user_address).await?;
+
+        // Find position for our asset
+        let exchange_position = user_state
+            .asset_positions
+            .iter()
+            .find(|p| p.position.coin == self.config.asset)
+            .map(|p| p.position.szi.parse::<f64>().unwrap_or(0.0))
+            .unwrap_or(0.0);
+
+        let local_position = self.position.position();
+        let drift = (exchange_position - local_position).abs();
+
+        if drift > crate::EPSILON {
+            warn!(
+                "Position drift detected: local={:.6}, exchange={:.6}, drift={:.6}",
+                local_position, exchange_position, drift
+            );
+            // Update local position to match exchange (authoritative)
+            self.position.set_position(exchange_position);
+            info!("Position synced from exchange: {:.6}", exchange_position);
+        } else {
+            info!(
+                "Position verified: {:.6} (exchange matches local)",
+                exchange_position
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Cancel ALL orders for our asset on startup.
+    /// Uses retry loop to ensure all orders are cancelled.
+    async fn cancel_all_orders_on_startup(&mut self) -> Result<()> {
+        const MAX_RETRIES: usize = 5;
+        const RETRY_DELAY_MS: u64 = 500;
+
+        for attempt in 0..MAX_RETRIES {
+            let open_orders = self.info_client.open_orders(self.user_address).await?;
+            let our_orders: Vec<_> = open_orders
+                .iter()
+                .filter(|o| o.coin == self.config.asset)
+                .collect();
+
+            if our_orders.is_empty() {
+                if attempt > 0 {
+                    info!("All orders cancelled after {} attempts", attempt);
+                }
+                return Ok(());
+            }
+
+            info!(
+                "Cancelling {} existing orders on startup (attempt {})",
+                our_orders.len(),
+                attempt + 1
+            );
+
+            // Cancel each order
+            for order in &our_orders {
+                let result = self
+                    .executor
+                    .cancel_order(&self.config.asset, order.oid)
+                    .await;
+                match result {
+                    CancelResult::Cancelled => {
+                        debug!("Startup cancel: oid={} cancelled", order.oid);
+                    }
+                    CancelResult::AlreadyCancelled => {
+                        debug!("Startup cancel: oid={} already cancelled", order.oid);
+                    }
+                    CancelResult::AlreadyFilled => {
+                        warn!(
+                            "Startup cancel: oid={} was already filled - position may need sync",
+                            order.oid
+                        );
+                    }
+                    CancelResult::Failed => {
+                        warn!("Startup cancel: oid={} failed, will retry", order.oid);
+                    }
+                }
+            }
+
+            // Wait before checking again
+            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+
+        // After max retries, check what's left
+        let remaining = self
+            .info_client
+            .open_orders(self.user_address)
+            .await?
+            .iter()
+            .filter(|o| o.coin == self.config.asset)
+            .count();
+
+        if remaining > 0 {
+            error!(
+                "Failed to cancel all orders after {} attempts, {} remaining",
+                MAX_RETRIES, remaining
+            );
         }
 
         Ok(())
@@ -547,6 +684,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
 
         // Build market params from econometric estimates via ParameterAggregator
+        let exchange_limits = &self.infra.exchange_limits;
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
@@ -562,6 +700,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             max_position: self.config.max_position,
             latest_mid: self.latest_mid,
             risk_aversion: self.config.risk_aversion,
+            // Exchange position limits
+            exchange_limits_valid: exchange_limits.is_initialized(),
+            exchange_effective_bid_limit: exchange_limits.effective_bid_limit(),
+            exchange_effective_ask_limit: exchange_limits.effective_ask_limit(),
+            exchange_limits_age_ms: exchange_limits.age_ms(),
         };
         let market_params = ParameterAggregator::build(&sources);
 
@@ -885,16 +1028,60 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // (pending is keyed by price, not OID)
 
                     if result.filled {
-                        // Order filled immediately - just remove from pending, don't track
-                        // The WebSocket fill notification will handle position update
-                        // We don't add to orders because it would just be cleaned up immediately
+                        // CRITICAL FIX: Order filled immediately - update position NOW
+                        // Don't wait for WebSocket which may be delayed by seconds!
+                        //
+                        // Previous bug: We removed from pending but didn't update position,
+                        // causing position drift until WebSocket arrived (100-8000ms delay).
+                        // This allowed placing duplicate orders and position runaway.
+
+                        let filled_size = result.resting_size; // 0 if fully filled
+                        let actual_fill = if filled_size < EPSILON {
+                            spec.size // Fully filled
+                        } else {
+                            spec.size - filled_size // Partial immediate fill
+                        };
+
+                        // Update position immediately from API response
+                        let is_buy = side == Side::Buy;
+                        self.position.process_fill(actual_fill, is_buy);
+
+                        // Track order as FilledImmediately for WebSocket deduplication
+                        // When WebSocket fill arrives, it will find this order and deduplicate
+                        let mut tracked =
+                            TrackedOrder::new(result.oid, side, spec.price, spec.size);
+                        tracked.filled = actual_fill;
+                        tracked.transition_to(OrderState::FilledImmediately);
+                        self.orders.add_order(tracked);
+
+                        // Remove from pending (it's now in orders)
                         self.orders.remove_pending(side, spec.price);
-                        debug!(
+
+                        // Record fill to safety components for analytics
+                        self.safety.fill_processor.pre_register_immediate_fill(result.oid);
+
+                        info!(
                             oid = result.oid,
                             price = spec.price,
                             size = spec.size,
-                            "Order filled immediately, not tracking (WebSocket will handle fill)"
+                            actual_fill = actual_fill,
+                            position = self.position.position(),
+                            "Order filled immediately - position updated, tracking for WS dedup"
                         );
+
+                        // If partially filled, still need to track the resting portion
+                        if filled_size > EPSILON {
+                            // Partial fill - some size still resting
+                            debug!(
+                                oid = result.oid,
+                                resting_size = filled_size,
+                                "Partial immediate fill, {} still resting",
+                                filled_size
+                            );
+                            // Order already added above with FilledImmediately state
+                            // It will transition to PartialFilled when WS confirms
+                        }
+
                         continue;
                     }
 
@@ -1193,6 +1380,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
         self.infra.last_margin_refresh = std::time::Instant::now();
 
+        // === Step 4b: Exchange position limits refresh ===
+        if let Err(e) = self.refresh_exchange_limits().await {
+            warn!("Failed to refresh exchange limits: {e}");
+        }
+
         // === Step 5: Exchange reconciliation ===
         let exchange_orders = self.info_client.open_orders(self.user_address).await?;
         let exchange_oids: HashSet<u64> = exchange_orders
@@ -1330,6 +1522,65 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             available = %format!("{:.2}", account_value - margin_used),
             "Margin state refreshed"
         );
+
+        Ok(())
+    }
+
+    /// Refresh exchange position limits from API.
+    ///
+    /// Fetches `active_asset_data` to get exchange-enforced position limits.
+    /// This prevents order rejections due to position limit violations.
+    async fn refresh_exchange_limits(&mut self) -> Result<()> {
+        let asset_data = self
+            .info_client
+            .active_asset_data(self.user_address, self.config.asset.clone())
+            .await?;
+
+        // Update exchange limits with local max_position for effective limit calculation
+        self.infra
+            .exchange_limits
+            .update_from_response(&asset_data, self.config.max_position);
+
+        // Log summary for diagnostics
+        let summary = self.infra.exchange_limits.summary();
+        debug!(
+            max_long = %format!("{:.6}", summary.max_long),
+            max_short = %format!("{:.6}", summary.max_short),
+            available_buy = %format!("{:.6}", summary.available_buy),
+            available_sell = %format!("{:.6}", summary.available_sell),
+            effective_bid = %format!("{:.6}", summary.effective_bid_limit),
+            effective_ask = %format!("{:.6}", summary.effective_ask_limit),
+            "Exchange position limits refreshed"
+        );
+
+        // Update Prometheus metrics
+        self.infra.prometheus.update_exchange_limits(
+            summary.max_long,
+            summary.max_short,
+            summary.available_buy,
+            summary.available_sell,
+            summary.effective_bid_limit,
+            summary.effective_ask_limit,
+            summary.age_ms,
+            true, // valid
+        );
+
+        // Warn if available capacity is low
+        let position = self.position.position();
+        if position > 0.0 && summary.available_sell < self.config.max_position * 0.1 {
+            warn!(
+                available_sell = %format!("{:.6}", summary.available_sell),
+                position = %format!("{:.6}", position),
+                "Low sell capacity - near exchange position limit"
+            );
+        }
+        if position < 0.0 && summary.available_buy < self.config.max_position * 0.1 {
+            warn!(
+                available_buy = %format!("{:.6}", summary.available_buy),
+                position = %format!("{:.6}", position),
+                "Low buy capacity - near exchange position limit"
+            );
+        }
 
         Ok(())
     }
