@@ -631,6 +631,8 @@ impl ParameterAggregator {
             fair_spread: sources.spread_tracker.fair_spread(),
             spread_percentile: sources.spread_tracker.spread_percentile(),
             spread_regime: sources.spread_tracker.spread_regime(),
+            // Market spread from observed best bid/ask
+            market_spread_bps: sources.spread_tracker.current_spread_bps(),
 
             // === First Principles Extensions (Gaps 1-10) ===
             // Jump-Diffusion (Gap 1)

@@ -66,6 +66,40 @@ pub trait QuotingStrategy: Send + Sync {
 
     /// Get the name of this strategy for logging.
     fn name(&self) -> &'static str;
+
+    // === Optional: Bayesian Fill Probability Interface ===
+
+    /// Record a fill observation for Bayesian learning.
+    ///
+    /// Strategies that maintain fill probability models (e.g., LadderStrategy)
+    /// can implement this to learn from observed fills. The default implementation
+    /// is a no-op for strategies that don't use fill probability.
+    ///
+    /// # Arguments
+    /// * `depth_bps` - Depth from mid in basis points where the order was placed
+    /// * `filled` - Whether the order filled (true) or was cancelled (false)
+    fn record_fill_observation(&mut self, _depth_bps: f64, _filled: bool) {
+        // Default: no-op for strategies without Bayesian fill models
+    }
+
+    /// Update fill model parameters from current market state.
+    ///
+    /// Strategies that maintain fill probability models should implement this
+    /// to keep their theoretical fallback aligned with current volatility.
+    ///
+    /// # Arguments
+    /// * `sigma` - Current volatility estimate
+    /// * `tau` - Time horizon for fill probability
+    fn update_fill_model_params(&mut self, _sigma: f64, _tau: f64) {
+        // Default: no-op for strategies without fill models
+    }
+
+    /// Check if the fill probability model has sufficient observations.
+    ///
+    /// Returns true for strategies without fill models (they don't need warmup).
+    fn fill_model_warmed_up(&self) -> bool {
+        true // Default: always warmed up for strategies without fill models
+    }
 }
 
 /// Blanket implementation for Box<dyn QuotingStrategy>.
@@ -106,6 +140,18 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
 
     fn name(&self) -> &'static str {
         (**self).name()
+    }
+
+    fn record_fill_observation(&mut self, depth_bps: f64, filled: bool) {
+        (**self).record_fill_observation(depth_bps, filled)
+    }
+
+    fn update_fill_model_params(&mut self, sigma: f64, tau: f64) {
+        (**self).update_fill_model_params(sigma, tau)
+    }
+
+    fn fill_model_warmed_up(&self) -> bool {
+        (**self).fill_model_warmed_up()
     }
 }
 

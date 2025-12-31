@@ -258,8 +258,7 @@ impl ConstrainedLadderOptimizer {
         // 1. Compute Kelly-weighted values for each level
         let kelly_values: Vec<f64> = levels
             .iter()
-            .enumerate()
-            .map(|(_i, level)| {
+            .map(|level| {
                 // Fill probability from first-passage time: P = 2Φ(-δ/(σ√τ))
                 let p_fill = fill_probability_stochastic(
                     level.depth_bps,

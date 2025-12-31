@@ -1,6 +1,7 @@
 //! Ladder quoting engine for multi-level quote generation.
 //!
 //! Implements multi-level quote ladders with:
+//! - **Dynamic depth generation** from GLFT optimal spread theory
 //! - Geometric or linear depth spacing
 //! - Fill intensity modeling: λ(δ) = σ²/δ²
 //! - Spread capture: SC(δ) = δ - AS₀ × exp(-δ/δ_char) - fees
@@ -11,12 +12,19 @@
 //!
 //! # Module Structure
 //!
+//! - `depth_generator`: Dynamic depth computation from market parameters
 //! - `generator`: Ladder generation logic and depth/size calculation
 //! - `optimizer`: Constrained optimization with multiple allocation strategies
 
+mod depth_generator;
+mod fill_probability;
 mod generator;
 mod optimizer;
 
+pub use depth_generator::{
+    DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator, DynamicDepths,
+};
+pub use fill_probability::{BayesianFillModel, DepthBucket, FirstPassageFillModel};
 pub use optimizer::{
     BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, KellyStochasticParams,
     LevelOptimizationParams,
@@ -52,10 +60,13 @@ pub struct LadderConfig {
     /// Number of levels per side (default: 5)
     pub num_levels: usize,
     /// Minimum depth from mid in basis points (default: 2 bps)
+    /// Used as fallback when dynamic_depths is None
     pub min_depth_bps: f64,
     /// Maximum depth from mid in basis points (default: 50 bps)
+    /// Used as fallback when dynamic_depths is None
     pub max_depth_bps: f64,
     /// Use geometric spacing (true) or linear spacing (false)
+    /// Used as fallback when dynamic_depths is None
     pub geometric_spacing: bool,
     /// Minimum size per level (orders below this are skipped)
     pub min_level_size: f64,
@@ -63,6 +74,11 @@ pub struct LadderConfig {
     pub fees_bps: f64,
     /// Adverse selection decay characteristic depth in bps
     pub as_decay_bps: f64,
+    /// Optional dynamic depths computed from market parameters.
+    /// When Some, these depths override min/max_depth_bps and geometric_spacing.
+    /// This enables GLFT-optimal depth selection that adapts to γ, κ, and market regime.
+    #[serde(skip)]
+    pub dynamic_depths: Option<DynamicDepths>,
 }
 
 impl Default for LadderConfig {
@@ -70,12 +86,49 @@ impl Default for LadderConfig {
         Self {
             num_levels: 5,
             min_depth_bps: 2.0,
-            max_depth_bps: 50.0,
+            max_depth_bps: 200.0,
             geometric_spacing: true,
             min_level_size: 0.001,
-            fees_bps: 0.5,
+            // Hyperliquid fees: maker ~1-2bp, taker ~3.5bp
+            // Round-trip = maker + taker ≈ 4.5-5.5bp
+            // We use 3.5bp as spread capture fee (half of round-trip)
+            // to account for adverse fill (we get maker, they get taker)
+            fees_bps: 3.5,
             as_decay_bps: 10.0,
+            dynamic_depths: None,
         }
+    }
+}
+
+impl LadderConfig {
+    /// Create a config with dynamic depths.
+    ///
+    /// When dynamic depths are set, they override the static min/max_depth_bps
+    /// and geometric_spacing settings.
+    pub fn with_dynamic_depths(mut self, depths: DynamicDepths) -> Self {
+        self.dynamic_depths = Some(depths);
+        self
+    }
+
+    /// Check if dynamic depths are enabled
+    pub fn has_dynamic_depths(&self) -> bool {
+        self.dynamic_depths.is_some()
+    }
+
+    /// Get effective number of bid levels (from dynamic or static config)
+    pub fn effective_bid_levels(&self) -> usize {
+        self.dynamic_depths
+            .as_ref()
+            .map(|d| d.bid.len())
+            .unwrap_or(self.num_levels)
+    }
+
+    /// Get effective number of ask levels (from dynamic or static config)
+    pub fn effective_ask_levels(&self) -> usize {
+        self.dynamic_depths
+            .as_ref()
+            .map(|d| d.ask.len())
+            .unwrap_or(self.num_levels)
     }
 }
 
@@ -121,7 +174,7 @@ mod tests {
         let config = LadderConfig::default();
         assert_eq!(config.num_levels, 5);
         assert!((config.min_depth_bps - 2.0).abs() < 0.01);
-        assert!((config.max_depth_bps - 50.0).abs() < 0.01);
+        assert!((config.max_depth_bps - 200.0).abs() < 0.01);
         assert!(config.geometric_spacing);
     }
 
@@ -135,6 +188,7 @@ mod tests {
             min_level_size: 0.01,
             fees_bps: 0.5,
             as_decay_bps: 10.0,
+            dynamic_depths: None,
         };
 
         let params = LadderParams {
@@ -217,6 +271,7 @@ mod tests {
             min_level_size: 0.01,
             fees_bps: 0.5,
             as_decay_bps: 10.0, // Ignored when depth_decay_as is Some
+            dynamic_depths: None,
         };
 
         // Calibrated AS model with higher AS at touch

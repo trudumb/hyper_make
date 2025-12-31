@@ -7,7 +7,8 @@ use crate::EPSILON;
 use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
 use crate::market_maker::quoting::{
-    ConstrainedLadderOptimizer, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
+    BayesianFillModel, ConstrainedLadderOptimizer, DepthSpacing, DynamicDepthConfig,
+    DynamicDepthGenerator, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
     LevelOptimizationParams,
 };
 
@@ -19,36 +20,159 @@ use super::{MarketParams, QuotingStrategy, RiskConfig};
 /// - Geometric or linear depth spacing
 /// - Size allocation proportional to λ(δ) × SC(δ) (fill intensity × spread capture)
 /// - GLFT inventory skew applied to entire ladder
+/// - **Bayesian fill probability**: Empirically-calibrated fill rates per depth bucket
 ///
 /// This strategy uses the same gamma calculation as GLFTStrategy but
 /// distributes liquidity across multiple price levels instead of just
 /// quoting at the touch.
+///
+/// # Bayesian Fill Model
+///
+/// The strategy maintains a `BayesianFillModel` that learns fill probabilities
+/// from observed fills. This replaces the theoretical first-passage model with
+/// empirical data when sufficient observations are available:
+///
+/// - **Initial**: Uses first-passage theory P(fill|δ,τ) = 2×Φ(-δ/(σ×√τ))
+/// - **After warmup**: Uses Beta-Binomial posterior from observed fill rates
+/// - **Depth buckets**: 2bp buckets for stable estimation
+///
+/// Call `record_fill_observation()` when orders fill or cancel to update the model.
 #[derive(Debug, Clone)]
 pub struct LadderStrategy {
     /// Risk configuration (same as GLFTStrategy)
     pub risk_config: RiskConfig,
     /// Ladder-specific configuration
     pub ladder_config: LadderConfig,
+    /// Dynamic depth generator for GLFT-optimal depths
+    depth_generator: DynamicDepthGenerator,
+    /// Bayesian fill probability model (learns from observed fills)
+    fill_model: BayesianFillModel,
 }
 
 impl LadderStrategy {
     /// Create a new ladder strategy with default configs.
     pub fn new(gamma_base: f64) -> Self {
+        let ladder_config = LadderConfig::default();
         Self {
             risk_config: RiskConfig {
                 gamma_base: gamma_base.clamp(0.01, 10.0),
                 ..Default::default()
             },
-            ladder_config: LadderConfig::default(),
+            depth_generator: Self::create_depth_generator(&ladder_config),
+            ladder_config,
+            fill_model: BayesianFillModel::default(),
         }
     }
 
     /// Create a new ladder strategy with custom configs.
     pub fn with_config(risk_config: RiskConfig, ladder_config: LadderConfig) -> Self {
         Self {
+            depth_generator: Self::create_depth_generator(&ladder_config),
             risk_config,
             ladder_config,
+            fill_model: BayesianFillModel::default(),
         }
+    }
+
+    /// Create a new ladder strategy with custom fill model parameters.
+    ///
+    /// # Arguments
+    /// * `risk_config` - Risk configuration
+    /// * `ladder_config` - Ladder configuration
+    /// * `prior_alpha` - Beta prior α (higher = stronger prior belief in fills)
+    /// * `prior_beta` - Beta prior β (higher = stronger prior belief in non-fills)
+    pub fn with_fill_model(
+        risk_config: RiskConfig,
+        ladder_config: LadderConfig,
+        prior_alpha: f64,
+        prior_beta: f64,
+    ) -> Self {
+        let sigma = 0.0001; // Default sigma, will be updated
+        let tau = 10.0; // Default tau, will be updated
+        Self {
+            depth_generator: Self::create_depth_generator(&ladder_config),
+            risk_config,
+            ladder_config,
+            fill_model: BayesianFillModel::new(prior_alpha, prior_beta, sigma, tau),
+        }
+    }
+
+    // === Bayesian Fill Model Interface ===
+
+    /// Record a fill observation for Bayesian learning.
+    ///
+    /// Call this when an order fills or cancels to update the fill probability model.
+    ///
+    /// # Arguments
+    /// * `depth_bps` - Depth from mid in basis points where the order was placed
+    /// * `filled` - Whether the order filled (true) or was cancelled (false)
+    pub fn record_fill_observation(&mut self, depth_bps: f64, filled: bool) {
+        self.fill_model.record_observation(depth_bps, filled);
+    }
+
+    /// Update fill model parameters from market state.
+    ///
+    /// Call this periodically (e.g., on each quote cycle) to keep the theoretical
+    /// fallback model aligned with current market volatility.
+    pub fn update_fill_model_params(&mut self, sigma: f64, tau: f64) {
+        self.fill_model.update_params(sigma, tau);
+    }
+
+    /// Get fill probability at a given depth.
+    ///
+    /// Uses Bayesian posterior if sufficient observations, otherwise first-passage theory.
+    pub fn fill_probability(&self, depth_bps: f64) -> f64 {
+        self.fill_model.fill_probability(depth_bps)
+    }
+
+    /// Get fill probability with explicit sigma/tau override.
+    pub fn fill_probability_with_params(&self, depth_bps: f64, sigma: f64, tau: f64) -> f64 {
+        self.fill_model
+            .fill_probability_with_params(depth_bps, sigma, tau)
+    }
+
+    /// Check if the fill model has sufficient observations.
+    pub fn fill_model_warmed_up(&self) -> bool {
+        self.fill_model.is_warmed_up()
+    }
+
+    /// Get fill model diagnostics for logging.
+    pub fn fill_model_stats(&self) -> (u64, u64) {
+        self.fill_model.total_observations()
+    }
+
+    /// Log fill model diagnostics.
+    pub fn log_fill_model_diagnostics(&self) {
+        self.fill_model.log_diagnostics();
+    }
+
+    /// Create a depth generator that inherits settings from ladder config
+    fn create_depth_generator(ladder_config: &LadderConfig) -> DynamicDepthGenerator {
+        // Spread floor should ensure profitability after fees
+        // We need at least fees_bps to break even, add 1bp buffer for safety
+        let spread_floor = (ladder_config.fees_bps + 1.0).max(ladder_config.min_depth_bps);
+
+        let config = DynamicDepthConfig {
+            num_levels: ladder_config.num_levels,
+            min_depth_bps: ladder_config.min_depth_bps.max(1.0), // At least 1bp
+            max_depth_bps: ladder_config.max_depth_bps,
+            max_depth_multiple: 5.0, // Up to 5x optimal spread
+            spacing: if ladder_config.geometric_spacing {
+                DepthSpacing::Geometric
+            } else {
+                DepthSpacing::Linear
+            },
+            geometric_ratio: 1.5, // Each level 50% further than previous
+            linear_step_bps: 3.0, // 3bp steps for linear
+            maker_fee_rate: ladder_config.fees_bps / 10000.0, // Convert bps to fraction
+            // Spread floor = fees + buffer to ensure profitability
+            // With fees_bps=3.5, floor=4.5bp means we capture at least 1bp after fees
+            min_spread_floor_bps: spread_floor,
+            enable_asymmetric: true, // Enable asymmetric bid/ask depths
+            // Cap GLFT optimal at 5x observed market spread for competitive quotes
+            market_spread_cap_multiple: 5.0,
+        };
+        DynamicDepthGenerator::new(config)
     }
 
     /// Calculate effective γ based on current market conditions.
@@ -196,6 +320,36 @@ impl LadderStrategy {
             depth_decay_as: market_params.depth_decay_as.clone(),
         };
 
+        // === DYNAMIC DEPTHS: GLFT-optimal depth computation ===
+        // Compute depths from effective gamma and kappa using GLFT formula:
+        // δ* = (1/γ) × ln(1 + γ/κ)
+        //
+        // With market spread cap: GLFT optimal is capped at 5× observed market spread
+        // to ensure competitive quotes even when GLFT parameters suggest wider spreads.
+        //
+        // For asymmetric depths, we could use separate bid/ask kappa estimates.
+        // Currently using symmetric kappa (same for both sides).
+        let dynamic_depths = self.depth_generator.compute_depths_with_market_cap(
+            gamma,
+            kappa,
+            kappa,
+            market_params.sigma,
+            market_params.market_spread_bps,
+        );
+
+        // Create ladder config with dynamic depths
+        let ladder_config = self.ladder_config.clone().with_dynamic_depths(dynamic_depths);
+
+        debug!(
+            gamma = %format!("{:.3}", gamma),
+            kappa = %format!("{:.1}", kappa),
+            sigma = %format!("{:.6}", market_params.sigma),
+            optimal_spread_bps = %format!("{:.2}", ladder_config.dynamic_depths.as_ref()
+                .and_then(|d| d.spread_at_touch())
+                .unwrap_or(0.0)),
+            "Dynamic depths computed for ladder"
+        );
+
         // === STOCHASTIC MODULE: Constrained Ladder Optimization ===
         // Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ  (expected profit)
         // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
@@ -311,14 +465,14 @@ impl LadderStrategy {
                 }
             }
 
-            // 4. Generate ladder to get depth levels and prices
-            let mut ladder = Ladder::generate(&self.ladder_config, &params);
+            // 4. Generate ladder to get depth levels and prices (using dynamic depths)
+            let mut ladder = Ladder::generate(&ladder_config, &params);
 
             // 5. Create separate optimizers for bids and asks with their respective limits
             let optimizer_bids = ConstrainedLadderOptimizer::new(
                 available_margin,
                 available_for_bids,
-                self.ladder_config.min_level_size,
+                ladder_config.min_level_size,
                 config.min_notional,
                 market_params.microprice,
                 leverage,
@@ -326,23 +480,31 @@ impl LadderStrategy {
             let optimizer_asks = ConstrainedLadderOptimizer::new(
                 available_margin,
                 available_for_asks,
-                self.ladder_config.min_level_size,
+                ladder_config.min_level_size,
                 config.min_notional,
                 market_params.microprice,
                 leverage,
             );
 
             // 5. Build LevelOptimizationParams for bids
+            // Use Kelly time horizon for Bayesian fill probability (τ for P(fill|δ,τ))
+            let tau_for_fill = market_params.kelly_time_horizon;
             let bid_level_params: Vec<_> = ladder
                 .bids
                 .iter()
                 .map(|level| {
-                    let fill_intensity =
-                        fill_intensity_at_depth(level.depth_bps, params.sigma, params.kappa);
+                    // Use Bayesian fill model (empirical when warmed up, theoretical fallback)
+                    let fill_intensity = fill_intensity_with_model(
+                        &self.fill_model,
+                        level.depth_bps,
+                        params.sigma,
+                        tau_for_fill,
+                        params.kappa,
+                    );
                     let spread_capture = spread_capture_at_depth(
                         level.depth_bps,
                         &params,
-                        self.ladder_config.fees_bps,
+                        ladder_config.fees_bps,
                     );
                     let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
                     LevelOptimizationParams {
@@ -405,12 +567,18 @@ impl LadderStrategy {
                 .asks
                 .iter()
                 .map(|level| {
-                    let fill_intensity =
-                        fill_intensity_at_depth(level.depth_bps, params.sigma, params.kappa);
+                    // Use Bayesian fill model (empirical when warmed up, theoretical fallback)
+                    let fill_intensity = fill_intensity_with_model(
+                        &self.fill_model,
+                        level.depth_bps,
+                        params.sigma,
+                        tau_for_fill,
+                        params.kappa,
+                    );
                     let spread_capture = spread_capture_at_depth(
                         level.depth_bps,
                         &params,
-                        self.ladder_config.fees_bps,
+                        ladder_config.fees_bps,
                     );
                     let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
                     LevelOptimizationParams {
@@ -474,7 +642,8 @@ impl LadderStrategy {
 
             ladder
         } else {
-            Ladder::generate(&self.ladder_config, &params)
+            // Fallback path without constrained optimization (still uses dynamic depths)
+            Ladder::generate(&ladder_config, &params)
         }
     }
 }
@@ -526,16 +695,89 @@ impl QuotingStrategy for LadderStrategy {
     fn name(&self) -> &'static str {
         "LadderGLFT"
     }
+
+    fn record_fill_observation(&mut self, depth_bps: f64, filled: bool) {
+        self.fill_model.record_observation(depth_bps, filled);
+    }
+
+    fn update_fill_model_params(&mut self, sigma: f64, tau: f64) {
+        self.fill_model.update_params(sigma, tau);
+    }
+
+    fn fill_model_warmed_up(&self) -> bool {
+        self.fill_model.is_warmed_up()
+    }
 }
 
 // ============================================================================
 // Helper Functions for Constrained Optimizer
 // ============================================================================
 
-/// Fill intensity at depth: λ(δ) = σ²/δ² × κ
+/// Fill intensity at depth using Bayesian model with time-normalized polynomial fallback.
+///
+/// Uses the Bayesian fill probability model which:
+/// - Uses empirically-calibrated Beta-Binomial posterior when sufficient observations exist
+/// - Falls back to time-normalized polynomial decay when no empirical data
+///
+/// The fallback formula `λ(δ) = κ × min(1, (σ×√τ / δ)²)` properly accounts for:
+/// - Time horizon τ: Longer horizon = more likely to fill at deeper levels
+/// - Volatility σ: Higher vol = price can reach deeper levels
+/// - Depth δ: Deeper = less likely to fill
+///
+/// This gives meaningful fill probabilities across the ladder:
+/// - At optimal depth (where σ×√τ ≈ δ): fill probability ~100%
+/// - At 2x optimal depth: fill probability ~25%
+/// - At 3x optimal depth: fill probability ~11%
+fn fill_intensity_with_model(
+    fill_model: &BayesianFillModel,
+    depth_bps: f64,
+    sigma: f64,
+    tau: f64,
+    kappa: f64,
+) -> f64 {
+    if depth_bps < EPSILON {
+        return kappa; // At touch, use kappa as baseline
+    }
+
+    // Check if we have empirical data for this depth bucket
+    let (fills, attempts) = fill_model.observations_at_depth(depth_bps);
+    if attempts >= 5 {
+        // Use Bayesian empirical fill probability when warmed up
+        // Prior: Beta(2, 2), Posterior: Beta(2 + fills, 2 + non-fills)
+        let posterior_alpha = 2.0 + fills as f64;
+        let posterior_beta = 2.0 + (attempts - fills) as f64;
+        let p_fill = posterior_alpha / (posterior_alpha + posterior_beta);
+        return (p_fill * kappa).min(kappa);
+    }
+
+    // Fallback: Time-normalized polynomial decay
+    //
+    // P(fill) ∝ (σ×√τ / δ)² where σ×√τ is the expected price move over time τ
+    //
+    // With typical values: sigma=0.0001 (1bp/sec), tau=10s
+    //   σ×√τ = 0.0001 × √10 ≈ 0.000316 ≈ 3.16bp expected move
+    //
+    // Example intensities (as fraction of kappa):
+    //   At 3bp depth: (3.16/3)² ≈ 1.0 (saturates at 1.0)
+    //   At 5bp depth: (3.16/5)² ≈ 0.4
+    //   At 10bp depth: (3.16/10)² ≈ 0.1
+    //   At 20bp depth: (3.16/20)² ≈ 0.025
+    //
+    // This provides meaningful size allocation across all levels.
+    let depth_frac = depth_bps / 10000.0;
+    let expected_move = sigma * tau.sqrt();
+    let fill_prob = (expected_move / depth_frac).powi(2).min(1.0);
+    fill_prob * kappa
+}
+
+/// Fill intensity at depth: λ(δ) = σ²/δ² × κ (theoretical fallback)
 ///
 /// Models probability of price reaching depth δ based on diffusion.
 /// At touch (δ → 0), returns kappa as baseline intensity.
+///
+/// NOTE: This is the legacy theoretical formula. Prefer `fill_intensity_with_model`
+/// when Bayesian model is available, as it uses empirically-calibrated fill rates.
+#[allow(dead_code)]
 fn fill_intensity_at_depth(depth_bps: f64, sigma: f64, kappa: f64) -> f64 {
     if depth_bps < EPSILON {
         return kappa; // At touch, use kappa as baseline

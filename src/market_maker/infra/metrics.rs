@@ -426,6 +426,7 @@ impl PrometheusMetrics {
     // === Exchange Position Limits Updates ===
 
     /// Update exchange position limits metrics.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_exchange_limits(
         &self,
         max_long: f64,

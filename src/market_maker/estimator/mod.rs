@@ -229,11 +229,16 @@ impl Default for EstimatorConfig {
             // Regime Detection - true toxic flow detection
             jump_ratio_threshold: 3.0, // RV/BV > 3.0 = toxic (lower values are normal bid-ask bounce)
 
-            // Bayesian Kappa (First Principles)
-            // Prior: κ ~ Gamma(α₀, β₀) with mean = 500, strength = 10
-            // κ = 500 implies avg fill distance = 1/500 = 0.002 = 20 bps
-            kappa_prior_mean: 500.0,
-            kappa_prior_strength: 10.0,
+            // Bayesian Kappa (First Principles) - Calibrated for liquid markets
+            // Prior: κ ~ Gamma(α₀, β₀) with mean = 2500, strength = 5
+            // κ = 2500 implies avg fill distance = 1/2500 = 0.0004 = 4 bps
+            // This is appropriate for BTC/ETH where trades execute very close to mid.
+            // For illiquid assets, use asset-specific config with lower kappa.
+            //
+            // GLFT spread formula: δ* = (1/γ) × ln(1 + γ/κ)
+            // With κ=2500, γ=0.3: δ* = 3.33 × ln(1.00012) ≈ 4bp + fees ≈ 6bp
+            kappa_prior_mean: 2500.0,
+            kappa_prior_strength: 5.0, // Lower strength = faster adaptation to real fills
             kappa_window_ms: 300_000, // 5 minutes
 
             // Warmup - reasonable for testnet/low-activity

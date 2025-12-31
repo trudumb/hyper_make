@@ -701,6 +701,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Post-processing: cleanup completed orders
         messages::cleanup_orders(&mut self.orders, &mut self.tier1.queue_tracker);
 
+        // Record fill observations to the strategy for Bayesian learning
+        // These observations update the fill probability model
+        for obs in &result.fill_observations {
+            self.strategy.record_fill_observation(obs.depth_bps, obs.filled);
+        }
+        if !result.fill_observations.is_empty() {
+            debug!(
+                observations = result.fill_observations.len(),
+                "Recorded fill observations for Bayesian learning"
+            );
+        }
+
         // Margin refresh on fills
         const MARGIN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
         if self.infra.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
@@ -834,6 +846,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             "Quote inputs with microprice"
         );
 
+        // Update fill model params for Bayesian fill probability
+        // Uses Kelly time horizon (τ) which is computed in ParameterAggregator
+        self.strategy.update_fill_model_params(
+            market_params.sigma,
+            market_params.kelly_time_horizon,
+        );
+
         // Try multi-level ladder quoting first
         let ladder = self.strategy.calculate_ladder(
             &quote_config,
@@ -932,6 +951,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Initiate cancel and update order state appropriately.
     /// Does NOT remove order from tracking - that happens via cleanup cycle.
     async fn initiate_and_track_cancel(&mut self, oid: u64) {
+        // Get order price before cancel for Bayesian learning
+        let order_price = self.orders.get_order(oid).map(|o| o.price);
+
         // Mark as CancelPending before sending request
         if !self.orders.initiate_cancel(oid) {
             debug!("Order {} not in cancellable state", oid);
@@ -945,11 +967,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Cancel confirmed - start fill window (DO NOT REMOVE YET)
                 self.orders.on_cancel_confirmed(oid);
                 info!("Cancel confirmed for oid={}, waiting for fill window", oid);
+
+                // Record cancel observation for Bayesian fill probability learning
+                // This teaches the model that orders at this depth did NOT fill
+                if let Some(price) = order_price {
+                    if self.latest_mid > 0.0 {
+                        let depth_bps = ((price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
+                        self.strategy.record_fill_observation(depth_bps, false);
+                        debug!(
+                            oid = oid,
+                            depth_bps = %format!("{:.2}", depth_bps),
+                            "Recorded cancel observation for Bayesian learning"
+                        );
+                    }
+                }
             }
             CancelResult::AlreadyFilled => {
                 // Order was filled - mark appropriately
                 self.orders.on_cancel_already_filled(oid);
                 info!("Order {} was already filled when cancelled", oid);
+                // Note: Fill observation is recorded via FillProcessor, not here
             }
             CancelResult::Failed => {
                 // Cancel failed - revert state

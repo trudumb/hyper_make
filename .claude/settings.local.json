@@ -43,7 +43,9 @@
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 180 cargo run:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk=debug timeout 90 cargo run:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=info timeout 90 cargo run:*)",
-      "Skill(sc:load)"
+      "Skill(sc:load)",
+      "Skill(sc:save)",
+      "Skill(sc:troubleshoot)"
     ]
   }
 }

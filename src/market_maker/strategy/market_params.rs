@@ -153,6 +153,10 @@ pub struct MarketParams {
     /// Spread regime (Tight/Normal/Wide)
     pub spread_regime: SpreadRegime,
 
+    /// Observed market spread in basis points (best_ask - best_bid) / mid × 10000
+    /// Used to cap GLFT optimal spread to stay competitive
+    pub market_spread_bps: f64,
+
     // === Volatility Regime ===
     /// Volatility regime (Low/Normal/High/Extreme)
     pub volatility_regime: VolatilityRegime,
@@ -320,6 +324,7 @@ impl Default for MarketParams {
             fair_spread: 0.0,
             spread_percentile: 0.5,
             spread_regime: SpreadRegime::Normal,
+            market_spread_bps: 0.0, // Will be computed from L2 book
             // Volatility Regime
             volatility_regime: VolatilityRegime::Normal,
             // First Principles Extensions

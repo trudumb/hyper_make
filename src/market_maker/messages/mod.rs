@@ -36,4 +36,4 @@ pub use context::MessageContext;
 pub use l2_book::{process_l2_book, L2BookState};
 pub use processors::*;
 pub use trades::{process_trades, TradesState};
-pub use user_fills::{cleanup_orders, process_user_fills, UserFillsResult};
+pub use user_fills::{cleanup_orders, process_user_fills, FillObservation, UserFillsResult};

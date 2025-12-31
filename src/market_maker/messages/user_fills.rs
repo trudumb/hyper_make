@@ -10,6 +10,15 @@ use super::context::MessageContext;
 use crate::market_maker::fills::{FillEvent, FillProcessor, FillState};
 use crate::market_maker::tracking::{OrderManager, QueuePositionTracker};
 
+/// A fill observation for Bayesian learning.
+#[derive(Debug, Clone, Copy)]
+pub struct FillObservation {
+    /// Depth from mid in basis points
+    pub depth_bps: f64,
+    /// Whether the order filled (true) or was cancelled (false)
+    pub filled: bool,
+}
+
 /// Result of processing UserFills message.
 #[derive(Debug, Default)]
 pub struct UserFillsResult {
@@ -23,6 +32,9 @@ pub struct UserFillsResult {
     pub should_update_quotes: bool,
     /// Number of fills for untracked orders (Phase 4: triggers reconciliation)
     pub unmatched_fills: usize,
+    /// Fill observations for Bayesian fill probability learning.
+    /// Each entry contains (depth_bps, filled=true) for the strategy to learn from.
+    pub fill_observations: Vec<FillObservation>,
 }
 
 /// Process UserFills through the FillProcessor.
@@ -86,6 +98,20 @@ pub fn process_user_fills<'a>(
             // Phase 4: Track unmatched fills for reconciliation triggering
             if !process_result.order_found {
                 result.unmatched_fills += 1;
+            }
+
+            // Record fill observation for Bayesian learning.
+            // We need to compute depth from the placement price if available.
+            if let Some(placement_price) = process_result.placement_price {
+                let depth_bps = if ctx.latest_mid > 0.0 {
+                    ((placement_price - ctx.latest_mid).abs() / ctx.latest_mid) * 10_000.0
+                } else {
+                    0.0
+                };
+                result.fill_observations.push(FillObservation {
+                    depth_bps,
+                    filled: true, // This is a fill, not a cancel
+                });
             }
         } else {
             result.fills_skipped += 1;

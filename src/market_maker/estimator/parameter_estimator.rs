@@ -177,6 +177,13 @@ impl ParameterEstimator {
 
         // Feed into MARKET kappa estimator (trade distance from mid)
         // This is the FALLBACK source - used when own_kappa confidence is low
+        //
+        // Initialize current_mid from trade price if not yet set.
+        // This prevents warmup deadlock where trades arrive before L2Book/AllMids.
+        // The trade price is close enough to mid for initial kappa estimates.
+        if self.current_mid <= 0.0 && price > 0.0 {
+            self.current_mid = price;
+        }
         if self.current_mid > 0.0 {
             self.market_kappa
                 .on_trade(timestamp_ms, price, size, self.current_mid);
@@ -349,23 +356,18 @@ impl ParameterEstimator {
         let own = self.own_kappa.posterior_mean();
         let market = self.market_kappa.posterior_mean();
 
-        // Conservative blending: when confidence is low, assume adverse selection
-        // is high and use a lower kappa (which widens spreads).
+        // Linear blending based on confidence:
+        // - 0% confidence → 100% market kappa (prior-based)
+        // - 100% confidence → 100% own kappa (fill-based)
         //
-        // Theory: Low confidence means few own fills observed. In GLFT, κ from
-        // market trades is too HIGH because market trades include uninformed flow,
-        // while our fills are adversely selected (informed traders hit us first).
+        // The prior is now calibrated for liquid markets (κ=2500 for BTC/ETH),
+        // so we no longer need the conservative 50% discount that was causing
+        // excessively wide spreads during warmup.
         //
-        // Fix: Apply a 50% discount to market kappa when confidence < 0.3
-        // This assumes ~50% adverse selection until we have enough data to know better.
-        if own_conf < 0.3 {
-            // Low confidence: be conservative, assume 50% adverse selection
-            let market_discounted = market * 0.5;
-            own_conf * own + (1.0 - own_conf) * market_discounted
-        } else {
-            // Higher confidence: trust the blend more
-            own_conf * own + (1.0 - own_conf) * market
-        }
+        // With proper prior calibration:
+        // - κ=2500 → δ* ≈ 4-6bp (competitive)
+        // - As fills accumulate, κ adapts to true fill rate
+        own_conf * own + (1.0 - own_conf) * market
     }
 
     /// Get kappa from our own order fills only (no blending).

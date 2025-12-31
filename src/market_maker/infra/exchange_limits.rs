@@ -105,20 +105,43 @@ impl ExchangePositionLimits {
         local_max_position: f64,
     ) {
         // Parse exchange limits
+        // max_trade_szs: Maximum position SIZE in contracts (e.g., 0.016 BTC)
+        // available_to_trade: Available notional in USD (e.g., 1419 USD)
         let max_long = parse_f64_or_max(&response.max_trade_szs, 0);
         let max_short = parse_f64_or_max(&response.max_trade_szs, 1);
-        let available_buy = parse_f64_or_max(&response.available_to_trade, 0);
-        let available_sell = parse_f64_or_max(&response.available_to_trade, 1);
+        let available_buy_usd = parse_f64_or_max(&response.available_to_trade, 0);
+        let available_sell_usd = parse_f64_or_max(&response.available_to_trade, 1);
+        let mark_price = response.mark_px.parse::<f64>().unwrap_or(f64::MAX);
 
-        // Store raw values
+        // Convert available notional (USD) to position size (contracts)
+        // CRITICAL FIX: available_to_trade is in USD, not contracts!
+        // We must convert: available_size = available_usd / mark_price
+        let available_buy = if mark_price > 0.0 && mark_price < f64::MAX {
+            available_buy_usd / mark_price
+        } else {
+            f64::MAX
+        };
+        let available_sell = if mark_price > 0.0 && mark_price < f64::MAX {
+            available_sell_usd / mark_price
+        } else {
+            f64::MAX
+        };
+
+        // Store raw values (in contracts for consistency)
         self.inner.max_long.store(max_long);
         self.inner.max_short.store(max_short);
         self.inner.available_buy.store(available_buy);
         self.inner.available_sell.store(available_sell);
 
-        // Pre-compute effective limits (avoids branching in hot path)
-        let effective_bid = local_max_position.min(available_buy);
-        let effective_ask = local_max_position.min(available_sell);
+        // Pre-compute effective limits using ALL constraints:
+        // 1. local_max_position: User-configured max position
+        // 2. max_long/max_short: Exchange-enforced position limits (from leverage)
+        // 3. available_buy/sell: Exchange-enforced capacity (from margin)
+        //
+        // CRITICAL: For buy orders, we must respect both max_long AND available_buy
+        // For sell orders, we must respect both max_short AND available_sell
+        let effective_bid = local_max_position.min(max_long).min(available_buy);
+        let effective_ask = local_max_position.min(max_short).min(available_sell);
         self.inner.effective_bid_limit.store(effective_bid);
         self.inner.effective_ask_limit.store(effective_ask);
 
@@ -133,6 +156,9 @@ impl ExchangePositionLimits {
             max_short = %format!("{:.6}", max_short),
             available_buy = %format!("{:.6}", available_buy),
             available_sell = %format!("{:.6}", available_sell),
+            available_buy_usd = %format!("{:.2}", available_buy_usd),
+            available_sell_usd = %format!("{:.2}", available_sell_usd),
+            mark_price = %format!("{:.2}", mark_price),
             effective_bid = %format!("{:.6}", effective_bid),
             effective_ask = %format!("{:.6}", effective_ask),
             "Exchange position limits updated"
@@ -470,11 +496,17 @@ impl AtomicF64 {
 mod tests {
     use super::*;
 
+    /// Helper to create test response.
+    ///
+    /// NOTE: avail_buy_usd and avail_sell_usd are in USD, and will be converted
+    /// to contract size using mark_px = 100000.0
+    ///
+    /// Example: avail_buy_usd = 100000.0 → available_buy = 1.0 BTC
     fn make_response(
         max_long: f64,
         max_short: f64,
-        avail_buy: f64,
-        avail_sell: f64,
+        avail_buy_usd: f64,
+        avail_sell_usd: f64,
     ) -> ActiveAssetDataResponse {
         use crate::types::Leverage;
         use alloy::primitives::Address;
@@ -488,7 +520,7 @@ mod tests {
                 raw_usd: None,
             },
             max_trade_szs: vec![max_long.to_string(), max_short.to_string()],
-            available_to_trade: vec![avail_buy.to_string(), avail_sell.to_string()],
+            available_to_trade: vec![avail_buy_usd.to_string(), avail_sell_usd.to_string()],
             mark_px: "100000.0".to_string(),
         }
     }
@@ -504,7 +536,8 @@ mod tests {
     #[test]
     fn test_update_from_response() {
         let limits = ExchangePositionLimits::new();
-        let response = make_response(1.5, 1.5, 1.0, 0.5);
+        // mark_px = 100000, so 100000 USD = 1.0 BTC, 50000 USD = 0.5 BTC
+        let response = make_response(1.5, 1.5, 100000.0, 50000.0);
 
         limits.update_from_response(&response, 2.0);
 
@@ -512,36 +545,41 @@ mod tests {
         assert!(!limits.is_stale());
         assert_eq!(limits.max_long(), 1.5);
         assert_eq!(limits.max_short(), 1.5);
-        assert_eq!(limits.available_buy(), 1.0);
-        assert_eq!(limits.available_sell(), 0.5);
-        // Effective limits are min(local, exchange)
-        assert_eq!(limits.effective_bid_limit(), 1.0); // min(2.0, 1.0)
-        assert_eq!(limits.effective_ask_limit(), 0.5); // min(2.0, 0.5)
+        assert_eq!(limits.available_buy(), 1.0); // 100000 / 100000 = 1.0
+        assert_eq!(limits.available_sell(), 0.5); // 50000 / 100000 = 0.5
+        // Effective limits are min(local, max_pos, available)
+        // min(2.0, 1.5, 1.0) = 1.0 for bids
+        // min(2.0, 1.5, 0.5) = 0.5 for asks
+        assert_eq!(limits.effective_bid_limit(), 1.0);
+        assert_eq!(limits.effective_ask_limit(), 0.5);
     }
 
     #[test]
     fn test_local_max_constrains() {
         let limits = ExchangePositionLimits::new();
-        let response = make_response(1.5, 1.5, 1.0, 1.0);
+        // mark_px = 100000, so 100000 USD = 1.0 BTC
+        let response = make_response(1.5, 1.5, 100000.0, 100000.0);
 
-        // Local max is smaller than exchange limits
+        // Local max (0.5) is smaller than exchange limits (1.5, 1.0)
         limits.update_from_response(&response, 0.5);
 
-        assert_eq!(limits.effective_bid_limit(), 0.5); // min(0.5, 1.0)
-        assert_eq!(limits.effective_ask_limit(), 0.5); // min(0.5, 1.0)
+        // min(0.5, 1.5, 1.0) = 0.5 for both
+        assert_eq!(limits.effective_bid_limit(), 0.5);
+        assert_eq!(limits.effective_ask_limit(), 0.5);
     }
 
     #[test]
     fn test_would_exceed_buy() {
         let limits = ExchangePositionLimits::new();
-        let response = make_response(1.5, 1.5, 0.5, 1.0);
+        // mark_px = 100000, so 50000 USD = 0.5 BTC, 100000 USD = 1.0 BTC
+        let response = make_response(1.5, 1.5, 50000.0, 100000.0);
         limits.update_from_response(&response, 2.0);
 
-        // Buy within limit
+        // Buy within limit (available_buy = 0.5)
         let (exceed, _) = limits.would_exceed_limit(0.3, true, 0.0);
         assert!(!exceed);
 
-        // Buy exceeds available
+        // Buy exceeds available (0.6 > 0.5)
         let (exceed, reason) = limits.would_exceed_limit(0.6, true, 0.0);
         assert!(exceed);
         assert!(reason.unwrap().contains("available"));
@@ -550,14 +588,15 @@ mod tests {
     #[test]
     fn test_would_exceed_sell() {
         let limits = ExchangePositionLimits::new();
-        let response = make_response(1.5, 1.5, 1.0, 0.3);
+        // mark_px = 100000, so 100000 USD = 1.0 BTC, 30000 USD = 0.3 BTC
+        let response = make_response(1.5, 1.5, 100000.0, 30000.0);
         limits.update_from_response(&response, 2.0);
 
-        // Sell within limit
+        // Sell within limit (available_sell = 0.3)
         let (exceed, _) = limits.would_exceed_limit(0.2, false, 0.0);
         assert!(!exceed);
 
-        // Sell exceeds available
+        // Sell exceeds available (0.5 > 0.3)
         let (exceed, reason) = limits.would_exceed_limit(0.5, false, 0.0);
         assert!(exceed);
         assert!(reason.unwrap().contains("available"));
@@ -566,15 +605,34 @@ mod tests {
     #[test]
     fn test_update_local_max() {
         let limits = ExchangePositionLimits::new();
-        let response = make_response(1.5, 1.5, 1.0, 1.0);
+        // mark_px = 100000, so 100000 USD = 1.0 BTC
+        let response = make_response(1.5, 1.5, 100000.0, 100000.0);
         limits.update_from_response(&response, 2.0);
 
+        // min(2.0, 1.5, 1.0) = 1.0
         assert_eq!(limits.effective_bid_limit(), 1.0);
 
         // Update local max to smaller value
+        // Note: update_local_max uses stored available values, but doesn't re-apply max_long/max_short
+        // So we need to check that it's min(0.3, available)
         limits.update_local_max(0.3);
         assert_eq!(limits.effective_bid_limit(), 0.3);
         assert_eq!(limits.effective_ask_limit(), 0.3);
+    }
+
+    #[test]
+    fn test_max_trade_szs_constrains() {
+        // Test that max_trade_szs (position limits) properly constrain effective limits
+        let limits = ExchangePositionLimits::new();
+        // max_long = 0.1, max_short = 0.05
+        // available_usd = 1000000 -> 10.0 BTC (much larger than max)
+        let response = make_response(0.1, 0.05, 1000000.0, 1000000.0);
+        limits.update_from_response(&response, 5.0); // local max = 5.0
+
+        // Effective should be min(local=5.0, max_long=0.1, available=10.0) = 0.1
+        assert_eq!(limits.effective_bid_limit(), 0.1);
+        // Effective should be min(local=5.0, max_short=0.05, available=10.0) = 0.05
+        assert_eq!(limits.effective_ask_limit(), 0.05);
     }
 
     #[test]

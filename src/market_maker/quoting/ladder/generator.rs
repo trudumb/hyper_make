@@ -20,13 +20,20 @@ impl Ladder {
     /// 4. Build raw ladder with price/size at each level
     /// 5. Apply inventory skew (shift prices and reduce sizes on one side)
     pub fn generate(config: &LadderConfig, params: &LadderParams) -> Self {
-        // 1. Compute depth spacing
+        // Check if we have asymmetric depths (bid ≠ ask)
+        if let Some(ref dynamic) = config.dynamic_depths {
+            if dynamic.bid != dynamic.ask {
+                return Self::generate_asymmetric(config, params);
+            }
+        }
+
+        // 1. Compute depth spacing (symmetric)
         let depths = compute_depths(config);
 
         // 2. Compute fill intensity and spread capture for each depth
         let intensities: Vec<f64> = depths
             .iter()
-            .map(|&d| fill_intensity(d, params.sigma, params.kappa))
+            .map(|&d| fill_intensity(d, params.sigma, params.kappa, params.time_horizon))
             .collect();
 
         // Use calibrated depth-dependent AS if available, else legacy config
@@ -84,6 +91,97 @@ impl Ladder {
         ladder
     }
 
+    /// Generate a ladder with asymmetric bid/ask depths.
+    ///
+    /// Used when bid and ask depths differ (e.g., different κ for each side).
+    /// Each side gets its own depth array and size allocation.
+    pub fn generate_asymmetric(config: &LadderConfig, params: &LadderParams) -> Self {
+        // 1. Get separate bid and ask depths
+        let bid_depths = compute_bid_depths(config);
+        let ask_depths = compute_ask_depths(config);
+
+        // 2. Compute fill intensity and spread capture for bid depths
+        let bid_intensities: Vec<f64> = bid_depths
+            .iter()
+            .map(|&d| fill_intensity(d, params.sigma, params.kappa, params.time_horizon))
+            .collect();
+
+        let bid_spreads: Vec<f64> = if let Some(ref depth_decay) = params.depth_decay_as {
+            bid_depths
+                .iter()
+                .map(|&d| depth_decay.spread_capture(d, config.fees_bps))
+                .collect()
+        } else {
+            bid_depths
+                .iter()
+                .map(|&d| {
+                    spread_capture(d, params.as_at_touch_bps, config.as_decay_bps, config.fees_bps)
+                })
+                .collect()
+        };
+
+        // 3. Compute fill intensity and spread capture for ask depths
+        let ask_intensities: Vec<f64> = ask_depths
+            .iter()
+            .map(|&d| fill_intensity(d, params.sigma, params.kappa, params.time_horizon))
+            .collect();
+
+        let ask_spreads: Vec<f64> = if let Some(ref depth_decay) = params.depth_decay_as {
+            ask_depths
+                .iter()
+                .map(|&d| depth_decay.spread_capture(d, config.fees_bps))
+                .collect()
+        } else {
+            ask_depths
+                .iter()
+                .map(|&d| {
+                    spread_capture(d, params.as_at_touch_bps, config.as_decay_bps, config.fees_bps)
+                })
+                .collect()
+        };
+
+        // 4. Allocate sizes separately for each side (half of total each)
+        let bid_sizes = allocate_sizes(
+            &bid_intensities,
+            &bid_spreads,
+            params.total_size / 2.0,
+            config.min_level_size,
+        );
+
+        let ask_sizes = allocate_sizes(
+            &ask_intensities,
+            &ask_spreads,
+            params.total_size / 2.0,
+            config.min_level_size,
+        );
+
+        // 5. Build raw ladder with asymmetric depths
+        let mut ladder = build_asymmetric_ladder(
+            &bid_depths,
+            &bid_sizes,
+            &ask_depths,
+            &ask_sizes,
+            params.mid_price,
+            params.decimals,
+            params.sz_decimals,
+            params.min_notional,
+        );
+
+        // 6. Apply inventory skew
+        apply_inventory_skew(
+            &mut ladder,
+            params.inventory_ratio,
+            params.gamma,
+            params.sigma,
+            params.time_horizon,
+            params.mid_price,
+            params.decimals,
+            params.sz_decimals,
+        );
+
+        ladder
+    }
+
     /// Check if ladder is empty (no valid quotes on either side)
     pub fn is_empty(&self) -> bool {
         self.bids.is_empty() && self.asks.is_empty()
@@ -120,11 +218,44 @@ impl Ladder {
     }
 }
 
-/// Compute depth levels using geometric or linear spacing.
+/// Compute depth levels using dynamic depths (if available) or geometric/linear spacing.
 ///
-/// Geometric: δ_k = δ_min × r^(k-1) where r = (δ_max/δ_min)^(1/(K-1))
-/// Linear: δ_k = δ_min + k × (δ_max - δ_min) / (K-1)
+/// If `config.dynamic_depths` is Some, returns the bid depths from there.
+/// Otherwise falls back to static computation:
+/// - Geometric: δ_k = δ_min × r^(k-1) where r = (δ_max/δ_min)^(1/(K-1))
+/// - Linear: δ_k = δ_min + k × (δ_max - δ_min) / (K-1)
 pub(crate) fn compute_depths(config: &LadderConfig) -> Vec<f64> {
+    // Use dynamic depths if available (GLFT-optimal)
+    if let Some(ref dynamic) = config.dynamic_depths {
+        // For symmetric ladder generation, use bid depths
+        // (caller can use compute_depths_asymmetric for separate bid/ask)
+        return dynamic.bid.clone();
+    }
+
+    // Fallback to static depth computation
+    compute_depths_static(config)
+}
+
+/// Compute bid-specific depths (for asymmetric ladder generation)
+pub(crate) fn compute_bid_depths(config: &LadderConfig) -> Vec<f64> {
+    if let Some(ref dynamic) = config.dynamic_depths {
+        dynamic.bid.clone()
+    } else {
+        compute_depths_static(config)
+    }
+}
+
+/// Compute ask-specific depths (for asymmetric ladder generation)
+pub(crate) fn compute_ask_depths(config: &LadderConfig) -> Vec<f64> {
+    if let Some(ref dynamic) = config.dynamic_depths {
+        dynamic.ask.clone()
+    } else {
+        compute_depths_static(config)
+    }
+}
+
+/// Static depth computation using min/max and geometric/linear spacing
+fn compute_depths_static(config: &LadderConfig) -> Vec<f64> {
     let k = config.num_levels;
     if k == 0 {
         return vec![];
@@ -148,18 +279,30 @@ pub(crate) fn compute_depths(config: &LadderConfig) -> Vec<f64> {
     }
 }
 
-/// Fill intensity model: λ(δ) = σ²/δ² × κ
+/// Fill intensity model: λ(δ) = κ × min(1, (σ×√τ / δ)²)
 ///
-/// Diffusion-driven fills: probability of price reaching depth δ
-/// scales as σ²/δ². Multiply by κ (order flow intensity) for scaling.
-pub(crate) fn fill_intensity(depth_bps: f64, sigma: f64, kappa: f64) -> f64 {
+/// Time-normalized diffusion-driven fills: probability of price reaching depth δ
+/// depends on the expected move σ×√τ over time horizon τ.
+///
+/// The formula gives meaningful fill probabilities across the ladder:
+/// - At optimal depth (where σ×√τ ≈ δ): fill probability ~100%
+/// - At 2x optimal depth: fill probability ~25%
+/// - At 3x optimal depth: fill probability ~11%
+///
+/// Example with sigma=0.0001 (1bp/sec), tau=10s:
+///   σ×√τ = 0.0001 × √10 ≈ 3.16bp expected move
+///   At 5bp depth: (3.16/5)² ≈ 0.4 → 40% of kappa
+///   At 10bp depth: (3.16/10)² ≈ 0.1 → 10% of kappa
+pub(crate) fn fill_intensity(depth_bps: f64, sigma: f64, kappa: f64, time_horizon: f64) -> f64 {
     let depth = depth_bps / 10000.0; // Convert bps to fraction
     if depth < EPSILON {
         return 0.0;
     }
-    // σ is per-second, so σ² gives variance per second
-    let diffusion_term = sigma.powi(2) / depth.powi(2);
-    diffusion_term * kappa
+    // Expected price move over time horizon τ
+    let expected_move = sigma * time_horizon.sqrt();
+    // Fill probability proportional to (expected_move / depth)², capped at 1.0
+    let fill_prob = (expected_move / depth).powi(2).min(1.0);
+    fill_prob * kappa
 }
 
 /// Spread capture: SC(δ) = δ - AS₀ × exp(-δ/δ_char) - fees
@@ -253,6 +396,77 @@ pub(crate) fn build_raw_ladder(
                 depth_bps,
             });
         }
+        if ask_price * size >= min_notional {
+            asks.push(LadderLevel {
+                price: ask_price,
+                size,
+                depth_bps,
+            });
+        }
+    }
+
+    // Sort: bids highest first (best bid), asks lowest first (best ask)
+    bids.sort_by(|a, b| {
+        b.price
+            .partial_cmp(&a.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    asks.sort_by(|a, b| {
+        a.price
+            .partial_cmp(&b.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ladder { bids, asks }
+}
+
+/// Build ladder with asymmetric depths for bids and asks.
+///
+/// Each side gets its own depth array and corresponding size array.
+/// This is used when bid/ask depths differ (e.g., different κ for each side).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_asymmetric_ladder(
+    bid_depths: &[f64],
+    bid_sizes: &[f64],
+    ask_depths: &[f64],
+    ask_sizes: &[f64],
+    mid: f64,
+    decimals: u32,
+    sz_decimals: u32,
+    min_notional: f64,
+) -> Ladder {
+    let mut bids = Vec::new();
+    let mut asks = Vec::new();
+
+    // Build bid levels
+    for (&depth_bps, &size) in bid_depths.iter().zip(bid_sizes.iter()) {
+        if size < EPSILON {
+            continue;
+        }
+
+        let offset = mid * (depth_bps / 10000.0);
+        let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
+        let size = truncate_float(size, sz_decimals, false);
+
+        if bid_price * size >= min_notional {
+            bids.push(LadderLevel {
+                price: bid_price,
+                size,
+                depth_bps,
+            });
+        }
+    }
+
+    // Build ask levels
+    for (&depth_bps, &size) in ask_depths.iter().zip(ask_sizes.iter()) {
+        if size < EPSILON {
+            continue;
+        }
+
+        let offset = mid * (depth_bps / 10000.0);
+        let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+        let size = truncate_float(size, sz_decimals, false);
+
         if ask_price * size >= min_notional {
             asks.push(LadderLevel {
                 price: ask_price,
@@ -398,15 +612,63 @@ mod tests {
 
     #[test]
     fn test_fill_intensity() {
-        // Higher intensity at tighter depths
-        let i_tight = fill_intensity(2.0, 0.001, 100.0);
-        let i_wide = fill_intensity(20.0, 0.001, 100.0);
+        let tau = 10.0; // 10 second time horizon
 
-        assert!(i_tight > i_wide);
+        // Use typical HFT sigma (0.0001 = 1bp/sec)
+        // Expected move = 0.0001 * √10 ≈ 0.000316 ≈ 3.16bp
+        let sigma = 0.0001;
+        let kappa = 100.0;
+
+        // Higher intensity at tighter depths
+        let i_tight = fill_intensity(2.0, sigma, kappa, tau);
+        let i_wide = fill_intensity(20.0, sigma, kappa, tau);
+
+        assert!(
+            i_tight > i_wide,
+            "i_tight={:.2} should be > i_wide={:.2}",
+            i_tight,
+            i_wide
+        );
 
         // Intensity at 0 depth should be 0 (avoid division by zero)
-        let i_zero = fill_intensity(0.0, 0.001, 100.0);
+        let i_zero = fill_intensity(0.0, sigma, kappa, tau);
         assert!((i_zero).abs() < EPSILON);
+
+        // With sigma=0.0001 (1bp/sec), tau=10s: expected move = 0.0001 * √10 ≈ 3.16bp
+        // At 2bp depth: (3.16/2)² ≈ 2.5, capped at 1.0 → intensity = 100
+        // At 5bp depth: (3.16/5)² ≈ 0.4 → intensity = 40
+        // At 10bp depth: (3.16/10)² ≈ 0.1 → intensity = 10
+        // At 20bp depth: (3.16/20)² ≈ 0.025 → intensity = 2.5
+        let i_2bp = fill_intensity(2.0, sigma, kappa, tau);
+        let i_5bp = fill_intensity(5.0, sigma, kappa, tau);
+        let i_10bp = fill_intensity(10.0, sigma, kappa, tau);
+        let i_20bp = fill_intensity(20.0, sigma, kappa, tau);
+
+        assert!(
+            (i_2bp - 100.0).abs() < 1.0,
+            "2bp intensity should be ~100 (capped), got {}",
+            i_2bp
+        );
+        assert!(
+            i_5bp > 35.0 && i_5bp < 45.0,
+            "5bp intensity should be ~40, got {}",
+            i_5bp
+        );
+        assert!(
+            i_10bp > 8.0 && i_10bp < 12.0,
+            "10bp intensity should be ~10, got {}",
+            i_10bp
+        );
+        assert!(
+            i_20bp > 2.0 && i_20bp < 3.0,
+            "20bp intensity should be ~2.5, got {}",
+            i_20bp
+        );
+
+        // Verify monotonic decay with depth
+        assert!(i_2bp >= i_5bp);
+        assert!(i_5bp > i_10bp);
+        assert!(i_10bp > i_20bp);
     }
 
     #[test]
