@@ -133,6 +133,11 @@ pub use market_maker::{
     // Phase 5: Rejection Rate Limiting
     RejectionRateLimiter,
     RejectionRateLimitConfig,
+    // Phase 6: Structured Logging
+    init_logging,
+    LogConfig,
+    LogFormat,
+    targets as log_targets,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;

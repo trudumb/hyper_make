@@ -243,6 +243,175 @@ pub struct RejectionRateLimitMetrics {
     pub ask_total_successes: u64,
 }
 
+// ============================================================================
+// Proactive Rate Limit Tracker
+// ============================================================================
+
+/// Configuration for proactive rate limit tracking.
+///
+/// Hyperliquid rate limits (per docs):
+/// - IP: 1200 weight/minute
+/// - Address: 1 request per 1 USDC traded (cumulative) + 10K buffer
+/// - Batched: 1 IP weight but n address requests
+#[derive(Debug, Clone)]
+pub struct ProactiveRateLimitConfig {
+    /// IP weight limit per minute (default: 1200)
+    pub ip_weight_per_minute: u32,
+    /// Warning threshold as fraction of limit (default: 0.8)
+    pub ip_warning_threshold: f64,
+    /// Address request buffer (initial budget)
+    pub address_initial_buffer: u64,
+    /// Requests per USDC traded (address budget accumulation)
+    pub requests_per_usd_traded: f64,
+    /// Minimum delay between requotes in ms
+    pub min_requote_interval_ms: u64,
+}
+
+impl Default for ProactiveRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            ip_weight_per_minute: 1200,
+            ip_warning_threshold: 0.8,
+            address_initial_buffer: 10_000,
+            requests_per_usd_traded: 1.0,
+            min_requote_interval_ms: 100, // 10 requotes/second max
+        }
+    }
+}
+
+/// Proactive rate limit tracker.
+///
+/// Tracks API usage to avoid hitting limits rather than reacting to errors.
+#[derive(Debug)]
+pub struct ProactiveRateLimitTracker {
+    config: ProactiveRateLimitConfig,
+    /// Rolling window of IP weights (last 60 seconds)
+    ip_weights: Vec<(Instant, u32)>,
+    /// Total address requests made this session
+    address_requests: u64,
+    /// Total USD volume traded (for address budget calculation)
+    usd_volume_traded: f64,
+    /// Last requote timestamp
+    last_requote: Instant,
+}
+
+impl Default for ProactiveRateLimitTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProactiveRateLimitTracker {
+    /// Create a new tracker with default config.
+    pub fn new() -> Self {
+        Self {
+            config: ProactiveRateLimitConfig::default(),
+            ip_weights: Vec::new(),
+            address_requests: 0,
+            usd_volume_traded: 0.0,
+            last_requote: Instant::now(),
+        }
+    }
+
+    /// Create with custom config.
+    pub fn with_config(config: ProactiveRateLimitConfig) -> Self {
+        Self {
+            config,
+            ip_weights: Vec::new(),
+            address_requests: 0,
+            usd_volume_traded: 0.0,
+            last_requote: Instant::now(),
+        }
+    }
+
+    /// Record an API call with its weight.
+    ///
+    /// # Arguments
+    /// - `ip_weight`: Weight for IP rate limit (1 for most calls)
+    /// - `address_requests`: Number of address-level requests (n for batched)
+    pub fn record_call(&mut self, ip_weight: u32, address_requests: u32) {
+        let now = Instant::now();
+        self.ip_weights.push((now, ip_weight));
+        self.address_requests += address_requests as u64;
+
+        // Prune old entries (> 60 seconds)
+        let cutoff = now - Duration::from_secs(60);
+        self.ip_weights.retain(|(t, _)| *t > cutoff);
+    }
+
+    /// Record a fill volume for address budget calculation.
+    pub fn record_fill_volume(&mut self, usd_value: f64) {
+        self.usd_volume_traded += usd_value;
+    }
+
+    /// Get current IP weight usage in the last minute.
+    pub fn ip_weight_used(&self) -> u32 {
+        let now = Instant::now();
+        let cutoff = now - Duration::from_secs(60);
+        self.ip_weights
+            .iter()
+            .filter(|(t, _)| *t > cutoff)
+            .map(|(_, w)| w)
+            .sum()
+    }
+
+    /// Check if we're approaching IP rate limit.
+    pub fn ip_rate_warning(&self) -> bool {
+        let used = self.ip_weight_used();
+        let threshold = (self.config.ip_weight_per_minute as f64
+            * self.config.ip_warning_threshold) as u32;
+        used >= threshold
+    }
+
+    /// Calculate remaining address budget.
+    pub fn address_budget_remaining(&self) -> i64 {
+        let budget = self.config.address_initial_buffer as f64
+            + self.usd_volume_traded * self.config.requests_per_usd_traded;
+        (budget as i64) - (self.address_requests as i64)
+    }
+
+    /// Check if address budget is low (< 1000 remaining).
+    pub fn address_budget_low(&self) -> bool {
+        self.address_budget_remaining() < 1000
+    }
+
+    /// Check if minimum requote interval has passed.
+    pub fn can_requote(&self) -> bool {
+        self.last_requote.elapsed()
+            >= Duration::from_millis(self.config.min_requote_interval_ms)
+    }
+
+    /// Mark that a requote was done.
+    pub fn mark_requote(&mut self) {
+        self.last_requote = Instant::now();
+    }
+
+    /// Get metrics for logging/monitoring.
+    pub fn get_metrics(&self) -> ProactiveRateLimitMetrics {
+        ProactiveRateLimitMetrics {
+            ip_weight_used_per_minute: self.ip_weight_used(),
+            ip_weight_limit: self.config.ip_weight_per_minute,
+            address_requests_used: self.address_requests,
+            address_budget_remaining: self.address_budget_remaining(),
+            usd_volume_traded: self.usd_volume_traded,
+            ip_warning: self.ip_rate_warning(),
+            address_warning: self.address_budget_low(),
+        }
+    }
+}
+
+/// Metrics from proactive rate limit tracker.
+#[derive(Debug, Clone)]
+pub struct ProactiveRateLimitMetrics {
+    pub ip_weight_used_per_minute: u32,
+    pub ip_weight_limit: u32,
+    pub address_requests_used: u64,
+    pub address_budget_remaining: i64,
+    pub usd_volume_traded: f64,
+    pub ip_warning: bool,
+    pub address_warning: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

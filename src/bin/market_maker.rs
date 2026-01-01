@@ -11,23 +11,20 @@ use alloy::signers::local::PrivateKeySigner;
 use axum::{routing::get, Router};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use hyperliquid_rust_sdk::{
-    AdverseSelectionConfig, BaseUrl, DataQualityConfig, DynamicRiskConfig, EstimatorConfig,
-    ExchangeClient, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient,
-    InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
-    MarginConfig, MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder,
-    PnLConfig, QueueConfig, QuotingStrategy, ReconciliationConfig, RecoveryConfig,
-    RejectionRateLimitConfig, RiskConfig, SpreadConfig, StochasticConfig, SymmetricStrategy,
+    init_logging, AdverseSelectionConfig, BaseUrl, DataQualityConfig, DynamicRiskConfig,
+    EstimatorConfig, ExchangeClient, FundingConfig, GLFTStrategy, HawkesConfig,
+    HyperliquidExecutor, InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig,
+    LadderStrategy, LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig,
+    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
+    QuotingStrategy, ReconciliationConfig, RecoveryConfig, RejectionRateLimitConfig, RiskConfig,
+    SpreadConfig, StochasticConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -90,6 +87,14 @@ struct Cli {
     /// Log file path (logs to both file and stdout)
     #[arg(long)]
     log_file: Option<String>,
+
+    /// Enable multi-stream logging (operational/diagnostic/errors)
+    #[arg(long)]
+    multi_stream_logs: bool,
+
+    /// Log directory for multi-stream logging (default: logs/)
+    #[arg(long)]
+    log_dir: Option<String>,
 
     /// Metrics HTTP port (0 to disable)
     #[arg(long)]
@@ -397,10 +402,20 @@ pub struct LoggingConfig {
     /// Optional log file path (logs to both file and stdout)
     #[serde(default)]
     pub log_file: Option<String>,
+    /// Enable multi-stream logging (operational/diagnostic/errors)
+    #[serde(default)]
+    pub multi_stream: bool,
+    /// Log directory for multi-stream logging
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_dir() -> String {
+    "logs".to_string()
 }
 
 impl Default for LoggingConfig {
@@ -409,6 +424,8 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             format: LogFormat::default(),
             log_file: None,
+            multi_stream: false,
+            log_dir: default_log_dir(),
         }
     }
 }
@@ -1013,73 +1030,60 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn std::error::Error>> {
     }
 }
 
+/// Static storage for log guards to keep them alive for the program duration.
+/// These guards ensure async log writes are flushed before program exit.
+static LOG_GUARDS: std::sync::OnceLock<Vec<tracing_appender::non_blocking::WorkerGuard>> =
+    std::sync::OnceLock::new();
+
 fn setup_logging(config: &AppConfig, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let level = cli.log_level.as_ref().unwrap_or(&config.logging.level);
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(level)
-            .add_directive("hyper::=warn".parse().unwrap())
-            .add_directive("reqwest=warn".parse().unwrap())
-            .add_directive("tokio_tungstenite=warn".parse().unwrap())
-    });
+    // Determine stdout format from CLI or config
+    let stdout_format = match cli.log_format.as_deref() {
+        Some("json") => MmLogFormat::Json,
+        Some("compact") => MmLogFormat::Compact,
+        Some("pretty") | Some(_) => MmLogFormat::Pretty,
+        None => match config.logging.format {
+            LogFormat::Json => MmLogFormat::Json,
+            LogFormat::Compact => MmLogFormat::Compact,
+            LogFormat::Pretty => MmLogFormat::Pretty,
+        },
+    };
 
-    let format = cli
-        .log_format
-        .as_deref()
-        .unwrap_or(match config.logging.format {
-            LogFormat::Json => "json",
-            LogFormat::Compact => "compact",
-            LogFormat::Pretty => "pretty",
-        });
+    // Check for multi-stream mode (CLI flag takes precedence)
+    let enable_multi_stream = cli.multi_stream_logs || config.logging.multi_stream;
 
-    // Get log file path from CLI or config
-    let log_file = cli.log_file.as_ref().or(config.logging.log_file.as_ref());
+    // Get log directory
+    let log_dir = cli
+        .log_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&config.logging.log_dir));
 
-    if let Some(log_path) = log_file {
-        // Create file writer
-        let file = std::fs::File::create(log_path)?;
-        let file = Mutex::new(file);
+    // Get log file path from CLI or config (legacy single-file mode)
+    let log_file = cli
+        .log_file
+        .as_ref()
+        .or(config.logging.log_file.as_ref())
+        .cloned();
 
-        // When logging to file, use JSON format for both (easier to parse)
-        let stdout_layer = tracing_subscriber::fmt::layer().json();
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(file)
-            .with_ansi(false)
-            .json();
+    // Build LogConfig
+    let log_config = LogConfig {
+        log_dir,
+        enable_multi_stream,
+        operational_level: "info".to_string(),
+        diagnostic_level: "debug".to_string(),
+        error_level: "warn".to_string(),
+        enable_stdout: true,
+        stdout_format,
+        log_file,
+    };
 
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(stdout_layer)
-            .with(file_layer)
-            .init();
+    // Initialize logging using the new module
+    let guards = init_logging(&log_config, Some(level))?;
 
-        eprintln!(
-            "Logging to file: {} (using JSON format for both stdout and file)",
-            log_path
-        );
-    } else {
-        // No file, just stdout with requested format
-        match format {
-            "json" => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .json()
-                    .init();
-            }
-            "compact" => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .compact()
-                    .init();
-            }
-            _ => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .with_target(false)
-                    .init();
-            }
-        }
-    }
+    // Store guards to keep them alive
+    let _ = LOG_GUARDS.set(guards);
 
     Ok(())
 }

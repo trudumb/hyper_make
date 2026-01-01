@@ -8,9 +8,9 @@ use crate::market_maker::{
     fills::FillProcessor,
     infra::{
         ConnectionHealthMonitor, DataQualityConfig, DataQualityMonitor, ExchangePositionLimits,
-        MarginAwareSizer, MarginConfig, PositionReconciler, PrometheusMetrics,
-        ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
-        RejectionRateLimiter,
+        MarginAwareSizer, MarginConfig, PositionReconciler, ProactiveRateLimitConfig,
+        ProactiveRateLimitTracker, PrometheusMetrics, ReconciliationConfig, RecoveryConfig,
+        RecoveryManager, RejectionRateLimitConfig, RejectionRateLimiter,
     },
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
@@ -133,6 +133,9 @@ pub struct InfraComponents {
     pub reconciler: PositionReconciler,
     /// Rejection-aware rate limiter (Phase 5)
     pub rate_limiter: RejectionRateLimiter,
+    /// Proactive rate limit tracker (Phase 6)
+    /// Tracks API usage to avoid hitting Hyperliquid limits
+    pub proactive_rate_tracker: ProactiveRateLimitTracker,
 }
 
 impl InfraComponents {
@@ -144,6 +147,7 @@ impl InfraComponents {
         recovery_config: RecoveryConfig,
         reconciliation_config: ReconciliationConfig,
         rate_limit_config: RejectionRateLimitConfig,
+        proactive_rate_config: ProactiveRateLimitConfig,
     ) -> Self {
         Self {
             margin_sizer: MarginAwareSizer::new(margin_config),
@@ -156,6 +160,7 @@ impl InfraComponents {
             recovery_manager: RecoveryManager::with_config(recovery_config),
             reconciler: PositionReconciler::with_config(reconciliation_config),
             rate_limiter: RejectionRateLimiter::with_config(rate_limit_config),
+            proactive_rate_tracker: ProactiveRateLimitTracker::with_config(proactive_rate_config),
         }
     }
 }

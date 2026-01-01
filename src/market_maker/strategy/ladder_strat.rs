@@ -169,8 +169,9 @@ impl LadderStrategy {
             // With fees_bps=3.5, floor=4.5bp means we capture at least 1bp after fees
             min_spread_floor_bps: spread_floor,
             enable_asymmetric: true, // Enable asymmetric bid/ask depths
-            // Cap GLFT optimal at 5x observed market spread for competitive quotes
-            market_spread_cap_multiple: 5.0,
+            // DISABLED: Trust GLFT optimal spreads from first principles
+            // Trade history showed spread cap caused -$562 loss over 9 days
+            market_spread_cap_multiple: 0.0,
         };
         DynamicDepthGenerator::new(config)
     }
@@ -231,12 +232,17 @@ impl LadderStrategy {
             1.0
         };
 
+        // Time-of-day scaling (toxic hours have higher adverse selection)
+        // Trade history showed -13 to -15 bps edge during 06-08, 14-15 UTC
+        let time_scalar = cfg.time_of_day_multiplier();
+
         let gamma_effective = cfg.gamma_base
             * vol_scalar
             * toxicity_scalar
             * inventory_scalar
             * regime_scalar
-            * hawkes_scalar;
+            * hawkes_scalar
+            * time_scalar;
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 

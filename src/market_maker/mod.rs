@@ -192,6 +192,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             recovery_config,
             reconciliation_config,
             rate_limit_config,
+            infra::ProactiveRateLimitConfig::default(),
         );
         let stochastic = core::StochasticComponents::new(
             hjb_config,
@@ -351,27 +352,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 attempt + 1
             );
 
-            // Cancel each order
-            for order in &our_orders {
-                let result = self
-                    .executor
-                    .cancel_order(&self.config.asset, order.oid)
-                    .await;
+            // RATE LIMIT OPTIMIZATION: Use bulk cancel instead of individual cancels
+            let oids: Vec<u64> = our_orders.iter().map(|o| o.oid).collect();
+            let results = self
+                .executor
+                .cancel_bulk_orders(&self.config.asset, oids.clone())
+                .await;
+
+            for (oid, result) in oids.iter().zip(results.iter()) {
                 match result {
                     CancelResult::Cancelled => {
-                        debug!("Startup cancel: oid={} cancelled", order.oid);
+                        debug!("Startup cancel: oid={} cancelled", oid);
                     }
                     CancelResult::AlreadyCancelled => {
-                        debug!("Startup cancel: oid={} already cancelled", order.oid);
+                        debug!("Startup cancel: oid={} already cancelled", oid);
                     }
                     CancelResult::AlreadyFilled => {
                         warn!(
                             "Startup cancel: oid={} was already filled - position may need sync",
-                            order.oid
+                            oid
                         );
                     }
                     CancelResult::Failed => {
-                        warn!("Startup cancel: oid={} failed, will retry", order.oid);
+                        warn!("Startup cancel: oid={} failed, will retry", oid);
                     }
                 }
             }
@@ -713,6 +716,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
+        // Record fill volume for rate limit budget calculation
+        if result.total_volume_usd > 0.0 {
+            self.infra
+                .proactive_rate_tracker
+                .record_fill_volume(result.total_volume_usd);
+            debug!(
+                volume_usd = %format!("{:.2}", result.total_volume_usd),
+                "Recorded fill volume for rate limit budget"
+            );
+        }
+
         // Margin refresh on fills
         const MARGIN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
         if self.infra.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
@@ -753,11 +767,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     }
 
     /// Update quotes based on current market state.
+    #[tracing::instrument(name = "quote_cycle", skip_all, fields(asset = %self.config.asset))]
     async fn update_quotes(&mut self) -> Result<()> {
         // Don't place orders until estimator is warmed up
         if !self.estimator.is_warmed_up() {
             return Ok(());
         }
+
+        // Phase 6: Rate limit throttling - respect minimum requote interval
+        if !self.infra.proactive_rate_tracker.can_requote() {
+            debug!("Skipping requote: minimum interval not elapsed");
+            return Ok(());
+        }
+
+        // Check for rate limit warnings
+        if self.infra.proactive_rate_tracker.ip_rate_warning() {
+            warn!("IP rate limit warning: approaching 80% of budget");
+        }
+        if self.infra.proactive_rate_tracker.address_budget_low() {
+            warn!("Address rate limit warning: budget below 1000 requests");
+        }
+
+        // Mark that we're doing a requote
+        self.infra.proactive_rate_tracker.mark_requote();
 
         // Phase 3: Check recovery state and handle IOC recovery if needed
         if let Some(action) = self.check_and_handle_recovery().await? {
@@ -948,6 +980,75 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Ok(())
     }
 
+    /// Initiate bulk cancel for multiple orders and update order states appropriately.
+    ///
+    /// RATE LIMIT OPTIMIZATION: Uses single bulk cancel API call instead of individual cancels.
+    /// Per Hyperliquid docs: batched requests are 1 weight for IP limits (vs n for individual).
+    async fn initiate_bulk_cancel(&mut self, oids: Vec<u64>) {
+        if oids.is_empty() {
+            return;
+        }
+
+        // Collect order prices for Bayesian learning before cancel
+        let order_prices: Vec<Option<f64>> = oids
+            .iter()
+            .map(|&oid| self.orders.get_order(oid).map(|o| o.price))
+            .collect();
+
+        // Mark all as CancelPending, filter out those not in cancellable state
+        let cancellable_oids: Vec<u64> = oids
+            .iter()
+            .filter(|&&oid| self.orders.initiate_cancel(oid))
+            .copied()
+            .collect();
+
+        if cancellable_oids.is_empty() {
+            debug!("No orders in cancellable state for bulk cancel");
+            return;
+        }
+
+        info!("Bulk cancelling {} orders", cancellable_oids.len());
+
+        let num_cancels = cancellable_oids.len() as u32;
+        let results = self
+            .executor
+            .cancel_bulk_orders(&self.config.asset, cancellable_oids.clone())
+            .await;
+
+        // Record API call for rate limit tracking
+        // Bulk cancel: 1 IP weight, n address requests
+        self.infra
+            .proactive_rate_tracker
+            .record_call(1, num_cancels);
+
+        // Process results and update order states
+        for (i, (oid, result)) in cancellable_oids.iter().zip(results.iter()).enumerate() {
+            let order_price = order_prices.get(i).and_then(|p| *p);
+
+            match result {
+                CancelResult::Cancelled | CancelResult::AlreadyCancelled => {
+                    self.orders.on_cancel_confirmed(*oid);
+                    // Record cancel observation for Bayesian learning
+                    if let Some(price) = order_price {
+                        if self.latest_mid > 0.0 {
+                            let depth_bps =
+                                ((price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
+                            self.strategy.record_fill_observation(depth_bps, false);
+                        }
+                    }
+                }
+                CancelResult::AlreadyFilled => {
+                    self.orders.on_cancel_already_filled(*oid);
+                    info!("Order {} was already filled when cancelled", oid);
+                }
+                CancelResult::Failed => {
+                    self.orders.on_cancel_failed(*oid);
+                    warn!("Bulk cancel failed for oid={}, reverted to active", oid);
+                }
+            }
+        }
+    }
+
     /// Initiate cancel and update order state appropriately.
     /// Does NOT remove order from tracking - that happens via cleanup cycle.
     async fn initiate_and_track_cancel(&mut self, oid: u64) {
@@ -1106,9 +1207,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // If no new quotes, cancel all existing orders
         if new_quotes.is_empty() {
-            for oid in current_orders {
-                self.initiate_and_track_cancel(oid).await;
-            }
+            // RATE LIMIT OPTIMIZATION: Use bulk cancel instead of individual cancels
+            self.initiate_bulk_cancel(current_orders).await;
             return Ok(());
         }
 
@@ -1116,10 +1216,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let needs_update = self.ladder_needs_update(side, &new_quotes);
 
         if needs_update || current_orders.is_empty() {
-            // Cancel all existing orders on this side first
-            for oid in &current_orders {
-                self.initiate_and_track_cancel(*oid).await;
-            }
+            // RATE LIMIT OPTIMIZATION: Cancel all existing orders in single API call
+            self.initiate_bulk_cancel(current_orders.clone()).await;
 
             // Build order specs for bulk placement WITH CLOIDs for deterministic tracking (Phase 1)
             let is_buy = side == Side::Buy;
@@ -1239,10 +1337,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
 
             // Place all orders in a single API call
+            let num_orders = order_specs.len() as u32;
             let results = self
                 .executor
                 .place_bulk_orders(&self.config.asset, order_specs.clone())
                 .await;
+
+            // Record API call for rate limit tracking
+            // Bulk order: 1 IP weight, n address requests
+            self.infra
+                .proactive_rate_tracker
+                .record_call(1, num_orders);
 
             // Finalize pending orders with real OIDs (using CLOID for deterministic matching)
             for (i, result) in results.iter().enumerate() {
@@ -1742,6 +1847,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Safety sync - periodically verify local state matches exchange.
     /// This is a fallback mechanism; if working correctly, should find no discrepancies.
+    #[tracing::instrument(name = "safety_sync", skip_all, fields(asset = %self.config.asset))]
     async fn safety_sync(&mut self) -> Result<()> {
         debug!("Running safety sync...");
 
@@ -1839,6 +1945,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             exchange_oids.len(),
             active_local_oids.len(),
             is_synced,
+        );
+
+        // === Step 5b: Rate limit status logging ===
+        let rate_metrics = self.infra.proactive_rate_tracker.get_metrics();
+        info!(
+            ip_weight_used = rate_metrics.ip_weight_used_per_minute,
+            ip_weight_limit = rate_metrics.ip_weight_limit,
+            address_requests = rate_metrics.address_requests_used,
+            address_budget_remaining = rate_metrics.address_budget_remaining,
+            volume_traded = %format!("{:.2}", rate_metrics.usd_volume_traded),
+            ip_warning = rate_metrics.ip_warning,
+            address_warning = rate_metrics.address_warning,
+            "[SafetySync] Rate limit status"
         );
 
         // === Step 6: Dynamic limit update ===

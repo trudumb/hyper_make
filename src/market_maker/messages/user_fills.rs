@@ -35,6 +35,8 @@ pub struct UserFillsResult {
     /// Fill observations for Bayesian fill probability learning.
     /// Each entry contains (depth_bps, filled=true) for the strategy to learn from.
     pub fill_observations: Vec<FillObservation>,
+    /// Total USD volume from new fills (for rate limit budget calculation)
+    pub total_volume_usd: f64,
 }
 
 /// Process UserFills through the FillProcessor.
@@ -99,6 +101,10 @@ pub fn process_user_fills<'a>(
             if !process_result.order_found {
                 result.unmatched_fills += 1;
             }
+
+            // Track USD volume for rate limit budget calculation
+            let fill_volume_usd = amount * fill_price;
+            result.total_volume_usd += fill_volume_usd;
 
             // Record fill observation for Bayesian learning.
             // We need to compute depth from the placement price if available.

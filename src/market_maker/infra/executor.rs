@@ -226,6 +226,23 @@ pub trait OrderExecutor: Send + Sync {
     /// - `Failed`: Cancel failed for other reasons
     async fn cancel_order(&self, asset: &str, oid: u64) -> CancelResult;
 
+    /// Cancel multiple orders in a single API call.
+    ///
+    /// RATE LIMIT OPTIMIZATION: Uses bulk cancel to reduce address-based rate limit consumption.
+    /// Per Hyperliquid docs: "A batched request with n orders is treated as one request for
+    /// IP based rate limiting, but as n requests for address-based rate limiting."
+    ///
+    /// However, cancels have a higher limit: min(limit + 100000, limit * 2).
+    /// Bulk cancel still saves on IP rate limits (1 request vs n requests).
+    ///
+    /// # Arguments
+    /// - `asset`: Asset symbol
+    /// - `oids`: List of order IDs to cancel
+    ///
+    /// # Returns
+    /// Vec of CancelResult for each order in the same order as input
+    async fn cancel_bulk_orders(&self, asset: &str, oids: Vec<u64>) -> Vec<CancelResult>;
+
     /// Modify an existing order.
     ///
     /// Updates the price and/or size of an order in place, preserving queue position
@@ -357,6 +374,7 @@ impl OrderExecutor for HyperliquidExecutor {
         OrderResult::failed_with_cloid(Some(cloid_str))
     }
 
+    #[tracing::instrument(name = "order_placement", skip_all, fields(count = orders.len(), asset = %asset))]
     async fn place_bulk_orders(&self, asset: &str, orders: Vec<OrderSpec>) -> Vec<OrderResult> {
         if orders.is_empty() {
             return vec![];
@@ -664,6 +682,87 @@ impl OrderExecutor for HyperliquidExecutor {
         }
 
         CancelResult::Failed
+    }
+
+    async fn cancel_bulk_orders(&self, asset: &str, oids: Vec<u64>) -> Vec<CancelResult> {
+        if oids.is_empty() {
+            return vec![];
+        }
+
+        info!("Bulk cancelling {} orders", oids.len());
+
+        // Convert to cancel requests
+        let cancel_requests: Vec<ClientCancelRequest> = oids
+            .iter()
+            .map(|&oid| ClientCancelRequest {
+                asset: asset.to_string(),
+                oid,
+            })
+            .collect();
+
+        let result = self.client.bulk_cancel(cancel_requests, None).await;
+
+        match result {
+            Ok(response) => match response {
+                ExchangeResponseStatus::Ok(data) => {
+                    if let Some(data) = data.data {
+                        let mut results = Vec::with_capacity(oids.len());
+
+                        for (i, status) in data.statuses.iter().enumerate() {
+                            let oid = oids.get(i).copied().unwrap_or(0);
+
+                            match status {
+                                ExchangeDataStatus::Success => {
+                                    if let Some(ref m) = self.metrics {
+                                        m.record_order_cancelled();
+                                    }
+                                    results.push(CancelResult::Cancelled);
+                                }
+                                ExchangeDataStatus::Error(e) => {
+                                    // Distinguish between "already cancelled" and "already filled"
+                                    if e.contains("filled") {
+                                        info!(
+                                            "Bulk cancel: oid={} already filled - keeping in tracking",
+                                            oid
+                                        );
+                                        results.push(CancelResult::AlreadyFilled);
+                                    } else if e.contains("already canceled")
+                                        || e.contains("does not exist")
+                                    {
+                                        info!("Bulk cancel: oid={} already cancelled", oid);
+                                        results.push(CancelResult::AlreadyCancelled);
+                                    } else {
+                                        error!("Bulk cancel error for oid={}: {}", oid, e);
+                                        results.push(CancelResult::Failed);
+                                    }
+                                }
+                                _ => {
+                                    warn!("Unexpected bulk cancel status for oid={}: {:?}", oid, status);
+                                    results.push(CancelResult::Failed);
+                                }
+                            }
+                        }
+
+                        // Fill remaining with Failed if we got fewer responses
+                        while results.len() < oids.len() {
+                            results.push(CancelResult::Failed);
+                        }
+
+                        return results;
+                    }
+                    error!("Bulk cancel response data is empty");
+                }
+                ExchangeResponseStatus::Err(e) => {
+                    error!("Bulk cancel failed: {}", e);
+                }
+            },
+            Err(e) => {
+                error!("Bulk cancel request failed: {}", e);
+            }
+        }
+
+        // All failed
+        vec![CancelResult::Failed; oids.len()]
     }
 
     async fn modify_order(

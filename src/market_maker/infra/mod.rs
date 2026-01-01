@@ -10,10 +10,12 @@
 //! - **Recovery**: Stuck position recovery state machine (Phase 3)
 //! - **Reconciliation**: Event-driven position sync (Phase 4)
 //! - **RateLimit**: Rejection-aware rate limiting (Phase 5)
+//! - **Logging**: Multi-stream structured logging (Phase 6)
 
 mod data_quality;
 mod exchange_limits;
 mod executor;
+mod logging;
 mod margin;
 mod metrics;
 mod rate_limit;
@@ -24,6 +26,7 @@ mod recovery;
 pub use data_quality::*;
 pub use exchange_limits::*;
 pub use executor::*;
+pub use logging::*;
 pub use margin::*;
 pub use metrics::*;
 pub use rate_limit::*;

@@ -173,15 +173,25 @@ impl Default for DynamicDepthConfig {
             spacing: DepthSpacing::Geometric,
             geometric_ratio: 1.5,     // Each level 50% further than previous
             linear_step_bps: 3.0,     // Or 3bp steps for linear
-            maker_fee_rate: 0.0002,   // 2bp maker fee (Hyperliquid typical)
-            // Spread floor = fees + buffer for profitability
-            // With round-trip ~5bp, need at least 5bp spread to break even
-            min_spread_floor_bps: 5.0,
+            maker_fee_rate: 0.00015,  // 1.5bp maker fee (Hyperliquid actual)
+            // FIRST PRINCIPLES: Spread floor must exceed AS + fees to be profitable
+            // Trade history analysis (Dec 2025) showed:
+            //   - Average edge needed: ~6.67 bps to break even
+            //   - GLFT optimal typically 8-9 bps
+            //   - Large trades need 13+ bps for profitability
+            // Setting floor to 8bp ensures minimum profitability
+            min_spread_floor_bps: 8.0,
             enable_asymmetric: true,
-            // Cap GLFT optimal at 5x observed market spread
-            // Prevents quoting 50bp when market is 2bp
-            // Set to 0.0 to use pure GLFT optimal
-            market_spread_cap_multiple: 5.0,
+            // FIRST PRINCIPLES: GLFT optimal spread δ* = (1/γ) × ln(1 + γ/κ)
+            // is derived from stochastic control theory and should be trusted.
+            // Capping below optimal sacrifices edge for competitive appearance.
+            //
+            // Set to 0.0 to disable capping entirely (recommended for profitability).
+            // Trade history showed capping at 5.0 (2.5× per side) caused -$562 loss.
+            //
+            // If competitive quoting is needed, set to 15.0+ (7.5× per side)
+            // to allow most GLFT optimal spreads through.
+            market_spread_cap_multiple: 0.0,  // DISABLED - trust GLFT theory
         }
     }
 }

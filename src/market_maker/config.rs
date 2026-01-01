@@ -320,9 +320,13 @@ impl Default for StochasticConfig {
             hjb_funding_half_life: 3600.0, // 1 hour
 
             // Kelly-Stochastic parameters
-            kelly_alpha_touch: 0.15,     // 15% informed at touch
-            kelly_alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
-            kelly_fraction: 0.25,        // Quarter Kelly (conservative)
+            // CALIBRATED from trade_history.csv (2,038 trades, Dec 2025):
+            // - 42.5% win rate suggests ~25% informed flow at touch
+            // - Large trades (>$2k) had -11.58 bps edge, 14.3% win rate
+            // - Conservatively set alpha higher than measured AS
+            kelly_alpha_touch: 0.25,     // 25% informed at touch (was 0.15)
+            kelly_alpha_decay_bps: 15.0, // Slower decay for wider protection (was 10)
+            kelly_fraction: 0.20,        // Conservative 1/5 Kelly (was 0.25)
 
             // Kelly time horizon parameters
             kelly_time_horizon_method: KellyTimeHorizonMethod::DiffusionBased,

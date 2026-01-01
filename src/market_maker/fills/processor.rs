@@ -173,6 +173,7 @@ impl FillProcessor {
     /// 7. Logs fill and threshold warnings
     ///
     /// Returns detailed processing result.
+    #[tracing::instrument(name = "fill_processing", skip_all, fields(oid = fill.oid, tid = fill.tid, side = %if fill.is_buy { "buy" } else { "sell" }))]
     pub fn process(&mut self, fill: &FillEvent, state: &mut FillState) -> FillProcessingResult {
         // Step 1: Centralized deduplication
         if !self.deduplicator.check_and_mark(fill.tid) {

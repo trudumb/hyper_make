@@ -122,6 +122,7 @@ impl RiskAggregator {
     }
 
     /// Evaluate all monitors against the current state.
+    #[tracing::instrument(name = "risk_evaluation", skip_all, fields(num_monitors = self.monitors.len()))]
     pub fn evaluate(&self, state: &RiskState) -> AggregatedRisk {
         let mut result = AggregatedRisk::default();
 
