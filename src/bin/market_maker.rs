@@ -816,6 +816,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sz_decimals,
         multi_asset: false, // Single-asset mode by default
         stochastic: StochasticConfig::default(),
+        smart_reconcile: true, // Enable queue-preserving ORDER MODIFY by default
     };
 
     // Create strategy based on config

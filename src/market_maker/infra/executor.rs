@@ -1,7 +1,7 @@
 //! Order execution abstraction for the market maker.
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     ClientCancelRequest, ClientLimit, ClientModifyRequest, ClientOrder, ClientOrderRequest,
@@ -180,6 +180,20 @@ impl OrderSpec {
     }
 }
 
+/// Specification for order modification.
+/// Used with bulk modify to preserve queue position when updating multiple orders.
+#[derive(Debug, Clone)]
+pub struct ModifySpec {
+    /// Order ID to modify
+    pub oid: u64,
+    /// New limit price
+    pub new_price: f64,
+    /// New order size
+    pub new_size: f64,
+    /// Whether this is a buy order
+    pub is_buy: bool,
+}
+
 /// Trait for order execution.
 /// Abstracts the exchange client to enable testing and mocking.
 #[async_trait]
@@ -265,6 +279,19 @@ pub trait OrderExecutor: Send + Sync {
         new_size: f64,
         is_buy: bool,
     ) -> ModifyResult;
+
+    /// Modify multiple orders in a single API call.
+    ///
+    /// RATE LIMIT OPTIMIZATION: Uses bulk modify to reduce API calls.
+    /// Preserves queue position where possible, which is critical for spread capturing.
+    ///
+    /// # Arguments
+    /// - `asset`: Asset symbol
+    /// - `modifies`: List of modification specifications
+    ///
+    /// # Returns
+    /// Vec of ModifyResult for each order in the same order as input
+    async fn modify_bulk_orders(&self, asset: &str, modifies: Vec<ModifySpec>) -> Vec<ModifyResult>;
 }
 
 /// Hyperliquid exchange executor.
@@ -407,7 +434,7 @@ impl OrderExecutor for HyperliquidExecutor {
             .collect();
 
         let num_orders = order_requests.len();
-        info!("Placing {} orders in bulk with CLOIDs", num_orders);
+        debug!("Placing {} orders in bulk with CLOIDs", num_orders);
 
         let result = self.client.bulk_order(order_requests, None).await;
 
@@ -416,6 +443,9 @@ impl OrderExecutor for HyperliquidExecutor {
                 ExchangeResponseStatus::Ok(data) => {
                     if let Some(data) = data.data {
                         let mut results = Vec::with_capacity(num_orders);
+                        let mut resting_oids = Vec::new();
+                        let mut filled_oids = Vec::new();
+                        let mut error_count = 0u32;
 
                         // Each status corresponds to one order in sequence
                         for (i, status) in data.statuses.iter().enumerate() {
@@ -425,10 +455,7 @@ impl OrderExecutor for HyperliquidExecutor {
 
                             match status {
                                 ExchangeDataStatus::Filled(order) => {
-                                    info!(
-                                        "Bulk order {} filled immediately: oid={} cloid={:?}",
-                                        i, order.oid, cloid
-                                    );
+                                    filled_oids.push(order.oid);
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -441,10 +468,7 @@ impl OrderExecutor for HyperliquidExecutor {
                                     });
                                 }
                                 ExchangeDataStatus::Resting(order) => {
-                                    info!(
-                                        "Bulk order {} resting: oid={} cloid={:?}",
-                                        i, order.oid, cloid
-                                    );
+                                    resting_oids.push(order.oid);
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -461,14 +485,26 @@ impl OrderExecutor for HyperliquidExecutor {
                                         "Bulk order {} rejected: asset={} side={} sz={} price={} cloid={:?} error={}",
                                         i, asset, side, spec.size, spec.price, cloid, e
                                     );
+                                    error_count += 1;
                                     // Phase 5: Capture error for rate limiter
                                     results.push(OrderResult::failed_with_cloid_and_error(cloid, e.clone()));
                                 }
                                 _ => {
                                     warn!("Unexpected bulk order {} status: {:?}", i, status);
+                                    error_count += 1;
                                     results.push(OrderResult::failed_with_cloid(cloid));
                                 }
                             }
+                        }
+
+                        // Log consolidated summary instead of per-order logs
+                        if !resting_oids.is_empty() || !filled_oids.is_empty() {
+                            info!(
+                                resting = resting_oids.len(),
+                                filled = filled_oids.len(),
+                                errors = error_count,
+                                "Bulk order placed"
+                            );
                         }
 
                         // If we got fewer statuses than orders, fill remaining with failures
@@ -852,5 +888,104 @@ impl OrderExecutor for HyperliquidExecutor {
                 return ModifyResult::failed(e.to_string());
             }
         }
+    }
+
+    async fn modify_bulk_orders(&self, asset: &str, modifies: Vec<ModifySpec>) -> Vec<ModifyResult> {
+        if modifies.is_empty() {
+            return vec![];
+        }
+
+        let num_modifies = modifies.len();
+
+        // Convert ModifySpec to ClientModifyRequest
+        let modify_requests: Vec<ClientModifyRequest> = modifies
+            .iter()
+            .map(|spec| ClientModifyRequest {
+                oid: spec.oid,
+                order: ClientOrderRequest {
+                    asset: asset.to_string(),
+                    is_buy: spec.is_buy,
+                    reduce_only: false,
+                    limit_px: spec.new_price,
+                    sz: spec.new_size,
+                    cloid: None,
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Gtc".to_string(),
+                    }),
+                },
+            })
+            .collect();
+
+        let result = self.client.bulk_modify(modify_requests, None).await;
+
+        match result {
+            Ok(response) => match response {
+                ExchangeResponseStatus::Ok(data) => {
+                    if let Some(data) = data.data {
+                        let mut results = Vec::with_capacity(num_modifies);
+                        let mut success_count = 0u32;
+                        let mut error_count = 0u32;
+
+                        for (i, status) in data.statuses.iter().enumerate() {
+                            let spec = &modifies[i];
+
+                            match status {
+                                ExchangeDataStatus::Filled(order) => {
+                                    if let Some(ref m) = self.metrics {
+                                        m.record_order_placed();
+                                    }
+                                    success_count += 1;
+                                    results.push(ModifyResult::success(order.oid, spec.new_size));
+                                }
+                                ExchangeDataStatus::Resting(order) => {
+                                    if let Some(ref m) = self.metrics {
+                                        m.record_order_placed();
+                                    }
+                                    success_count += 1;
+                                    results.push(ModifyResult::success(order.oid, spec.new_size));
+                                }
+                                ExchangeDataStatus::Error(e) => {
+                                    error_count += 1;
+                                    results.push(ModifyResult::failed(e.clone()));
+                                }
+                                _ => {
+                                    error_count += 1;
+                                    results.push(ModifyResult::failed("Unexpected status".to_string()));
+                                }
+                            }
+                        }
+
+                        // Log consolidated summary
+                        if success_count > 0 || error_count > 0 {
+                            info!(
+                                success = success_count,
+                                errors = error_count,
+                                "Bulk modify completed"
+                            );
+                        }
+
+                        // Fill remaining with failed if we got fewer responses
+                        while results.len() < num_modifies {
+                            results.push(ModifyResult::failed("Missing response".to_string()));
+                        }
+
+                        return results;
+                    }
+                    error!("Bulk modify response data is empty");
+                }
+                ExchangeResponseStatus::Err(e) => {
+                    error!("Bulk modify failed: {}", e);
+                }
+            },
+            Err(e) => {
+                error!("Bulk modify request failed: {}", e);
+            }
+        }
+
+        // All failed
+        modifies
+            .iter()
+            .map(|_| ModifyResult::failed("Bulk modify failed".to_string()))
+            .collect()
     }
 }

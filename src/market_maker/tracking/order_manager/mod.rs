@@ -17,6 +17,7 @@ mod reconcile;
 mod types;
 
 pub use manager::OrderManager;
+pub use reconcile::{reconcile_side_smart, ReconcileConfig};
 pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder};
 
 #[cfg(test)]

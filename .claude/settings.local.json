@@ -46,7 +46,8 @@
       "Skill(sc:load)",
       "Skill(sc:save)",
       "Skill(sc:troubleshoot)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(git filter-branch:*)"
     ]
   }
 }

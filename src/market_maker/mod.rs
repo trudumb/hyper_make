@@ -941,8 +941,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
 
             // Reconcile ladder quotes
-            self.reconcile_ladder_side(Side::Buy, bid_quotes).await?;
-            self.reconcile_ladder_side(Side::Sell, ask_quotes).await?;
+            if self.config.smart_reconcile {
+                // Smart reconciliation with ORDER MODIFY for queue preservation
+                self.reconcile_ladder_smart(bid_quotes, ask_quotes).await?;
+            } else {
+                // Legacy all-or-nothing reconciliation
+                self.reconcile_ladder_side(Side::Buy, bid_quotes).await?;
+                self.reconcile_ladder_side(Side::Sell, ask_quotes).await?;
+            }
         } else {
             // Fallback to single-quote mode for non-ladder strategies
             let (mut bid, mut ask) = self.strategy.calculate_quotes(
@@ -1007,7 +1013,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return;
         }
 
-        info!("Bulk cancelling {} orders", cancellable_oids.len());
+        // Debug level here since executor.rs logs at INFO level
+        debug!("Bulk cancelling {} orders", cancellable_oids.len());
 
         let num_cancels = cancellable_oids.len() as u32;
         let results = self
@@ -1524,6 +1531,219 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         false
     }
 
+    /// Smart ladder reconciliation with ORDER MODIFY for queue preservation.
+    ///
+    /// Uses differential updates (SKIP/MODIFY/CANCEL+PLACE) to preserve queue position
+    /// when possible. Both sides are processed in parallel for reduced latency.
+    ///
+    /// Decision logic per level:
+    /// - SKIP: Order unchanged (price ≤1 bps, size ≤5%)
+    /// - MODIFY: Small change (price ≤10 bps, size ≤50%) - preserves queue
+    /// - CANCEL+PLACE: Large change - fresh queue position
+    async fn reconcile_ladder_smart(
+        &mut self,
+        bid_quotes: Vec<Quote>,
+        ask_quotes: Vec<Quote>,
+    ) -> Result<()> {
+        use crate::market_maker::tracking::{reconcile_side_smart, ReconcileConfig};
+        use crate::market_maker::quoting::LadderLevel;
+
+        let reconcile_config = ReconcileConfig::default();
+
+        // Convert Quote to LadderLevel for reconciliation
+        let bid_levels: Vec<LadderLevel> = bid_quotes
+            .iter()
+            .map(|q| LadderLevel {
+                price: q.price,
+                size: q.size,
+                depth_bps: 0.0, // Not used for reconciliation
+            })
+            .collect();
+
+        let ask_levels: Vec<LadderLevel> = ask_quotes
+            .iter()
+            .map(|q| LadderLevel {
+                price: q.price,
+                size: q.size,
+                depth_bps: 0.0,
+            })
+            .collect();
+
+        // Get current orders for each side
+        let current_bids: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Buy);
+        let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
+
+        // Generate actions for each side using smart reconciliation
+        let bid_actions = reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, &reconcile_config);
+        let ask_actions = reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, &reconcile_config);
+
+        // Partition actions by type for batching
+        let (bid_cancels, bid_modifies, bid_places) = partition_ladder_actions(&bid_actions, Side::Buy);
+        let (ask_cancels, ask_modifies, ask_places) = partition_ladder_actions(&ask_actions, Side::Sell);
+
+        // Log action summary (skip count only considers existing orders minus those modified/cancelled)
+        let _total_skips = (current_bids.len() + current_asks.len())
+            .saturating_sub(bid_cancels.len() + bid_modifies.len() + ask_cancels.len() + ask_modifies.len());
+        if !bid_actions.is_empty() || !ask_actions.is_empty() {
+            debug!(
+                bid_skip = current_bids.len().saturating_sub(bid_cancels.len() + bid_modifies.len()),
+                bid_modify = bid_modifies.len(),
+                bid_cancel = bid_cancels.len(),
+                bid_place = bid_places.len(),
+                ask_skip = current_asks.len().saturating_sub(ask_cancels.len() + ask_modifies.len()),
+                ask_modify = ask_modifies.len(),
+                ask_cancel = ask_cancels.len(),
+                ask_place = ask_places.len(),
+                "Smart reconciliation actions"
+            );
+        }
+
+        // Execute cancels first (bulk cancel is efficient)
+        let all_cancels: Vec<u64> = bid_cancels.into_iter().chain(ask_cancels).collect();
+        if !all_cancels.is_empty() {
+            self.initiate_bulk_cancel(all_cancels).await;
+        }
+
+        // Execute modifies (preserves queue position)
+        let all_modifies: Vec<ModifySpec> = bid_modifies.into_iter().chain(ask_modifies).collect();
+        if !all_modifies.is_empty() {
+            let num_modifies = all_modifies.len() as u32;
+            let modify_results = self
+                .executor
+                .modify_bulk_orders(&self.config.asset, all_modifies.clone())
+                .await;
+
+            // Record API call for rate tracking
+            self.infra.proactive_rate_tracker.record_call(1, num_modifies);
+
+            // Process modify results
+            for (i, result) in modify_results.iter().enumerate() {
+                let spec = &all_modifies[i];
+                if result.success {
+                    // Update tracking with new price/size
+                    self.orders.on_modify_success(spec.oid, spec.new_price, spec.new_size);
+                    // Record successful modify in metrics
+                    self.infra.prometheus.record_order_modified();
+                } else {
+                    // Modify failed - fallback to cancel+place
+                    warn!(
+                        oid = spec.oid,
+                        error = ?result.error,
+                        "Modify failed, falling back to cancel+place"
+                    );
+                    // Record fallback in metrics
+                    self.infra.prometheus.record_modify_fallback();
+                    // Cancel the order (may already be gone)
+                    let _ = self.executor.cancel_order(&self.config.asset, spec.oid).await;
+
+                    // Place new order at target price/size
+                    let cloid = uuid::Uuid::new_v4().to_string();
+                    let order_spec = OrderSpec::with_cloid(
+                        spec.new_price,
+                        spec.new_size,
+                        spec.is_buy,
+                        cloid,
+                    );
+                    let _ = self.executor.place_order(
+                        &self.config.asset,
+                        order_spec.price,
+                        order_spec.size,
+                        order_spec.is_buy,
+                    ).await;
+                }
+            }
+        }
+
+        // Execute places (new orders)
+        if !bid_places.is_empty() {
+            self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
+        }
+        if !ask_places.is_empty() {
+            self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Helper to place bulk ladder orders with proper tracking and margin checks.
+    async fn place_bulk_ladder_orders(
+        &mut self,
+        side: Side,
+        orders: Vec<(f64, f64)>, // (price, size) tuples
+    ) -> Result<()> {
+        let is_buy = side == Side::Buy;
+
+        let mut order_specs: Vec<OrderSpec> = Vec::new();
+        for (price, size) in orders {
+            if size <= 0.0 {
+                continue;
+            }
+
+            // Apply margin check
+            let sizing_result = self.infra.margin_sizer.adjust_size(
+                size,
+                price,
+                self.position.position(),
+                is_buy,
+            );
+
+            if sizing_result.adjusted_size <= 0.0 {
+                continue;
+            }
+
+            let truncated_size = truncate_float(
+                sizing_result.adjusted_size,
+                self.config.sz_decimals,
+                false,
+            );
+            if truncated_size <= 0.0 {
+                continue;
+            }
+
+            let cloid = uuid::Uuid::new_v4().to_string();
+            order_specs.push(OrderSpec::with_cloid(price, truncated_size, is_buy, cloid));
+        }
+
+        if order_specs.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-register as pending
+        for spec in &order_specs {
+            if let Some(ref cloid) = spec.cloid {
+                self.orders.add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+            }
+        }
+
+        // Place orders
+        let num_orders = order_specs.len() as u32;
+        let results = self.executor.place_bulk_orders(&self.config.asset, order_specs.clone()).await;
+
+        // Record API call
+        self.infra.proactive_rate_tracker.record_call(1, num_orders);
+
+        // Finalize pending orders
+        for (i, result) in results.iter().enumerate() {
+            let spec = &order_specs[i];
+            if result.oid > 0 {
+                self.infra.rate_limiter.record_success(is_buy);
+
+                let order = if let Some(ref cloid) = spec.cloid {
+                    TrackedOrder::with_cloid(result.oid, cloid.clone(), side, spec.price, spec.size)
+                } else {
+                    TrackedOrder::new(result.oid, side, spec.price, spec.size)
+                };
+                self.orders.add_order(order);
+
+                if let Some(ref cloid) = spec.cloid {
+                    self.orders.remove_pending_by_cloid(cloid);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Phase 3: Check recovery state and handle IOC recovery if needed.
     ///
     /// This method implements the recovery state machine for stuck reduce-only mode:
@@ -1948,17 +2168,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
 
         // === Step 5b: Rate limit status logging ===
+        // Only log at INFO level if there are warnings, otherwise DEBUG to reduce noise
         let rate_metrics = self.infra.proactive_rate_tracker.get_metrics();
-        info!(
-            ip_weight_used = rate_metrics.ip_weight_used_per_minute,
-            ip_weight_limit = rate_metrics.ip_weight_limit,
-            address_requests = rate_metrics.address_requests_used,
-            address_budget_remaining = rate_metrics.address_budget_remaining,
-            volume_traded = %format!("{:.2}", rate_metrics.usd_volume_traded),
-            ip_warning = rate_metrics.ip_warning,
-            address_warning = rate_metrics.address_warning,
-            "[SafetySync] Rate limit status"
-        );
+        if rate_metrics.ip_warning || rate_metrics.address_warning {
+            warn!(
+                ip_weight_used = rate_metrics.ip_weight_used_per_minute,
+                ip_weight_limit = rate_metrics.ip_weight_limit,
+                address_requests = rate_metrics.address_requests_used,
+                address_budget_remaining = rate_metrics.address_budget_remaining,
+                volume_traded = %format!("{:.2}", rate_metrics.usd_volume_traded),
+                ip_warning = rate_metrics.ip_warning,
+                address_warning = rate_metrics.address_warning,
+                "[SafetySync] Rate limit WARNING"
+            );
+        } else {
+            debug!(
+                ip_weight_used = rate_metrics.ip_weight_used_per_minute,
+                address_requests = rate_metrics.address_requests_used,
+                "[SafetySync] Rate limit OK"
+            );
+        }
 
         // === Step 6: Dynamic limit update ===
         let account_value = self.infra.margin_sizer.state().account_value;
@@ -2281,4 +2510,48 @@ fn side_str(side: Side) -> &'static str {
         Side::Buy => "BUY",
         Side::Sell => "SELL",
     }
+}
+
+/// Partition LadderActions into separate collections by action type.
+///
+/// Returns (cancels, modifies, places) where:
+/// - cancels: Vec<u64> of order IDs to cancel
+/// - modifies: Vec<ModifySpec> of orders to modify
+/// - places: Vec<(f64, f64)> of (price, size) for new orders
+fn partition_ladder_actions(
+    actions: &[tracking::LadderAction],
+    side: Side,
+) -> (Vec<u64>, Vec<ModifySpec>, Vec<(f64, f64)>) {
+    use tracking::LadderAction;
+
+    let mut cancels = Vec::new();
+    let mut modifies = Vec::new();
+    let mut places = Vec::new();
+    let is_buy = side == Side::Buy;
+
+    for action in actions {
+        match action {
+            LadderAction::Cancel { oid } => {
+                cancels.push(*oid);
+            }
+            LadderAction::Modify {
+                oid,
+                new_price,
+                new_size,
+                ..
+            } => {
+                modifies.push(ModifySpec {
+                    oid: *oid,
+                    new_price: *new_price,
+                    new_size: *new_size,
+                    is_buy,
+                });
+            }
+            LadderAction::Place { price, size, .. } => {
+                places.push((*price, *size));
+            }
+        }
+    }
+
+    (cancels, modifies, places)
 }

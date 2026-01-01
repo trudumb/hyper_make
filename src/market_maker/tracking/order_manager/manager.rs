@@ -94,6 +94,32 @@ impl OrderManager {
         self.orders.get_mut(&oid)
     }
 
+    /// Update an order after successful modify.
+    ///
+    /// Preserves tracking data (placed_at, fill history, state) while updating price/size.
+    /// This is critical for queue position preservation - the order maintains its place
+    /// in the book rather than being re-queued at the back.
+    ///
+    /// # Returns
+    /// `true` if the order was found and updated, `false` otherwise.
+    pub fn on_modify_success(&mut self, oid: u64, new_price: f64, new_size: f64) -> bool {
+        if let Some(order) = self.orders.get_mut(&oid) {
+            debug!(
+                oid = oid,
+                old_price = order.price,
+                new_price = new_price,
+                old_size = order.size,
+                new_size = new_size,
+                "Order modified, tracking updated (queue position preserved)"
+            );
+            order.price = new_price;
+            order.size = new_size;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get the first active order on a given side (for single-order-per-side strategies).
     /// Only returns orders that are actively quoting (Resting or PartialFilled).
     pub fn get_by_side(&self, side: Side) -> Option<&TrackedOrder> {

@@ -2,7 +2,7 @@
 
 use tracing::debug;
 
-use crate::EPSILON;
+use crate::{truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
@@ -547,7 +547,8 @@ impl LadderStrategy {
                 };
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.bids.len() {
-                        ladder.bids[i].size = size;
+                        // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
+                        ladder.bids[i].size = truncate_float(size, config.sz_decimals, false);
                     }
                 }
                 let effective_kelly = if market_params.use_kelly_stochastic {
@@ -621,7 +622,8 @@ impl LadderStrategy {
                 };
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.asks.len() {
-                        ladder.asks[i].size = size;
+                        // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
+                        ladder.asks[i].size = truncate_float(size, config.sz_decimals, false);
                     }
                 }
                 let effective_kelly = if market_params.use_kelly_stochastic {

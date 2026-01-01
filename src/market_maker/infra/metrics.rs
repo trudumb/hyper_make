@@ -60,6 +60,10 @@ struct MetricsInner {
     orders_filled: AtomicU64,
     /// Total orders cancelled
     orders_cancelled: AtomicU64,
+    /// Total orders modified (queue-preserving updates)
+    orders_modified: AtomicU64,
+    /// Total modify fallbacks (modify failed, fell back to cancel+place)
+    modify_fallbacks: AtomicU64,
     /// Total fill volume (base asset)
     fill_volume: AtomicF64,
     /// Buy fill volume
@@ -180,6 +184,8 @@ impl PrometheusMetrics {
                 orders_placed: AtomicU64::new(0),
                 orders_filled: AtomicU64::new(0),
                 orders_cancelled: AtomicU64::new(0),
+                orders_modified: AtomicU64::new(0),
+                modify_fallbacks: AtomicU64::new(0),
                 fill_volume: AtomicF64::new(0.0),
                 buy_volume: AtomicF64::new(0.0),
                 sell_volume: AtomicF64::new(0.0),
@@ -294,6 +300,16 @@ impl PrometheusMetrics {
     /// Record an order cancelled.
     pub fn record_cancel(&self) {
         self.inner.orders_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an order modified (queue-preserving update).
+    pub fn record_order_modified(&self) {
+        self.inner.orders_modified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a modify fallback (modify failed, fell back to cancel+place).
+    pub fn record_modify_fallback(&self) {
+        self.inner.modify_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
     // === Market Updates ===
@@ -569,6 +585,22 @@ impl PrometheusMetrics {
              mm_fill_volume_total{{{}}} {}\n",
             labels,
             self.inner.fill_volume.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_orders_modified_total Orders modified (queue-preserving updates)\n\
+             # TYPE mm_orders_modified_total counter\n\
+             mm_orders_modified_total{{{}}} {}\n",
+            labels,
+            self.inner.orders_modified.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_modify_fallbacks_total Modify failures falling back to cancel+place\n\
+             # TYPE mm_modify_fallbacks_total counter\n\
+             mm_modify_fallbacks_total{{{}}} {}\n",
+            labels,
+            self.inner.modify_fallbacks.load(Ordering::Relaxed)
         ));
 
         // Market metrics

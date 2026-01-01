@@ -40,6 +40,11 @@ pub struct MarketMakerConfig {
     /// Stochastic module integration settings.
     /// Controls HJB skew, Kalman filter, constrained optimizer, and depth AS calibration.
     pub stochastic: StochasticConfig,
+    /// Enable smart ladder reconciliation with ORDER MODIFY for queue preservation.
+    /// When true, uses differential updates (SKIP/MODIFY/CANCEL+PLACE) to preserve
+    /// queue position when possible. This improves spread capturing competitiveness.
+    /// Default: true (recommended for production)
+    pub smart_reconcile: bool,
 }
 
 /// Configuration passed to strategy for quote calculation.

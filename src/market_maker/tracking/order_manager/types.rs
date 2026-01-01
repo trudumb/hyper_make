@@ -89,6 +89,13 @@ pub enum LadderAction {
     Place { side: Side, price: f64, size: f64 },
     /// Cancel an existing order by ID
     Cancel { oid: u64 },
+    /// Modify an existing order (preserves queue position when possible)
+    Modify {
+        oid: u64,
+        new_price: f64,
+        new_size: f64,
+        side: Side,
+    },
 }
 
 /// A pending order awaiting OID from exchange.
