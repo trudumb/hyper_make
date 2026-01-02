@@ -173,6 +173,13 @@ impl PositionReconciler {
             return;
         }
 
+        // oid=0 with size=0 is a dedup artifact, not a real unmatched fill
+        // Log at debug level to avoid spam
+        if oid == 0 && size.abs() < 1e-9 {
+            tracing::debug!("Skipping reconciliation for oid=0 size=0 (dedup artifact)");
+            return;
+        }
+
         tracing::warn!(
             oid = oid,
             size = %format!("{:.6}", size),

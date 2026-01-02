@@ -1930,6 +1930,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .proactive_rate_tracker
                     .record_call(1, num_modifies);
 
+            // Track OID remaps for summary logging
+            let mut oid_remap_count = 0u32;
+            let mut modify_success_count = 0u32;
+
             // Process modify results
             for (i, result) in modify_results.iter().enumerate() {
                 let spec = &all_modifies[i];
@@ -1940,11 +1944,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     let effective_oid = if result.oid > 0 && result.oid != spec.oid {
                         // OID changed - re-key the order in tracking
                         if self.orders.replace_oid(spec.oid, result.oid) {
-                            info!(
+                            // Log at DEBUG to reduce verbosity - summary logged at end of cycle
+                            debug!(
                                 old_oid = spec.oid,
                                 new_oid = result.oid,
-                                "Modify returned new OID - tracking updated"
+                                "OID remapped"
                             );
+                            oid_remap_count += 1;
                         }
                         result.oid
                     } else {
@@ -1956,6 +1962,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         .on_modify_success(effective_oid, spec.new_price, spec.new_size);
                     // Record successful modify in metrics
                     self.infra.prometheus.record_order_modified();
+                    modify_success_count += 1;
                 } else {
                     // Modify failed - fallback to cancel+place
                     warn!(
@@ -2163,6 +2170,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         );
                     }
                 }
+            }
+
+            // Log consolidated quote cycle summary with spread info
+            if modify_success_count > 0 {
+                // Get best quotes from tracked orders for spread calculation
+                let (best_bid, best_ask, bid_levels, ask_levels) = self.orders.get_quote_summary();
+                let mid = if best_bid > 0.0 && best_ask > 0.0 {
+                    (best_bid + best_ask) / 2.0
+                } else {
+                    0.0
+                };
+                let spread_bps = if mid > 0.0 {
+                    (best_ask - best_bid) / mid * 10000.0
+                } else {
+                    0.0
+                };
+
+                info!(
+                    modified = modify_success_count,
+                    oid_remaps = oid_remap_count,
+                    best_bid = %format!("{:.2}", best_bid),
+                    best_ask = %format!("{:.2}", best_ask),
+                    spread_bps = %format!("{:.2}", spread_bps),
+                    bid_levels = bid_levels,
+                    ask_levels = ask_levels,
+                    position = %format!("{:.6}", self.position.position()),
+                    "Quote cycle complete"
+                );
             }
             } // Close the else block for rate limit check
         }

@@ -646,6 +646,24 @@ impl OrderManager {
         (min_position, max_position)
     }
 
+    /// Get a summary of current quotes for logging.
+    ///
+    /// Returns (best_bid, best_ask, bid_levels, ask_levels).
+    /// Prices are 0.0 if no active orders exist on that side.
+    pub fn get_quote_summary(&self) -> (f64, f64, usize, usize) {
+        let bids = self.get_all_by_side(Side::Buy);
+        let asks = self.get_all_by_side(Side::Sell);
+
+        let best_bid = bids.iter().map(|o| o.price).fold(0.0_f64, f64::max);
+        let best_ask = asks
+            .iter()
+            .map(|o| o.price)
+            .fold(f64::MAX, f64::min);
+        let best_ask = if best_ask == f64::MAX { 0.0 } else { best_ask };
+
+        (best_bid, best_ask, bids.len(), asks.len())
+    }
+
     /// Get total resting notional value (for risk monitoring).
     ///
     /// Returns (bid_notional, ask_notional) in USD.
