@@ -134,7 +134,7 @@ impl InfoClient {
     pub async fn subscribe(
         &mut self,
         subscription: Subscription,
-        sender_channel: UnboundedSender<Message>,
+        sender_channel: UnboundedSender<std::sync::Arc<Message>>,
     ) -> Result<u32> {
         if self.ws_manager.is_none() {
             let ws_manager = WsManager::new(

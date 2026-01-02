@@ -43,7 +43,7 @@ pub fn process_trades(
 
     for trade in &trades.data {
         // Skip trades for other assets
-        if trade.coin != ctx.asset {
+        if trade.coin != *ctx.asset {
             result.trades_skipped += 1;
             continue;
         }
@@ -129,6 +129,7 @@ fn log_warmup_progress(estimator: &ParameterEstimator, last_warmup_log: &mut usi
 mod tests {
     use super::*;
     use crate::market_maker::{DataQualityConfig, EstimatorConfig, HawkesConfig};
+    use std::sync::Arc;
 
     fn make_test_state<'a>(
         estimator: &'a mut ParameterEstimator,
@@ -162,7 +163,7 @@ mod tests {
             &mut last_warmup_log,
         );
 
-        let ctx = MessageContext::new("BTC".to_string(), 50000.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false);
 
         // Create trades for wrong asset
         let trades = Trades {

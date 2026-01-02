@@ -8,6 +8,7 @@ use tracing::debug;
 use super::config::QueueConfig;
 use super::normal_cdf;
 use super::position::{OrderQueuePosition, QueuePositionSummary, QueueSummary};
+use crate::market_maker::infra::capacity::QUEUE_TRACKER_CAPACITY;
 
 /// Tracks queue positions for all active orders.
 #[derive(Debug)]
@@ -27,10 +28,12 @@ pub struct QueuePositionTracker {
 
 impl QueuePositionTracker {
     /// Create a new queue position tracker.
+    ///
+    /// Pre-allocates HashMap to avoid heap reallocations in hot paths.
     pub fn new(config: QueueConfig) -> Self {
         Self {
             config,
-            positions: HashMap::new(),
+            positions: HashMap::with_capacity(QUEUE_TRACKER_CAPACITY),
             best_bid: None,
             best_ask: None,
             sigma: 0.0001, // Default sigma

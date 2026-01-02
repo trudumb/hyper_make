@@ -64,7 +64,7 @@ pub fn process_user_fills<'a>(
     // Process each fill
     for fill in &user_fills.data.fills {
         // Filter by asset
-        if fill.coin != ctx.asset {
+        if fill.coin != *ctx.asset {
             result.fills_skipped += 1;
             continue;
         }
@@ -89,7 +89,7 @@ pub fn process_user_fills<'a>(
             is_buy,
             ctx.latest_mid,
             None,
-            ctx.asset.clone(),
+            ctx.asset.to_string(),
         );
 
         // Process through unified processor
@@ -157,10 +157,11 @@ mod tests {
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EstimatorConfig,
         ParameterEstimator, PnLConfig, PnLTracker, PositionTracker, PrometheusMetrics, QueueConfig,
     };
+    use std::sync::Arc;
 
     #[test]
     fn test_process_filters_wrong_asset() {
-        let ctx = MessageContext::new("BTC".to_string(), 50000.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false);
 
         let mut fill_processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);
@@ -224,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_process_skips_without_mid() {
-        let ctx = MessageContext::new("BTC".to_string(), -1.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, false);
 
         let mut fill_processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);

@@ -1,6 +1,7 @@
 use alloy::primitives::address;
 use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 use log::info;
+use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 
 #[tokio::main]
@@ -10,7 +11,7 @@ async fn main() {
     let user = address!("0xc64cc00b46101bd40aa1c3121195e85c0b0918d8");
     let coin = "BTC".to_string();
 
-    let (sender, mut receiver) = unbounded_channel();
+    let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();
     let subscription_id = info_client
         .subscribe(Subscription::ActiveAssetData { user, coin }, sender)
         .await
@@ -20,8 +21,10 @@ async fn main() {
 
     loop {
         tokio::select! {
-            Some(Message::ActiveAssetData(active_asset_data)) = receiver.recv() => {
-                info!("Received active asset data: {active_asset_data:?}");
+            Some(arc_msg) = receiver.recv() => {
+                if let Message::ActiveAssetData(active_asset_data) = &*arc_msg {
+                    info!("Received active asset data: {active_asset_data:?}");
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutting down...");

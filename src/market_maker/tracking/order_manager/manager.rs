@@ -14,6 +14,7 @@ use super::types::{
     price_to_key, LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder,
 };
 use crate::market_maker::config::Quote;
+use crate::market_maker::infra::capacity::ORDER_MANAGER_CAPACITY;
 use crate::market_maker::quoting::Ladder;
 
 /// Manages tracked orders for the market maker with proper lifecycle handling.
@@ -55,21 +56,25 @@ impl Default for OrderManager {
 
 impl OrderManager {
     /// Create a new order manager with default configuration.
+    ///
+    /// Pre-allocates HashMaps to avoid heap reallocations in hot paths.
     pub fn new() -> Self {
         Self {
-            orders: HashMap::new(),
-            pending: HashMap::new(),
-            pending_by_cloid: HashMap::new(),
+            orders: HashMap::with_capacity(ORDER_MANAGER_CAPACITY),
+            pending: HashMap::with_capacity(ORDER_MANAGER_CAPACITY),
+            pending_by_cloid: HashMap::with_capacity(ORDER_MANAGER_CAPACITY),
             config: OrderManagerConfig::default(),
         }
     }
 
     /// Create a new order manager with custom configuration.
+    ///
+    /// Pre-allocates HashMaps to avoid heap reallocations in hot paths.
     pub fn with_config(config: OrderManagerConfig) -> Self {
         Self {
-            orders: HashMap::new(),
-            pending: HashMap::new(),
-            pending_by_cloid: HashMap::new(),
+            orders: HashMap::with_capacity(ORDER_MANAGER_CAPACITY),
+            pending: HashMap::with_capacity(ORDER_MANAGER_CAPACITY),
+            pending_by_cloid: HashMap::with_capacity(ORDER_MANAGER_CAPACITY),
             config,
         }
     }

@@ -24,6 +24,7 @@ pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side
 mod tests {
     use super::*;
     use crate::market_maker::quoting::{Ladder, LadderLevel};
+    use smallvec::smallvec;
     use std::time::Duration;
 
     #[test]
@@ -207,7 +208,7 @@ mod tests {
     fn test_reconcile_ladder_empty_to_ladder() {
         let mgr = OrderManager::new();
         let ladder = Ladder {
-            bids: vec![
+            bids: smallvec![
                 LadderLevel {
                     price: 99.0,
                     size: 1.0,
@@ -219,7 +220,7 @@ mod tests {
                     depth_bps: 20.0,
                 },
             ],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 101.0,
                 size: 1.0,
                 depth_bps: 10.0,
@@ -244,12 +245,12 @@ mod tests {
         mgr.add_order(TrackedOrder::new(2, Side::Sell, 101.0, 1.0));
 
         let ladder = Ladder {
-            bids: vec![LadderLevel {
+            bids: smallvec![LadderLevel {
                 price: 99.0,
                 size: 1.0,
                 depth_bps: 10.0,
             }],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 101.0,
                 size: 1.0,
                 depth_bps: 10.0,
@@ -269,12 +270,12 @@ mod tests {
         mgr.add_order(TrackedOrder::new(2, Side::Sell, 105.0, 1.0)); // Too far from target
 
         let ladder = Ladder {
-            bids: vec![LadderLevel {
+            bids: smallvec![LadderLevel {
                 price: 99.0,
                 size: 1.0,
                 depth_bps: 10.0,
             }],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 101.0,
                 size: 1.0,
                 depth_bps: 10.0,
@@ -304,7 +305,7 @@ mod tests {
                                                                    // No ask order
 
         let ladder = Ladder {
-            bids: vec![
+            bids: smallvec![
                 LadderLevel {
                     price: 99.0,
                     size: 1.0,
@@ -316,7 +317,7 @@ mod tests {
                     depth_bps: 20.0,
                 },
             ],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 101.0,
                 size: 1.0,
                 depth_bps: 10.0,

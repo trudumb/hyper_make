@@ -12,6 +12,7 @@
 //! - **CascadeDetected**: Liquidation cascade intensity too high
 //! - **Manual**: Operator-triggered shutdown
 
+use portable_atomic::{AtomicF64, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -243,16 +244,21 @@ pub struct KillSwitch {
     config: Mutex<KillSwitchConfig>,
     /// Current state
     state: Mutex<KillSwitchState>,
+    /// Max position value limit - atomic for lock-free hot path reads.
+    /// Uses portable_atomic::AtomicF64 for cross-platform f64 atomics.
+    atomic_max_position_value: AtomicF64,
 }
 
 impl KillSwitch {
     /// Create a new kill switch with the given configuration.
     pub fn new(config: KillSwitchConfig) -> Self {
+        let initial_max_position_value = config.max_position_value;
         Self {
             triggered: AtomicBool::new(false),
             trigger_reasons: Mutex::new(Vec::new()),
             config: Mutex::new(config),
             state: Mutex::new(KillSwitchState::default()),
+            atomic_max_position_value: AtomicF64::new(initial_max_position_value),
         }
     }
 
@@ -397,13 +403,20 @@ impl KillSwitch {
     /// Call this periodically to adjust limits based on current account equity,
     /// volatility, and sigma confidence. Uses Bayesian blend to regularize.
     pub fn update_dynamic_limit(&self, new_max_value: f64) {
+        // Update atomic for lock-free reads
+        self.atomic_max_position_value
+            .store(new_max_value, AtomicOrdering::Release);
+        // Also update config for consistency in check() calls
         let mut config = self.config.lock().unwrap();
         config.max_position_value = new_max_value;
     }
 
     /// Get the current max position value limit.
+    ///
+    /// This is a fast lock-free read suitable for hot paths.
+    #[inline]
     pub fn max_position_value(&self) -> f64 {
-        self.config.lock().unwrap().max_position_value
+        self.atomic_max_position_value.load(AtomicOrdering::Acquire)
     }
 
     // === Private helper methods ===

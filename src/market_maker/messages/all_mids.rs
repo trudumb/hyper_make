@@ -61,7 +61,7 @@ pub fn process_all_mids(
 ) -> Result<Option<AllMidsResult>> {
     // Get mid for our asset
     let mids = &all_mids.data.mids;
-    let Some(mid_str) = mids.get(&ctx.asset) else {
+    let Some(mid_str) = mids.get(&*ctx.asset) else {
         return Ok(None);
     };
 
@@ -116,6 +116,7 @@ mod tests {
     use crate::market_maker::{
         AdverseSelectionConfig, EstimatorConfig, HJBConfig, LiquidationConfig,
     };
+    use std::sync::Arc;
 
     fn make_test_state<'a>(
         estimator: &'a mut ParameterEstimator,
@@ -167,7 +168,7 @@ mod tests {
             &mut latest_mid,
         );
 
-        let ctx = MessageContext::new("BTC".to_string(), 0.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 0.0, 0.0, 1.0, false);
 
         // Create AllMids with BTC mid price
         let mut mids = std::collections::HashMap::new();

@@ -2,14 +2,17 @@
 //!
 //! Provides a snapshot of market state for message processors.
 
+use std::sync::Arc;
+
 /// Context for message processing.
 ///
 /// Captures the current state needed by processors without
 /// requiring access to the full MarketMaker.
 #[derive(Debug, Clone)]
 pub struct MessageContext {
-    /// Current asset being traded
-    pub asset: String,
+    /// Current asset being traded.
+    /// Uses Arc<str> for cheap cloning from MarketMakerConfig.
+    pub asset: Arc<str>,
     /// Latest mid price
     pub latest_mid: f64,
     /// Current position
@@ -23,7 +26,7 @@ pub struct MessageContext {
 impl MessageContext {
     /// Create a new message context.
     pub fn new(
-        asset: String,
+        asset: Arc<str>,
         latest_mid: f64,
         position: f64,
         max_position: f64,
@@ -59,16 +62,16 @@ mod tests {
 
     #[test]
     fn test_position_utilization() {
-        let ctx = MessageContext::new("BTC".to_string(), 50000.0, 0.5, 1.0, true);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.5, 1.0, true);
         assert!((ctx.position_utilization() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_has_mid() {
-        let ctx = MessageContext::new("BTC".to_string(), 50000.0, 0.0, 1.0, true);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, true);
         assert!(ctx.has_mid());
 
-        let ctx_no_mid = MessageContext::new("BTC".to_string(), -1.0, 0.0, 1.0, true);
+        let ctx_no_mid = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, true);
         assert!(!ctx_no_mid.has_mid());
     }
 }

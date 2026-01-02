@@ -32,6 +32,7 @@ pub use strategy::*;
 pub use tracking::*;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::Address;
@@ -269,7 +270,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Track any remaining orders (should be empty after cancel-all, but be safe)
         let open_orders = self.info_client.open_orders(self.user_address).await?;
 
-        for order in open_orders.iter().filter(|o| o.coin == self.config.asset) {
+        for order in open_orders.iter().filter(|o| o.coin == *self.config.asset) {
             let sz: f64 = order.sz.parse().unwrap_or(0.0);
             let px: f64 = order.limit_px.parse().unwrap_or(0.0);
             let side = if order.side == "B" {
@@ -301,7 +302,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let exchange_position = user_state
             .asset_positions
             .iter()
-            .find(|p| p.position.coin == self.config.asset)
+            .find(|p| p.position.coin == *self.config.asset)
             .map(|p| p.position.szi.parse::<f64>().unwrap_or(0.0))
             .unwrap_or(0.0);
 
@@ -336,7 +337,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let open_orders = self.info_client.open_orders(self.user_address).await?;
             let our_orders: Vec<_> = open_orders
                 .iter()
-                .filter(|o| o.coin == self.config.asset)
+                .filter(|o| o.coin == *self.config.asset)
                 .collect();
 
             if our_orders.is_empty() {
@@ -389,7 +390,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .open_orders(self.user_address)
             .await?
             .iter()
-            .filter(|o| o.coin == self.config.asset)
+            .filter(|o| o.coin == *self.config.asset)
             .count();
 
         if remaining > 0 {
@@ -404,7 +405,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Start the market maker event loop.
     pub async fn start(&mut self) -> Result<()> {
-        let (sender, mut receiver) = unbounded_channel();
+        // Channel uses Arc<Message> for zero-copy dispatch from WsManager
+        let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();
 
         // Subscribe to UserFills for fill detection
         self.info_client
@@ -425,7 +427,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.info_client
             .subscribe(
                 Subscription::Trades {
-                    coin: self.config.asset.clone(),
+                    coin: self.config.asset.to_string(),
                 },
                 sender.clone(),
             )
@@ -435,7 +437,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.info_client
             .subscribe(
                 Subscription::L2Book {
-                    coin: self.config.asset.clone(),
+                    coin: self.config.asset.to_string(),
                 },
                 sender.clone(),
             )
@@ -477,7 +479,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             tokio::select! {
                 message = receiver.recv() => {
                     match message {
-                        Some(msg) => {
+                        Some(arc_msg) => {
+                            // Zero-copy unwrap: Arc::try_unwrap succeeds when we're the only owner
+                            // (which is typical since WsManager sends to each subscriber separately).
+                            // Falls back to clone only if Arc is still shared.
+                            let msg = Arc::try_unwrap(arc_msg)
+                                .unwrap_or_else(|arc| (*arc).clone());
+
                             if let Err(e) = self.handle_message(msg).await {
                                 error!("Error handling message: {e}");
                             }
@@ -931,7 +939,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 max_position: self.effective_max_position, // First-principles limit
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
-                asset: self.config.asset.clone(),
+                asset: self.config.asset.to_string(),
             };
             let reduce_only_result = quoting::QuoteFilter::apply_reduce_only_with_exchange_limits(
                 &mut bid_quotes,
@@ -980,7 +988,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 max_position: self.effective_max_position, // First-principles limit
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
-                asset: self.config.asset.clone(),
+                asset: self.config.asset.to_string(),
             };
             quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
 
@@ -2150,7 +2158,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let exchange_orders = self.info_client.open_orders(self.user_address).await?;
         let exchange_oids: HashSet<u64> = exchange_orders
             .iter()
-            .filter(|o| o.coin == self.config.asset)
+            .filter(|o| o.coin == *self.config.asset)
             .map(|o| o.oid)
             .collect();
         let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
@@ -2320,7 +2328,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     async fn refresh_exchange_limits(&mut self) -> Result<()> {
         let asset_data = self
             .info_client
-            .active_asset_data(self.user_address, self.config.asset.clone())
+            .active_asset_data(self.user_address, self.config.asset.to_string())
             .await?;
 
         // Update exchange limits with local max_position for effective limit calculation

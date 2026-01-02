@@ -12,7 +12,11 @@
 //! - **Reconciliation**: Event-driven position sync (Phase 4)
 //! - **RateLimit**: Rejection-aware rate limiting (Phase 5)
 //! - **Logging**: Multi-stream structured logging (Phase 6)
+//! - **Capacity**: Pre-allocation constants for latency optimization
+//! - **Arena**: Quote cycle arena allocator for latency optimization
 
+mod arena;
+pub mod capacity;
 mod connection_supervisor;
 mod data_quality;
 mod exchange_limits;
@@ -25,6 +29,7 @@ mod reconciliation;
 mod reconnection;
 mod recovery;
 
+pub use arena::*;
 pub use connection_supervisor::*;
 pub use data_quality::*;
 pub use exchange_limits::*;

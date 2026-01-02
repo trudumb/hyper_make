@@ -18,8 +18,9 @@ pub trait MarketMakerMetricsRecorder: Send + Sync {
 /// Configuration for the market maker.
 #[derive(Debug, Clone)]
 pub struct MarketMakerConfig {
-    /// Asset to market make on (e.g., "ETH", "BTC")
-    pub asset: String,
+    /// Asset to market make on (e.g., "ETH", "BTC").
+    /// Uses Arc<str> for cheap cloning in hot paths.
+    pub asset: Arc<str>,
     /// Amount of liquidity to target on each side
     pub target_liquidity: f64,
     /// Risk aversion parameter (gamma) - controls spread and inventory skew

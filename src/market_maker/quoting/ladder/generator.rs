@@ -6,9 +6,15 @@
 //! - Spread capture: SC(δ) = δ - AS₀ × exp(-δ/δ_char) - fees
 //! - Size allocation proportional to marginal value
 
+use smallvec::SmallVec;
+
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
-use super::{Ladder, LadderConfig, LadderLevel, LadderParams};
+use super::{Ladder, LadderConfig, LadderLevel, LadderLevels, LadderParams};
+use crate::market_maker::infra::capacity::DEPTH_INLINE_CAPACITY;
+
+/// Type alias for depth values using SmallVec for stack allocation
+type DepthVec = SmallVec<[f64; DEPTH_INLINE_CAPACITY]>;
 
 impl Ladder {
     /// Generate a ladder using the GLFT-based approach.
@@ -234,12 +240,14 @@ impl Ladder {
 /// Otherwise falls back to static computation:
 /// - Geometric: δ_k = δ_min × r^(k-1) where r = (δ_max/δ_min)^(1/(K-1))
 /// - Linear: δ_k = δ_min + k × (δ_max - δ_min) / (K-1)
-pub(crate) fn compute_depths(config: &LadderConfig) -> Vec<f64> {
+///
+/// Uses SmallVec to avoid heap allocation for typical ladder sizes.
+pub(crate) fn compute_depths(config: &LadderConfig) -> DepthVec {
     // Use dynamic depths if available (GLFT-optimal)
     if let Some(ref dynamic) = config.dynamic_depths {
         // For symmetric ladder generation, use bid depths
         // (caller can use compute_depths_asymmetric for separate bid/ask)
-        return dynamic.bid.clone();
+        return dynamic.bid.iter().copied().collect();
     }
 
     // Fallback to static depth computation
@@ -247,31 +255,34 @@ pub(crate) fn compute_depths(config: &LadderConfig) -> Vec<f64> {
 }
 
 /// Compute bid-specific depths (for asymmetric ladder generation)
-pub(crate) fn compute_bid_depths(config: &LadderConfig) -> Vec<f64> {
+pub(crate) fn compute_bid_depths(config: &LadderConfig) -> DepthVec {
     if let Some(ref dynamic) = config.dynamic_depths {
-        dynamic.bid.clone()
+        dynamic.bid.iter().copied().collect()
     } else {
         compute_depths_static(config)
     }
 }
 
 /// Compute ask-specific depths (for asymmetric ladder generation)
-pub(crate) fn compute_ask_depths(config: &LadderConfig) -> Vec<f64> {
+pub(crate) fn compute_ask_depths(config: &LadderConfig) -> DepthVec {
     if let Some(ref dynamic) = config.dynamic_depths {
-        dynamic.ask.clone()
+        dynamic.ask.iter().copied().collect()
     } else {
         compute_depths_static(config)
     }
 }
 
-/// Static depth computation using min/max and geometric/linear spacing
-fn compute_depths_static(config: &LadderConfig) -> Vec<f64> {
+/// Static depth computation using min/max and geometric/linear spacing.
+/// Returns SmallVec to avoid heap allocation for typical ladder sizes.
+fn compute_depths_static(config: &LadderConfig) -> DepthVec {
     let k = config.num_levels;
     if k == 0 {
-        return vec![];
+        return DepthVec::new();
     }
     if k == 1 {
-        return vec![config.min_depth_bps];
+        let mut depths = DepthVec::new();
+        depths.push(config.min_depth_bps);
+        return depths;
     }
 
     if config.geometric_spacing {
@@ -335,14 +346,15 @@ pub(crate) fn spread_capture(
 ///
 /// Sizes are normalized to sum to total_size, with levels below
 /// min_size set to zero (orders too small to be worth placing).
+/// Uses SmallVec to avoid heap allocation for typical ladder sizes.
 pub(crate) fn allocate_sizes(
     intensities: &[f64],
     spreads: &[f64],
     total_size: f64,
     min_size: f64,
-) -> Vec<f64> {
+) -> DepthVec {
     // Compute marginal value at each depth
-    let marginal_values: Vec<f64> = intensities
+    let marginal_values: DepthVec = intensities
         .iter()
         .zip(spreads.iter())
         .map(|(&lambda, &sc)| (lambda * sc).max(0.0)) // Only positive values
@@ -350,8 +362,10 @@ pub(crate) fn allocate_sizes(
 
     let total: f64 = marginal_values.iter().sum();
     if total <= EPSILON {
-        // No profitable levels
-        return vec![0.0; marginal_values.len()];
+        // No profitable levels - return zeros
+        let mut zeros = DepthVec::new();
+        zeros.resize(marginal_values.len(), 0.0);
+        return zeros;
     }
 
     // Normalize to total_size
@@ -372,6 +386,7 @@ pub(crate) fn allocate_sizes(
 ///
 /// Creates symmetric bid/ask levels around mid price, applying
 /// proper price rounding and size truncation per exchange requirements.
+/// Uses SmallVec to avoid heap allocation for typical ladder sizes.
 pub(crate) fn build_raw_ladder(
     depths: &[f64],
     sizes: &[f64],
@@ -380,8 +395,8 @@ pub(crate) fn build_raw_ladder(
     sz_decimals: u32,
     min_notional: f64,
 ) -> Ladder {
-    let mut bids = Vec::new();
-    let mut asks = Vec::new();
+    let mut bids = LadderLevels::new();
+    let mut asks = LadderLevels::new();
 
     for (&depth_bps, &size) in depths.iter().zip(sizes.iter()) {
         if size < EPSILON {
@@ -434,6 +449,7 @@ pub(crate) fn build_raw_ladder(
 ///
 /// Each side gets its own depth array and corresponding size array.
 /// This is used when bid/ask depths differ (e.g., different κ for each side).
+/// Uses SmallVec to avoid heap allocation for typical ladder sizes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_asymmetric_ladder(
     bid_depths: &[f64],
@@ -445,8 +461,8 @@ pub(crate) fn build_asymmetric_ladder(
     sz_decimals: u32,
     min_notional: f64,
 ) -> Ladder {
-    let mut bids = Vec::new();
-    let mut asks = Vec::new();
+    let mut bids = LadderLevels::new();
+    let mut asks = LadderLevels::new();
 
     // Build bid levels
     for (&depth_bps, &size) in bid_depths.iter().zip(bid_sizes.iter()) {
@@ -554,6 +570,7 @@ pub(crate) fn apply_inventory_skew(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     #[test]
     fn test_compute_depths_geometric() {
@@ -764,12 +781,12 @@ mod tests {
     #[test]
     fn test_inventory_skew_long() {
         let mut ladder = Ladder {
-            bids: vec![LadderLevel {
+            bids: smallvec![LadderLevel {
                 price: 100.0,
                 size: 1.0,
                 depth_bps: 2.0,
             }],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 100.2,
                 size: 1.0,
                 depth_bps: 2.0,
@@ -787,12 +804,12 @@ mod tests {
     #[test]
     fn test_inventory_skew_short() {
         let mut ladder = Ladder {
-            bids: vec![LadderLevel {
+            bids: smallvec![LadderLevel {
                 price: 100.0,
                 size: 1.0,
                 depth_bps: 2.0,
             }],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 100.2,
                 size: 1.0,
                 depth_bps: 2.0,
@@ -810,12 +827,12 @@ mod tests {
     #[test]
     fn test_inventory_skew_zero() {
         let mut ladder = Ladder {
-            bids: vec![LadderLevel {
+            bids: smallvec![LadderLevel {
                 price: 100.0,
                 size: 1.0,
                 depth_bps: 2.0,
             }],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 100.2,
                 size: 1.0,
                 depth_bps: 2.0,
@@ -834,12 +851,12 @@ mod tests {
     fn test_inventory_skew_price_precision() {
         // Test that prices remain properly rounded after skew (BTC-like: 0 decimals)
         let mut ladder = Ladder {
-            bids: vec![LadderLevel {
+            bids: smallvec![LadderLevel {
                 price: 87833.0,
                 size: 0.02,
                 depth_bps: 2.0,
             }],
-            asks: vec![LadderLevel {
+            asks: smallvec![LadderLevel {
                 price: 87850.0,
                 size: 0.02,
                 depth_bps: 2.0,

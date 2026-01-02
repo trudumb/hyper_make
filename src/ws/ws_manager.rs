@@ -37,7 +37,7 @@ use crate::{
 
 #[derive(Debug)]
 struct SubscriptionData {
-    sending_channel: UnboundedSender<Message>,
+    sending_channel: UnboundedSender<Arc<Message>>,
     subscription_id: u32,
     id: String,
 }
@@ -664,13 +664,16 @@ impl WsManager {
                         return Ok(());
                     }
 
+                    // Wrap message in Arc once; Arc::clone is cheap (pointer copy)
+                    let arc_message = Arc::new(message);
+
                     let mut subscriptions = subscriptions.lock().await;
                     let mut res = Ok(());
                     if let Some(subscription_datas) = subscriptions.get_mut(&identifier) {
                         for subscription_data in subscription_datas {
                             if let Err(e) = subscription_data
                                 .sending_channel
-                                .send(message.clone())
+                                .send(Arc::clone(&arc_message))
                                 .map_err(|e| Error::WsSend(e.to_string()))
                             {
                                 res = Err(e);
@@ -703,13 +706,16 @@ impl WsManager {
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
         message: Message,
     ) -> Result<()> {
+        // Wrap message in Arc once; Arc::clone is cheap (pointer copy)
+        let arc_message = Arc::new(message);
+
         let mut subscriptions = subscriptions.lock().await;
         let mut res = Ok(());
         for subscription_datas in subscriptions.values_mut() {
             for subscription_data in subscription_datas {
                 if let Err(e) = subscription_data
                     .sending_channel
-                    .send(message.clone())
+                    .send(Arc::clone(&arc_message))
                     .map_err(|e| Error::WsSend(e.to_string()))
                 {
                     res = Err(e);
@@ -755,7 +761,7 @@ impl WsManager {
     pub(crate) async fn add_subscription(
         &mut self,
         identifier: String,
-        sending_channel: UnboundedSender<Message>,
+        sending_channel: UnboundedSender<Arc<Message>>,
     ) -> Result<u32> {
         let mut subscriptions = self.subscriptions.lock().await;
 

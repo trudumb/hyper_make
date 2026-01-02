@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
 
+use super::capacity::DATA_QUALITY_CHANNELS;
+
 /// Configuration for data quality checks.
 #[derive(Debug, Clone)]
 pub struct DataQualityConfig {
@@ -86,12 +88,14 @@ pub struct DataQualityMonitor {
 
 impl DataQualityMonitor {
     /// Create a new data quality monitor with given config.
+    ///
+    /// Pre-allocates HashMaps to avoid heap reallocations.
     pub fn new(config: DataQualityConfig) -> Self {
         Self {
-            last_sequences: HashMap::new(),
-            last_timestamps: HashMap::new(),
-            anomaly_counts: HashMap::new(),
-            last_update_times: HashMap::new(),
+            last_sequences: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
+            last_timestamps: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
+            anomaly_counts: HashMap::with_capacity(8), // ~8 anomaly types
+            last_update_times: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
             total_sequence_gaps: 0,
             total_crossed_books: 0,
             config,

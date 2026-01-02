@@ -807,7 +807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create market maker config
     let mm_config = MmConfig {
-        asset: asset.clone(),
+        asset: Arc::from(asset.as_str()),
         target_liquidity,
         risk_aversion,
         max_bps_diff,

@@ -9,6 +9,9 @@
 
 use std::time::{Duration, Instant};
 
+use smallvec::SmallVec;
+
+use crate::market_maker::infra::capacity::FILL_TID_INLINE_CAPACITY;
 use crate::EPSILON;
 
 /// Side of an order (buy or sell).
@@ -185,8 +188,9 @@ pub struct TrackedOrder {
     pub state_changed_at: Instant,
     /// When the last fill occurred (for activity tracking)
     pub last_fill_at: Option<Instant>,
-    /// Trade IDs of fills processed for this order (for dedup at order level)
-    pub fill_tids: Vec<u64>,
+    /// Trade IDs of fills processed for this order (for dedup at order level).
+    /// Uses SmallVec to avoid heap allocation for typical 1-4 fills per order.
+    pub fill_tids: SmallVec<[u64; FILL_TID_INLINE_CAPACITY]>,
 }
 
 impl TrackedOrder {
@@ -205,7 +209,7 @@ impl TrackedOrder {
             placed_at: now,
             state_changed_at: now,
             last_fill_at: None,
-            fill_tids: Vec::new(),
+            fill_tids: SmallVec::new(),
         }
     }
 

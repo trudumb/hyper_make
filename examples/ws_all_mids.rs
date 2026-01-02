@@ -1,5 +1,6 @@
 use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 use log::info;
+use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 
 #[tokio::main]
@@ -8,7 +9,7 @@ async fn main() {
 
     let mut info_client = InfoClient::new(None, Some(BaseUrl::Testnet)).await.unwrap();
 
-    let (sender, mut receiver) = unbounded_channel();
+    let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();
     let subscription_id = info_client
         .subscribe(Subscription::AllMids, sender)
         .await
@@ -18,8 +19,10 @@ async fn main() {
 
     loop {
         tokio::select! {
-            Some(Message::AllMids(all_mids)) = receiver.recv() => {
-                info!("Received mids data: {all_mids:?}");
+            Some(arc_msg) = receiver.recv() => {
+                if let Message::AllMids(all_mids) = &*arc_msg {
+                    info!("Received mids data: {all_mids:?}");
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutting down...");

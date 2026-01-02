@@ -46,7 +46,7 @@ pub fn process_l2_book(
     let mut result = L2BookProcessingResult::default();
 
     // Validate asset and mid price
-    if l2_book.data.coin != ctx.asset || ctx.latest_mid <= 0.0 {
+    if l2_book.data.coin != *ctx.asset || ctx.latest_mid <= 0.0 {
         return Ok(result);
     }
 
@@ -137,6 +137,7 @@ fn parse_l2_book(levels: &[Vec<OrderBookLevel>]) -> Result<ParsedL2Book> {
 mod tests {
     use super::*;
     use crate::market_maker::{DataQualityConfig, EstimatorConfig, QueueConfig, SpreadConfig};
+    use std::sync::Arc;
 
     fn make_test_state<'a>(
         estimator: &'a mut ParameterEstimator,
@@ -192,7 +193,7 @@ mod tests {
             &mut prometheus,
         );
 
-        let ctx = MessageContext::new("BTC".to_string(), 50000.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false);
 
         // Create L2Book for wrong asset
         let l2_book = L2Book {
