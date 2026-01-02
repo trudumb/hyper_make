@@ -452,15 +452,18 @@ impl AdaptiveSpreadCalculator {
         self.floor.learned_spread_floor()
     }
 
-    /// Get blended kappa (using book kappa as fallback if provided).
-    pub fn kappa(&self, book_kappa_fallback: f64) -> f64 {
-        if self.is_warmed_up() {
-            self.kappa.kappa()
-        } else {
-            // During warmup, blend with book kappa fallback
-            let warmup_progress = self.kappa.own_fill_count().min(20) as f64 / 20.0;
-            warmup_progress * self.kappa.kappa() + (1.0 - warmup_progress) * book_kappa_fallback
-        }
+    /// Get blended kappa from Bayesian estimator.
+    ///
+    /// The BlendedKappaEstimator has its own well-calibrated prior (κ=2500 for BTC).
+    /// During warmup with no fills, it returns prior_mean * warmup_factor = 2500 * 0.8 = 2000.
+    /// This ensures tight spreads from startup rather than falling back to potentially
+    /// unreliable book-based estimates from thin order books (like on testnet).
+    ///
+    /// The `_book_kappa_fallback` parameter is kept for API compatibility but not used.
+    pub fn kappa(&self, _book_kappa_fallback: f64) -> f64 {
+        // Always use BlendedKappaEstimator - it has proper prior-based warmup logic.
+        // DO NOT fall back to external kappa estimates which can be unreliable on thin books.
+        self.kappa.kappa()
     }
 
     /// Get adaptive gamma given market signals.

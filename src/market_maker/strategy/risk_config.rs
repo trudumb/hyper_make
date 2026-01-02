@@ -89,6 +89,38 @@ pub struct RiskConfig {
     /// These hours showed -13 to -15 bps adverse selection in trade data.
     #[serde(default = "default_toxic_hours")]
     pub toxic_hours: Vec<u32>,
+
+    // ==================== Book Depth Risk Scaling ====================
+    // FIRST PRINCIPLES: Thin order books mean higher execution risk.
+    // When we can't exit positions easily, we should be more risk averse.
+    // This flows through γ in the GLFT formula: δ = (1/γ) × ln(1 + γ/κ)
+    // Higher γ → wider spreads, but computed through the principled formula.
+
+    /// Enable book depth gamma scaling.
+    /// When true, γ increases as near-touch book depth decreases.
+    pub enable_book_depth_scaling: bool,
+
+    /// Book depth threshold (USD) below which gamma scaling activates.
+    /// Orders within 5 bps of mid are counted.
+    pub book_depth_threshold_usd: f64,
+
+    /// Maximum gamma multiplier when book depth approaches zero.
+    /// 1.5 means γ can increase by up to 50% for very thin books.
+    pub max_book_depth_gamma_mult: f64,
+
+    // ==================== Warmup Uncertainty Scaling ====================
+    // FIRST PRINCIPLES: During parameter estimation warmup, we have uncertainty.
+    // Higher uncertainty → more risk aversion → higher γ.
+    // This replaces the arbitrary warmup spread multiplier.
+
+    /// Enable warmup gamma scaling.
+    /// When true, γ is scaled up during adaptive warmup period.
+    pub enable_warmup_gamma_scaling: bool,
+
+    /// Maximum warmup gamma multiplier at 0% warmup progress.
+    /// Decays linearly to 1.0 as warmup completes.
+    /// 1.1 means 10% higher γ during early warmup.
+    pub max_warmup_gamma_mult: f64,
 }
 
 fn default_toxic_hours() -> Vec<u32> {
@@ -124,6 +156,43 @@ impl RiskConfig {
             1.0
         }
     }
+
+    /// Get book depth gamma multiplier.
+    ///
+    /// FIRST PRINCIPLES: Thin order books → harder to exit → higher risk → higher γ
+    /// Multiplier scales linearly from 1.0 (at threshold) to max_book_depth_gamma_mult (at zero depth).
+    ///
+    /// Formula: mult = 1 + (max_mult - 1) × (1 - depth/threshold)  when depth < threshold
+    ///          mult = 1.0                                         when depth >= threshold
+    pub fn book_depth_multiplier(&self, near_touch_depth_usd: f64) -> f64 {
+        if !self.enable_book_depth_scaling || near_touch_depth_usd >= self.book_depth_threshold_usd
+        {
+            return 1.0;
+        }
+
+        // Linearly scale from 1.0 to max_mult as depth decreases
+        let depth_ratio = (near_touch_depth_usd / self.book_depth_threshold_usd).max(0.0);
+        let additional = (self.max_book_depth_gamma_mult - 1.0) * (1.0 - depth_ratio);
+        1.0 + additional
+    }
+
+    /// Get warmup uncertainty gamma multiplier.
+    ///
+    /// FIRST PRINCIPLES: During warmup, parameter estimates have high variance.
+    /// Higher uncertainty → more risk aversion → higher γ.
+    ///
+    /// Formula: mult = 1 + (max_mult - 1) × (1 - warmup_progress)
+    /// At 0% warmup: mult = max_warmup_gamma_mult (e.g., 1.1)
+    /// At 100% warmup: mult = 1.0
+    pub fn warmup_multiplier(&self, warmup_progress: f64) -> f64 {
+        if !self.enable_warmup_gamma_scaling {
+            return 1.0;
+        }
+
+        let progress = warmup_progress.clamp(0.0, 1.0);
+        let additional = (self.max_warmup_gamma_mult - 1.0) * (1.0 - progress);
+        1.0 + additional
+    }
 }
 
 impl Default for RiskConfig {
@@ -154,6 +223,15 @@ impl Default for RiskConfig {
             enable_time_of_day_scaling: true,
             toxic_hour_gamma_multiplier: 2.0, // Double γ during toxic hours → ~2× wider spreads
             toxic_hours: default_toxic_hours(),
+            // Book depth gamma scaling: ENABLED by default
+            // FIRST PRINCIPLES: Thin book → harder to exit → more risk averse
+            enable_book_depth_scaling: true,
+            book_depth_threshold_usd: 50_000.0, // $50k threshold for scaling
+            max_book_depth_gamma_mult: 1.5,     // Up to 50% more risk averse for thin books
+            // Warmup gamma scaling: ENABLED by default
+            // FIRST PRINCIPLES: During warmup, parameter uncertainty → more risk averse
+            enable_warmup_gamma_scaling: true,
+            max_warmup_gamma_mult: 1.1, // 10% higher γ at start of warmup
         }
     }
 }

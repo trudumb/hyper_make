@@ -66,7 +66,14 @@
       "mcp__serena__search_for_pattern",
       "Skill(sc:improve)",
       "Bash(timeout 15 npx:*)",
-      "Bash(npm search:*)"
+      "Bash(npm search:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 30 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=debug timeout 20 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::strategy::ladder_strat=trace timeout 25 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::estimator=debug timeout 20 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::strategy::ladder_strat=debug,hyperliquid_rust_sdk::market_maker::quoting=debug timeout 30 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk=debug timeout 25 cargo run:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=info timeout 35 cargo run:*)"
     ]
   }
 }

@@ -124,13 +124,30 @@ impl GLFTStrategy {
             1.0 // Normal activity
         };
 
+        // === TIME-OF-DAY SCALING ===
+        // Trade history showed -13 to -15 bps edge during 06-08, 14-15 UTC
+        let time_scalar = cfg.time_of_day_multiplier();
+
+        // === BOOK DEPTH SCALING (FIRST PRINCIPLES) ===
+        // Thin order books → harder to exit → higher risk → higher γ
+        // This replaces the arbitrary stochastic_spread_multiplier
+        let book_depth_scalar = cfg.book_depth_multiplier(market_params.near_touch_depth_usd);
+
+        // === WARMUP UNCERTAINTY SCALING (FIRST PRINCIPLES) ===
+        // During warmup, parameter uncertainty → more conservative
+        // This replaces the arbitrary adaptive_uncertainty_factor
+        let warmup_scalar = cfg.warmup_multiplier(market_params.adaptive_warmup_progress);
+
         // === COMBINE AND CLAMP ===
         let gamma_effective = cfg.gamma_base
             * vol_scalar
             * toxicity_scalar
             * inventory_scalar
             * regime_scalar
-            * hawkes_scalar;
+            * hawkes_scalar
+            * time_scalar
+            * book_depth_scalar
+            * warmup_scalar;
         let gamma_clamped = gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max);
 
         // Log gamma component breakdown for debugging strategy behavior
@@ -141,6 +158,9 @@ impl GLFTStrategy {
             inv_scalar = %format!("{:.3}", inventory_scalar),
             regime_scalar = %format!("{:.3}", regime_scalar),
             hawkes_scalar = %format!("{:.3}", hawkes_scalar),
+            time_scalar = %format!("{:.3}", time_scalar),
+            book_scalar = %format!("{:.3}", book_depth_scalar),
+            warmup_scalar = %format!("{:.3}", warmup_scalar),
             gamma_raw = %format!("{:.4}", gamma_effective),
             gamma_clamped = %format!("{:.4}", gamma_clamped),
             "Gamma component breakdown"
@@ -465,40 +485,20 @@ impl QuotingStrategy for GLFTStrategy {
             half_spread = half_spread.min(ceiling);
         }
 
-        // Apply stochastic spread multiplier for conditional tight quoting
-        // When tight quoting is NOT allowed, multiplier > 1.0 to widen spreads
-        // When tight quoting IS allowed, multiplier = 1.0 (no adjustment)
-        if market_params.stochastic_spread_multiplier > 1.0 {
-            half_spread_bid *= market_params.stochastic_spread_multiplier;
-            half_spread_ask *= market_params.stochastic_spread_multiplier;
-            half_spread *= market_params.stochastic_spread_multiplier;
-            debug!(
-                stochastic_mult = %format!("{:.2}", market_params.stochastic_spread_multiplier),
-                tight_quoting_allowed = market_params.tight_quoting_allowed,
-                block_reason = ?market_params.tight_quoting_block_reason,
-                "Stochastic spread multiplier applied"
-            );
-        }
-
-        // === 2f. ADAPTIVE WARMUP UNCERTAINTY SCALING ===
-        // During adaptive warmup, apply a small safety margin to spreads.
-        // This provides protection while priors are being refined from actual fills.
-        // Factor decays from ~1.2 (20% wider) to 1.0 (no adjustment) as warmup progresses.
-        if market_params.use_adaptive_spreads
-            && market_params.adaptive_can_estimate
-            && market_params.adaptive_uncertainty_factor > 1.001
-        {
-            let factor = market_params.adaptive_uncertainty_factor;
-            half_spread_bid *= factor;
-            half_spread_ask *= factor;
-            half_spread *= factor;
-            debug!(
-                uncertainty_factor = %format!("{:.3}", factor),
-                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-                spread_after_bps = %format!("{:.2}", half_spread * 10000.0),
-                "Adaptive warmup uncertainty scaling applied"
-            );
-        }
+        // === DEPRECATED: SPREAD MULTIPLIERS ===
+        // FIRST PRINCIPLES REFACTOR: Arbitrary spread multipliers bypass the GLFT model.
+        //
+        // Previously this section applied:
+        //   1. stochastic_spread_multiplier (book depth, toxicity)
+        //   2. adaptive_uncertainty_factor (warmup uncertainty)
+        //
+        // These have been REMOVED. All risk factors now flow through gamma:
+        //   - Book depth → RiskConfig.book_depth_multiplier() → gamma scaling
+        //   - Toxicity → RiskConfig.toxicity_sensitivity → gamma scaling
+        //   - Warmup uncertainty → RiskConfig.warmup_multiplier() → gamma scaling
+        //
+        // The GLFT formula δ = (1/γ) × ln(1 + γ/κ) now handles all spread widening
+        // in a mathematically principled way.
 
         // === 3. USE LEVERAGE-ADJUSTED SIGMA FOR INVENTORY SKEW ===
         // sigma_leverage_adjusted incorporates:

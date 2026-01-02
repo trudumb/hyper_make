@@ -1,6 +1,6 @@
 //! GLFT Ladder Strategy - multi-level quoting with depth-dependent sizing.
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::{truncate_float, EPSILON};
 
@@ -236,13 +236,23 @@ impl LadderStrategy {
         // Trade history showed -13 to -15 bps edge during 06-08, 14-15 UTC
         let time_scalar = cfg.time_of_day_multiplier();
 
+        // Book depth scaling (thin books → harder to exit → higher risk)
+        // FIRST PRINCIPLES: This replaces the arbitrary stochastic_spread_multiplier
+        let book_depth_scalar = cfg.book_depth_multiplier(market_params.near_touch_depth_usd);
+
+        // Warmup uncertainty scaling (parameter uncertainty → more conservative)
+        // FIRST PRINCIPLES: This replaces the arbitrary adaptive_uncertainty_factor
+        let warmup_scalar = cfg.warmup_multiplier(market_params.adaptive_warmup_progress);
+
         let gamma_effective = cfg.gamma_base
             * vol_scalar
             * toxicity_scalar
             * inventory_scalar
             * regime_scalar
             * hawkes_scalar
-            * time_scalar;
+            * time_scalar
+            * book_depth_scalar
+            * warmup_scalar;
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
@@ -405,44 +415,20 @@ impl LadderStrategy {
             }
         }
 
-        // Apply stochastic spread multiplier for conditional tight quoting
-        // When tight quoting is NOT allowed, multiplier > 1.0 to widen spreads
-        if market_params.stochastic_spread_multiplier > 1.0 {
-            for depth in dynamic_depths.bid.iter_mut() {
-                *depth *= market_params.stochastic_spread_multiplier;
-            }
-            for depth in dynamic_depths.ask.iter_mut() {
-                *depth *= market_params.stochastic_spread_multiplier;
-            }
-            debug!(
-                stochastic_mult = %format!("{:.2}", market_params.stochastic_spread_multiplier),
-                tight_quoting_allowed = market_params.tight_quoting_allowed,
-                block_reason = ?market_params.tight_quoting_block_reason,
-                "Stochastic spread multiplier applied to ladder depths"
-            );
-        }
-
-        // === ADAPTIVE WARMUP UNCERTAINTY SCALING ===
-        // During adaptive warmup, apply a small safety margin to spreads.
-        // This provides protection while priors are being refined from actual fills.
-        // Factor decays from ~1.2 (20% wider) to 1.0 (no adjustment) as warmup progresses.
-        if market_params.use_adaptive_spreads
-            && market_params.adaptive_can_estimate
-            && market_params.adaptive_uncertainty_factor > 1.001
-        {
-            let factor = market_params.adaptive_uncertainty_factor;
-            for depth in dynamic_depths.bid.iter_mut() {
-                *depth *= factor;
-            }
-            for depth in dynamic_depths.ask.iter_mut() {
-                *depth *= factor;
-            }
-            debug!(
-                uncertainty_factor = %format!("{:.3}", factor),
-                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-                "Adaptive warmup uncertainty applied to ladder depths"
-            );
-        }
+        // === DEPRECATED: SPREAD MULTIPLIERS ===
+        // FIRST PRINCIPLES REFACTOR: Arbitrary spread multipliers bypass the GLFT model.
+        //
+        // Previously this section applied:
+        //   1. stochastic_spread_multiplier (book depth, toxicity)
+        //   2. adaptive_uncertainty_factor (warmup uncertainty)
+        //
+        // These have been REMOVED. All risk factors now flow through gamma:
+        //   - Book depth → RiskConfig.book_depth_multiplier() → gamma scaling
+        //   - Toxicity → RiskConfig.toxicity_sensitivity → gamma scaling
+        //   - Warmup uncertainty → RiskConfig.warmup_multiplier() → gamma scaling
+        //
+        // The GLFT formula δ = (1/γ) × ln(1 + γ/κ) now handles all spread widening
+        // in a mathematically principled way.
 
         // Create ladder config with dynamic depths
         let ladder_config = self
@@ -450,7 +436,9 @@ impl LadderStrategy {
             .clone()
             .with_dynamic_depths(dynamic_depths);
 
-        debug!(
+        // INFO-level log for spread diagnostics
+        // Shows gamma (includes book_depth + warmup scaling), kappa, and resulting spread
+        info!(
             gamma = %format!("{:.3}", gamma),
             kappa = %format!("{:.1}", kappa),
             sigma = %format!("{:.6}", market_params.sigma),
@@ -458,10 +446,10 @@ impl LadderStrategy {
                 .and_then(|d| d.spread_at_touch())
                 .unwrap_or(0.0)),
             effective_floor_bps = %format!("{:.1}", effective_floor_bps),
-            tight_quoting = market_params.tight_quoting_allowed,
-            adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,
+            book_depth_usd = %format!("{:.0}", market_params.near_touch_depth_usd),
             warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-            "Dynamic depths computed for ladder"
+            adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,
+            "Ladder spread diagnostics (gamma includes book_depth + warmup scaling)"
         );
 
         // === STOCHASTIC MODULE: Constrained Ladder Optimization ===

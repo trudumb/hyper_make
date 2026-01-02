@@ -750,30 +750,18 @@ impl MarketParams {
         self.tight_quoting_allowed = can_quote_tight;
         self.tight_quoting_block_reason = block_reason;
 
-        // === 3. Compute Stochastic Spread Multiplier ===
-        // Combines all constraint violations into a single widening factor
-        let mut multiplier = 1.0;
-
-        // Book depth scaling (if enabled)
-        if config.use_book_depth_constraint && self.near_touch_depth_usd > 0.0 {
-            if self.near_touch_depth_usd < config.min_book_depth_usd {
-                // Very thin book: widen significantly
-                multiplier *= 1.5;
-            } else if self.near_touch_depth_usd < config.tight_spread_book_depth_usd {
-                // Interpolate between min and tight thresholds
-                let depth_ratio = (self.near_touch_depth_usd - config.min_book_depth_usd)
-                    / (config.tight_spread_book_depth_usd - config.min_book_depth_usd);
-                // depth_ratio 0 → 1.3x, depth_ratio 1 → 1.0x
-                multiplier *= 1.0 + 0.3 * (1.0 - depth_ratio);
-            }
-        }
-
-        // Jump regime widening (already handled by volatility regime, but add safety margin)
-        if self.is_toxic_regime {
-            multiplier *= 1.2;
-        }
-
-        self.stochastic_spread_multiplier = multiplier;
+        // === 3. Stochastic Spread Multiplier - DEPRECATED ===
+        // FIRST PRINCIPLES REFACTOR: Arbitrary spread multipliers bypass the GLFT model.
+        // All risk factors now flow through gamma (risk aversion) scaling:
+        //   - Book depth → gamma scaling via RiskConfig.book_depth_multiplier()
+        //   - Toxicity → gamma scaling via RiskConfig.toxicity_sensitivity
+        //   - Warmup uncertainty → gamma scaling via RiskConfig.warmup_multiplier()
+        //
+        // This ensures spreads are computed through the principled formula:
+        //   δ = (1/γ) × ln(1 + γ/κ)
+        //
+        // Setting to 1.0 (no-op) - the field is kept for API compatibility.
+        self.stochastic_spread_multiplier = 1.0;
     }
 
     /// Get the effective minimum spread floor in fractional terms.
