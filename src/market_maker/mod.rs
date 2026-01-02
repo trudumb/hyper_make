@@ -1843,26 +1843,59 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Execute modifies (preserves queue position)
+        // RATE LIMIT FIX: Check modify debounce before executing
         let all_modifies: Vec<ModifySpec> = bid_modifies.into_iter().chain(ask_modifies).collect();
         if !all_modifies.is_empty() {
-            let num_modifies = all_modifies.len() as u32;
-            let modify_results = self
-                .executor
-                .modify_bulk_orders(&self.config.asset, all_modifies.clone())
-                .await;
+            // Check if we're rate limited or modify interval hasn't passed
+            if self.infra.proactive_rate_tracker.is_rate_limited() {
+                debug!(
+                    remaining_backoff = ?self.infra.proactive_rate_tracker.remaining_backoff(),
+                    "Skipping modify: rate limited (429 backoff active)"
+                );
+                // Convert modifies to cancel+place instead (will be handled in next cycle)
+                // Don't execute modifies during backoff
+            } else if !self.infra.proactive_rate_tracker.can_modify() {
+                debug!("Skipping modify: minimum modify interval not elapsed (prevents OID churn)");
+                // Skip this cycle, will retry next time
+            } else {
+                // Mark that we're doing a modify
+                self.infra.proactive_rate_tracker.mark_modify();
 
-            // Record API call for rate tracking
-            self.infra
-                .proactive_rate_tracker
-                .record_call(1, num_modifies);
+                let num_modifies = all_modifies.len() as u32;
+                let modify_results = self
+                    .executor
+                    .modify_bulk_orders(&self.config.asset, all_modifies.clone())
+                    .await;
+
+                // Record API call for rate tracking
+                self.infra
+                    .proactive_rate_tracker
+                    .record_call(1, num_modifies);
 
             // Process modify results
             for (i, result) in modify_results.iter().enumerate() {
                 let spec = &all_modifies[i];
                 if result.success {
-                    // Update tracking with new price/size
+                    // CRITICAL FIX: Hyperliquid modify can return NEW OID.
+                    // The exchange may assign a new order ID on price change.
+                    // We must re-key our tracking to use the new OID.
+                    let effective_oid = if result.oid > 0 && result.oid != spec.oid {
+                        // OID changed - re-key the order in tracking
+                        if self.orders.replace_oid(spec.oid, result.oid) {
+                            info!(
+                                old_oid = spec.oid,
+                                new_oid = result.oid,
+                                "Modify returned new OID - tracking updated"
+                            );
+                        }
+                        result.oid
+                    } else {
+                        spec.oid
+                    };
+
+                    // Update tracking with new price/size using the effective OID
                     self.orders
-                        .on_modify_success(spec.oid, spec.new_price, spec.new_size);
+                        .on_modify_success(effective_oid, spec.new_price, spec.new_size);
                     // Record successful modify in metrics
                     self.infra.prometheus.record_order_modified();
                 } else {
@@ -1875,10 +1908,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // Record fallback in metrics
                     self.infra.prometheus.record_modify_fallback();
 
-                    // Check if the error indicates order is already filled or canceled
+                    // Check if the error indicates order is already filled or canceled.
+                    // CRITICAL FIX: Check "canceled" FIRST because the error message
+                    // "Cannot modify canceled or filled order" contains BOTH words.
+                    // We need to handle canceled orders (remove from tracking) differently
+                    // from filled orders (wait for WS fill notification).
                     let error_msg = result.error.as_deref().unwrap_or("");
-                    let is_already_filled = error_msg.contains("filled");
                     let is_already_canceled = error_msg.contains("canceled");
+                    let is_already_filled = !is_already_canceled && error_msg.contains("filled");
+
+                    if is_already_canceled {
+                        // Order was already canceled - remove from tracking
+                        debug!(
+                            oid = spec.oid,
+                            "Modify failed because order already canceled - removing from tracking"
+                        );
+                        self.orders.remove_order(spec.oid);
+                        continue;
+                    }
 
                     if is_already_filled {
                         // Order was filled - mark as FilledImmediately so it's excluded
@@ -1895,15 +1942,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         continue;
                     }
 
-                    if is_already_canceled {
-                        // Order was already canceled - remove from tracking
-                        debug!(
-                            oid = spec.oid,
-                            "Modify failed because order already canceled - removing from tracking"
-                        );
-                        self.orders.remove_order(spec.oid);
-                        continue;
-                    }
+                    // Neither canceled nor filled - proceed with cancel+place fallback
+                    // (This handles other errors like "Order not found", rate limits, etc.)
 
                     // Initiate cancel in OrderManager BEFORE sending to exchange
                     // This properly transitions state and prevents stale tracking
@@ -2066,6 +2106,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     }
                 }
             }
+            } // Close the else block for rate limit check
         }
 
         // Execute places (new orders)
@@ -2706,15 +2747,35 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
-        for oid in aged_orphans {
-            warn!(
-                "[SafetySync] Orphan order aged past grace period: oid={} - cancelling",
-                oid
+        // PERFORMANCE FIX: Use bulk cancel instead of sequential cancellation.
+        // With 16+ orphans, sequential cancellation takes 8+ seconds (500ms each).
+        // Bulk cancel is a single API call regardless of count.
+        if !aged_orphans.is_empty() {
+            info!(
+                count = aged_orphans.len(),
+                "[SafetySync] Bulk cancelling {} orphan orders that aged past grace period",
+                aged_orphans.len()
             );
-            let cancel_result = self.executor.cancel_order(&self.config.asset, oid).await;
-            safety::SafetyAuditor::log_orphan_cancellation(oid, cancel_result.order_is_gone());
-            // Clear from orphan tracking after handling
-            self.infra.orphan_tracker.clear_orphan(oid);
+
+            // Log each OID for debugging
+            for &oid in &aged_orphans {
+                warn!(
+                    "[SafetySync] Orphan order aged past grace period: oid={} - queued for bulk cancel",
+                    oid
+                );
+            }
+
+            // Bulk cancel for efficiency (single API call)
+            let cancel_results = self
+                .executor
+                .cancel_bulk_orders(&self.config.asset, aged_orphans.clone())
+                .await;
+
+            // Process results and clear from orphan tracking
+            for (oid, result) in aged_orphans.iter().zip(cancel_results.iter()) {
+                safety::SafetyAuditor::log_orphan_cancellation(*oid, result.order_is_gone());
+                self.infra.orphan_tracker.clear_orphan(*oid);
+            }
         }
 
         // Remove stale local orders (tracked but not on exchange)

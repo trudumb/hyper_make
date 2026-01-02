@@ -260,6 +260,7 @@ pub struct RejectionRateLimitMetrics {
 /// - IP: 1200 weight/minute
 /// - Address: 1 request per 1 USDC traded (cumulative) + 10K buffer
 /// - Batched: 1 IP weight but n address requests
+/// - On 429: 1 request per 10 seconds only!
 #[derive(Debug, Clone)]
 pub struct ProactiveRateLimitConfig {
     /// IP weight limit per minute (default: 1200)
@@ -272,6 +273,14 @@ pub struct ProactiveRateLimitConfig {
     pub requests_per_usd_traded: f64,
     /// Minimum delay between requotes in ms
     pub min_requote_interval_ms: u64,
+    /// Minimum delay between modify operations in ms (prevents rapid OID churn)
+    pub min_modify_interval_ms: u64,
+    /// Initial backoff duration when 429 received
+    pub initial_429_backoff: Duration,
+    /// Maximum backoff duration for 429 errors
+    pub max_429_backoff: Duration,
+    /// Backoff multiplier for consecutive 429 errors
+    pub backoff_429_multiplier: f64,
 }
 
 impl Default for ProactiveRateLimitConfig {
@@ -281,7 +290,11 @@ impl Default for ProactiveRateLimitConfig {
             ip_warning_threshold: 0.8,
             address_initial_buffer: 10_000,
             requests_per_usd_traded: 1.0,
-            min_requote_interval_ms: 100, // 10 requotes/second max
+            min_requote_interval_ms: 100,       // 10 requotes/second max
+            min_modify_interval_ms: 2000,       // Modifies at most every 2 seconds
+            initial_429_backoff: Duration::from_secs(10), // Per Hyperliquid docs: 1 req/10s when limited
+            max_429_backoff: Duration::from_secs(60),     // Cap at 1 minute
+            backoff_429_multiplier: 1.5,        // Moderate exponential increase
         }
     }
 }
@@ -289,6 +302,7 @@ impl Default for ProactiveRateLimitConfig {
 /// Proactive rate limit tracker.
 ///
 /// Tracks API usage to avoid hitting limits rather than reacting to errors.
+/// Also handles 429 response backoff with exponential increase.
 #[derive(Debug)]
 pub struct ProactiveRateLimitTracker {
     config: ProactiveRateLimitConfig,
@@ -300,6 +314,12 @@ pub struct ProactiveRateLimitTracker {
     usd_volume_traded: f64,
     /// Last requote timestamp
     last_requote: Instant,
+    /// Last modify timestamp (for modify debouncing)
+    last_modify: Instant,
+    /// When 429 backoff expires (if in backoff)
+    backoff_until: Option<Instant>,
+    /// Consecutive 429 errors (for exponential backoff)
+    consecutive_429s: u32,
 }
 
 impl Default for ProactiveRateLimitTracker {
@@ -317,6 +337,9 @@ impl ProactiveRateLimitTracker {
             address_requests: 0,
             usd_volume_traded: 0.0,
             last_requote: Instant::now(),
+            last_modify: Instant::now() - Duration::from_secs(10), // Allow immediate first modify
+            backoff_until: None,
+            consecutive_429s: 0,
         }
     }
 
@@ -328,6 +351,9 @@ impl ProactiveRateLimitTracker {
             address_requests: 0,
             usd_volume_traded: 0.0,
             last_requote: Instant::now(),
+            last_modify: Instant::now() - Duration::from_secs(10), // Allow immediate first modify
+            backoff_until: None,
+            consecutive_429s: 0,
         }
     }
 
@@ -384,12 +410,94 @@ impl ProactiveRateLimitTracker {
 
     /// Check if minimum requote interval has passed.
     pub fn can_requote(&self) -> bool {
+        // Don't requote if we're in 429 backoff
+        if self.is_rate_limited() {
+            return false;
+        }
         self.last_requote.elapsed() >= Duration::from_millis(self.config.min_requote_interval_ms)
     }
 
     /// Mark that a requote was done.
     pub fn mark_requote(&mut self) {
         self.last_requote = Instant::now();
+    }
+
+    /// Check if minimum modify interval has passed.
+    ///
+    /// Modifies are expensive operations that generate new OIDs on Hyperliquid.
+    /// Rate limiting modifies prevents rapid OID churn and rate limit exhaustion.
+    pub fn can_modify(&self) -> bool {
+        // Don't modify if we're in 429 backoff
+        if self.is_rate_limited() {
+            return false;
+        }
+        self.last_modify.elapsed() >= Duration::from_millis(self.config.min_modify_interval_ms)
+    }
+
+    /// Mark that a modify operation was done.
+    pub fn mark_modify(&mut self) {
+        self.last_modify = Instant::now();
+    }
+
+    /// Record a 429 (Too Many Requests) response.
+    ///
+    /// Triggers exponential backoff. Per Hyperliquid docs, when rate limited
+    /// you can only make 1 request per 10 seconds.
+    ///
+    /// # Returns
+    /// The backoff duration that was set
+    pub fn record_429(&mut self) -> Duration {
+        self.consecutive_429s += 1;
+
+        // Calculate backoff with exponential increase
+        let multiplier = self.config.backoff_429_multiplier.powi((self.consecutive_429s - 1) as i32);
+        let backoff_secs = (self.config.initial_429_backoff.as_secs_f64() * multiplier)
+            .min(self.config.max_429_backoff.as_secs_f64());
+        let backoff = Duration::from_secs_f64(backoff_secs);
+
+        self.backoff_until = Some(Instant::now() + backoff);
+
+        tracing::error!(
+            consecutive_429s = self.consecutive_429s,
+            backoff_secs = %format!("{:.1}", backoff_secs),
+            "Rate limited (429) - entering backoff. Per Hyperliquid docs: 1 req/10s when limited"
+        );
+
+        backoff
+    }
+
+    /// Record a successful API call (resets 429 counter).
+    pub fn record_api_success(&mut self) {
+        if self.consecutive_429s > 0 {
+            tracing::info!(
+                previous_429s = self.consecutive_429s,
+                "API success after rate limiting - resetting 429 counter"
+            );
+        }
+        self.consecutive_429s = 0;
+        self.backoff_until = None;
+    }
+
+    /// Check if we're currently in 429 backoff.
+    pub fn is_rate_limited(&self) -> bool {
+        if let Some(until) = self.backoff_until {
+            if Instant::now() < until {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get remaining backoff time if rate limited.
+    pub fn remaining_backoff(&self) -> Option<Duration> {
+        self.backoff_until.and_then(|until| {
+            let now = Instant::now();
+            if now < until {
+                Some(until - now)
+            } else {
+                None
+            }
+        })
     }
 
     /// Get metrics for logging/monitoring.
@@ -402,6 +510,8 @@ impl ProactiveRateLimitTracker {
             usd_volume_traded: self.usd_volume_traded,
             ip_warning: self.ip_rate_warning(),
             address_warning: self.address_budget_low(),
+            is_rate_limited: self.is_rate_limited(),
+            consecutive_429s: self.consecutive_429s,
         }
     }
 }
@@ -416,6 +526,8 @@ pub struct ProactiveRateLimitMetrics {
     pub usd_volume_traded: f64,
     pub ip_warning: bool,
     pub address_warning: bool,
+    pub is_rate_limited: bool,
+    pub consecutive_429s: u32,
 }
 
 #[cfg(test)]

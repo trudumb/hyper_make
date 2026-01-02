@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{bps_diff, EPSILON};
 
@@ -121,6 +121,43 @@ impl OrderManager {
             order.size = new_size;
             true
         } else {
+            false
+        }
+    }
+
+    /// Replace an order's OID after modify (exchange may assign new OID).
+    ///
+    /// Hyperliquid's modify API can return a NEW order ID. This method re-keys
+    /// the order in our tracking HashMap while preserving all tracking data.
+    ///
+    /// # Arguments
+    /// * `old_oid` - The original order ID we tracked
+    /// * `new_oid` - The new order ID from exchange modify response
+    ///
+    /// # Returns
+    /// `true` if the order was found and re-keyed, `false` otherwise.
+    pub fn replace_oid(&mut self, old_oid: u64, new_oid: u64) -> bool {
+        if old_oid == new_oid {
+            return true; // No change needed
+        }
+
+        if let Some(mut order) = self.orders.remove(&old_oid) {
+            debug!(
+                old_oid = old_oid,
+                new_oid = new_oid,
+                side = ?order.side,
+                price = order.price,
+                "Replacing order OID after modify (exchange assigned new OID)"
+            );
+            order.oid = new_oid;
+            self.orders.insert(new_oid, order);
+            true
+        } else {
+            warn!(
+                old_oid = old_oid,
+                new_oid = new_oid,
+                "Cannot replace OID - old order not found in tracking"
+            );
             false
         }
     }
@@ -655,5 +692,55 @@ impl OrderManager {
         ));
 
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_replace_oid() {
+        let mut manager = OrderManager::new();
+
+        // Add an order with old OID
+        let order = TrackedOrder::new(100, Side::Buy, 50000.0, 0.01);
+        manager.add_order(order);
+
+        assert!(manager.get_order(100).is_some());
+        assert!(manager.get_order(200).is_none());
+
+        // Replace OID 100 -> 200
+        assert!(manager.replace_oid(100, 200));
+
+        // Old OID should be gone, new OID should exist
+        assert!(manager.get_order(100).is_none());
+        assert!(manager.get_order(200).is_some());
+
+        // Check order data preserved
+        let order = manager.get_order(200).unwrap();
+        assert_eq!(order.oid, 200);
+        assert_eq!(order.side, Side::Buy);
+        assert!((order.price - 50000.0).abs() < f64::EPSILON);
+        assert!((order.size - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_replace_oid_same() {
+        let mut manager = OrderManager::new();
+        let order = TrackedOrder::new(100, Side::Buy, 50000.0, 0.01);
+        manager.add_order(order);
+
+        // Replacing with same OID should succeed (no-op)
+        assert!(manager.replace_oid(100, 100));
+        assert!(manager.get_order(100).is_some());
+    }
+
+    #[test]
+    fn test_replace_oid_not_found() {
+        let mut manager = OrderManager::new();
+
+        // Replacing non-existent OID should fail
+        assert!(!manager.replace_oid(999, 1000));
     }
 }
