@@ -3,6 +3,7 @@
 //! Groups related modules into logical bundles for cleaner organization.
 
 use crate::market_maker::{
+    adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::MetricsRecorder,
     fills::FillProcessor,
@@ -234,6 +235,8 @@ pub struct StochasticComponents {
     pub stochastic_config: StochasticConfig,
     /// Dynamic risk configuration
     pub dynamic_risk_config: DynamicRiskConfig,
+    /// Adaptive Bayesian spread calculator
+    pub adaptive_spreads: AdaptiveSpreadCalculator,
 }
 
 impl StochasticComponents {
@@ -243,10 +246,26 @@ impl StochasticComponents {
         stochastic_config: StochasticConfig,
         dynamic_risk_config: DynamicRiskConfig,
     ) -> Self {
+        Self::with_adaptive_config(
+            hjb_config,
+            stochastic_config,
+            dynamic_risk_config,
+            AdaptiveBayesianConfig::default(),
+        )
+    }
+
+    /// Create stochastic components with custom adaptive config.
+    pub fn with_adaptive_config(
+        hjb_config: HJBConfig,
+        stochastic_config: StochasticConfig,
+        dynamic_risk_config: DynamicRiskConfig,
+        adaptive_config: AdaptiveBayesianConfig,
+    ) -> Self {
         Self {
             hjb_controller: HJBInventoryController::new(hjb_config),
             stochastic_config,
             dynamic_risk_config,
+            adaptive_spreads: AdaptiveSpreadCalculator::new(adaptive_config),
         }
     }
 }

@@ -251,47 +251,74 @@ impl QuotingStrategy for GLFTStrategy {
         let effective_max_position = market_params.effective_max_position(max_position);
 
         // === 1. DYNAMIC GAMMA with Tail Risk ===
-        // γ scales with volatility, toxicity, inventory utilization, liquidity, AND cascade severity
-        let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
-        // Apply liquidity multiplier: thin book → higher gamma → wider spread
-        let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
-        // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
-        let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
-
-        // === 1a. ADVERSE SELECTION-ADJUSTED KAPPA (Fix 1 + Fix 2: Directional) ===
-        // Theory: Informed flow reduces effective supply of uninformed liquidity.
-        // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
+        // When adaptive spreads enabled: use log-additive shrinkage gamma
+        // When disabled: use multiplicative RiskConfig gamma
         //
-        // In GLFT, κ is the order book depth decay. But when our fills are adversely
-        // selected (informed traders hit us first), the effective κ for OUR orders
-        // is lower than the market-wide κ. Lower κ → wider spreads (correct response).
-        //
-        // Fix 2: Directional kappa estimation - use separate κ_bid and κ_ask
-        // When informed flow is selling, our bids get hit → lower κ_bid → wider bid spread
-        // When informed flow is buying, our asks get lifted → lower κ_ask → wider ask spread
-        //
-        // Fix 3: Heavy-tail adjustment - when CV > 1.2, large fills are more likely
-        // than exponential model predicts. Reduce kappa by (2-CV) to widen spreads.
-        //
-        // Example: α = 0.5 → kappa halves → spread widens by ~30%
-        let alpha = market_params.predicted_alpha.min(0.5); // Cap at 50% AS
-
-        // Heavy-tail adjustment: when CV > 1.2, reduce kappa
-        // This accounts for fat-tailed fill distance distributions
-        let tail_multiplier = if market_params.is_heavy_tailed {
-            // CV > 1.2 means heavy tail - reduce kappa (widen spread)
-            // At CV=2.0, multiplier = 0.5 (halve kappa)
-            (2.0 - market_params.kappa_cv).clamp(0.5, 1.0)
+        // KEY FIX: Use `adaptive_can_estimate` instead of `adaptive_warmed_up`
+        // The adaptive system provides usable values IMMEDIATELY via Bayesian priors.
+        // We don't need to wait for 20+ fills - priors give reasonable starting points.
+        let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+            // Adaptive gamma: log-additive scaling prevents multiplicative explosion
+            // Still apply tail risk multiplier for cascade protection
+            let adaptive_gamma = market_params.adaptive_gamma;
+            let gamma_with_tail = adaptive_gamma * market_params.tail_risk_multiplier;
+            debug!(
+                adaptive_gamma = %format!("{:.4}", adaptive_gamma),
+                tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
+                gamma_final = %format!("{:.4}", gamma_with_tail),
+                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                "Using ADAPTIVE gamma (log-additive shrinkage)"
+            );
+            gamma_with_tail
         } else {
-            1.0
+            // Legacy: multiplicative RiskConfig gamma
+            let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
+            // Apply liquidity multiplier: thin book → higher gamma → wider spread
+            let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
+            // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
+            gamma_with_liq * market_params.tail_risk_multiplier
         };
 
-        // Symmetric kappa (for skew and logging)
-        let kappa = market_params.kappa * (1.0 - alpha) * tail_multiplier;
+        // === 1a. KAPPA: Adaptive vs Legacy ===
+        // When adaptive spreads enabled: use blended book/own-fill kappa
+        // When disabled: use book-only kappa with AS adjustment
+        //
+        // KEY FIX: Use `adaptive_can_estimate` - our Bayesian priors give reasonable
+        // kappa estimates immediately (κ=2500 prior for liquid markets).
+        let (kappa, kappa_bid, kappa_ask) =
+            if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+                // Adaptive kappa: blended from book depth + own fill experience
+                // Already incorporates fill rate information via Bayesian update
+                let k = market_params.adaptive_kappa;
+                debug!(
+                    adaptive_kappa = %format!("{:.0}", k),
+                    book_kappa = %format!("{:.0}", market_params.kappa),
+                    warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                    "Using ADAPTIVE kappa (blended book + own fills)"
+                );
+                // For now, use symmetric kappa (directional can be added later)
+                (k, k, k)
+            } else {
+                // Legacy: Book-based kappa with AS and heavy-tail adjustments
+                // Theory: Informed flow reduces effective supply of uninformed liquidity.
+                // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
+                let alpha = market_params.predicted_alpha.min(0.5); // Cap at 50% AS
 
-        // Directional kappas for asymmetric GLFT spreads
-        let kappa_bid = market_params.kappa_bid * (1.0 - alpha) * tail_multiplier;
-        let kappa_ask = market_params.kappa_ask * (1.0 - alpha) * tail_multiplier;
+                // Heavy-tail adjustment: when CV > 1.2, reduce kappa
+                let tail_multiplier = if market_params.is_heavy_tailed {
+                    (2.0 - market_params.kappa_cv).clamp(0.5, 1.0)
+                } else {
+                    1.0
+                };
+
+                // Symmetric kappa (for skew and logging)
+                let k = market_params.kappa * (1.0 - alpha) * tail_multiplier;
+
+                // Directional kappas for asymmetric GLFT spreads
+                let k_bid = market_params.kappa_bid * (1.0 - alpha) * tail_multiplier;
+                let k_ask = market_params.kappa_ask * (1.0 - alpha) * tail_multiplier;
+                (k, k_bid, k_ask)
+            };
 
         // Time horizon from arrival intensity: T = 1/λ (with max cap)
         let time_horizon = self.holding_time(market_params.arrival_intensity);
@@ -388,16 +415,55 @@ impl QuotingStrategy for GLFTStrategy {
         half_spread_ask *= spread_regime_mult;
         half_spread *= spread_regime_mult;
 
-        // === 2d. STOCHASTIC SPREAD FLOOR (First-Principles) ===
-        // Apply the effective minimum spread floor which incorporates:
-        // - Static min_spread_floor from RiskConfig (baseline protection)
-        // - Tick size constraint (can't quote finer than market tick)
-        // - Latency-based floor: σ × √(2×τ_update) (update delay cost)
-        let effective_floor =
-            market_params.effective_spread_floor(self.risk_config.min_spread_floor);
+        // === 2d. SPREAD FLOOR: Adaptive vs Static ===
+        // When adaptive spreads enabled: use learned floor from Bayesian AS estimation
+        // When disabled: use static RiskConfig floor + latency/tick constraints
+        //
+        // KEY FIX: Use `adaptive_can_estimate` - our Bayesian prior gives reasonable
+        // floor estimates immediately (fees + 3bps AS prior + safety margin ≈ 8-10 bps).
+        let effective_floor = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate
+        {
+            // Adaptive floor: learned from actual fill AS + fees + safety buffer
+            // During warmup, the prior-based floor is already conservative (fees + 3bps + 1.5σ)
+            let floor = market_params.adaptive_spread_floor;
+            debug!(
+                adaptive_floor_bps = %format!("{:.2}", floor * 10000.0),
+                static_floor_bps = %format!("{:.2}", self.risk_config.min_spread_floor * 10000.0),
+                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                "Using ADAPTIVE spread floor (Bayesian AS estimation)"
+            );
+            floor
+        } else {
+            // Legacy: Static floor from RiskConfig + tick/latency constraints
+            market_params.effective_spread_floor(self.risk_config.min_spread_floor)
+        };
         half_spread_bid = half_spread_bid.max(effective_floor);
         half_spread_ask = half_spread_ask.max(effective_floor);
         half_spread = half_spread.max(effective_floor);
+
+        // === 2e. SPREAD CEILING: Fill Rate Controller ===
+        // When adaptive spreads enabled: apply ceiling to ensure minimum fill rate
+        // This prevents spreads from being so wide we never trade
+        //
+        // NOTE: For ceiling, we DO check `adaptive_warmed_up` here because the
+        // fill rate controller needs observation time (2+ minutes) before it can
+        // reliably suggest a ceiling. Using a ceiling too early could be harmful.
+        if market_params.use_adaptive_spreads
+            && market_params.adaptive_warmed_up
+            && market_params.adaptive_spread_ceiling < f64::MAX
+        {
+            let ceiling = market_params.adaptive_spread_ceiling;
+            if half_spread > ceiling {
+                debug!(
+                    half_spread_bps = %format!("{:.2}", half_spread * 10000.0),
+                    ceiling_bps = %format!("{:.2}", ceiling * 10000.0),
+                    "Applying ADAPTIVE spread ceiling (fill rate target)"
+                );
+            }
+            half_spread_bid = half_spread_bid.min(ceiling);
+            half_spread_ask = half_spread_ask.min(ceiling);
+            half_spread = half_spread.min(ceiling);
+        }
 
         // Apply stochastic spread multiplier for conditional tight quoting
         // When tight quoting is NOT allowed, multiplier > 1.0 to widen spreads
@@ -411,6 +477,26 @@ impl QuotingStrategy for GLFTStrategy {
                 tight_quoting_allowed = market_params.tight_quoting_allowed,
                 block_reason = ?market_params.tight_quoting_block_reason,
                 "Stochastic spread multiplier applied"
+            );
+        }
+
+        // === 2f. ADAPTIVE WARMUP UNCERTAINTY SCALING ===
+        // During adaptive warmup, apply a small safety margin to spreads.
+        // This provides protection while priors are being refined from actual fills.
+        // Factor decays from ~1.2 (20% wider) to 1.0 (no adjustment) as warmup progresses.
+        if market_params.use_adaptive_spreads
+            && market_params.adaptive_can_estimate
+            && market_params.adaptive_uncertainty_factor > 1.001
+        {
+            let factor = market_params.adaptive_uncertainty_factor;
+            half_spread_bid *= factor;
+            half_spread_ask *= factor;
+            half_spread *= factor;
+            debug!(
+                uncertainty_factor = %format!("{:.3}", factor),
+                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                spread_after_bps = %format!("{:.2}", half_spread * 10000.0),
+                "Adaptive warmup uncertainty scaling applied"
             );
         }
 
@@ -581,7 +667,8 @@ impl QuotingStrategy for GLFTStrategy {
             kappa_bid = %format!("{:.0}", kappa_bid),
             kappa_ask = %format!("{:.0}", kappa_ask),
             kappa_cv = %format!("{:.2}", market_params.kappa_cv),
-            tail_mult = %format!("{:.2}", tail_multiplier),
+            adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,
+            warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
             time_horizon = %format!("{:.2}", time_horizon),
             half_spread_bps = %format!("{:.1}", half_spread * 10000.0),
             half_spread_bid_bps = %format!("{:.1}", half_spread_bid * 10000.0),

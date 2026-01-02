@@ -323,6 +323,45 @@ pub struct MarketParams {
     /// 1.0 = no widening (all constraints satisfied)
     /// > 1.0 = widen spreads proportionally
     pub stochastic_spread_multiplier: f64,
+
+    // ==================== Adaptive Bayesian System ====================
+    /// Whether the adaptive Bayesian system is enabled.
+    pub use_adaptive_spreads: bool,
+
+    /// Adaptive learned spread floor from Bayesian AS estimation.
+    /// Replaces static min_spread_floor when enabled.
+    /// Formula: floor = fees + max(0, μ_AS) + k × σ_AS
+    pub adaptive_spread_floor: f64,
+
+    /// Adaptive kappa from blended book/own-fill estimation.
+    /// More accurate than book-only kappa especially in thin markets.
+    pub adaptive_kappa: f64,
+
+    /// Adaptive gamma from shrinkage estimation.
+    /// Log-additive to prevent multiplicative explosion.
+    pub adaptive_gamma: f64,
+
+    /// Spread ceiling from fill rate controller.
+    /// Ensures minimum fill rate to maintain market presence.
+    pub adaptive_spread_ceiling: f64,
+
+    /// Whether adaptive system is warmed up with enough data.
+    /// NOTE: For deciding to USE adaptive values, check `adaptive_can_estimate` instead.
+    /// This field indicates full calibration (20+ fills).
+    pub adaptive_warmed_up: bool,
+
+    /// Whether adaptive system can provide reasonable estimates.
+    /// TRUE immediately - uses Bayesian priors that give sensible starting values.
+    /// Use this to decide whether to use adaptive values (not adaptive_warmed_up).
+    pub adaptive_can_estimate: bool,
+
+    /// Warmup progress (0.0 to 1.0).
+    /// Used for uncertainty scaling during warmup.
+    pub adaptive_warmup_progress: f64,
+
+    /// Uncertainty factor for warmup period.
+    /// Multiply spreads by this factor (> 1.0 during warmup, 1.0 when warmed up).
+    pub adaptive_uncertainty_factor: f64,
 }
 
 impl Default for MarketParams {
@@ -428,6 +467,16 @@ impl Default for MarketParams {
             tight_quoting_allowed: false, // Conservative default
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
+            // Adaptive Bayesian System
+            use_adaptive_spreads: false,      // Default OFF for safety
+            adaptive_spread_floor: 0.0008,    // 8 bps fallback floor
+            adaptive_kappa: 100.0,            // Moderate kappa fallback
+            adaptive_gamma: 0.3,              // Base gamma fallback
+            adaptive_spread_ceiling: f64::MAX, // No ceiling by default
+            adaptive_warmed_up: false,        // Not warmed up initially
+            adaptive_can_estimate: true,      // Can estimate immediately via priors
+            adaptive_warmup_progress: 0.0,    // Start at 0% progress
+            adaptive_uncertainty_factor: 1.2, // Start with 20% wider spreads
         }
     }
 }

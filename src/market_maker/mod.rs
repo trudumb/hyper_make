@@ -6,6 +6,7 @@
 //! - **PositionTracker**: Tracks position and deduplicates fills
 //! - **Executor**: Handles order placement and cancellation
 
+pub mod adaptive;
 mod adverse_selection;
 mod config;
 pub mod core;
@@ -795,6 +796,41 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
+        // Update adaptive Bayesian spread calculator with fill data
+        // This updates: learned floor (AS), blended kappa (fill rate), shrinkage gamma (PnL)
+        if self.stochastic.stochastic_config.use_adaptive_spreads {
+            for fill in &user_fills.data.fills {
+                if fill.coin != *self.config.asset {
+                    continue;
+                }
+
+                let fill_price: f64 = fill.px.parse().unwrap_or(0.0);
+                let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
+
+                // Compute realized adverse selection: (mid_after - fill_price) × direction
+                // direction = +1 for buy (we bought, if mid moved up we gained),
+                // direction = -1 for sell (we sold, if mid moved down we gained)
+                // Positive AS means we lost (price moved against us after fill)
+                let direction = if is_buy { 1.0 } else { -1.0 };
+                let as_realized = (self.latest_mid - fill_price) * direction / fill_price;
+
+                // Compute depth of this fill (distance from mid when placed)
+                // For now use adverse selection as proxy until we track order placement mid
+                let depth_from_mid = (fill_price - self.latest_mid).abs() / self.latest_mid;
+
+                // PnL for this fill: simplified as -AS (negative AS = profit)
+                let fill_pnl = -as_realized;
+
+                // Update all adaptive components via simplified fill handler
+                self.stochastic.adaptive_spreads.on_fill_simple(
+                    as_realized,
+                    depth_from_mid,
+                    fill_pnl,
+                    self.estimator.kappa(),
+                );
+            }
+        }
+
         // Record fill volume for rate limit budget calculation
         if result.total_volume_usd > 0.0 {
             self.infra
@@ -1001,6 +1037,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             hjb_controller: &self.stochastic.hjb_controller,
             margin_sizer: &self.infra.margin_sizer,
             stochastic_config: &self.stochastic.stochastic_config,
+            adaptive_spreads: &self.stochastic.adaptive_spreads,
             position: self.position.position(),
             max_position: self.config.max_position,
             latest_mid: self.latest_mid,
@@ -1043,6 +1080,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
         self.effective_max_position = new_effective;
+
+        // Log adaptive system status if enabled
+        if self.stochastic.stochastic_config.use_adaptive_spreads {
+            let adaptive = &self.stochastic.adaptive_spreads;
+            debug!(
+                can_estimate = market_params.adaptive_can_estimate,
+                fully_warmed_up = market_params.adaptive_warmed_up,
+                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                uncertainty_factor = %format!("{:.3}", market_params.adaptive_uncertainty_factor),
+                adaptive_floor_bps = %format!("{:.2}", market_params.adaptive_spread_floor * 10000.0),
+                adaptive_kappa = %format!("{:.0}", market_params.adaptive_kappa),
+                adaptive_gamma = %format!("{:.3}", market_params.adaptive_gamma),
+                adaptive_ceiling_bps = %format!("{:.2}", market_params.adaptive_spread_ceiling * 10000.0),
+                fill_rate = %format!("{:.4}", adaptive.fill_rate_controller().observed_fill_rate()),
+                "Adaptive Bayesian spreads (using immediately via priors)"
+            );
+
+            // Call on_no_fill to nudge toward tighter spreads when quoting without fills
+            // This is a soft decay that reduces spread over time when not getting filled
+            self.stochastic.adaptive_spreads.on_no_fill_simple();
+        }
 
         debug!(
             mid = self.latest_mid,

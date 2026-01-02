@@ -353,6 +353,18 @@ pub struct StochasticConfig {
     /// Common: US open (14:30 UTC), EU open (7-8 UTC), Asia session (0-2 UTC).
     /// Default: [7, 14] (EU open, US open)
     pub tight_quoting_excluded_hours: Vec<u8>,
+
+    // ==================== Adaptive Bayesian System ====================
+    /// Enable adaptive Bayesian spread calculator.
+    /// When true, uses learned spread floor, blended kappa, and shrinkage gamma.
+    /// This replaces static parameters with online-learned values.
+    /// Default: false (conservative - enable after testing)
+    pub use_adaptive_spreads: bool,
+
+    /// Baseline volatility for adaptive gamma scaling (per-second σ).
+    /// This is duplicated from RiskConfig for module isolation.
+    /// Default: 0.0002 (20 bps per second)
+    pub sigma_baseline: f64,
 }
 
 impl Default for StochasticConfig {
@@ -403,6 +415,15 @@ impl Default for StochasticConfig {
             tight_quoting_max_inventory: 0.3, // 30% of max position
             tight_quoting_max_toxicity: 0.1,  // 10% predicted alpha
             tight_quoting_excluded_hours: vec![7, 14], // EU open, US open
+
+            // Adaptive Bayesian System
+            // ENABLED by default - uses learned parameters instead of static ones:
+            // - Learned spread floor from Bayesian AS estimation
+            // - Blended kappa from book depth + own fills
+            // - Log-additive shrinkage gamma (prevents multiplicative explosion)
+            // - Fill rate targeting with spread ceiling
+            use_adaptive_spreads: true,
+            sigma_baseline: 0.0002, // 20 bps per second (matches RiskConfig)
         }
     }
 }

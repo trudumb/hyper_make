@@ -522,6 +522,7 @@ impl StochasticConstraintParams {
 
 // === Parameter Aggregation ===
 
+use crate::market_maker::adaptive::AdaptiveSpreadCalculator;
 use crate::market_maker::adverse_selection::AdverseSelectionEstimator;
 use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
 use crate::market_maker::estimator::ParameterEstimator;
@@ -555,6 +556,9 @@ pub struct ParameterSources<'a> {
     pub hjb_controller: &'a HJBInventoryController,
     pub margin_sizer: &'a MarginAwareSizer,
     pub stochastic_config: &'a StochasticConfig,
+
+    // Adaptive Bayesian system
+    pub adaptive_spreads: &'a AdaptiveSpreadCalculator,
 
     // Context
     pub position: f64,
@@ -790,6 +794,27 @@ impl ParameterAggregator {
             tight_quoting_allowed: false, // Conservative default, computed by caller
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // Computed dynamically
+
+            // === Adaptive Bayesian System ===
+            use_adaptive_spreads: sources.stochastic_config.use_adaptive_spreads,
+            adaptive_spread_floor: sources.adaptive_spreads.spread_floor(),
+            adaptive_kappa: sources.adaptive_spreads.kappa(sources.estimator.kappa()),
+            adaptive_gamma: sources.adaptive_spreads.gamma(
+                sources.risk_aversion,
+                sources.estimator.sigma_effective() / sources.stochastic_config.sigma_baseline.max(1e-9),
+                sources.estimator.jump_ratio(),
+                sources.adaptive_spreads.inventory_utilization(
+                    sources.position,
+                    sources.max_position,
+                ),
+                sources.hawkes.intensity_percentile(),
+                sources.liquidation_detector.cascade_severity(),
+            ),
+            adaptive_spread_ceiling: sources.adaptive_spreads.spread_ceiling(),
+            adaptive_warmed_up: sources.adaptive_spreads.is_warmed_up(),
+            adaptive_can_estimate: sources.adaptive_spreads.can_provide_estimates(),
+            adaptive_warmup_progress: sources.adaptive_spreads.warmup_progress(),
+            adaptive_uncertainty_factor: sources.adaptive_spreads.warmup_uncertainty_factor(),
         }
     }
 }
