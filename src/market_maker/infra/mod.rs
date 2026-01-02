@@ -14,6 +14,7 @@
 //! - **Logging**: Multi-stream structured logging (Phase 6)
 //! - **Capacity**: Pre-allocation constants for latency optimization
 //! - **Arena**: Quote cycle arena allocator for latency optimization
+//! - **OrphanTracker**: Prevents false orphan detection during order lifecycle
 
 mod arena;
 pub mod capacity;
@@ -24,6 +25,7 @@ mod executor;
 mod logging;
 mod margin;
 mod metrics;
+mod orphan_tracker;
 mod rate_limit;
 mod reconciliation;
 mod reconnection;
@@ -37,6 +39,7 @@ pub use executor::*;
 pub use logging::*;
 pub use margin::*;
 pub use metrics::*;
+pub use orphan_tracker::*;
 pub use rate_limit::*;
 pub use reconciliation::*;
 pub use reconnection::*;

@@ -50,9 +50,13 @@ struct ExchangeLimitsInner {
     max_long: AtomicF64,
     /// Maximum short position allowed (max_trade_szs[1])
     max_short: AtomicF64,
-    /// Available capacity to buy (available_to_trade[0])
+    /// Available capacity to INCREASE long exposure (available_to_trade[0])
+    /// NOTE: This is capacity for new long positions, NOT capacity to close shorts.
+    /// Closing a short (buying to flat) releases margin, doesn't consume this.
     available_buy: AtomicF64,
-    /// Available capacity to sell (available_to_trade[1])
+    /// Available capacity to INCREASE short exposure (available_to_trade[1])
+    /// NOTE: This is capacity for new short positions, NOT capacity to close longs.
+    /// Closing a long (selling to flat) releases margin, doesn't consume this.
     available_sell: AtomicF64,
 
     // === Pre-computed effective limits ===
@@ -106,7 +110,12 @@ impl ExchangePositionLimits {
     ) {
         // Parse exchange limits
         // max_trade_szs: Maximum position SIZE in contracts (e.g., 0.016 BTC)
-        // available_to_trade: Available notional in USD (e.g., 1419 USD)
+        // available_to_trade: Available notional in USD to INCREASE exposure
+        //   [0] = capacity to increase LONG (buy more)
+        //   [1] = capacity to increase SHORT (sell more)
+        // NOTE: These limits apply to opening/increasing positions, NOT closing.
+        // Closing a position releases margin, so you can always close regardless
+        // of available_to_trade values.
         let max_long = parse_f64_or_max(&response.max_trade_szs, 0);
         let max_short = parse_f64_or_max(&response.max_trade_szs, 1);
         let available_buy_usd = parse_f64_or_max(&response.available_to_trade, 0);

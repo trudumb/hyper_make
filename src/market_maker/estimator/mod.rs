@@ -209,8 +209,9 @@ pub struct EstimatorConfig {
     // === Warmup ===
     /// Minimum volume ticks before volatility estimates are valid
     pub min_volume_ticks: usize,
-    /// Minimum L2 updates before kappa is valid
-    pub min_l2_updates: usize,
+    /// Minimum trade observations before kappa is valid
+    /// (Note: Originally named min_l2_updates, but actually counts trades via market_kappa)
+    pub min_trade_observations: usize,
 
     // === Defaults ===
     /// Default sigma during warmup (per-second volatility)
@@ -261,7 +262,7 @@ impl Default for EstimatorConfig {
 
             // Warmup - reasonable for testnet/low-activity
             min_volume_ticks: 10,
-            min_l2_updates: 5,
+            min_trade_observations: 5,
 
             // Defaults
             default_sigma: 0.0001,          // 0.01% per-second

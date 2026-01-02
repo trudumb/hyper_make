@@ -100,22 +100,34 @@ pub fn process_trades(
 }
 
 /// Log estimator warmup progress (throttled).
+///
+/// Progress is logged:
+/// - Immediately on first trade (so user knows trades are being received)
+/// - Every tick during early warmup (ticks 0-5)
+/// - Every 5 ticks during later warmup
 fn log_warmup_progress(estimator: &ParameterEstimator, last_warmup_log: &mut usize) {
     if estimator.is_warmed_up() {
         return;
     }
 
-    let (vol_ticks, min_vol, l2_updates, min_l2) = estimator.warmup_progress();
+    let (vol_ticks, min_vol, trade_obs, min_trades) = estimator.warmup_progress();
 
-    if vol_ticks >= *last_warmup_log + 5 {
+    // Determine logging threshold: more frequent early, less frequent later
+    let log_threshold = if vol_ticks < 5 { 1 } else { 5 };
+
+    // Log on first trade or when threshold crossed
+    let should_log = (*last_warmup_log == 0 && trade_obs > 0)
+        || (vol_ticks >= *last_warmup_log + log_threshold);
+
+    if should_log {
         info!(
-            "Warming up: {}/{} volume ticks, {}/{} L2 updates",
-            vol_ticks, min_vol, l2_updates, min_l2
+            "Warming up: {}/{} volume ticks, {}/{} trade observations",
+            vol_ticks, min_vol, trade_obs, min_trades
         );
-        *last_warmup_log = vol_ticks;
+        *last_warmup_log = vol_ticks.max(1); // Prevent re-logging at 0
     }
 
-    if vol_ticks >= min_vol && l2_updates >= min_l2 {
+    if vol_ticks >= min_vol && trade_obs >= min_trades {
         info!(
             "Warmup complete! σ={:.6}, κ={:.2}, jump_ratio={:.2}",
             estimator.sigma(),

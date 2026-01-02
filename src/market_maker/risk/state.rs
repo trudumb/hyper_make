@@ -78,6 +78,14 @@ pub struct RiskState {
     /// Rate limit errors count
     pub rate_limit_errors: u32,
 
+    // === Connection State ===
+    /// Whether WebSocket is actively reconnecting
+    pub is_reconnecting: bool,
+    /// Current reconnection attempt number (0 = not reconnecting)
+    pub reconnection_attempt: u32,
+    /// Whether connection has permanently failed
+    pub connection_failed: bool,
+
     // === Timestamp ===
     /// When this snapshot was taken
     pub timestamp: Instant,
@@ -127,6 +135,9 @@ impl RiskState {
             data_age: now.duration_since(last_data_time),
             last_data_time,
             rate_limit_errors: 0,
+            is_reconnecting: false,
+            reconnection_attempt: 0,
+            connection_failed: false,
             timestamp: now,
         }
     }
@@ -165,6 +176,19 @@ impl RiskState {
     /// Builder-style method to set rate limit errors.
     pub fn with_rate_limit_errors(mut self, errors: u32) -> Self {
         self.rate_limit_errors = errors;
+        self
+    }
+
+    /// Builder-style method to set connection state.
+    pub fn with_connection_state(
+        mut self,
+        is_reconnecting: bool,
+        attempt: u32,
+        failed: bool,
+    ) -> Self {
+        self.is_reconnecting = is_reconnecting;
+        self.reconnection_attempt = attempt;
+        self.connection_failed = failed;
         self
     }
 
@@ -304,6 +328,9 @@ impl Default for RiskState {
             data_age: Duration::ZERO,
             last_data_time: now,
             rate_limit_errors: 0,
+            is_reconnecting: false,
+            reconnection_attempt: 0,
+            connection_failed: false,
             timestamp: now,
         }
     }

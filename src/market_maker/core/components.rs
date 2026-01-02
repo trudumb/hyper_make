@@ -8,8 +8,8 @@ use crate::market_maker::{
     fills::FillProcessor,
     infra::{
         ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
-        ExchangePositionLimits, MarginAwareSizer, MarginConfig, PositionReconciler,
-        ProactiveRateLimitConfig, ProactiveRateLimitTracker, PrometheusMetrics,
+        ExchangePositionLimits, MarginAwareSizer, MarginConfig, OrphanTracker, OrphanTrackerConfig,
+        PositionReconciler, ProactiveRateLimitConfig, ProactiveRateLimitTracker, PrometheusMetrics,
         ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
         RejectionRateLimiter, SupervisorConfig,
     },
@@ -139,6 +139,9 @@ pub struct InfraComponents {
     /// Proactive rate limit tracker (Phase 6)
     /// Tracks API usage to avoid hitting Hyperliquid limits
     pub proactive_rate_tracker: ProactiveRateLimitTracker,
+    /// Orphan order tracker (Phase 7)
+    /// Prevents false orphan detection during order lifecycle
+    pub orphan_tracker: OrphanTracker,
 }
 
 impl InfraComponents {
@@ -176,6 +179,32 @@ impl InfraComponents {
         proactive_rate_config: ProactiveRateLimitConfig,
         supervisor_config: SupervisorConfig,
     ) -> Self {
+        Self::with_orphan_config(
+            margin_config,
+            data_quality_config,
+            metrics,
+            recovery_config,
+            reconciliation_config,
+            rate_limit_config,
+            proactive_rate_config,
+            supervisor_config,
+            OrphanTrackerConfig::default(),
+        )
+    }
+
+    /// Create infrastructure components with all custom configs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_orphan_config(
+        margin_config: MarginConfig,
+        data_quality_config: DataQualityConfig,
+        metrics: MetricsRecorder,
+        recovery_config: RecoveryConfig,
+        reconciliation_config: ReconciliationConfig,
+        rate_limit_config: RejectionRateLimitConfig,
+        proactive_rate_config: ProactiveRateLimitConfig,
+        supervisor_config: SupervisorConfig,
+        orphan_config: OrphanTrackerConfig,
+    ) -> Self {
         let connection_supervisor = ConnectionSupervisor::with_config(supervisor_config);
         Self {
             margin_sizer: MarginAwareSizer::new(margin_config),
@@ -191,6 +220,7 @@ impl InfraComponents {
             reconciler: PositionReconciler::with_config(reconciliation_config),
             rate_limiter: RejectionRateLimiter::with_config(rate_limit_config),
             proactive_rate_tracker: ProactiveRateLimitTracker::with_config(proactive_rate_config),
+            orphan_tracker: OrphanTracker::with_config(orphan_config),
         }
     }
 }

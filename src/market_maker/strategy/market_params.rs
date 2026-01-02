@@ -294,6 +294,35 @@ pub struct MarketParams {
     /// Whether the dynamic limit is valid (has been calculated from margin state).
     /// If false, strategies should fall back to config.max_position.
     pub dynamic_limit_valid: bool,
+
+    // ==================== Stochastic Constraints (First Principles) ====================
+    /// Asset tick size in basis points.
+    /// Spread floor must be >= tick_size_bps (can't quote finer than tick).
+    /// Set from asset metadata (e.g., BTC tick = 0.1 → 10 bps at $100k).
+    pub tick_size_bps: f64,
+
+    /// Latency-aware spread floor: δ_min = σ × √(2×τ_update)
+    /// Dynamically computed from current volatility and expected quote latency.
+    /// In fractional terms (multiply by 10000 for bps).
+    pub latency_spread_floor: f64,
+
+    /// Near-touch book depth (USD) within 5 bps of mid.
+    /// Used for book depth constraint on tight quoting.
+    pub near_touch_depth_usd: f64,
+
+    /// Whether tight quoting is currently allowed based on all constraints.
+    /// Combines: regime, toxicity, book depth, inventory, time-of-day.
+    pub tight_quoting_allowed: bool,
+
+    /// Reason tight quoting is blocked (if not allowed).
+    /// None if tight quoting is allowed.
+    pub tight_quoting_block_reason: Option<String>,
+
+    /// Stochastic spread floor multiplier [1.0, 2.0+].
+    /// Combines all constraints into a single spread widening factor.
+    /// 1.0 = no widening (all constraints satisfied)
+    /// > 1.0 = widen spreads proportionally
+    pub stochastic_spread_multiplier: f64,
 }
 
 impl Default for MarketParams {
@@ -392,6 +421,13 @@ impl Default for MarketParams {
             // Dynamic Position Limits
             dynamic_max_position: 0.0,  // Will be set from kill switch
             dynamic_limit_valid: false, // Not valid until margin state refreshed
+            // Stochastic Constraints
+            tick_size_bps: 10.0,          // Default 10 bps tick
+            latency_spread_floor: 0.0003, // 3 bps default floor
+            near_touch_depth_usd: 0.0,    // No depth data initially
+            tight_quoting_allowed: false, // Conservative default
+            tight_quoting_block_reason: Some("Warmup".to_string()),
+            stochastic_spread_multiplier: 1.0, // No widening initially
         }
     }
 }
@@ -560,5 +596,147 @@ impl MarketParams {
             effective_ask_limit: self.exchange_effective_ask_limit,
             age_ms: self.exchange_limits_age_ms,
         }
+    }
+
+    /// Extract stochastic constraint parameters as a focused struct.
+    pub fn stochastic_constraints(&self) -> params::StochasticConstraintParams {
+        params::StochasticConstraintParams {
+            tick_size_bps: self.tick_size_bps,
+            latency_spread_floor: self.latency_spread_floor,
+            near_touch_depth_usd: self.near_touch_depth_usd,
+            tight_quoting_allowed: self.tight_quoting_allowed,
+            stochastic_spread_multiplier: self.stochastic_spread_multiplier,
+        }
+    }
+
+    /// Compute stochastic constraints and update fields.
+    ///
+    /// This evaluates all first-principles constraints and updates:
+    /// - `latency_spread_floor`: σ × √(2×τ_update)
+    /// - `tight_quoting_allowed`: Combined constraint check
+    /// - `tight_quoting_block_reason`: Why blocked (if any)
+    /// - `stochastic_spread_multiplier`: Combined widening factor
+    ///
+    /// # Arguments
+    /// - `config`: Stochastic configuration with constraint parameters
+    /// - `position`: Current position (signed)
+    /// - `max_position`: Maximum allowed position
+    /// - `current_hour_utc`: Current hour in UTC (0-23)
+    pub fn compute_stochastic_constraints(
+        &mut self,
+        config: &crate::market_maker::StochasticConfig,
+        position: f64,
+        max_position: f64,
+        current_hour_utc: u8,
+    ) {
+        // === 1. Latency-Aware Spread Floor ===
+        // δ_min = σ × √(2×τ_update) where τ_update is in seconds
+        if config.use_latency_spread_floor {
+            let tau_update_sec = config.quote_update_latency_ms / 1000.0;
+            self.latency_spread_floor = self.sigma * (2.0 * tau_update_sec).sqrt();
+        }
+
+        // === 2. Evaluate Tight Quoting Conditions ===
+        let mut can_quote_tight = true;
+        let mut block_reason: Option<String> = None;
+
+        if config.use_conditional_tight_quoting {
+            // Condition 1: Volatility regime must be Low or Normal
+            if self.volatility_regime != VolatilityRegime::Low
+                && self.volatility_regime != VolatilityRegime::Normal
+            {
+                can_quote_tight = false;
+                block_reason = Some(format!("Vol regime {:?}", self.volatility_regime));
+            }
+
+            // Condition 2: Toxicity (predicted alpha) must be low
+            if can_quote_tight && self.predicted_alpha > config.tight_quoting_max_toxicity {
+                can_quote_tight = false;
+                block_reason = Some(format!(
+                    "Toxicity {:.1}% > {:.1}%",
+                    self.predicted_alpha * 100.0,
+                    config.tight_quoting_max_toxicity * 100.0
+                ));
+            }
+
+            // Condition 3: Inventory utilization must be low
+            let inventory_util = if max_position > 0.0 {
+                (position / max_position).abs()
+            } else {
+                0.0
+            };
+            if can_quote_tight && inventory_util > config.tight_quoting_max_inventory {
+                can_quote_tight = false;
+                block_reason = Some(format!(
+                    "Inventory {:.0}% > {:.0}%",
+                    inventory_util * 100.0,
+                    config.tight_quoting_max_inventory * 100.0
+                ));
+            }
+
+            // Condition 4: Not in excluded hours
+            if can_quote_tight
+                && config
+                    .tight_quoting_excluded_hours
+                    .contains(&current_hour_utc)
+            {
+                can_quote_tight = false;
+                block_reason = Some(format!("Excluded hour {} UTC", current_hour_utc));
+            }
+
+            // Condition 5: Book depth must be sufficient (if enabled)
+            if config.use_book_depth_constraint
+                && can_quote_tight
+                && self.near_touch_depth_usd < config.min_book_depth_usd
+            {
+                can_quote_tight = false;
+                block_reason = Some(format!(
+                    "Thin book ${:.0}k < ${:.0}k",
+                    self.near_touch_depth_usd / 1000.0,
+                    config.min_book_depth_usd / 1000.0
+                ));
+            }
+        }
+
+        self.tight_quoting_allowed = can_quote_tight;
+        self.tight_quoting_block_reason = block_reason;
+
+        // === 3. Compute Stochastic Spread Multiplier ===
+        // Combines all constraint violations into a single widening factor
+        let mut multiplier = 1.0;
+
+        // Book depth scaling (if enabled)
+        if config.use_book_depth_constraint && self.near_touch_depth_usd > 0.0 {
+            if self.near_touch_depth_usd < config.min_book_depth_usd {
+                // Very thin book: widen significantly
+                multiplier *= 1.5;
+            } else if self.near_touch_depth_usd < config.tight_spread_book_depth_usd {
+                // Interpolate between min and tight thresholds
+                let depth_ratio = (self.near_touch_depth_usd - config.min_book_depth_usd)
+                    / (config.tight_spread_book_depth_usd - config.min_book_depth_usd);
+                // depth_ratio 0 → 1.3x, depth_ratio 1 → 1.0x
+                multiplier *= 1.0 + 0.3 * (1.0 - depth_ratio);
+            }
+        }
+
+        // Jump regime widening (already handled by volatility regime, but add safety margin)
+        if self.is_toxic_regime {
+            multiplier *= 1.2;
+        }
+
+        self.stochastic_spread_multiplier = multiplier;
+    }
+
+    /// Get the effective minimum spread floor in fractional terms.
+    ///
+    /// Returns the maximum of:
+    /// - Static min_spread_floor from RiskConfig
+    /// - Tick size (can't quote finer than tick)
+    /// - Latency-based floor (σ × √(2×τ_update))
+    pub fn effective_spread_floor(&self, risk_config_floor: f64) -> f64 {
+        let tick_floor = self.tick_size_bps / 10_000.0; // Convert bps to fraction
+        risk_config_floor
+            .max(tick_floor)
+            .max(self.latency_spread_floor)
     }
 }

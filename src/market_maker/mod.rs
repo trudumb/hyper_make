@@ -31,6 +31,8 @@ pub use risk::*;
 pub use strategy::*;
 pub use tracking::*;
 
+use tracking::ws_order_state::{WsFillEvent, WsOrderUpdateEvent};
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +40,8 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, warn};
+
+use chrono::Timelike;
 
 use crate::helpers::truncate_float;
 use crate::prelude::Result;
@@ -77,6 +81,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     executor: E,
     /// Order state manager
     orders: OrderManager,
+    /// WebSocket-based order state manager for improved state tracking
+    ws_state: WsOrderStateManager,
     /// Position tracker
     position: PositionTracker,
     /// Info client for subscriptions
@@ -209,6 +215,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             strategy,
             executor,
             orders: OrderManager::new(),
+            ws_state: WsOrderStateManager::new(),
             position: PositionTracker::new(initial_position),
             info_client,
             user_address,
@@ -443,6 +450,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             )
             .await?;
 
+        // Subscribe to OrderUpdates for order state tracking via WsOrderStateManager
+        self.info_client
+            .subscribe(
+                Subscription::OrderUpdates {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
         drop(sender); // Explicitly drop the sender since we're done with subscriptions
 
         info!(
@@ -621,6 +638,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             Message::Trades(trades) => self.handle_trades(trades),
             Message::UserFills(user_fills) => self.handle_user_fills(user_fills).await,
             Message::L2Book(l2_book) => self.handle_l2_book(l2_book),
+            Message::OrderUpdates(order_updates) => self.handle_order_updates(order_updates),
             _ => Ok(()),
         }
     }
@@ -719,6 +737,41 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &mut fill_state,
         )?;
 
+        // Process fills through WsOrderStateManager for additional state tracking
+        // This provides secondary deduplication and state consistency
+        for fill in &user_fills.data.fills {
+            if fill.coin != *self.config.asset {
+                continue;
+            }
+
+            let fill_event = WsFillEvent {
+                oid: fill.oid,
+                tid: fill.tid,
+                size: fill.sz.parse().unwrap_or(0.0),
+                price: fill.px.parse().unwrap_or(0.0),
+                is_buy: fill.side == "B" || fill.side.to_lowercase() == "buy",
+                coin: fill.coin.clone(),
+                cloid: fill.cloid.clone(),
+                timestamp: fill.time,
+            };
+
+            // Note: ws_state.handle_fill would update position, but position is already
+            // updated by the main fill processor. We call it with a no-op tracker.
+            // The main benefit is order state tracking and dedup validation.
+            if let Some(ws_order) = self.ws_state.get_order(fill.oid) {
+                // Just record the fill for state tracking (already processed above)
+                if !ws_order.fill_tids.contains(&fill.tid) {
+                    if let Some(order) = self.ws_state.get_order_mut(fill.oid) {
+                        order.record_fill_with_price(
+                            fill_event.tid,
+                            fill_event.size,
+                            fill_event.price,
+                        );
+                    }
+                }
+            }
+        }
+
         // Phase 4: Trigger reconciliation for unmatched fills
         if result.unmatched_fills > 0 {
             for _ in 0..result.unmatched_fills {
@@ -789,6 +842,102 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
 
         let _result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
+        Ok(())
+    }
+
+    /// Handle OrderUpdates message - processes order state changes via WsOrderStateManager.
+    fn handle_order_updates(
+        &mut self,
+        order_updates: crate::ws::message_types::OrderUpdates,
+    ) -> Result<()> {
+        for update in &order_updates.data {
+            // Filter to our asset
+            if update.order.coin != *self.config.asset {
+                continue;
+            }
+
+            // Convert to WsOrderUpdateEvent format
+            let event = WsOrderUpdateEvent {
+                oid: update.order.oid,
+                cloid: update.order.cloid.clone(),
+                status: update.status.clone(),
+                size: update.order.sz.parse().unwrap_or(0.0),
+                orig_size: update.order.orig_sz.parse().unwrap_or(0.0),
+                price: update.order.limit_px.parse().unwrap_or(0.0),
+                coin: update.order.coin.clone(),
+                is_buy: update.order.side == "B" || update.order.side.to_lowercase() == "buy",
+                status_timestamp: update.status_timestamp,
+            };
+
+            // Process through WsOrderStateManager
+            self.ws_state.handle_order_update(&event);
+
+            // CRITICAL: Also sync state to OrderManager to keep both tracking systems in sync.
+            // The safety_sync uses OrderManager for state comparison, so it must know about
+            // filled/cancelled orders to avoid false stale/orphan detection.
+            // Note: Using set_state() is appropriate here since we're receiving status from WS,
+            // not initiating state transitions internally.
+            #[allow(deprecated)]
+            match event.status.as_str() {
+                "filled" => {
+                    if self.orders.set_state(event.oid, OrderState::Filled) {
+                        info!(
+                            oid = event.oid,
+                            status = %event.status,
+                            "Order state update: filled (synced to OrderManager)"
+                        );
+                    } else {
+                        // Order not in OrderManager - could be from previous session
+                        debug!(
+                            oid = event.oid,
+                            status = %event.status,
+                            "Order filled but not tracked in OrderManager"
+                        );
+                    }
+                }
+                "canceled" => {
+                    if self.orders.set_state(event.oid, OrderState::Cancelled) {
+                        debug!(
+                            oid = event.oid,
+                            status = %event.status,
+                            "Order state update: canceled (synced to OrderManager)"
+                        );
+                    } else {
+                        debug!(
+                            oid = event.oid,
+                            status = %event.status,
+                            "Order canceled but not tracked in OrderManager"
+                        );
+                    }
+                }
+                "open" => {
+                    // Order is resting - no state change needed unless partially filled
+                    // Size changes are handled by ws_state
+                    debug!(
+                        oid = event.oid,
+                        status = %event.status,
+                        "Order state update: open"
+                    );
+                }
+                _ => {
+                    debug!(
+                        oid = event.oid,
+                        status = %event.status,
+                        "Order state update (unknown status)"
+                    );
+                }
+            }
+        }
+
+        // Periodic cleanup of terminal orders in ws_state
+        let removed = self.ws_state.cleanup();
+        if !removed.is_empty() {
+            debug!(
+                count = removed.len(),
+                "Cleaned up terminal orders from ws_state"
+            );
+        }
+
         Ok(())
     }
 
@@ -867,8 +1016,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Dynamic position limits (first principles)
             dynamic_max_position_value,
             dynamic_limit_valid,
+            // Stochastic constraints (first principles)
+            tick_size_bps: 10.0, // TODO: Get from asset metadata
+            near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
         };
-        let market_params = ParameterAggregator::build(&sources);
+        let mut market_params = ParameterAggregator::build(&sources);
+
+        // Compute stochastic constraints (latency floor, tight quoting conditions)
+        let current_hour_utc = chrono::Utc::now().hour() as u8;
+        market_params.compute_stochastic_constraints(
+            &self.stochastic.stochastic_config,
+            self.position.position(),
+            self.config.max_position,
+            current_hour_utc,
+        );
 
         // CRITICAL: Update cached effective max_position from first principles
         // This is THE source of truth for all position limit checks
@@ -1356,14 +1517,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Pre-register orders as pending with CLOIDs BEFORE the API call (Phase 1 Fix).
             // CLOID lookup is deterministic - eliminates timing race between REST and WebSocket.
+            let mut cloids_for_tracker: Vec<String> = Vec::with_capacity(order_specs.len());
             for spec in &order_specs {
                 if let Some(ref cloid) = spec.cloid {
                     self.orders
                         .add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+                    cloids_for_tracker.push(cloid.clone());
                 } else {
                     // Fallback (shouldn't happen with new code)
                     self.orders.add_pending(side, spec.price, spec.size);
                 }
+            }
+
+            // Phase 7: Register expected CLOIDs with orphan tracker BEFORE API call.
+            // This protects these orders from being cancelled as orphans if safety_sync
+            // runs before finalization completes.
+            if !cloids_for_tracker.is_empty() {
+                self.infra
+                    .orphan_tracker
+                    .register_expected_cloids(&cloids_for_tracker);
             }
 
             // Place all orders in a single API call
@@ -1406,10 +1578,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             "Recovery manager escalating to IOC recovery mode"
                         );
                     }
+                    // Phase 7: Mark CLOID as failed in orphan tracker
+                    if let Some(ref cloid) = spec.cloid {
+                        self.infra.orphan_tracker.mark_failed(cloid);
+                    }
                 }
 
                 if result.oid > 0 {
                     let cloid = spec.cloid.as_ref().or(result.cloid.as_ref());
+
+                    // Phase 7: Record OID for CLOID in orphan tracker.
+                    // This associates the OID with the expected CLOID for protection.
+                    if let Some(c) = cloid {
+                        self.infra
+                            .orphan_tracker
+                            .record_oid_for_cloid(c, result.oid);
+                    }
 
                     if result.filled {
                         // CRITICAL FIX: Order filled immediately - update position NOW
@@ -1450,6 +1634,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         // Remove from pending using CLOID (Phase 1 Fix)
                         if let Some(c) = cloid {
                             self.orders.remove_pending_by_cloid(c);
+                            // Phase 7: Mark as finalized - order now tracked locally
+                            self.infra.orphan_tracker.mark_finalized(c, result.oid);
                         } else {
                             self.orders.remove_pending(side, spec.price);
                         }
@@ -1505,6 +1691,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     if let Some(c) = cloid {
                         self.orders
                             .finalize_pending_by_cloid(c, result.oid, result.resting_size);
+                        // Phase 7: Mark as finalized - order now fully tracked locally
+                        self.infra.orphan_tracker.mark_finalized(c, result.oid);
                     } else {
                         self.orders.finalize_pending(
                             side,
@@ -1766,6 +1954,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         cloid.clone(),
                     );
 
+                    // Phase 7: Register expected CLOID with orphan tracker BEFORE API call
+                    self.infra
+                        .orphan_tracker
+                        .register_expected_cloids(std::slice::from_ref(&cloid));
+
                     // Pass the pre-registered CLOID to place_order for deterministic matching.
                     // This ensures the pending order is finalized with the correct OID.
                     let place_result = self
@@ -1781,9 +1974,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Finalize tracking based on placement result
                     if place_result.oid > 0 {
+                        // Phase 7: Record OID for CLOID in orphan tracker
+                        self.infra
+                            .orphan_tracker
+                            .record_oid_for_cloid(&cloid, place_result.oid);
+
                         if place_result.filled {
                             // Filled immediately - calculate actual fill vs resting
                             self.orders.remove_pending_by_cloid(&cloid);
+                            // Phase 7: Mark as finalized
+                            self.infra
+                                .orphan_tracker
+                                .mark_finalized(&cloid, place_result.oid);
 
                             let resting_size = place_result.resting_size;
                             let actual_fill = if resting_size < EPSILON {
@@ -1839,6 +2041,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                 place_result.oid,
                                 place_result.resting_size,
                             );
+                            // Phase 7: Mark as finalized
+                            self.infra
+                                .orphan_tracker
+                                .mark_finalized(&cloid, place_result.oid);
                             debug!(
                                 oid = place_result.oid,
                                 price = spec.new_price,
@@ -1849,6 +2055,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     } else {
                         // Order placement failed - remove from pending
                         self.orders.remove_pending_by_cloid(&cloid);
+                        // Phase 7: Mark CLOID as failed
+                        self.infra.orphan_tracker.mark_failed(&cloid);
                         warn!(
                             price = spec.new_price,
                             size = spec.new_size,
@@ -1911,11 +2119,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Pre-register as pending
+        let mut cloids_for_tracker: Vec<String> = Vec::with_capacity(order_specs.len());
         for spec in &order_specs {
             if let Some(ref cloid) = spec.cloid {
                 self.orders
                     .add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+                cloids_for_tracker.push(cloid.clone());
             }
+        }
+
+        // Phase 7: Register expected CLOIDs with orphan tracker BEFORE API call
+        if !cloids_for_tracker.is_empty() {
+            self.infra
+                .orphan_tracker
+                .register_expected_cloids(&cloids_for_tracker);
         }
 
         // Place orders
@@ -1958,12 +2175,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Remove from pending on rejection
                 if let Some(ref cloid) = spec.cloid {
                     self.orders.remove_pending_by_cloid(cloid);
+                    // Phase 7: Mark CLOID as failed
+                    self.infra.orphan_tracker.mark_failed(cloid);
                 }
                 continue;
             }
 
             if result.oid > 0 {
                 let cloid = spec.cloid.as_ref().or(result.cloid.as_ref());
+
+                // Phase 7: Record OID for CLOID in orphan tracker
+                if let Some(c) = cloid {
+                    self.infra
+                        .orphan_tracker
+                        .record_oid_for_cloid(c, result.oid);
+                }
 
                 if result.filled {
                     // Order filled immediately - update position NOW
@@ -1979,23 +2205,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Track order as FilledImmediately for WebSocket deduplication
                     let mut tracked = if let Some(c) = cloid {
-                        TrackedOrder::with_cloid(
-                            result.oid,
-                            c.clone(),
-                            side,
-                            spec.price,
-                            spec.size,
-                        )
+                        TrackedOrder::with_cloid(result.oid, c.clone(), side, spec.price, spec.size)
                     } else {
                         TrackedOrder::new(result.oid, side, spec.price, spec.size)
                     };
                     tracked.filled = actual_fill;
                     tracked.transition_to(OrderState::FilledImmediately);
-                    self.orders.add_order(tracked);
+                    self.orders.add_order(tracked.clone());
+                    // Also add to WsOrderStateManager
+                    self.ws_state.add_order(tracked);
 
                     // Remove from pending using CLOID
                     if let Some(c) = cloid {
                         self.orders.remove_pending_by_cloid(c);
+                        // Phase 7: Mark as finalized
+                        self.infra.orphan_tracker.mark_finalized(c, result.oid);
                     } else {
                         self.orders.remove_pending(side, spec.price);
                     }
@@ -2037,14 +2261,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 if let Some(c) = cloid {
                     self.orders
                         .finalize_pending_by_cloid(c, result.oid, result.resting_size);
+                    // Phase 7: Mark as finalized
+                    self.infra.orphan_tracker.mark_finalized(c, result.oid);
                 } else {
-                    self.orders.finalize_pending(
+                    self.orders
+                        .finalize_pending(side, spec.price, result.oid, result.resting_size);
+                }
+
+                // Also add to WsOrderStateManager for improved state tracking
+                let tracked = if let Some(c) = cloid {
+                    TrackedOrder::with_cloid(
+                        result.oid,
+                        c.clone(),
                         side,
                         spec.price,
-                        result.oid,
                         result.resting_size,
-                    );
-                }
+                    )
+                } else {
+                    TrackedOrder::new(result.oid, side, spec.price, result.resting_size)
+                };
+                self.ws_state.add_order(tracked);
 
                 // Initialize queue tracking for this order
                 self.tier1.queue_tracker.order_placed(
@@ -2242,7 +2478,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 quote.size
             );
 
+            // Add to primary order manager
             self.orders.add_order(TrackedOrder::new(
+                result.oid,
+                side,
+                quote.price,
+                result.resting_size,
+            ));
+
+            // Also add to WsOrderStateManager for improved state tracking
+            self.ws_state.add_order(TrackedOrder::new(
                 result.oid,
                 side,
                 quote.price,
@@ -2440,15 +2685,36 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .collect();
         let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
 
+        // Phase 7: Clean up expired entries in orphan tracker
+        self.infra.orphan_tracker.cleanup();
+
         // Cancel orphan orders (on exchange but not tracked locally)
-        let orphans = safety::SafetyAuditor::find_orphans(&exchange_oids, &local_oids);
-        for oid in orphans {
+        // Phase 7: Use orphan tracker with grace period instead of immediate cancellation.
+        // This prevents false positives during the window between API response and finalization.
+        let candidate_orphans = safety::SafetyAuditor::find_orphans(&exchange_oids, &local_oids);
+        let (aged_orphans, new_orphan_count) = self
+            .infra
+            .orphan_tracker
+            .filter_aged_orphans(&candidate_orphans);
+
+        if new_orphan_count > 0 {
+            debug!(
+                new_orphans = new_orphan_count,
+                total_candidates = candidate_orphans.len(),
+                aged = aged_orphans.len(),
+                "[SafetySync] New potential orphans detected - starting grace period"
+            );
+        }
+
+        for oid in aged_orphans {
             warn!(
-                "[SafetySync] Orphan order detected: oid={} - cancelling",
+                "[SafetySync] Orphan order aged past grace period: oid={} - cancelling",
                 oid
             );
             let cancel_result = self.executor.cancel_order(&self.config.asset, oid).await;
             safety::SafetyAuditor::log_orphan_cancellation(oid, cancel_result.order_is_gone());
+            // Clear from orphan tracking after handling
+            self.infra.orphan_tracker.clear_orphan(oid);
         }
 
         // Remove stale local orders (tracked but not on exchange)
@@ -2637,34 +2903,39 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             true, // valid
         );
 
-        // Warn if available capacity is insufficient to close position.
+        // Log capacity info for monitoring.
         //
-        // The warning should trigger when we can't close our current position,
-        // NOT when available capacity is small relative to max_position.
+        // IMPORTANT: `available_to_trade` from Hyperliquid represents capacity to
+        // INCREASE exposure (open new positions), NOT capacity to close positions.
+        // Closing a position (e.g., selling a long) RELEASES margin rather than
+        // consuming it, so these limits don't apply to position closing.
         //
-        // Example: position=0.014, available_sell=0.016, max=0.65
-        // Old logic: 0.016 < 0.65*0.1=0.065 → warning (WRONG - we can close!)
-        // New logic: 0.016 >= 0.014*1.5=0.021 → no warning (CORRECT)
+        // For market making, we care about:
+        // - Long position: available_buy = capacity to add more long
+        // - Short position: available_sell = capacity to add more short
         //
-        // We use 1.5x multiplier to ensure headroom for slippage/partial fills.
-        const CAPACITY_HEADROOM: f64 = 1.5;
+        // We only warn when the capacity to increase position on the side we're
+        // already exposed to is low, which could limit our ability to scale up.
         let position = self.position.position();
-        let position_abs = position.abs();
 
-        if position > 0.0 && summary.available_sell < position_abs * CAPACITY_HEADROOM {
-            warn!(
-                available_sell = %format!("{:.6}", summary.available_sell),
-                position = %format!("{:.6}", position),
-                required = %format!("{:.6}", position_abs * CAPACITY_HEADROOM),
-                "Low sell capacity - insufficient to close long position"
-            );
-        }
-        if position < 0.0 && summary.available_buy < position_abs * CAPACITY_HEADROOM {
-            warn!(
+        // Warn if capacity to increase existing exposure is very low
+        // (less than 10% of max position)
+        let low_capacity_threshold = self.config.max_position * 0.1;
+
+        if position > 0.0 && summary.available_buy < low_capacity_threshold {
+            debug!(
                 available_buy = %format!("{:.6}", summary.available_buy),
                 position = %format!("{:.6}", position),
-                required = %format!("{:.6}", position_abs * CAPACITY_HEADROOM),
-                "Low buy capacity - insufficient to close short position"
+                threshold = %format!("{:.6}", low_capacity_threshold),
+                "Limited capacity to increase long exposure"
+            );
+        }
+        if position < 0.0 && summary.available_sell < low_capacity_threshold {
+            debug!(
+                available_sell = %format!("{:.6}", summary.available_sell),
+                position = %format!("{:.6}", position),
+                threshold = %format!("{:.6}", low_capacity_threshold),
+                "Limited capacity to increase short exposure"
             );
         }
 
@@ -2745,6 +3016,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         .with_pending_exposure(
             self.orders.pending_exposure().0,
             self.orders.pending_exposure().1,
+        )
+        .with_connection_state(
+            self.infra.connection_health.state()
+                == crate::market_maker::infra::ConnectionState::Reconnecting,
+            self.infra.connection_health.current_attempt() as u32,
+            self.infra.connection_health.state()
+                == crate::market_maker::infra::ConnectionState::Failed,
         )
     }
 

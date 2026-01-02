@@ -101,6 +101,22 @@ position.process_fill(update, is_buy);
 - `mm_sigma`: Volatility estimate
 - `mm_kappa`: Order flow intensity
 
+## Stochastic Constraints (Added 2026-01-02)
+
+The market maker includes first-principles stochastic constraints:
+- **Tick size floor**: Spreads can't be finer than tick size
+- **Latency floor**: σ × √(2×τ_update) accounts for quote update delay
+- **Conditional tight quoting**: 5 prerequisites (vol regime, toxicity, inventory, time, book depth)
+- **Book depth threshold**: Minimum depth required for tight spreads
+
+Key parameters in `StochasticConfig`:
+- `quote_update_latency_ms`: 50ms default
+- `tight_quoting_max_inventory`: 0.3 (30%)
+- `tight_quoting_max_toxicity`: 0.1
+- `tight_quoting_excluded_hours`: [7, 14] UTC
+
+See `session_2026-01-02_stochastic_constraints` for implementation details.
+
 ## Important Constants
 
 - Default gamma_base: 0.3

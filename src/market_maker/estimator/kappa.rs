@@ -484,4 +484,10 @@ impl BookStructureEstimator {
             ratio.sqrt().clamp(1.0, 2.0)
         }
     }
+
+    /// Get near-touch depth in contracts.
+    /// This is the depth within 10 bps (0.1%) of mid.
+    pub(crate) fn near_touch_depth(&self) -> f64 {
+        self.near_touch_depth
+    }
 }

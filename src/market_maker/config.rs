@@ -301,6 +301,58 @@ pub struct StochasticConfig {
     /// Should be set to mid-ladder depth for balanced allocation.
     /// Default: 25.0 bps
     pub kelly_char_depth_bps: f64,
+
+    // ==================== Stochastic Constraints (First Principles) ====================
+    /// Enable latency-aware spread floor: δ_min = σ × √(2×τ_update) + fee
+    /// When enabled, spread floor dynamically scales with volatility and quote latency.
+    /// Default: true
+    pub use_latency_spread_floor: bool,
+
+    /// Expected quote update latency in milliseconds.
+    /// Used in latency-aware spread floor: δ_min = σ × √(2×τ_update)
+    /// Lower latency allows tighter spreads.
+    /// Default: 50.0 ms
+    pub quote_update_latency_ms: f64,
+
+    /// Enable book depth threshold for tight quoting.
+    /// When enabled, tight spreads require sufficient book depth to ensure fills.
+    /// Default: true
+    pub use_book_depth_constraint: bool,
+
+    /// Minimum book depth (USD) within 5 bps of mid to allow tight quoting.
+    /// Below this, spreads widen to protect against thin-book slippage.
+    /// Default: $50,000
+    pub min_book_depth_usd: f64,
+
+    /// Book depth (USD) required for tightest spreads (3-5 bps).
+    /// Interpolate between min and tight thresholds for spread adjustment.
+    /// Default: $200,000
+    pub tight_spread_book_depth_usd: f64,
+
+    /// Enable conditional tight quoting logic.
+    /// When true, enforces all prerequisites for tight spreads:
+    /// - Calm volatility regime
+    /// - Low toxicity (< toxicity_threshold)
+    /// - Sufficient book depth
+    /// - Low inventory utilization
+    ///
+    /// Default: true
+    pub use_conditional_tight_quoting: bool,
+
+    /// Maximum inventory utilization (fraction of max_position) for tight quoting.
+    /// Above this, spreads widen to reduce inventory risk.
+    /// Default: 0.3 (30%)
+    pub tight_quoting_max_inventory: f64,
+
+    /// Maximum toxicity (predicted alpha) for tight quoting.
+    /// Above this, spreads widen to protect against informed flow.
+    /// Default: 0.1 (10%)
+    pub tight_quoting_max_toxicity: f64,
+
+    /// Hours (UTC) to exclude from tight quoting due to high volatility.
+    /// Common: US open (14:30 UTC), EU open (7-8 UTC), Asia session (0-2 UTC).
+    /// Default: [7, 14] (EU open, US open)
+    pub tight_quoting_excluded_hours: Vec<u8>,
 }
 
 impl Default for StochasticConfig {
@@ -340,6 +392,17 @@ impl Default for StochasticConfig {
             kelly_tau_min: 10.0,        // 10 seconds floor
             kelly_tau_max: 600.0,       // 10 minutes ceiling
             kelly_char_depth_bps: 25.0, // Mid-ladder characteristic depth
+
+            // Stochastic Constraints (First Principles)
+            use_latency_spread_floor: true,
+            quote_update_latency_ms: 50.0, // 50ms expected round-trip
+            use_book_depth_constraint: true,
+            min_book_depth_usd: 50_000.0,           // $50k minimum
+            tight_spread_book_depth_usd: 200_000.0, // $200k for tightest spreads
+            use_conditional_tight_quoting: true,
+            tight_quoting_max_inventory: 0.3, // 30% of max position
+            tight_quoting_max_toxicity: 0.1,  // 10% predicted alpha
+            tight_quoting_excluded_hours: vec![7, 14], // EU open, US open
         }
     }
 }

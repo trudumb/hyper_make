@@ -574,6 +574,13 @@ impl ParameterEstimator {
         self.book_structure.gamma_multiplier()
     }
 
+    /// Get near-touch book depth in USD (within 10 bps of mid).
+    /// Used for stochastic constraint on tight quoting.
+    pub fn near_touch_depth_usd(&self) -> f64 {
+        // near_touch_depth is in contracts, multiply by mid to get USD
+        self.book_structure.near_touch_depth() * self.current_mid
+    }
+
     // === Microprice Accessors ===
 
     /// Get microprice (data-driven fair price).
@@ -809,7 +816,7 @@ impl ParameterEstimator {
     /// immediately, while own_kappa needs actual fills to accumulate.
     pub fn is_warmed_up(&self) -> bool {
         self.multi_scale.tick_count() >= self.config.min_volume_ticks
-            && self.market_kappa.update_count() >= self.config.min_l2_updates
+            && self.market_kappa.update_count() >= self.config.min_trade_observations
     }
 
     /// Get confidence in sigma estimate (0.0 to 1.0).
@@ -835,7 +842,7 @@ impl ParameterEstimator {
     }
 
     /// Get current warmup progress.
-    /// Returns (volume_ticks, min_volume_ticks, kappa_updates, min_kappa_updates)
+    /// Returns (volume_ticks, min_volume_ticks, trade_observations, min_trade_observations)
     ///
     /// Uses market_kappa for progress since own_kappa needs fills.
     pub fn warmup_progress(&self) -> (usize, usize, usize, usize) {
@@ -843,7 +850,7 @@ impl ParameterEstimator {
             self.multi_scale.tick_count(),
             self.config.min_volume_ticks,
             self.market_kappa.update_count(),
-            self.config.min_l2_updates,
+            self.config.min_trade_observations,
         )
     }
 
@@ -1027,7 +1034,7 @@ mod tests {
         EstimatorConfig {
             initial_bucket_volume: 1.0,
             min_volume_ticks: 5,
-            min_l2_updates: 3,
+            min_trade_observations: 3,
             fast_half_life_ticks: 5.0,
             medium_half_life_ticks: 10.0,
             slow_half_life_ticks: 50.0,

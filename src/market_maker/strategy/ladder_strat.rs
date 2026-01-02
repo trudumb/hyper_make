@@ -327,6 +327,15 @@ impl LadderStrategy {
             depth_decay_as: market_params.depth_decay_as.clone(),
         };
 
+        // === STOCHASTIC SPREAD FLOOR (First-Principles) ===
+        // Calculate effective minimum spread incorporating:
+        // - Static min_spread_floor from RiskConfig (baseline protection)
+        // - Tick size constraint (can't quote finer than market tick)
+        // - Latency-based floor: σ × √(2×τ_update) (update delay cost)
+        let effective_floor_frac =
+            market_params.effective_spread_floor(self.risk_config.min_spread_floor);
+        let effective_floor_bps = effective_floor_frac * 10_000.0;
+
         // === DYNAMIC DEPTHS: GLFT-optimal depth computation ===
         // Compute depths from effective gamma and kappa using GLFT formula:
         // δ* = (1/γ) × ln(1 + γ/κ)
@@ -336,13 +345,43 @@ impl LadderStrategy {
         //
         // For asymmetric depths, we could use separate bid/ask kappa estimates.
         // Currently using symmetric kappa (same for both sides).
-        let dynamic_depths = self.depth_generator.compute_depths_with_market_cap(
+        let mut dynamic_depths = self.depth_generator.compute_depths_with_market_cap(
             gamma,
             kappa,
             kappa,
             market_params.sigma,
             market_params.market_spread_bps,
         );
+
+        // Apply stochastic floor to dynamic depths
+        // Ensure all levels are at least at effective_floor_bps
+        for depth in dynamic_depths.bid.iter_mut() {
+            if *depth < effective_floor_bps {
+                *depth = effective_floor_bps;
+            }
+        }
+        for depth in dynamic_depths.ask.iter_mut() {
+            if *depth < effective_floor_bps {
+                *depth = effective_floor_bps;
+            }
+        }
+
+        // Apply stochastic spread multiplier for conditional tight quoting
+        // When tight quoting is NOT allowed, multiplier > 1.0 to widen spreads
+        if market_params.stochastic_spread_multiplier > 1.0 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth *= market_params.stochastic_spread_multiplier;
+            }
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth *= market_params.stochastic_spread_multiplier;
+            }
+            debug!(
+                stochastic_mult = %format!("{:.2}", market_params.stochastic_spread_multiplier),
+                tight_quoting_allowed = market_params.tight_quoting_allowed,
+                block_reason = ?market_params.tight_quoting_block_reason,
+                "Stochastic spread multiplier applied to ladder depths"
+            );
+        }
 
         // Create ladder config with dynamic depths
         let ladder_config = self
@@ -357,6 +396,8 @@ impl LadderStrategy {
             optimal_spread_bps = %format!("{:.2}", ladder_config.dynamic_depths.as_ref()
                 .and_then(|d| d.spread_at_touch())
                 .unwrap_or(0.0)),
+            effective_floor_bps = %format!("{:.1}", effective_floor_bps),
+            tight_quoting = market_params.tight_quoting_allowed,
             "Dynamic depths computed for ladder"
         );
 

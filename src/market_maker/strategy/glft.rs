@@ -388,10 +388,31 @@ impl QuotingStrategy for GLFTStrategy {
         half_spread_ask *= spread_regime_mult;
         half_spread *= spread_regime_mult;
 
-        // Apply minimum spread floor
-        half_spread_bid = half_spread_bid.max(self.risk_config.min_spread_floor);
-        half_spread_ask = half_spread_ask.max(self.risk_config.min_spread_floor);
-        half_spread = half_spread.max(self.risk_config.min_spread_floor);
+        // === 2d. STOCHASTIC SPREAD FLOOR (First-Principles) ===
+        // Apply the effective minimum spread floor which incorporates:
+        // - Static min_spread_floor from RiskConfig (baseline protection)
+        // - Tick size constraint (can't quote finer than market tick)
+        // - Latency-based floor: σ × √(2×τ_update) (update delay cost)
+        let effective_floor =
+            market_params.effective_spread_floor(self.risk_config.min_spread_floor);
+        half_spread_bid = half_spread_bid.max(effective_floor);
+        half_spread_ask = half_spread_ask.max(effective_floor);
+        half_spread = half_spread.max(effective_floor);
+
+        // Apply stochastic spread multiplier for conditional tight quoting
+        // When tight quoting is NOT allowed, multiplier > 1.0 to widen spreads
+        // When tight quoting IS allowed, multiplier = 1.0 (no adjustment)
+        if market_params.stochastic_spread_multiplier > 1.0 {
+            half_spread_bid *= market_params.stochastic_spread_multiplier;
+            half_spread_ask *= market_params.stochastic_spread_multiplier;
+            half_spread *= market_params.stochastic_spread_multiplier;
+            debug!(
+                stochastic_mult = %format!("{:.2}", market_params.stochastic_spread_multiplier),
+                tight_quoting_allowed = market_params.tight_quoting_allowed,
+                block_reason = ?market_params.tight_quoting_block_reason,
+                "Stochastic spread multiplier applied"
+            );
+        }
 
         // === 3. USE LEVERAGE-ADJUSTED SIGMA FOR INVENTORY SKEW ===
         // sigma_leverage_adjusted incorporates:
@@ -565,6 +586,7 @@ impl QuotingStrategy for GLFTStrategy {
             half_spread_bps = %format!("{:.1}", half_spread * 10000.0),
             half_spread_bid_bps = %format!("{:.1}", half_spread_bid * 10000.0),
             half_spread_ask_bps = %format!("{:.1}", half_spread_ask * 10000.0),
+            effective_floor_bps = %format!("{:.1}", effective_floor * 10000.0),
             flow_imb = %format!("{:.3}", market_params.flow_imbalance),
             flow_mod = %format!("{:.3}", flow_modifier),
             base_skew_bps = %format!("{:.4}", base_skew * 10000.0),
@@ -581,6 +603,7 @@ impl QuotingStrategy for GLFTStrategy {
             ask_delta_bps = %format!("{:.1}", ask_delta * 10000.0),
             is_toxic = market_params.is_toxic_regime,
             heavy_tail = market_params.is_heavy_tailed,
+            tight_quoting = market_params.tight_quoting_allowed,
             "GLFT spread components with asymmetric kappa"
         );
 
