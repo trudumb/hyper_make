@@ -283,15 +283,44 @@ impl LadderStrategy {
             );
         }
 
-        // Calculate effective gamma (includes all scaling factors)
-        let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
-        let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
-        let gamma = gamma_with_liq * market_params.tail_risk_multiplier;
+        // === GAMMA: Adaptive vs Legacy ===
+        // When adaptive spreads enabled: use log-additive shrinkage gamma
+        // When disabled: use multiplicative RiskConfig gamma
+        let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+            // Adaptive gamma: log-additive scaling prevents multiplicative explosion
+            // Still apply tail risk multiplier for cascade protection
+            let adaptive_gamma = market_params.adaptive_gamma;
+            debug!(
+                adaptive_gamma = %format!("{:.4}", adaptive_gamma),
+                tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
+                warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                "Ladder using ADAPTIVE gamma"
+            );
+            adaptive_gamma * market_params.tail_risk_multiplier
+        } else {
+            // Legacy: multiplicative RiskConfig gamma
+            let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
+            let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
+            gamma_with_liq * market_params.tail_risk_multiplier
+        };
 
-        // AS-adjusted kappa: same logic as GLFTStrategy
-        // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
-        let alpha = market_params.predicted_alpha.min(0.5);
-        let kappa = market_params.kappa * (1.0 - alpha);
+        // === KAPPA: Adaptive vs Legacy ===
+        // When adaptive spreads enabled: use blended book/own-fill kappa
+        // When disabled: use book-only kappa with AS adjustment
+        let kappa = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+            // Adaptive kappa: blended from book depth + own fill experience
+            debug!(
+                adaptive_kappa = %format!("{:.0}", market_params.adaptive_kappa),
+                book_kappa = %format!("{:.0}", market_params.kappa),
+                "Ladder using ADAPTIVE kappa"
+            );
+            market_params.adaptive_kappa
+        } else {
+            // Legacy: Book-based kappa with AS adjustment
+            // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
+            let alpha = market_params.predicted_alpha.min(0.5);
+            market_params.kappa * (1.0 - alpha)
+        };
 
         let time_horizon = self.holding_time(market_params.arrival_intensity);
 
@@ -327,13 +356,23 @@ impl LadderStrategy {
             depth_decay_as: market_params.depth_decay_as.clone(),
         };
 
-        // === STOCHASTIC SPREAD FLOOR (First-Principles) ===
-        // Calculate effective minimum spread incorporating:
-        // - Static min_spread_floor from RiskConfig (baseline protection)
-        // - Tick size constraint (can't quote finer than market tick)
-        // - Latency-based floor: σ × √(2×τ_update) (update delay cost)
-        let effective_floor_frac =
-            market_params.effective_spread_floor(self.risk_config.min_spread_floor);
+        // === SPREAD FLOOR: Adaptive vs Static ===
+        // When adaptive spreads enabled: use learned floor from Bayesian AS estimation
+        // When disabled: use static RiskConfig floor + tick/latency constraints
+        let effective_floor_frac = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+            // Adaptive floor: learned from actual fill AS + fees + safety buffer
+            // During warmup, the prior-based floor is already conservative (fees + 3bps + 1.5σ)
+            debug!(
+                adaptive_floor_bps = %format!("{:.2}", market_params.adaptive_spread_floor * 10000.0),
+                static_floor_bps = %format!("{:.2}", self.risk_config.min_spread_floor * 10000.0),
+                warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                "Ladder using ADAPTIVE spread floor"
+            );
+            market_params.adaptive_spread_floor
+        } else {
+            // Legacy: Static floor from RiskConfig + tick/latency constraints
+            market_params.effective_spread_floor(self.risk_config.min_spread_floor)
+        };
         let effective_floor_bps = effective_floor_frac * 10_000.0;
 
         // === DYNAMIC DEPTHS: GLFT-optimal depth computation ===
@@ -383,6 +422,28 @@ impl LadderStrategy {
             );
         }
 
+        // === ADAPTIVE WARMUP UNCERTAINTY SCALING ===
+        // During adaptive warmup, apply a small safety margin to spreads.
+        // This provides protection while priors are being refined from actual fills.
+        // Factor decays from ~1.2 (20% wider) to 1.0 (no adjustment) as warmup progresses.
+        if market_params.use_adaptive_spreads
+            && market_params.adaptive_can_estimate
+            && market_params.adaptive_uncertainty_factor > 1.001
+        {
+            let factor = market_params.adaptive_uncertainty_factor;
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth *= factor;
+            }
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth *= factor;
+            }
+            debug!(
+                uncertainty_factor = %format!("{:.3}", factor),
+                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                "Adaptive warmup uncertainty applied to ladder depths"
+            );
+        }
+
         // Create ladder config with dynamic depths
         let ladder_config = self
             .ladder_config
@@ -398,6 +459,8 @@ impl LadderStrategy {
                 .unwrap_or(0.0)),
             effective_floor_bps = %format!("{:.1}", effective_floor_bps),
             tight_quoting = market_params.tight_quoting_allowed,
+            adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,
+            warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
             "Dynamic depths computed for ladder"
         );
 
