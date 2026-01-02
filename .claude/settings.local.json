@@ -64,7 +64,9 @@
       "mcp__serena__check_onboarding_performed",
       "mcp__serena__list_dir",
       "mcp__serena__search_for_pattern",
-      "Skill(sc:improve)"
+      "Skill(sc:improve)",
+      "Bash(timeout 15 npx:*)",
+      "Bash(npm search:*)"
     ]
   }
 }

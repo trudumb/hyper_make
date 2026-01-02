@@ -704,6 +704,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         &mut self,
         user_fills: crate::ws::message_types::UserFills,
     ) -> Result<()> {
+        // Skip snapshot fills - these are historical fills from previous sessions.
+        // Position is already loaded from exchange at startup, so processing these
+        // would cause "untracked order filled" warnings for orders we didn't place.
+        if user_fills.data.is_snapshot.unwrap_or(false) {
+            debug!(
+                fills = user_fills.data.fills.len(),
+                "Skipping UserFills snapshot (historical fills from previous sessions)"
+            );
+            return Ok(());
+        }
+
         // HARMONIZED: Use effective_max_position for position utilization calculations
         let ctx = messages::MessageContext::new(
             self.config.asset.clone(),
