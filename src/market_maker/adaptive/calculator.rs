@@ -395,8 +395,9 @@ impl AdaptiveSpreadCalculator {
     /// Formula: 1 + (1 - warmup_progress) * warmup_conservatism
     pub fn warmup_uncertainty_factor(&self) -> f64 {
         let progress = self.warmup_progress();
-        // Start with 20% wider spreads, decay to 0% as we warm up
-        1.0 + (1.0 - progress) * 0.2
+        // Start with 10% wider spreads, decay to 0% as we warm up
+        // Reduced from 20% since priors are now well-calibrated
+        1.0 + (1.0 - progress) * 0.1
     }
 
     /// Get component status for diagnostics.

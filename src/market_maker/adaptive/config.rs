@@ -134,10 +134,12 @@ impl GammaSignal {
 impl Default for AdaptiveBayesianConfig {
     fn default() -> Self {
         Self {
-            // Learned Floor - conservative start
-            as_prior_mean: 0.0003,      // 3 bps prior AS
-            as_prior_std: 0.0005,       // 5 bps uncertainty
-            floor_risk_k: 1.5,          // 1.5σ safety margin (~87% coverage)
+            // Learned Floor - calibrated from trade history analysis
+            // Trade history showed: fee 1.5 bps + AS ~3 bps = ~4.5 bps break-even per side
+            // floor = fee + E[AS] + k×σ = 1.5 + 3 + 0.5×3 = 6 bps (half-spread)
+            as_prior_mean: 0.0003,      // 3 bps prior AS (calibrated from Dec 2025 trades)
+            as_prior_std: 0.0003,       // 3 bps uncertainty (tightened from 5 bps)
+            floor_risk_k: 0.5,          // 0.5σ safety margin → floor = 1.5 + 3 + 1.5 = 6 bps
             floor_absolute_min: 0.0001, // 1 bp hard floor (tick size)
             as_horizon_ms: 1000,        // 1 second AS measurement
             as_ewma_decay: 0.995,       // ~200 obs half-life
@@ -168,8 +170,8 @@ impl Default for AdaptiveBayesianConfig {
             fill_min_observation_secs: 120.0, // 2 minutes warmup
             fill_rate_decay: 0.995,     // ~200 obs half-life
 
-            // Fees - user should override based on their tier
-            maker_fee_rate: 0.0003,     // 3 bps default
+            // Fees - Hyperliquid maker fee is 1.5 bps (round-trip 3 bps)
+            maker_fee_rate: 0.00015,    // 1.5 bps maker fee
 
             // Integration - all enabled by default
             enable_adaptive_floor: true,
