@@ -409,8 +409,8 @@ impl Default for StochasticConfig {
             use_latency_spread_floor: true,
             quote_update_latency_ms: 50.0, // 50ms expected round-trip
             use_book_depth_constraint: true,
-            min_book_depth_usd: 50_000.0,           // $50k minimum
-            tight_spread_book_depth_usd: 200_000.0, // $200k for tightest spreads
+            min_book_depth_usd: 20_000.0,           // $20k minimum (reduced from $50k)
+            tight_spread_book_depth_usd: 100_000.0, // $100k for tightest spreads (reduced from $200k)
             use_conditional_tight_quoting: true,
             tight_quoting_max_inventory: 0.3, // 30% of max position
             tight_quoting_max_toxicity: 0.1,  // 10% predicted alpha

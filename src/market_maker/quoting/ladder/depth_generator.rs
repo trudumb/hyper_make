@@ -174,13 +174,11 @@ impl Default for DynamicDepthConfig {
             geometric_ratio: 1.5,    // Each level 50% further than previous
             linear_step_bps: 3.0,    // Or 3bp steps for linear
             maker_fee_rate: 0.00015, // 1.5bp maker fee (Hyperliquid actual)
-            // FIRST PRINCIPLES: Spread floor must exceed AS + fees to be profitable
-            // Trade history analysis (Dec 2025) showed:
-            //   - Average edge needed: ~6.67 bps to break even
-            //   - GLFT optimal typically 8-9 bps
-            //   - Large trades need 13+ bps for profitability
-            // Setting floor to 8bp ensures minimum profitability
-            min_spread_floor_bps: 8.0,
+            // FIRST PRINCIPLES: This is a safety floor, not the primary floor.
+            // The adaptive floor (6 bps) from AdaptiveBayesianConfig is the effective floor.
+            // Set this lower so adaptive floor takes precedence.
+            // Trade history (Dec 2025): break-even ~6.67 bps, adaptive floor = 6 bps
+            min_spread_floor_bps: 4.0,  // Safety floor, adaptive floor (6 bps) takes over
             enable_asymmetric: true,
             // FIRST PRINCIPLES: GLFT optimal spread δ* = (1/γ) × ln(1 + γ/κ)
             // is derived from stochastic control theory and should be trusted.
