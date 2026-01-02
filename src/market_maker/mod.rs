@@ -1454,10 +1454,38 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             self.orders.remove_pending(side, spec.price);
                         }
 
-                        // Record fill to safety components for analytics
+                        // Register immediate fill amount for WS deduplication.
+                        // The FillProcessor tracks the AMOUNT filled immediately, so when
+                        // WS fills arrive, it can properly dedup by decrementing from the
+                        // tracked amount. This works for both full and partial immediate fills.
                         self.safety
                             .fill_processor
-                            .pre_register_immediate_fill(result.oid);
+                            .pre_register_immediate_fill(result.oid, actual_fill);
+
+                        // If partially filled, still need to track the resting portion
+                        if filled_size > EPSILON {
+                            // Partial immediate fill - update order to PartialFilled so it's
+                            // included in reconciliation for the resting portion.
+                            //
+                            // IMPORTANT: Can't use FilledImmediately for partial fills because:
+                            // - FilledImmediately is not in is_active() (Resting | PartialFilled)
+                            // - Order wouldn't be included in get_all_by_side()
+                            // - The resting portion would become orphaned!
+                            //
+                            // For partial fills, we need PartialFilled state so reconciliation
+                            // sees the resting portion and can modify/cancel it as needed.
+                            if let Some(order) = self.orders.get_order_mut(result.oid) {
+                                order.transition_to(OrderState::PartialFilled);
+                                // Update size to reflect what's actually resting
+                                order.size = filled_size;
+                                debug!(
+                                    oid = result.oid,
+                                    filled = actual_fill,
+                                    resting_size = filled_size,
+                                    "Partial immediate fill - tracking resting portion as PartialFilled"
+                                );
+                            }
+                        }
 
                         info!(
                             oid = result.oid,
@@ -1465,22 +1493,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             price = spec.price,
                             size = spec.size,
                             actual_fill = actual_fill,
+                            resting = filled_size,
                             position = self.position.position(),
-                            "Order filled immediately - position updated, tracking for WS dedup"
+                            "Order filled immediately - position updated"
                         );
-
-                        // If partially filled, still need to track the resting portion
-                        if filled_size > EPSILON {
-                            // Partial fill - some size still resting
-                            debug!(
-                                oid = result.oid,
-                                resting_size = filled_size,
-                                "Partial immediate fill, {} still resting",
-                                filled_size
-                            );
-                            // Order already added above with FilledImmediately state
-                            // It will transition to PartialFilled when WS confirms
-                        }
 
                         continue;
                     }
@@ -1670,25 +1686,176 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     );
                     // Record fallback in metrics
                     self.infra.prometheus.record_modify_fallback();
-                    // Cancel the order (may already be gone)
-                    let _ = self
+
+                    // Check if the error indicates order is already filled or canceled
+                    let error_msg = result.error.as_deref().unwrap_or("");
+                    let is_already_filled = error_msg.contains("filled");
+                    let is_already_canceled = error_msg.contains("canceled");
+
+                    if is_already_filled {
+                        // Order was filled - mark as FilledImmediately so it's excluded
+                        // from future reconciliation until WS fill arrives
+                        debug!(
+                            oid = spec.oid,
+                            "Modify failed because order already filled - marking for WS fill"
+                        );
+                        // Transition to FilledImmediately - this removes it from is_active()
+                        // so get_all_by_side won't include it in future modify attempts
+                        if let Some(order) = self.orders.get_order_mut(spec.oid) {
+                            order.transition_to(OrderState::FilledImmediately);
+                        }
+                        continue;
+                    }
+
+                    if is_already_canceled {
+                        // Order was already canceled - remove from tracking
+                        debug!(
+                            oid = spec.oid,
+                            "Modify failed because order already canceled - removing from tracking"
+                        );
+                        self.orders.remove_order(spec.oid);
+                        continue;
+                    }
+
+                    // Initiate cancel in OrderManager BEFORE sending to exchange
+                    // This properly transitions state and prevents stale tracking
+                    self.orders.initiate_cancel(spec.oid);
+
+                    // Cancel the order on exchange
+                    let cancel_result = self
                         .executor
                         .cancel_order(&self.config.asset, spec.oid)
                         .await;
 
-                    // Place new order at target price/size
+                    // Update OrderManager based on cancel result
+                    match cancel_result {
+                        CancelResult::Cancelled | CancelResult::AlreadyCancelled => {
+                            self.orders.on_cancel_confirmed(spec.oid);
+                        }
+                        CancelResult::AlreadyFilled => {
+                            // Order was filled during our cancel attempt
+                            // Mark it appropriately and wait for WS fill
+                            self.orders.on_cancel_already_filled(spec.oid);
+                            debug!(
+                                oid = spec.oid,
+                                "Cancel in modify fallback found order already filled"
+                            );
+                            continue; // Don't place replacement order
+                        }
+                        CancelResult::Failed => {
+                            // Cancel failed - order may still be active
+                            // Revert state and don't place replacement to avoid duplicates
+                            self.orders.on_cancel_failed(spec.oid);
+                            warn!(
+                                oid = spec.oid,
+                                "Cancel failed in modify fallback - not placing replacement"
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Place new order at target price/size with proper tracking
+                    let side = if spec.is_buy { Side::Buy } else { Side::Sell };
                     let cloid = uuid::Uuid::new_v4().to_string();
-                    let order_spec =
-                        OrderSpec::with_cloid(spec.new_price, spec.new_size, spec.is_buy, cloid);
-                    let _ = self
+
+                    // Pre-register as pending BEFORE API call (consistent with bulk order flow)
+                    self.orders.add_pending_with_cloid(
+                        side,
+                        spec.new_price,
+                        spec.new_size,
+                        cloid.clone(),
+                    );
+
+                    // Pass the pre-registered CLOID to place_order for deterministic matching.
+                    // This ensures the pending order is finalized with the correct OID.
+                    let place_result = self
                         .executor
                         .place_order(
                             &self.config.asset,
-                            order_spec.price,
-                            order_spec.size,
-                            order_spec.is_buy,
+                            spec.new_price,
+                            spec.new_size,
+                            spec.is_buy,
+                            Some(cloid.clone()),
                         )
                         .await;
+
+                    // Finalize tracking based on placement result
+                    if place_result.oid > 0 {
+                        if place_result.filled {
+                            // Filled immediately - calculate actual fill vs resting
+                            self.orders.remove_pending_by_cloid(&cloid);
+
+                            let resting_size = place_result.resting_size;
+                            let actual_fill = if resting_size < EPSILON {
+                                spec.new_size // Fully filled
+                            } else {
+                                spec.new_size - resting_size // Partial immediate fill
+                            };
+
+                            self.position.process_fill(actual_fill, spec.is_buy);
+
+                            // Register immediate fill amount for WS deduplication
+                            self.safety
+                                .fill_processor
+                                .pre_register_immediate_fill(place_result.oid, actual_fill);
+
+                            let mut tracked = TrackedOrder::with_cloid(
+                                place_result.oid,
+                                cloid.clone(),
+                                side,
+                                spec.new_price,
+                                spec.new_size,
+                            );
+                            tracked.filled = actual_fill;
+
+                            // Determine correct state based on fill completeness
+                            if resting_size > EPSILON {
+                                // Partial fill - use PartialFilled so order is included in reconciliation
+                                tracked.transition_to(OrderState::PartialFilled);
+                                tracked.size = resting_size; // Track resting portion
+                                info!(
+                                    oid = place_result.oid,
+                                    price = spec.new_price,
+                                    filled = actual_fill,
+                                    resting = resting_size,
+                                    "Modify fallback order partially filled"
+                                );
+                            } else {
+                                // Fully filled - use FilledImmediately for WS dedup
+                                tracked.transition_to(OrderState::FilledImmediately);
+                                info!(
+                                    oid = place_result.oid,
+                                    price = spec.new_price,
+                                    size = spec.new_size,
+                                    "Modify fallback order filled immediately"
+                                );
+                            }
+
+                            self.orders.add_order(tracked);
+                        } else {
+                            // Resting - finalize pending to tracked
+                            self.orders.finalize_pending_by_cloid(
+                                &cloid,
+                                place_result.oid,
+                                place_result.resting_size,
+                            );
+                            debug!(
+                                oid = place_result.oid,
+                                price = spec.new_price,
+                                size = spec.new_size,
+                                "Modify fallback order placed and tracked"
+                            );
+                        }
+                    } else {
+                        // Order placement failed - remove from pending
+                        self.orders.remove_pending_by_cloid(&cloid);
+                        warn!(
+                            price = spec.new_price,
+                            size = spec.new_size,
+                            error = ?place_result.error,
+                            "Modify fallback order placement failed"
+                        );
+                    }
                 }
             }
         }
@@ -1761,22 +1928,132 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Record API call
         self.infra.proactive_rate_tracker.record_call(1, num_orders);
 
-        // Finalize pending orders
+        // Finalize pending orders with proper state handling
         for (i, result) in results.iter().enumerate() {
             let spec = &order_specs[i];
+
+            // Handle success vs rejection for rate limiting and recovery
             if result.oid > 0 {
                 self.infra.rate_limiter.record_success(is_buy);
-
-                let order = if let Some(ref cloid) = spec.cloid {
-                    TrackedOrder::with_cloid(result.oid, cloid.clone(), side, spec.price, spec.size)
-                } else {
-                    TrackedOrder::new(result.oid, side, spec.price, spec.size)
-                };
-                self.orders.add_order(order);
-
+                self.infra.recovery_manager.record_success();
+            } else if let Some(ref err) = result.error {
+                // Record rejection for rate limiting
+                if let Some(backoff) = self.infra.rate_limiter.record_rejection(is_buy, err) {
+                    warn!(
+                        side = %if is_buy { "buy" } else { "sell" },
+                        backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+                        error = %err,
+                        "Rate limiter entering backoff due to rejection"
+                    );
+                }
+                // Trigger reconciliation for position-related rejections
+                self.infra.reconciler.on_order_rejection(err);
+                // Record for recovery state machine
+                if self.infra.recovery_manager.record_rejection(is_buy, err) {
+                    warn!(
+                        side = %if is_buy { "buy" } else { "sell" },
+                        "Recovery manager escalating to IOC recovery mode"
+                    );
+                }
+                // Remove from pending on rejection
                 if let Some(ref cloid) = spec.cloid {
                     self.orders.remove_pending_by_cloid(cloid);
                 }
+                continue;
+            }
+
+            if result.oid > 0 {
+                let cloid = spec.cloid.as_ref().or(result.cloid.as_ref());
+
+                if result.filled {
+                    // Order filled immediately - update position NOW
+                    let filled_size = result.resting_size;
+                    let actual_fill = if filled_size < EPSILON {
+                        spec.size // Fully filled
+                    } else {
+                        spec.size - filled_size // Partial immediate fill
+                    };
+
+                    // Update position immediately from API response
+                    self.position.process_fill(actual_fill, is_buy);
+
+                    // Track order as FilledImmediately for WebSocket deduplication
+                    let mut tracked = if let Some(c) = cloid {
+                        TrackedOrder::with_cloid(
+                            result.oid,
+                            c.clone(),
+                            side,
+                            spec.price,
+                            spec.size,
+                        )
+                    } else {
+                        TrackedOrder::new(result.oid, side, spec.price, spec.size)
+                    };
+                    tracked.filled = actual_fill;
+                    tracked.transition_to(OrderState::FilledImmediately);
+                    self.orders.add_order(tracked);
+
+                    // Remove from pending using CLOID
+                    if let Some(c) = cloid {
+                        self.orders.remove_pending_by_cloid(c);
+                    } else {
+                        self.orders.remove_pending(side, spec.price);
+                    }
+
+                    // Register immediate fill for WS deduplication
+                    self.safety
+                        .fill_processor
+                        .pre_register_immediate_fill(result.oid, actual_fill);
+
+                    // Handle partial immediate fills
+                    if filled_size > EPSILON {
+                        if let Some(order) = self.orders.get_order_mut(result.oid) {
+                            order.transition_to(OrderState::PartialFilled);
+                            order.size = filled_size;
+                            debug!(
+                                oid = result.oid,
+                                filled = actual_fill,
+                                resting_size = filled_size,
+                                "Bulk order partial immediate fill - tracking resting portion"
+                            );
+                        }
+                    }
+
+                    info!(
+                        oid = result.oid,
+                        cloid = ?cloid,
+                        price = spec.price,
+                        size = spec.size,
+                        actual_fill = actual_fill,
+                        resting = filled_size,
+                        position = self.position.position(),
+                        "Bulk order filled immediately - position updated"
+                    );
+
+                    continue;
+                }
+
+                // Move from pending to tracked atomically using finalize_pending_by_cloid
+                if let Some(c) = cloid {
+                    self.orders
+                        .finalize_pending_by_cloid(c, result.oid, result.resting_size);
+                } else {
+                    self.orders.finalize_pending(
+                        side,
+                        spec.price,
+                        result.oid,
+                        result.resting_size,
+                    );
+                }
+
+                // Initialize queue tracking for this order
+                self.tier1.queue_tracker.order_placed(
+                    result.oid,
+                    spec.price,
+                    result.resting_size,
+                    0.0, // depth_ahead will be refined by L2 updates
+                    is_buy,
+                );
             }
         }
 
@@ -1952,7 +2229,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
         let result = self
             .executor
-            .place_order(&self.config.asset, quote.price, adjusted_size, is_buy)
+            .place_order(&self.config.asset, quote.price, adjusted_size, is_buy, None)
             .await;
 
         if result.oid != 0 {
@@ -2360,23 +2637,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             true, // valid
         );
 
-        // Warn if available capacity is low
-        // HARMONIZED: Use effective_max_position for capacity threshold
+        // Warn if available capacity is insufficient to close position.
+        //
+        // The warning should trigger when we can't close our current position,
+        // NOT when available capacity is small relative to max_position.
+        //
+        // Example: position=0.014, available_sell=0.016, max=0.65
+        // Old logic: 0.016 < 0.65*0.1=0.065 → warning (WRONG - we can close!)
+        // New logic: 0.016 >= 0.014*1.5=0.021 → no warning (CORRECT)
+        //
+        // We use 1.5x multiplier to ensure headroom for slippage/partial fills.
+        const CAPACITY_HEADROOM: f64 = 1.5;
         let position = self.position.position();
-        if position > 0.0 && summary.available_sell < self.effective_max_position * 0.1 {
+        let position_abs = position.abs();
+
+        if position > 0.0 && summary.available_sell < position_abs * CAPACITY_HEADROOM {
             warn!(
                 available_sell = %format!("{:.6}", summary.available_sell),
                 position = %format!("{:.6}", position),
-                effective_max = %format!("{:.6}", self.effective_max_position),
-                "Low sell capacity - near exchange position limit"
+                required = %format!("{:.6}", position_abs * CAPACITY_HEADROOM),
+                "Low sell capacity - insufficient to close long position"
             );
         }
-        if position < 0.0 && summary.available_buy < self.effective_max_position * 0.1 {
+        if position < 0.0 && summary.available_buy < position_abs * CAPACITY_HEADROOM {
             warn!(
                 available_buy = %format!("{:.6}", summary.available_buy),
                 position = %format!("{:.6}", position),
-                effective_max = %format!("{:.6}", self.effective_max_position),
-                "Low buy capacity - near exchange position limit"
+                required = %format!("{:.6}", position_abs * CAPACITY_HEADROOM),
+                "Low buy capacity - insufficient to close short position"
             );
         }
 

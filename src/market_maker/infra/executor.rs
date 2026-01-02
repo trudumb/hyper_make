@@ -199,7 +199,23 @@ pub struct ModifySpec {
 #[async_trait]
 pub trait OrderExecutor: Send + Sync {
     /// Place a limit order.
-    async fn place_order(&self, asset: &str, price: f64, size: f64, is_buy: bool) -> OrderResult;
+    ///
+    /// # Arguments
+    /// - `asset`: Asset symbol
+    /// - `price`: Limit price
+    /// - `size`: Order size
+    /// - `is_buy`: Whether this is a buy order
+    /// - `cloid`: Optional client order ID. If provided, uses this CLOID for tracking.
+    ///            If None, generates a new UUID. Passing a CLOID allows the caller
+    ///            to pre-register pending orders for deterministic matching.
+    async fn place_order(
+        &self,
+        asset: &str,
+        price: f64,
+        size: f64,
+        is_buy: bool,
+        cloid: Option<String>,
+    ) -> OrderResult;
 
     /// Place multiple orders in a single API call.
     ///
@@ -310,12 +326,21 @@ impl HyperliquidExecutor {
 
 #[async_trait]
 impl OrderExecutor for HyperliquidExecutor {
-    async fn place_order(&self, asset: &str, price: f64, size: f64, is_buy: bool) -> OrderResult {
+    async fn place_order(
+        &self,
+        asset: &str,
+        price: f64,
+        size: f64,
+        is_buy: bool,
+        caller_cloid: Option<String>,
+    ) -> OrderResult {
         let side = if is_buy { "BUY" } else { "SELL" };
 
-        // Generate CLOID for single orders too (for consistency)
-        let cloid = uuid::Uuid::new_v4();
-        let cloid_str = cloid.to_string();
+        // Use caller-provided CLOID if available, otherwise generate one.
+        // This allows the caller to pre-register pending orders with a known CLOID
+        // for deterministic matching when the API response arrives.
+        let cloid_str = caller_cloid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let cloid = uuid::Uuid::parse_str(&cloid_str).unwrap_or_else(|_| uuid::Uuid::new_v4());
 
         let order = self
             .client

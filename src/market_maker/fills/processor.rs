@@ -109,10 +109,16 @@ pub struct FillState<'a> {
 pub struct FillProcessor {
     /// Centralized deduplication
     deduplicator: FillDeduplicator,
-    /// OIDs of orders that filled immediately (from API response).
-    /// When WebSocket fill arrives for these OIDs, skip position update
-    /// since position was already updated from API response.
-    immediate_fill_oids: std::collections::HashSet<u64>,
+    /// Remaining immediate fill amounts per OID.
+    ///
+    /// When an order fills immediately (API returns filled=true before WebSocket),
+    /// we track how much was filled so we can properly dedup WS fills.
+    /// Maps OID -> remaining amount to skip.
+    ///
+    /// For full immediate fills: register full size, first WS fill skips all.
+    /// For partial immediate fills: register partial size, WS fills decrement
+    /// until remaining reaches 0, then subsequent fills update position normally.
+    immediate_fill_amounts: std::collections::HashMap<u64, f64>,
 }
 
 impl FillProcessor {
@@ -120,7 +126,7 @@ impl FillProcessor {
     pub fn new() -> Self {
         Self {
             deduplicator: FillDeduplicator::new(),
-            immediate_fill_oids: std::collections::HashSet::new(),
+            immediate_fill_amounts: std::collections::HashMap::new(),
         }
     }
 
@@ -128,37 +134,60 @@ impl FillProcessor {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             deduplicator: FillDeduplicator::with_capacity(capacity),
-            immediate_fill_oids: std::collections::HashSet::new(),
+            immediate_fill_amounts: std::collections::HashMap::new(),
         }
     }
 
-    /// Pre-register an OID as having filled immediately from API response.
+    /// Pre-register an immediate fill amount for an OID.
     ///
     /// When an order fills immediately (API returns filled=true before WebSocket),
-    /// position is updated from the API response. This method registers the OID
-    /// so that when the WebSocket fill arrives later, we skip position update
-    /// to prevent double-counting.
+    /// position is updated from the API response. This method registers the amount
+    /// so that when WebSocket fills arrive later, we skip position updates up to
+    /// that amount to prevent double-counting.
     ///
-    /// The OID is automatically removed when the corresponding WebSocket fill
-    /// is processed, or can be manually cleared via `clear_immediate_fill_oid()`.
-    pub fn pre_register_immediate_fill(&mut self, oid: u64) {
-        self.immediate_fill_oids.insert(oid);
-        debug!(oid, "Pre-registered immediate fill OID for dedup");
+    /// For partial immediate fills, multiple WS fills may arrive. We decrement
+    /// the remaining amount with each fill until it reaches 0, then subsequent
+    /// fills update position normally.
+    ///
+    /// # Arguments
+    /// * `oid` - Order ID
+    /// * `amount` - Amount that was filled immediately (from API response)
+    pub fn pre_register_immediate_fill(&mut self, oid: u64, amount: f64) {
+        // Add to existing amount if already registered (shouldn't happen normally)
+        let entry = self.immediate_fill_amounts.entry(oid).or_insert(0.0);
+        *entry += amount;
+        debug!(
+            oid,
+            amount,
+            total = *entry,
+            "Pre-registered immediate fill amount for dedup"
+        );
     }
 
-    /// Check if an OID was pre-registered as an immediate fill.
+    /// Check if an OID has remaining immediate fill amount to skip.
     pub fn is_immediate_fill(&self, oid: u64) -> bool {
-        self.immediate_fill_oids.contains(&oid)
+        self.immediate_fill_amounts
+            .get(&oid)
+            .map(|&amt| amt > 1e-10)
+            .unwrap_or(false)
     }
 
-    /// Clear an OID from the immediate fill set (after WebSocket confirmation).
+    /// Get remaining immediate fill amount for an OID.
+    pub fn get_immediate_fill_remaining(&self, oid: u64) -> f64 {
+        self.immediate_fill_amounts
+            .get(&oid)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Clear an OID from the immediate fill tracking.
     pub fn clear_immediate_fill_oid(&mut self, oid: u64) {
-        self.immediate_fill_oids.remove(&oid);
+        self.immediate_fill_amounts.remove(&oid);
     }
 
-    /// Get count of pending immediate fill OIDs.
+    /// Get count of OIDs with pending immediate fill amounts.
     pub fn immediate_fill_count(&self) -> usize {
-        self.immediate_fill_oids.len()
+        self.immediate_fill_amounts.len()
     }
 
     /// Process a fill through all modules.
@@ -181,21 +210,52 @@ impl FillProcessor {
             return FillProcessingResult::duplicate();
         }
 
-        // Step 2: Check if this is a WebSocket confirmation for an immediate fill
-        // If so, position was already updated from API response - skip position update!
-        let is_immediate_fill_confirmation = self.immediate_fill_oids.remove(&fill.oid);
+        // Step 2: Check if this fill (or part of it) was already counted from API response.
+        // For partial immediate fills, we track the remaining amount to skip.
+        let remaining_immediate = self
+            .immediate_fill_amounts
+            .get(&fill.oid)
+            .copied()
+            .unwrap_or(0.0);
+        let skip_amount = remaining_immediate.min(fill.size);
+        let update_amount = fill.size - skip_amount;
+        let is_immediate_fill_confirmation = skip_amount > 1e-10;
+
         if is_immediate_fill_confirmation {
-            info!(
-                oid = fill.oid,
-                tid = fill.tid,
-                size = fill.size,
-                "WebSocket fill for immediate-fill order - position already updated, skipping"
-            );
+            // Decrement the remaining immediate fill amount
+            if let Some(remaining) = self.immediate_fill_amounts.get_mut(&fill.oid) {
+                *remaining -= skip_amount;
+                if *remaining <= 1e-10 {
+                    // All immediate fill amount consumed, remove entry
+                    self.immediate_fill_amounts.remove(&fill.oid);
+                }
+            }
+
+            if update_amount > 1e-10 {
+                info!(
+                    oid = fill.oid,
+                    tid = fill.tid,
+                    fill_size = fill.size,
+                    skip_amount,
+                    update_amount,
+                    "Partial immediate fill dedup - skipping {} of {}, updating position by {}",
+                    skip_amount,
+                    fill.size,
+                    update_amount
+                );
+            } else {
+                info!(
+                    oid = fill.oid,
+                    tid = fill.tid,
+                    size = fill.size,
+                    "WebSocket fill for immediate-fill order - position already updated, skipping"
+                );
+            }
         }
 
-        // Step 3: Update position (unless already updated from API for immediate fills)
-        if !is_immediate_fill_confirmation {
-            state.position.process_fill(fill.size, fill.is_buy);
+        // Step 3: Update position by the non-immediate portion only
+        if update_amount > 1e-10 {
+            state.position.process_fill(update_amount, fill.is_buy);
         }
 
         // Step 4: Update order tracking
@@ -545,13 +605,14 @@ mod tests {
         assert!(!processor.is_immediate_fill(100));
         assert_eq!(processor.immediate_fill_count(), 0);
 
-        // Register an immediate fill
-        processor.pre_register_immediate_fill(100);
+        // Register an immediate fill with amount
+        processor.pre_register_immediate_fill(100, 1.0);
         assert!(processor.is_immediate_fill(100));
         assert_eq!(processor.immediate_fill_count(), 1);
+        assert!((processor.get_immediate_fill_remaining(100) - 1.0).abs() < 1e-10);
 
         // Register another
-        processor.pre_register_immediate_fill(200);
+        processor.pre_register_immediate_fill(200, 0.5);
         assert!(processor.is_immediate_fill(200));
         assert_eq!(processor.immediate_fill_count(), 2);
 
@@ -576,8 +637,8 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
 
-        // Pre-register OID 100 as immediate fill (simulating API returned filled=true)
-        processor.pre_register_immediate_fill(100);
+        // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
+        processor.pre_register_immediate_fill(100, 1.0);
 
         let mut state = make_test_state(
             &mut position,
@@ -655,7 +716,7 @@ mod tests {
 
     #[test]
     fn test_immediate_fill_then_additional_fills() {
-        // Scenario: Order partially fills immediately, then more fills arrive via WS
+        // Scenario: Order partially fills immediately (0.5), then more fills arrive via WS
         let mut processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.5); // Start with 0.5 from API immediate fill
         let mut orders = OrderManager::new();
@@ -668,8 +729,8 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
 
-        // Pre-register OID 100 as immediate fill
-        processor.pre_register_immediate_fill(100);
+        // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
+        processor.pre_register_immediate_fill(100, 0.5);
 
         // First WS fill arrives (confirmation of immediate fill)
         let fill1 = make_fill(1, 100, 0.5, 50000.0, true);
@@ -692,7 +753,7 @@ mod tests {
         // Position stays at 0.5 (no double-count)
         assert!((position.position() - 0.5).abs() < f64::EPSILON);
 
-        // Second WS fill arrives (additional fill, not pre-registered)
+        // Second WS fill arrives (resting portion filled, not pre-registered)
         let fill2 = make_fill(2, 100, 0.3, 50000.0, true);
         let result2 = {
             let mut state = make_test_state(
@@ -714,6 +775,109 @@ mod tests {
         assert!(
             (position.position() - 0.8).abs() < f64::EPSILON,
             "Position was {}, expected 0.8",
+            position.position()
+        );
+    }
+
+    #[test]
+    fn test_partial_immediate_fill_multiple_ws_fills() {
+        // Scenario: Order for 1.0 partially fills immediately (0.6), WS sends two fills
+        // Fill 1: 0.4 (part of immediate)
+        // Fill 2: 0.3 (remaining immediate 0.2 + resting 0.1)
+        // Fill 3: 0.3 (all resting)
+        let mut processor = FillProcessor::new();
+        let mut position = PositionTracker::new(0.6); // Start with 0.6 from API immediate fill
+        let mut orders = OrderManager::new();
+        let mut adverse_selection =
+            AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
+        let mut depth_decay_as = DepthDecayAS::default();
+        let mut queue_tracker = QueuePositionTracker::new(QueueConfig::default());
+        let mut estimator = ParameterEstimator::new(EstimatorConfig::default());
+        let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
+        let mut prometheus = PrometheusMetrics::new();
+        let metrics: MetricsRecorder = None;
+
+        // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
+        processor.pre_register_immediate_fill(100, 0.6);
+        assert!((processor.get_immediate_fill_remaining(100) - 0.6).abs() < 1e-10);
+
+        // First WS fill: 0.4 (all from immediate portion)
+        let fill1 = make_fill(1, 100, 0.4, 50000.0, true);
+        let result1 = {
+            let mut state = make_test_state(
+                &mut position,
+                &mut orders,
+                &mut adverse_selection,
+                &mut depth_decay_as,
+                &mut queue_tracker,
+                &mut estimator,
+                &mut pnl_tracker,
+                &mut prometheus,
+                &metrics,
+            );
+            processor.process(&fill1, &mut state)
+        };
+
+        assert!(result1.is_immediate_fill_confirmation);
+        // Position stays at 0.6 (skipped full 0.4)
+        assert!(
+            (position.position() - 0.6).abs() < f64::EPSILON,
+            "Position was {}, expected 0.6",
+            position.position()
+        );
+        // Remaining immediate: 0.6 - 0.4 = 0.2
+        assert!((processor.get_immediate_fill_remaining(100) - 0.2).abs() < 1e-10);
+
+        // Second WS fill: 0.3 (0.2 from remaining immediate + 0.1 from resting)
+        let fill2 = make_fill(2, 100, 0.3, 50000.0, true);
+        let result2 = {
+            let mut state = make_test_state(
+                &mut position,
+                &mut orders,
+                &mut adverse_selection,
+                &mut depth_decay_as,
+                &mut queue_tracker,
+                &mut estimator,
+                &mut pnl_tracker,
+                &mut prometheus,
+                &metrics,
+            );
+            processor.process(&fill2, &mut state)
+        };
+
+        // This is still marked as immediate fill confirmation because we skipped part of it
+        assert!(result2.is_immediate_fill_confirmation);
+        // Position should be 0.6 + 0.1 = 0.7 (skipped 0.2, updated 0.1)
+        assert!(
+            (position.position() - 0.7).abs() < 1e-10,
+            "Position was {}, expected 0.7",
+            position.position()
+        );
+        // Remaining immediate should be 0 (and OID removed from map)
+        assert!(!processor.is_immediate_fill(100));
+
+        // Third WS fill: 0.3 (all from resting)
+        let fill3 = make_fill(3, 100, 0.3, 50000.0, true);
+        let result3 = {
+            let mut state = make_test_state(
+                &mut position,
+                &mut orders,
+                &mut adverse_selection,
+                &mut depth_decay_as,
+                &mut queue_tracker,
+                &mut estimator,
+                &mut pnl_tracker,
+                &mut prometheus,
+                &metrics,
+            );
+            processor.process(&fill3, &mut state)
+        };
+
+        assert!(!result3.is_immediate_fill_confirmation);
+        // Position should be 0.7 + 0.3 = 1.0
+        assert!(
+            (position.position() - 1.0).abs() < 1e-10,
+            "Position was {}, expected 1.0",
             position.position()
         );
     }
