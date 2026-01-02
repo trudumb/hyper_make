@@ -7,10 +7,11 @@ use crate::market_maker::{
     config::MetricsRecorder,
     fills::FillProcessor,
     infra::{
-        ConnectionHealthMonitor, DataQualityConfig, DataQualityMonitor, ExchangePositionLimits,
-        MarginAwareSizer, MarginConfig, PositionReconciler, ProactiveRateLimitConfig,
-        ProactiveRateLimitTracker, PrometheusMetrics, ReconciliationConfig, RecoveryConfig,
-        RecoveryManager, RejectionRateLimitConfig, RejectionRateLimiter,
+        ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
+        ExchangePositionLimits, MarginAwareSizer, MarginConfig, PositionReconciler,
+        ProactiveRateLimitConfig, ProactiveRateLimitTracker, PrometheusMetrics,
+        ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
+        RejectionRateLimiter, SupervisorConfig,
     },
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
@@ -119,8 +120,10 @@ pub struct InfraComponents {
     pub exchange_limits: ExchangePositionLimits,
     /// Prometheus metrics
     pub prometheus: PrometheusMetrics,
-    /// Connection health monitor
+    /// Connection health monitor (low-level tracking)
     pub connection_health: ConnectionHealthMonitor,
+    /// Connection supervisor (high-level proactive monitoring)
+    pub connection_supervisor: ConnectionSupervisor,
     /// Data quality monitor
     pub data_quality: DataQualityMonitor,
     /// Optional metrics recorder
@@ -149,11 +152,38 @@ impl InfraComponents {
         rate_limit_config: RejectionRateLimitConfig,
         proactive_rate_config: ProactiveRateLimitConfig,
     ) -> Self {
+        Self::with_supervisor_config(
+            margin_config,
+            data_quality_config,
+            metrics,
+            recovery_config,
+            reconciliation_config,
+            rate_limit_config,
+            proactive_rate_config,
+            SupervisorConfig::default(),
+        )
+    }
+
+    /// Create infrastructure components with custom supervisor config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_supervisor_config(
+        margin_config: MarginConfig,
+        data_quality_config: DataQualityConfig,
+        metrics: MetricsRecorder,
+        recovery_config: RecoveryConfig,
+        reconciliation_config: ReconciliationConfig,
+        rate_limit_config: RejectionRateLimitConfig,
+        proactive_rate_config: ProactiveRateLimitConfig,
+        supervisor_config: SupervisorConfig,
+    ) -> Self {
+        let connection_supervisor = ConnectionSupervisor::with_config(supervisor_config);
         Self {
             margin_sizer: MarginAwareSizer::new(margin_config),
             exchange_limits: ExchangePositionLimits::new(),
             prometheus: PrometheusMetrics::new(),
-            connection_health: ConnectionHealthMonitor::new(),
+            // Use the health monitor from the supervisor for consistency
+            connection_health: connection_supervisor.health_monitor(),
+            connection_supervisor,
             data_quality: DataQualityMonitor::new(data_quality_config),
             metrics,
             last_margin_refresh: std::time::Instant::now(),

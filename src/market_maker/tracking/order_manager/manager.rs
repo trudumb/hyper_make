@@ -218,12 +218,7 @@ impl OrderManager {
     ///
     /// # Returns
     /// `true` if the pending order was found and finalized, `false` otherwise.
-    pub fn finalize_pending_by_cloid(
-        &mut self,
-        cloid: &str,
-        oid: u64,
-        resting_size: f64,
-    ) -> bool {
+    pub fn finalize_pending_by_cloid(&mut self, cloid: &str, oid: u64, resting_size: f64) -> bool {
         if let Some(pending) = self.pending_by_cloid.remove(cloid) {
             // Also remove from price-based map
             let key = (pending.side, price_to_key(pending.price));

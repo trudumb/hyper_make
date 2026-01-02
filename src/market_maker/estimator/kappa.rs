@@ -76,6 +76,14 @@ pub(crate) struct BayesianKappaEstimator {
 
     /// Update count for logging throttling
     update_count: usize,
+
+    // === Heavy-Tail Detection ===
+    /// Rolling count of high-CV observations (CV > 1.2)
+    heavy_tail_count: usize,
+    /// Total observations for heavy-tail tracking
+    heavy_tail_window: usize,
+    /// Whether we've detected consistent heavy-tail behavior
+    is_heavy_tailed: bool,
 }
 
 impl BayesianKappaEstimator {
@@ -105,6 +113,9 @@ impl BayesianKappaEstimator {
             mean_distance: 1.0 / prior_mean,
             cv: 1.0, // Exponential has CV = 1.0
             update_count: 0,
+            heavy_tail_count: 0,
+            heavy_tail_window: 0,
+            is_heavy_tailed: false,
         }
     }
 
@@ -190,6 +201,38 @@ impl BayesianKappaEstimator {
             }
         }
 
+        // Track heavy-tail detection
+        // CV > 1.2 indicates heavy tail (power-law like distribution)
+        self.heavy_tail_window += 1;
+        if self.cv > 1.2 {
+            self.heavy_tail_count += 1;
+        }
+
+        // Check for consistent heavy-tail behavior after 100+ observations
+        // If more than 80% of recent observations have CV > 1.2, flag as heavy-tailed
+        if self.heavy_tail_window >= 100 {
+            let heavy_ratio = self.heavy_tail_count as f64 / self.heavy_tail_window as f64;
+            let was_heavy = self.is_heavy_tailed;
+            self.is_heavy_tailed = heavy_ratio > 0.8;
+
+            // Reset counters periodically to adapt to regime changes
+            if self.heavy_tail_window >= 500 {
+                // Decay counters by half
+                self.heavy_tail_window /= 2;
+                self.heavy_tail_count /= 2;
+            }
+
+            // Log transition
+            if self.is_heavy_tailed != was_heavy {
+                debug!(
+                    is_heavy = self.is_heavy_tailed,
+                    cv = %format!("{:.2}", self.cv),
+                    heavy_ratio = %format!("{:.2}", heavy_ratio),
+                    "Kappa tail regime change"
+                );
+            }
+        }
+
         // Posterior parameters with volume weighting
         // Note: Using sum_volume as effective n (volume-weighted sample size)
         // and sum_volume_weighted_distance as the sum of distances
@@ -229,6 +272,39 @@ impl BayesianKappaEstimator {
     /// CV < 1.0 indicates light tail
     pub(crate) fn cv(&self) -> f64 {
         self.cv
+    }
+
+    /// Check if distribution is detected as heavy-tailed.
+    ///
+    /// Returns true if CV has consistently been > 1.2 over recent observations.
+    /// Heavy-tailed distributions mean occasional large fills are more likely,
+    /// requiring wider spreads to account for tail risk.
+    pub(crate) fn is_heavy_tailed(&self) -> bool {
+        self.is_heavy_tailed
+    }
+
+    /// Get tail-adjusted kappa for GLFT spread calculation.
+    ///
+    /// When the fill distance distribution is heavy-tailed (CV > 1.2),
+    /// the standard exponential model underestimates the probability of
+    /// large adverse fills. This method returns a more conservative kappa
+    /// by applying a tail risk premium:
+    ///
+    /// - For exponential (CV ≈ 1.0): κ_adj = κ
+    /// - For heavy tail (CV > 1.2): κ_adj = κ × (2 - CV), capped at 0.5×κ
+    ///
+    /// Lower effective κ → wider spreads → protection against tail risk.
+    #[allow(dead_code)]
+    pub(crate) fn tail_adjusted_kappa(&self) -> f64 {
+        if !self.is_heavy_tailed {
+            return self.kappa_posterior_mean;
+        }
+
+        // Heavy-tail adjustment: reduce effective kappa based on CV
+        // CV = 1.2 → multiplier = 0.8 (20% reduction)
+        // CV = 1.5 → multiplier = 0.5 (50% reduction, floor)
+        let multiplier = (2.0 - self.cv).clamp(0.5, 1.0);
+        self.kappa_posterior_mean * multiplier
     }
 
     /// Get mean fill distance for diagnostics.

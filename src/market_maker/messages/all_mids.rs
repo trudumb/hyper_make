@@ -9,7 +9,7 @@ use tracing::debug;
 use super::context::MessageContext;
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
 use crate::market_maker::estimator::ParameterEstimator;
-use crate::market_maker::infra::ConnectionHealthMonitor;
+use crate::market_maker::infra::{ConnectionHealthMonitor, ConnectionSupervisor};
 use crate::market_maker::process_models::{HJBInventoryController, LiquidationCascadeDetector};
 use crate::market_maker::StochasticConfig;
 
@@ -17,8 +17,10 @@ use crate::market_maker::StochasticConfig;
 pub struct AllMidsState<'a> {
     /// Parameter estimator
     pub estimator: &'a mut ParameterEstimator,
-    /// Connection health monitor
+    /// Connection health monitor (low-level)
     pub connection_health: &'a mut ConnectionHealthMonitor,
+    /// Connection supervisor (high-level)
+    pub connection_supervisor: &'a ConnectionSupervisor,
     /// Adverse selection estimator
     pub adverse_selection: &'a mut AdverseSelectionEstimator,
     /// Depth-dependent AS model
@@ -71,8 +73,9 @@ pub fn process_all_mids(
     *state.latest_mid = mid;
     state.estimator.on_mid_update(mid);
 
-    // Connection health tracking
+    // Connection health tracking (both low-level monitor and high-level supervisor)
     state.connection_health.record_data_received();
+    state.connection_supervisor.record_market_data();
 
     // Tier 1: Update AS estimator (resolves pending fills)
     state.adverse_selection.update(mid);
@@ -117,6 +120,7 @@ mod tests {
     fn make_test_state<'a>(
         estimator: &'a mut ParameterEstimator,
         connection_health: &'a mut ConnectionHealthMonitor,
+        connection_supervisor: &'a ConnectionSupervisor,
         adverse_selection: &'a mut AdverseSelectionEstimator,
         depth_decay_as: &'a mut DepthDecayAS,
         liquidation_detector: &'a mut LiquidationCascadeDetector,
@@ -127,6 +131,7 @@ mod tests {
         AllMidsState {
             estimator,
             connection_health,
+            connection_supervisor,
             adverse_selection,
             depth_decay_as,
             liquidation_detector,
@@ -140,6 +145,7 @@ mod tests {
     fn test_process_updates_mid() {
         let mut estimator = ParameterEstimator::new(EstimatorConfig::default());
         let mut connection_health = ConnectionHealthMonitor::new();
+        let connection_supervisor = ConnectionSupervisor::new();
         let mut adverse_selection =
             AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
         let mut depth_decay_as = DepthDecayAS::default();
@@ -152,6 +158,7 @@ mod tests {
         let mut state = make_test_state(
             &mut estimator,
             &mut connection_health,
+            &connection_supervisor,
             &mut adverse_selection,
             &mut depth_decay_as,
             &mut liquidation_detector,

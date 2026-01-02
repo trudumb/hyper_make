@@ -487,6 +487,7 @@ mod tests {
             sigma: 0.01,
             sigma_total: 0.01,
             sigma_effective: 0.01,
+            sigma_leverage_adjusted: 0.01, // Required for inventory skew calculation
             kappa: 50.0,
             arrival_intensity: 0.5, // T = 2 seconds
             is_toxic_regime: false,
@@ -530,6 +531,7 @@ mod tests {
             sigma: 0.01,
             sigma_total: 0.01,
             sigma_effective: 0.01,
+            sigma_leverage_adjusted: 0.01, // Required for inventory skew calculation
             kappa: 50.0,
             arrival_intensity: 0.5,
             is_toxic_regime: false,

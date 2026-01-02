@@ -21,9 +21,7 @@ mod fill_probability;
 mod generator;
 mod optimizer;
 
-pub use depth_generator::{
-    DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator, DynamicDepths,
-};
+pub use depth_generator::{DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator, DynamicDepths};
 pub use fill_probability::{BayesianFillModel, DepthBucket, FirstPassageFillModel};
 pub use optimizer::{
     BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, KellyStochasticParams,

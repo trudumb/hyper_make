@@ -9,7 +9,7 @@ use super::jump::JumpEstimator;
 use super::kalman::KalmanPriceFilter;
 use super::kappa::{BayesianKappaEstimator, BookStructureEstimator};
 use super::microprice::MicropriceEstimator;
-use super::momentum::{MomentumDetector, TradeFlowTracker};
+use super::momentum::{MomentumDetector, MomentumModel, TradeFlowTracker};
 use super::volatility::{MultiScaleBipowerEstimator, StochasticVolParams, VolatilityRegimeTracker};
 use super::volume::{VolumeBucketAccumulator, VolumeTickArrivalEstimator};
 use super::{EstimatorConfig, MarketEstimator, VolatilityRegime};
@@ -66,6 +66,10 @@ pub struct ParameterEstimator {
     stoch_vol: StochasticVolParams,
     /// Kalman filter for denoising mid price (stochastic module integration)
     kalman_filter: KalmanPriceFilter,
+    /// Probabilistic momentum model for learned continuation probabilities
+    momentum_model: MomentumModel,
+    /// Last momentum value (for detecting continuation vs reversal)
+    last_momentum_bps: f64,
 }
 
 impl ParameterEstimator {
@@ -125,6 +129,10 @@ impl ParameterEstimator {
         // Uses sensible defaults for crypto markets (Q=1bp², R=0.5bp²)
         let kalman_filter = KalmanPriceFilter::default_crypto();
 
+        // Momentum model for learned continuation probabilities (First Principles Gap 10)
+        // Uses 5-minute window and 0.1 EWMA alpha for smooth learning
+        let momentum_model = MomentumModel::default_config();
+
         Self {
             config,
             bucket_accumulator,
@@ -144,6 +152,8 @@ impl ParameterEstimator {
             jump_estimator,
             stoch_vol,
             kalman_filter,
+            momentum_model,
+            last_momentum_bps: 0.0,
         }
     }
 
@@ -202,6 +212,21 @@ impl ParameterEstimator {
             if let Some(ret) = log_return {
                 self.momentum.on_bucket(bucket.end_time_ms, ret);
 
+                // Update probabilistic momentum model with continuation observation
+                // Continuation = return has same sign as previous momentum
+                let ret_bps = ret * 10_000.0;
+                if self.last_momentum_bps.abs() > 1.0 {
+                    // Only record if there was meaningful prior momentum
+                    let continued = (ret_bps > 0.0) == (self.last_momentum_bps > 0.0);
+                    self.momentum_model.record_observation(
+                        bucket.end_time_ms,
+                        self.last_momentum_bps,
+                        continued,
+                    );
+                }
+                // Update last momentum for next iteration
+                self.last_momentum_bps = self.momentum.momentum_bps(bucket.end_time_ms);
+
                 // Update jump estimator with return (detects jumps > 3σ)
                 let sigma_clean = self.multi_scale.sigma_clean();
                 self.jump_estimator
@@ -217,6 +242,16 @@ impl ParameterEstimator {
             let sigma = self.multi_scale.sigma_clean();
             let jump_ratio = self.multi_scale.jump_ratio_fast();
             self.volatility_regime.update(sigma, jump_ratio);
+
+            // Update Kalman filter process noise Q from current volatility estimate
+            // Adaptive Q = σ² × dt, where dt is approximate bucket duration in seconds
+            // This makes the Kalman filter more responsive during high volatility
+            let bucket_duration_secs =
+                bucket.end_time_ms.saturating_sub(bucket.start_time_ms) as f64 / 1000.0;
+            // Use a minimum dt to avoid numerical instability
+            let dt = bucket_duration_secs.max(0.1);
+            self.kalman_filter
+                .set_process_noise_from_volatility(sigma, dt);
 
             // Slowly update baseline from slow sigma (long-term anchor)
             // Using slow sigma as the stable reference for regime thresholds
@@ -303,6 +338,11 @@ impl ParameterEstimator {
         // Book structure for imbalance and liquidity signals (still valid uses)
         self.book_structure.update(bids, asks, mid);
 
+        // Adapt microprice forward horizon to current arrival intensity
+        // Fast markets → shorter horizon, slow markets → longer horizon
+        let arrival = self.arrival.ticks_per_second();
+        self.microprice_estimator.update_horizon(arrival);
+
         // Feed microprice estimator with current signals
         self.microprice_estimator.on_book_update(
             self.current_time_ms,
@@ -337,6 +377,35 @@ impl ParameterEstimator {
     /// Use for inventory skew (reacts appropriately to jumps).
     pub fn sigma_effective(&self) -> f64 {
         self.multi_scale.sigma_effective()
+    }
+
+    /// Get leverage-adjusted effective volatility.
+    ///
+    /// Applies the leverage effect: volatility increases during down moves
+    /// when ρ (price-vol correlation) is negative.
+    ///
+    /// Formula: sigma_adjusted = sigma_effective × (1 + |ρ| × 0.2 × down_move_indicator)
+    ///
+    /// This provides wider spreads during falling markets when volatility
+    /// typically spikes, reducing adverse selection.
+    pub fn sigma_leverage_adjusted(&self) -> f64 {
+        let base_sigma = self.multi_scale.sigma_effective();
+        let rho = self.stoch_vol.rho();
+        let momentum_bps = self.momentum.momentum_bps(self.current_time_ms);
+
+        // Only apply leverage effect when:
+        // 1. Momentum is negative (falling market)
+        // 2. ρ is negative (leverage effect exists)
+        if momentum_bps < 0.0 && rho < 0.0 {
+            // Scale adjustment by momentum magnitude (capped at 50bps)
+            let momentum_factor = (momentum_bps.abs() / 50.0).clamp(0.0, 1.0);
+            // Adjustment = |ρ| × 0.2 × momentum_factor
+            // Max adjustment: 0.95 × 0.2 × 1.0 = 19% vol increase
+            let adjustment = rho.abs() * 0.2 * momentum_factor;
+            base_sigma * (1.0 + adjustment)
+        } else {
+            base_sigma
+        }
     }
 
     // === Order Book Accessors ===
@@ -431,19 +500,21 @@ impl ParameterEstimator {
     /// Theory: When informed flow is selling, our bids get hit more often
     /// and at worse prices → lower κ_bid → wider bid spread.
     ///
-    /// Uses same conservative blending as main kappa() when confidence is low.
+    /// Uses smooth confidence-weighted blending to avoid spread blow-up during warmup:
+    /// - Low confidence: Blend toward market kappa with conservative scaling
+    /// - High confidence: Use own fill data directly
     pub fn kappa_bid(&self) -> f64 {
         let own_conf = self.own_kappa_bid.confidence();
         let own = self.own_kappa_bid.posterior_mean();
         let market = self.market_kappa.posterior_mean();
+        let market_conf = self.market_kappa.confidence();
 
-        // Conservative blending: discount market kappa when confidence low
-        if own_conf < 0.3 {
-            let market_discounted = market * 0.5;
-            own_conf * own + (1.0 - own_conf) * market_discounted
-        } else {
-            own_conf * own + (1.0 - own_conf) * market
-        }
+        // Smooth blending formula:
+        // kappa_bid = own_conf * own_kappa + (1-own_conf) * market_kappa * market_scale
+        // market_scale smoothly transitions from 0.5 to 1.0 based on market confidence
+        // This avoids the hard 0.3 threshold that caused spread discontinuities
+        let market_scale = 0.5 + 0.5 * market_conf;
+        own_conf * own + (1.0 - own_conf) * market * market_scale
     }
 
     /// Get directional kappa for ask side (our sell fills).
@@ -451,19 +522,21 @@ impl ParameterEstimator {
     /// Theory: When informed flow is buying, our asks get lifted more often
     /// and at worse prices → lower κ_ask → wider ask spread.
     ///
-    /// Uses same conservative blending as main kappa() when confidence is low.
+    /// Uses smooth confidence-weighted blending to avoid spread blow-up during warmup:
+    /// - Low confidence: Blend toward market kappa with conservative scaling
+    /// - High confidence: Use own fill data directly
     pub fn kappa_ask(&self) -> f64 {
         let own_conf = self.own_kappa_ask.confidence();
         let own = self.own_kappa_ask.posterior_mean();
         let market = self.market_kappa.posterior_mean();
+        let market_conf = self.market_kappa.confidence();
 
-        // Conservative blending: discount market kappa when confidence low
-        if own_conf < 0.3 {
-            let market_discounted = market * 0.5;
-            own_conf * own + (1.0 - own_conf) * market_discounted
-        } else {
-            own_conf * own + (1.0 - own_conf) * market
-        }
+        // Smooth blending formula:
+        // kappa_ask = own_conf * own_kappa + (1-own_conf) * market_kappa * market_scale
+        // market_scale smoothly transitions from 0.5 to 1.0 based on market confidence
+        // This avoids the hard 0.3 threshold that caused spread discontinuities
+        let market_scale = 0.5 + 0.5 * market_conf;
+        own_conf * own + (1.0 - own_conf) * market * market_scale
     }
 
     /// Get confidence for directional kappa estimates.
@@ -474,6 +547,12 @@ impl ParameterEstimator {
     /// Get confidence for directional kappa estimates.
     pub fn kappa_ask_confidence(&self) -> f64 {
         self.own_kappa_ask.confidence()
+    }
+
+    /// Check if fill distance distribution is heavy-tailed (CV > 1.2).
+    /// Heavy-tailed distributions mean occasional large fills are more likely.
+    pub fn is_heavy_tailed(&self) -> bool {
+        self.market_kappa.is_heavy_tailed() || self.own_kappa.is_heavy_tailed()
     }
 
     /// Get current order arrival intensity (volume ticks per second).
@@ -593,6 +672,49 @@ impl ParameterEstimator {
     /// Negative = sell pressure, Positive = buy pressure.
     pub fn flow_imbalance(&self) -> f64 {
         self.flow.imbalance()
+    }
+
+    // === Probabilistic Momentum Model Accessors ===
+
+    /// Get learned probability of momentum continuation.
+    ///
+    /// Returns P(next return has same sign as current momentum).
+    /// Uses learned probabilities if calibrated, falls back to 0.5 prior otherwise.
+    pub fn momentum_continuation_probability(&self) -> f64 {
+        self.momentum_model
+            .continuation_probability(self.last_momentum_bps)
+    }
+
+    /// Get bid protection factor based on learned momentum model.
+    ///
+    /// Returns multiplier > 1 if we should protect bids (falling market).
+    /// Based on learned continuation probability and momentum magnitude.
+    pub fn bid_protection_factor(&self) -> f64 {
+        self.momentum_model
+            .bid_protection_factor(self.last_momentum_bps)
+    }
+
+    /// Get ask protection factor based on learned momentum model.
+    ///
+    /// Returns multiplier > 1 if we should protect asks (rising market).
+    /// Based on learned continuation probability and momentum magnitude.
+    pub fn ask_protection_factor(&self) -> f64 {
+        self.momentum_model
+            .ask_protection_factor(self.last_momentum_bps)
+    }
+
+    /// Get overall momentum strength [0, 1] from learned model.
+    ///
+    /// Combines continuation probability with magnitude for a single
+    /// "how strong is the directional signal" metric.
+    pub fn momentum_strength(&self) -> f64 {
+        self.momentum_model
+            .momentum_strength(self.last_momentum_bps)
+    }
+
+    /// Check if momentum model is calibrated (enough observations).
+    pub fn momentum_model_calibrated(&self) -> bool {
+        self.momentum_model.is_calibrated()
     }
 
     // === Jump Process Accessors (First Principles Gap 1) ===
@@ -786,6 +908,9 @@ impl MarketEstimator for ParameterEstimator {
     fn sigma_effective(&self) -> f64 {
         self.sigma_effective()
     }
+    fn sigma_leverage_adjusted(&self) -> f64 {
+        self.sigma_leverage_adjusted()
+    }
     fn volatility_regime(&self) -> VolatilityRegime {
         self.volatility_regime()
     }
@@ -797,6 +922,14 @@ impl MarketEstimator for ParameterEstimator {
     }
     fn kappa_ask(&self) -> f64 {
         self.kappa_ask()
+    }
+    fn is_heavy_tailed(&self) -> bool {
+        // Check if any kappa estimator shows heavy-tailed behavior
+        // Use market kappa since it has more observations during warmup
+        self.market_kappa.is_heavy_tailed() || self.own_kappa.is_heavy_tailed()
+    }
+    fn kappa_cv(&self) -> f64 {
+        self.kappa_cv()
     }
     fn arrival_intensity(&self) -> f64 {
         self.arrival_intensity()
@@ -821,6 +954,21 @@ impl MarketEstimator for ParameterEstimator {
     }
     fn rising_knife_score(&self) -> f64 {
         self.rising_knife_score()
+    }
+    fn momentum_continuation_probability(&self) -> f64 {
+        self.momentum_continuation_probability()
+    }
+    fn bid_protection_factor(&self) -> f64 {
+        self.bid_protection_factor()
+    }
+    fn ask_protection_factor(&self) -> f64 {
+        self.ask_protection_factor()
+    }
+    fn momentum_strength(&self) -> f64 {
+        self.momentum_strength()
+    }
+    fn momentum_model_calibrated(&self) -> bool {
+        self.momentum_model_calibrated()
     }
     fn book_imbalance(&self) -> f64 {
         self.book_imbalance()

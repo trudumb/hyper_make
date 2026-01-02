@@ -61,14 +61,25 @@ enum CorrelationMode {
 /// - Prevents coefficient explosion when signals are collinear
 /// - Biases coefficients toward zero when data is noisy
 /// - Produces more stable estimates across market regimes
+///
+/// **Adaptive horizon:**
+/// - Horizon adapts to arrival intensity: horizon_ms = 2000 / arrival_intensity
+/// - Fast markets (high intensity): shorter horizon (min 100ms)
+/// - Slow markets (low intensity): longer horizon (max 500ms)
 #[derive(Debug)]
 pub(crate) struct MicropriceEstimator {
     /// Pending observations waiting for forward horizon to elapse
     pending: VecDeque<MicropriceObservation>,
     /// Window for regression data (ms)
     window_ms: u64,
-    /// Forward horizon to measure realized return (ms)
+    /// Forward horizon to measure realized return (ms) - now adaptive
     forward_horizon_ms: u64,
+    /// Default forward horizon (used when arrival intensity unknown)
+    default_forward_horizon_ms: u64,
+    /// Minimum forward horizon (ms)
+    min_horizon_ms: u64,
+    /// Maximum forward horizon (ms)
+    max_horizon_ms: u64,
 
     // Running sums for online regression (2-variable linear regression)
     // y = β_book × x_book + β_flow × x_flow + ε
@@ -119,6 +130,9 @@ impl MicropriceEstimator {
             pending: VecDeque::with_capacity(2000),
             window_ms,
             forward_horizon_ms,
+            default_forward_horizon_ms: forward_horizon_ms,
+            min_horizon_ms: 100, // Minimum 100ms for fast markets
+            max_horizon_ms: 500, // Maximum 500ms for slow markets
             n: 0,
             sum_x_book: 0.0,
             sum_x_flow: 0.0,
@@ -151,6 +165,34 @@ impl MicropriceEstimator {
             sum_xx_net: 0.0,
             sum_xy_net: 0.0,
         }
+    }
+
+    /// Update forward horizon based on arrival intensity.
+    ///
+    /// Adapts the prediction horizon to market activity:
+    /// - Fast markets (high intensity): shorter horizon for quicker updates
+    /// - Slow markets (low intensity): longer horizon for more stable predictions
+    ///
+    /// Formula: horizon_ms = 2000 / arrival_intensity
+    /// Clamped to [min_horizon_ms, max_horizon_ms]
+    pub(crate) fn update_horizon(&mut self, arrival_intensity: f64) {
+        if arrival_intensity <= 0.0 {
+            self.forward_horizon_ms = self.default_forward_horizon_ms;
+            return;
+        }
+
+        // Formula: horizon_ms = 2000 / arrival_intensity
+        // At intensity 4 ticks/sec: horizon = 500ms
+        // At intensity 10 ticks/sec: horizon = 200ms
+        // At intensity 20 ticks/sec: horizon = 100ms
+        let computed = (2000.0 / arrival_intensity) as u64;
+        self.forward_horizon_ms = computed.clamp(self.min_horizon_ms, self.max_horizon_ms);
+    }
+
+    /// Get current forward horizon in ms.
+    #[allow(dead_code)]
+    pub(crate) fn forward_horizon_ms(&self) -> u64 {
+        self.forward_horizon_ms
     }
 
     /// Update with new book state.

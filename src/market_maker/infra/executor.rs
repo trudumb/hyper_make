@@ -291,7 +291,8 @@ pub trait OrderExecutor: Send + Sync {
     ///
     /// # Returns
     /// Vec of ModifyResult for each order in the same order as input
-    async fn modify_bulk_orders(&self, asset: &str, modifies: Vec<ModifySpec>) -> Vec<ModifyResult>;
+    async fn modify_bulk_orders(&self, asset: &str, modifies: Vec<ModifySpec>)
+        -> Vec<ModifyResult>;
 }
 
 /// Hyperliquid exchange executor.
@@ -341,7 +342,10 @@ impl OrderExecutor for HyperliquidExecutor {
                         if !order.statuses.is_empty() {
                             match order.statuses[0].clone() {
                                 ExchangeDataStatus::Filled(order) => {
-                                    info!("Order filled immediately: oid={} cloid={}", order.oid, cloid_str);
+                                    info!(
+                                        "Order filled immediately: oid={} cloid={}",
+                                        order.oid, cloid_str
+                                    );
                                     if let Some(ref m) = self.metrics {
                                         m.record_order_placed();
                                     }
@@ -412,7 +416,9 @@ impl OrderExecutor for HyperliquidExecutor {
         let cloids: Vec<Option<String>> = orders
             .iter()
             .map(|spec| {
-                spec.cloid.clone().or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+                spec.cloid
+                    .clone()
+                    .or_else(|| Some(uuid::Uuid::new_v4().to_string()))
             })
             .collect();
 
@@ -487,7 +493,10 @@ impl OrderExecutor for HyperliquidExecutor {
                                     );
                                     error_count += 1;
                                     // Phase 5: Capture error for rate limiter
-                                    results.push(OrderResult::failed_with_cloid_and_error(cloid, e.clone()));
+                                    results.push(OrderResult::failed_with_cloid_and_error(
+                                        cloid,
+                                        e.clone(),
+                                    ));
                                 }
                                 _ => {
                                     warn!("Unexpected bulk order {} status: {:?}", i, status);
@@ -631,10 +640,7 @@ impl OrderExecutor for HyperliquidExecutor {
                                     );
                                 }
                                 _ => {
-                                    warn!(
-                                        "Unexpected IOC order status: {:?}",
-                                        order.statuses[0]
-                                    );
+                                    warn!("Unexpected IOC order status: {:?}", order.statuses[0]);
                                 }
                             }
                         } else {
@@ -773,7 +779,10 @@ impl OrderExecutor for HyperliquidExecutor {
                                     }
                                 }
                                 _ => {
-                                    warn!("Unexpected bulk cancel status for oid={}: {:?}", oid, status);
+                                    warn!(
+                                        "Unexpected bulk cancel status for oid={}: {:?}",
+                                        oid, status
+                                    );
                                     results.push(CancelResult::Failed);
                                 }
                             }
@@ -890,7 +899,11 @@ impl OrderExecutor for HyperliquidExecutor {
         }
     }
 
-    async fn modify_bulk_orders(&self, asset: &str, modifies: Vec<ModifySpec>) -> Vec<ModifyResult> {
+    async fn modify_bulk_orders(
+        &self,
+        asset: &str,
+        modifies: Vec<ModifySpec>,
+    ) -> Vec<ModifyResult> {
         if modifies.is_empty() {
             return vec![];
         }
@@ -950,7 +963,9 @@ impl OrderExecutor for HyperliquidExecutor {
                                 }
                                 _ => {
                                     error_count += 1;
-                                    results.push(ModifyResult::failed("Unexpected status".to_string()));
+                                    results.push(ModifyResult::failed(
+                                        "Unexpected status".to_string(),
+                                    ));
                                 }
                             }
                         }

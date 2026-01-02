@@ -167,13 +167,13 @@ impl Default for DynamicDepthConfig {
     fn default() -> Self {
         Self {
             num_levels: 5,
-            min_depth_bps: 1.0,       // At least 1bp from mid
-            max_depth_multiple: 5.0,  // Up to 5x optimal spread
-            max_depth_bps: 200.0,     // Hard cap at 200bp
+            min_depth_bps: 1.0,      // At least 1bp from mid
+            max_depth_multiple: 5.0, // Up to 5x optimal spread
+            max_depth_bps: 200.0,    // Hard cap at 200bp
             spacing: DepthSpacing::Geometric,
-            geometric_ratio: 1.5,     // Each level 50% further than previous
-            linear_step_bps: 3.0,     // Or 3bp steps for linear
-            maker_fee_rate: 0.00015,  // 1.5bp maker fee (Hyperliquid actual)
+            geometric_ratio: 1.5,    // Each level 50% further than previous
+            linear_step_bps: 3.0,    // Or 3bp steps for linear
+            maker_fee_rate: 0.00015, // 1.5bp maker fee (Hyperliquid actual)
             // FIRST PRINCIPLES: Spread floor must exceed AS + fees to be profitable
             // Trade history analysis (Dec 2025) showed:
             //   - Average edge needed: ~6.67 bps to break even
@@ -191,7 +191,7 @@ impl Default for DynamicDepthConfig {
             //
             // If competitive quoting is needed, set to 15.0+ (7.5× per side)
             // to allow most GLFT optimal spreads through.
-            market_spread_cap_multiple: 0.0,  // DISABLED - trust GLFT theory
+            market_spread_cap_multiple: 0.0, // DISABLED - trust GLFT theory
         }
     }
 }
@@ -417,14 +417,17 @@ impl DynamicDepthGenerator {
         }
 
         // Calculate max depth for this ladder
-        let max_depth = (optimal_bps * self.config.max_depth_multiple).min(self.config.max_depth_bps);
+        let max_depth =
+            (optimal_bps * self.config.max_depth_multiple).min(self.config.max_depth_bps);
 
         // If optimal spread exceeds max_depth_bps, create a distributed ladder
         // from min_spread_floor to max_depth instead of clamping all to max.
         // This ensures we have competitive quotes at the touch AND distribution.
         let effective_start = if optimal_bps > max_depth {
             // Start from floor and expand to max
-            self.config.min_spread_floor_bps.max(self.config.min_depth_bps)
+            self.config
+                .min_spread_floor_bps
+                .max(self.config.min_depth_bps)
         } else {
             optimal_bps
         };
@@ -585,9 +588,9 @@ mod tests {
         let config = DynamicDepthConfig {
             num_levels: 5,
             min_depth_bps: 1.0,
-            max_depth_bps: 50.0,          // Low max to force fallback
+            max_depth_bps: 50.0, // Low max to force fallback
             max_depth_multiple: 5.0,
-            min_spread_floor_bps: 2.0,    // Competitive floor
+            min_spread_floor_bps: 2.0, // Competitive floor
             geometric_ratio: 1.5,
             ..Default::default()
         };

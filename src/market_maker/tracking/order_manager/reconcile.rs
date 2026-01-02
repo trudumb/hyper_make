@@ -28,10 +28,10 @@ pub struct ReconcileConfig {
 impl Default for ReconcileConfig {
     fn default() -> Self {
         Self {
-            max_modify_price_bps: 10,       // Modify if price ≤ 10 bps change
-            max_modify_size_pct: 0.50,      // Modify if size ≤ 50% change
-            skip_price_tolerance_bps: 1,    // Skip if price ≤ 1 bps (unchanged)
-            skip_size_tolerance_pct: 0.05,  // Skip if size ≤ 5% (unchanged)
+            max_modify_price_bps: 10,      // Modify if price ≤ 10 bps change
+            max_modify_size_pct: 0.50,     // Modify if size ≤ 50% change
+            skip_price_tolerance_bps: 1,   // Skip if price ≤ 1 bps (unchanged)
+            skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
         }
     }
 }

@@ -102,6 +102,14 @@ struct MetricsInner {
     cascade_severity: AtomicF64,
     /// Adverse selection in bps
     adverse_selection_bps: AtomicF64,
+    /// AS at 500ms horizon (bps)
+    as_500ms_bps: AtomicF64,
+    /// AS at 1000ms horizon (bps)
+    as_1000ms_bps: AtomicF64,
+    /// AS at 2000ms horizon (bps)
+    as_2000ms_bps: AtomicF64,
+    /// Current best AS horizon (ms)
+    as_best_horizon_ms: AtomicU64,
     /// Tail risk multiplier
     tail_risk_multiplier: AtomicF64,
 
@@ -132,6 +140,18 @@ struct MetricsInner {
     last_trade_age_ms: AtomicU64,
     /// Time since last L2 book update (ms)
     last_book_age_ms: AtomicU64,
+    /// Total WebSocket reconnections since start
+    ws_reconnection_count: AtomicU64,
+    /// Number of pong timeout events (connection died before server responded)
+    ws_pong_timeout_count: AtomicU64,
+    /// Average ping round-trip latency (ms)
+    ws_ping_latency_ms: AtomicF64,
+    /// Time since last successful pong (ms) - indicates connection liveness
+    ws_time_since_pong_ms: AtomicU64,
+    /// Connection supervisor consecutive stale readings
+    supervisor_stale_count: AtomicU64,
+    /// Connection supervisor reconnect signal count
+    supervisor_reconnect_signals: AtomicU64,
 
     // === Data Quality Metrics ===
     /// Total data quality issues detected
@@ -202,6 +222,10 @@ impl PrometheusMetrics {
                 kill_switch_triggered: AtomicU64::new(0),
                 cascade_severity: AtomicF64::new(0.0),
                 adverse_selection_bps: AtomicF64::new(0.0),
+                as_500ms_bps: AtomicF64::new(0.0),
+                as_1000ms_bps: AtomicF64::new(0.0),
+                as_2000ms_bps: AtomicF64::new(0.0),
+                as_best_horizon_ms: AtomicU64::new(1000),
                 tail_risk_multiplier: AtomicF64::new(1.0),
                 data_staleness_secs: AtomicF64::new(0.0),
                 quote_cycle_latency_ms: AtomicF64::new(0.0),
@@ -214,6 +238,12 @@ impl PrometheusMetrics {
                 websocket_connected: AtomicU64::new(0),
                 last_trade_age_ms: AtomicU64::new(0),
                 last_book_age_ms: AtomicU64::new(0),
+                ws_reconnection_count: AtomicU64::new(0),
+                ws_pong_timeout_count: AtomicU64::new(0),
+                ws_ping_latency_ms: AtomicF64::new(0.0),
+                ws_time_since_pong_ms: AtomicU64::new(0),
+                supervisor_stale_count: AtomicU64::new(0),
+                supervisor_reconnect_signals: AtomicU64::new(0),
                 data_quality_issues_total: AtomicU64::new(0),
                 message_loss_count: AtomicU64::new(0),
                 // Exchange Position Limits defaults
@@ -254,7 +284,9 @@ impl PrometheusMetrics {
     pub fn update_pending_exposure(&self, bid_exposure: f64, ask_exposure: f64, position: f64) {
         self.inner.pending_bid_exposure.store(bid_exposure);
         self.inner.pending_ask_exposure.store(ask_exposure);
-        self.inner.net_pending_change.store(bid_exposure - ask_exposure);
+        self.inner
+            .net_pending_change
+            .store(bid_exposure - ask_exposure);
         self.inner
             .worst_case_max_position
             .store(position + bid_exposure);
@@ -377,6 +409,28 @@ impl PrometheusMetrics {
             .store(regime, Ordering::Relaxed);
     }
 
+    /// Update multi-horizon adverse selection metrics.
+    ///
+    /// # Arguments
+    /// - `as_500ms_bps`: AS measured at 500ms horizon
+    /// - `as_1000ms_bps`: AS measured at 1000ms horizon
+    /// - `as_2000ms_bps`: AS measured at 2000ms horizon
+    /// - `best_horizon_ms`: Current best horizon in use
+    pub fn update_multi_horizon_as(
+        &self,
+        as_500ms_bps: f64,
+        as_1000ms_bps: f64,
+        as_2000ms_bps: f64,
+        best_horizon_ms: u64,
+    ) {
+        self.inner.as_500ms_bps.store(as_500ms_bps);
+        self.inner.as_1000ms_bps.store(as_1000ms_bps);
+        self.inner.as_2000ms_bps.store(as_2000ms_bps);
+        self.inner
+            .as_best_horizon_ms
+            .store(best_horizon_ms, Ordering::Relaxed);
+    }
+
     // === Kelly-Stochastic Updates ===
 
     /// Update Kelly-Stochastic allocation metrics.
@@ -414,6 +468,46 @@ impl PrometheusMetrics {
     /// Update last book age in milliseconds.
     pub fn set_last_book_age_ms(&self, age_ms: u64) {
         self.inner.last_book_age_ms.store(age_ms, Ordering::Relaxed);
+    }
+
+    /// Update WebSocket health statistics.
+    ///
+    /// # Arguments
+    /// - `reconnection_count`: Total reconnections since start
+    /// - `pong_timeout_count`: Number of pong timeouts detected
+    /// - `avg_ping_latency_ms`: Average ping RTT in milliseconds
+    /// - `time_since_pong_ms`: Time since last pong received (ms)
+    pub fn update_ws_health(
+        &self,
+        reconnection_count: u64,
+        pong_timeout_count: u64,
+        avg_ping_latency_ms: f64,
+        time_since_pong_ms: u64,
+    ) {
+        self.inner
+            .ws_reconnection_count
+            .store(reconnection_count, Ordering::Relaxed);
+        self.inner
+            .ws_pong_timeout_count
+            .store(pong_timeout_count, Ordering::Relaxed);
+        self.inner.ws_ping_latency_ms.store(avg_ping_latency_ms);
+        self.inner
+            .ws_time_since_pong_ms
+            .store(time_since_pong_ms, Ordering::Relaxed);
+    }
+
+    /// Update connection supervisor statistics.
+    ///
+    /// # Arguments
+    /// - `stale_count`: Consecutive stale readings
+    /// - `reconnect_signal_count`: Total reconnection signals issued
+    pub fn update_supervisor_stats(&self, stale_count: u32, reconnect_signal_count: u64) {
+        self.inner
+            .supervisor_stale_count
+            .store(stale_count as u64, Ordering::Relaxed);
+        self.inner
+            .supervisor_reconnect_signals
+            .store(reconnect_signal_count, Ordering::Relaxed);
     }
 
     // === Data Quality Updates ===
@@ -669,6 +763,39 @@ impl PrometheusMetrics {
             self.inner.adverse_selection_bps.load()
         ));
 
+        // Multi-horizon AS metrics
+        output.push_str(&format!(
+            "# HELP mm_as_500ms_bps Adverse selection at 500ms horizon\n\
+             # TYPE mm_as_500ms_bps gauge\n\
+             mm_as_500ms_bps{{{}}} {:.2}\n",
+            labels,
+            self.inner.as_500ms_bps.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_as_1000ms_bps Adverse selection at 1000ms horizon\n\
+             # TYPE mm_as_1000ms_bps gauge\n\
+             mm_as_1000ms_bps{{{}}} {:.2}\n",
+            labels,
+            self.inner.as_1000ms_bps.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_as_2000ms_bps Adverse selection at 2000ms horizon\n\
+             # TYPE mm_as_2000ms_bps gauge\n\
+             mm_as_2000ms_bps{{{}}} {:.2}\n",
+            labels,
+            self.inner.as_2000ms_bps.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_as_best_horizon_ms Best AS measurement horizon in ms\n\
+             # TYPE mm_as_best_horizon_ms gauge\n\
+             mm_as_best_horizon_ms{{{}}} {}\n",
+            labels,
+            self.inner.as_best_horizon_ms.load(Ordering::Relaxed)
+        ));
+
         // Timing metrics
         output.push_str(&format!(
             "# HELP mm_data_staleness_secs Time since last data update\n\
@@ -751,6 +878,55 @@ impl PrometheusMetrics {
              mm_last_book_age_ms{{{}}} {}\n",
             labels,
             self.inner.last_book_age_ms.load(Ordering::Relaxed)
+        ));
+
+        // Enhanced WebSocket health metrics
+        output.push_str(&format!(
+            "# HELP mm_ws_reconnection_total Total WebSocket reconnections since start\n\
+             # TYPE mm_ws_reconnection_total counter\n\
+             mm_ws_reconnection_total{{{}}} {}\n",
+            labels,
+            self.inner.ws_reconnection_count.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_ws_pong_timeout_total Number of pong timeouts detected\n\
+             # TYPE mm_ws_pong_timeout_total counter\n\
+             mm_ws_pong_timeout_total{{{}}} {}\n",
+            labels,
+            self.inner.ws_pong_timeout_count.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_ws_ping_latency_ms Average WebSocket ping RTT in ms\n\
+             # TYPE mm_ws_ping_latency_ms gauge\n\
+             mm_ws_ping_latency_ms{{{}}} {:.1}\n",
+            labels,
+            self.inner.ws_ping_latency_ms.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_ws_time_since_pong_ms Time since last pong received (ms)\n\
+             # TYPE mm_ws_time_since_pong_ms gauge\n\
+             mm_ws_time_since_pong_ms{{{}}} {}\n",
+            labels,
+            self.inner.ws_time_since_pong_ms.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_supervisor_stale_count Consecutive stale data readings\n\
+             # TYPE mm_supervisor_stale_count gauge\n\
+             mm_supervisor_stale_count{{{}}} {}\n",
+            labels,
+            self.inner.supervisor_stale_count.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_supervisor_reconnect_signals_total Total reconnect signals from supervisor\n\
+             # TYPE mm_supervisor_reconnect_signals_total counter\n\
+             mm_supervisor_reconnect_signals_total{{{}}} {}\n",
+            labels,
+            self.inner.supervisor_reconnect_signals.load(Ordering::Relaxed)
         ));
 
         // Data quality metrics

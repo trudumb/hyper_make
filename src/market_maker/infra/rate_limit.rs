@@ -119,12 +119,11 @@ impl RejectionRateLimiter {
 
         // Calculate backoff if over threshold
         if state.consecutive_rejections >= self.config.backoff_start_threshold {
-            let rejections_over = state.consecutive_rejections - self.config.backoff_start_threshold;
+            let rejections_over =
+                state.consecutive_rejections - self.config.backoff_start_threshold;
             let multiplier = self.config.backoff_multiplier.powi(rejections_over as i32);
-            let backoff_secs =
-                (self.config.initial_backoff.as_secs_f64() * multiplier).min(
-                    self.config.max_backoff.as_secs_f64(),
-                );
+            let backoff_secs = (self.config.initial_backoff.as_secs_f64() * multiplier)
+                .min(self.config.max_backoff.as_secs_f64());
             let backoff = Duration::from_secs_f64(backoff_secs);
 
             state.backoff_until = Some(Instant::now() + backoff);
@@ -220,8 +219,16 @@ impl RejectionRateLimiter {
         RejectionRateLimitMetrics {
             bid_consecutive_rejections: self.bid_state.consecutive_rejections,
             ask_consecutive_rejections: self.ask_state.consecutive_rejections,
-            bid_in_backoff: self.bid_state.backoff_until.map(|u| Instant::now() < u).unwrap_or(false),
-            ask_in_backoff: self.ask_state.backoff_until.map(|u| Instant::now() < u).unwrap_or(false),
+            bid_in_backoff: self
+                .bid_state
+                .backoff_until
+                .map(|u| Instant::now() < u)
+                .unwrap_or(false),
+            ask_in_backoff: self
+                .ask_state
+                .backoff_until
+                .map(|u| Instant::now() < u)
+                .unwrap_or(false),
             bid_total_rejections: self.bid_state.total_rejections,
             ask_total_rejections: self.ask_state.total_rejections,
             bid_total_successes: self.bid_state.total_successes,
@@ -358,8 +365,8 @@ impl ProactiveRateLimitTracker {
     /// Check if we're approaching IP rate limit.
     pub fn ip_rate_warning(&self) -> bool {
         let used = self.ip_weight_used();
-        let threshold = (self.config.ip_weight_per_minute as f64
-            * self.config.ip_warning_threshold) as u32;
+        let threshold =
+            (self.config.ip_weight_per_minute as f64 * self.config.ip_warning_threshold) as u32;
         used >= threshold
     }
 
@@ -377,8 +384,7 @@ impl ProactiveRateLimitTracker {
 
     /// Check if minimum requote interval has passed.
     pub fn can_requote(&self) -> bool {
-        self.last_requote.elapsed()
-            >= Duration::from_millis(self.config.min_requote_interval_ms)
+        self.last_requote.elapsed() >= Duration::from_millis(self.config.min_requote_interval_ms)
     }
 
     /// Mark that a requote was done.
@@ -425,8 +431,12 @@ mod tests {
         let mut limiter = RejectionRateLimiter::with_config(config);
 
         // Two rejections should not trigger backoff
-        assert!(limiter.record_rejection(true, "position exceeded").is_none());
-        assert!(limiter.record_rejection(true, "position exceeded").is_none());
+        assert!(limiter
+            .record_rejection(true, "position exceeded")
+            .is_none());
+        assert!(limiter
+            .record_rejection(true, "position exceeded")
+            .is_none());
 
         assert!(!limiter.should_skip(true));
     }
@@ -441,7 +451,9 @@ mod tests {
         let mut limiter = RejectionRateLimiter::with_config(config);
 
         // First rejection - no backoff
-        assert!(limiter.record_rejection(true, "position exceeded").is_none());
+        assert!(limiter
+            .record_rejection(true, "position exceeded")
+            .is_none());
 
         // Second rejection - triggers backoff
         let backoff = limiter.record_rejection(true, "position exceeded");
@@ -535,7 +547,9 @@ mod tests {
         let mut limiter = RejectionRateLimiter::new();
 
         // Non-position error - should be ignored
-        assert!(limiter.record_rejection(true, "insufficient margin").is_none());
+        assert!(limiter
+            .record_rejection(true, "insufficient margin")
+            .is_none());
         assert_eq!(limiter.bid_state.consecutive_rejections, 0);
     }
 }

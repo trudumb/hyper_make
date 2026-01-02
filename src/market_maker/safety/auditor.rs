@@ -334,10 +334,10 @@ mod tests {
     #[test]
     fn test_pending_exposure_within_limits() {
         let warning = SafetyAuditor::check_pending_exposure_risk(
-            0.5,  // position
-            0.3,  // pending_bid
-            0.2,  // pending_ask
-            1.0,  // max_position
+            0.5, // position
+            0.3, // pending_bid
+            0.2, // pending_ask
+            1.0, // max_position
         );
         assert!(warning.is_none()); // 0.5 + 0.3 = 0.8 < 1.0
     }
@@ -345,10 +345,10 @@ mod tests {
     #[test]
     fn test_pending_exposure_exceeds_long() {
         let warning = SafetyAuditor::check_pending_exposure_risk(
-            0.5,  // position
-            0.7,  // pending_bid - would exceed
-            0.2,  // pending_ask
-            1.0,  // max_position
+            0.5, // position
+            0.7, // pending_bid - would exceed
+            0.2, // pending_ask
+            1.0, // max_position
         );
         assert!(warning.is_some());
         let msg = warning.unwrap();
@@ -373,10 +373,10 @@ mod tests {
     #[test]
     fn test_pending_exposure_exceeds_both() {
         let warning = SafetyAuditor::check_pending_exposure_risk(
-            0.0,  // neutral position
-            1.5,  // pending_bid - would exceed long
-            1.5,  // pending_ask - would exceed short
-            1.0,  // max_position
+            0.0, // neutral position
+            1.5, // pending_bid - would exceed long
+            1.5, // pending_ask - would exceed short
+            1.0, // max_position
         );
         assert!(warning.is_some());
         let msg = warning.unwrap();

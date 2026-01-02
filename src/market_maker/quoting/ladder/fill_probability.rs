@@ -53,7 +53,8 @@ fn std_normal_cdf(x: f64) -> f64 {
     let x_abs = x.abs();
 
     let t = 1.0 / (1.0 + P * x_abs);
-    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x_abs * x_abs / 2.0).exp();
+    let y =
+        1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x_abs * x_abs / 2.0).exp();
 
     0.5 * (1.0 + sign * y)
 }
@@ -128,8 +129,8 @@ impl FirstPassageFillModel {
 impl Default for FirstPassageFillModel {
     fn default() -> Self {
         Self {
-            sigma: 0.0001,  // 1bp/sec default
-            tau: 10.0,      // 10 second horizon
+            sigma: 0.0001, // 1bp/sec default
+            tau: 10.0,     // 10 second horizon
         }
     }
 }
@@ -279,12 +280,7 @@ impl BayesianFillModel {
     }
 
     /// Get fill probability with explicit sigma/tau override
-    pub fn fill_probability_with_params(
-        &self,
-        depth_bps: f64,
-        sigma: f64,
-        tau: f64,
-    ) -> f64 {
+    pub fn fill_probability_with_params(&self, depth_bps: f64, sigma: f64, tau: f64) -> f64 {
         let bucket = DepthBucket::from_bps(depth_bps);
 
         if let Some(obs) = self.observations.get(&bucket) {
@@ -297,7 +293,8 @@ impl BayesianFillModel {
         }
 
         // Fall back to theoretical with provided params
-        self.theoretical.probability_with_params(depth_bps, sigma, tau)
+        self.theoretical
+            .probability_with_params(depth_bps, sigma, tau)
     }
 
     /// Get posterior uncertainty (standard deviation) at a given depth
@@ -347,9 +344,9 @@ impl BayesianFillModel {
 
     /// Get total observations across all buckets
     pub fn total_observations(&self) -> (u64, u64) {
-        self.observations.values().fold((0, 0), |acc, obs| {
-            (acc.0 + obs.fills, acc.1 + obs.attempts)
-        })
+        self.observations
+            .values()
+            .fold((0, 0), |acc, obs| (acc.0 + obs.fills, acc.1 + obs.attempts))
     }
 
     /// Check if model has sufficient data for reliable estimates
@@ -582,6 +579,11 @@ mod tests {
         // At 50bp depth, should have lower fill probability
         // z = -0.005 / (0.001 * √10) = -1.58, Φ(-1.58) ≈ 0.057, 2*0.057 ≈ 0.11
         let p_50bp = model.fill_probability(50.0);
-        assert!(p_50bp < p_5bp, "p_50bp = {} should be < p_5bp = {}", p_50bp, p_5bp);
+        assert!(
+            p_50bp < p_5bp,
+            "p_50bp = {} should be < p_5bp = {}",
+            p_50bp,
+            p_5bp
+        );
     }
 }

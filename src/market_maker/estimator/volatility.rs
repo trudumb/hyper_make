@@ -511,10 +511,14 @@ impl VolatilityRegime {
     }
 }
 
-/// Tracks volatility regime with hysteresis to prevent rapid switching.
+/// Tracks volatility regime with asymmetric hysteresis to prevent rapid switching.
 ///
 /// Transitions between states require sustained conditions to trigger,
 /// preventing oscillation at boundaries.
+///
+/// Asymmetric hysteresis captures real market behavior:
+/// - Vol spikes fast: Escalation to High/Extreme is faster (2 ticks)
+/// - Vol mean-reverts slow: De-escalation to Normal/Low is slower (8 ticks)
 #[derive(Debug)]
 pub(crate) struct VolatilityRegimeTracker {
     /// Current regime state
@@ -523,8 +527,10 @@ pub(crate) struct VolatilityRegimeTracker {
     baseline_sigma: f64,
     /// Consecutive updates in potential new regime (for hysteresis)
     transition_count: u32,
-    /// Minimum transitions before state change (hysteresis parameter)
-    min_transitions: u32,
+    /// Minimum transitions for escalating to higher regime (fast: vol spikes)
+    min_transitions_escalate: u32,
+    /// Minimum transitions for de-escalating to lower regime (slow: vol mean-reverts)
+    min_transitions_deescalate: u32,
     /// Thresholds relative to baseline
     low_threshold: f64, // σ < baseline × low_threshold → Low
     high_threshold: f64,    // σ > baseline × high_threshold → High
@@ -541,7 +547,10 @@ impl VolatilityRegimeTracker {
             regime: VolatilityRegime::Normal,
             baseline_sigma,
             transition_count: 0,
-            min_transitions: 5, // Require 5 consecutive updates before transition
+            // Asymmetric hysteresis: escalate fast (2 ticks), de-escalate slow (8 ticks)
+            // This matches market behavior: vol spikes quickly, mean-reverts slowly
+            min_transitions_escalate: 2,
+            min_transitions_deescalate: 8,
             low_threshold: 0.5,
             high_threshold: 1.5,
             extreme_threshold: 3.0,
@@ -550,7 +559,37 @@ impl VolatilityRegimeTracker {
         }
     }
 
+    /// Determine if a transition is escalating (moving to higher risk regime).
+    fn is_escalation(&self, from: VolatilityRegime, to: VolatilityRegime) -> bool {
+        let from_level = match from {
+            VolatilityRegime::Low => 0,
+            VolatilityRegime::Normal => 1,
+            VolatilityRegime::High => 2,
+            VolatilityRegime::Extreme => 3,
+        };
+        let to_level = match to {
+            VolatilityRegime::Low => 0,
+            VolatilityRegime::Normal => 1,
+            VolatilityRegime::High => 2,
+            VolatilityRegime::Extreme => 3,
+        };
+        to_level > from_level
+    }
+
+    /// Get required transitions for a regime change (asymmetric).
+    fn required_transitions(&self, from: VolatilityRegime, to: VolatilityRegime) -> u32 {
+        if self.is_escalation(from, to) {
+            self.min_transitions_escalate
+        } else {
+            self.min_transitions_deescalate
+        }
+    }
+
     /// Update regime based on current volatility and jump ratio.
+    ///
+    /// Uses asymmetric hysteresis:
+    /// - Escalation (to higher risk): 2 ticks - react quickly to vol spikes
+    /// - De-escalation (to lower risk): 8 ticks - confirm vol has truly subsided
     pub(crate) fn update(&mut self, sigma: f64, jump_ratio: f64) {
         // Determine target regime based on current conditions
         let target = self.classify(sigma, jump_ratio);
@@ -559,14 +598,23 @@ impl VolatilityRegimeTracker {
         if let Some(pending) = self.pending_regime {
             if pending == target {
                 self.transition_count += 1;
-                if self.transition_count >= self.min_transitions {
+                // Use asymmetric hysteresis: fast escalation, slow de-escalation
+                let required = self.required_transitions(self.regime, target);
+                if self.transition_count >= required {
                     // Transition confirmed
                     if self.regime != target {
+                        let direction = if self.is_escalation(self.regime, target) {
+                            "escalation"
+                        } else {
+                            "de-escalation"
+                        };
                         debug!(
                             from = ?self.regime,
                             to = ?target,
                             sigma = %format!("{:.6}", sigma),
                             jump_ratio = %format!("{:.2}", jump_ratio),
+                            direction = direction,
+                            ticks_required = required,
                             "Volatility regime transition"
                         );
                     }

@@ -29,6 +29,11 @@ pub struct MarketParams {
     /// Reacts to jump regime; use for inventory skew
     pub sigma_effective: f64,
 
+    /// Leverage-adjusted effective volatility
+    /// Wider during down moves when ρ < 0 (leverage effect)
+    /// Use for asymmetric inventory skew in falling markets
+    pub sigma_leverage_adjusted: f64,
+
     // === Order Book ===
     /// Estimated order book depth decay (κ) - from weighted L2 book regression
     pub kappa: f64,
@@ -42,6 +47,15 @@ pub struct MarketParams {
     /// Theory: When informed flow is buying, κ_ask < κ_bid → wider ask spread.
     /// Use for asymmetric GLFT: δ_ask = (1/γ) × ln(1 + γ/κ_ask)
     pub kappa_ask: f64,
+
+    /// Whether fill distance distribution is heavy-tailed (CV > 1.2).
+    /// Heavy-tailed distributions mean occasional large fills are more likely.
+    /// When true, kappa values should be treated more conservatively.
+    pub is_heavy_tailed: bool,
+
+    /// Coefficient of variation of fill distances (CV = σ/μ).
+    /// CV = 1.0 for exponential, CV > 1.2 indicates heavy tail (power-law like).
+    pub kappa_cv: f64,
 
     /// Order arrival intensity (A) - volume ticks per second
     pub arrival_intensity: f64,
@@ -285,24 +299,27 @@ pub struct MarketParams {
 impl Default for MarketParams {
     fn default() -> Self {
         Self {
-            sigma: 0.0001,             // 0.01% per-second volatility (clean)
-            sigma_total: 0.0001,       // Same initially
-            sigma_effective: 0.0001,   // Same initially
-            kappa: 100.0,              // Moderate depth decay
-            kappa_bid: 100.0,          // Same as kappa initially
-            kappa_ask: 100.0,          // Same as kappa initially
-            arrival_intensity: 0.5,    // 0.5 volume ticks per second
-            is_toxic_regime: false,    // Default: not toxic
-            jump_ratio: 1.0,           // Default: normal diffusion
-            momentum_bps: 0.0,         // Default: no momentum
-            flow_imbalance: 0.0,       // Default: balanced flow
-            falling_knife_score: 0.0,  // Default: no falling knife
-            rising_knife_score: 0.0,   // Default: no rising knife
-            book_imbalance: 0.0,       // Default: balanced book
-            liquidity_gamma_mult: 1.0, // Default: normal liquidity
-            microprice: 0.0,           // Will be set from estimator
-            beta_book: 0.0,            // Will be learned from data
-            beta_flow: 0.0,            // Will be learned from data
+            sigma: 0.0001,                   // 0.01% per-second volatility (clean)
+            sigma_total: 0.0001,             // Same initially
+            sigma_effective: 0.0001,         // Same initially
+            sigma_leverage_adjusted: 0.0001, // Same initially (no leverage effect)
+            kappa: 100.0,                    // Moderate depth decay
+            kappa_bid: 100.0,                // Same as kappa initially
+            kappa_ask: 100.0,                // Same as kappa initially
+            is_heavy_tailed: false,          // Assume exponential tails
+            kappa_cv: 1.0,                   // CV=1 for exponential
+            arrival_intensity: 0.5,          // 0.5 volume ticks per second
+            is_toxic_regime: false,          // Default: not toxic
+            jump_ratio: 1.0,                 // Default: normal diffusion
+            momentum_bps: 0.0,               // Default: no momentum
+            flow_imbalance: 0.0,             // Default: balanced flow
+            falling_knife_score: 0.0,        // Default: no falling knife
+            rising_knife_score: 0.0,         // Default: no rising knife
+            book_imbalance: 0.0,             // Default: balanced book
+            liquidity_gamma_mult: 1.0,       // Default: normal liquidity
+            microprice: 0.0,                 // Will be set from estimator
+            beta_book: 0.0,                  // Will be learned from data
+            beta_flow: 0.0,                  // Will be learned from data
             // Tier 1: Adverse Selection
             as_spread_adjustment: 0.0, // No adjustment until warmed up
             predicted_alpha: 0.0,      // Default: no informed flow detected
@@ -373,8 +390,8 @@ impl Default for MarketParams {
             pending_bid_exposure: 0.0, // No resting orders initially
             pending_ask_exposure: 0.0, // No resting orders initially
             // Dynamic Position Limits
-            dynamic_max_position: 0.0,   // Will be set from kill switch
-            dynamic_limit_valid: false,  // Not valid until margin state refreshed
+            dynamic_max_position: 0.0,  // Will be set from kill switch
+            dynamic_limit_valid: false, // Not valid until margin state refreshed
         }
     }
 }
@@ -420,6 +437,8 @@ impl MarketParams {
             kappa: self.kappa,
             kappa_bid: self.kappa_bid,
             kappa_ask: self.kappa_ask,
+            is_heavy_tailed: self.is_heavy_tailed,
+            kappa_cv: self.kappa_cv,
             arrival_intensity: self.arrival_intensity,
             liquidity_gamma_mult: self.liquidity_gamma_mult,
             calibrated_volume_rate: self.calibrated_volume_rate,

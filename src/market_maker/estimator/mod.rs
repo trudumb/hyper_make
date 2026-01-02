@@ -67,6 +67,8 @@ pub trait MarketEstimator: Send + Sync {
     fn sigma_total(&self) -> f64;
     /// Blended effective volatility.
     fn sigma_effective(&self) -> f64;
+    /// Leverage-adjusted effective volatility (wider during down moves).
+    fn sigma_leverage_adjusted(&self) -> f64;
     /// Current volatility regime.
     fn volatility_regime(&self) -> VolatilityRegime;
 
@@ -77,6 +79,10 @@ pub trait MarketEstimator: Send + Sync {
     fn kappa_bid(&self) -> f64;
     /// Ask-side kappa.
     fn kappa_ask(&self) -> f64;
+    /// Whether fill distance distribution is heavy-tailed (CV > 1.2).
+    fn is_heavy_tailed(&self) -> bool;
+    /// Kappa coefficient of variation (CV=1 for exponential, >1 for heavy tail).
+    fn kappa_cv(&self) -> f64;
     /// Order arrival intensity (ticks/second).
     fn arrival_intensity(&self) -> f64;
     /// Liquidity-based gamma multiplier.
@@ -97,6 +103,18 @@ pub trait MarketEstimator: Send + Sync {
     fn falling_knife_score(&self) -> f64;
     /// Rising knife score [0, 3].
     fn rising_knife_score(&self) -> f64;
+
+    // === Probabilistic Momentum Model ===
+    /// Learned momentum continuation probability.
+    fn momentum_continuation_probability(&self) -> f64;
+    /// Bid protection factor from learned model.
+    fn bid_protection_factor(&self) -> f64;
+    /// Ask protection factor from learned model.
+    fn ask_protection_factor(&self) -> f64;
+    /// Overall momentum strength [0, 1].
+    fn momentum_strength(&self) -> f64;
+    /// Whether momentum model is calibrated.
+    fn momentum_model_calibrated(&self) -> bool;
 
     // === L2 Book Structure ===
     /// Book imbalance [-1, 1].
@@ -239,7 +257,7 @@ impl Default for EstimatorConfig {
             // With κ=2500, γ=0.3: δ* = 3.33 × ln(1.00012) ≈ 4bp + fees ≈ 6bp
             kappa_prior_mean: 2500.0,
             kappa_prior_strength: 5.0, // Lower strength = faster adaptation to real fills
-            kappa_window_ms: 300_000, // 5 minutes
+            kappa_window_ms: 300_000,  // 5 minutes
 
             // Warmup - reasonable for testnet/low-activity
             min_volume_ticks: 10,

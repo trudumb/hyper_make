@@ -710,7 +710,7 @@ mod tests {
         };
 
         assert!(!result2.is_immediate_fill_confirmation); // Not an immediate fill
-        // Position should now be 0.5 + 0.3 = 0.8
+                                                          // Position should now be 0.5 + 0.3 = 0.8
         assert!(
             (position.position() - 0.8).abs() < f64::EPSILON,
             "Position was {}, expected 0.8",

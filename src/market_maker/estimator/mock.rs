@@ -42,6 +42,9 @@ impl MarketEstimator for MockEstimator {
     fn sigma_effective(&self) -> f64 {
         self.sigma
     }
+    fn sigma_leverage_adjusted(&self) -> f64 {
+        self.sigma // Mock returns same as sigma (no leverage effect)
+    }
     fn volatility_regime(&self) -> VolatilityRegime {
         VolatilityRegime::Normal
     }
@@ -53,6 +56,12 @@ impl MarketEstimator for MockEstimator {
     }
     fn kappa_ask(&self) -> f64 {
         self.kappa
+    }
+    fn is_heavy_tailed(&self) -> bool {
+        false // Mock assumes exponential tails
+    }
+    fn kappa_cv(&self) -> f64 {
+        1.0 // CV=1 for exponential
     }
     fn arrival_intensity(&self) -> f64 {
         1.0
@@ -77,6 +86,21 @@ impl MarketEstimator for MockEstimator {
     }
     fn rising_knife_score(&self) -> f64 {
         0.0
+    }
+    fn momentum_continuation_probability(&self) -> f64 {
+        0.5 // 50% prior - no learned data
+    }
+    fn bid_protection_factor(&self) -> f64 {
+        1.0 // No protection needed
+    }
+    fn ask_protection_factor(&self) -> f64 {
+        1.0 // No protection needed
+    }
+    fn momentum_strength(&self) -> f64 {
+        0.0 // No momentum
+    }
+    fn momentum_model_calibrated(&self) -> bool {
+        false // Not calibrated
     }
     fn book_imbalance(&self) -> f64 {
         0.0

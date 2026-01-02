@@ -70,6 +70,12 @@ pub struct LiquidityParams {
     /// When informed flow is buying, κ_ask < κ_bid → wider ask spread.
     pub kappa_ask: f64,
 
+    /// Whether fill distance distribution is heavy-tailed (CV > 1.2).
+    pub is_heavy_tailed: bool,
+
+    /// Coefficient of variation of fill distances (CV = σ/μ).
+    pub kappa_cv: f64,
+
     /// Order arrival intensity (A) - volume ticks per second.
     pub arrival_intensity: f64,
 
@@ -90,6 +96,8 @@ impl Default for LiquidityParams {
             kappa: 100.0,
             kappa_bid: 100.0,
             kappa_ask: 100.0,
+            is_heavy_tailed: false,
+            kappa_cv: 1.0,
             arrival_intensity: 0.5,
             liquidity_gamma_mult: 1.0,
             calibrated_volume_rate: 1.0,
@@ -573,12 +581,15 @@ impl ParameterAggregator {
             sigma: est.sigma_clean(),
             sigma_total: est.sigma_total(),
             sigma_effective: est.sigma_effective(),
+            sigma_leverage_adjusted: est.sigma_leverage_adjusted(),
             volatility_regime: est.volatility_regime(),
 
             // === Order book / Liquidity ===
             kappa: est.kappa(),
             kappa_bid: est.kappa_bid(),
             kappa_ask: est.kappa_ask(),
+            is_heavy_tailed: est.is_heavy_tailed(),
+            kappa_cv: est.kappa_cv(),
             arrival_intensity,
             liquidity_gamma_mult: est.liquidity_gamma_multiplier(),
 

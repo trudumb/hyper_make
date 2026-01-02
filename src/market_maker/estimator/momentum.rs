@@ -91,7 +91,6 @@ impl MomentumDetector {
 /// Replaces heuristic knife scores with Bayesian probability estimates
 /// of momentum continuation.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct MomentumModel {
     /// Prior probability of momentum continuation
     prior_continuation: f64,
@@ -109,7 +108,6 @@ pub struct MomentumModel {
     alpha: f64,
 }
 
-#[allow(dead_code)]
 impl MomentumModel {
     /// Create a new momentum model.
     pub(crate) fn new(window_ms: u64, alpha: f64) -> Self {

@@ -320,4 +320,33 @@ impl KalmanPriceFilter {
         self.update_count = 0;
         self.last_observation = None;
     }
+
+    /// Set process noise Q from external volatility estimate.
+    ///
+    /// # Arguments
+    /// * `sigma` - Per-second volatility (e.g., from bipower variation)
+    /// * `dt_seconds` - Time step in seconds (typical: 0.5-2.0 for volume ticks)
+    ///
+    /// Scales Q as sigma^2 * dt to match actual market volatility.
+    /// This provides faster adaptation than learning Q from innovations.
+    pub fn set_process_noise_from_volatility(&mut self, sigma: f64, dt_seconds: f64) {
+        // Q = sigma^2 * dt for random walk with volatility sigma per second
+        let new_q = sigma.powi(2) * dt_seconds;
+
+        // Use faster adaptation during warmup, slower after
+        let alpha = if self.update_count < 20 { 0.3 } else { 0.05 };
+
+        self.q = alpha * new_q + (1.0 - alpha) * self.q;
+        self.q_estimate = self.q; // Keep estimate in sync
+    }
+
+    /// Get current process noise Q.
+    pub fn process_noise(&self) -> f64 {
+        self.q
+    }
+
+    /// Get observation noise R.
+    pub fn observation_noise(&self) -> f64 {
+        self.r
+    }
 }

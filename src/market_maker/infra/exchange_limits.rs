@@ -547,9 +547,9 @@ mod tests {
         assert_eq!(limits.max_short(), 1.5);
         assert_eq!(limits.available_buy(), 1.0); // 100000 / 100000 = 1.0
         assert_eq!(limits.available_sell(), 0.5); // 50000 / 100000 = 0.5
-        // Effective limits are min(local, max_pos, available)
-        // min(2.0, 1.5, 1.0) = 1.0 for bids
-        // min(2.0, 1.5, 0.5) = 0.5 for asks
+                                                  // Effective limits are min(local, max_pos, available)
+                                                  // min(2.0, 1.5, 1.0) = 1.0 for bids
+                                                  // min(2.0, 1.5, 0.5) = 0.5 for asks
         assert_eq!(limits.effective_bid_limit(), 1.0);
         assert_eq!(limits.effective_ask_limit(), 0.5);
     }

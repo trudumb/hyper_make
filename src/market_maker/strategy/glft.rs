@@ -270,15 +270,28 @@ impl QuotingStrategy for GLFTStrategy {
         // When informed flow is selling, our bids get hit → lower κ_bid → wider bid spread
         // When informed flow is buying, our asks get lifted → lower κ_ask → wider ask spread
         //
+        // Fix 3: Heavy-tail adjustment - when CV > 1.2, large fills are more likely
+        // than exponential model predicts. Reduce kappa by (2-CV) to widen spreads.
+        //
         // Example: α = 0.5 → kappa halves → spread widens by ~30%
         let alpha = market_params.predicted_alpha.min(0.5); // Cap at 50% AS
 
+        // Heavy-tail adjustment: when CV > 1.2, reduce kappa
+        // This accounts for fat-tailed fill distance distributions
+        let tail_multiplier = if market_params.is_heavy_tailed {
+            // CV > 1.2 means heavy tail - reduce kappa (widen spread)
+            // At CV=2.0, multiplier = 0.5 (halve kappa)
+            (2.0 - market_params.kappa_cv).clamp(0.5, 1.0)
+        } else {
+            1.0
+        };
+
         // Symmetric kappa (for skew and logging)
-        let kappa = market_params.kappa * (1.0 - alpha);
+        let kappa = market_params.kappa * (1.0 - alpha) * tail_multiplier;
 
         // Directional kappas for asymmetric GLFT spreads
-        let kappa_bid = market_params.kappa_bid * (1.0 - alpha);
-        let kappa_ask = market_params.kappa_ask * (1.0 - alpha);
+        let kappa_bid = market_params.kappa_bid * (1.0 - alpha) * tail_multiplier;
+        let kappa_ask = market_params.kappa_ask * (1.0 - alpha) * tail_multiplier;
 
         // Time horizon from arrival intensity: T = 1/λ (with max cap)
         let time_horizon = self.holding_time(market_params.arrival_intensity);
@@ -380,9 +393,12 @@ impl QuotingStrategy for GLFTStrategy {
         half_spread_ask = half_spread_ask.max(self.risk_config.min_spread_floor);
         half_spread = half_spread.max(self.risk_config.min_spread_floor);
 
-        // === 3. USE SIGMA_EFFECTIVE FOR INVENTORY SKEW ===
-        // sigma_effective blends clean and total based on jump regime
-        let sigma_for_skew = market_params.sigma_effective;
+        // === 3. USE LEVERAGE-ADJUSTED SIGMA FOR INVENTORY SKEW ===
+        // sigma_leverage_adjusted incorporates:
+        // - sigma_effective (blended clean/total based on jump regime)
+        // - Leverage effect: wider during down moves when ρ < 0
+        // This provides asymmetric risk management in falling markets
+        let sigma_for_skew = market_params.sigma_leverage_adjusted;
 
         // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
         let inventory_ratio = if effective_max_position > EPSILON {
@@ -543,6 +559,8 @@ impl QuotingStrategy for GLFTStrategy {
             kappa = %format!("{:.0}", kappa),
             kappa_bid = %format!("{:.0}", kappa_bid),
             kappa_ask = %format!("{:.0}", kappa_ask),
+            kappa_cv = %format!("{:.2}", market_params.kappa_cv),
+            tail_mult = %format!("{:.2}", tail_multiplier),
             time_horizon = %format!("{:.2}", time_horizon),
             half_spread_bps = %format!("{:.1}", half_spread * 10000.0),
             half_spread_bid_bps = %format!("{:.1}", half_spread_bid * 10000.0),
@@ -558,9 +576,11 @@ impl QuotingStrategy for GLFTStrategy {
             hawkes_activity = %format!("{:.2}", market_params.hawkes_activity_percentile),
             funding_rate = %format!("{:.4}", market_params.funding_rate),
             microprice = %format!("{:.4}", fair_price),
+            sigma_lev = %format!("{:.6}", sigma_for_skew),
             bid_delta_bps = %format!("{:.1}", bid_delta * 10000.0),
             ask_delta_bps = %format!("{:.1}", ask_delta * 10000.0),
             is_toxic = market_params.is_toxic_regime,
+            heavy_tail = market_params.is_heavy_tailed,
             "GLFT spread components with asymmetric kappa"
         );
 
@@ -596,8 +616,12 @@ impl QuotingStrategy for GLFTStrategy {
         );
 
         // Calculate sizes based on position limits (using first-principles dynamic limit)
-        let buy_size_raw = (effective_max_position - position).min(target_liquidity).max(0.0);
-        let sell_size_raw = (effective_max_position + position).min(target_liquidity).max(0.0);
+        let buy_size_raw = (effective_max_position - position)
+            .min(target_liquidity)
+            .max(0.0);
+        let sell_size_raw = (effective_max_position + position)
+            .min(target_liquidity)
+            .max(0.0);
 
         // === Apply cascade size reduction for graceful degradation ===
         // During moderate cascade (before quote pulling), reduce size gradually

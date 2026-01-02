@@ -553,6 +553,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.infra.connection_health.time_since_last_data().as_millis() as u64
                     );
 
+                    // Update supervisor statistics for Prometheus
+                    let supervisor_stats = self.infra.connection_supervisor.stats();
+                    self.infra.prometheus.update_supervisor_stats(
+                        supervisor_stats.consecutive_stale_count,
+                        supervisor_stats.reconnect_signal_count,
+                    );
+
+                    // Check if supervisor recommends reconnection
+                    if self.infra.connection_supervisor.is_reconnect_recommended() {
+                        warn!(
+                            time_since_market_data_secs = supervisor_stats.time_since_market_data.as_secs_f64(),
+                            connection_state = %supervisor_stats.connection_state,
+                            "Connection supervisor recommends reconnection"
+                        );
+                    }
+
                     // === Update P&L inventory snapshot for carry calculation ===
                     if self.latest_mid > 0.0 {
                         self.tier2.pnl_tracker.record_inventory_snapshot(self.latest_mid);
@@ -615,6 +631,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let mut state = messages::AllMidsState {
             estimator: &mut self.estimator,
             connection_health: &mut self.infra.connection_health,
+            connection_supervisor: &self.infra.connection_supervisor,
             adverse_selection: &mut self.tier1.adverse_selection,
             depth_decay_as: &mut self.tier1.depth_decay_as,
             liquidation_detector: &mut self.tier1.liquidation_detector,
@@ -707,7 +724,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Record fill observations to the strategy for Bayesian learning
         // These observations update the fill probability model
         for obs in &result.fill_observations {
-            self.strategy.record_fill_observation(obs.depth_bps, obs.filled);
+            self.strategy
+                .record_fill_observation(obs.depth_bps, obs.filled);
         }
         if !result.fill_observations.is_empty() {
             debug!(
@@ -880,10 +898,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Update fill model params for Bayesian fill probability
         // Uses Kelly time horizon (τ) which is computed in ParameterAggregator
-        self.strategy.update_fill_model_params(
-            market_params.sigma,
-            market_params.kelly_time_horizon,
-        );
+        self.strategy
+            .update_fill_model_params(market_params.sigma, market_params.kelly_time_horizon);
 
         // Try multi-level ladder quoting first
         let ladder = self.strategy.calculate_ladder(
@@ -927,9 +943,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // If escalation is needed, the recovery manager should be notified
             // (This happens automatically via rate limiter when orders get rejected)
             if reduce_only_result.needs_escalation {
-                debug!(
-                    "Reduce-only mode activated with potential escalation"
-                );
+                debug!("Reduce-only mode activated with potential escalation");
             }
 
             debug!(
@@ -1080,7 +1094,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // This teaches the model that orders at this depth did NOT fill
                 if let Some(price) = order_price {
                     if self.latest_mid > 0.0 {
-                        let depth_bps = ((price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
+                        let depth_bps =
+                            ((price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
                         self.strategy.record_fill_observation(depth_bps, false);
                         debug!(
                             oid = oid,
@@ -1352,9 +1367,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Record API call for rate limit tracking
             // Bulk order: 1 IP weight, n address requests
-            self.infra
-                .proactive_rate_tracker
-                .record_call(1, num_orders);
+            self.infra.proactive_rate_tracker.record_call(1, num_orders);
 
             // Finalize pending orders with real OIDs (using CLOID for deterministic matching)
             for (i, result) in results.iter().enumerate() {
@@ -1469,8 +1482,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.orders
                             .finalize_pending_by_cloid(c, result.oid, result.resting_size);
                     } else {
-                        self.orders
-                            .finalize_pending(side, spec.price, result.oid, result.resting_size);
+                        self.orders.finalize_pending(
+                            side,
+                            spec.price,
+                            result.oid,
+                            result.resting_size,
+                        );
                     }
 
                     // Initialize queue tracking for this order
@@ -1545,8 +1562,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         bid_quotes: Vec<Quote>,
         ask_quotes: Vec<Quote>,
     ) -> Result<()> {
-        use crate::market_maker::tracking::{reconcile_side_smart, ReconcileConfig};
         use crate::market_maker::quoting::LadderLevel;
+        use crate::market_maker::tracking::{reconcile_side_smart, ReconcileConfig};
 
         let reconcile_config = ReconcileConfig::default();
 
@@ -1574,23 +1591,32 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
 
         // Generate actions for each side using smart reconciliation
-        let bid_actions = reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, &reconcile_config);
-        let ask_actions = reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, &reconcile_config);
+        let bid_actions =
+            reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, &reconcile_config);
+        let ask_actions =
+            reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, &reconcile_config);
 
         // Partition actions by type for batching
-        let (bid_cancels, bid_modifies, bid_places) = partition_ladder_actions(&bid_actions, Side::Buy);
-        let (ask_cancels, ask_modifies, ask_places) = partition_ladder_actions(&ask_actions, Side::Sell);
+        let (bid_cancels, bid_modifies, bid_places) =
+            partition_ladder_actions(&bid_actions, Side::Buy);
+        let (ask_cancels, ask_modifies, ask_places) =
+            partition_ladder_actions(&ask_actions, Side::Sell);
 
         // Log action summary (skip count only considers existing orders minus those modified/cancelled)
-        let _total_skips = (current_bids.len() + current_asks.len())
-            .saturating_sub(bid_cancels.len() + bid_modifies.len() + ask_cancels.len() + ask_modifies.len());
+        let _total_skips = (current_bids.len() + current_asks.len()).saturating_sub(
+            bid_cancels.len() + bid_modifies.len() + ask_cancels.len() + ask_modifies.len(),
+        );
         if !bid_actions.is_empty() || !ask_actions.is_empty() {
             debug!(
-                bid_skip = current_bids.len().saturating_sub(bid_cancels.len() + bid_modifies.len()),
+                bid_skip = current_bids
+                    .len()
+                    .saturating_sub(bid_cancels.len() + bid_modifies.len()),
                 bid_modify = bid_modifies.len(),
                 bid_cancel = bid_cancels.len(),
                 bid_place = bid_places.len(),
-                ask_skip = current_asks.len().saturating_sub(ask_cancels.len() + ask_modifies.len()),
+                ask_skip = current_asks
+                    .len()
+                    .saturating_sub(ask_cancels.len() + ask_modifies.len()),
                 ask_modify = ask_modifies.len(),
                 ask_cancel = ask_cancels.len(),
                 ask_place = ask_places.len(),
@@ -1614,14 +1640,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .await;
 
             // Record API call for rate tracking
-            self.infra.proactive_rate_tracker.record_call(1, num_modifies);
+            self.infra
+                .proactive_rate_tracker
+                .record_call(1, num_modifies);
 
             // Process modify results
             for (i, result) in modify_results.iter().enumerate() {
                 let spec = &all_modifies[i];
                 if result.success {
                     // Update tracking with new price/size
-                    self.orders.on_modify_success(spec.oid, spec.new_price, spec.new_size);
+                    self.orders
+                        .on_modify_success(spec.oid, spec.new_price, spec.new_size);
                     // Record successful modify in metrics
                     self.infra.prometheus.record_order_modified();
                 } else {
@@ -1634,22 +1663,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // Record fallback in metrics
                     self.infra.prometheus.record_modify_fallback();
                     // Cancel the order (may already be gone)
-                    let _ = self.executor.cancel_order(&self.config.asset, spec.oid).await;
+                    let _ = self
+                        .executor
+                        .cancel_order(&self.config.asset, spec.oid)
+                        .await;
 
                     // Place new order at target price/size
                     let cloid = uuid::Uuid::new_v4().to_string();
-                    let order_spec = OrderSpec::with_cloid(
-                        spec.new_price,
-                        spec.new_size,
-                        spec.is_buy,
-                        cloid,
-                    );
-                    let _ = self.executor.place_order(
-                        &self.config.asset,
-                        order_spec.price,
-                        order_spec.size,
-                        order_spec.is_buy,
-                    ).await;
+                    let order_spec =
+                        OrderSpec::with_cloid(spec.new_price, spec.new_size, spec.is_buy, cloid);
+                    let _ = self
+                        .executor
+                        .place_order(
+                            &self.config.asset,
+                            order_spec.price,
+                            order_spec.size,
+                            order_spec.is_buy,
+                        )
+                        .await;
                 }
             }
         }
@@ -1659,7 +1690,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
         }
         if !ask_places.is_empty() {
-            self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+            self.place_bulk_ladder_orders(Side::Sell, ask_places)
+                .await?;
         }
 
         Ok(())
@@ -1680,22 +1712,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
 
             // Apply margin check
-            let sizing_result = self.infra.margin_sizer.adjust_size(
-                size,
-                price,
-                self.position.position(),
-                is_buy,
-            );
+            let sizing_result =
+                self.infra
+                    .margin_sizer
+                    .adjust_size(size, price, self.position.position(), is_buy);
 
             if sizing_result.adjusted_size <= 0.0 {
                 continue;
             }
 
-            let truncated_size = truncate_float(
-                sizing_result.adjusted_size,
-                self.config.sz_decimals,
-                false,
-            );
+            let truncated_size =
+                truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, false);
             if truncated_size <= 0.0 {
                 continue;
             }
@@ -1711,13 +1738,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Pre-register as pending
         for spec in &order_specs {
             if let Some(ref cloid) = spec.cloid {
-                self.orders.add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+                self.orders
+                    .add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
             }
         }
 
         // Place orders
         let num_orders = order_specs.len() as u32;
-        let results = self.executor.place_bulk_orders(&self.config.asset, order_specs.clone()).await;
+        let results = self
+            .executor
+            .place_bulk_orders(&self.config.asset, order_specs.clone())
+            .await;
 
         // Record API call
         self.infra.proactive_rate_tracker.record_call(1, num_orders);
@@ -1760,7 +1791,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // which is called from the order placement results loop
                 Ok(None)
             }
-            RecoveryState::ReduceOnlyStuck { is_buy_side, consecutive_rejections, .. } => {
+            RecoveryState::ReduceOnlyStuck {
+                is_buy_side,
+                consecutive_rejections,
+                ..
+            } => {
                 // Already in stuck state - waiting for rejections to hit threshold
                 // The record_rejection() method will transition to IocRecovery when threshold is hit
                 debug!(
@@ -1769,11 +1804,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     threshold = self.infra.recovery_manager.config().rejection_threshold,
                     "In reduce-only-stuck state, waiting for threshold"
                 );
-                Ok(None)  // Continue normal quoting until we hit threshold
+                Ok(None) // Continue normal quoting until we hit threshold
             }
-            RecoveryState::IocRecovery { is_buy_side, attempts, .. } => {
+            RecoveryState::IocRecovery {
+                is_buy_side,
+                attempts,
+                ..
+            } => {
                 // Check if we should send an IOC
-                if let Some((ioc_is_buy, slippage_bps)) = self.infra.recovery_manager.should_send_ioc() {
+                if let Some((ioc_is_buy, slippage_bps)) =
+                    self.infra.recovery_manager.should_send_ioc()
+                {
                     // Attempt IOC order to reduce position
                     let position = self.position.position();
                     let min_size = self.infra.recovery_manager.config().min_ioc_size;

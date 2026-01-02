@@ -75,7 +75,6 @@ pub struct RiskConfig {
     //   - 06:00-08:00 UTC (London open): High informed flow
     //   - 14:00-15:00 UTC (US afternoon): Institutional activity
     // During these hours, wider spreads are needed to remain profitable.
-
     /// Enable time-of-day gamma scaling.
     /// When true, γ is multiplied during toxic hours.
     pub enable_time_of_day_scaling: bool,
@@ -93,7 +92,7 @@ pub struct RiskConfig {
 }
 
 fn default_toxic_hours() -> Vec<u32> {
-    vec![6, 7, 14]  // London open (06-08) and US afternoon (14-15)
+    vec![6, 7, 14] // London open (06-08) and US afternoon (14-15)
 }
 
 impl RiskConfig {
@@ -147,9 +146,9 @@ impl Default for RiskConfig {
             //   - Need 11.67 bps for break-even
             // Setting to 8 bps = fees (1.5) + AS (0.5) + buffer (6) for base profitability
             min_spread_floor: 0.0008, // 8 bps (raised from 5 bps)
-            max_holding_time: 120.0,   // 2 minutes
-            flow_sensitivity: 0.5,     // exp(-0.5) ≈ 0.61 at perfect alignment
-            maker_fee_rate: 0.00015,   // 1.5 bps Hyperliquid maker fee
+            max_holding_time: 120.0,  // 2 minutes
+            flow_sensitivity: 0.5,    // exp(-0.5) ≈ 0.61 at perfect alignment
+            maker_fee_rate: 0.00015,  // 1.5 bps Hyperliquid maker fee
             // Time-of-day scaling: ENABLED by default for profitability
             // Trade history showed -13 to -15 bps edge during toxic hours
             enable_time_of_day_scaling: true,

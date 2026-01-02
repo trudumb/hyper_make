@@ -187,11 +187,8 @@ pub fn init_logging(
         std::fs::create_dir_all(&config.log_dir)?;
 
         // Operational log (INFO+, all components)
-        let operational_appender = RollingFileAppender::new(
-            Rotation::DAILY,
-            &config.log_dir,
-            "mm-operational.log",
-        );
+        let operational_appender =
+            RollingFileAppender::new(Rotation::DAILY, &config.log_dir, "mm-operational.log");
         let (operational_writer, guard1) = tracing_appender::non_blocking(operational_appender);
         guards.push(guard1);
 
@@ -206,11 +203,8 @@ pub fn init_logging(
             .with_filter(operational_filter);
 
         // Diagnostic log (DEBUG+, estimator/tracking/fills components)
-        let diagnostic_appender = RollingFileAppender::new(
-            Rotation::DAILY,
-            &config.log_dir,
-            "mm-diagnostic.log",
-        );
+        let diagnostic_appender =
+            RollingFileAppender::new(Rotation::DAILY, &config.log_dir, "mm-diagnostic.log");
         let (diagnostic_writer, guard2) = tracing_appender::non_blocking(diagnostic_appender);
         guards.push(guard2);
 
@@ -229,11 +223,8 @@ pub fn init_logging(
             .with_filter(diagnostic_filter);
 
         // Error log (WARN+, all components)
-        let error_appender = RollingFileAppender::new(
-            Rotation::DAILY,
-            &config.log_dir,
-            "mm-errors.log",
-        );
+        let error_appender =
+            RollingFileAppender::new(Rotation::DAILY, &config.log_dir, "mm-errors.log");
         let (error_writer, guard3) = tracing_appender::non_blocking(error_appender);
         guards.push(guard3);
 
@@ -281,20 +272,14 @@ pub fn init_logging(
                 .init();
         }
 
-        eprintln!(
-            "Multi-stream logging enabled: {}",
-            config.log_dir.display()
-        );
+        eprintln!("Multi-stream logging enabled: {}", config.log_dir.display());
     } else if let Some(ref log_file) = config.log_file {
         // Single file mode (legacy) - always use JSON for both file and stdout
         // This ensures type compatibility between layers
         let file = std::fs::File::create(log_file)?;
         let file = std::sync::Mutex::new(file);
 
-        let file_layer = fmt::layer()
-            .with_writer(file)
-            .with_ansi(false)
-            .json();
+        let file_layer = fmt::layer().with_writer(file).with_ansi(false).json();
 
         let stdout_layer = fmt::layer().json();
 

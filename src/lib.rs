@@ -29,6 +29,9 @@ pub use helpers::{bps_diff, round_to_significant_and_decimal, truncate_float, Ba
 pub use info::info_client::*;
 pub use info::response_structs::*;
 pub use market_maker::{
+    // Phase 6: Structured Logging
+    init_logging,
+    targets as log_targets,
     // Tier 1: Adverse Selection
     AdverseSelectionConfig,
     AdverseSelectionEstimator,
@@ -74,6 +77,8 @@ pub use market_maker::{
     LiquidationCascadeDetector,
     LiquidationConfig,
     LiquidationSummary,
+    LogConfig,
+    LogFormat,
     // Production: Margin-Aware Sizing
     MarginAwareSizer,
     MarginConfig,
@@ -98,6 +103,8 @@ pub use market_maker::{
     PnLConfig,
     PnLSummary,
     PnLTracker,
+    // Phase 4: Position Reconciliation
+    PositionReconciler,
     PositionTracker,
     PrometheusMetrics,
     // Tier 1: Queue Position
@@ -107,7 +114,16 @@ pub use market_maker::{
     Quote,
     QuoteConfig,
     QuotingStrategy,
+    ReconciliationConfig,
+    ReconciliationTrigger,
     ReconnectionConfig,
+    // Phase 3: Recovery Manager
+    RecoveryConfig,
+    RecoveryManager,
+    RecoveryState,
+    RejectionRateLimitConfig,
+    // Phase 5: Rejection Rate Limiting
+    RejectionRateLimiter,
     RiskConfig,
     Side,
     SizingResult,
@@ -122,22 +138,6 @@ pub use market_maker::{
     TrackedOrder,
     // Volatility Regime
     VolatilityRegime,
-    // Phase 3: Recovery Manager
-    RecoveryConfig,
-    RecoveryManager,
-    RecoveryState,
-    // Phase 4: Position Reconciliation
-    PositionReconciler,
-    ReconciliationConfig,
-    ReconciliationTrigger,
-    // Phase 5: Rejection Rate Limiting
-    RejectionRateLimiter,
-    RejectionRateLimitConfig,
-    // Phase 6: Structured Logging
-    init_logging,
-    LogConfig,
-    LogFormat,
-    targets as log_targets,
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use serde_utils::hyperliquid_chain;

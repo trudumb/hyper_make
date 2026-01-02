@@ -360,13 +360,12 @@ mod tests {
 
     #[test]
     fn test_with_pending_exposure() {
-        let state = RiskState::default()
-            .with_pending_exposure(1.0, 0.5);
+        let state = RiskState::default().with_pending_exposure(1.0, 0.5);
 
         assert!((state.pending_bid_exposure - 1.0).abs() < f64::EPSILON);
         assert!((state.pending_ask_exposure - 0.5).abs() < f64::EPSILON);
         assert!((state.net_pending_change - 0.5).abs() < f64::EPSILON); // 1.0 - 0.5
-        // Default position is 0, so worst case:
+                                                                        // Default position is 0, so worst case:
         assert!((state.worst_case_max_position - 1.0).abs() < f64::EPSILON); // 0 + 1.0
         assert!((state.worst_case_min_position - (-0.5)).abs() < f64::EPSILON); // 0 - 0.5
     }
@@ -386,7 +385,8 @@ mod tests {
             position: 0.5,
             max_position: 1.0,
             ..Default::default()
-        }.with_pending_exposure(0.6, 0.2); // 0.5 + 0.6 = 1.1 > 1.0
+        }
+        .with_pending_exposure(0.6, 0.2); // 0.5 + 0.6 = 1.1 > 1.0
         assert!(state.worst_case_exceeds_long_limit());
     }
 
@@ -396,7 +396,8 @@ mod tests {
             position: -0.5,
             max_position: 1.0,
             ..Default::default()
-        }.with_pending_exposure(0.2, 0.6); // -0.5 - 0.6 = -1.1 < -1.0
+        }
+        .with_pending_exposure(0.2, 0.6); // -0.5 - 0.6 = -1.1 < -1.0
         assert!(state.worst_case_exceeds_short_limit());
     }
 
@@ -406,7 +407,8 @@ mod tests {
             position: 0.5,
             mid_price: 100.0,
             ..Default::default()
-        }.with_pending_exposure(1.0, 0.5);
+        }
+        .with_pending_exposure(1.0, 0.5);
 
         // worst_case_max_position = 0.5 + 1.0 = 1.5
         // worst_case_min_position = 0.5 - 0.5 = 0.0
@@ -418,18 +420,15 @@ mod tests {
     #[test]
     fn test_is_book_balanced() {
         // Balanced book (within 10%)
-        let state = RiskState::default()
-            .with_pending_exposure(1.0, 0.95);
+        let state = RiskState::default().with_pending_exposure(1.0, 0.95);
         assert!(state.is_book_balanced()); // net = 0.05, total = 1.95, ratio = 2.5% < 10%
 
         // Unbalanced book
-        let state = RiskState::default()
-            .with_pending_exposure(1.0, 0.5);
+        let state = RiskState::default().with_pending_exposure(1.0, 0.5);
         assert!(!state.is_book_balanced()); // net = 0.5, total = 1.5, ratio = 33% > 10%
 
         // Empty book is balanced
-        let state = RiskState::default()
-            .with_pending_exposure(0.0, 0.0);
+        let state = RiskState::default().with_pending_exposure(0.0, 0.0);
         assert!(state.is_book_balanced());
     }
 }

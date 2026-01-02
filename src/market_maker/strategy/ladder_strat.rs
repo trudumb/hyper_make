@@ -273,7 +273,8 @@ impl LadderStrategy {
         let effective_max_position = market_params.effective_max_position(max_position);
 
         // Log when using dynamic limit
-        if market_params.dynamic_limit_valid && (effective_max_position - max_position).abs() > EPSILON
+        if market_params.dynamic_limit_valid
+            && (effective_max_position - max_position).abs() > EPSILON
         {
             tracing::debug!(
                 static_limit = %format!("{:.6}", max_position),
@@ -344,7 +345,10 @@ impl LadderStrategy {
         );
 
         // Create ladder config with dynamic depths
-        let ladder_config = self.ladder_config.clone().with_dynamic_depths(dynamic_depths);
+        let ladder_config = self
+            .ladder_config
+            .clone()
+            .with_dynamic_depths(dynamic_depths);
 
         debug!(
             gamma = %format!("{:.3}", gamma),
@@ -507,11 +511,8 @@ impl LadderStrategy {
                         tau_for_fill,
                         params.kappa,
                     );
-                    let spread_capture = spread_capture_at_depth(
-                        level.depth_bps,
-                        &params,
-                        ladder_config.fees_bps,
-                    );
+                    let spread_capture =
+                        spread_capture_at_depth(level.depth_bps, &params, ladder_config.fees_bps);
                     let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
                     LevelOptimizationParams {
                         depth_bps: level.depth_bps,
@@ -582,11 +583,8 @@ impl LadderStrategy {
                         tau_for_fill,
                         params.kappa,
                     );
-                    let spread_capture = spread_capture_at_depth(
-                        level.depth_bps,
-                        &params,
-                        ladder_config.fees_bps,
-                    );
+                    let spread_capture =
+                        spread_capture_at_depth(level.depth_bps, &params, ladder_config.fees_bps);
                     let adverse_selection = adverse_selection_at_depth(level.depth_bps, &params);
                     LevelOptimizationParams {
                         depth_bps: level.depth_bps,

@@ -23,12 +23,31 @@ struct PendingFill {
     size: f64,
     /// True if this was a buy fill (we got lifted on our ask)
     is_buy: bool,
+    /// Horizons already measured (to avoid double-counting)
+    horizons_measured: [bool; 3],
+}
+
+/// Multi-horizon AS measurement horizons (milliseconds)
+const HORIZONS_MS: [u64; 3] = [500, 1000, 2000];
+
+/// Tracks AS statistics for a single horizon
+#[derive(Debug, Clone, Default)]
+struct HorizonStats {
+    /// EWMA of AS magnitude
+    as_ewma: f64,
+    /// EWMA of AS variance (for stability scoring)
+    as_var_ewma: f64,
+    /// Count of measurements
+    count: usize,
 }
 
 /// Estimates adverse selection costs from fill data.
 ///
 /// Measures ground truth E[Δp | fill] by tracking price movement after fills,
 /// and provides spread adjustment recommendations.
+///
+/// Features multi-horizon measurement (500ms, 1000ms, 2000ms) with automatic
+/// horizon selection based on estimate stability.
 #[derive(Debug)]
 pub struct AdverseSelectionEstimator {
     config: AdverseSelectionConfig,
@@ -36,7 +55,7 @@ pub struct AdverseSelectionEstimator {
     /// Fills waiting for price resolution
     pending_fills: VecDeque<PendingFill>,
 
-    /// Total fills measured (after resolution)
+    /// Total fills measured (after resolution at primary horizon)
     fills_measured: usize,
 
     // === Realized AS Tracking (EWMA) ===
@@ -56,6 +75,13 @@ pub struct AdverseSelectionEstimator {
 
     /// Count of sell fills measured
     sell_fills_measured: usize,
+
+    // === Multi-Horizon AS Tracking ===
+    /// Stats for each horizon (500ms, 1000ms, 2000ms)
+    horizon_stats: [HorizonStats; 3],
+
+    /// Index of currently selected best horizon (0, 1, or 2)
+    best_horizon_idx: usize,
 
     // === Signal Cache for Alpha Prediction ===
     /// Latest volatility surprise (realized_vol / expected_vol - 1.0)
@@ -80,6 +106,8 @@ impl AdverseSelectionEstimator {
             realized_as_total: 0.0,
             buy_fills_measured: 0,
             sell_fills_measured: 0,
+            horizon_stats: Default::default(),
+            best_horizon_idx: 1, // Default to 1000ms (middle horizon)
             cached_vol_surprise: 0.0,
             cached_flow_magnitude: 0.0,
             cached_jump_ratio: 1.0,
@@ -106,6 +134,7 @@ impl AdverseSelectionEstimator {
             fill_mid: current_mid,
             size,
             is_buy,
+            horizons_measured: [false; 3],
         });
 
         debug!(
@@ -121,71 +150,126 @@ impl AdverseSelectionEstimator {
     /// Update estimator with current mid price.
     ///
     /// Call this on each mid price update to resolve pending fills
-    /// whose measurement horizon has elapsed.
+    /// at multiple horizons (500ms, 1000ms, 2000ms).
     pub fn update(&mut self, current_mid: f64) {
         let now = Instant::now();
-        let horizon = Duration::from_millis(self.config.measurement_horizon_ms);
+        let alpha = self.config.ewma_alpha;
+        let _best_horizon_idx = self.best_horizon_idx;
 
-        // Process all pending fills whose horizon has elapsed
-        while let Some(front) = self.pending_fills.front() {
-            if now.duration_since(front.fill_time) < horizon {
-                break; // Not ready yet
+        // Collect measurements to process (avoid borrow issues)
+        let mut measurements: Vec<(usize, f64, bool)> = Vec::new(); // (horizon_idx, signed_as, is_buy)
+        let mut fills_to_remove = Vec::new();
+
+        // First pass: measure at each horizon
+        for (fill_idx, fill) in self.pending_fills.iter_mut().enumerate() {
+            let elapsed = now.duration_since(fill.fill_time);
+
+            for (horizon_idx, &horizon_ms) in HORIZONS_MS.iter().enumerate() {
+                if fill.horizons_measured[horizon_idx] {
+                    continue; // Already measured at this horizon
+                }
+
+                if elapsed >= Duration::from_millis(horizon_ms) {
+                    // Measure AS at this horizon
+                    let price_change = (current_mid - fill.fill_mid) / fill.fill_mid;
+                    let signed_as = if fill.is_buy {
+                        -price_change // We bought, price going DOWN is adverse
+                    } else {
+                        price_change // We sold, price going UP is adverse
+                    };
+
+                    fill.horizons_measured[horizon_idx] = true;
+
+                    // Collect for later processing - use first horizon (500ms) for legacy stats
+                    // to maintain backward compatibility with fills_measured counter
+                    if horizon_idx == 0 {
+                        measurements.push((fill.tid as usize, signed_as, fill.is_buy));
+                    }
+
+                    // Update horizon stats inline (these are separate from self borrow)
+                    let stats = &mut self.horizon_stats[horizon_idx];
+                    let prev_as = stats.as_ewma;
+                    stats.as_ewma = alpha * signed_as.abs() + (1.0 - alpha) * stats.as_ewma;
+                    let deviation = (signed_as.abs() - prev_as).powi(2);
+                    stats.as_var_ewma = alpha * deviation + (1.0 - alpha) * stats.as_var_ewma;
+                    stats.count += 1;
+                }
             }
 
-            let fill = self.pending_fills.pop_front().unwrap();
-            self.measure_fill_impact(&fill, current_mid);
+            // Check if all horizons measured
+            if fill.horizons_measured.iter().all(|&m| m) {
+                fills_to_remove.push(fill_idx);
+            }
+        }
+
+        // Remove fully measured fills (in reverse order to preserve indices)
+        for idx in fills_to_remove.into_iter().rev() {
+            self.pending_fills.remove(idx);
+        }
+
+        // Second pass: update legacy stats from collected measurements
+        for (_tid, signed_as, is_buy) in measurements {
+            if is_buy {
+                self.realized_as_buy = alpha * signed_as + (1.0 - alpha) * self.realized_as_buy;
+                self.buy_fills_measured += 1;
+            } else {
+                self.realized_as_sell = alpha * signed_as + (1.0 - alpha) * self.realized_as_sell;
+                self.sell_fills_measured += 1;
+            }
+            self.realized_as_total =
+                alpha * signed_as.abs() + (1.0 - alpha) * self.realized_as_total;
+            self.fills_measured += 1;
+        }
+
+        // Periodically update best horizon selection
+        self.update_best_horizon();
+    }
+
+    /// Update best horizon selection based on variance (stability).
+    fn update_best_horizon(&mut self) {
+        // Need at least 20 measurements per horizon before comparing
+        let min_count = 20;
+        if self.horizon_stats.iter().any(|s| s.count < min_count) {
+            return;
+        }
+
+        // Find horizon with lowest variance (most stable)
+        let best_idx = self
+            .horizon_stats
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.as_var_ewma
+                    .partial_cmp(&b.as_var_ewma)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(1);
+
+        if best_idx != self.best_horizon_idx {
+            debug!(
+                prev_horizon_ms = HORIZONS_MS[self.best_horizon_idx],
+                new_horizon_ms = HORIZONS_MS[best_idx],
+                variance_prev = %format!("{:.6}", self.horizon_stats[self.best_horizon_idx].as_var_ewma),
+                variance_new = %format!("{:.6}", self.horizon_stats[best_idx].as_var_ewma),
+                "AS: Switching to more stable horizon"
+            );
+            self.best_horizon_idx = best_idx;
         }
     }
 
-    /// Measure the adverse selection impact of a resolved fill.
-    fn measure_fill_impact(&mut self, fill: &PendingFill, current_mid: f64) {
-        // Calculate price change (as fraction of fill price)
-        let price_change = (current_mid - fill.fill_mid) / fill.fill_mid;
+    /// Get the currently selected measurement horizon in milliseconds.
+    pub fn current_horizon_ms(&self) -> u64 {
+        HORIZONS_MS[self.best_horizon_idx]
+    }
 
-        // Adverse selection from the MM's perspective:
-        // - If we got LIFTED (sold to aggressor = is_buy=true for our fill):
-        //   Price going UP after = adverse (we sold too cheap)
-        // - If we got HIT (bought from aggressor = is_buy=false for our fill):
-        //   Price going DOWN after = adverse (we bought too expensive)
-        //
-        // Note: is_buy from the fill perspective means WE bought (got filled on our bid)
-        // So for AS: if is_buy=true and price goes DOWN, that's adverse for us
-        //           if is_buy=false and price goes UP, that's adverse for us
-
-        let signed_as = if fill.is_buy {
-            // We bought (bid got hit), price going DOWN is adverse for us
-            -price_change // Positive AS if price dropped
-        } else {
-            // We sold (ask got lifted), price going UP is adverse for us
-            price_change // Positive AS if price rose
-        };
-
-        // Update EWMA
-        let alpha = self.config.ewma_alpha;
-
-        if fill.is_buy {
-            self.realized_as_buy = alpha * signed_as + (1.0 - alpha) * self.realized_as_buy;
-            self.buy_fills_measured += 1;
-        } else {
-            self.realized_as_sell = alpha * signed_as + (1.0 - alpha) * self.realized_as_sell;
-            self.sell_fills_measured += 1;
-        }
-
-        // Total AS (magnitude)
-        self.realized_as_total = alpha * signed_as.abs() + (1.0 - alpha) * self.realized_as_total;
-        self.fills_measured += 1;
-
-        debug!(
-            tid = fill.tid,
-            is_buy = fill.is_buy,
-            fill_mid = fill.fill_mid,
-            current_mid = current_mid,
-            price_change_bps = price_change * 10000.0,
-            signed_as_bps = signed_as * 10000.0,
-            realized_as_total_bps = self.realized_as_total * 10000.0,
-            fills = self.fills_measured,
-            "AS: Measured fill impact"
-        );
+    /// Get AS estimates at all horizons (for diagnostics).
+    pub fn horizon_as_bps(&self) -> [(u64, f64); 3] {
+        [
+            (HORIZONS_MS[0], self.horizon_stats[0].as_ewma * 10000.0),
+            (HORIZONS_MS[1], self.horizon_stats[1].as_ewma * 10000.0),
+            (HORIZONS_MS[2], self.horizon_stats[2].as_ewma * 10000.0),
+        ]
     }
 
     /// Update signal cache for alpha prediction.
@@ -333,6 +417,35 @@ impl AdverseSelectionEstimator {
             predicted_alpha: self.predicted_alpha(),
         }
     }
+
+    // ========================================================================
+    // Multi-Horizon AS Accessors
+    // ========================================================================
+
+    /// Get AS at 500ms horizon (in bps).
+    pub fn as_500ms_bps(&self) -> f64 {
+        self.horizon_stats[0].as_ewma * 10000.0
+    }
+
+    /// Get AS at 1000ms horizon (in bps).
+    pub fn as_1000ms_bps(&self) -> f64 {
+        self.horizon_stats[1].as_ewma * 10000.0
+    }
+
+    /// Get AS at 2000ms horizon (in bps).
+    pub fn as_2000ms_bps(&self) -> f64 {
+        self.horizon_stats[2].as_ewma * 10000.0
+    }
+
+    /// Get current best horizon in milliseconds.
+    pub fn best_horizon_ms(&self) -> u64 {
+        HORIZONS_MS[self.best_horizon_idx]
+    }
+
+    /// Get AS at the currently selected best horizon (in bps).
+    pub fn best_horizon_as_bps(&self) -> f64 {
+        self.horizon_stats[self.best_horizon_idx].as_ewma * 10000.0
+    }
 }
 
 /// Summary of adverse selection state for logging.
@@ -354,8 +467,8 @@ mod tests {
 
     fn make_estimator() -> AdverseSelectionEstimator {
         let config = AdverseSelectionConfig {
-            measurement_horizon_ms: 10, // 10ms for fast tests
-            ewma_alpha: 0.5,            // High alpha for visible changes
+            measurement_horizon_ms: 500, // Match first multi-horizon (500ms)
+            ewma_alpha: 0.5,             // High alpha for visible changes
             min_fills_warmup: 3,
             max_pending_fills: 100,
             spread_adjustment_multiplier: 2.0,
@@ -365,6 +478,9 @@ mod tests {
         };
         AdverseSelectionEstimator::new(config)
     }
+
+    // Sleep duration that exceeds the first horizon (500ms)
+    const TEST_HORIZON_SLEEP: std::time::Duration = std::time::Duration::from_millis(510);
 
     #[test]
     fn test_record_fill() {
@@ -383,8 +499,8 @@ mod tests {
         // Record a buy fill at mid=100
         est.record_fill(1, 1.0, true, 100.0);
 
-        // Wait for horizon
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        // Wait for first multi-horizon (500ms)
+        std::thread::sleep(TEST_HORIZON_SLEEP);
 
         // Price dropped to 99 (1% adverse for our buy)
         est.update(99.0);
@@ -402,8 +518,8 @@ mod tests {
         // Record a sell fill at mid=100
         est.record_fill(1, 1.0, false, 100.0);
 
-        // Wait for horizon
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        // Wait for first multi-horizon (500ms)
+        std::thread::sleep(TEST_HORIZON_SLEEP);
 
         // Price rose to 101 (1% adverse for our sell)
         est.update(101.0);
@@ -420,7 +536,7 @@ mod tests {
 
         for i in 0..3 {
             est.record_fill(i as u64, 1.0, true, 100.0);
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(TEST_HORIZON_SLEEP);
             est.update(99.0); // Adverse for buys
         }
 
@@ -435,7 +551,7 @@ mod tests {
         // Create extreme AS
         for i in 0..5 {
             est.record_fill(i as u64, 1.0, true, 100.0);
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(TEST_HORIZON_SLEEP);
             est.update(90.0); // 10% adverse
         }
 

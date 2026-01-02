@@ -115,7 +115,12 @@ impl Ladder {
             bid_depths
                 .iter()
                 .map(|&d| {
-                    spread_capture(d, params.as_at_touch_bps, config.as_decay_bps, config.fees_bps)
+                    spread_capture(
+                        d,
+                        params.as_at_touch_bps,
+                        config.as_decay_bps,
+                        config.fees_bps,
+                    )
                 })
                 .collect()
         };
@@ -135,7 +140,12 @@ impl Ladder {
             ask_depths
                 .iter()
                 .map(|&d| {
-                    spread_capture(d, params.as_at_touch_bps, config.as_decay_bps, config.fees_bps)
+                    spread_capture(
+                        d,
+                        params.as_at_touch_bps,
+                        config.as_decay_bps,
+                        config.fees_bps,
+                    )
                 })
                 .collect()
         };
