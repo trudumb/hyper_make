@@ -2641,36 +2641,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if total_orders == 0 {
             info!("No resting orders to cancel");
         } else {
-            info!("Cancelling {} resting orders...", total_orders);
-
-            let mut cancelled = 0;
-            let mut failed = 0;
-
-            for oid in oids {
-                let cancel_result = self.cancel_with_retry(&self.config.asset, oid, 3).await;
-                if cancel_result.order_is_gone() {
-                    // Order is gone (cancelled, already cancelled, or already filled)
-                    if cancel_result == CancelResult::AlreadyFilled {
-                        info!("Order already filled during shutdown: oid={}", oid);
-                    } else {
-                        info!("Cancelled order: oid={}", oid);
-                    }
-                    cancelled += 1;
-                } else {
-                    warn!("Failed to cancel order after retries: oid={}", oid);
-                    failed += 1;
-                }
-            }
-
-            if failed > 0 {
-                warn!(
-                    cancelled = cancelled,
-                    failed = failed,
-                    "Some orders failed to cancel - may need manual cleanup"
-                );
-            } else {
-                info!(cancelled = cancelled, "All orders cancelled successfully");
-            }
+            info!("Bulk cancelling {} resting orders...", total_orders);
+            self.initiate_bulk_cancel(oids).await;
+            info!(cancelled = total_orders, "Bulk cancel completed");
         }
 
         info!("=== GRACEFUL SHUTDOWN COMPLETE ===");
