@@ -13,7 +13,8 @@ All HIP-3 detection and margin mode logic is pre-computed at startup. The quote 
 | Constraint | Value |
 |-----------|-------|
 | **Margin Mode** | Isolated-only (cross margin NOT supported) |
-| **Fee Structure** | 2x normal fees (deployer gets 50%) |
+| **Fee Structure** | Deployer configurable 0-300% share (0-100% growth mode) |
+| **Fee in API** | `fee` field in fills includes `builderFee` (optional if non-zero) |
 | **OI Caps** | Notional limits set by deployer |
 | **Leverage** | Configurable by deployer, may differ from mainnet defaults |
 | **DEX Abstraction** | Automatic collateral routing from validator perps balance |
@@ -21,7 +22,9 @@ All HIP-3 detection and margin mode logic is pre-computed at startup. The quote 
 
 **Sources:**
 - [HIP-3: Builder-deployed perpetuals](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals)
-- [FalconX HIP-3 Analysis](https://www.falconx.io/newsroom/the-transformational-potential-of-hyperliquids-hip-3)
+- [HIP-3 Deployer Actions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions)
+- [Fees Documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees)
+- [maxBuilderFee API](https://docs.chainstack.com/reference/hyperliquid-info-max-builder-fee)
 
 ---
 
@@ -58,16 +61,16 @@ Create a **pre-computed** runtime configuration that resolves all Option types a
 ///
 /// All HIP-3 detection is done ONCE at startup. Quote cycle uses only
 /// primitive fields (bool, f64) with no Option unwraps or string comparisons.
+///
+/// NOTE: Fees are NOT pre-computed. HIP-3 builder fees vary per deployer
+/// (0-300% share) and are included in the `fee` field of each fill.
+/// See Phase 8 for fee handling.
 #[derive(Debug, Clone)]
 pub struct AssetRuntimeConfig {
     // === Pre-computed margin fields (NO OPTIONS) ===
     /// Whether to use cross margin (pre-computed from AssetMeta)
     /// HOT PATH: Used directly in margin calculations
     pub is_cross: bool,
-
-    /// Fee multiplier (1.0 for validator perps, 2.0 for HIP-3)
-    /// HOT PATH: Applied to P&L calculations
-    pub fee_multiplier: f64,
 
     /// Open interest cap in USD (f64::MAX if no cap)
     /// HOT PATH: Pre-flight check before order placement
@@ -106,7 +109,6 @@ impl AssetRuntimeConfig {
         Self {
             // Pre-compute for hot path
             is_cross: !is_hip3,
-            fee_multiplier: if is_hip3 { 2.0 } else { 1.0 },
             oi_cap_usd: meta.oi_cap_usd.unwrap_or(f64::MAX),
             sz_multiplier: 10_f64.powi(meta.sz_decimals as i32),
             price_multiplier: 10_f64.powi(5), // 5 sig figs for perps
@@ -164,13 +166,12 @@ info!(
     asset = %runtime_config.asset,
     is_cross = runtime_config.is_cross,
     is_hip3 = runtime_config.is_hip3,
-    fee_mult = runtime_config.fee_multiplier,
     oi_cap = %if runtime_config.oi_cap_usd == f64::MAX {
         "unlimited".to_string()
     } else {
         format!("${:.0}", runtime_config.oi_cap_usd)
     },
-    "Asset runtime config resolved"
+    "Asset runtime config resolved (fees from fill data)"
 );
 
 // Set leverage with pre-computed is_cross
@@ -874,42 +875,157 @@ if !runtime_config.is_cross {
 
 ---
 
-## Phase 8: P&L Tracking with Fee Multipliers (NEW)
+## Phase 8: Builder Fee Tracking (CORRECTED)
 
-### 8.1 Update P&L Tracker
+### Key Insight: Fees Are Already in Fill Data
+
+**The `fee` field in fills already includes builder fees.** No multiplier needed.
+
+Per [API docs](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint):
+- `fee`: Total fee (inclusive of `builderFee`)
+- `builderFee`: Optional, only present if non-zero
+
+HIP-3 deployers can set fee share from 0-300% (0-100% in growth mode). The actual fee varies per deployer and is reflected in the fill data.
+
+### 8.1 Extend TradeInfo with Builder Fee
+
+**File:** `src/types/trades.rs`
+
+```rust
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeInfo {
+    pub coin: String,
+    pub side: String,
+    pub px: String,
+    pub sz: String,
+    pub time: u64,
+    pub hash: String,
+    pub start_position: String,
+    pub dir: String,
+    pub closed_pnl: String,
+    pub oid: u64,
+    pub cloid: Option<String>,
+    pub crossed: bool,
+    pub fee: String,           // Total fee (includes builder fee)
+    pub fee_token: String,
+    pub tid: u64,
+
+    // NEW: HIP-3 builder fee tracking
+    /// Builder fee component (optional, only present if non-zero)
+    #[serde(default)]
+    pub builder_fee: Option<String>,
+}
+
+impl TradeInfo {
+    /// Get total fee as f64.
+    #[inline(always)]
+    pub fn total_fee(&self) -> f64 {
+        self.fee.parse().unwrap_or(0.0)
+    }
+
+    /// Get builder fee component as f64 (0.0 if not present).
+    #[inline(always)]
+    pub fn builder_fee_amount(&self) -> f64 {
+        self.builder_fee
+            .as_ref()
+            .and_then(|f| f.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get protocol fee component (total - builder).
+    #[inline(always)]
+    pub fn protocol_fee(&self) -> f64 {
+        self.total_fee() - self.builder_fee_amount()
+    }
+}
+```
+
+### 8.2 Update AssetRuntimeConfig (Remove fee_multiplier)
+
+**File:** `src/market_maker/config.rs`
+
+```rust
+pub struct AssetRuntimeConfig {
+    // REMOVED: fee_multiplier: f64 - fees come from fill data
+
+    // === Pre-computed margin fields (NO OPTIONS) ===
+    pub is_cross: bool,
+    pub oi_cap_usd: f64,
+    pub sz_multiplier: f64,
+    pub price_multiplier: f64,
+
+    // === Cold path metadata ===
+    pub asset: Arc<str>,
+    pub max_leverage: f64,
+    pub is_hip3: bool,
+    pub deployer: Option<Arc<str>>,
+}
+```
+
+### 8.3 P&L Tracker Uses Actual Fee
 
 **File:** `src/market_maker/tracking/pnl.rs`
 
 ```rust
-pub struct PnLTracker {
-    // ... existing fields ...
-
-    /// Fee multiplier for this asset (1.0 for validator perps, 2.0 for HIP-3)
-    /// Pre-computed from AssetRuntimeConfig at construction.
-    fee_multiplier: f64,
-}
-
 impl PnLTracker {
-    pub fn with_fee_multiplier(mut self, multiplier: f64) -> Self {
-        self.fee_multiplier = multiplier;
-        self
-    }
-
-    /// Record fill with fee adjustment.
+    /// Record fill using actual fee from exchange.
+    /// The fee already includes builder fee for HIP-3 assets.
     #[inline(always)]
-    pub fn record_fill(&mut self, size: f64, price: f64, is_buy: bool, raw_fee: f64) {
-        // Apply fee multiplier for HIP-3 assets
-        let adjusted_fee = raw_fee * self.fee_multiplier;
+    pub fn record_fill(&mut self, fill: &TradeInfo) {
+        let fee = fill.total_fee();  // Use actual fee, not multiplied
+        let builder_fee = fill.builder_fee_amount();
+
+        // Track fees separately for analytics
+        self.total_fees += fee;
+        self.total_builder_fees += builder_fee;
+        self.total_protocol_fees += fill.protocol_fee();
+
         // ... rest of P&L calculation
     }
 }
 ```
 
-### 8.2 Integrate into Market Maker Construction
+### 8.4 Query Fee Schedule at Startup (Optional, for Logging)
+
+**File:** `src/info/info_client.rs`
+
+Add query for user fee schedule to display expected rates:
 
 ```rust
-let pnl_tracker = PnLTracker::new()
-    .with_fee_multiplier(runtime_config.fee_multiplier);
+impl InfoClient {
+    /// Query user's fee schedule (maker/taker rates, discounts).
+    pub async fn user_fees(&self, address: Address) -> Result<UserFeesResponse> {
+        let input = InfoRequest::UserFees { user: address };
+        self.send_info_request(input).await
+    }
+}
+```
+
+At startup, log fee information:
+
+```rust
+// Log user fee schedule for awareness
+let fee_schedule = info_client.user_fees(user_address).await?;
+info!(
+    maker_rate = %fee_schedule.fee_schedule.add,
+    taker_rate = %fee_schedule.fee_schedule.cross,
+    referral_discount = %fee_schedule.active_referral_discount,
+    is_hip3 = runtime_config.is_hip3,
+    "Fee schedule loaded (HIP-3 builder fees applied at trade time)"
+);
+```
+
+### 8.5 Prometheus Metrics for Builder Fees
+
+**File:** `src/market_maker/infra/metrics.rs`
+
+```rust
+// Add metrics for fee breakdown
+mm_total_fees: Gauge,
+mm_builder_fees: Gauge,
+mm_protocol_fees: Gauge,
+mm_builder_fee_ratio: Gauge,  // builder_fees / total_fees
 ```
 
 ---
@@ -994,7 +1110,7 @@ struct Cli {
 | **2. Margin Infra** | P0 | MarginMode enum, dual tracking | `margin.rs` |
 | **3. Exchange Client** | P1 | DEX abstraction, leverage setup | `accounts.rs` |
 | **4. Market Maker** | P1 | Use runtime config, OI checks | `mod.rs`, `bin/market_maker.rs` |
-| **5. P&L Tracking** | P1 | Fee multiplier in P&L | `pnl.rs` |
+| **5. Builder Fee Parsing** | P1 | Parse `builderFee` from fills | `trades.rs`, `pnl.rs` |
 | **6. Risk Mgmt** | P2 | Tighter limits for isolated | `kill_switch.rs` |
 | **7. Testing** | P1 | Unit + integration tests | Various |
 
@@ -1008,7 +1124,7 @@ struct Cli {
 | Insufficient isolated margin | Liquidation | Monitor liq price, auto top-up if close |
 | OI cap exceeded | Order rejection | Pre-flight check in quote cycle |
 | DEX abstraction not enabled | Collateral routing fails | Enable at startup, verify state |
-| Fee calculation wrong | P&L miscalculation | Use fee_multiplier from runtime config |
+| Missing `builderFee` field | Inaccurate fee breakdown | Field is optional, gracefully handle None |
 
 ---
 
@@ -1019,7 +1135,7 @@ struct Cli {
 | HIP-3 detection | 0 ns | Pre-computed at startup |
 | Margin mode check | 0 ns | Single bool field access |
 | OI cap check | <10 ns | f64 comparison only |
-| Fee multiplier apply | <5 ns | f64 multiply |
+| Fee parsing | ~20 ns | String parse only on fills (not hot path) |
 
 ---
 
@@ -1031,7 +1147,9 @@ struct Cli {
 - [ ] DEX abstraction enabled for HIP-3 assets
 - [ ] Initial isolated margin is allocated
 - [ ] OI cap is enforced before order placement
-- [ ] P&L tracking uses correct fee multiplier
+- [ ] `builderFee` parsed from fills when present
+- [ ] P&L tracking uses actual fee from fill data (not multiplied)
+- [ ] Fee breakdown metrics exported (total/builder/protocol)
 - [ ] Kill switch triggers appropriately for isolated positions
 - [ ] Liquidation price is monitored for isolated positions
 - [ ] CLI displays margin mode in status output
