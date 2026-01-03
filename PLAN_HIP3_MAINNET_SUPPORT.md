@@ -1112,7 +1112,8 @@ struct Cli {
 | **4. Market Maker** | P1 | Use runtime config, OI checks | `mod.rs`, `bin/market_maker.rs` |
 | **5. Builder Fee Parsing** | P1 | Parse `builderFee` from fills | `trades.rs`, `pnl.rs` |
 | **6. Risk Mgmt** | P2 | Tighter limits for isolated | `kill_switch.rs` |
-| **7. Testing** | P1 | Unit + integration tests | Various |
+| **7-10. Testing** | P1 | Unit + integration tests | Various |
+| **11. Verification** | P0 | 5-layer validation pipeline | Tests, scripts, CI |
 
 ---
 
@@ -1156,3 +1157,794 @@ struct Cli {
 - [ ] All existing tests pass
 - [ ] New tests cover HIP-3 detection and margin mode logic
 - [ ] **Zero additional latency in quote cycle** (benchmark verified)
+
+---
+
+## Phase 11: Verification & Feedback Loop (CRITICAL)
+
+### Design Principle: Layered Validation
+
+Verification happens at 5 layers, each catching different classes of bugs:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 5: Production Monitoring (live metrics, alerts)         │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 4: Shadow Mode (production data, no real orders)        │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 3: Testnet Validation (real exchange, real HIP-3)       │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 2: Integration Tests (mock exchange, full flow)         │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 1: Unit Tests (isolated components)                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 11.1 Layer 1: Unit Tests
+
+**Goal:** Validate individual components in isolation
+
+#### Margin Mode Detection Tests
+
+**File:** `src/meta.rs` (tests module)
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test matrix for HIP-3 detection
+    const TEST_CASES: &[(&str, bool, Option<bool>, Option<&str>, bool, bool)] = &[
+        // (name, expected_hip3, only_isolated, margin_mode, is_builder_deployed, expected_cross)
+        ("BTC", false, None, None, false, true),
+        ("ETH", false, Some(false), None, false, true),
+        ("HIP3_A", true, Some(true), None, false, false),
+        ("HIP3_B", true, None, Some("noCross"), true, false),
+        ("HIP3_C", true, None, Some("strictIsolated"), true, false),
+        ("HIP3_D", true, Some(false), None, true, false),  // is_builder_deployed wins
+    ];
+
+    #[test]
+    fn test_hip3_detection_matrix() {
+        for (name, expected_hip3, only_isolated, margin_mode, is_builder, expected_cross) in TEST_CASES {
+            let meta = AssetMeta {
+                name: name.to_string(),
+                only_isolated: *only_isolated,
+                margin_mode: margin_mode.map(String::from),
+                is_builder_deployed: Some(*is_builder),
+                ..Default::default()
+            };
+
+            assert_eq!(meta.is_hip3(), *expected_hip3, "is_hip3 failed for {}", name);
+            assert_eq!(meta.allows_cross_margin(), *expected_cross, "allows_cross failed for {}", name);
+        }
+    }
+
+    #[test]
+    fn test_runtime_config_precomputation() {
+        let meta = AssetMeta {
+            name: "TEST_HIP3".to_string(),
+            sz_decimals: 3,
+            max_leverage: 10,
+            only_isolated: Some(true),
+            oi_cap_usd: Some(5_000_000.0),
+            ..Default::default()
+        };
+
+        let runtime = AssetRuntimeConfig::from_asset_meta(&meta);
+
+        assert!(!runtime.is_cross, "HIP-3 should be isolated");
+        assert!(runtime.is_hip3);
+        assert_eq!(runtime.oi_cap_usd, 5_000_000.0);
+        assert_eq!(runtime.sz_multiplier, 1000.0);  // 10^3
+    }
+}
+```
+
+#### OI Cap Tests
+
+```rust
+#[test]
+fn test_oi_cap_enforcement() {
+    let mut runtime = AssetRuntimeConfig {
+        oi_cap_usd: 1_000_000.0,
+        ..Default::default()
+    };
+
+    // Test remaining capacity
+    assert_eq!(runtime.remaining_oi_capacity(0.0), 1_000_000.0);
+    assert_eq!(runtime.remaining_oi_capacity(500_000.0), 500_000.0);
+    assert_eq!(runtime.remaining_oi_capacity(1_500_000.0), 0.0);  // Over cap returns 0
+}
+
+#[test]
+fn test_oi_cap_unlimited() {
+    let runtime = AssetRuntimeConfig {
+        oi_cap_usd: f64::MAX,  // No cap
+        ..Default::default()
+    };
+
+    assert_eq!(runtime.remaining_oi_capacity(1_000_000_000.0), f64::MAX - 1_000_000_000.0);
+}
+```
+
+#### Fee Parsing Tests
+
+**File:** `src/types/trades.rs` (tests module)
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fee_parsing_with_builder_fee() {
+        let fill = TradeInfo {
+            fee: "0.50".to_string(),
+            builder_fee: Some("0.30".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(fill.total_fee(), 0.50);
+        assert_eq!(fill.builder_fee_amount(), 0.30);
+        assert_eq!(fill.protocol_fee(), 0.20);
+    }
+
+    #[test]
+    fn test_fee_parsing_no_builder_fee() {
+        let fill = TradeInfo {
+            fee: "0.25".to_string(),
+            builder_fee: None,  // Validator perp
+            ..Default::default()
+        };
+
+        assert_eq!(fill.total_fee(), 0.25);
+        assert_eq!(fill.builder_fee_amount(), 0.0);
+        assert_eq!(fill.protocol_fee(), 0.25);
+    }
+
+    #[test]
+    fn test_fee_parsing_malformed() {
+        let fill = TradeInfo {
+            fee: "invalid".to_string(),
+            builder_fee: Some("also_invalid".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(fill.total_fee(), 0.0);
+        assert_eq!(fill.builder_fee_amount(), 0.0);
+    }
+}
+```
+
+#### Run Unit Tests
+
+```bash
+# Run all unit tests with verbose output
+cargo test --lib -- --nocapture
+
+# Run only HIP-3 related tests
+cargo test hip3 -- --nocapture
+cargo test margin_mode -- --nocapture
+cargo test fee_parsing -- --nocapture
+```
+
+---
+
+### 11.2 Layer 2: Integration Tests
+
+**Goal:** Validate full flow with mock exchange
+
+#### Mock Exchange for Integration Testing
+
+**File:** `src/market_maker/testing/mock_exchange.rs` (new file)
+
+```rust
+/// Mock exchange for integration testing.
+/// Simulates API responses without network calls.
+pub struct MockExchange {
+    assets: HashMap<String, AssetMeta>,
+    user_state: UserStateResponse,
+    orders: Vec<OpenOrdersResponse>,
+    fills: Vec<TradeInfo>,
+    leverage_calls: Vec<(String, u32, bool)>,  // (asset, leverage, is_cross)
+    dex_abstraction_enabled: bool,
+}
+
+impl MockExchange {
+    pub fn with_hip3_asset(name: &str, oi_cap: f64) -> Self {
+        let meta = AssetMeta {
+            name: name.to_string(),
+            sz_decimals: 2,
+            max_leverage: 10,
+            only_isolated: Some(true),
+            is_builder_deployed: Some(true),
+            oi_cap_usd: Some(oi_cap),
+            deployer: Some("0xbuilder".to_string()),
+            ..Default::default()
+        };
+
+        let mut assets = HashMap::new();
+        assets.insert(name.to_string(), meta);
+
+        Self {
+            assets,
+            user_state: UserStateResponse::default(),
+            orders: vec![],
+            fills: vec![],
+            leverage_calls: vec![],
+            dex_abstraction_enabled: false,
+        }
+    }
+
+    /// Verify leverage was set correctly
+    pub fn assert_leverage_call(&self, asset: &str, expected_cross: bool) {
+        let call = self.leverage_calls.iter()
+            .find(|(a, _, _)| a == asset)
+            .expect("No leverage call for asset");
+
+        assert_eq!(call.2, expected_cross,
+            "Leverage is_cross mismatch: expected {}, got {}", expected_cross, call.2);
+    }
+
+    /// Verify DEX abstraction was enabled
+    pub fn assert_dex_abstraction_enabled(&self) {
+        assert!(self.dex_abstraction_enabled, "DEX abstraction not enabled");
+    }
+}
+```
+
+#### Integration Test: Full HIP-3 Setup Flow
+
+**File:** `tests/hip3_integration.rs`
+
+```rust
+use hyperliquid_rust_sdk::market_maker::testing::MockExchange;
+
+#[tokio::test]
+async fn test_hip3_full_setup_flow() {
+    let mock = MockExchange::with_hip3_asset("MEMECOIN", 5_000_000.0);
+
+    // Simulate market maker startup sequence
+    let meta = mock.get_asset_meta("MEMECOIN").unwrap();
+    let runtime = AssetRuntimeConfig::from_asset_meta(&meta);
+
+    // Verify HIP-3 detection
+    assert!(runtime.is_hip3);
+    assert!(!runtime.is_cross);
+    assert_eq!(runtime.oi_cap_usd, 5_000_000.0);
+
+    // Simulate startup calls
+    if runtime.is_hip3 {
+        mock.enable_dex_abstraction();
+    }
+    mock.update_leverage("MEMECOIN", 5, runtime.is_cross);
+
+    // Verify correct API calls were made
+    mock.assert_dex_abstraction_enabled();
+    mock.assert_leverage_call("MEMECOIN", false);  // isolated = not cross
+}
+
+#[tokio::test]
+async fn test_validator_perp_unchanged() {
+    let mock = MockExchange::with_validator_asset("BTC");
+
+    let meta = mock.get_asset_meta("BTC").unwrap();
+    let runtime = AssetRuntimeConfig::from_asset_meta(&meta);
+
+    // Verify NOT HIP-3
+    assert!(!runtime.is_hip3);
+    assert!(runtime.is_cross);
+    assert_eq!(runtime.oi_cap_usd, f64::MAX);
+
+    // Simulate startup
+    mock.update_leverage("BTC", 10, runtime.is_cross);
+
+    // Verify correct call (cross margin)
+    mock.assert_leverage_call("BTC", true);
+}
+
+#[tokio::test]
+async fn test_fee_tracking_hip3_fill() {
+    let mut pnl_tracker = PnLTracker::new();
+
+    // Simulate HIP-3 fill with builder fee
+    let fill = TradeInfo {
+        coin: "MEMECOIN".to_string(),
+        side: "B".to_string(),
+        px: "100.0".to_string(),
+        sz: "10.0".to_string(),
+        fee: "1.50".to_string(),
+        builder_fee: Some("0.90".to_string()),  // 60% to builder
+        ..Default::default()
+    };
+
+    pnl_tracker.record_fill(&fill);
+
+    assert_eq!(pnl_tracker.total_fees, 1.50);
+    assert_eq!(pnl_tracker.total_builder_fees, 0.90);
+    assert_eq!(pnl_tracker.total_protocol_fees, 0.60);
+}
+```
+
+#### Run Integration Tests
+
+```bash
+cargo test --test hip3_integration -- --nocapture
+```
+
+---
+
+### 11.3 Layer 3: Testnet Validation
+
+**Goal:** Validate against real exchange with real HIP-3 assets
+
+#### Testnet Validation Script
+
+**File:** `scripts/validate_hip3_testnet.sh`
+
+```bash
+#!/bin/bash
+set -e
+
+echo "=== HIP-3 Testnet Validation ==="
+
+# Configuration
+TESTNET_ASSET="${1:-PURR}"  # Use a known HIP-3 testnet asset
+TIMEOUT_SECS=300
+
+# Step 1: Query asset metadata
+echo "[1/5] Querying asset metadata for $TESTNET_ASSET..."
+ASSET_META=$(cargo run --example info -- meta $TESTNET_ASSET 2>/dev/null)
+echo "Asset metadata:"
+echo "$ASSET_META" | jq '.'
+
+# Verify HIP-3 detection
+ONLY_ISOLATED=$(echo "$ASSET_META" | jq '.only_isolated')
+MARGIN_MODE=$(echo "$ASSET_META" | jq -r '.margin_mode // "null"')
+echo "only_isolated: $ONLY_ISOLATED"
+echo "margin_mode: $MARGIN_MODE"
+
+# Step 2: Attempt to set leverage in isolated mode
+echo "[2/5] Setting leverage in isolated mode..."
+LEVERAGE_RESULT=$(cargo run --example leverage -- --asset $TESTNET_ASSET --leverage 3 --isolated 2>&1)
+if echo "$LEVERAGE_RESULT" | grep -q "error\|failed"; then
+    echo "ERROR: Leverage set failed"
+    echo "$LEVERAGE_RESULT"
+    exit 1
+fi
+echo "Leverage set successfully (isolated mode)"
+
+# Step 3: Attempt to set leverage in cross mode (should FAIL for HIP-3)
+echo "[3/5] Testing cross margin rejection for HIP-3..."
+CROSS_RESULT=$(cargo run --example leverage -- --asset $TESTNET_ASSET --leverage 3 --cross 2>&1 || true)
+if echo "$CROSS_RESULT" | grep -qi "cross.*not.*supported\|isolated.*only"; then
+    echo "PASS: Cross margin correctly rejected for HIP-3 asset"
+else
+    echo "WARNING: Cross margin not rejected as expected"
+    echo "$CROSS_RESULT"
+fi
+
+# Step 4: Run market maker in dry-run mode
+echo "[4/5] Running market maker in shadow mode for ${TIMEOUT_SECS}s..."
+timeout $TIMEOUT_SECS cargo run --bin market_maker -- \
+    --asset $TESTNET_ASSET \
+    --shadow-mode \
+    --log-file testnet_validation.log \
+    2>&1 | tee testnet_mm_output.log || true
+
+# Step 5: Verify logs
+echo "[5/5] Checking logs for correct behavior..."
+
+# Check margin mode detection
+if grep -q "margin_mode=Isolated" testnet_mm_output.log; then
+    echo "PASS: Detected isolated margin mode"
+else
+    echo "FAIL: Did not detect isolated margin mode"
+    exit 1
+fi
+
+# Check DEX abstraction
+if grep -q "DEX abstraction enabled" testnet_mm_output.log; then
+    echo "PASS: DEX abstraction enabled"
+else
+    echo "FAIL: DEX abstraction not enabled"
+    exit 1
+fi
+
+# Check leverage set with isolated
+if grep -q "is_cross=false" testnet_mm_output.log; then
+    echo "PASS: Leverage set with is_cross=false"
+else
+    echo "FAIL: Leverage not set correctly"
+    exit 1
+fi
+
+echo ""
+echo "=== All Testnet Validation Checks PASSED ==="
+```
+
+#### Testnet Checklist
+
+| Check | Expected | Actual | Pass |
+|-------|----------|--------|------|
+| Asset metadata has `only_isolated: true` | Yes | | [ ] |
+| Asset metadata has `margin_mode: "noCross"` | Yes | | [ ] |
+| `AssetRuntimeConfig.is_hip3` = true | Yes | | [ ] |
+| `AssetRuntimeConfig.is_cross` = false | Yes | | [ ] |
+| DEX abstraction enable succeeds | Yes | | [ ] |
+| Leverage set with `is_cross=false` succeeds | Yes | | [ ] |
+| Leverage set with `is_cross=true` fails | Yes | | [ ] |
+| Order placement succeeds | Yes | | [ ] |
+| Fill data contains `builderFee` | Yes (if applicable) | | [ ] |
+| OI cap check works | Yes | | [ ] |
+
+---
+
+### 11.4 Layer 4: Shadow Mode
+
+**Goal:** Run production logic with live data, no real orders
+
+#### Shadow Mode Implementation
+
+**File:** `src/bin/market_maker.rs`
+
+```rust
+#[derive(Parser)]
+struct Cli {
+    // ... existing fields ...
+
+    /// Run in shadow mode (no real orders, log what would happen)
+    #[arg(long)]
+    shadow_mode: bool,
+}
+```
+
+**File:** `src/market_maker/mod.rs`
+
+```rust
+impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+    /// Shadow mode: logs orders without placing them
+    async fn update_quotes_shadow(&mut self) -> Result<()> {
+        // Calculate quotes as normal
+        let (bid, ask) = self.calculate_quotes()?;
+
+        // Log what would happen instead of placing
+        if let Some(bid) = &bid {
+            info!(
+                side = "bid",
+                price = %bid.price,
+                size = %bid.size,
+                shadow = true,
+                "[SHADOW] Would place order"
+            );
+        }
+
+        if let Some(ask) = &ask {
+            info!(
+                side = "ask",
+                price = %ask.price,
+                size = %ask.size,
+                shadow = true,
+                "[SHADOW] Would place order"
+            );
+        }
+
+        // Track metrics as if orders were placed
+        self.shadow_metrics.orders_would_place += 2;
+
+        // Simulate fills based on market trades
+        self.simulate_fills(&bid, &ask)?;
+
+        Ok(())
+    }
+
+    /// Simulate fills based on market trades passing through our shadow quotes
+    fn simulate_fills(&mut self, bid: &Option<Quote>, ask: &Option<Quote>) -> Result<()> {
+        for trade in &self.recent_trades {
+            let trade_px: f64 = trade.px.parse()?;
+
+            if let Some(bid) = bid {
+                if trade.side == "S" && trade_px <= bid.price {
+                    info!(
+                        side = "bid",
+                        quote_px = %bid.price,
+                        trade_px = %trade_px,
+                        size = %bid.size,
+                        shadow = true,
+                        "[SHADOW] Would have been filled"
+                    );
+                    self.shadow_metrics.fills_would_receive += 1;
+                }
+            }
+
+            if let Some(ask) = ask {
+                if trade.side == "B" && trade_px >= ask.price {
+                    info!(
+                        side = "ask",
+                        quote_px = %ask.price,
+                        trade_px = %trade_px,
+                        size = %ask.size,
+                        shadow = true,
+                        "[SHADOW] Would have been filled"
+                    );
+                    self.shadow_metrics.fills_would_receive += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+#### Shadow Mode Validation Checks
+
+```rust
+/// Shadow mode sanity checks
+struct ShadowValidator {
+    hip3_checks_passed: u32,
+    hip3_checks_failed: u32,
+}
+
+impl ShadowValidator {
+    fn validate_order(&mut self, order: &Quote, runtime: &AssetRuntimeConfig) {
+        // Check 1: Margin mode consistency
+        if runtime.is_hip3 && !runtime.is_cross {
+            self.hip3_checks_passed += 1;
+        } else if runtime.is_hip3 && runtime.is_cross {
+            error!("HIP-3 asset with cross margin detected!");
+            self.hip3_checks_failed += 1;
+        }
+
+        // Check 2: OI cap not exceeded
+        let order_notional = order.price * order.size;
+        if order_notional > runtime.remaining_oi_capacity(0.0) {
+            error!("Order would exceed OI cap");
+            self.hip3_checks_failed += 1;
+        }
+    }
+
+    fn report(&self) {
+        info!(
+            passed = self.hip3_checks_passed,
+            failed = self.hip3_checks_failed,
+            "Shadow mode validation report"
+        );
+
+        if self.hip3_checks_failed > 0 {
+            error!("SHADOW MODE FOUND {} FAILURES - DO NOT GO LIVE", self.hip3_checks_failed);
+        } else {
+            info!("Shadow mode validation PASSED - safe to go live");
+        }
+    }
+}
+```
+
+---
+
+### 11.5 Layer 5: Production Monitoring
+
+**Goal:** Continuous validation in production
+
+#### Critical Metrics to Monitor
+
+**File:** `src/market_maker/infra/metrics.rs`
+
+```rust
+// HIP-3 specific metrics
+mm_hip3_leverage_set_failures: Counter,    // Leverage set with wrong is_cross
+mm_hip3_order_rejections: Counter,          // Orders rejected for margin mode
+mm_hip3_oi_cap_blocked: Counter,            // Orders blocked by OI cap
+mm_hip3_builder_fee_ratio: Gauge,           // builder_fee / total_fee
+mm_hip3_margin_mode_mismatch: Counter,      // Detected margin mode mismatch
+```
+
+#### Alerting Rules (Prometheus/Grafana)
+
+```yaml
+# alerts.yaml
+groups:
+  - name: hip3_alerts
+    rules:
+      # Alert if margin mode mismatch detected
+      - alert: HIP3MarginModeMismatch
+        expr: mm_hip3_margin_mode_mismatch > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HIP-3 margin mode mismatch detected"
+          description: "Market maker detected inconsistent margin mode for HIP-3 asset"
+
+      # Alert if orders rejected for margin mode
+      - alert: HIP3OrderRejections
+        expr: rate(mm_hip3_order_rejections[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HIP-3 orders being rejected"
+          description: "Orders rejected due to margin mode issues"
+
+      # Alert if OI cap frequently blocking
+      - alert: HIP3OICapBlocking
+        expr: rate(mm_hip3_oi_cap_blocked[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OI cap frequently blocking orders"
+
+      # Alert on unusual builder fee ratio
+      - alert: HIP3BuilderFeeAnomaly
+        expr: mm_hip3_builder_fee_ratio > 0.8 or mm_hip3_builder_fee_ratio < 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusual HIP-3 builder fee ratio"
+```
+
+#### State Reconciliation Check
+
+**File:** `src/market_maker/safety/auditor.rs`
+
+```rust
+impl SafetyAuditor {
+    /// Periodic reconciliation to detect drift
+    pub async fn reconcile_hip3_state(&self, runtime: &AssetRuntimeConfig) -> ReconciliationResult {
+        let mut result = ReconciliationResult::default();
+
+        // Fetch fresh metadata from API
+        let fresh_meta = self.info_client.meta().await?;
+        let fresh_asset = fresh_meta.universe.iter()
+            .find(|a| a.name == runtime.asset.as_ref());
+
+        if let Some(fresh) = fresh_asset {
+            // Check HIP-3 status hasn't changed
+            let fresh_hip3 = fresh.is_hip3();
+            if fresh_hip3 != runtime.is_hip3 {
+                result.errors.push(format!(
+                    "HIP-3 status mismatch: runtime={}, fresh={}",
+                    runtime.is_hip3, fresh_hip3
+                ));
+            }
+
+            // Check OI cap hasn't changed
+            let fresh_cap = fresh.oi_cap_usd.unwrap_or(f64::MAX);
+            if (fresh_cap - runtime.oi_cap_usd).abs() > 1.0 {
+                result.warnings.push(format!(
+                    "OI cap changed: runtime={}, fresh={}",
+                    runtime.oi_cap_usd, fresh_cap
+                ));
+            }
+        } else {
+            result.errors.push("Asset not found in fresh metadata".to_string());
+        }
+
+        result
+    }
+}
+```
+
+---
+
+### 11.6 CI/CD Integration
+
+**Goal:** Automated testing on every commit
+
+#### CI Pipeline
+
+**File:** `.github/workflows/hip3_validation.yml`
+
+```yaml
+name: HIP-3 Validation
+
+on:
+  push:
+    paths:
+      - 'src/market_maker/**'
+      - 'src/meta.rs'
+      - 'src/types/trades.rs'
+  pull_request:
+    paths:
+      - 'src/market_maker/**'
+      - 'src/meta.rs'
+      - 'src/types/trades.rs'
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run HIP-3 unit tests
+        run: |
+          cargo test hip3 -- --nocapture
+          cargo test margin_mode -- --nocapture
+          cargo test fee_parsing -- --nocapture
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run integration tests
+        run: cargo test --test hip3_integration -- --nocapture
+
+  lint-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy check for HIP-3 code
+        run: cargo clippy -- -D warnings
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run latency benchmarks
+        run: |
+          cargo bench --bench hip3_latency -- --baseline main
+          # Fail if hot path > 10ns
+```
+
+---
+
+### 11.7 Verification Workflow Summary
+
+```
+Development → CI Unit Tests → CI Integration Tests → Testnet Validation → Shadow Mode → Production + Monitoring
+     │              │                  │                     │                │              │
+     │              │                  │                     │                │              │
+     ▼              ▼                  ▼                     ▼                ▼              ▼
+  [Write]       [Auto]             [Auto]              [Manual/Auto]    [24-48h]       [Continuous]
+   code        on push            on push              before deploy     observe         alerts
+
+                                                              │
+                                                              ▼
+                                                        Go/No-Go Decision
+```
+
+#### Go-Live Checklist
+
+| Gate | Criteria | Status |
+|------|----------|--------|
+| Unit Tests | All pass, >90% coverage on new code | [ ] |
+| Integration Tests | All pass | [ ] |
+| Testnet Validation | All 10 checks pass | [ ] |
+| Shadow Mode | 24h with 0 failures | [ ] |
+| Latency Benchmark | Zero hot-path overhead | [ ] |
+| Alerts Configured | All 4 alert rules active | [ ] |
+| Rollback Plan | Documented, tested | [ ] |
+
+---
+
+### 11.8 Rollback Plan
+
+If HIP-3 issues detected in production:
+
+1. **Immediate:** Kill switch triggers (automatic)
+2. **Short-term:** Revert to previous binary (manual)
+3. **Investigation:** Check logs for margin mode mismatch
+4. **Fix:** Patch and re-deploy through full validation
+
+```bash
+# Emergency rollback
+git checkout v1.x.x-pre-hip3
+cargo build --release
+systemctl restart market-maker
+
+# Verify rollback
+cargo run --bin market_maker -- --asset BTC --dry-run
+```
