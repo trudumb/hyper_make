@@ -8,6 +8,7 @@
 //! - **Tiered Leverage**: Supports position-based leverage reduction
 //! - **Position Limits**: Enforces notional position limits
 //! - **Order Size Adjustment**: Dynamically adjusts order sizes to fit within margin
+//! - **Margin Mode Support**: Cross vs Isolated margin for HIP-3 assets
 //!
 //! # First-Principles Design
 //!
@@ -17,10 +18,62 @@
 //! The `AssetLeverageConfig` from `meta.rs` provides:
 //! - Base max leverage from asset metadata
 //! - Optional tiered leverage (reduced max at higher notional)
+//!
+//! # HIP-3 Support
+//!
+//! HIP-3 (builder-deployed perpetuals) require isolated margin mode.
+//! This module provides `MarginMode` enum to distinguish between cross and isolated.
 
 use std::time::{Duration, Instant};
 
 use crate::meta::{AssetLeverageConfig, AssetMeta};
+
+// ============================================================================
+// Margin Mode (HIP-3 Support)
+// ============================================================================
+
+/// Margin mode for a position.
+///
+/// HIP-3 builder-deployed assets require isolated margin mode.
+/// Standard validator-operated assets support both modes, defaulting to cross.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarginMode {
+    /// Cross margin - shares margin across all positions.
+    /// This is the default for validator-operated perps.
+    #[default]
+    Cross,
+    /// Isolated margin - each position has dedicated margin.
+    /// Required for HIP-3 builder-deployed assets.
+    Isolated,
+}
+
+impl MarginMode {
+    /// Get `is_cross` flag for API calls (leverage, orders).
+    #[inline]
+    pub fn is_cross(&self) -> bool {
+        matches!(self, MarginMode::Cross)
+    }
+
+    /// Create from asset metadata.
+    ///
+    /// Returns `Isolated` for HIP-3 assets, `Cross` for validator perps.
+    pub fn from_asset_meta(meta: &AssetMeta) -> Self {
+        if meta.allows_cross_margin() {
+            MarginMode::Cross
+        } else {
+            MarginMode::Isolated
+        }
+    }
+}
+
+impl std::fmt::Display for MarginMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MarginMode::Cross => write!(f, "Cross"),
+            MarginMode::Isolated => write!(f, "Isolated"),
+        }
+    }
+}
 
 /// Configuration for margin-aware position sizing.
 ///
@@ -32,6 +85,11 @@ use crate::meta::{AssetLeverageConfig, AssetMeta};
 ///
 /// **Fallback**: `Default` provides a conservative 3x limit, but this should be
 /// replaced with API-derived values in production.
+///
+/// # HIP-3 Support
+///
+/// For HIP-3 assets, `margin_mode` will be `Isolated` and `initial_isolated_margin`
+/// specifies how much margin to allocate at startup.
 #[derive(Debug, Clone)]
 pub struct MarginConfig {
     /// Maximum leverage to use (e.g., 5.0 = 5x)
@@ -48,13 +106,23 @@ pub struct MarginConfig {
     pub max_order_notional: f64,
     /// Minimum margin refresh interval
     pub refresh_interval: Duration,
+
+    // === HIP-3 Support Fields ===
+    /// Margin mode for this asset (derived from metadata).
+    /// Cross for validator perps, Isolated for HIP-3 builder perps.
+    pub margin_mode: MarginMode,
+    /// Initial isolated margin to allocate in USD.
+    /// Only used when margin_mode == Isolated.
+    pub initial_isolated_margin: f64,
 }
 
 impl MarginConfig {
     /// Create margin config from asset metadata (preferred method).
     ///
-    /// This derives leverage limits from the exchange API, ensuring you're
-    /// using the actual maximum allowed for this asset.
+    /// This derives leverage limits and margin mode from the exchange API,
+    /// ensuring you're using the actual constraints for this asset.
+    ///
+    /// For HIP-3 assets, this will set `margin_mode` to `Isolated`.
     ///
     /// # Arguments
     /// - `asset_meta`: Asset metadata from the exchange API
@@ -65,9 +133,11 @@ impl MarginConfig {
     /// let btc_meta = meta.universe.iter().find(|a| a.name == "BTC").unwrap();
     /// let config = MarginConfig::from_asset_meta(btc_meta);
     /// // config.max_leverage == 50.0 (for BTC)
+    /// // config.margin_mode == MarginMode::Cross (for standard perps)
     /// ```
     pub fn from_asset_meta(asset_meta: &AssetMeta) -> Self {
         let leverage_config = AssetLeverageConfig::from_asset_meta(asset_meta);
+        let margin_mode = MarginMode::from_asset_meta(asset_meta);
         Self {
             max_leverage: leverage_config.max_leverage,
             leverage_config: Some(leverage_config),
@@ -75,6 +145,8 @@ impl MarginConfig {
             max_notional_position: 100_000.0,
             max_order_notional: 10_000.0,
             refresh_interval: Duration::from_secs(10),
+            margin_mode,
+            initial_isolated_margin: 1000.0, // $1000 default
         }
     }
 
@@ -82,7 +154,14 @@ impl MarginConfig {
     ///
     /// Use this when you have parsed margin tables from the API and
     /// want position-based leverage limits.
+    ///
+    /// Defaults to cross margin mode. Use `with_margin_mode()` to override.
     pub fn from_leverage_config(leverage_config: AssetLeverageConfig) -> Self {
+        let margin_mode = if leverage_config.isolated_only {
+            MarginMode::Isolated
+        } else {
+            MarginMode::Cross
+        };
         Self {
             max_leverage: leverage_config.max_leverage,
             leverage_config: Some(leverage_config),
@@ -90,12 +169,15 @@ impl MarginConfig {
             max_notional_position: 100_000.0,
             max_order_notional: 10_000.0,
             refresh_interval: Duration::from_secs(10),
+            margin_mode,
+            initial_isolated_margin: 1000.0,
         }
     }
 
     /// Create margin config with explicit leverage (for testing or override).
     ///
     /// Prefer `from_asset_meta()` in production code.
+    /// Defaults to cross margin mode.
     pub fn with_leverage(max_leverage: f64) -> Self {
         Self {
             max_leverage,
@@ -104,6 +186,8 @@ impl MarginConfig {
             max_notional_position: 100_000.0,
             max_order_notional: 10_000.0,
             refresh_interval: Duration::from_secs(10),
+            margin_mode: MarginMode::Cross,
+            initial_isolated_margin: 1000.0,
         }
     }
 
@@ -141,10 +225,28 @@ impl MarginConfig {
         self.refresh_interval = interval;
         self
     }
+
+    /// Builder: set margin mode
+    pub fn with_margin_mode(mut self, mode: MarginMode) -> Self {
+        self.margin_mode = mode;
+        self
+    }
+
+    /// Builder: set initial isolated margin
+    pub fn with_initial_isolated_margin(mut self, margin: f64) -> Self {
+        self.initial_isolated_margin = margin;
+        self
+    }
+
+    /// Check if this config requires isolated margin.
+    #[inline]
+    pub fn requires_isolated(&self) -> bool {
+        self.margin_mode == MarginMode::Isolated
+    }
 }
 
 impl Default for MarginConfig {
-    /// Conservative default with 3x leverage.
+    /// Conservative default with 3x leverage in cross margin mode.
     ///
     /// **Note**: This should be replaced with `from_asset_meta()` in production
     /// to use the actual exchange limits for the asset being traded.
@@ -156,6 +258,8 @@ impl Default for MarginConfig {
             max_notional_position: 100_000.0, // $100k max position
             max_order_notional: 10_000.0,     // $10k max per order
             refresh_interval: Duration::from_secs(10),
+            margin_mode: MarginMode::Cross,
+            initial_isolated_margin: 1000.0, // $1000 default
         }
     }
 }
@@ -698,12 +802,74 @@ mod tests {
             only_isolated: None,
             margin_mode: None,
             is_delisted: None,
+            deployer: None,
+            dex_id: None,
+            oi_cap_usd: None,
+            is_builder_deployed: None,
         };
         let config = MarginConfig::from_asset_meta(&asset_meta);
 
         assert_eq!(config.max_leverage, 50.0);
         assert!(config.leverage_config.is_some());
         assert_eq!(config.leverage_config.as_ref().unwrap().asset, "BTC");
+        assert_eq!(config.margin_mode, MarginMode::Cross);
+    }
+
+    #[test]
+    fn test_from_hip3_asset_meta() {
+        let asset_meta = AssetMeta {
+            name: "MEMECOIN".to_string(),
+            sz_decimals: 0,
+            max_leverage: 3,
+            only_isolated: Some(true),
+            margin_mode: Some("noCross".to_string()),
+            is_delisted: None,
+            deployer: Some("0xbuilder".to_string()),
+            dex_id: Some(5),
+            oi_cap_usd: Some(5_000_000.0),
+            is_builder_deployed: Some(true),
+        };
+        let config = MarginConfig::from_asset_meta(&asset_meta);
+
+        assert_eq!(config.max_leverage, 3.0);
+        assert!(config.leverage_config.is_some());
+        assert_eq!(config.margin_mode, MarginMode::Isolated);
+        assert!(config.requires_isolated());
+    }
+
+    #[test]
+    fn test_margin_mode_from_asset_meta() {
+        // Validator perp (cross allowed)
+        let btc = AssetMeta {
+            name: "BTC".to_string(),
+            sz_decimals: 5,
+            max_leverage: 50,
+            only_isolated: None,
+            margin_mode: None,
+            is_delisted: None,
+            deployer: None,
+            dex_id: None,
+            oi_cap_usd: None,
+            is_builder_deployed: None,
+        };
+        assert_eq!(MarginMode::from_asset_meta(&btc), MarginMode::Cross);
+        assert!(MarginMode::from_asset_meta(&btc).is_cross());
+
+        // HIP-3 perp (isolated only)
+        let hip3 = AssetMeta {
+            name: "HIP3COIN".to_string(),
+            sz_decimals: 2,
+            max_leverage: 5,
+            only_isolated: Some(true),
+            margin_mode: None,
+            is_delisted: None,
+            deployer: None,
+            dex_id: None,
+            oi_cap_usd: None,
+            is_builder_deployed: None,
+        };
+        assert_eq!(MarginMode::from_asset_meta(&hip3), MarginMode::Isolated);
+        assert!(!MarginMode::from_asset_meta(&hip3).is_cross());
     }
 
     #[test]

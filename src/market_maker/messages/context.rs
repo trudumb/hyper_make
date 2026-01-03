@@ -21,6 +21,9 @@ pub struct MessageContext {
     pub max_position: f64,
     /// Whether estimator is warmed up
     pub is_warmed_up: bool,
+    /// Expected collateral/quote asset symbol (e.g., "USDC", "USDE", "USDH").
+    /// Used to validate fee_token in fills matches expected DEX collateral.
+    pub expected_collateral: Arc<str>,
 }
 
 impl MessageContext {
@@ -31,6 +34,7 @@ impl MessageContext {
         position: f64,
         max_position: f64,
         is_warmed_up: bool,
+        expected_collateral: Arc<str>,
     ) -> Self {
         Self {
             asset,
@@ -38,6 +42,7 @@ impl MessageContext {
             position,
             max_position,
             is_warmed_up,
+            expected_collateral,
         }
     }
 
@@ -62,16 +67,16 @@ mod tests {
 
     #[test]
     fn test_position_utilization() {
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.5, 1.0, true);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.5, 1.0, true, Arc::from("USDC"));
         assert!((ctx.position_utilization() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_has_mid() {
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, true);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, true, Arc::from("USDC"));
         assert!(ctx.has_mid());
 
-        let ctx_no_mid = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, true);
+        let ctx_no_mid = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, true, Arc::from("USDC"));
         assert!(!ctx_no_mid.has_mid());
     }
 }

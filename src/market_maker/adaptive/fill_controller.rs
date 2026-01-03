@@ -142,7 +142,7 @@ impl FillRateController {
         // Log significant changes
         let current_rate = self.observed_fill_rate();
         let rate_change = (current_rate - self.last_logged_rate).abs();
-        if rate_change > 0.01 || self.total_fills % 10 == 0 && self.total_fills > 0 {
+        if rate_change > 0.01 || self.total_fills.is_multiple_of(10) && self.total_fills > 0 {
             debug!(
                 total_fills = self.total_fills,
                 observation_time = self.observation_time,
@@ -274,10 +274,10 @@ mod tests {
 
     fn default_controller() -> FillRateController {
         FillRateController::new(
-            0.02,   // target: 1 fill per 50 seconds
-            1.5,    // ceiling_mult
-            120.0,  // 2 minutes warmup
-            0.995,  // decay
+            0.02,  // target: 1 fill per 50 seconds
+            1.5,   // ceiling_mult
+            120.0, // 2 minutes warmup
+            0.995, // decay
         )
     }
 

@@ -12,7 +12,7 @@ use crate::{
         ReferralResponse, UserFeesResponse, UserFillsResponse, UserFundingResponse,
         UserStateResponse, UserTokenBalanceResponse,
     },
-    meta::{AssetContext, Meta, SpotMeta, SpotMetaAndAssetCtxs},
+    meta::{AssetContext, Meta, PerpDex, PerpDexLimits, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
     req::HttpClient,
     types::OrderInfo,
@@ -33,9 +33,16 @@ pub struct CandleSnapshotRequest {
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
 pub enum InfoRequest {
+    /// Get user's clearinghouse state.
+    /// For HIP-3 builder DEXs, include `dex` parameter to query DEX-specific state.
     #[serde(rename = "clearinghouseState")]
+    #[serde(rename_all = "camelCase")]
     UserState {
         user: Address,
+        /// Optional HIP-3 DEX name for DEX-specific clearinghouse state.
+        /// If None, returns validator perps state.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
     },
     #[serde(rename = "batchClearinghouseStates")]
     UserStates {
@@ -55,11 +62,37 @@ pub enum InfoRequest {
         user: Address,
         oid: u64,
     },
-    Meta,
-    MetaAndAssetCtxs,
+    /// Get perp metadata. Use `dex` for HIP-3 builder DEXs.
+    #[serde(rename_all = "camelCase")]
+    Meta {
+        /// Optional HIP-3 DEX name (e.g., "hyena", "felix").
+        /// If None, returns validator perps.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
+    /// Get perp metadata with asset contexts.
+    #[serde(rename_all = "camelCase")]
+    MetaAndAssetCtxs {
+        /// Optional HIP-3 DEX name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
+    /// List all available HIP-3 DEXs.
+    PerpDexs,
+    /// Get open interest limits for a HIP-3 DEX.
+    #[serde(rename_all = "camelCase")]
+    PerpDexLimits {
+        dex: String,
+    },
     SpotMeta,
     SpotMetaAndAssetCtxs,
-    AllMids,
+    /// Get all mid prices. Use `dex` for HIP-3 builder DEXs.
+    #[serde(rename_all = "camelCase")]
+    AllMids {
+        /// Optional HIP-3 DEX name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
     UserFills {
         user: Address,
     },
@@ -188,8 +221,34 @@ impl InfoClient {
         self.send_info_request(input).await
     }
 
+    /// Get user's clearinghouse state for validator perps.
+    ///
+    /// For HIP-3 builder DEXs, use `user_state_for_dex()` instead.
     pub async fn user_state(&self, address: Address) -> Result<UserStateResponse> {
-        let input = InfoRequest::UserState { user: address };
+        let input = InfoRequest::UserState {
+            user: address,
+            dex: None,
+        };
+        self.send_info_request(input).await
+    }
+
+    /// Get user's clearinghouse state for a specific HIP-3 DEX.
+    ///
+    /// For HIP-3 builder-deployed perps, the clearinghouse state is per-DEX.
+    /// Without the `dex` parameter, the API returns validator perps state.
+    ///
+    /// # Arguments
+    /// * `address` - User's wallet address
+    /// * `dex` - Optional HIP-3 DEX name (e.g., "hyna", "flx"). None for validator perps.
+    pub async fn user_state_for_dex(
+        &self,
+        address: Address,
+        dex: Option<&str>,
+    ) -> Result<UserStateResponse> {
+        let input = InfoRequest::UserState {
+            user: address,
+            dex: dex.map(String::from),
+        };
         self.send_info_request(input).await
     }
 
@@ -208,13 +267,74 @@ impl InfoClient {
         self.send_info_request(input).await
     }
 
+    /// Get perp metadata for validator perps (default).
+    ///
+    /// For HIP-3 builder DEXs, use `meta_for_dex()` instead.
     pub async fn meta(&self) -> Result<Meta> {
-        let input = InfoRequest::Meta;
+        let input = InfoRequest::Meta { dex: None };
         self.send_info_request(input).await
     }
 
+    /// Get perp metadata for a specific DEX.
+    ///
+    /// # Arguments
+    /// - `dex`: Optional DEX name (e.g., "hyena", "felix").
+    ///   If None, returns validator perps (same as `meta()`).
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Get Hyena DEX metadata
+    /// let meta = info_client.meta_for_dex(Some("hyena")).await?;
+    /// ```
+    pub async fn meta_for_dex(&self, dex: Option<&str>) -> Result<Meta> {
+        let input = InfoRequest::Meta {
+            dex: dex.map(String::from),
+        };
+        self.send_info_request(input).await
+    }
+
+    /// Get perp metadata with asset contexts for validator perps (default).
     pub async fn meta_and_asset_contexts(&self) -> Result<(Meta, Vec<AssetContext>)> {
-        let input = InfoRequest::MetaAndAssetCtxs;
+        let input = InfoRequest::MetaAndAssetCtxs { dex: None };
+        self.send_info_request(input).await
+    }
+
+    /// Get perp metadata with asset contexts for a specific DEX.
+    pub async fn meta_and_asset_contexts_for_dex(
+        &self,
+        dex: Option<&str>,
+    ) -> Result<(Meta, Vec<AssetContext>)> {
+        let input = InfoRequest::MetaAndAssetCtxs {
+            dex: dex.map(String::from),
+        };
+        self.send_info_request(input).await
+    }
+
+    /// List all available HIP-3 DEXs.
+    ///
+    /// Returns a vector where each element is either a `PerpDex` or `None`
+    /// (for unregistered DEX IDs).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dexs = info_client.perp_dexs().await?;
+    /// for dex in dexs.iter().flatten() {
+    ///     println!("{} - {}", dex.name, dex.full_name);
+    /// }
+    /// ```
+    pub async fn perp_dexs(&self) -> Result<Vec<Option<PerpDex>>> {
+        let input = InfoRequest::PerpDexs;
+        self.send_info_request(input).await
+    }
+
+    /// Get open interest limits for a specific HIP-3 DEX.
+    ///
+    /// # Arguments
+    /// - `dex`: DEX name (e.g., "hyena", "felix")
+    pub async fn perp_dex_limits(&self, dex: &str) -> Result<PerpDexLimits> {
+        let input = InfoRequest::PerpDexLimits {
+            dex: dex.to_string(),
+        };
         self.send_info_request(input).await
     }
 
@@ -228,8 +348,20 @@ impl InfoClient {
         self.send_info_request(input).await
     }
 
+    /// Get all mid prices for validator perps (default).
     pub async fn all_mids(&self) -> Result<HashMap<String, String>> {
-        let input = InfoRequest::AllMids;
+        let input = InfoRequest::AllMids { dex: None };
+        self.send_info_request(input).await
+    }
+
+    /// Get all mid prices for a specific DEX.
+    ///
+    /// # Arguments
+    /// - `dex`: Optional DEX name. If None, returns validator perps.
+    pub async fn all_mids_for_dex(&self, dex: Option<&str>) -> Result<HashMap<String, String>> {
+        let input = InfoRequest::AllMids {
+            dex: dex.map(String::from),
+        };
         self.send_info_request(input).await
     }
 

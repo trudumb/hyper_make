@@ -801,12 +801,12 @@ impl ParameterAggregator {
             adaptive_kappa: sources.adaptive_spreads.kappa(sources.estimator.kappa()),
             adaptive_gamma: sources.adaptive_spreads.gamma(
                 sources.risk_aversion,
-                sources.estimator.sigma_effective() / sources.stochastic_config.sigma_baseline.max(1e-9),
+                sources.estimator.sigma_effective()
+                    / sources.stochastic_config.sigma_baseline.max(1e-9),
                 sources.estimator.jump_ratio(),
-                sources.adaptive_spreads.inventory_utilization(
-                    sources.position,
-                    sources.max_position,
-                ),
+                sources
+                    .adaptive_spreads
+                    .inventory_utilization(sources.position, sources.max_position),
                 sources.hawkes.intensity_percentile(),
                 sources.liquidation_detector.cascade_severity(),
             ),

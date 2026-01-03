@@ -137,12 +137,12 @@ impl Default for AdaptiveBayesianConfig {
             // Learned Floor - calibrated from trade history analysis
             // Trade history showed: fee 1.5 bps + AS ~3 bps = ~4.5 bps break-even per side
             // floor = fee + E[AS] + k×σ = 1.5 + 3 + 0.5×3 = 6 bps (half-spread)
-            as_prior_mean: 0.0003,      // 3 bps prior AS (calibrated from Dec 2025 trades)
-            as_prior_std: 0.0003,       // 3 bps uncertainty (tightened from 5 bps)
-            floor_risk_k: 0.5,          // 0.5σ safety margin → floor = 1.5 + 3 + 1.5 = 6 bps
+            as_prior_mean: 0.0003, // 3 bps prior AS (calibrated from Dec 2025 trades)
+            as_prior_std: 0.0003,  // 3 bps uncertainty (tightened from 5 bps)
+            floor_risk_k: 0.5,     // 0.5σ safety margin → floor = 1.5 + 3 + 1.5 = 6 bps
             floor_absolute_min: 0.0001, // 1 bp hard floor (tick size)
-            as_horizon_ms: 1000,        // 1 second AS measurement
-            as_ewma_decay: 0.995,       // ~200 obs half-life
+            as_horizon_ms: 1000,   // 1 second AS measurement
+            as_ewma_decay: 0.995,  // ~200 obs half-life
 
             // Shrinkage Gamma - moderate base, strong shrinkage
             gamma_base: 0.3,
@@ -158,20 +158,20 @@ impl Default for AdaptiveBayesianConfig {
             ],
 
             // Blended Kappa - liquid market priors
-            kappa_prior_mean: 2500.0,   // 4 bps avg fill distance
-            kappa_prior_strength: 5.0,  // Quick adaptation
-            kappa_blend_min_fills: 10,  // Need 10 fills before trusting own data
-            kappa_blend_scale: 5.0,     // Moderate transition steepness
-            kappa_warmup_factor: 0.8,   // 20% conservative during warmup
+            kappa_prior_mean: 2500.0,  // 4 bps avg fill distance
+            kappa_prior_strength: 5.0, // Quick adaptation
+            kappa_blend_min_fills: 10, // Need 10 fills before trusting own data
+            kappa_blend_scale: 5.0,    // Moderate transition steepness
+            kappa_warmup_factor: 0.8,  // 20% conservative during warmup
 
             // Fill Rate Controller
-            target_fill_rate: 0.02,     // 1 fill per 50 seconds
-            fill_ceiling_mult: 1.5,     // Allow 50% wider than fill target
+            target_fill_rate: 0.02,           // 1 fill per 50 seconds
+            fill_ceiling_mult: 1.5,           // Allow 50% wider than fill target
             fill_min_observation_secs: 120.0, // 2 minutes warmup
-            fill_rate_decay: 0.995,     // ~200 obs half-life
+            fill_rate_decay: 0.995,           // ~200 obs half-life
 
             // Fees - Hyperliquid maker fee is 1.5 bps (round-trip 3 bps)
-            maker_fee_rate: 0.00015,    // 1.5 bps maker fee
+            maker_fee_rate: 0.00015, // 1.5 bps maker fee
 
             // Integration - all enabled by default
             enable_adaptive_floor: true,
@@ -186,10 +186,10 @@ impl AdaptiveBayesianConfig {
     /// Create a config optimized for tight, competitive quoting.
     pub fn competitive() -> Self {
         Self {
-            floor_risk_k: 1.0,          // Less conservative floor
-            gamma_base: 0.2,            // Lower base gamma = tighter
-            tau_initial: 0.05,          // More shrinkage
-            target_fill_rate: 0.05,     // Higher fill target
+            floor_risk_k: 1.0,      // Less conservative floor
+            gamma_base: 0.2,        // Lower base gamma = tighter
+            tau_initial: 0.05,      // More shrinkage
+            target_fill_rate: 0.05, // Higher fill target
             ..Default::default()
         }
     }
@@ -197,10 +197,10 @@ impl AdaptiveBayesianConfig {
     /// Create a config optimized for conservative, safe quoting.
     pub fn conservative() -> Self {
         Self {
-            floor_risk_k: 2.0,          // More conservative floor
-            gamma_base: 0.5,            // Higher base gamma = wider
-            tau_initial: 0.2,           // Less shrinkage (allow adjustments)
-            target_fill_rate: 0.01,     // Lower fill target
+            floor_risk_k: 2.0,      // More conservative floor
+            gamma_base: 0.5,        // Higher base gamma = wider
+            tau_initial: 0.2,       // Less shrinkage (allow adjustments)
+            target_fill_rate: 0.01, // Lower fill target
             ..Default::default()
         }
     }

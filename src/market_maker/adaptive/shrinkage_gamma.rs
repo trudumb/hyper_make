@@ -92,8 +92,8 @@ impl ShrinkageGamma {
         Self {
             log_gamma_base: gamma_base.ln(),
             signals,
-            weights: vec![0.0; n_signals],         // Start at 0 (no adjustment)
-            lambda_squared: vec![1.0; n_signals],  // Start with unit local shrinkage
+            weights: vec![0.0; n_signals], // Start at 0 (no adjustment)
+            lambda_squared: vec![1.0; n_signals], // Start with unit local shrinkage
             tau_squared: tau_initial * tau_initial,
             learning_rate,
             gamma_min,
@@ -154,12 +154,7 @@ impl ShrinkageGamma {
     ///   - Positive: wider spread would have been better (increase weights)
     ///   - Negative: tighter spread would have been better (decrease weights)
     /// * `magnitude` - Magnitude of the PnL outcome (for scaling update)
-    pub fn update(
-        &mut self,
-        standardized_signals: &[f64],
-        pnl_gradient: f64,
-        magnitude: f64,
-    ) {
+    pub fn update(&mut self, standardized_signals: &[f64], pnl_gradient: f64, magnitude: f64) {
         if standardized_signals.len() != self.weights.len() {
             return;
         }
@@ -169,7 +164,11 @@ impl ShrinkageGamma {
         // Scale learning rate by magnitude (larger PnL = stronger signal)
         let scaled_lr = self.learning_rate * magnitude.abs().min(1.0);
 
-        for (i, &std_signal) in standardized_signals.iter().enumerate().take(self.weights.len()) {
+        for (i, &std_signal) in standardized_signals
+            .iter()
+            .enumerate()
+            .take(self.weights.len())
+        {
             // Gradient of PnL w.r.t. weight
             let grad = pnl_gradient * std_signal;
 
@@ -189,12 +188,12 @@ impl ShrinkageGamma {
         }
 
         // Update global shrinkage τ² based on overall weight variance
-        let weight_variance: f64 = self.weights.iter().map(|w| w * w).sum::<f64>()
-            / self.weights.len() as f64;
+        let weight_variance: f64 =
+            self.weights.iter().map(|w| w * w).sum::<f64>() / self.weights.len() as f64;
         self.tau_squared = 0.99 * self.tau_squared + 0.01 * (weight_variance + 0.01);
 
         // Log periodically
-        if self.update_count % 100 == 0 {
+        if self.update_count.is_multiple_of(100) {
             debug!(
                 update_count = self.update_count,
                 tau_squared = self.tau_squared,
@@ -219,7 +218,9 @@ impl ShrinkageGamma {
 
                 // Use peek (don't update) for this read
                 match signal {
-                    GammaSignal::VolatilityRatio => self.standardizers.vol_ratio.standardize_peek(raw),
+                    GammaSignal::VolatilityRatio => {
+                        self.standardizers.vol_ratio.standardize_peek(raw)
+                    }
                     GammaSignal::JumpRatio => self.standardizers.jump_ratio.standardize_peek(raw),
                     GammaSignal::InventoryUtilization => {
                         self.standardizers.inventory.standardize_peek(raw)
@@ -228,7 +229,9 @@ impl ShrinkageGamma {
                     GammaSignal::SpreadRegime => {
                         self.standardizers.spread_regime.standardize_peek(raw)
                     }
-                    GammaSignal::CascadeSeverity => self.standardizers.cascade.standardize_peek(raw),
+                    GammaSignal::CascadeSeverity => {
+                        self.standardizers.cascade.standardize_peek(raw)
+                    }
                 }
             })
             .collect()
@@ -277,10 +280,10 @@ mod tests {
                 GammaSignal::JumpRatio,
                 GammaSignal::InventoryUtilization,
             ],
-            0.1,   // tau_initial
-            0.01,  // learning_rate
-            0.05,  // gamma_min
-            2.0,   // gamma_max
+            0.1,  // tau_initial
+            0.01, // learning_rate
+            0.05, // gamma_min
+            2.0,  // gamma_max
         )
     }
 

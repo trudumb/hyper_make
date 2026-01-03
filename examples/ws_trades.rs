@@ -14,6 +14,7 @@ async fn main() {
         .subscribe(
             Subscription::Trades {
                 coin: "ETH".to_string(),
+                dex: None,
             },
             sender,
         )

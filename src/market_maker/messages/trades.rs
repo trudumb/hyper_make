@@ -116,8 +116,8 @@ fn log_warmup_progress(estimator: &ParameterEstimator, last_warmup_log: &mut usi
     let log_threshold = if vol_ticks < 5 { 1 } else { 5 };
 
     // Log on first trade or when threshold crossed
-    let should_log = (*last_warmup_log == 0 && trade_obs > 0)
-        || (vol_ticks >= *last_warmup_log + log_threshold);
+    let should_log =
+        (*last_warmup_log == 0 && trade_obs > 0) || (vol_ticks >= *last_warmup_log + log_threshold);
 
     if should_log {
         info!(
@@ -175,7 +175,7 @@ mod tests {
             &mut last_warmup_log,
         );
 
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false, Arc::from("USDC"));
 
         // Create trades for wrong asset
         let trades = Trades {

@@ -4,7 +4,7 @@
 
 use crate::prelude::Result;
 use crate::ws::message_types::UserFills;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::context::MessageContext;
 use crate::market_maker::fills::{FillEvent, FillProcessor, FillState};
@@ -79,6 +79,18 @@ pub fn process_user_fills<'a>(
         };
         let fill_price: f64 = fill.px.parse().unwrap_or(ctx.latest_mid);
         let is_buy = fill.side.eq("B");
+
+        // Validate fee_token matches expected collateral for this DEX
+        // This catches misconfiguration where we're trading on wrong DEX
+        if fill.fee_token != *ctx.expected_collateral {
+            warn!(
+                asset = %ctx.asset,
+                tid = fill.tid,
+                expected_collateral = %ctx.expected_collateral,
+                actual_fee_token = %fill.fee_token,
+                "Fill fee_token mismatch - trading on wrong DEX or collateral misconfigured"
+            );
+        }
 
         // Create fill event
         let fill_event = FillEvent::new(
@@ -161,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_process_filters_wrong_asset() {
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false, Arc::from("USDC"));
 
         let mut fill_processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);
@@ -210,6 +222,7 @@ mod tests {
                     fee: "0".to_string(),
                     fee_token: "USDC".to_string(),
                     cloid: None,
+                    builder_fee: None, // HIP-3: no builder fee for validator perps
                 }],
                 user: alloy::primitives::Address::ZERO,
                 is_snapshot: Some(false),
@@ -225,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_process_skips_without_mid() {
-        let ctx = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, false, Arc::from("USDC"));
 
         let mut fill_processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);

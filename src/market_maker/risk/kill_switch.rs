@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::market_maker::MarginMode;
+
 /// Configuration for the kill switch.
 #[derive(Debug, Clone)]
 pub struct KillSwitchConfig {
@@ -58,6 +60,33 @@ impl Default for KillSwitchConfig {
             stale_data_threshold: Duration::from_secs(30),
             max_rate_limit_errors: 3,
             enabled: true,
+        }
+    }
+}
+
+impl KillSwitchConfig {
+    /// Create config appropriate for margin mode.
+    ///
+    /// HIP-3 assets use isolated margin which is more dangerous because:
+    /// 1. Margin cannot be shared with other positions
+    /// 2. Liquidation happens per-position, not account-wide
+    /// 3. Position can be liquidated even if overall account is healthy
+    ///
+    /// For isolated margin, we apply tighter limits as a safety measure.
+    pub fn for_margin_mode(margin_mode: MarginMode, base_config: Self) -> Self {
+        match margin_mode {
+            MarginMode::Cross => base_config,
+            MarginMode::Isolated => {
+                // Isolated margin is more dangerous - apply tighter limits
+                Self {
+                    // 20% tighter drawdown limit for isolated positions
+                    max_drawdown: base_config.max_drawdown * 0.8,
+                    // 30% tighter position value limit (isolated can liquidate faster)
+                    max_position_value: base_config.max_position_value * 0.7,
+                    // Everything else stays the same
+                    ..base_config
+                }
+            }
         }
     }
 }

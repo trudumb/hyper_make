@@ -226,7 +226,11 @@ mod tests {
 
         // Std should be close to empirical std of samples
         let std = s.std();
-        assert!(std > 0.5 && std < 1.5, "Std should be reasonable, got {}", std);
+        assert!(
+            std > 0.5 && std < 1.5,
+            "Std should be reasonable, got {}",
+            std
+        );
     }
 
     #[test]

@@ -95,7 +95,6 @@ pub struct RiskConfig {
     // When we can't exit positions easily, we should be more risk averse.
     // This flows through γ in the GLFT formula: δ = (1/γ) × ln(1 + γ/κ)
     // Higher γ → wider spreads, but computed through the principled formula.
-
     /// Enable book depth gamma scaling.
     /// When true, γ increases as near-touch book depth decreases.
     pub enable_book_depth_scaling: bool,
@@ -112,7 +111,6 @@ pub struct RiskConfig {
     // FIRST PRINCIPLES: During parameter estimation warmup, we have uncertainty.
     // Higher uncertainty → more risk aversion → higher γ.
     // This replaces the arbitrary warmup spread multiplier.
-
     /// Enable warmup gamma scaling.
     /// When true, γ is scaled up during adaptive warmup period.
     pub enable_warmup_gamma_scaling: bool,

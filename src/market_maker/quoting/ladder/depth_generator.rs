@@ -178,7 +178,7 @@ impl Default for DynamicDepthConfig {
             // The adaptive floor (6 bps) from AdaptiveBayesianConfig is the effective floor.
             // Set this lower so adaptive floor takes precedence.
             // Trade history (Dec 2025): break-even ~6.67 bps, adaptive floor = 6 bps
-            min_spread_floor_bps: 4.0,  // Safety floor, adaptive floor (6 bps) takes over
+            min_spread_floor_bps: 4.0, // Safety floor, adaptive floor (6 bps) takes over
             enable_asymmetric: true,
             // FIRST PRINCIPLES: GLFT optimal spread δ* = (1/γ) × ln(1 + γ/κ)
             // is derived from stochastic control theory and should be trusted.

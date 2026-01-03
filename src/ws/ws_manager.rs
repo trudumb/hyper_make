@@ -196,16 +196,45 @@ pub(crate) struct WsManager {
     health_config: WsHealthConfig,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
 pub enum Subscription {
-    AllMids,
+    /// Subscribe to all mid prices.
+    /// For HIP-3 DEXs, use `dex` to specify which DEX.
+    #[serde(rename_all = "camelCase")]
+    AllMids {
+        /// Optional HIP-3 DEX name (e.g., "hyena", "felix").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
     Notification { user: Address },
     WebData2 { user: Address },
-    Candle { coin: String, interval: String },
-    L2Book { coin: String },
-    Trades { coin: String },
+    /// Subscribe to candle data.
+    #[serde(rename_all = "camelCase")]
+    Candle {
+        coin: String,
+        interval: String,
+        /// Optional HIP-3 DEX name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
+    /// Subscribe to L2 order book updates.
+    #[serde(rename_all = "camelCase")]
+    L2Book {
+        coin: String,
+        /// Optional HIP-3 DEX name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
+    /// Subscribe to trade feed.
+    #[serde(rename_all = "camelCase")]
+    Trades {
+        coin: String,
+        /// Optional HIP-3 DEX name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
     OrderUpdates { user: Address },
     UserEvents { user: Address },
     UserFills { user: Address },
@@ -213,7 +242,48 @@ pub enum Subscription {
     UserNonFundingLedgerUpdates { user: Address },
     ActiveAssetCtx { coin: String },
     ActiveAssetData { user: Address, coin: String },
-    Bbo { coin: String },
+    /// Subscribe to best bid/offer updates.
+    #[serde(rename_all = "camelCase")]
+    Bbo {
+        coin: String,
+        /// Optional HIP-3 DEX name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
+}
+
+/// Normalize subscription identifier for HashMap lookup.
+///
+/// For HIP-3 DEXs, we need to strip the `dex` field because:
+/// - Subscriptions are sent to server WITH `dex` (for correct routing)
+/// - Incoming messages don't include `dex` in the channel info
+/// - We need consistent keys for HashMap lookup
+///
+/// This ensures that when we subscribe with `dex: Some("hyna")`, the HashMap
+/// key matches what `get_identifier()` produces for incoming messages.
+fn normalize_identifier(identifier: &str) -> Result<String> {
+    let sub: Subscription =
+        serde_json::from_str(identifier).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+    let normalized = match sub {
+        Subscription::AllMids { dex: _ } => Subscription::AllMids { dex: None },
+        Subscription::L2Book { coin, dex: _ } => Subscription::L2Book { coin, dex: None },
+        Subscription::Trades { coin, dex: _ } => Subscription::Trades { coin, dex: None },
+        Subscription::Candle {
+            coin,
+            interval,
+            dex: _,
+        } => Subscription::Candle {
+            coin,
+            interval,
+            dex: None,
+        },
+        Subscription::Bbo { coin, dex: _ } => Subscription::Bbo { coin, dex: None },
+        // Non-DEX subscriptions pass through unchanged
+        other => other,
+    };
+
+    serde_json::to_string(&normalized).map_err(|e| Error::JsonParse(e.to_string()))
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -566,7 +636,10 @@ impl WsManager {
 
     fn get_identifier(message: &Message) -> Result<String> {
         match message {
-            Message::AllMids(_) => serde_json::to_string(&Subscription::AllMids)
+            // Note: For incoming messages, we don't know which DEX they belong to.
+            // The server routes messages based on the subscription, so we use None here.
+            // This matches the default subscription behavior.
+            Message::AllMids(_) => serde_json::to_string(&Subscription::AllMids { dex: None })
                 .map_err(|e| Error::JsonParse(e.to_string())),
             Message::User(_) => Ok("userEvents".to_string()),
             Message::UserFills(fills) => serde_json::to_string(&Subscription::UserFills {
@@ -579,17 +652,20 @@ impl WsManager {
                 } else {
                     serde_json::to_string(&Subscription::Trades {
                         coin: trades.data[0].coin.clone(),
+                        dex: None,
                     })
                     .map_err(|e| Error::JsonParse(e.to_string()))
                 }
             }
             Message::L2Book(l2_book) => serde_json::to_string(&Subscription::L2Book {
                 coin: l2_book.data.coin.clone(),
+                dex: None,
             })
             .map_err(|e| Error::JsonParse(e.to_string())),
             Message::Candle(candle) => serde_json::to_string(&Subscription::Candle {
                 coin: candle.data.coin.clone(),
                 interval: candle.data.interval.clone(),
+                dex: None,
             })
             .map_err(|e| Error::JsonParse(e.to_string())),
             Message::OrderUpdates(_) => Ok("orderUpdates".to_string()),
@@ -629,6 +705,7 @@ impl WsManager {
             }
             Message::Bbo(bbo) => serde_json::to_string(&Subscription::Bbo {
                 coin: bbo.data.coin.clone(),
+                dex: None,
             })
             .map_err(|e| Error::JsonParse(e.to_string())),
             Message::SubscriptionResponse | Message::Pong => Ok(String::default()),
@@ -776,7 +853,10 @@ impl WsManager {
         {
             "orderUpdates".to_string()
         } else {
-            identifier.clone()
+            // Normalize DEX subscriptions for consistent HashMap lookup keys.
+            // This strips the `dex` field so subscriptions with dex: Some("hyna")
+            // can be found when incoming messages produce keys with dex: None.
+            normalize_identifier(&identifier)?
         };
         let subscriptions = subscriptions
             .entry(identifier_entry.clone())
@@ -821,7 +901,8 @@ impl WsManager {
         {
             "orderUpdates".to_string()
         } else {
-            identifier.clone()
+            // Use same normalization as add_subscription for consistent lookup
+            normalize_identifier(&identifier)?
         };
 
         self.subscription_identifiers.remove(&subscription_id);

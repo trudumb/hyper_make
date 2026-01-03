@@ -73,7 +73,13 @@
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::estimator=debug timeout 20 cargo run:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::strategy::ladder_strat=debug,hyperliquid_rust_sdk::market_maker::quoting=debug timeout 30 cargo run:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk=debug timeout 25 cargo run:*)",
-      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=info timeout 35 cargo run:*)"
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker=info timeout 35 cargo run:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "mcp__serena__edit_memory",
+      "Bash(do)",
+      "Bash(echo:*)",
+      "mcp__serena__initial_instructions"
     ]
   }
 }

@@ -41,6 +41,86 @@ pub struct ExchangeClient {
     pub coin_to_asset: HashMap<String, u32>,
 }
 
+// ============================================================================
+// DEX Asset Mapping for HIP-3 Support
+// ============================================================================
+
+/// Asset mapping for a specific DEX.
+///
+/// This struct holds the coin-to-asset-index mapping for a particular DEX.
+/// For validator perps, `dex_name` is None.
+/// For HIP-3 builder DEXs, `dex_name` contains the DEX name (e.g., "hyena").
+///
+/// # Example
+/// ```ignore
+/// // Build asset map for Hyena DEX
+/// let hyena_map = DexAssetMap::build(&info_client, Some("hyena")).await?;
+///
+/// // Look up asset index for BTC on Hyena
+/// let btc_index = hyena_map.asset_index("BTC").ok_or("Asset not found")?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct DexAssetMap {
+    /// DEX name (None for validator perps)
+    pub dex_name: Option<String>,
+    /// Mapping from coin name to asset index
+    pub coin_to_asset: HashMap<String, u32>,
+}
+
+impl DexAssetMap {
+    /// Build an asset map for a specific DEX (or validator perps if None).
+    ///
+    /// # Arguments
+    /// - `info_client`: The InfoClient to use for fetching metadata
+    /// - `dex`: Optional DEX name. If None, builds map for validator perps.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Validator perps
+    /// let validator_map = DexAssetMap::build(&info_client, None).await?;
+    ///
+    /// // Hyena DEX
+    /// let hyena_map = DexAssetMap::build(&info_client, Some("hyena")).await?;
+    /// ```
+    pub async fn build(info_client: &InfoClient, dex: Option<&str>) -> Result<Self> {
+        let meta = info_client.meta_for_dex(dex).await?;
+        let coin_to_asset = meta
+            .universe
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.name.clone(), i as u32))
+            .collect();
+
+        Ok(Self {
+            dex_name: dex.map(String::from),
+            coin_to_asset,
+        })
+    }
+
+    /// Get asset index for a coin name.
+    #[inline]
+    pub fn asset_index(&self, coin: &str) -> Option<u32> {
+        self.coin_to_asset.get(coin).copied()
+    }
+
+    /// Check if a coin exists in this DEX.
+    #[inline]
+    pub fn has_coin(&self, coin: &str) -> bool {
+        self.coin_to_asset.contains_key(coin)
+    }
+
+    /// Get the number of assets in this DEX.
+    #[inline]
+    pub fn asset_count(&self) -> usize {
+        self.coin_to_asset.len()
+    }
+
+    /// Get the DEX display name (for logging).
+    pub fn display_name(&self) -> &str {
+        self.dex_name.as_deref().unwrap_or("validator")
+    }
+}
+
 // Security: Custom Debug implementation to prevent private key leakage
 impl std::fmt::Debug for ExchangeClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

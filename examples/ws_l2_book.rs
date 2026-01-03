@@ -14,6 +14,7 @@ async fn main() {
         .subscribe(
             Subscription::L2Book {
                 coin: "ETH".to_string(),
+                dex: None,
             },
             sender,
         )

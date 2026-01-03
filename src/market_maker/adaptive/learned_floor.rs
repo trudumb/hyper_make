@@ -183,7 +183,7 @@ impl LearnedSpreadFloor {
             * (precision_prior * self.prior_mean + precision_likelihood * ewma_mean);
 
         // Log update periodically
-        if self.n_observations % 50 == 0 {
+        if self.n_observations.is_multiple_of(50) {
             debug!(
                 n = self.n_observations,
                 as_realized_bps = as_realized * 10000.0,
@@ -203,7 +203,11 @@ impl LearnedSpreadFloor {
 
         let n = self.recent_observations.len() as f64;
         let mean: f64 = self.recent_observations.iter().sum::<f64>() / n;
-        let variance: f64 = self.recent_observations.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+        let variance: f64 = self
+            .recent_observations
+            .iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>()
             / (n - 1.0);
 
         variance.max(1e-12)
@@ -276,12 +280,12 @@ mod tests {
 
     fn default_floor() -> LearnedSpreadFloor {
         LearnedSpreadFloor::new(
-            0.0003,  // 3 bps maker fee
-            0.0003,  // 3 bps prior AS mean
-            0.0005,  // 5 bps prior AS std
-            1.5,     // 1.5σ risk margin
-            0.0001,  // 1 bp minimum
-            0.995,   // EWMA decay
+            0.0003, // 3 bps maker fee
+            0.0003, // 3 bps prior AS mean
+            0.0005, // 5 bps prior AS std
+            1.5,    // 1.5σ risk margin
+            0.0001, // 1 bp minimum
+            0.995,  // EWMA decay
         )
     }
 

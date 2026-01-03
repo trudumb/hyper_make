@@ -207,7 +207,7 @@ impl AdaptiveSpreadCalculator {
         self.last_spread = delta_final;
 
         // Log periodically
-        if self.quote_count % 100 == 0 {
+        if self.quote_count.is_multiple_of(100) {
             debug!(
                 quote_count = self.quote_count,
                 gamma_eff = %format!("{:.4}", gamma_eff),
@@ -269,11 +269,8 @@ impl AdaptiveSpreadCalculator {
         );
 
         // 3. Update fill rate controller
-        self.fill_controller.update(
-            1,
-            self.time_since_last_fill,
-            self.kappa.kappa(),
-        );
+        self.fill_controller
+            .update(1, self.time_since_last_fill, self.kappa.kappa());
         self.time_since_last_fill = 0.0;
 
         // 4. Update gamma weights based on PnL
@@ -288,7 +285,8 @@ impl AdaptiveSpreadCalculator {
             };
 
             let magnitude = (as_realized / self.config.as_prior_mean).abs().min(2.0);
-            self.gamma.update(&self.last_signals, pnl_gradient, magnitude);
+            self.gamma
+                .update(&self.last_signals, pnl_gradient, magnitude);
         }
 
         // Log fill
@@ -310,7 +308,8 @@ impl AdaptiveSpreadCalculator {
         self.time_since_last_fill += elapsed_secs;
 
         // Update fill rate controller (0 fills)
-        self.fill_controller.update(0, elapsed_secs, self.kappa.kappa());
+        self.fill_controller
+            .update(0, elapsed_secs, self.kappa.kappa());
 
         // If we're consistently not getting fills, nudge gamma down (tighter)
         if self.fill_controller.is_active()
@@ -353,9 +352,7 @@ impl AdaptiveSpreadCalculator {
     /// provides usable values IMMEDIATELY via reasonable priors.
     /// GLFT should use adaptive values even when not "warmed up".
     pub fn is_warmed_up(&self) -> bool {
-        self.floor.is_warmed_up()
-            && self.kappa.is_warmed_up()
-            && self.gamma.is_warmed_up()
+        self.floor.is_warmed_up() && self.kappa.is_warmed_up() && self.gamma.is_warmed_up()
     }
 
     /// Check if the system can provide reasonable estimates.
@@ -532,14 +529,16 @@ impl AdaptiveSpreadCalculator {
         self.kappa.increment_fill_count();
 
         // 3. Update fill rate controller
-        self.fill_controller.update(1, self.time_since_last_fill, book_kappa);
+        self.fill_controller
+            .update(1, self.time_since_last_fill, book_kappa);
         self.time_since_last_fill = 0.0;
 
         // 4. Update gamma weights based on PnL
         if !self.last_signals.is_empty() {
             let pnl_gradient = if pnl < 0.0 { 1.0 } else { -0.5 };
             let magnitude = (pnl.abs() / 0.0003).min(2.0); // Normalize by ~3 bps
-            self.gamma.update(&self.last_signals, pnl_gradient, magnitude);
+            self.gamma
+                .update(&self.last_signals, pnl_gradient, magnitude);
         }
 
         debug!(

@@ -18,13 +18,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use hyperliquid_rust_sdk::{
-    init_logging, AdverseSelectionConfig, BaseUrl, DataQualityConfig, DynamicRiskConfig,
-    EstimatorConfig, ExchangeClient, FundingConfig, GLFTStrategy, HawkesConfig,
-    HyperliquidExecutor, InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig,
-    LadderStrategy, LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig,
-    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
-    QuotingStrategy, ReconciliationConfig, RecoveryConfig, RejectionRateLimitConfig, RiskConfig,
-    SpreadConfig, StochasticConfig, SymmetricStrategy,
+    init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CollateralInfo,
+    DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, FundingConfig,
+    GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient, InventoryAwareStrategy,
+    KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig, LogConfig,
+    LogFormat as MmLogFormat, MarginConfig, MarketMaker, MarketMakerConfig as MmConfig,
+    MarketMakerMetricsRecorder, PnLConfig, QueueConfig, QuotingStrategy, ReconciliationConfig,
+    RecoveryConfig, RejectionRateLimitConfig, RiskConfig, SpreadConfig, StochasticConfig,
+    SymmetricStrategy,
 };
 
 // ============================================================================
@@ -103,6 +104,26 @@ struct Cli {
     /// Dry run mode: validate config and connect but don't place orders
     #[arg(long)]
     dry_run: bool,
+
+    // === HIP-3 Support Flags ===
+    /// Initial isolated margin allocation in USD for HIP-3 assets
+    /// Only used when trading builder-deployed assets
+    #[arg(long, default_value = "1000.0")]
+    initial_isolated_margin: f64,
+
+    /// Force isolated margin mode even for cross-capable assets
+    /// Useful for testing or when you want isolated-style risk
+    #[arg(long)]
+    force_isolated: bool,
+
+    /// HIP-3 DEX name (e.g., "hyena", "felix")
+    /// If not specified, trades on validator perps (default)
+    #[arg(long)]
+    dex: Option<String>,
+
+    /// List available HIP-3 DEXs and exit
+    #[arg(long)]
+    list_dexs: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -583,6 +604,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Handle --list-dexs flag (before normal startup)
+    if cli.list_dexs {
+        return list_available_dexs(&cli).await;
+    }
+
     // Load and merge configuration
     let config = load_config(&cli)?;
 
@@ -617,18 +643,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Query metadata to get sz_decimals (always needed for size precision)
     // Use with_reconnect to automatically reconnect if WebSocket disconnects
     let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
+
+    // Use DEX-specific metadata query if --dex is specified
+    let dex = cli.dex.clone();
+
+    // Auto-prefix asset with DEX name for HIP-3 DEXs
+    // API returns prefixed names like "hyna:BTC" for HIP-3 assets
+    let asset = if let Some(ref dex_name) = dex {
+        if asset.contains(':') {
+            // Already prefixed (e.g., "hyna:BTC"), use as-is
+            asset
+        } else {
+            // Auto-prefix: "BTC" + "hyna" → "hyna:BTC"
+            let prefixed = format!("{}:{}", dex_name, asset);
+            info!(
+                original = %asset,
+                prefixed = %prefixed,
+                dex = %dex_name,
+                "Auto-prefixed asset name for HIP-3 DEX"
+            );
+            prefixed
+        }
+    } else {
+        // No DEX specified, use plain asset name (validator perps)
+        asset
+    };
+
     let meta = info_client
-        .meta()
+        .meta_for_dex(dex.as_deref())
         .await
-        .map_err(|e| format!("Failed to get metadata: {e}"))?;
+        .map_err(|e| format!("Failed to get metadata for DEX '{}': {e}", dex.as_deref().unwrap_or("validator")))?;
 
     let asset_meta = meta
         .universe
         .iter()
         .find(|a| a.name == asset)
-        .ok_or_else(|| format!("Asset '{}' not found in metadata", asset))?;
+        .ok_or_else(|| {
+            format!(
+                "Asset '{}' not found in DEX '{}'. Use --list-dexs to see available DEXs.",
+                asset,
+                dex.as_deref().unwrap_or("validator")
+            )
+        })?;
 
     let sz_decimals = asset_meta.sz_decimals;
+
+    // Resolve collateral/quote asset for HIP-3 DEXs
+    // Different HIP-3 DEXs use different stablecoins: USDC, USDE, USDH, etc.
+    let collateral = if let Some(token_index) = meta.collateral_token {
+        // Fetch spot metadata to resolve token index to name/decimals
+        let spot_meta = info_client
+            .spot_meta()
+            .await
+            .map_err(|e| format!("Failed to get spot metadata for collateral resolution: {e}"))?;
+        let collateral_info = CollateralInfo::from_token_index(token_index, &spot_meta);
+        info!(
+            dex = %dex.as_deref().unwrap_or("validator"),
+            token_index = token_index,
+            symbol = %collateral_info.symbol,
+            "Resolved collateral token for DEX"
+        );
+        collateral_info
+    } else {
+        // No collateral_token in meta = validator perps = USDC
+        CollateralInfo::usdc()
+    };
+
+    // Log DEX selection with collateral info
+    if let Some(ref dex_name) = dex {
+        info!(
+            dex = %dex_name,
+            asset = %asset,
+            collateral = %collateral.symbol,
+            "Using HIP-3 DEX with collateral"
+        );
+    }
+
+    // Create runtime config from asset metadata (HIP-3 detection happens here, ONCE at startup)
+    let mut runtime_config = AssetRuntimeConfig::from_asset_meta(asset_meta);
+
+    // Handle --force-isolated flag: override is_cross to false
+    if cli.force_isolated && runtime_config.is_cross {
+        info!(
+            asset = %asset,
+            "Force isolated mode: overriding cross margin to isolated (--force-isolated)"
+        );
+        runtime_config.is_cross = false;
+    }
+
+    // Log HIP-3/margin status at startup
+    if runtime_config.is_hip3 {
+        info!(
+            asset = %asset,
+            is_hip3 = true,
+            is_cross = runtime_config.is_cross,
+            oi_cap_usd = %runtime_config.oi_cap_usd,
+            deployer = ?runtime_config.deployer,
+            "HIP-3 builder-deployed asset detected (isolated margin only)"
+        );
+    } else if cli.force_isolated {
+        info!(
+            asset = %asset,
+            is_hip3 = false,
+            is_cross = false,
+            "Standard validator perp using forced isolated margin mode"
+        );
+    } else {
+        info!(
+            asset = %asset,
+            is_hip3 = false,
+            is_cross = runtime_config.is_cross,
+            "Standard validator perp (cross margin supported)"
+        );
+    }
 
     // Use CLI/config leverage if specified, otherwise use max available from asset metadata
     let leverage = cli
@@ -672,7 +799,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Print startup banner
-    print_startup_banner(&asset, &base_url, cli.dry_run);
+    print_startup_banner(&asset, &collateral.symbol, &base_url, cli.dry_run);
 
     info!(
         asset = %asset,
@@ -709,15 +836,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create exchange client
-    let exchange_client = ExchangeClient::new(None, wallet.clone(), Some(base_url), None, None)
-        .await
-        .map_err(|e| format!("Failed to create exchange client: {e}"))?;
+    // Create exchange client (pass DEX-specific meta for HIP-3 support)
+    let exchange_client =
+        ExchangeClient::new(None, wallet.clone(), Some(base_url), Some(meta.clone()), None)
+            .await
+            .map_err(|e| format!("Failed to create exchange client: {e}"))?;
 
-    // Set leverage on the exchange
-    info!(leverage = leverage, asset = %asset, "Setting leverage on exchange");
+    // Set leverage on the exchange (use is_cross from runtime config for HIP-3 support)
+    info!(
+        leverage = leverage,
+        asset = %asset,
+        is_cross = runtime_config.is_cross,
+        "Setting leverage on exchange"
+    );
     match exchange_client
-        .update_leverage(leverage, &asset, true, None)
+        .update_leverage(leverage, &asset, runtime_config.is_cross, None)
         .await
     {
         Ok(response) => {
@@ -728,10 +861,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Query initial position
+    // Query initial position (use DEX-specific clearinghouse state for HIP-3)
     let user_address = wallet.address();
     let user_state = info_client
-        .user_state(user_address)
+        .user_state_for_dex(user_address, dex.as_deref())
         .await
         .map_err(|e| format!("Failed to get user state: {e}"))?;
     let initial_position = user_state
@@ -751,16 +884,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let asset_data_result = info_client
             .active_asset_data(user_address, asset.clone())
             .await;
-        let user_state_result = info_client.user_state(user_address).await;
 
-        match (asset_data_result, user_state_result) {
-            (Ok(asset_data), Ok(user_state)) => {
+        // For HIP-3 DEXs, collateral is in spot balance (USDE, USDH, etc.)
+        // For validator perps, collateral is in perps clearinghouse (USDC)
+        let account_value: f64 = if dex.is_some() {
+            // HIP-3: Get account value from spot balance
+            match info_client.user_token_balances(user_address).await {
+                Ok(balances) => collateral
+                    .available_balance_from_spot(&balances.balances)
+                    .unwrap_or(0.0),
+                Err(e) => {
+                    warn!("Failed to query spot balances for HIP-3: {e}, using 0");
+                    0.0
+                }
+            }
+        } else {
+            // Validator perps: Get account value from perps clearinghouse
+            match info_client.user_state(user_address).await {
+                Ok(state) => state.margin_summary.account_value.parse().unwrap_or(0.0),
+                Err(e) => {
+                    warn!("Failed to query user state: {e}, using 0");
+                    0.0
+                }
+            }
+        };
+
+        match asset_data_result {
+            Ok(asset_data) => {
                 let mark_px: f64 = asset_data.mark_px.parse().unwrap_or(1.0);
-                let account_value: f64 = user_state
-                    .margin_summary
-                    .account_value
-                    .parse()
-                    .unwrap_or(0.0);
 
                 // Calculate max position from account equity × leverage (we set leverage above)
                 // Use 50% safety factor to leave room for adverse moves
@@ -784,12 +935,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 (capped_liquidity, capped_max_pos)
             }
-            (Err(e), _) => {
+            Err(e) => {
                 tracing::warn!("Failed to query asset data: {e}, using config defaults");
-                (target_liquidity, max_position)
-            }
-            (_, Err(e)) => {
-                tracing::warn!("Failed to query user state: {e}, using config defaults");
                 (target_liquidity, max_position)
             }
         }
@@ -805,6 +952,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Dynamic risk config (position limit = min(equity × leverage, volatility-based))"
     );
 
+    // Initial isolated margin from CLI (default $1000)
+    let initial_isolated_margin = cli.initial_isolated_margin;
+
+    // Save collateral symbol for metrics before it's moved into config
+    let collateral_symbol = collateral.symbol.clone();
+
     // Create market maker config
     let mm_config = MmConfig {
         asset: Arc::from(asset.as_str()),
@@ -817,6 +970,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         multi_asset: false, // Single-asset mode by default
         stochastic: StochasticConfig::default(),
         smart_reconcile: true, // Enable queue-preserving ORDER MODIFY by default
+        // HIP-3 support: pre-computed runtime config for zero hot-path overhead
+        runtime: runtime_config,
+        initial_isolated_margin,
+        // HIP-3 DEX selection
+        dex: dex.clone(),
+        // Collateral/quote asset (USDC, USDE, USDH, etc.)
+        collateral,
     };
 
     // Create strategy based on config
@@ -960,6 +1120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.monitoring.enable_http_metrics && metrics_port > 0 {
         let prometheus = market_maker.prometheus().clone();
         let asset_for_metrics = asset.clone();
+        let quote_for_metrics = collateral_symbol.clone();
 
         tokio::spawn(async move {
             let app = Router::new().route(
@@ -967,7 +1128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 get(move || {
                     let prom = prometheus.clone();
                     let asset = asset_for_metrics.clone();
-                    async move { prom.to_prometheus_text(&asset) }
+                    let quote = quote_for_metrics.clone();
+                    async move { prom.to_prometheus_text(&asset, &quote) }
                 }),
             );
 
@@ -1122,7 +1284,7 @@ fn generate_sample_config(path: &str) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// Print startup banner with version and configuration summary.
-fn print_startup_banner(asset: &str, network: &BaseUrl, dry_run: bool) {
+fn print_startup_banner(asset: &str, quote_asset: &str, network: &BaseUrl, dry_run: bool) {
     let version = env!("CARGO_PKG_VERSION");
     let mode = if dry_run { " [DRY RUN]" } else { "" };
     let network_str = match network {
@@ -1142,8 +1304,64 @@ fn print_startup_banner(asset: &str, network: &BaseUrl, dry_run: bool) {
         "║  Asset:   {:<15}  Network: {:<15}   ║",
         asset, network_str
     );
+    eprintln!(
+        "║  Quote:   {:<15}                                ║",
+        quote_asset
+    );
     eprintln!("╚═══════════════════════════════════════════════════════════╝");
     eprintln!();
+}
+
+/// List available HIP-3 DEXs.
+async fn list_available_dexs(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(cli)?;
+    let base_url = parse_base_url(cli.network.as_ref().unwrap_or(&config.network.base_url))?;
+
+    println!("Connecting to {:?}...", base_url);
+
+    let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
+
+    // Query available DEXs
+    let dexs = info_client
+        .perp_dexs()
+        .await
+        .map_err(|e| format!("Failed to query DEXs: {e}"))?;
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  Available HIP-3 DEXs");
+    println!("═══════════════════════════════════════════════════════════");
+    println!();
+
+    let mut found_any = false;
+    for (idx, dex_opt) in dexs.iter().enumerate() {
+        if let Some(dex) = dex_opt {
+            found_any = true;
+            println!(
+                "  [{:>2}] {} - {}",
+                idx,
+                dex.name,
+                dex.full_name
+            );
+            println!("       Deployer: {}", dex.deployer);
+            if let Some(ref oracle) = dex.oracle_updater {
+                println!("       Oracle:   {}", oracle);
+            }
+            println!();
+        }
+    }
+
+    if !found_any {
+        println!("  No HIP-3 DEXs found on this network.");
+        println!();
+    }
+
+    println!("═══════════════════════════════════════════════════════════");
+    println!();
+    println!("Usage: cargo run --bin market_maker -- --asset BTC --dex <name>");
+    println!();
+
+    Ok(())
 }
 
 /// Show account status without starting the market maker.
@@ -1169,8 +1387,9 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
     let user_address = wallet.address();
 
-    // Get user state
-    let user_state = info_client.user_state(user_address).await?;
+    // Get user state (use DEX-specific clearinghouse state for HIP-3)
+    let dex = cli.dex.as_deref();
+    let user_state = info_client.user_state_for_dex(user_address, dex).await?;
 
     // Get open orders
     let open_orders = info_client.open_orders(user_address).await?;

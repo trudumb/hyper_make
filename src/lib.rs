@@ -38,6 +38,8 @@ pub use market_maker::{
     AdverseSelectionSummary,
     // Data Quality Monitoring
     AnomalyType,
+    // HIP-3 Runtime Config
+    AssetRuntimeConfig,
     // Tier 1: Liquidation Cascade
     CascadeDirection,
     // WebSocket Reconnection
@@ -139,7 +141,10 @@ pub use market_maker::{
     // Volatility Regime
     VolatilityRegime,
 };
-pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
+pub use meta::{
+    AssetContext, AssetMeta, CollateralInfo, Meta, MetaAndAssetCtxs, PerpDex, PerpDexLimits,
+    SpotAssetMeta, SpotMeta,
+};
 pub use serde_utils::hyperliquid_chain;
 pub use types::*;
 pub use ws::message_types::{

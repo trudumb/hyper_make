@@ -168,7 +168,7 @@ mod tests {
             &mut latest_mid,
         );
 
-        let ctx = MessageContext::new(Arc::from("BTC"), 0.0, 0.0, 1.0, false);
+        let ctx = MessageContext::new(Arc::from("BTC"), 0.0, 0.0, 1.0, false, Arc::from("USDC"));
 
         // Create AllMids with BTC mid price
         let mut mids = std::collections::HashMap::new();

@@ -1,7 +1,7 @@
 # Market Maker Architecture Overview
 
 **Project**: hyper_make (Hyperliquid Rust SDK with Market Maker)
-**Last Updated**: 2026-01-01
+**Last Updated**: 2026-01-02
 
 ## Core Components
 
@@ -116,6 +116,49 @@ Key parameters in `StochasticConfig`:
 - `tight_quoting_excluded_hours`: [7, 14] UTC
 
 See `session_2026-01-02_stochastic_constraints` for implementation details.
+
+## HIP-3 Multi-DEX Support
+
+### Auto-Prefix Feature (2026-01-02)
+Asset names are automatically prefixed with DEX name when `--dex` is specified:
+- `--asset BTC --dex hyna` → uses `hyna:BTC`
+- Location: `src/bin/market_maker.rs:649-669`
+
+### Core Implementation (Added 2026-01-02)
+
+The market maker supports trading on HIP-3 builder-deployed perpetuals:
+
+### New Types
+- `PerpDex`: DEX metadata (name, full_name, deployer, oracle_updater)
+- `PerpDexLimits`: Per-DEX OI caps and transfer limits
+- `DexAssetMap`: Per-DEX asset index mapping
+
+### CLI Flags
+```bash
+--dex <name>           # HIP-3 DEX name (e.g., "hyena", "felix")
+--list-dexs            # List available DEXs and exit
+--initial-isolated-margin <USD>  # Isolated margin for HIP-3 (default: 1000)
+--force-isolated       # Force isolated margin mode
+```
+
+### API Patterns
+```rust
+// DEX-specific metadata
+info_client.meta_for_dex(Some("hyena")).await?;
+info_client.perp_dexs().await?;
+info_client.perp_dex_limits("hyena").await?;
+
+// WebSocket with DEX context
+Subscription::AllMids { dex: Some("hyena".to_string()) }
+Subscription::L2Book { coin: "BTC".to_string(), dex: Some("hyena".to_string()) }
+```
+
+### Backward Compatibility
+- No `--dex` flag = validator perps (existing behavior)
+- `meta()` unchanged (calls `meta_for_dex(None)`)
+- Subscription variants work with `dex: None`
+
+See `session_2026-01-02_hip3_dex_support_complete` for full implementation details.
 
 ## Important Constants
 

@@ -40,7 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let address: Address = address_str.parse()?;
-    let network = if use_testnet { BaseUrl::Testnet } else { BaseUrl::Mainnet };
+    let network = if use_testnet {
+        BaseUrl::Testnet
+    } else {
+        BaseUrl::Mainnet
+    };
     let network_name = if use_testnet { "TESTNET" } else { "MAINNET" };
 
     println!("\n═══════════════════════════════════════════════════════════");
@@ -56,14 +60,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Display margin summary
     println!("📊 Account Summary:");
-    println!("   Account Value:     ${}", user_state.margin_summary.account_value);
-    println!("   Total Margin Used: ${}", user_state.margin_summary.total_margin_used);
-    println!("   Total Position:    ${}", user_state.margin_summary.total_ntl_pos);
+    println!(
+        "   Account Value:     ${}",
+        user_state.margin_summary.account_value
+    );
+    println!(
+        "   Total Margin Used: ${}",
+        user_state.margin_summary.total_margin_used
+    );
+    println!(
+        "   Total Position:    ${}",
+        user_state.margin_summary.total_ntl_pos
+    );
     println!("   Withdrawable:      ${}", user_state.withdrawable);
     println!();
 
     // Display positions
-    let positions: Vec<_> = user_state.asset_positions
+    let positions: Vec<_> = user_state
+        .asset_positions
         .iter()
         .filter(|p| p.position.szi.parse::<f64>().unwrap_or(0.0).abs() > 1e-9)
         .collect();
@@ -72,14 +86,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📭 No open positions\n");
     } else {
         println!("📈 Open Positions ({}):", positions.len());
-        println!("   {:<6} {:>12} {:>12} {:>12} {:>12} {:>10}",
-            "Asset", "Size", "Entry", "Mark", "PnL", "Leverage");
+        println!(
+            "   {:<6} {:>12} {:>12} {:>12} {:>12} {:>10}",
+            "Asset", "Size", "Entry", "Mark", "PnL", "Leverage"
+        );
         println!("   {}", "-".repeat(72));
 
         for p in &positions {
             let pos = &p.position;
             let size: f64 = pos.szi.parse().unwrap_or(0.0);
-            let entry: f64 = pos.entry_px.as_ref()
+            let entry: f64 = pos
+                .entry_px
+                .as_ref()
                 .map(|s| s.parse().unwrap_or(0.0))
                 .unwrap_or(0.0);
             let pnl: f64 = pos.unrealized_pnl.parse().unwrap_or(0.0);
@@ -87,7 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Get mark price (position_value / size)
             let pos_value: f64 = pos.position_value.parse().unwrap_or(0.0);
-            let mark = if size.abs() > 1e-9 { pos_value / size.abs() } else { 0.0 };
+            let mark = if size.abs() > 1e-9 {
+                pos_value / size.abs()
+            } else {
+                0.0
+            };
 
             let pnl_str = if pnl >= 0.0 {
                 format!("+${:.2}", pnl)
@@ -95,7 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("-${:.2}", pnl.abs())
             };
 
-            println!("   {:<6} {:>12.5} {:>12.2} {:>12.2} {:>12} {:>10}",
+            println!(
+                "   {:<6} {:>12.5} {:>12.2} {:>12.2} {:>12} {:>10}",
                 pos.coin,
                 size,
                 entry,
@@ -114,17 +137,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("📭 No open orders\n");
     } else {
         println!("📋 Open Orders ({}):", open_orders.len());
-        println!("   {:<6} {:>6} {:>12} {:>12} {:>16}",
-            "Asset", "Side", "Size", "Price", "OID");
+        println!(
+            "   {:<6} {:>6} {:>12} {:>12} {:>16}",
+            "Asset", "Side", "Size", "Price", "OID"
+        );
         println!("   {}", "-".repeat(58));
 
         for order in &open_orders {
-            println!("   {:<6} {:>6} {:>12} {:>12} {:>16}",
-                order.coin,
-                order.side,
-                order.sz,
-                order.limit_px,
-                order.oid
+            println!(
+                "   {:<6} {:>6} {:>12} {:>12} {:>16}",
+                order.coin, order.side, order.sz, order.limit_px, order.oid
             );
         }
         println!();

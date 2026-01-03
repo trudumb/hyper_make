@@ -575,9 +575,13 @@ impl PrometheusMetrics {
     // === Getters ===
 
     /// Get all metrics as Prometheus text format.
-    pub fn to_prometheus_text(&self, asset: &str) -> String {
+    ///
+    /// # Arguments
+    /// * `asset` - The trading asset (e.g., "BTC", "hyna:BTC")
+    /// * `quote_asset` - The collateral/quote asset (e.g., "USDC", "USDE", "USDH")
+    pub fn to_prometheus_text(&self, asset: &str, quote_asset: &str) -> String {
         let uptime_secs = self.inner.start_time.elapsed().as_secs_f64();
-        let labels = format!("asset=\"{}\"", asset);
+        let labels = format!("asset=\"{}\",quote=\"{}\"", asset, quote_asset);
 
         let mut output = String::with_capacity(4096);
 
@@ -1293,11 +1297,24 @@ mod tests {
         metrics.update_position(1.0, 10.0);
         metrics.update_market(50000.0, 5.0, 0.001, 1.2, 500.0);
 
-        let output = metrics.to_prometheus_text("BTC");
+        let output = metrics.to_prometheus_text("BTC", "USDC");
 
-        assert!(output.contains("mm_position{asset=\"BTC\"}"));
-        assert!(output.contains("mm_mid_price{asset=\"BTC\"}"));
+        assert!(output.contains("mm_position{asset=\"BTC\",quote=\"USDC\"}"));
+        assert!(output.contains("mm_mid_price{asset=\"BTC\",quote=\"USDC\"}"));
         assert!(output.contains("# TYPE mm_position gauge"));
+    }
+
+    #[test]
+    fn test_prometheus_output_hip3_collateral() {
+        let metrics = PrometheusMetrics::new();
+        metrics.update_position(1.0, 10.0);
+        metrics.update_market(50000.0, 5.0, 0.001, 1.2, 500.0);
+
+        // Test with HIP-3 collateral (USDE)
+        let output = metrics.to_prometheus_text("hyna:BTC", "USDE");
+
+        assert!(output.contains("mm_position{asset=\"hyna:BTC\",quote=\"USDE\"}"));
+        assert!(output.contains("mm_mid_price{asset=\"hyna:BTC\",quote=\"USDE\"}"));
     }
 
     #[test]

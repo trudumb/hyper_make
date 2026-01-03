@@ -468,15 +468,15 @@ impl Default for MarketParams {
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
             // Adaptive Bayesian System
-            use_adaptive_spreads: false,      // Default OFF for safety
-            adaptive_spread_floor: 0.0008,    // 8 bps fallback floor
-            adaptive_kappa: 100.0,            // Moderate kappa fallback
-            adaptive_gamma: 0.3,              // Base gamma fallback
+            use_adaptive_spreads: false,       // Default OFF for safety
+            adaptive_spread_floor: 0.0008,     // 8 bps fallback floor
+            adaptive_kappa: 100.0,             // Moderate kappa fallback
+            adaptive_gamma: 0.3,               // Base gamma fallback
             adaptive_spread_ceiling: f64::MAX, // No ceiling by default
-            adaptive_warmed_up: false,        // Not warmed up initially
-            adaptive_can_estimate: true,      // Can estimate immediately via priors
-            adaptive_warmup_progress: 0.0,    // Start at 0% progress
-            adaptive_uncertainty_factor: 1.2, // Start with 20% wider spreads
+            adaptive_warmed_up: false,         // Not warmed up initially
+            adaptive_can_estimate: true,       // Can estimate immediately via priors
+            adaptive_warmup_progress: 0.0,     // Start at 0% progress
+            adaptive_uncertainty_factor: 1.2,  // Start with 20% wider spreads
         }
     }
 }

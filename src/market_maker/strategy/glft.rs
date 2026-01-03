@@ -305,40 +305,41 @@ impl QuotingStrategy for GLFTStrategy {
         //
         // KEY FIX: Use `adaptive_can_estimate` - our Bayesian priors give reasonable
         // kappa estimates immediately (κ=2500 prior for liquid markets).
-        let (kappa, kappa_bid, kappa_ask) =
-            if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
-                // Adaptive kappa: blended from book depth + own fill experience
-                // Already incorporates fill rate information via Bayesian update
-                let k = market_params.adaptive_kappa;
-                debug!(
-                    adaptive_kappa = %format!("{:.0}", k),
-                    book_kappa = %format!("{:.0}", market_params.kappa),
-                    warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-                    "Using ADAPTIVE kappa (blended book + own fills)"
-                );
-                // For now, use symmetric kappa (directional can be added later)
-                (k, k, k)
+        let (kappa, kappa_bid, kappa_ask) = if market_params.use_adaptive_spreads
+            && market_params.adaptive_can_estimate
+        {
+            // Adaptive kappa: blended from book depth + own fill experience
+            // Already incorporates fill rate information via Bayesian update
+            let k = market_params.adaptive_kappa;
+            debug!(
+                adaptive_kappa = %format!("{:.0}", k),
+                book_kappa = %format!("{:.0}", market_params.kappa),
+                warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+                "Using ADAPTIVE kappa (blended book + own fills)"
+            );
+            // For now, use symmetric kappa (directional can be added later)
+            (k, k, k)
+        } else {
+            // Legacy: Book-based kappa with AS and heavy-tail adjustments
+            // Theory: Informed flow reduces effective supply of uninformed liquidity.
+            // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
+            let alpha = market_params.predicted_alpha.min(0.5); // Cap at 50% AS
+
+            // Heavy-tail adjustment: when CV > 1.2, reduce kappa
+            let tail_multiplier = if market_params.is_heavy_tailed {
+                (2.0 - market_params.kappa_cv).clamp(0.5, 1.0)
             } else {
-                // Legacy: Book-based kappa with AS and heavy-tail adjustments
-                // Theory: Informed flow reduces effective supply of uninformed liquidity.
-                // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
-                let alpha = market_params.predicted_alpha.min(0.5); // Cap at 50% AS
-
-                // Heavy-tail adjustment: when CV > 1.2, reduce kappa
-                let tail_multiplier = if market_params.is_heavy_tailed {
-                    (2.0 - market_params.kappa_cv).clamp(0.5, 1.0)
-                } else {
-                    1.0
-                };
-
-                // Symmetric kappa (for skew and logging)
-                let k = market_params.kappa * (1.0 - alpha) * tail_multiplier;
-
-                // Directional kappas for asymmetric GLFT spreads
-                let k_bid = market_params.kappa_bid * (1.0 - alpha) * tail_multiplier;
-                let k_ask = market_params.kappa_ask * (1.0 - alpha) * tail_multiplier;
-                (k, k_bid, k_ask)
+                1.0
             };
+
+            // Symmetric kappa (for skew and logging)
+            let k = market_params.kappa * (1.0 - alpha) * tail_multiplier;
+
+            // Directional kappas for asymmetric GLFT spreads
+            let k_bid = market_params.kappa_bid * (1.0 - alpha) * tail_multiplier;
+            let k_ask = market_params.kappa_ask * (1.0 - alpha) * tail_multiplier;
+            (k, k_bid, k_ask)
+        };
 
         // Time horizon from arrival intensity: T = 1/λ (with max cap)
         let time_horizon = self.holding_time(market_params.arrival_intensity);
@@ -441,7 +442,8 @@ impl QuotingStrategy for GLFTStrategy {
         //
         // KEY FIX: Use `adaptive_can_estimate` - our Bayesian prior gives reasonable
         // floor estimates immediately (fees + 3bps AS prior + safety margin ≈ 8-10 bps).
-        let effective_floor = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate
+        let effective_floor = if market_params.use_adaptive_spreads
+            && market_params.adaptive_can_estimate
         {
             // Adaptive floor: learned from actual fill AS + fees + safety buffer
             // During warmup, the prior-based floor is already conservative (fees + 3bps + 1.5σ)

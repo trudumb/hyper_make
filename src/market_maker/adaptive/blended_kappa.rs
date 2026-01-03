@@ -162,7 +162,7 @@ impl BlendedKappaEstimator {
         self.own_beta = self.prior_strength / self.prior_mean + sum_distance;
 
         // Log periodically
-        if self.own_fill_count % 20 == 0 {
+        if self.own_fill_count.is_multiple_of(20) {
             debug!(
                 own_fill_count = self.own_fill_count,
                 own_kappa = self.own_kappa(),
@@ -369,11 +369,11 @@ mod tests {
 
     fn default_blended() -> BlendedKappaEstimator {
         BlendedKappaEstimator::new(
-            2500.0, // prior_mean: 4 bps avg distance
-            5.0,    // prior_strength
-            10,     // blend_min_fills
-            5.0,    // blend_scale
-            0.8,    // warmup_factor
+            2500.0,  // prior_mean: 4 bps avg distance
+            5.0,     // prior_strength
+            10,      // blend_min_fills
+            5.0,     // blend_scale
+            0.8,     // warmup_factor
             300_000, // 5 min window
         )
     }

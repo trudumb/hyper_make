@@ -304,7 +304,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Sync position from exchange - the exchange is the authoritative source.
     async fn sync_position_from_exchange(&mut self) -> Result<()> {
-        let user_state = self.info_client.user_state(self.user_address).await?;
+        let user_state = self
+            .info_client
+            .user_state_for_dex(self.user_address, self.config.dex.as_deref())
+            .await?;
 
         // Find position for our asset
         let exchange_position = user_state
@@ -426,26 +429,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             )
             .await?;
 
-        // Subscribe to AllMids for price updates
-        self.info_client
-            .subscribe(Subscription::AllMids, sender.clone())
-            .await?;
-
-        // Subscribe to Trades for volatility and arrival intensity estimation
+        // Subscribe to AllMids for price updates (DEX-aware for HIP-3)
         self.info_client
             .subscribe(
-                Subscription::Trades {
-                    coin: self.config.asset.to_string(),
+                Subscription::AllMids {
+                    dex: self.config.dex.clone(),
                 },
                 sender.clone(),
             )
             .await?;
 
-        // Subscribe to L2Book for kappa (order book depth decay) estimation
+        // Subscribe to Trades for volatility and arrival intensity estimation (DEX-aware)
+        self.info_client
+            .subscribe(
+                Subscription::Trades {
+                    coin: self.config.asset.to_string(),
+                    dex: self.config.dex.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to L2Book for kappa (order book depth decay) estimation (DEX-aware)
         self.info_client
             .subscribe(
                 Subscription::L2Book {
                     coin: self.config.asset.to_string(),
+                    dex: self.config.dex.clone(),
                 },
                 sender.clone(),
             )
@@ -602,7 +612,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Log Prometheus output (for scraping or debugging)
                     debug!(
-                        prometheus_output = %self.infra.prometheus.to_prometheus_text(&self.config.asset),
+                        prometheus_output = %self.infra.prometheus.to_prometheus_text(&self.config.asset, &self.config.collateral.symbol),
                         "Prometheus metrics snapshot"
                     );
 
@@ -653,6 +663,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.position.position(),
             self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
+            Arc::from(self.config.collateral.symbol.as_str()),
         );
 
         let mut state = messages::AllMidsState {
@@ -685,6 +696,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.position.position(),
             self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
+            Arc::from(self.config.collateral.symbol.as_str()),
         );
 
         let mut state = messages::TradesState {
@@ -722,6 +734,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.position.position(),
             self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
+            Arc::from(self.config.collateral.symbol.as_str()),
         );
 
         // Create fill state for the processor
@@ -878,6 +891,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.position.position(),
             self.effective_max_position, // First-principles limit
             self.estimator.is_warmed_up(),
+            Arc::from(self.config.collateral.symbol.as_str()),
         );
 
         let mut state = messages::L2BookState {
@@ -993,6 +1007,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     async fn update_quotes(&mut self) -> Result<()> {
         // Don't place orders until estimator is warmed up
         if !self.estimator.is_warmed_up() {
+            return Ok(());
+        }
+
+        // HIP-3: OI cap pre-flight check (fast path for unlimited)
+        // This is on the hot path, so we use pre-computed values from runtime config
+        let current_position_notional = self.position.position().abs() * self.latest_mid;
+        let remaining_oi_capacity = self
+            .config
+            .runtime
+            .remaining_oi_capacity(current_position_notional);
+
+        if remaining_oi_capacity < MIN_ORDER_NOTIONAL {
+            warn!(
+                oi_cap_usd = %self.config.runtime.oi_cap_usd,
+                current_notional = %format!("{:.2}", current_position_notional),
+                "HIP-3 OI cap reached, skipping quotes"
+            );
             return Ok(());
         }
 
@@ -1941,275 +1972,273 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .proactive_rate_tracker
                     .record_call(1, num_modifies);
 
-            // Track OID remaps for summary logging
-            let mut oid_remap_count = 0u32;
-            let mut modify_success_count = 0u32;
+                // Track OID remaps for summary logging
+                let mut oid_remap_count = 0u32;
+                let mut modify_success_count = 0u32;
 
-            // Process modify results
-            for (i, result) in modify_results.iter().enumerate() {
-                let spec = &all_modifies[i];
-                if result.success {
-                    // CRITICAL FIX: Hyperliquid modify can return NEW OID.
-                    // The exchange may assign a new order ID on price change.
-                    // We must re-key our tracking to use the new OID.
-                    let effective_oid = if result.oid > 0 && result.oid != spec.oid {
-                        // OID changed - re-key the order in tracking
-                        if self.orders.replace_oid(spec.oid, result.oid) {
-                            // Log at DEBUG to reduce verbosity - summary logged at end of cycle
-                            debug!(
-                                old_oid = spec.oid,
-                                new_oid = result.oid,
-                                "OID remapped"
-                            );
-                            oid_remap_count += 1;
-                        }
-                        result.oid
+                // Process modify results
+                for (i, result) in modify_results.iter().enumerate() {
+                    let spec = &all_modifies[i];
+                    if result.success {
+                        // CRITICAL FIX: Hyperliquid modify can return NEW OID.
+                        // The exchange may assign a new order ID on price change.
+                        // We must re-key our tracking to use the new OID.
+                        let effective_oid = if result.oid > 0 && result.oid != spec.oid {
+                            // OID changed - re-key the order in tracking
+                            if self.orders.replace_oid(spec.oid, result.oid) {
+                                // Log at DEBUG to reduce verbosity - summary logged at end of cycle
+                                debug!(old_oid = spec.oid, new_oid = result.oid, "OID remapped");
+                                oid_remap_count += 1;
+                            }
+                            result.oid
+                        } else {
+                            spec.oid
+                        };
+
+                        // Update tracking with new price/size using the effective OID
+                        self.orders
+                            .on_modify_success(effective_oid, spec.new_price, spec.new_size);
+                        // Record successful modify in metrics
+                        self.infra.prometheus.record_order_modified();
+                        modify_success_count += 1;
                     } else {
-                        spec.oid
-                    };
+                        // Modify failed - fallback to cancel+place
+                        warn!(
+                            oid = spec.oid,
+                            error = ?result.error,
+                            "Modify failed, falling back to cancel+place"
+                        );
+                        // Record fallback in metrics
+                        self.infra.prometheus.record_modify_fallback();
 
-                    // Update tracking with new price/size using the effective OID
-                    self.orders
-                        .on_modify_success(effective_oid, spec.new_price, spec.new_size);
-                    // Record successful modify in metrics
-                    self.infra.prometheus.record_order_modified();
-                    modify_success_count += 1;
-                } else {
-                    // Modify failed - fallback to cancel+place
-                    warn!(
-                        oid = spec.oid,
-                        error = ?result.error,
-                        "Modify failed, falling back to cancel+place"
-                    );
-                    // Record fallback in metrics
-                    self.infra.prometheus.record_modify_fallback();
+                        // Check if the error indicates order is already filled or canceled.
+                        // CRITICAL FIX: Check "canceled" FIRST because the error message
+                        // "Cannot modify canceled or filled order" contains BOTH words.
+                        // We need to handle canceled orders (remove from tracking) differently
+                        // from filled orders (wait for WS fill notification).
+                        let error_msg = result.error.as_deref().unwrap_or("");
+                        let is_already_canceled = error_msg.contains("canceled");
+                        let is_already_filled =
+                            !is_already_canceled && error_msg.contains("filled");
 
-                    // Check if the error indicates order is already filled or canceled.
-                    // CRITICAL FIX: Check "canceled" FIRST because the error message
-                    // "Cannot modify canceled or filled order" contains BOTH words.
-                    // We need to handle canceled orders (remove from tracking) differently
-                    // from filled orders (wait for WS fill notification).
-                    let error_msg = result.error.as_deref().unwrap_or("");
-                    let is_already_canceled = error_msg.contains("canceled");
-                    let is_already_filled = !is_already_canceled && error_msg.contains("filled");
-
-                    if is_already_canceled {
-                        // Order was already canceled - remove from tracking
-                        debug!(
+                        if is_already_canceled {
+                            // Order was already canceled - remove from tracking
+                            debug!(
                             oid = spec.oid,
                             "Modify failed because order already canceled - removing from tracking"
                         );
-                        self.orders.remove_order(spec.oid);
-                        continue;
-                    }
-
-                    if is_already_filled {
-                        // Order was filled - mark as FilledImmediately so it's excluded
-                        // from future reconciliation until WS fill arrives
-                        debug!(
-                            oid = spec.oid,
-                            "Modify failed because order already filled - marking for WS fill"
-                        );
-                        // Transition to FilledImmediately - this removes it from is_active()
-                        // so get_all_by_side won't include it in future modify attempts
-                        if let Some(order) = self.orders.get_order_mut(spec.oid) {
-                            order.transition_to(OrderState::FilledImmediately);
-                        }
-                        continue;
-                    }
-
-                    // Neither canceled nor filled - proceed with cancel+place fallback
-                    // (This handles other errors like "Order not found", rate limits, etc.)
-
-                    // Initiate cancel in OrderManager BEFORE sending to exchange
-                    // This properly transitions state and prevents stale tracking
-                    self.orders.initiate_cancel(spec.oid);
-
-                    // Cancel the order on exchange
-                    let cancel_result = self
-                        .executor
-                        .cancel_order(&self.config.asset, spec.oid)
-                        .await;
-
-                    // Update OrderManager based on cancel result
-                    match cancel_result {
-                        CancelResult::Cancelled | CancelResult::AlreadyCancelled => {
-                            self.orders.on_cancel_confirmed(spec.oid);
-                        }
-                        CancelResult::AlreadyFilled => {
-                            // Order was filled during our cancel attempt
-                            // Mark it appropriately and wait for WS fill
-                            self.orders.on_cancel_already_filled(spec.oid);
-                            debug!(
-                                oid = spec.oid,
-                                "Cancel in modify fallback found order already filled"
-                            );
-                            continue; // Don't place replacement order
-                        }
-                        CancelResult::Failed => {
-                            // Cancel failed - order may still be active
-                            // Revert state and don't place replacement to avoid duplicates
-                            self.orders.on_cancel_failed(spec.oid);
-                            warn!(
-                                oid = spec.oid,
-                                "Cancel failed in modify fallback - not placing replacement"
-                            );
+                            self.orders.remove_order(spec.oid);
                             continue;
                         }
-                    }
 
-                    // Place new order at target price/size with proper tracking
-                    let side = if spec.is_buy { Side::Buy } else { Side::Sell };
-                    let cloid = uuid::Uuid::new_v4().to_string();
+                        if is_already_filled {
+                            // Order was filled - mark as FilledImmediately so it's excluded
+                            // from future reconciliation until WS fill arrives
+                            debug!(
+                                oid = spec.oid,
+                                "Modify failed because order already filled - marking for WS fill"
+                            );
+                            // Transition to FilledImmediately - this removes it from is_active()
+                            // so get_all_by_side won't include it in future modify attempts
+                            if let Some(order) = self.orders.get_order_mut(spec.oid) {
+                                order.transition_to(OrderState::FilledImmediately);
+                            }
+                            continue;
+                        }
 
-                    // Pre-register as pending BEFORE API call (consistent with bulk order flow)
-                    self.orders.add_pending_with_cloid(
-                        side,
-                        spec.new_price,
-                        spec.new_size,
-                        cloid.clone(),
-                    );
+                        // Neither canceled nor filled - proceed with cancel+place fallback
+                        // (This handles other errors like "Order not found", rate limits, etc.)
 
-                    // Phase 7: Register expected CLOID with orphan tracker BEFORE API call
-                    self.infra
-                        .orphan_tracker
-                        .register_expected_cloids(std::slice::from_ref(&cloid));
+                        // Initiate cancel in OrderManager BEFORE sending to exchange
+                        // This properly transitions state and prevents stale tracking
+                        self.orders.initiate_cancel(spec.oid);
 
-                    // Pass the pre-registered CLOID to place_order for deterministic matching.
-                    // This ensures the pending order is finalized with the correct OID.
-                    let place_result = self
-                        .executor
-                        .place_order(
-                            &self.config.asset,
+                        // Cancel the order on exchange
+                        let cancel_result = self
+                            .executor
+                            .cancel_order(&self.config.asset, spec.oid)
+                            .await;
+
+                        // Update OrderManager based on cancel result
+                        match cancel_result {
+                            CancelResult::Cancelled | CancelResult::AlreadyCancelled => {
+                                self.orders.on_cancel_confirmed(spec.oid);
+                            }
+                            CancelResult::AlreadyFilled => {
+                                // Order was filled during our cancel attempt
+                                // Mark it appropriately and wait for WS fill
+                                self.orders.on_cancel_already_filled(spec.oid);
+                                debug!(
+                                    oid = spec.oid,
+                                    "Cancel in modify fallback found order already filled"
+                                );
+                                continue; // Don't place replacement order
+                            }
+                            CancelResult::Failed => {
+                                // Cancel failed - order may still be active
+                                // Revert state and don't place replacement to avoid duplicates
+                                self.orders.on_cancel_failed(spec.oid);
+                                warn!(
+                                    oid = spec.oid,
+                                    "Cancel failed in modify fallback - not placing replacement"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Place new order at target price/size with proper tracking
+                        let side = if spec.is_buy { Side::Buy } else { Side::Sell };
+                        let cloid = uuid::Uuid::new_v4().to_string();
+
+                        // Pre-register as pending BEFORE API call (consistent with bulk order flow)
+                        self.orders.add_pending_with_cloid(
+                            side,
                             spec.new_price,
                             spec.new_size,
-                            spec.is_buy,
-                            Some(cloid.clone()),
-                        )
-                        .await;
+                            cloid.clone(),
+                        );
 
-                    // Finalize tracking based on placement result
-                    if place_result.oid > 0 {
-                        // Phase 7: Record OID for CLOID in orphan tracker
+                        // Phase 7: Register expected CLOID with orphan tracker BEFORE API call
                         self.infra
                             .orphan_tracker
-                            .record_oid_for_cloid(&cloid, place_result.oid);
+                            .register_expected_cloids(std::slice::from_ref(&cloid));
 
-                        if place_result.filled {
-                            // Filled immediately - calculate actual fill vs resting
-                            self.orders.remove_pending_by_cloid(&cloid);
-                            // Phase 7: Mark as finalized
-                            self.infra
-                                .orphan_tracker
-                                .mark_finalized(&cloid, place_result.oid);
-
-                            let resting_size = place_result.resting_size;
-                            let actual_fill = if resting_size < EPSILON {
-                                spec.new_size // Fully filled
-                            } else {
-                                spec.new_size - resting_size // Partial immediate fill
-                            };
-
-                            self.position.process_fill(actual_fill, spec.is_buy);
-
-                            // Register immediate fill amount for WS deduplication
-                            self.safety
-                                .fill_processor
-                                .pre_register_immediate_fill(place_result.oid, actual_fill);
-
-                            let mut tracked = TrackedOrder::with_cloid(
-                                place_result.oid,
-                                cloid.clone(),
-                                side,
+                        // Pass the pre-registered CLOID to place_order for deterministic matching.
+                        // This ensures the pending order is finalized with the correct OID.
+                        let place_result = self
+                            .executor
+                            .place_order(
+                                &self.config.asset,
                                 spec.new_price,
                                 spec.new_size,
-                            );
-                            tracked.filled = actual_fill;
+                                spec.is_buy,
+                                Some(cloid.clone()),
+                            )
+                            .await;
 
-                            // Determine correct state based on fill completeness
-                            if resting_size > EPSILON {
-                                // Partial fill - use PartialFilled so order is included in reconciliation
-                                tracked.transition_to(OrderState::PartialFilled);
-                                tracked.size = resting_size; // Track resting portion
-                                info!(
-                                    oid = place_result.oid,
-                                    price = spec.new_price,
-                                    filled = actual_fill,
-                                    resting = resting_size,
-                                    "Modify fallback order partially filled"
+                        // Finalize tracking based on placement result
+                        if place_result.oid > 0 {
+                            // Phase 7: Record OID for CLOID in orphan tracker
+                            self.infra
+                                .orphan_tracker
+                                .record_oid_for_cloid(&cloid, place_result.oid);
+
+                            if place_result.filled {
+                                // Filled immediately - calculate actual fill vs resting
+                                self.orders.remove_pending_by_cloid(&cloid);
+                                // Phase 7: Mark as finalized
+                                self.infra
+                                    .orphan_tracker
+                                    .mark_finalized(&cloid, place_result.oid);
+
+                                let resting_size = place_result.resting_size;
+                                let actual_fill = if resting_size < EPSILON {
+                                    spec.new_size // Fully filled
+                                } else {
+                                    spec.new_size - resting_size // Partial immediate fill
+                                };
+
+                                self.position.process_fill(actual_fill, spec.is_buy);
+
+                                // Register immediate fill amount for WS deduplication
+                                self.safety
+                                    .fill_processor
+                                    .pre_register_immediate_fill(place_result.oid, actual_fill);
+
+                                let mut tracked = TrackedOrder::with_cloid(
+                                    place_result.oid,
+                                    cloid.clone(),
+                                    side,
+                                    spec.new_price,
+                                    spec.new_size,
                                 );
+                                tracked.filled = actual_fill;
+
+                                // Determine correct state based on fill completeness
+                                if resting_size > EPSILON {
+                                    // Partial fill - use PartialFilled so order is included in reconciliation
+                                    tracked.transition_to(OrderState::PartialFilled);
+                                    tracked.size = resting_size; // Track resting portion
+                                    info!(
+                                        oid = place_result.oid,
+                                        price = spec.new_price,
+                                        filled = actual_fill,
+                                        resting = resting_size,
+                                        "Modify fallback order partially filled"
+                                    );
+                                } else {
+                                    // Fully filled - use FilledImmediately for WS dedup
+                                    tracked.transition_to(OrderState::FilledImmediately);
+                                    info!(
+                                        oid = place_result.oid,
+                                        price = spec.new_price,
+                                        size = spec.new_size,
+                                        "Modify fallback order filled immediately"
+                                    );
+                                }
+
+                                self.orders.add_order(tracked);
                             } else {
-                                // Fully filled - use FilledImmediately for WS dedup
-                                tracked.transition_to(OrderState::FilledImmediately);
-                                info!(
+                                // Resting - finalize pending to tracked
+                                self.orders.finalize_pending_by_cloid(
+                                    &cloid,
+                                    place_result.oid,
+                                    place_result.resting_size,
+                                );
+                                // Phase 7: Mark as finalized
+                                self.infra
+                                    .orphan_tracker
+                                    .mark_finalized(&cloid, place_result.oid);
+                                debug!(
                                     oid = place_result.oid,
                                     price = spec.new_price,
                                     size = spec.new_size,
-                                    "Modify fallback order filled immediately"
+                                    "Modify fallback order placed and tracked"
                                 );
                             }
-
-                            self.orders.add_order(tracked);
                         } else {
-                            // Resting - finalize pending to tracked
-                            self.orders.finalize_pending_by_cloid(
-                                &cloid,
-                                place_result.oid,
-                                place_result.resting_size,
-                            );
-                            // Phase 7: Mark as finalized
-                            self.infra
-                                .orphan_tracker
-                                .mark_finalized(&cloid, place_result.oid);
-                            debug!(
-                                oid = place_result.oid,
+                            // Order placement failed - remove from pending
+                            self.orders.remove_pending_by_cloid(&cloid);
+                            // Phase 7: Mark CLOID as failed
+                            self.infra.orphan_tracker.mark_failed(&cloid);
+                            warn!(
                                 price = spec.new_price,
                                 size = spec.new_size,
-                                "Modify fallback order placed and tracked"
+                                error = ?place_result.error,
+                                "Modify fallback order placement failed"
                             );
                         }
-                    } else {
-                        // Order placement failed - remove from pending
-                        self.orders.remove_pending_by_cloid(&cloid);
-                        // Phase 7: Mark CLOID as failed
-                        self.infra.orphan_tracker.mark_failed(&cloid);
-                        warn!(
-                            price = spec.new_price,
-                            size = spec.new_size,
-                            error = ?place_result.error,
-                            "Modify fallback order placement failed"
-                        );
                     }
                 }
-            }
 
-            // Log consolidated quote cycle summary with spread info
-            if modify_success_count > 0 {
-                // Get best quotes from tracked orders for spread calculation
-                let (best_bid, best_ask, bid_levels, ask_levels) = self.orders.get_quote_summary();
-                let mid = if best_bid > 0.0 && best_ask > 0.0 {
-                    (best_bid + best_ask) / 2.0
-                } else {
-                    0.0
-                };
-                let spread_bps = if mid > 0.0 {
-                    (best_ask - best_bid) / mid * 10000.0
-                } else {
-                    0.0
-                };
+                // Log consolidated quote cycle summary with spread info
+                if modify_success_count > 0 {
+                    // Get best quotes from tracked orders for spread calculation
+                    let (best_bid, best_ask, bid_levels, ask_levels) =
+                        self.orders.get_quote_summary();
+                    let mid = if best_bid > 0.0 && best_ask > 0.0 {
+                        (best_bid + best_ask) / 2.0
+                    } else {
+                        0.0
+                    };
+                    let spread_bps = if mid > 0.0 {
+                        (best_ask - best_bid) / mid * 10000.0
+                    } else {
+                        0.0
+                    };
 
-                info!(
-                    modified = modify_success_count,
-                    oid_remaps = oid_remap_count,
-                    best_bid = %format!("{:.2}", best_bid),
-                    best_ask = %format!("{:.2}", best_ask),
-                    spread_bps = %format!("{:.2}", spread_bps),
-                    bid_levels = bid_levels,
-                    ask_levels = ask_levels,
-                    position = %format!("{:.6}", self.position.position()),
-                    "Quote cycle complete"
-                );
-            }
+                    info!(
+                        modified = modify_success_count,
+                        oid_remaps = oid_remap_count,
+                        best_bid = %format!("{:.2}", best_bid),
+                        best_ask = %format!("{:.2}", best_ask),
+                        spread_bps = %format!("{:.2}", spread_bps),
+                        bid_levels = bid_levels,
+                        ask_levels = ask_levels,
+                        position = %format!("{:.6}", self.position.position()),
+                        "Quote cycle complete"
+                    );
+                }
             } // Close the else block for rate limit check
         }
 
@@ -2966,25 +2995,60 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Refresh margin state from exchange.
     ///
     /// Fetches user account state and updates the MarginAwareSizer with current values.
+    /// For HIP-3 DEXs, collateral is in spot balance. For validator perps, in clearinghouse.
     async fn refresh_margin_state(&mut self) -> Result<()> {
-        let user_state = self.info_client.user_state(self.user_address).await?;
+        // For HIP-3 DEXs, collateral is in spot balance (USDE, USDH, etc.)
+        // For validator perps, collateral is in perps clearinghouse (USDC)
+        let (account_value, margin_used, total_notional) = if self.config.dex.is_some() {
+            // HIP-3: Get account value from spot balance
+            let balances = self.info_client.user_token_balances(self.user_address).await?;
+            let account_value = self
+                .config
+                .collateral
+                .available_balance_from_spot(&balances.balances)
+                .unwrap_or(0.0);
 
-        // Parse margin values from the response
-        let account_value: f64 = user_state
-            .cross_margin_summary
-            .account_value
-            .parse()
-            .unwrap_or(0.0);
-        let margin_used: f64 = user_state
-            .cross_margin_summary
-            .total_margin_used
-            .parse()
-            .unwrap_or(0.0);
-        let total_notional: f64 = user_state
-            .cross_margin_summary
-            .total_ntl_pos
-            .parse()
-            .unwrap_or(0.0);
+            // Get margin used from DEX-specific clearinghouse
+            let user_state = self
+                .info_client
+                .user_state_for_dex(self.user_address, self.config.dex.as_deref())
+                .await?;
+            let margin_used: f64 = user_state
+                .margin_summary
+                .total_margin_used
+                .parse()
+                .unwrap_or(0.0);
+            let total_notional: f64 = user_state
+                .margin_summary
+                .total_ntl_pos
+                .parse()
+                .unwrap_or(0.0);
+
+            (account_value, margin_used, total_notional)
+        } else {
+            // Validator perps: Get all values from perps clearinghouse
+            let user_state = self
+                .info_client
+                .user_state(self.user_address)
+                .await?;
+            let account_value: f64 = user_state
+                .cross_margin_summary
+                .account_value
+                .parse()
+                .unwrap_or(0.0);
+            let margin_used: f64 = user_state
+                .cross_margin_summary
+                .total_margin_used
+                .parse()
+                .unwrap_or(0.0);
+            let total_notional: f64 = user_state
+                .cross_margin_summary
+                .total_ntl_pos
+                .parse()
+                .unwrap_or(0.0);
+
+            (account_value, margin_used, total_notional)
+        };
 
         // Update the margin sizer with fresh values
         self.infra

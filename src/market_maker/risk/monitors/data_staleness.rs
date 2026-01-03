@@ -192,8 +192,8 @@ mod tests {
 
     #[test]
     fn test_stale_but_reconnecting_within_grace() {
-        let monitor = DataStalenessMonitor::new(Duration::from_secs(30))
-            .with_max_reconnection_attempts(5);
+        let monitor =
+            DataStalenessMonitor::new(Duration::from_secs(30)).with_max_reconnection_attempts(5);
         let now = Instant::now();
         let state = RiskState {
             data_age: Duration::from_secs(45), // Stale
@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn test_stale_reconnection_exhausted() {
-        let monitor = DataStalenessMonitor::new(Duration::from_secs(30))
-            .with_max_reconnection_attempts(5);
+        let monitor =
+            DataStalenessMonitor::new(Duration::from_secs(30)).with_max_reconnection_attempts(5);
         let now = Instant::now();
         let state = RiskState {
             data_age: Duration::from_secs(120), // Very stale

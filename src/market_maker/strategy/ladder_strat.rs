@@ -369,7 +369,9 @@ impl LadderStrategy {
         // === SPREAD FLOOR: Adaptive vs Static ===
         // When adaptive spreads enabled: use learned floor from Bayesian AS estimation
         // When disabled: use static RiskConfig floor + tick/latency constraints
-        let effective_floor_frac = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+        let effective_floor_frac = if market_params.use_adaptive_spreads
+            && market_params.adaptive_can_estimate
+        {
             // Adaptive floor: learned from actual fill AS + fees + safety buffer
             // During warmup, the prior-based floor is already conservative (fees + 3bps + 1.5σ)
             debug!(

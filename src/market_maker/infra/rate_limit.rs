@@ -290,11 +290,11 @@ impl Default for ProactiveRateLimitConfig {
             ip_warning_threshold: 0.8,
             address_initial_buffer: 10_000,
             requests_per_usd_traded: 1.0,
-            min_requote_interval_ms: 100,       // 10 requotes/second max
-            min_modify_interval_ms: 2000,       // Modifies at most every 2 seconds
+            min_requote_interval_ms: 100, // 10 requotes/second max
+            min_modify_interval_ms: 2000, // Modifies at most every 2 seconds
             initial_429_backoff: Duration::from_secs(10), // Per Hyperliquid docs: 1 req/10s when limited
             max_429_backoff: Duration::from_secs(60),     // Cap at 1 minute
-            backoff_429_multiplier: 1.5,        // Moderate exponential increase
+            backoff_429_multiplier: 1.5,                  // Moderate exponential increase
         }
     }
 }
@@ -450,7 +450,10 @@ impl ProactiveRateLimitTracker {
         self.consecutive_429s += 1;
 
         // Calculate backoff with exponential increase
-        let multiplier = self.config.backoff_429_multiplier.powi((self.consecutive_429s - 1) as i32);
+        let multiplier = self
+            .config
+            .backoff_429_multiplier
+            .powi((self.consecutive_429s - 1) as i32);
         let backoff_secs = (self.config.initial_429_backoff.as_secs_f64() * multiplier)
             .min(self.config.max_429_backoff.as_secs_f64());
         let backoff = Duration::from_secs_f64(backoff_secs);

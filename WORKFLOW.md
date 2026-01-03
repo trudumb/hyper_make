@@ -1,36 +1,48 @@
-# Market Maker Workflow Guide
+# Market Maker Standard Operating Procedures (SOP)
 
-This document provides a comprehensive overview of the Hyperliquid market maker's workflow, architecture, intent, and operational commands.
+**Version:** 2.0
+**Last Updated:** 2025-01-02
+**Document Type:** Standard Operating Procedure
 
-## Table of Contents
-
-1. [Project Intent](#project-intent)
-2. [Architecture Overview](#architecture-overview)
-3. [Core Workflow](#core-workflow)
-4. [Getting Started](#getting-started)
-5. [Configuration](#configuration)
-6. [Running the Market Maker](#running-the-market-maker)
-7. [Monitoring & Observability](#monitoring--observability)
-8. [Risk Management](#risk-management)
-9. [Development Workflow](#development-workflow)
-10. [Module Reference](#module-reference)
+This document provides comprehensive operational guidance for the Hyperliquid market maker, including setup, daily operations, monitoring, troubleshooting, and emergency procedures.
 
 ---
 
-## Project Intent
+## Table of Contents
 
-### What This System Does
+1. [System Overview](#1-system-overview)
+2. [Pre-Flight Checklist](#2-pre-flight-checklist)
+3. [Installation & Setup](#3-installation--setup)
+4. [Configuration Reference](#4-configuration-reference)
+5. [Operational Procedures](#5-operational-procedures)
+6. [HIP-3 DEX Operations](#6-hip-3-dex-operations)
+7. [Monitoring & Alerting](#7-monitoring--alerting)
+8. [Risk Management](#8-risk-management)
+9. [Troubleshooting Guide](#9-troubleshooting-guide)
+10. [Emergency Procedures](#10-emergency-procedures)
+11. [Maintenance Procedures](#11-maintenance-procedures)
+12. [Architecture Reference](#12-architecture-reference)
+13. [Module Reference](#13-module-reference)
+14. [Quick Reference Card](#14-quick-reference-card)
+
+---
+
+## 1. System Overview
+
+### 1.1 Purpose
 
 This is a **production-grade automated market maker** for the Hyperliquid decentralized exchange. It provides continuous two-sided liquidity by placing bid and ask orders around a fair price, earning the spread while managing inventory risk.
 
-### Core Philosophy
+### 1.2 Core Philosophy
 
-1. **First-Principles Mathematics**: All decisions derive from stochastic control theory (GLFT model), not ad-hoc heuristics
-2. **Data-Driven Adaptation**: Parameters (volatility, order flow, adverse selection) are estimated live from market data
-3. **Defense in Depth**: Multiple layers of risk controls prevent catastrophic losses
-4. **Modular Architecture**: Components are isolated, testable, and replaceable
+| Principle | Description |
+|-----------|-------------|
+| **First-Principles Mathematics** | All decisions derive from stochastic control theory (GLFT model), not ad-hoc heuristics |
+| **Data-Driven Adaptation** | Parameters (volatility, order flow, adverse selection) are estimated live from market data |
+| **Defense in Depth** | Multiple layers of risk controls prevent catastrophic losses |
+| **Modular Architecture** | Components are isolated, testable, and replaceable |
 
-### Key Capabilities
+### 1.3 Key Capabilities
 
 - **Optimal Quote Placement**: Guéant-Lehalle-Fernandez-Tapia (GLFT) model for spread and inventory skew
 - **Multi-Level Ladder Quoting**: 5+ price levels per side for deeper liquidity provision
@@ -38,10 +50,818 @@ This is a **production-grade automated market maker** for the Hyperliquid decent
 - **Adverse Selection Measurement**: Ground truth E[Δp | fill] tracking
 - **Liquidation Cascade Detection**: Hawkes process for tail risk identification
 - **Kill Switch Protection**: Automatic shutdown on loss/position/staleness limits
+- **HIP-3 DEX Support**: Trade on builder-deployed perpetuals (Hyena, Felix, etc.)
 
 ---
 
-## Architecture Overview
+## 2. Pre-Flight Checklist
+
+### 2.1 Before First Run
+
+- [ ] Rust 1.70+ installed (`rustc --version`)
+- [ ] Repository cloned and built (`cargo build --release`)
+- [ ] All tests passing (`cargo test`)
+- [ ] Private key configured (see [3.3 Environment Setup](#33-environment-setup))
+- [ ] Configuration file created (`cargo run --bin market_maker -- generate-config`)
+- [ ] Network selected (testnet for testing, mainnet for production)
+- [ ] Account funded with sufficient collateral
+
+### 2.2 Before Each Session
+
+- [ ] Check account status: `cargo run --bin market_maker -- status`
+- [ ] Verify no orphaned orders from previous session
+- [ ] Confirm exchange connectivity (WebSocket, REST)
+- [ ] Review current market conditions (volatility, spread regime)
+- [ ] Validate configuration: `cargo run --bin market_maker -- validate-config`
+- [ ] Run dry-run test: `cargo run --bin market_maker -- --dry-run`
+
+### 2.3 Production Deployment Checklist
+
+- [ ] Release build used (`cargo build --release`)
+- [ ] Log file configured (`--log-file /var/log/market_maker.log`)
+- [ ] Metrics endpoint enabled (`--metrics-port 9090`)
+- [ ] Log rotation configured (external, e.g., logrotate)
+- [ ] Alerting configured (Prometheus alertmanager)
+- [ ] Backup private key secured (not on trading server)
+- [ ] Kill switch thresholds reviewed and appropriate
+- [ ] Process supervisor configured (systemd, supervisord)
+
+---
+
+## 3. Installation & Setup
+
+### 3.1 Prerequisites
+
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| Rust | 1.70+ | Latest stable |
+| Memory | 512MB | 2GB |
+| CPU | 1 core | 2+ cores |
+| Network | Stable internet | Low-latency connection |
+| Account | Funded Hyperliquid account | Sufficient margin for target position |
+
+### 3.2 Installation
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd hyper_make
+
+# Build release binary (required for production)
+cargo build --release
+
+# Verify build
+./target/release/market_maker --version
+
+# Run all tests
+cargo test
+
+# Run full CI pipeline (build, fmt, clippy, test)
+./ci.sh
+```
+
+### 3.3 Environment Setup
+
+**Option A: Environment Variable (Recommended)**
+```bash
+# Add to ~/.bashrc or ~/.zshrc
+export HYPERLIQUID_PRIVATE_KEY="your_private_key_here"
+
+# Reload shell
+source ~/.bashrc
+```
+
+**Option B: .env File**
+```bash
+echo "HYPERLIQUID_PRIVATE_KEY=your_private_key_here" > .env
+```
+
+**Option C: Config File** (Not recommended for production)
+```toml
+# In market_maker.toml
+[network]
+private_key = "your_private_key_here"
+```
+
+**Security Notes:**
+- Never commit private keys to version control
+- Use environment variables for production deployments
+- Consider using a secrets manager (Vault, AWS Secrets Manager)
+- Restrict file permissions: `chmod 600 .env`
+
+---
+
+## 4. Configuration Reference
+
+### 4.1 Generate Configuration
+
+```bash
+# Generate sample config with all options documented
+cargo run --bin market_maker -- generate-config
+
+# Output: market_maker.toml
+```
+
+### 4.2 Configuration File Structure
+
+```toml
+# market_maker.toml - Complete Reference
+
+#══════════════════════════════════════════════════════════════════════════════
+# NETWORK CONFIGURATION
+#══════════════════════════════════════════════════════════════════════════════
+[network]
+base_url = "testnet"  # Options: mainnet, testnet, localhost
+# private_key = "..."  # Prefer env var HYPERLIQUID_PRIVATE_KEY
+
+#══════════════════════════════════════════════════════════════════════════════
+# TRADING PARAMETERS
+#══════════════════════════════════════════════════════════════════════════════
+[trading]
+asset = "BTC"                         # Trading pair (BTC, ETH, SOL, etc.)
+target_liquidity = 0.01               # Order size per side in asset units
+risk_aversion = 0.3                   # γ: 0.1 (aggressive) to 1.0 (conservative)
+max_bps_diff = 5                      # Requote threshold in basis points
+max_absolute_position_size = 0.05     # Maximum position in asset units
+# leverage = 20                       # Optional: uses max available if not set
+
+#══════════════════════════════════════════════════════════════════════════════
+# STRATEGY CONFIGURATION
+#══════════════════════════════════════════════════════════════════════════════
+[strategy]
+strategy_type = "ladder"         # Options: symmetric, inventory_aware, glft, ladder
+estimation_window_secs = 300     # Rolling window for parameter estimation
+min_trades = 50                  # Minimum trades before quoting begins
+warmup_decay_secs = 300          # Adaptive warmup decay period
+
+[strategy.ladder_config]
+num_levels = 5                   # Number of price levels per side
+min_depth_bps = 5                # Closest level distance from mid
+max_depth_bps = 50               # Farthest level distance from mid
+geometric_spacing = true         # Use geometric vs linear level spacing
+
+#══════════════════════════════════════════════════════════════════════════════
+# LOGGING CONFIGURATION
+#══════════════════════════════════════════════════════════════════════════════
+[logging]
+level = "info"                   # Options: trace, debug, info, warn, error
+format = "pretty"                # Options: pretty, json, compact
+
+#══════════════════════════════════════════════════════════════════════════════
+# MONITORING CONFIGURATION
+#══════════════════════════════════════════════════════════════════════════════
+[monitoring]
+metrics_port = 9090              # Prometheus metrics port (0 to disable)
+enable_http_metrics = true       # Enable HTTP metrics endpoint
+```
+
+### 4.3 CLI Options Reference
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `-c, --config` | PATH | `market_maker.toml` | Path to configuration file |
+| `--asset` | STRING | `BTC` | Trading asset symbol |
+| `--target-liquidity` | FLOAT | Config value | Order size per side |
+| `--risk-aversion` | FLOAT | `0.3` | Gamma (γ) parameter |
+| `--max-bps-diff` | FLOAT | `5` | Requote threshold |
+| `--max-position` | FLOAT | Config value | Maximum position size |
+| `--leverage` | INT | Max available | Leverage setting |
+| `--decimals` | INT | Auto | Price decimals override |
+| `--network` | STRING | `testnet` | Network selection |
+| `--private-key` | STRING | Env var | Private key (prefer env var) |
+| `--log-level` | STRING | `info` | Logging verbosity |
+| `--log-format` | STRING | `pretty` | Log output format |
+| `--log-file` | PATH | None | Log file path |
+| `--multi-stream-logs` | FLAG | false | Enable multi-stream logging |
+| `--log-dir` | PATH | `logs/` | Multi-stream log directory |
+| `--metrics-port` | INT | `9090` | Prometheus metrics port |
+| `--dry-run` | FLAG | false | Validate without trading |
+| `--initial-isolated-margin` | FLOAT | `1000.0` | HIP-3 isolated margin (USD) |
+| `--force-isolated` | FLAG | false | Force isolated margin mode |
+| `--dex` | STRING | None | HIP-3 DEX name |
+| `--list-dexs` | FLAG | false | List available DEXs |
+
+### 4.4 Parameter Sizing Guidelines
+
+**Position Sizing (Runtime Capped):**
+```
+max_position ≤ (account_value × leverage × 0.5) / price
+target_liquidity ≤ max_position × 0.4
+```
+
+**Risk Aversion (γ) Guidelines:**
+
+| γ Value | Profile | Spread | Inventory Sensitivity |
+|---------|---------|--------|----------------------|
+| 0.1 | Aggressive | Tight | Low |
+| 0.3 | Moderate | Medium | Medium |
+| 0.5 | Conservative | Wide | High |
+| 1.0 | Very Conservative | Very Wide | Very High |
+
+**Asset Selection:**
+
+| Asset | Liquidity | Recommended For |
+|-------|-----------|-----------------|
+| BTC | Highest | Production, beginners |
+| ETH | High | Production |
+| SOL | Medium | Experienced operators |
+| Altcoins | Lower | Advanced users only |
+
+---
+
+## 5. Operational Procedures
+
+### 5.1 Starting the Market Maker
+
+**Development/Testing:**
+```bash
+# Basic testnet run
+cargo run --bin market_maker -- --asset BTC
+
+# With debug logging
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker -- --network mainnet --asset BTC --dex hyna
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker -- --network mainnet --asset BTC --dex hyna
+
+# Dry run (validates everything without placing orders)
+cargo run --bin market_maker -- --dry-run
+```
+
+**Production:**
+```bash
+# Full production command
+RUST_LOG=hyperliquid_rust_sdk::market_maker=info \
+./target/release/market_maker \
+  --config /etc/market_maker/production.toml \
+  --asset BTC \
+  --network mainnet \
+  --log-file /var/log/market_maker/mm.log \
+  --metrics-port 9090
+```
+
+### 5.2 Stopping the Market Maker
+
+**Graceful Shutdown (Preferred):**
+```bash
+# Send SIGINT (Ctrl+C)
+# Market maker will:
+# 1. Stop accepting new trades
+# 2. Cancel all resting orders with retry
+# 3. Log final position and P&L
+# 4. Log adverse selection summary
+# 5. Exit cleanly
+```
+
+**Emergency Shutdown:**
+```bash
+# Send SIGTERM
+kill -TERM $(pgrep market_maker)
+
+# Force kill (last resort - may leave orphaned orders!)
+kill -9 $(pgrep market_maker)
+```
+
+**Post-Shutdown Verification:**
+```bash
+# Check for orphaned orders
+cargo run --bin market_maker -- status
+
+# Manually cancel if needed (use Hyperliquid UI)
+```
+
+### 5.3 Checking Status
+
+```bash
+# Full account status
+cargo run --bin market_maker -- status
+
+# Output includes:
+# - Current position
+# - Account balance
+# - Open orders
+# - Available margin
+# - Leverage settings
+```
+
+### 5.4 Subcommands Reference
+
+| Command | Purpose | When to Use |
+|---------|---------|-------------|
+| `generate-config` | Create sample config | Initial setup |
+| `validate-config` | Validate config file | Before starting |
+| `status` | Show account state | Before/after sessions |
+| `run` | Run market maker | Normal operation (default) |
+
+---
+
+## 6. HIP-3 DEX Operations
+
+### 6.1 Overview
+
+HIP-3 allows third-party builders to deploy their own perpetual markets. When multiple DEXs offer the same asset (e.g., "BTC"), you must specify which DEX to trade on.
+
+### 6.2 Listing Available DEXs
+
+```bash
+# List all HIP-3 DEXs
+cargo run --bin market_maker -- --list-dexs
+
+# Output example:
+# Available HIP-3 DEXs:
+#   hyena - Hyena Exchange (deployer: 0x...)
+#   felix - Felix Protocol (deployer: 0x...)
+```
+
+### 6.3 Trading on HIP-3 DEXs
+
+```bash
+# Trade Hyena's BTC perp
+cargo run --bin market_maker -- --asset BTC --dex hyena
+
+# Trade Felix's BTC with custom margin
+cargo run --bin market_maker -- --asset BTC --dex felix --initial-isolated-margin 2000
+
+# Force isolated margin mode
+cargo run --bin market_maker -- --asset BTC --dex hyena --force-isolated
+```
+
+### 6.4 HIP-3 Considerations
+
+| Factor | Validator Perps | HIP-3 DEX Perps |
+|--------|-----------------|-----------------|
+| Liquidity | Highest | Varies by DEX |
+| Margin Mode | Cross (default) | Isolated (required) |
+| OI Limits | Exchange-wide | Per-DEX caps |
+| Fee Structure | Standard | DEX-specific |
+
+**HIP-3 CLI Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--dex <name>` | None | DEX name (e.g., "hyena", "felix") |
+| `--list-dexs` | - | List available DEXs and exit |
+| `--initial-isolated-margin` | $1,000 | Initial margin allocation |
+| `--force-isolated` | false | Force isolated margin mode |
+
+### 6.5 HIP-3 OI Cap Handling
+
+The market maker automatically detects and respects OI caps:
+- Queries DEX-specific limits at startup
+- Reduces position sizes if approaching caps
+- Logs warnings when near capacity
+
+---
+
+## 7. Monitoring & Alerting
+
+### 7.1 Prometheus Metrics
+
+**Access Point:** `http://localhost:9090/metrics`
+
+**Position Metrics:**
+```
+mm_position{asset="BTC"} 0.125           # Current position
+mm_max_position{asset="BTC"} 0.5         # Position limit
+mm_inventory_utilization{asset="BTC"} 0.25  # position / max_position
+```
+
+**P&L Metrics:**
+```
+mm_daily_pnl{asset="BTC"} 15.50          # Session P&L (realized + unrealized)
+mm_realized_pnl{asset="BTC"} 12.30       # Closed trade P&L
+mm_unrealized_pnl{asset="BTC"} 3.20      # Mark-to-market
+mm_peak_pnl{asset="BTC"} 20.00           # Session high
+mm_drawdown_pct{asset="BTC"} 0.02        # Current drawdown
+```
+
+**Market Metrics:**
+```
+mm_mid_price{asset="BTC"} 100500.50      # Current mid price
+mm_spread_bps{asset="BTC"} 8.5           # Bid-ask spread
+mm_sigma{asset="BTC"} 0.00015            # Volatility estimate
+mm_kappa{asset="BTC"} 85.2               # Order flow intensity
+mm_jump_ratio{asset="BTC"} 1.2           # RV/BV ratio (toxicity)
+```
+
+**Estimator Metrics:**
+```
+mm_microprice_deviation_bps{asset="BTC"} 0.5  # Microprice vs mid
+mm_book_imbalance{asset="BTC"} 0.15           # L2 book imbalance (-1 to 1)
+mm_flow_imbalance{asset="BTC"} -0.08          # Trade flow imbalance
+mm_beta_book{asset="BTC"} 0.003               # Learned book coefficient
+mm_beta_flow{asset="BTC"} 0.002               # Learned flow coefficient
+```
+
+**Risk Metrics:**
+```
+mm_kill_switch_triggered{asset="BTC"} 0       # 0=running, 1=triggered
+mm_cascade_severity{asset="BTC"} 0.15         # Liquidation cascade (0-1)
+mm_adverse_selection_bps{asset="BTC"} 0.8     # Running AS estimate
+mm_tail_risk_multiplier{asset="BTC"} 1.0      # Gamma scaling factor
+```
+
+**Infrastructure Metrics:**
+```
+mm_data_staleness_secs{asset="BTC"} 0.5       # Data age
+mm_quote_cycle_latency_ms{asset="BTC"} 15     # Quote cycle time
+mm_volatility_regime{asset="BTC"} 0           # 0=Normal, 1=High, 2=Extreme
+mm_orders_placed_total{asset="BTC"} 1250      # Total orders placed
+mm_orders_filled_total{asset="BTC"} 180       # Total fills
+```
+
+### 7.2 Log Analysis
+
+**Real-time Monitoring:**
+```bash
+# Watch all activity
+tail -f mm.log
+
+# Watch fills only
+tail -f mm.log | grep "Fill processed"
+
+# Watch quote updates
+tail -f mm.log | grep "Calculated ladder"
+
+# Watch risk events
+tail -f mm.log | grep -E "(Kill switch|cascade|adverse selection|WARN|ERROR)"
+
+# Watch warmup progress
+tail -f mm.log | grep -E "(Warming up|warmed up)"
+```
+
+**JSON Log Parsing:**
+```bash
+# Parse JSON logs with jq
+cat mm.log | jq 'select(.target == "hyperliquid_rust_sdk::market_maker")'
+
+# Extract fills with position
+cat mm.log | jq 'select(.message | contains("Fill")) | {time: .timestamp, msg: .message}'
+
+# Count events by type
+cat mm.log | jq -r '.message' | cut -d' ' -f1-3 | sort | uniq -c | sort -rn
+```
+
+### 7.3 Key Log Events
+
+| Event | Level | Meaning | Action |
+|-------|-------|---------|--------|
+| `Market maker started` | INFO | Initialization complete | None |
+| `Warming up parameter estimator` | INFO | Collecting initial data | Wait |
+| `Parameter estimation warmed up` | INFO | Ready to quote | None |
+| `Calculated ladder` | DEBUG | Quote calculation | None |
+| `Fill processed` | INFO | Order filled | Monitor position |
+| `Reduce-only mode` | WARN | Position at limit | Monitor |
+| `Kill switch condition detected` | WARN | Risk limit approaching | Review |
+| `Cascade detected` | WARN | Liquidations occurring | Monitor closely |
+| `KILL SWITCH TRIGGERED` | ERROR | Emergency shutdown | Investigate |
+| `Data staleness exceeded` | WARN | Market data delayed | Check connection |
+
+### 7.4 Alerting Configuration
+
+**Prometheus Alertmanager Rules (example):**
+```yaml
+groups:
+  - name: market_maker
+    rules:
+      - alert: KillSwitchTriggered
+        expr: mm_kill_switch_triggered == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Market maker kill switch triggered"
+
+      - alert: HighDrawdown
+        expr: mm_drawdown_pct > 0.03
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Drawdown exceeds 3%"
+
+      - alert: DataStale
+        expr: mm_data_staleness_secs > 3
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Market data is stale"
+
+      - alert: HighCascadeSeverity
+        expr: mm_cascade_severity > 0.5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Liquidation cascade detected"
+```
+
+---
+
+## 8. Risk Management
+
+### 8.1 Kill Switch Conditions
+
+| Condition | Default Threshold | Description |
+|-----------|-------------------|-------------|
+| Max Daily Loss | $500 | Cumulative session loss |
+| Max Drawdown | 5% | Peak-to-trough P&L percentage |
+| Max Position Value | $10,000 | \|position\| × mid_price |
+| Stale Data | 5 seconds | No market data received |
+| Cascade Severity | 0.95 | Liquidation cascade intensity |
+| Rate Limit Errors | 10 | Exchange rate limiting count |
+
+### 8.2 Graceful Shutdown Protocol
+
+When kill switch triggers:
+1. **Stop New Trades**: No new orders placed
+2. **Cancel Orders**: Bulk cancel all resting orders
+3. **Retry Cancels**: Retry failed cancellations up to 3x
+4. **Log State**: Final position, P&L, adverse selection stats
+5. **Exit**: Process terminates with non-zero exit code
+
+### 8.3 Reduce-Only Mode
+
+Automatically activated when:
+- Position exceeds `max_position`
+- Position value exceeds `max_position_value`
+
+Behavior:
+- Cancels orders that would increase position
+- Only places orders that reduce exposure
+- Logs WARN message when activated
+
+### 8.4 Risk Parameter Tuning
+
+**Dynamic Gamma (γ) Scaling:**
+
+The effective gamma scales based on:
+- Volatility regime (σ above baseline)
+- Flow toxicity (RV/BV ratio)
+- Inventory utilization
+- Cascade severity
+
+```
+γ_effective = γ_base × volatility_mult × toxicity_mult × inventory_mult × tail_risk_mult
+```
+
+**Cascade Risk Management:**
+
+| Cascade Severity | Action |
+|-----------------|--------|
+| 0.0 - 0.3 | Normal quoting |
+| 0.3 - 0.5 | Widen spreads (γ × 1.5) |
+| 0.5 - 0.8 | Reduce size (γ × 2.5) |
+| 0.8 - 0.95 | Pull all quotes |
+| > 0.95 | Kill switch |
+
+---
+
+## 9. Troubleshooting Guide
+
+### 9.1 Startup Issues
+
+**Problem: "Config file not found"**
+```bash
+# Solution: Generate config
+cargo run --bin market_maker -- generate-config
+```
+
+**Problem: "Private key not set"**
+```bash
+# Solution: Set environment variable
+export HYPERLIQUID_PRIVATE_KEY="0x..."
+```
+
+**Problem: "Failed to connect to exchange"**
+```bash
+# Check network setting
+cargo run --bin market_maker -- --network testnet status
+
+# Verify connectivity
+curl https://api.hyperliquid.xyz/info
+```
+
+**Problem: "Asset not found"**
+```bash
+# Check asset exists
+cargo run --bin market_maker -- status
+
+# For HIP-3 assets, specify DEX
+cargo run --bin market_maker -- --asset BTC --dex hyena
+```
+
+### 9.2 Runtime Issues
+
+**Problem: "No quotes being placed"**
+- Check warmup status (need 50+ trades, 20 volume ticks)
+- Verify parameter estimator has warmed up
+- Check for reduce-only mode (position at limit)
+- Verify sufficient margin
+
+**Problem: "All orders rejected"**
+- Check account balance/margin
+- Verify leverage settings
+- Check minimum order size ($10 notional)
+- Review rate limits
+
+**Problem: "Orders placed but no fills"**
+- Spread may be too wide (reduce γ)
+- Check if market is active
+- Review quote prices vs market
+
+**Problem: "Excessive fills / inventory building"**
+- Spread may be too tight (increase γ)
+- Check for one-sided flow (toxicity)
+- Review adverse selection metrics
+
+**Problem: "WebSocket disconnections"**
+```bash
+# Check connection health in logs
+tail -f mm.log | grep -E "(reconnect|disconnect|connection)"
+
+# Monitor data staleness metric
+curl -s localhost:9090/metrics | grep mm_data_staleness
+```
+
+### 9.3 Performance Issues
+
+**Problem: "High quote cycle latency"**
+- Check CPU usage
+- Use release build (`cargo build --release`)
+- Reduce logging level (`--log-level warn`)
+
+**Problem: "Memory growing"**
+- Check for fills backlog
+- Monitor fill deduplication cache
+- Review metrics accumulation
+
+### 9.4 Common Error Messages
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `InsufficientMargin` | Not enough collateral | Add margin or reduce size |
+| `OrderWouldBeLiquidated` | Order would cause liquidation | Reduce leverage/size |
+| `RateLimited` | Too many requests | Reduce quoting frequency |
+| `InvalidPrice` | Price precision error | Check decimals setting |
+| `AssetNotFound` | Invalid asset | Check spelling, use --dex for HIP-3 |
+| `DexNotFound` | Invalid HIP-3 DEX | Run --list-dexs |
+
+---
+
+## 10. Emergency Procedures
+
+### 10.1 Kill Switch Triggered
+
+**Immediate Actions:**
+1. **Verify shutdown**: Check process is not running
+2. **Check status**: `cargo run --bin market_maker -- status`
+3. **Review cause**: Check last log entries
+4. **Cancel orphans**: Manually cancel any remaining orders via UI
+
+**Investigation:**
+1. Review logs for kill switch trigger reason
+2. Check metrics at time of trigger
+3. Review market conditions
+4. Document incident
+
+**Recovery:**
+1. Wait for market conditions to stabilize
+2. Adjust risk parameters if needed
+3. Run dry-run test
+4. Restart with monitoring
+
+### 10.2 Orphaned Orders
+
+**Detection:**
+```bash
+# Check for open orders without running market maker
+cargo run --bin market_maker -- status
+```
+
+**Resolution:**
+1. Use Hyperliquid UI to cancel orders manually
+2. Or restart market maker (will auto-cancel on startup)
+
+### 10.3 Position Stuck
+
+**Symptoms:**
+- Large position that won't reduce
+- Reduce-only mode active
+- Low fill rate
+
+**Resolution Options:**
+1. **Wait**: Let reduce-only mode work naturally
+2. **Widen spreads**: Restart with higher γ
+3. **Manual trade**: Use Hyperliquid UI to market-close
+4. **Stop market maker**: Cancel all orders, manage position manually
+
+### 10.4 Exchange Issues
+
+**Symptoms:**
+- Repeated connection failures
+- Orders not appearing on exchange
+- Fill notifications delayed
+
+**Actions:**
+1. Stop market maker gracefully
+2. Check Hyperliquid status (Discord, Twitter)
+3. Wait for exchange issues to resolve
+4. Verify account state via UI
+5. Restart when stable
+
+### 10.5 Emergency Contacts
+
+| Issue Type | Resource |
+|------------|----------|
+| Exchange Issues | Hyperliquid Discord |
+| Market Maker Bugs | GitHub Issues |
+| Account Issues | Hyperliquid Support |
+
+---
+
+## 11. Maintenance Procedures
+
+### 11.1 Daily Operations
+
+| Task | Frequency | Procedure |
+|------|-----------|-----------|
+| Check account status | Before each session | `cargo run --bin market_maker -- status` |
+| Review P&L | End of session | Check `mm_daily_pnl` metric |
+| Review fills | Daily | Analyze fill quality, adverse selection |
+| Check logs for errors | Daily | `grep -E "WARN|ERROR" mm.log` |
+
+### 11.2 Weekly Operations
+
+| Task | Procedure |
+|------|-----------|
+| Update repository | `git pull && cargo build --release` |
+| Review performance | Analyze P&L, fill rate, adverse selection trends |
+| Backup logs | Archive and rotate log files |
+| Review risk parameters | Adjust based on performance |
+
+### 11.3 Configuration Updates
+
+```bash
+# 1. Stop market maker gracefully (Ctrl+C)
+
+# 2. Edit configuration
+vim market_maker.toml
+
+# 3. Validate changes
+cargo run --bin market_maker -- validate-config
+
+# 4. Test with dry-run
+cargo run --bin market_maker -- --dry-run
+
+# 5. Restart
+cargo run --bin market_maker
+```
+
+### 11.4 Software Updates
+
+```bash
+# 1. Stop market maker gracefully
+
+# 2. Pull latest changes
+git pull
+
+# 3. Rebuild
+cargo build --release
+
+# 4. Run tests
+cargo test
+
+# 5. Validate config (API changes may require updates)
+cargo run --bin market_maker -- validate-config
+
+# 6. Test with dry-run
+cargo run --bin market_maker -- --dry-run
+
+# 7. Restart
+./target/release/market_maker --config production.toml
+```
+
+### 11.5 Log Management
+
+**Log Rotation (logrotate example):**
+```
+/var/log/market_maker/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 trader trader
+}
+```
+
+---
+
+## 12. Architecture Reference
+
+### 12.1 System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -75,26 +895,7 @@ This is a **production-grade automated market maker** for the Hyperliquid decent
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Module Organization (~24K lines, 74 files)
-
-| Module | Purpose | Key Components |
-|--------|---------|----------------|
-| `strategy/` | Quote pricing logic | GLFTStrategy, LadderStrategy, RiskConfig |
-| `estimator/` | Live parameter estimation | VolumeClock, BipowerVariation, Microprice |
-| `tracking/` | Order & position state | OrderManager, PositionTracker, QueueTracker |
-| `adverse_selection/` | Fill quality measurement | ASEstimator, DepthDecayAS |
-| `process_models/` | Stochastic processes | Hawkes, Funding, Liquidation, Spread, HJB |
-| `risk/` | Risk monitoring | KillSwitch, RiskAggregator, Monitors |
-| `quoting/` | Quote generation | LadderGenerator, Optimizer, Filters |
-| `infra/` | Infrastructure | Margin, Prometheus, Reconnection, DataQuality |
-| `safety/` | Exchange reconciliation | SafetyAuditor |
-| `core/` | Component bundles | Tier1, Tier2, Safety, Infra, Stochastic |
-
----
-
-## Core Workflow
-
-### Event Loop (Simplified)
+### 12.2 Event Loop Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -133,394 +934,49 @@ This is a **production-grade automated market maker** for the Hyperliquid decent
                     └───────────────────────┘
 ```
 
-### Quote Calculation Flow
+### 12.3 Quote Calculation
 
-1. **Microprice Estimation**: Fair price from book/flow imbalance signals
-   ```
-   microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
-   ```
-
-2. **GLFT Optimal Spread**: Market-driven half-spread
-   ```
-   δ = (1/γ) × ln(1 + γ/κ)
-   ```
-
-3. **Inventory Skew**: Position-dependent price adjustment
-   ```
-   skew = (q/Q_max) × γ × σ² × T
-   ```
-
-4. **Final Quotes**:
-   ```
-   bid = microprice × (1 - δ - skew)
-   ask = microprice × (1 + δ - skew)
-   ```
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- Rust 1.70+
-- Hyperliquid account with API access
-- Private key for signing transactions
-
-### Installation
-
-```bash
-# Clone the repository
-git clone <repo-url>
-cd hyper_make
-
-# Build the project
-cargo build --release
-
-# Run tests to verify
-cargo test
+**1. Microprice Estimation:**
+```
+microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
 ```
 
-### Environment Setup
+**2. GLFT Optimal Spread:**
+```
+δ = (1/γ) × ln(1 + γ/κ)
+```
 
-```bash
-# Create .env file (or export directly)
-echo "HYPERLIQUID_PRIVATE_KEY=your_private_key_here" > .env
+**3. Inventory Skew:**
+```
+skew = (q/Q_max) × γ × σ² × T
+```
+
+**4. Final Quotes:**
+```
+bid = microprice × (1 - δ - skew)
+ask = microprice × (1 + δ - skew)
 ```
 
 ---
 
-## Configuration
-
-### Generate Sample Config
-
-```bash
-cargo run --bin market_maker -- generate-config
-```
-
-This creates `market_maker.toml` with all available options:
-
-```toml
-# market_maker.toml - Hyperliquid Market Maker Configuration
-
-[network]
-base_url = "testnet"  # mainnet, testnet, localhost
-# private_key = "..."  # Prefer env var HYPERLIQUID_PRIVATE_KEY
-
-[trading]
-asset = "BTC"                         # Most liquid, tightest spreads
-target_liquidity = 0.01               # ~$1K per side (capped by equity)
-risk_aversion = 0.3                   # γ: 0.1 (aggressive) to 1.0 (conservative)
-max_bps_diff = 5                      # Requote threshold (5 bps reduces churn)
-max_absolute_position_size = 0.05     # ~$5K max (capped by equity)
-# leverage = 20                       # Optional: uses max available if not set
-
-[strategy]
-strategy_type = "ladder"         # symmetric, inventory_aware, glft, ladder
-estimation_window_secs = 300     # 5-minute rolling window
-min_trades = 50                  # Warmup threshold
-warmup_decay_secs = 300          # Adaptive warmup decay
-
-[strategy.ladder_config]
-num_levels = 5
-min_depth_bps = 5
-max_depth_bps = 50
-geometric_spacing = true
-
-[logging]
-level = "info"                   # trace, debug, info, warn, error
-format = "pretty"                # pretty, json, compact
-
-[monitoring]
-metrics_port = 9090
-enable_http_metrics = true
-```
-
-### Key Configuration Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `asset` | BTC | Most liquid crypto, best for market making |
-| `target_liquidity` | 0.01 | Order size per side (~$1K notional) |
-| `risk_aversion` | 0.3 | γ - matches RiskConfig.gamma_base |
-| `max_bps_diff` | 5 | Price deviation threshold (5 bps reduces churn) |
-| `max_absolute_position_size` | 0.05 | Position limit (~$5K, below kill switch) |
-| `min_trades` | 50 | Warmup trades before quoting begins |
-
-**Note**: `target_liquidity` and `max_position` are **maximums** capped at runtime:
-- `max_position` ≤ `(account_value × leverage × 0.5) / price`
-- `target_liquidity` ≤ `max_position × 0.4`
-
----
-
-## Running the Market Maker
-
-### Basic Commands
-
-```bash
-# Run with defaults (BTC on testnet, reads market_maker.toml)
-cargo run --bin market_maker
-
-# Run with specific asset
-cargo run --bin market_maker -- --asset ETH
-
-# Run with debug logging
-RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker
-
-# Run with debug logging and log file
-RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker -- \
-  --log-file mm.log
-
-# Check account status (position, balance, orders)
-cargo run --bin market_maker -- status
-
-# Dry run - validate everything without placing orders
-cargo run --bin market_maker -- --dry-run
-
-# Validate configuration without running
-cargo run --bin market_maker -- validate-config
-
-# Show all CLI options
-cargo run --bin market_maker -- --help
-```
-
-### Subcommands
-
-| Command | Description |
-|---------|-------------|
-| `status` | Show account status (position, balance, open orders) |
-| `validate-config` | Validate configuration file without running |
-| `generate-config` | Generate sample configuration file |
-| `run` | Run the market maker (default) |
-
-### CLI Options
-
-| Option | Description |
-|--------|-------------|
-| `--config <path>` | Config file path (default: market_maker.toml) |
-| `--asset <symbol>` | Override asset (default: BTC) |
-| `--target-liquidity <f64>` | Override liquidity per side |
-| `--risk-aversion <f64>` | Override gamma parameter |
-| `--max-position <f64>` | Override position limit |
-| `--leverage <u32>` | Override leverage |
-| `--network <network>` | mainnet, testnet, localhost |
-| `--log-level <level>` | trace, debug, info, warn, error |
-| `--log-file <path>` | Log to file (also logs to stdout) |
-| `--metrics-port <port>` | Prometheus metrics port (0 to disable) |
-| `--dry-run` | Validate everything without placing orders |
-
-### Production Run Example
-
-```bash
-# Full production command with all options
-RUST_LOG=hyperliquid_rust_sdk::market_maker=info \
-cargo run --release --bin market_maker -- \
-  --config production.toml \
-  --asset BTC \
-  --network mainnet \
-  --log-file /var/log/market_maker.log \
-  --metrics-port 9090
-```
-
----
-
-## Monitoring & Observability
-
-### Prometheus Metrics
-
-Access at `http://localhost:9090/metrics`:
-
-```
-# Position
-mm_position{asset="ETH"} 0.125
-mm_max_position{asset="ETH"} 0.5
-mm_inventory_utilization{asset="ETH"} 0.25
-
-# P&L
-mm_daily_pnl{asset="ETH"} 15.50
-mm_realized_pnl{asset="ETH"} 12.30
-mm_unrealized_pnl{asset="ETH"} 3.20
-mm_drawdown_pct{asset="ETH"} 0.02
-
-# Market
-mm_mid_price{asset="ETH"} 3500.50
-mm_spread_bps{asset="ETH"} 8.5
-mm_sigma{asset="ETH"} 0.00015
-mm_kappa{asset="ETH"} 85.2
-mm_jump_ratio{asset="ETH"} 1.2
-
-# Risk
-mm_kill_switch_triggered{asset="ETH"} 0
-mm_cascade_severity{asset="ETH"} 0.15
-mm_adverse_selection_bps{asset="ETH"} 0.8
-mm_tail_risk_multiplier{asset="ETH"} 1.0
-```
-
-### Log Analysis
-
-```bash
-# Watch for fills
-tail -f mm.log | grep "Fill processed"
-
-# Watch for quote updates
-tail -f mm.log | grep "Calculated ladder"
-
-# Watch for risk events
-tail -f mm.log | grep -E "(Kill switch|cascade|adverse selection)"
-
-# JSON log parsing
-cat mm.log | jq 'select(.target == "hyperliquid_rust_sdk::market_maker")'
-```
-
-### Key Log Events
-
-| Event | Level | Meaning |
-|-------|-------|---------|
-| `Market maker started` | INFO | System initialized successfully |
-| `Warming up parameter estimator` | INFO | Collecting initial data |
-| `Parameter estimation warmed up` | INFO | Ready to quote |
-| `Fill processed` | INFO | Order filled, position updated |
-| `Kill switch condition detected` | WARN | Risk limit approaching |
-| `KILL SWITCH TRIGGERED` | ERROR | Emergency shutdown initiated |
-
----
-
-## Risk Management
-
-### Kill Switch Conditions
-
-The market maker automatically shuts down when:
-
-| Condition | Default | Description |
-|-----------|---------|-------------|
-| Max Daily Loss | $500 | Cumulative session loss |
-| Max Drawdown | 5% | Peak-to-trough P&L |
-| Max Position Value | $10,000 | |position| × mid_price |
-| Stale Data | 5 seconds | No market data received |
-| Cascade Severity | 0.95 | Liquidation cascade detected |
-| Rate Limit Errors | 10 | Exchange rate limiting |
-
-### Graceful Shutdown
-
-When triggered (or on Ctrl+C):
-
-1. Stop accepting new trades
-2. Cancel all resting orders with retry
-3. Log final position and P&L
-4. Log adverse selection summary
-5. Exit cleanly
-
-### Reduce-Only Mode
-
-Automatically activated when:
-- Position exceeds `max_position`
-- Position value exceeds `max_position_value`
-
-In reduce-only mode:
-- Only orders that reduce position are placed
-- Quotes on the exposed side are cancelled
-
----
-
-## Development Workflow
-
-### Build Commands
-
-```bash
-# Development build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Format code
-cargo fmt
-
-# Lint with warnings as errors
-cargo clippy -- -D warnings
-
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_glft_zero_inventory
-
-# Run full CI pipeline
-./ci.sh
-```
-
-### Code Organization
-
-```
-src/
-├── bin/
-│   └── market_maker.rs     # CLI entry point
-├── market_maker/
-│   ├── mod.rs              # MarketMaker orchestrator
-│   ├── config.rs           # Configuration types
-│   ├── strategy/           # Quoting strategies
-│   │   ├── glft.rs         # GLFT optimal spread
-│   │   ├── ladder_strat.rs # Multi-level ladder
-│   │   └── risk_config.rs  # Dynamic gamma
-│   ├── estimator/          # Parameter estimation
-│   │   ├── volume.rs       # Volume clock
-│   │   ├── volatility.rs   # Bipower variation
-│   │   └── microprice.rs   # Fair price learning
-│   ├── tracking/           # State management
-│   │   ├── order_manager/  # Order lifecycle
-│   │   ├── position.rs     # Position tracking
-│   │   └── queue/          # Queue position
-│   └── ...
-└── lib.rs                  # Library exports
-```
-
-### Adding a New Strategy
-
-```rust
-// In strategy/my_strategy.rs
-pub struct MyStrategy {
-    // Custom parameters
-}
-
-impl QuotingStrategy for MyStrategy {
-    fn calculate_quotes(
-        &self,
-        config: &QuoteConfig,
-        position: f64,
-        max_position: f64,
-        target_liquidity: f64,
-        market_params: &MarketParams,
-    ) -> (Option<Quote>, Option<Quote>) {
-        // Your quoting logic here
-        // market_params contains: microprice, sigma, kappa, etc.
-    }
-
-    fn name(&self) -> &'static str {
-        "MyStrategy"
-    }
-}
-```
-
-### Testing
-
-```bash
-# Run unit tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific module tests
-cargo test market_maker::strategy::tests
-
-# Run integration tests (requires testnet)
-cargo test --test integration -- --ignored
-```
-
----
-
-## Module Reference
-
-### Strategy Module (`strategy/`)
+## 13. Module Reference
+
+### 13.1 Module Organization (~24K lines, 74 files)
+
+| Module | Purpose | Key Components |
+|--------|---------|----------------|
+| `strategy/` | Quote pricing logic | GLFTStrategy, LadderStrategy, RiskConfig |
+| `estimator/` | Live parameter estimation | VolumeClock, BipowerVariation, Microprice |
+| `tracking/` | Order & position state | OrderManager, PositionTracker, QueueTracker |
+| `adverse_selection/` | Fill quality measurement | ASEstimator, DepthDecayAS |
+| `process_models/` | Stochastic processes | Hawkes, Funding, Liquidation, Spread, HJB |
+| `risk/` | Risk monitoring | KillSwitch, RiskAggregator, Monitors |
+| `quoting/` | Quote generation | LadderGenerator, Optimizer, Filters |
+| `infra/` | Infrastructure | Margin, Prometheus, Reconnection, DataQuality |
+| `safety/` | Exchange reconciliation | SafetyAuditor |
+| `core/` | Component bundles | Tier1, Tier2, Safety, Infra, Stochastic |
+
+### 13.2 Strategy Module (`strategy/`)
 
 | File | Purpose |
 |------|---------|
@@ -530,7 +986,7 @@ cargo test --test integration -- --ignored
 | `risk_config.rs` | RiskConfig for dynamic gamma |
 | `market_params.rs` | MarketParams aggregation |
 
-### Estimator Module (`estimator/`)
+### 13.3 Estimator Module (`estimator/`)
 
 | File | Purpose |
 |------|---------|
@@ -541,16 +997,16 @@ cargo test --test integration -- --ignored
 | `microprice.rs` | Fair price from signal regression |
 | `kalman.rs` | Kalman filter price smoothing |
 
-### Tracking Module (`tracking/`)
+### 13.4 Risk Module (`risk/`)
 
 | File | Purpose |
 |------|---------|
-| `order_manager/` | Order lifecycle state machine |
-| `position.rs` | Position tracking with fill dedup |
-| `queue/` | Queue position and fill probability |
-| `pnl.rs` | P&L tracking with attribution |
+| `kill_switch.rs` | Emergency shutdown |
+| `aggregator.rs` | Multi-monitor risk eval |
+| `monitors/` | Individual risk monitors |
+| `state.rs` | Unified risk state |
 
-### Process Models (`process_models/`)
+### 13.5 Process Models (`process_models/`)
 
 | File | Purpose |
 |------|---------|
@@ -560,62 +1016,80 @@ cargo test --test integration -- --ignored
 | `spread.rs` | Spread regime tracking |
 | `hjb_control.rs` | HJB optimal inventory |
 
-### Risk Module (`risk/`)
-
-| File | Purpose |
-|------|---------|
-| `kill_switch.rs` | Emergency shutdown |
-| `aggregator.rs` | Multi-monitor risk eval |
-| `monitors/` | Individual risk monitors |
-| `state.rs` | Unified risk state |
-
 ---
 
-## Quick Reference Card
+## 14. Quick Reference Card
+
+### Build Commands
 
 ```bash
-# === BUILD ===
-cargo build                     # Dev build
-cargo build --release           # Release build
+cargo build                     # Development build
+cargo build --release           # Production build
 cargo fmt && cargo clippy       # Format + lint
+cargo test                      # Run all tests
+./ci.sh                         # Full CI pipeline
+```
 
-# === TEST ===
-cargo test                      # All tests
-cargo test strategy             # Strategy tests
+### Operational Commands
 
-# === RUN ===
-# Generate config
-cargo run --bin market_maker -- generate-config
+```bash
+# Config Management
+cargo run --bin market_maker -- generate-config      # Create config
+cargo run --bin market_maker -- validate-config      # Validate config
 
-# Validate config
-cargo run --bin market_maker -- validate-config
+# Status & Testing
+cargo run --bin market_maker -- status               # Account status
+cargo run --bin market_maker -- --dry-run            # Dry run test
 
-# Check account status
-cargo run --bin market_maker -- status
+# Basic Run
+cargo run --bin market_maker                         # Default (BTC/testnet)
+cargo run --bin market_maker -- --asset ETH          # Different asset
 
-# Dry run (validate without trading)
-cargo run --bin market_maker -- --dry-run
+# Production Run
+RUST_LOG=info ./target/release/market_maker \
+  --network mainnet \
+  --log-file mm.log \
+  --metrics-port 9090
 
-# Run (default: BTC on testnet)
+# Debug Run
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
 cargo run --bin market_maker
 
-# Run with specific asset
-cargo run --bin market_maker -- --asset ETH
-
-# Run mainnet (production)
-RUST_LOG=info cargo run --release --bin market_maker -- \
-  --network mainnet --log-file mm.log
-
-# Debug mode
-RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker
-
-# === MONITOR ===
-# Prometheus metrics
-curl localhost:9090/metrics
-
-# Watch logs
-tail -f mm.log | grep -E "(Fill|Quote|Kill)"
+# HIP-3 DEX
+cargo run --bin market_maker -- --list-dexs          # List DEXs
+cargo run --bin market_maker -- --asset BTC --dex hyena  # Trade on Hyena
 ```
+
+### Monitoring Commands
+
+```bash
+# Metrics
+curl localhost:9090/metrics
+curl -s localhost:9090/metrics | grep mm_position
+
+# Logs
+tail -f mm.log                                        # All logs
+tail -f mm.log | grep "Fill processed"               # Fills only
+tail -f mm.log | grep -E "WARN|ERROR"                # Warnings/errors
+```
+
+### Key Metrics to Watch
+
+| Metric | Normal Range | Alert Threshold |
+|--------|--------------|-----------------|
+| `mm_inventory_utilization` | 0 - 0.5 | > 0.8 |
+| `mm_drawdown_pct` | 0 - 0.02 | > 0.03 |
+| `mm_cascade_severity` | 0 - 0.3 | > 0.5 |
+| `mm_data_staleness_secs` | 0 - 1 | > 3 |
+| `mm_adverse_selection_bps` | 0 - 1.5 | > 2.5 |
+
+### Emergency Contacts
+
+| Resource | Purpose |
+|----------|---------|
+| Hyperliquid Discord | Exchange issues |
+| GitHub Issues | Market maker bugs |
+| Hyperliquid UI | Manual trading |
 
 ---
 
@@ -624,3 +1098,7 @@ tail -f mm.log | grep -E "(Fill|Quote|Kill)"
 - [CLAUDE.md](./CLAUDE.md) - Detailed architecture and implementation notes
 - [Hyperliquid Docs](https://hyperliquid.gitbook.io/) - Exchange API reference
 - [GLFT Paper](https://arxiv.org/abs/1105.3115) - Optimal market making theory
+
+---
+
+*Document maintained by the development team. Report issues via GitHub.*
