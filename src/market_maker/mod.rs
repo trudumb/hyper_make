@@ -279,7 +279,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Track any remaining orders (should be empty after cancel-all, but be safe)
-        let open_orders = self.info_client.open_orders(self.user_address).await?;
+        // Use DEX-aware open_orders for HIP-3 support
+        let open_orders = self
+            .info_client
+            .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+            .await?;
 
         for order in open_orders.iter().filter(|o| o.coin == *self.config.asset) {
             let sz: f64 = order.sz.parse().unwrap_or(0.0);
@@ -348,7 +352,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         const RETRY_DELAY_MS: u64 = 500;
 
         for attempt in 0..MAX_RETRIES {
-            let open_orders = self.info_client.open_orders(self.user_address).await?;
+            // Use DEX-aware open_orders for HIP-3 support
+            let open_orders = self
+                .info_client
+                .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+                .await?;
             let our_orders: Vec<_> = open_orders
                 .iter()
                 .filter(|o| o.coin == *self.config.asset)
@@ -399,9 +407,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // After max retries, check what's left
+        // Use DEX-aware open_orders for HIP-3 support
         let remaining = self
             .info_client
-            .open_orders(self.user_address)
+            .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
             .await?
             .iter()
             .filter(|o| o.coin == *self.config.asset)
@@ -502,8 +511,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         #[cfg(not(unix))]
         let mut sigterm_signal = std::future::pending::<()>();
 
-        let mut shutdown_signal = std::pin::pin!(tokio::signal::ctrl_c());
-
         loop {
             // === Kill Switch Check (before processing any message) ===
             if self.safety.kill_switch.is_triggered() {
@@ -521,8 +528,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 biased;
 
                 // SIGINT (Ctrl+C) - highest priority
-                _ = &mut shutdown_signal => {
-                    info!("Shutdown signal received (SIGINT)");
+                // Note: ctrl_c() called fresh each iteration - each call registers a new listener
+                // and all pending listeners are notified when signal arrives
+                result = tokio::signal::ctrl_c() => {
+                    match result {
+                        Ok(()) => info!("Shutdown signal received (SIGINT)"),
+                        Err(e) => error!("Failed to listen for SIGINT: {e}"),
+                    }
                     break;
                 }
 
@@ -2906,7 +2918,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // === Step 5: Exchange reconciliation ===
-        let exchange_orders = self.info_client.open_orders(self.user_address).await?;
+        // Use DEX-aware open_orders for HIP-3 support
+        let exchange_orders = self
+            .info_client
+            .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+            .await?;
         let exchange_oids: HashSet<u64> = exchange_orders
             .iter()
             .filter(|o| o.coin == *self.config.asset)

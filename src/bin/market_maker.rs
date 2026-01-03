@@ -1399,8 +1399,8 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     let dex = cli.dex.as_deref();
     let user_state = info_client.user_state_for_dex(user_address, dex).await?;
 
-    // Get open orders
-    let open_orders = info_client.open_orders(user_address).await?;
+    // Get open orders (use DEX-aware for HIP-3)
+    let open_orders = info_client.open_orders_for_dex(user_address, dex).await?;
     let asset_orders: Vec<_> = open_orders.iter().filter(|o| o.coin == asset).collect();
 
     // Get asset-specific data

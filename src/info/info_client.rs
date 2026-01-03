@@ -55,8 +55,14 @@ pub enum InfoRequest {
     UserFees {
         user: Address,
     },
+    /// Get user's open orders. Use `dex` for HIP-3 builder DEXs.
+    #[serde(rename_all = "camelCase")]
     OpenOrders {
         user: Address,
+        /// Optional HIP-3 DEX name (e.g., "hyna", "flx").
+        /// If None, returns validator perps orders only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
     },
     OrderStatus {
         user: Address,
@@ -216,8 +222,34 @@ impl InfoClient {
         serde_json::from_str(&return_data).map_err(|e| Error::JsonParse(e.to_string()))
     }
 
+    /// Get user's open orders for validator perps.
+    ///
+    /// For HIP-3 builder DEXs, use `open_orders_for_dex()` instead.
     pub async fn open_orders(&self, address: Address) -> Result<Vec<OpenOrdersResponse>> {
-        let input = InfoRequest::OpenOrders { user: address };
+        let input = InfoRequest::OpenOrders {
+            user: address,
+            dex: None,
+        };
+        self.send_info_request(input).await
+    }
+
+    /// Get user's open orders for a specific HIP-3 DEX.
+    ///
+    /// For HIP-3 builder-deployed perps, orders are per-DEX.
+    /// Without the `dex` parameter, the API returns validator perps orders only.
+    ///
+    /// # Arguments
+    /// * `address` - User's wallet address
+    /// * `dex` - Optional HIP-3 DEX name (e.g., "hyna", "flx"). None for validator perps.
+    pub async fn open_orders_for_dex(
+        &self,
+        address: Address,
+        dex: Option<&str>,
+    ) -> Result<Vec<OpenOrdersResponse>> {
+        let input = InfoRequest::OpenOrders {
+            user: address,
+            dex: dex.map(|s| s.to_string()),
+        };
         self.send_info_request(input).await
     }
 
