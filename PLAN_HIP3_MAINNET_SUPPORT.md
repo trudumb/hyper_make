@@ -1,8 +1,12 @@
-# HIP-3 Mainnet Support Implementation Plan
+# HIP-3 Mainnet Support Implementation Plan (v2 - Latency Optimized)
 
 ## Executive Summary
 
 This plan adds support for HIP-3 (builder-deployed perpetuals) to the Hyperliquid Rust SDK and market maker. HIP-3 assets have specific constraints that differ from validator-operated perps, primarily **isolated-only margin mode**.
+
+**Key Design Principle: ZERO HOT-PATH OVERHEAD**
+
+All HIP-3 detection and margin mode logic is pre-computed at startup. The quote cycle and message handlers have no additional branches, string comparisons, or Option unwraps compared to current implementation.
 
 ## HIP-3 Key Constraints (from Official Docs)
 
@@ -12,11 +16,168 @@ This plan adds support for HIP-3 (builder-deployed perpetuals) to the Hyperliqui
 | **Fee Structure** | 2x normal fees (deployer gets 50%) |
 | **OI Caps** | Notional limits set by deployer |
 | **Leverage** | Configurable by deployer, may differ from mainnet defaults |
+| **DEX Abstraction** | Automatic collateral routing from validator perps balance |
 | **Slashing Risk** | 500k HYPE stake, burned if malicious |
 
 **Sources:**
 - [HIP-3: Builder-deployed perpetuals](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals)
 - [FalconX HIP-3 Analysis](https://www.falconx.io/newsroom/the-transformational-potential-of-hyperliquids-hip-3)
+
+---
+
+## CRITICAL: Latency Considerations
+
+### Hot Path Analysis
+
+The following paths are latency-critical (< 1ms target):
+1. **Quote cycle** (`update_quotes()`) - runs every price tick
+2. **Message handlers** (`handle_all_mids`, `handle_trades`, `handle_l2_book`)
+3. **Order placement** (`place_bulk_orders`)
+4. **Fill processing** (`handle_user_fills`)
+
+### Design Principles
+
+1. **Pre-compute everything at startup** - margin mode, OI caps, fee multipliers
+2. **Use `#[repr(u8)]` enums** - single-byte comparison, not string matching
+3. **Store pre-computed `is_cross: bool`** - avoid enum matching in hot paths
+4. **No `Option::unwrap()` in hot paths** - use pre-resolved values
+5. **Inline critical methods** - `#[inline(always)]` for margin checks
+
+---
+
+## Phase 0: Pre-Computed Asset Configuration (LATENCY CRITICAL)
+
+### 0.1 Unified Asset Runtime Config
+
+**File:** `src/market_maker/config.rs`
+
+Create a **pre-computed** runtime configuration that resolves all Option types and string comparisons at startup:
+
+```rust
+/// Pre-computed asset configuration for zero-overhead hot paths.
+///
+/// All HIP-3 detection is done ONCE at startup. Quote cycle uses only
+/// primitive fields (bool, f64) with no Option unwraps or string comparisons.
+#[derive(Debug, Clone)]
+pub struct AssetRuntimeConfig {
+    // === Pre-computed margin fields (NO OPTIONS) ===
+    /// Whether to use cross margin (pre-computed from AssetMeta)
+    /// HOT PATH: Used directly in margin calculations
+    pub is_cross: bool,
+
+    /// Fee multiplier (1.0 for validator perps, 2.0 for HIP-3)
+    /// HOT PATH: Applied to P&L calculations
+    pub fee_multiplier: f64,
+
+    /// Open interest cap in USD (f64::MAX if no cap)
+    /// HOT PATH: Pre-flight check before order placement
+    pub oi_cap_usd: f64,
+
+    /// Pre-computed sz_decimals as f64 power for truncation
+    /// HOT PATH: Avoids powi() call in size formatting
+    pub sz_multiplier: f64,
+
+    /// Pre-computed price decimals multiplier
+    pub price_multiplier: f64,
+
+    // === Cold path metadata (startup only) ===
+    /// Asset name (Arc for cheap cloning)
+    pub asset: Arc<str>,
+
+    /// Maximum leverage (from API)
+    pub max_leverage: f64,
+
+    /// Whether this is a HIP-3 builder-deployed asset
+    pub is_hip3: bool,
+
+    /// Deployer address (for logging/display only)
+    pub deployer: Option<Arc<str>>,
+}
+
+impl AssetRuntimeConfig {
+    /// Build from API metadata - called ONCE at startup.
+    pub fn from_asset_meta(meta: &AssetMeta) -> Self {
+        // Resolve HIP-3 status ONCE
+        let is_hip3 = meta.is_builder_deployed.unwrap_or(false)
+            || meta.only_isolated.unwrap_or(false)
+            || meta.margin_mode.as_deref() == Some("noCross")
+            || meta.margin_mode.as_deref() == Some("strictIsolated");
+
+        Self {
+            // Pre-compute for hot path
+            is_cross: !is_hip3,
+            fee_multiplier: if is_hip3 { 2.0 } else { 1.0 },
+            oi_cap_usd: meta.oi_cap_usd.unwrap_or(f64::MAX),
+            sz_multiplier: 10_f64.powi(meta.sz_decimals as i32),
+            price_multiplier: 10_f64.powi(5), // 5 sig figs for perps
+
+            // Cold path storage
+            asset: Arc::from(meta.name.as_str()),
+            max_leverage: meta.max_leverage as f64,
+            is_hip3,
+            deployer: meta.deployer.as_ref().map(|d| Arc::from(d.as_str())),
+        }
+    }
+
+    /// Fast size truncation (hot path).
+    #[inline(always)]
+    pub fn truncate_size(&self, size: f64) -> f64 {
+        (size * self.sz_multiplier).trunc() / self.sz_multiplier
+    }
+
+    /// Check OI cap (hot path) - returns max additional notional allowed.
+    #[inline(always)]
+    pub fn remaining_oi_capacity(&self, current_oi: f64) -> f64 {
+        (self.oi_cap_usd - current_oi).max(0.0)
+    }
+}
+```
+
+### 0.2 Update MarketMakerConfig
+
+**File:** `src/market_maker/config.rs`
+
+```rust
+#[derive(Debug, Clone)]
+pub struct MarketMakerConfig {
+    // ... existing fields ...
+
+    /// Pre-computed runtime config (resolved at startup)
+    /// All hot-path reads go through this.
+    pub runtime: AssetRuntimeConfig,
+}
+```
+
+### 0.3 Startup Resolution Pattern
+
+**File:** `src/bin/market_maker.rs`
+
+```rust
+// At startup, resolve everything ONCE:
+let asset_meta = meta.universe.iter()
+    .find(|a| a.name == asset)
+    .ok_or_else(|| anyhow!("Asset {} not found", asset))?;
+
+let runtime_config = AssetRuntimeConfig::from_asset_meta(asset_meta);
+
+info!(
+    asset = %runtime_config.asset,
+    is_cross = runtime_config.is_cross,
+    is_hip3 = runtime_config.is_hip3,
+    fee_mult = runtime_config.fee_multiplier,
+    oi_cap = %if runtime_config.oi_cap_usd == f64::MAX {
+        "unlimited".to_string()
+    } else {
+        format!("${:.0}", runtime_config.oi_cap_usd)
+    },
+    "Asset runtime config resolved"
+);
+
+// Set leverage with pre-computed is_cross
+exchange_client
+    .update_leverage(leverage, &asset, runtime_config.is_cross, None)
+    .await?;
+```
 
 ---
 
@@ -26,7 +187,7 @@ This plan adds support for HIP-3 (builder-deployed perpetuals) to the Hyperliqui
 
 **File:** `src/meta.rs`
 
-Add new fields to capture HIP-3-specific metadata:
+Add new fields to capture HIP-3-specific metadata from API:
 
 ```rust
 #[derive(Deserialize, Debug, Clone)]
@@ -44,77 +205,44 @@ pub struct AssetMeta {
     #[serde(default)]
     pub is_delisted: Option<bool>,
 
-    // NEW: HIP-3 specific fields
-    /// Deployer address (present for HIP-3 assets)
+    // NEW: HIP-3 specific fields (parsed from API, used only at startup)
     #[serde(default)]
     pub deployer: Option<String>,
-    /// DEX identifier for builder-deployed perps
     #[serde(default)]
     pub dex_id: Option<u32>,
-    /// Open interest cap in USD notional
     #[serde(default)]
     pub oi_cap_usd: Option<f64>,
-    /// Whether this is a HIP-3 (builder-deployed) asset
     #[serde(default)]
     pub is_builder_deployed: Option<bool>,
 }
 ```
 
-### 1.2 Add Asset Type Enum
+### 1.2 Add Compact Asset Type Enum
 
 **File:** `src/meta.rs`
 
 ```rust
-/// Asset deployment type for margin mode determination.
+/// Asset deployment type - compact representation for startup logic.
+/// Uses repr(u8) for minimal memory footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AssetType {
-    /// Validator-operated perp (supports cross margin)
-    ValidatorPerp,
-    /// Builder-deployed HIP-3 perp (isolated-only)
-    BuilderPerp,
-    /// Spot asset (no margin)
-    Spot,
+    ValidatorPerp = 0,
+    BuilderPerp = 1,  // HIP-3
+    Spot = 2,
 }
 
 impl AssetMeta {
-    /// Determine asset type from metadata.
+    /// Determine asset type - called ONCE at startup.
+    /// Do NOT call in hot paths - use AssetRuntimeConfig.is_hip3 instead.
     pub fn asset_type(&self) -> AssetType {
         if self.is_builder_deployed.unwrap_or(false)
            || self.only_isolated.unwrap_or(false)
-           || self.margin_mode.as_deref() == Some("noCross") {
+           || self.margin_mode.as_deref() == Some("noCross")
+           || self.margin_mode.as_deref() == Some("strictIsolated") {
             AssetType::BuilderPerp
         } else {
             AssetType::ValidatorPerp
-        }
-    }
-
-    /// Check if cross margin is allowed.
-    pub fn allows_cross_margin(&self) -> bool {
-        matches!(self.asset_type(), AssetType::ValidatorPerp)
-    }
-
-    /// Check if this is a HIP-3 asset.
-    pub fn is_hip3(&self) -> bool {
-        matches!(self.asset_type(), AssetType::BuilderPerp)
-    }
-}
-```
-
-### 1.3 Extend `AssetLeverageConfig`
-
-**File:** `src/meta.rs`
-
-```rust
-impl AssetLeverageConfig {
-    /// Create leverage config from asset metadata with HIP-3 awareness.
-    pub fn from_asset_meta(meta: &AssetMeta) -> Self {
-        Self {
-            asset: meta.name.clone(),
-            max_leverage: meta.max_leverage as f64,
-            isolated_only: meta.only_isolated.unwrap_or(false)
-                          || meta.is_builder_deployed.unwrap_or(false)
-                          || meta.margin_mode.as_deref() == Some("noCross"),
-            tiers: vec![],
         }
     }
 }
@@ -679,9 +807,160 @@ fn test_margin_state_isolated_mode() {
 
 ---
 
-## Phase 7: CLI Enhancements
+## Phase 7: DEX Abstraction & Collateral Routing (NEW)
 
-### 7.1 Add Margin Mode CLI Flag
+### 7.1 Enable DEX Abstraction at Startup
+
+**File:** `src/exchange/actions.rs`
+
+```rust
+/// Enable HIP-3 DEX abstraction for automatic collateral routing.
+/// When enabled, actions on HIP-3 perps automatically transfer collateral
+/// from validator-operated USDC perps balance.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDexAbstraction {
+    pub enable: bool,
+}
+```
+
+**File:** `src/exchange/accounts.rs`
+
+```rust
+impl ExchangeClient {
+    /// Enable HIP-3 DEX abstraction for automatic collateral routing.
+    /// Call ONCE at startup before trading HIP-3 assets.
+    pub async fn enable_dex_abstraction(
+        &self,
+        wallet: Option<&PrivateKeySigner>,
+    ) -> Result<ExchangeResponseStatus> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let action = Actions::UserDexAbstraction(UserDexAbstraction { enable: true });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action)?;
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+
+        self.post(action, signature, timestamp).await
+    }
+}
+```
+
+### 7.2 Startup Sequence for HIP-3 Assets
+
+**File:** `src/bin/market_maker.rs`
+
+```rust
+// At startup, BEFORE setting leverage:
+if runtime_config.is_hip3 {
+    info!("Enabling DEX abstraction for HIP-3 asset {}", asset);
+    exchange_client.enable_dex_abstraction(None).await?;
+}
+
+// Then set leverage with correct margin mode
+exchange_client
+    .update_leverage(leverage, &asset, runtime_config.is_cross, None)
+    .await?;
+
+// For isolated assets, allocate initial margin
+if !runtime_config.is_cross {
+    exchange_client
+        .update_isolated_margin(initial_margin, &asset, None)
+        .await?;
+}
+```
+
+---
+
+## Phase 8: P&L Tracking with Fee Multipliers (NEW)
+
+### 8.1 Update P&L Tracker
+
+**File:** `src/market_maker/tracking/pnl.rs`
+
+```rust
+pub struct PnLTracker {
+    // ... existing fields ...
+
+    /// Fee multiplier for this asset (1.0 for validator perps, 2.0 for HIP-3)
+    /// Pre-computed from AssetRuntimeConfig at construction.
+    fee_multiplier: f64,
+}
+
+impl PnLTracker {
+    pub fn with_fee_multiplier(mut self, multiplier: f64) -> Self {
+        self.fee_multiplier = multiplier;
+        self
+    }
+
+    /// Record fill with fee adjustment.
+    #[inline(always)]
+    pub fn record_fill(&mut self, size: f64, price: f64, is_buy: bool, raw_fee: f64) {
+        // Apply fee multiplier for HIP-3 assets
+        let adjusted_fee = raw_fee * self.fee_multiplier;
+        // ... rest of P&L calculation
+    }
+}
+```
+
+### 8.2 Integrate into Market Maker Construction
+
+```rust
+let pnl_tracker = PnLTracker::new()
+    .with_fee_multiplier(runtime_config.fee_multiplier);
+```
+
+---
+
+## Phase 9: OI Cap Enforcement (NEW)
+
+### 9.1 Pre-Flight OI Check in Order Placement
+
+**File:** `src/market_maker/mod.rs`
+
+```rust
+/// Check if order would exceed OI cap.
+/// Called before placing orders - HOT PATH, must be fast.
+#[inline(always)]
+fn check_oi_capacity(&self, order_notional: f64) -> bool {
+    // Fast path: no cap
+    if self.config.runtime.oi_cap_usd == f64::MAX {
+        return true;
+    }
+
+    // Check remaining capacity
+    let current_notional = self.position.position().abs() * self.latest_mid;
+    current_notional + order_notional <= self.config.runtime.oi_cap_usd
+}
+```
+
+### 9.2 Integrate into Quote Cycle
+
+```rust
+async fn update_quotes(&mut self) -> Result<()> {
+    // ... existing warmup check ...
+
+    // OI cap pre-flight (fast path for unlimited)
+    let max_order_notional = self.config.runtime.remaining_oi_capacity(
+        self.position.position().abs() * self.latest_mid
+    );
+
+    if max_order_notional < MIN_ORDER_NOTIONAL {
+        warn!(oi_cap = self.config.runtime.oi_cap_usd, "OI cap reached, skipping quotes");
+        return Ok(());
+    }
+
+    // ... rest of quote logic with constrained max_order_notional ...
+}
+```
+
+---
+
+## Phase 10: CLI Enhancements
+
+### 10.1 Add Margin Mode CLI Flag
 
 **File:** `src/bin/market_maker.rs`
 
@@ -690,10 +969,6 @@ fn test_margin_state_isolated_mode() {
 struct Cli {
     // ... existing fields ...
 
-    /// Override margin mode (auto-detected by default)
-    #[arg(long)]
-    margin_mode: Option<String>,
-
     /// Initial isolated margin allocation in USD
     #[arg(long, default_value = "1000.0")]
     initial_isolated_margin: f64,
@@ -701,38 +976,27 @@ struct Cli {
     /// Force isolated margin mode even for cross-capable assets
     #[arg(long)]
     force_isolated: bool,
-}
-```
 
-### 7.2 Add HIP-3 Asset Info Command
-
-```rust
-#[derive(Subcommand)]
-enum Commands {
-    // ... existing commands ...
-
-    /// Show HIP-3 asset information
-    Hip3Info {
-        /// Asset to query
-        #[arg(long)]
-        asset: String,
-    },
+    /// Skip DEX abstraction enable (for debugging)
+    #[arg(long)]
+    skip_dex_abstraction: bool,
 }
 ```
 
 ---
 
-## Implementation Order
+## Implementation Order (Revised)
 
-| Phase | Priority | Estimated Files Changed |
-|-------|----------|------------------------|
-| 1. Asset Metadata | P0 | `src/meta.rs` |
-| 2. Margin Infrastructure | P0 | `src/types/margin.rs`, `src/market_maker/infra/margin.rs` |
-| 3. Exchange Client | P1 | `src/exchange/accounts.rs`, `src/info/info_client.rs` |
-| 4. Market Maker | P1 | `src/bin/market_maker.rs`, `src/market_maker/mod.rs`, `src/market_maker/config.rs` |
-| 5. Risk Management | P2 | `src/market_maker/risk/` |
-| 6. Testing | P1 | Various test modules |
-| 7. CLI Enhancements | P3 | `src/bin/market_maker.rs` |
+| Phase | Priority | Description | Files |
+|-------|----------|-------------|-------|
+| **0. Runtime Config** | P0 | Pre-computed asset config | `config.rs` |
+| **1. Metadata** | P0 | Parse HIP-3 fields from API | `meta.rs` |
+| **2. Margin Infra** | P0 | MarginMode enum, dual tracking | `margin.rs` |
+| **3. Exchange Client** | P1 | DEX abstraction, leverage setup | `accounts.rs` |
+| **4. Market Maker** | P1 | Use runtime config, OI checks | `mod.rs`, `bin/market_maker.rs` |
+| **5. P&L Tracking** | P1 | Fee multiplier in P&L | `pnl.rs` |
+| **6. Risk Mgmt** | P2 | Tighter limits for isolated | `kill_switch.rs` |
+| **7. Testing** | P1 | Unit + integration tests | Various |
 
 ---
 
@@ -740,10 +1004,22 @@ enum Commands {
 
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
-| Incorrect margin mode detection | Order rejections | Validate against live API response |
-| Insufficient isolated margin | Liquidation | Monitor liquidation price, add margin buffer |
-| Fee assumptions (2x) | P&L miscalculation | Fetch actual fee from exchange |
-| OI cap exceeded | Order rejection | Track OI and reject oversized orders |
+| Incorrect margin mode detection | Order rejections | Validate against live API, log discrepancies |
+| Insufficient isolated margin | Liquidation | Monitor liq price, auto top-up if close |
+| OI cap exceeded | Order rejection | Pre-flight check in quote cycle |
+| DEX abstraction not enabled | Collateral routing fails | Enable at startup, verify state |
+| Fee calculation wrong | P&L miscalculation | Use fee_multiplier from runtime config |
+
+---
+
+## Latency Benchmark Targets
+
+| Operation | Target | Notes |
+|-----------|--------|-------|
+| HIP-3 detection | 0 ns | Pre-computed at startup |
+| Margin mode check | 0 ns | Single bool field access |
+| OI cap check | <10 ns | f64 comparison only |
+| Fee multiplier apply | <5 ns | f64 multiply |
 
 ---
 
@@ -752,9 +1028,13 @@ enum Commands {
 - [ ] Cross margin assets still work as before
 - [ ] HIP-3 assets correctly use isolated mode
 - [ ] Leverage is set with correct `is_cross` flag
+- [ ] DEX abstraction enabled for HIP-3 assets
 - [ ] Initial isolated margin is allocated
+- [ ] OI cap is enforced before order placement
+- [ ] P&L tracking uses correct fee multiplier
 - [ ] Kill switch triggers appropriately for isolated positions
 - [ ] Liquidation price is monitored for isolated positions
 - [ ] CLI displays margin mode in status output
 - [ ] All existing tests pass
 - [ ] New tests cover HIP-3 detection and margin mode logic
+- [ ] **Zero additional latency in quote cycle** (benchmark verified)
