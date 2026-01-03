@@ -163,26 +163,61 @@ impl ConstrainedLadderOptimizer {
             BindingConstraint::None
         };
 
-        // 3. Allocate sizes proportional to marginal value
+        // 3. Calculate dynamic minimum size from notional requirement
+        // This ensures we can quote with any capital level that meets exchange minimums
+        let dynamic_min_size = (self.min_notional / self.price).max(self.min_size * 0.1);
+        let effective_min_size = dynamic_min_size.max(1e-8); // Absolute floor for precision
+
+        // 4. Allocate sizes proportional to marginal value
         let mut raw_sizes: Vec<f64> = marginal_values
             .iter()
             .map(|&mv| max_position_total * mv / total_mv)
             .collect();
 
-        // 4. Filter out levels below min_size or min_notional thresholds
-        // Set sizes to 0 for levels that don't meet thresholds
+        // 5. Filter out levels below effective min_size or min_notional thresholds
         for size in raw_sizes.iter_mut() {
             let notional = *size * self.price;
-            if *size < self.min_size || notional < self.min_notional {
+            if *size < effective_min_size || notional < self.min_notional {
                 *size = 0.0;
             }
         }
 
-        // 5. Compute actual margin and position used
+        // 6. CONCENTRATION FALLBACK: If all levels filtered out but capacity exists,
+        // concentrate into the single best level to guarantee at least one quote
+        let valid_count = raw_sizes.iter().filter(|&&s| s > EPSILON).count();
+        if valid_count == 0 && max_position_total >= effective_min_size {
+            // Find best level by marginal value
+            if let Some((best_idx, best_mv)) = marginal_values
+                .iter()
+                .enumerate()
+                .filter(|(_, &mv)| mv > EPSILON)
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                // Concentrate entire capacity into best level
+                raw_sizes = vec![0.0; levels.len()];
+                let concentrated_size = max_position_total.max(effective_min_size);
+                let notional = concentrated_size * self.price;
+                // Only place if meets notional minimum
+                if notional >= self.min_notional {
+                    raw_sizes[best_idx] = concentrated_size;
+                    tracing::info!(
+                        levels = levels.len(),
+                        best_level = best_idx,
+                        concentrated_size = %format!("{:.6}", concentrated_size),
+                        notional = %format!("{:.2}", notional),
+                        max_position_total = %format!("{:.6}", max_position_total),
+                        best_mv = %format!("{:.6}", best_mv),
+                        "Concentration fallback: single quote at best level"
+                    );
+                }
+            }
+        }
+
+        // 7. Compute actual margin and position used
         let position_used: f64 = raw_sizes.iter().sum();
         let margin_used = position_used * margin_per_unit;
 
-        // 6. Compute shadow price (marginal value of lowest allocated level)
+        // 8. Compute shadow price (marginal value of lowest allocated level)
         let shadow_price = marginal_values
             .iter()
             .zip(raw_sizes.iter())
@@ -308,25 +343,61 @@ impl ConstrainedLadderOptimizer {
             BindingConstraint::None
         };
 
-        // 3. Allocate sizes proportional to Kelly-weighted values
+        // 3. Calculate dynamic minimum size from notional requirement
+        // This ensures we can quote with any capital level that meets exchange minimums
+        let dynamic_min_size = (self.min_notional / self.price).max(self.min_size * 0.1);
+        let effective_min_size = dynamic_min_size.max(1e-8); // Absolute floor for precision
+
+        // 4. Allocate sizes proportional to Kelly-weighted values
         let mut raw_sizes: Vec<f64> = kelly_values
             .iter()
             .map(|&kv| max_position_total * kv / total_kelly)
             .collect();
 
-        // 4. Filter out levels below min_size or min_notional thresholds
+        // 5. Filter out levels below effective min_size or min_notional thresholds
         for size in raw_sizes.iter_mut() {
             let notional = *size * self.price;
-            if *size < self.min_size || notional < self.min_notional {
+            if *size < effective_min_size || notional < self.min_notional {
                 *size = 0.0;
             }
         }
 
-        // 5. Compute actual margin and position used
+        // 6. CONCENTRATION FALLBACK: If all levels filtered out but capacity exists,
+        // concentrate into the single best level to guarantee at least one quote
+        let valid_count = raw_sizes.iter().filter(|&&s| s > EPSILON).count();
+        if valid_count == 0 && max_position_total >= effective_min_size {
+            // Find best level by Kelly value
+            if let Some((best_idx, best_kv)) = kelly_values
+                .iter()
+                .enumerate()
+                .filter(|(_, &kv)| kv > EPSILON)
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                // Concentrate entire capacity into best level
+                raw_sizes = vec![0.0; levels.len()];
+                let concentrated_size = max_position_total.max(effective_min_size);
+                let notional = concentrated_size * self.price;
+                // Only place if meets notional minimum
+                if notional >= self.min_notional {
+                    raw_sizes[best_idx] = concentrated_size;
+                    tracing::info!(
+                        levels = levels.len(),
+                        best_level = best_idx,
+                        concentrated_size = %format!("{:.6}", concentrated_size),
+                        notional = %format!("{:.2}", notional),
+                        max_position_total = %format!("{:.6}", max_position_total),
+                        best_kelly = %format!("{:.6}", best_kv),
+                        "Concentration fallback (Kelly): single quote at best level"
+                    );
+                }
+            }
+        }
+
+        // 7. Compute actual margin and position used
         let position_used: f64 = raw_sizes.iter().sum();
         let margin_used = position_used * margin_per_unit;
 
-        // 6. Shadow price is the minimum Kelly value among allocated levels
+        // 8. Shadow price is the minimum Kelly value among allocated levels
         let shadow_price = kelly_values
             .iter()
             .zip(raw_sizes.iter())
@@ -765,5 +836,177 @@ mod tests {
         // Extreme values
         assert!(normal_cdf(10.0) > 0.999);
         assert!(normal_cdf(-10.0) < 0.001);
+    }
+
+    #[test]
+    fn test_concentration_fallback_small_capacity() {
+        // Scenario: Extremely small position capacity where even with dynamic min_size,
+        // proportional allocation still produces sub-minimum sizes.
+        // The concentration fallback should put entire capacity in single best level.
+        //
+        // With dynamic min_size = max($10/$90000, 0.001*0.1) = max(0.000111, 0.0001) = 0.000111
+        // If capacity = 0.0003 and 5 levels, each gets 0.00006 < 0.000111 → all filtered → concentrate
+        let optimizer = ConstrainedLadderOptimizer::new(
+            50.0,     // margin_available ($50)
+            0.0003,   // max_position (extremely small - less than min_notional worth)
+            0.001,    // min_size (hardcoded, but dynamic calculation should override)
+            10.0,     // min_notional ($10 exchange minimum)
+            90000.0,  // price ($90k BTC)
+            20.0,     // leverage
+        );
+
+        // Create 5 levels with varying marginal values
+        let levels = vec![
+            LevelOptimizationParams {
+                depth_bps: 5.0,
+                fill_intensity: 0.8,
+                spread_capture: 0.0005,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+            LevelOptimizationParams {
+                depth_bps: 10.0,
+                fill_intensity: 0.6,
+                spread_capture: 0.001,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+            LevelOptimizationParams {
+                depth_bps: 15.0,
+                fill_intensity: 0.4,
+                spread_capture: 0.0015,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+            LevelOptimizationParams {
+                depth_bps: 20.0,
+                fill_intensity: 0.3,
+                spread_capture: 0.002,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+            LevelOptimizationParams {
+                depth_bps: 25.0,
+                fill_intensity: 0.2,
+                spread_capture: 0.0025,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+        ];
+
+        let allocation = optimizer.optimize(&levels);
+
+        // With 0.0003 BTC capacity split 5 ways = 0.00006 each < 0.000111 dynamic min
+        // But concentration gives 0.0003 BTC which is 0.0003 * 90000 = $27 > $10 min_notional
+        // So we should get exactly 1 non-zero level
+        let non_zero_count = allocation.sizes.iter().filter(|&&s| s > 0.0001).count();
+        assert_eq!(non_zero_count, 1, "Expected concentration into single level");
+
+        // The single level should have ~full capacity
+        let total_size: f64 = allocation.sizes.iter().sum();
+        assert!(
+            total_size >= 0.0002,
+            "Expected concentrated size near capacity, got {}",
+            total_size
+        );
+
+        // Notional should meet minimum ($27 > $10)
+        let max_size = allocation.sizes.iter().cloned().fold(0.0, f64::max);
+        let notional = max_size * 90000.0;
+        assert!(
+            notional >= 10.0,
+            "Expected notional >= $10, got {}",
+            notional
+        );
+    }
+
+    #[test]
+    fn test_dynamic_min_size_allows_small_orders() {
+        // Test that with dynamic min_size, small accounts CAN quote across multiple levels
+        // Previously: 0.002633 BTC / 5 levels = 0.000527 < 0.001 hardcoded → all filtered
+        // Now: dynamic min = $10/$90k = 0.000111, so 0.000527 > 0.000111 → passes
+        let optimizer = ConstrainedLadderOptimizer::new(
+            250.0,    // margin_available ($250)
+            0.002633, // max_position (same as log analysis)
+            0.001,    // min_size (hardcoded, would filter if used)
+            10.0,     // min_notional ($10 exchange minimum)
+            90000.0,  // price ($90k BTC)
+            20.0,     // leverage
+        );
+
+        let levels = vec![
+            LevelOptimizationParams {
+                depth_bps: 5.0,
+                fill_intensity: 0.8,
+                spread_capture: 0.0005,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+            LevelOptimizationParams {
+                depth_bps: 10.0,
+                fill_intensity: 0.6,
+                spread_capture: 0.001,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+            LevelOptimizationParams {
+                depth_bps: 15.0,
+                fill_intensity: 0.4,
+                spread_capture: 0.0015,
+                margin_per_unit: 90000.0 / 20.0,
+                adverse_selection: 0.0001,
+            },
+        ];
+
+        let allocation = optimizer.optimize(&levels);
+
+        // All 3 levels should now pass with dynamic min_size
+        let non_zero_count = allocation.sizes.iter().filter(|&&s| s > 0.0001).count();
+        assert_eq!(
+            non_zero_count, 3,
+            "Expected all 3 levels to pass with dynamic min_size"
+        );
+
+        // Total should be ~full capacity
+        let total_size: f64 = allocation.sizes.iter().sum();
+        assert!(
+            (total_size - 0.002633).abs() < 0.0001,
+            "Expected total near capacity, got {}",
+            total_size
+        );
+    }
+
+    #[test]
+    fn test_dynamic_min_size_from_notional() {
+        // Test that dynamic min_size is calculated from min_notional/price
+        // rather than using hardcoded min_size when it's too restrictive
+        let optimizer = ConstrainedLadderOptimizer::new(
+            1000.0,    // margin_available
+            0.005,     // max_position
+            0.001,     // min_size (hardcoded 0.001 BTC = $90 at $90k)
+            10.0,      // min_notional ($10 = 0.000111 BTC at $90k)
+            90000.0,   // price
+            20.0,      // leverage
+        );
+
+        // Single level that would be filtered by 0.001 min_size
+        // but should pass dynamic min_size from notional
+        let levels = vec![LevelOptimizationParams {
+            depth_bps: 10.0,
+            fill_intensity: 0.5,
+            spread_capture: 0.001,
+            margin_per_unit: 90000.0 / 20.0,
+            adverse_selection: 0.0001,
+        }];
+
+        let allocation = optimizer.optimize(&levels);
+
+        // With 0.005 BTC capacity and single level, should get full allocation
+        // not filtered out by hardcoded 0.001 min_size
+        assert!(
+            allocation.sizes[0] > 0.0001,
+            "Expected allocation, got {}",
+            allocation.sizes[0]
+        );
     }
 }

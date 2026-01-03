@@ -79,7 +79,9 @@
       "mcp__serena__edit_memory",
       "Bash(do)",
       "Bash(echo:*)",
-      "mcp__serena__initial_instructions"
+      "mcp__serena__initial_instructions",
+      "Bash(git -C:*)",
+      "Bash(chmod:*)"
     ]
   }
 }

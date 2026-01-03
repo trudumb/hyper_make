@@ -836,11 +836,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create exchange client (pass DEX-specific meta for HIP-3 support)
-    let exchange_client =
-        ExchangeClient::new(None, wallet.clone(), Some(base_url), Some(meta.clone()), None)
-            .await
-            .map_err(|e| format!("Failed to create exchange client: {e}"))?;
+    // Create exchange client (pass DEX-specific meta and DEX name for HIP-3 support)
+    // For HIP-3 DEXs, this applies the correct asset index formula:
+    // asset_index = 100000 + (perp_dex_index × 10000) + index_in_meta
+    let exchange_client = ExchangeClient::new_for_dex(
+        None,
+        wallet.clone(),
+        Some(base_url),
+        Some(meta.clone()),
+        None,
+        dex.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("Failed to create exchange client: {e}"))?;
 
     // Set leverage on the exchange (use is_cross from runtime config for HIP-3 support)
     info!(

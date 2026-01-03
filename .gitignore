@@ -4,3 +4,4 @@ Cargo.lock
 .env
 market_maker.toml
 *.log
+logs/

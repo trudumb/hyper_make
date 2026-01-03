@@ -198,12 +198,42 @@ impl Actions {
 }
 
 impl ExchangeClient {
+    /// Create a new ExchangeClient for validator perps (default).
+    ///
+    /// For HIP-3 builder DEXs, use `new_for_dex()` instead.
     pub async fn new(
         client: Option<Client>,
         wallet: PrivateKeySigner,
         base_url: Option<BaseUrl>,
         meta: Option<Meta>,
         vault_address: Option<Address>,
+    ) -> Result<ExchangeClient> {
+        Self::new_for_dex(client, wallet, base_url, meta, vault_address, None).await
+    }
+
+    /// Create a new ExchangeClient for a specific DEX.
+    ///
+    /// # Arguments
+    /// - `client`: Optional HTTP client
+    /// - `wallet`: Wallet for signing transactions
+    /// - `base_url`: API base URL (mainnet/testnet)
+    /// - `meta`: Optional pre-fetched metadata
+    /// - `vault_address`: Optional vault address
+    /// - `dex`: DEX name for HIP-3 builder DEXs (e.g., "hyna", "felix").
+    ///   If None, uses validator perps (default).
+    ///
+    /// # HIP-3 Asset Index Formula
+    /// For HIP-3 DEXs, asset indices follow the formula:
+    /// `asset_index = 100000 + (perp_dex_index × 10000) + index_in_meta`
+    ///
+    /// This ensures orders are routed to the correct DEX.
+    pub async fn new_for_dex(
+        client: Option<Client>,
+        wallet: PrivateKeySigner,
+        base_url: Option<BaseUrl>,
+        meta: Option<Meta>,
+        vault_address: Option<Address>,
+        dex: Option<&str>,
     ) -> Result<ExchangeClient> {
         let client = client.unwrap_or_default();
         let base_url = base_url.unwrap_or(BaseUrl::Mainnet);
@@ -212,14 +242,39 @@ impl ExchangeClient {
         let meta = if let Some(meta) = meta {
             meta
         } else {
-            info.meta().await?
+            info.meta_for_dex(dex).await?
         };
 
+        // Build coin_to_asset map with correct indices
         let mut coin_to_asset = HashMap::new();
-        for (asset_ind, asset) in meta.universe.iter().enumerate() {
-            coin_to_asset.insert(asset.name.clone(), asset_ind as u32);
+
+        if let Some(dex_name) = dex {
+            // HIP-3 DEX: Look up DEX index and apply formula
+            // Formula: asset_index = 100000 + (perp_dex_index × 10000) + index_in_meta
+            let perp_dexs = info.perp_dexs().await?;
+            let dex_index = perp_dexs
+                .iter()
+                .position(|d| d.as_ref().map(|d| d.name.as_str()) == Some(dex_name))
+                .ok_or(Error::AssetNotFound)?; // DEX not found in perp_dexs list
+
+            let base_offset = 100000 + (dex_index as u32 * 10000);
+            debug!(
+                "HIP-3 DEX '{}' has index {}, base offset {}",
+                dex_name, dex_index, base_offset
+            );
+
+            for (asset_ind, asset) in meta.universe.iter().enumerate() {
+                let full_index = base_offset + asset_ind as u32;
+                coin_to_asset.insert(asset.name.clone(), full_index);
+            }
+        } else {
+            // Validator perps: use indices directly from meta
+            for (asset_ind, asset) in meta.universe.iter().enumerate() {
+                coin_to_asset.insert(asset.name.clone(), asset_ind as u32);
+            }
         }
 
+        // Add spot assets (always use 10000 + index)
         coin_to_asset = info
             .spot_meta()
             .await?

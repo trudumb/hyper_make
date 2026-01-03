@@ -25,6 +25,43 @@ cargo run --bin market_maker -- --help                   # Show CLI options
 cargo run --bin market_maker -- generate-config          # Generate sample config
 ```
 
+### Development Testing with Timestamped Logs
+
+Create `logs/` directory and run with timestamped log files for session tracking:
+
+```bash
+# Create logs directory (one-time)
+mkdir -p logs
+
+# Testnet (default)
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
+cargo run --bin market_maker -- \
+  --asset BTC \
+  --log-file logs/mm_testnet_BTC_${TIMESTAMP}.log
+
+# Mainnet (validator perps)
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
+cargo run --bin market_maker -- \
+  --network mainnet \
+  --asset BTC \
+  --log-file logs/mm_mainnet_BTC_${TIMESTAMP}.log
+
+# HIP-3 DEX
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
+cargo run --bin market_maker -- \
+  --network mainnet \
+  --asset BTC \
+  --dex hyna \
+  --log-file logs/mm_hyna_BTC_${TIMESTAMP}.log
+```
+
+**Log naming convention:** `logs/mm_{network|dex}_{asset}_{YYYY-MM-DD}_{HH-MM-SS}.log`
+
+Logs are tracked via Serena session memories for checkpoint analysis.
+
 ## Architecture
 
 This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data, and WebSocket streaming capabilities.

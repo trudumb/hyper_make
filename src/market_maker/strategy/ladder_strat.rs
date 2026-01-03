@@ -1,6 +1,6 @@
 //! GLFT Ladder Strategy - multi-level quoting with depth-dependent sizing.
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{truncate_float, EPSILON};
 
@@ -737,8 +737,34 @@ impl LadderStrategy {
             }
 
             // 9. Filter out zero-size levels
+            let bids_before = ladder.bids.len();
+            let asks_before = ladder.asks.len();
             ladder.bids.retain(|l| l.size > EPSILON);
             ladder.asks.retain(|l| l.size > EPSILON);
+
+            // Diagnostic: warn if all levels were filtered out
+            if bids_before > 0 && ladder.bids.is_empty() {
+                warn!(
+                    bids_before = bids_before,
+                    available_margin = %format!("{:.2}", available_margin),
+                    available_position = %format!("{:.6}", available_for_bids),
+                    min_notional = %format!("{:.2}", config.min_notional),
+                    min_level_size = %format!("{:.6}", ladder_config.min_level_size),
+                    mid_price = %format!("{:.2}", market_params.microprice),
+                    "All bid levels filtered out (sizes too small)"
+                );
+            }
+            if asks_before > 0 && ladder.asks.is_empty() {
+                warn!(
+                    asks_before = asks_before,
+                    available_margin = %format!("{:.2}", available_margin),
+                    available_position = %format!("{:.6}", available_for_asks),
+                    min_notional = %format!("{:.2}", config.min_notional),
+                    min_level_size = %format!("{:.6}", ladder_config.min_level_size),
+                    mid_price = %format!("{:.2}", market_params.microprice),
+                    "All ask levels filtered out (sizes too small)"
+                );
+            }
 
             ladder
         } else {

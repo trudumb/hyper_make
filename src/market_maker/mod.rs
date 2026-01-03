@@ -96,6 +96,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     estimator: ParameterEstimator,
     /// Last logged warmup progress (to avoid spam)
     last_warmup_log: usize,
+    /// Last time warmup blocked quoting was logged (Instant for time-based throttling)
+    last_warmup_block_log: Option<std::time::Instant>,
 
     // === Component Bundles ===
     /// Tier 1: Production resilience (AS, queue, liquidation)
@@ -223,6 +225,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             latest_mid: -1.0,
             estimator: ParameterEstimator::new(estimator_config),
             last_warmup_log: 0,
+            last_warmup_block_log: None,
             tier1,
             tier2,
             safety,
@@ -489,8 +492,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Skip the immediate first tick
         sync_interval.tick().await;
 
-        // Create shutdown signal listener ONCE before the loop (not inside select!)
-        // This ensures the signal is captured even if pressed during message processing
+        // Create shutdown signal listeners for both SIGINT (Ctrl+C) and SIGTERM
+        // This ensures graceful shutdown works with process managers that send SIGTERM
+        #[cfg(unix)]
+        let mut sigterm_signal = {
+            use tokio::signal::unix::{signal, SignalKind};
+            signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler")
+        };
+        #[cfg(not(unix))]
+        let mut sigterm_signal = std::future::pending::<()>();
+
         let mut shutdown_signal = std::pin::pin!(tokio::signal::ctrl_c());
 
         loop {
@@ -504,7 +515,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 break;
             }
 
+            // Use biased select to prioritize shutdown signals over other events
+            // This ensures graceful shutdown is responsive even during high message load
             tokio::select! {
+                biased;
+
+                // SIGINT (Ctrl+C) - highest priority
+                _ = &mut shutdown_signal => {
+                    info!("Shutdown signal received (SIGINT)");
+                    break;
+                }
+
+                // SIGTERM (process managers, systemd, docker stop) - also high priority
+                _ = sigterm_signal.recv() => {
+                    info!("Shutdown signal received (SIGTERM)");
+                    break;
+                }
+
+                // Message processing
                 message = receiver.recv() => {
                     match message {
                         Some(arc_msg) => {
@@ -540,6 +568,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         }
                     }
                 }
+
+                // Periodic safety sync
                 _ = sync_interval.tick() => {
                     if let Err(e) = self.safety_sync().await {
                         warn!("Safety sync failed: {e}");
@@ -627,15 +657,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         "Kill switch status"
                     );
                 }
-                _ = &mut shutdown_signal => {
-                    info!("Shutdown signal received");
-                    break;
-                }
             }
         }
 
-        // Graceful shutdown
-        self.shutdown().await?;
+        // Graceful shutdown with timeout to ensure completion even under load
+        // We give ourselves 5 seconds to cancel orders before forced exit
+        info!("Initiating graceful shutdown (5 second timeout)...");
+        match tokio::time::timeout(Duration::from_secs(5), self.shutdown()).await {
+            Ok(Ok(())) => {
+                info!("Graceful shutdown completed successfully");
+            }
+            Ok(Err(e)) => {
+                error!("Graceful shutdown encountered error: {e}");
+            }
+            Err(_) => {
+                error!("Graceful shutdown timed out after 5 seconds - orders may remain on exchange");
+            }
+        }
 
         info!("Market maker stopped.");
         Ok(())
@@ -1007,6 +1045,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     async fn update_quotes(&mut self) -> Result<()> {
         // Don't place orders until estimator is warmed up
         if !self.estimator.is_warmed_up() {
+            // Log warmup status every 10 seconds to help diagnose why orders aren't placed
+            let should_log = match self.last_warmup_block_log {
+                None => true,
+                Some(last) => last.elapsed() >= std::time::Duration::from_secs(10),
+            };
+            if should_log {
+                let (vol_ticks, min_vol, trade_obs, min_trades) = self.estimator.warmup_progress();
+                warn!(
+                    volume_ticks = vol_ticks,
+                    volume_ticks_required = min_vol,
+                    trade_observations = trade_obs,
+                    trade_observations_required = min_trades,
+                    "Warmup incomplete - no orders placed (waiting for market data)"
+                );
+                self.last_warmup_block_log = Some(std::time::Instant::now());
+            }
             return Ok(());
         }
 
@@ -2284,6 +2338,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 continue;
             }
 
+            // Post-truncation notional check - truncation can push size below $10 minimum
+            let notional = truncated_size * price;
+            if notional < MIN_ORDER_NOTIONAL {
+                tracing::debug!(
+                    size = %format!("{:.6}", truncated_size),
+                    price = %format!("{:.2}", price),
+                    notional = %format!("{:.2}", notional),
+                    min = MIN_ORDER_NOTIONAL,
+                    "Skipping order: post-truncation notional below minimum"
+                );
+                continue;
+            }
+
             let cloid = uuid::Uuid::new_v4().to_string();
             order_specs.push(OrderSpec::with_cloid(price, truncated_size, is_buy, cloid));
         }
@@ -2637,6 +2704,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
             return Ok(());
         }
+
+        // Post-truncation notional check - truncation can push size below $10 minimum
+        let notional = adjusted_size * quote.price;
+        if notional < MIN_ORDER_NOTIONAL {
+            debug!(
+                side = %side_str(side),
+                size = %format!("{:.6}", adjusted_size),
+                price = %format!("{:.2}", quote.price),
+                notional = %format!("{:.2}", notional),
+                min = MIN_ORDER_NOTIONAL,
+                "Skipping order: post-truncation notional below minimum"
+            );
+            return Ok(());
+        }
+
         let result = self
             .executor
             .place_order(&self.config.asset, quote.price, adjusted_size, is_buy, None)

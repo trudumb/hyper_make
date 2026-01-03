@@ -410,6 +410,80 @@ The market maker automatically detects and respects OI caps:
 - Reduces position sizes if approaching caps
 - Logs warnings when near capacity
 
+### 6.6 HIP-3 Testing Workflow
+
+**Quick Start:**
+```bash
+# Use the test script (recommended)
+./scripts/test_hip3.sh BTC hyna 60    # 1 minute test
+./scripts/test_hip3.sh BTC hyna 300   # 5 minute test
+./scripts/test_hip3.sh ETH flx 120    # 2 minute test on Felix
+```
+
+**Manual Command with Timestamped Logs:**
+```bash
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
+cargo run --bin market_maker -- \
+  --network mainnet \
+  --asset BTC \
+  --dex hyna \
+  --log-file logs/mm_hyna_BTC_${TIMESTAMP}.log
+```
+
+**Log Naming Convention:**
+```
+logs/mm_{network|dex}_{asset}_{YYYY-MM-DD}_{HH-MM-SS}.log
+```
+
+| Identifier | Use Case |
+|------------|----------|
+| `testnet` | Testnet trading |
+| `mainnet` | Validator perps production |
+| `{dex}` | HIP-3 DEX (e.g., `hyna`, `flx`) |
+
+### 6.7 Log Analysis Workflow
+
+After running a test session:
+
+1. **Quick Log Stats:**
+   ```bash
+   # Count key events
+   grep -c "ERROR" logs/mm_hyna_BTC_*.log
+   grep -c "WARN" logs/mm_hyna_BTC_*.log
+   grep -c "Quote cycle" logs/mm_hyna_BTC_*.log
+   grep -c "Trades processed" logs/mm_hyna_BTC_*.log
+   ```
+
+2. **Analyze with Claude:**
+   Provide the log file to Claude and request `sc:analyze` for:
+   - Behavior summary
+   - Issues categorized by severity
+   - Recommended fixes with code locations
+   - Questions for implementation decisions
+
+3. **Create Serena Checkpoint:**
+   Claude will create a session memory for tracking:
+   ```
+   session_{YYYY-MM-DD}_{short_description}
+   ```
+
+4. **Track Fixes via Git PRs:**
+   - Branch: `fix/{issue-description}`
+   - Commit: Conventional format with Claude Code footer
+
+### 6.8 Key Metrics to Monitor
+
+During HIP-3 testing, watch for:
+
+| Metric | Healthy Range | Warning Sign |
+|--------|---------------|--------------|
+| `mm_spread_bps` | 5-15 bps | >30 bps consistently |
+| `mm_jump_ratio` | <1.5 | >3.0 (toxic flow) |
+| `mm_inventory_utilization` | <50% | >80% |
+| `mm_adverse_selection_bps` | <3 bps | >10 bps |
+| Quote cycle latency | <100ms | >500ms |
+
 ---
 
 ## 7. Monitoring & Alerting
