@@ -548,6 +548,28 @@ pub struct StochasticConfig {
     /// n = 20: Quasi-deterministic
     /// Default: 5
     pub entropy_thompson_samples: usize,
+
+    // ==================== Calibration Fill Rate Controller ====================
+    /// Enable calibration-aware fill rate targeting.
+    /// During warmup, reduces gamma to attract fills for parameter calibration.
+    /// Automatically phases out as calibration completes.
+    ///
+    /// Default: true
+    pub enable_calibration_fill_rate: bool,
+
+    /// Target fill rate per hour (across all levels).
+    /// The controller adjusts gamma to achieve this fill rate during warmup.
+    /// 10 fills/hour ≈ 2 fills/level for a 5-level ladder.
+    ///
+    /// Default: 10.0
+    pub target_fill_rate_per_hour: f64,
+
+    /// Minimum gamma multiplier during fill-hungry mode.
+    /// 0.3 = allow up to 70% gamma reduction (tighter quotes).
+    /// Lower values = more aggressive fill seeking.
+    ///
+    /// Default: 0.3
+    pub min_fill_hungry_gamma: f64,
 }
 
 impl Default for StochasticConfig {
@@ -615,6 +637,12 @@ impl Default for StochasticConfig {
             entropy_base_temperature: 1.0,      // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level
             entropy_thompson_samples: 5,        // Moderate stochasticity
+
+            // Calibration Fill Rate Controller
+            // ENABLED by default - ensures fills for parameter calibration
+            enable_calibration_fill_rate: true,
+            target_fill_rate_per_hour: 10.0,    // 10 fills/hour = ~2/level for 5 levels
+            min_fill_hungry_gamma: 0.3,          // Max 70% gamma reduction
         }
     }
 }

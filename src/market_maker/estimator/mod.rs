@@ -27,6 +27,7 @@
 //! - `tick_ewma`: Tick-based EWMA for volume-clock aligned estimation
 //! - `parameter_estimator`: Main orchestrator
 
+mod calibration_controller;
 mod covariance;
 mod hierarchical_kappa;
 mod jump;
@@ -50,6 +51,7 @@ pub(crate) use hierarchical_kappa::{HierarchicalKappa, HierarchicalKappaConfig};
 pub(crate) use soft_jump::SoftJumpClassifier;
 
 // Re-export public types
+pub use calibration_controller::{CalibrationController, CalibrationControllerConfig};
 pub use jump::{JumpEstimator, JumpEstimatorConfig};
 pub use kalman::{KalmanPriceFilter, NoiseFilter};
 pub use mock::MockEstimator;

@@ -415,6 +415,20 @@ pub struct MarketParams {
     /// Uncertainty factor for warmup period.
     /// Multiply spreads by this factor (> 1.0 during warmup, 1.0 when warmed up).
     pub adaptive_uncertainty_factor: f64,
+
+    // ==================== Calibration Fill Rate Controller ====================
+    /// Gamma multiplier from calibration controller [0.3, 1.0].
+    /// Lower values = tighter quotes to attract fills during warmup.
+    /// 1.0 = calibration complete, normal GLFT behavior.
+    pub calibration_gamma_mult: f64,
+
+    /// Calibration progress [0.0, 1.0].
+    /// Based on AS fills + kappa confidence.
+    pub calibration_progress: f64,
+
+    /// Whether calibration is complete.
+    /// When true, calibration_gamma_mult = 1.0.
+    pub calibration_complete: bool,
 }
 
 impl Default for MarketParams {
@@ -544,6 +558,10 @@ impl Default for MarketParams {
             adaptive_can_estimate: true,       // Can estimate immediately via priors
             adaptive_warmup_progress: 0.0,     // Start at 0% progress
             adaptive_uncertainty_factor: 1.2,  // Start with 20% wider spreads
+            // Calibration Fill Rate Controller
+            calibration_gamma_mult: 0.3,       // Start fill-hungry (70% gamma reduction)
+            calibration_progress: 0.0,         // Start at 0% calibration
+            calibration_complete: false,       // Not calibrated yet
         }
     }
 }

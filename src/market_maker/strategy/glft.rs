@@ -138,6 +138,12 @@ impl GLFTStrategy {
         // This replaces the arbitrary adaptive_uncertainty_factor
         let warmup_scalar = cfg.warmup_multiplier(market_params.adaptive_warmup_progress);
 
+        // === CALIBRATION FILL-HUNGRY SCALING (FIRST PRINCIPLES) ===
+        // During calibration, reduce gamma to attract fills for parameter estimation.
+        // calibration_gamma_mult ∈ [0.3, 1.0]: lower = tighter quotes = more fills
+        // Once calibrated, calibration_gamma_mult = 1.0 (no adjustment).
+        let calibration_scalar = market_params.calibration_gamma_mult;
+
         // === COMBINE AND CLAMP ===
         let gamma_effective = cfg.gamma_base
             * vol_scalar
@@ -147,7 +153,8 @@ impl GLFTStrategy {
             * hawkes_scalar
             * time_scalar
             * book_depth_scalar
-            * warmup_scalar;
+            * warmup_scalar
+            * calibration_scalar;
         let gamma_clamped = gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max);
 
         // Log gamma component breakdown for debugging strategy behavior
@@ -161,6 +168,7 @@ impl GLFTStrategy {
             time_scalar = %format!("{:.3}", time_scalar),
             book_scalar = %format!("{:.3}", book_depth_scalar),
             warmup_scalar = %format!("{:.3}", warmup_scalar),
+            calibration_scalar = %format!("{:.3}", calibration_scalar),
             gamma_raw = %format!("{:.4}", gamma_effective),
             gamma_clamped = %format!("{:.4}", gamma_clamped),
             "Gamma component breakdown"

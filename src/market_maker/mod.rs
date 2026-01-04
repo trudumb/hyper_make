@@ -697,6 +697,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         supervisor_stats.reconnect_signal_count,
                     );
 
+                    // Update calibration fill rate controller metrics
+                    self.infra.prometheus.update_calibration(
+                        self.stochastic.calibration_controller.gamma_multiplier(),
+                        self.stochastic.calibration_controller.calibration_progress(),
+                        self.stochastic.calibration_controller.fill_count(),
+                        self.stochastic.calibration_controller.is_calibrated(),
+                    );
+
                     // Check if supervisor recommends reconnection
                     if self.infra.connection_supervisor.is_reconnect_recommended() {
                         warn!(
@@ -963,6 +971,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     fill_pnl,
                     self.estimator.kappa(),
                 );
+
+                // Record fill for calibration controller
+                // This updates fill rate tracking for fill-hungry mode
+                self.stochastic.calibration_controller.record_fill();
             }
         }
 
@@ -1179,6 +1191,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
+        // Update calibration controller with current calibration status
+        // This uses AS fills measured and kappa confidence to track calibration progress
+        // and adjust fill-hungry gamma multiplier accordingly
+        let as_fills_measured = self.tier1.adverse_selection.fills_measured() as u64;
+        let kappa_confidence = self.estimator.kappa_confidence();
+        self.stochastic
+            .calibration_controller
+            .update_calibration_status(as_fills_measured, kappa_confidence);
+
         // HIP-3: OI cap pre-flight check (fast path for unlimited)
         // This is on the hot path, so we use pre-computed values from runtime config
         let current_position_notional = self.position.position().abs() * self.latest_mid;
@@ -1306,6 +1327,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Stochastic constraints (first principles)
             tick_size_bps: 10.0, // TODO: Get from asset metadata
             near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
+            // Calibration fill rate controller
+            calibration_gamma_mult: self.stochastic.calibration_controller.gamma_multiplier(),
+            calibration_progress: self.stochastic.calibration_controller.calibration_progress(),
+            calibration_complete: self.stochastic.calibration_controller.is_calibrated(),
         };
         let mut market_params = ParameterAggregator::build(&sources);
 

@@ -193,6 +193,16 @@ struct MetricsInner {
     /// Whether exchange limits are valid (1 = valid, 0 = not fetched)
     exchange_limits_valid: AtomicU64,
 
+    // === Calibration Fill Rate Controller Metrics ===
+    /// Calibration gamma multiplier [0.3, 1.0] - lower = more fill-hungry
+    calibration_gamma_mult: AtomicF64,
+    /// Calibration progress [0.0, 1.0]
+    calibration_progress: AtomicF64,
+    /// Fill count in lookback window
+    calibration_fill_count: AtomicU64,
+    /// Whether calibration is complete (1 = yes, 0 = no)
+    calibration_complete: AtomicU64,
+
     /// Start time for uptime calculation
     start_time: Instant,
 }
@@ -277,6 +287,11 @@ impl PrometheusMetrics {
                 exchange_limits_age_ms: AtomicU64::new(u64::MAX),
                 exchange_limits_valid: AtomicU64::new(0),
                 crossed_book_incidents: AtomicU64::new(0),
+                // Calibration Fill Rate Controller defaults
+                calibration_gamma_mult: AtomicF64::new(0.3), // Start fill-hungry
+                calibration_progress: AtomicF64::new(0.0),
+                calibration_fill_count: AtomicU64::new(0),
+                calibration_complete: AtomicU64::new(0),
                 start_time: Instant::now(),
             }),
         }
@@ -612,6 +627,26 @@ impl PrometheusMetrics {
         self.inner
             .quote_cycle_latency_ms
             .store(quote_cycle_latency_ms);
+    }
+
+    // === Calibration Fill Rate Controller Updates ===
+
+    /// Update calibration fill rate controller metrics.
+    ///
+    /// # Arguments
+    /// - `gamma_mult`: Current gamma multiplier [0.3, 1.0]
+    /// - `progress`: Calibration progress [0.0, 1.0]
+    /// - `fill_count`: Number of fills in lookback window
+    /// - `complete`: Whether calibration is complete
+    pub fn update_calibration(&self, gamma_mult: f64, progress: f64, fill_count: usize, complete: bool) {
+        self.inner.calibration_gamma_mult.store(gamma_mult);
+        self.inner.calibration_progress.store(progress);
+        self.inner
+            .calibration_fill_count
+            .store(fill_count as u64, Ordering::Relaxed);
+        self.inner
+            .calibration_complete
+            .store(if complete { 1 } else { 0 }, Ordering::Relaxed);
     }
 
     // === Getters ===
@@ -1115,6 +1150,40 @@ impl PrometheusMetrics {
              mm_exchange_limits_valid{{{}}} {}\n",
             labels,
             if limits_valid { 1 } else { 0 }
+        ));
+
+        // Calibration fill rate controller metrics
+        output.push_str(&format!(
+            "# HELP mm_calibration_gamma_mult Fill-hungry gamma multiplier [0.3=max hunger, 1.0=calibrated]\n\
+             # TYPE mm_calibration_gamma_mult gauge\n\
+             mm_calibration_gamma_mult{{{}}} {}\n",
+            labels,
+            self.inner.calibration_gamma_mult.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_calibration_progress Calibration progress [0.0=cold start, 1.0=complete]\n\
+             # TYPE mm_calibration_progress gauge\n\
+             mm_calibration_progress{{{}}} {}\n",
+            labels,
+            self.inner.calibration_progress.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_calibration_fill_count Fills in lookback window for rate calculation\n\
+             # TYPE mm_calibration_fill_count gauge\n\
+             mm_calibration_fill_count{{{}}} {}\n",
+            labels,
+            self.inner.calibration_fill_count.load(Ordering::Relaxed)
+        ));
+
+        let calibration_complete = self.inner.calibration_complete.load(Ordering::Relaxed) == 1;
+        output.push_str(&format!(
+            "# HELP mm_calibration_complete Whether calibration is complete (1=yes, 0=no)\n\
+             # TYPE mm_calibration_complete gauge\n\
+             mm_calibration_complete{{{}}} {}\n",
+            labels,
+            if calibration_complete { 1 } else { 0 }
         ));
 
         output

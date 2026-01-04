@@ -6,6 +6,7 @@ use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::MetricsRecorder,
+    estimator::{CalibrationController, CalibrationControllerConfig},
     fills::FillProcessor,
     infra::{
         ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
@@ -227,7 +228,7 @@ impl InfraComponents {
 }
 
 /// Stochastic module components: First-principles risk and HJB control.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StochasticComponents {
     /// HJB inventory controller
     pub hjb_controller: HJBInventoryController,
@@ -237,6 +238,8 @@ pub struct StochasticComponents {
     pub dynamic_risk_config: DynamicRiskConfig,
     /// Adaptive Bayesian spread calculator
     pub adaptive_spreads: AdaptiveSpreadCalculator,
+    /// Calibration-aware fill rate controller
+    pub calibration_controller: CalibrationController,
 }
 
 impl StochasticComponents {
@@ -261,11 +264,20 @@ impl StochasticComponents {
         dynamic_risk_config: DynamicRiskConfig,
         adaptive_config: AdaptiveBayesianConfig,
     ) -> Self {
+        // Create calibration controller from stochastic config
+        let calibration_config = CalibrationControllerConfig {
+            enabled: stochastic_config.enable_calibration_fill_rate,
+            target_fill_rate_per_hour: stochastic_config.target_fill_rate_per_hour,
+            min_gamma_mult: stochastic_config.min_fill_hungry_gamma,
+            ..CalibrationControllerConfig::default()
+        };
+
         Self {
             hjb_controller: HJBInventoryController::new(hjb_config),
             stochastic_config,
             dynamic_risk_config,
             adaptive_spreads: AdaptiveSpreadCalculator::new(adaptive_config),
+            calibration_controller: CalibrationController::new(calibration_config),
         }
     }
 }

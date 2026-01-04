@@ -668,6 +668,14 @@ pub struct ParameterSources<'a> {
     pub tick_size_bps: f64,
     /// Near-touch book depth (USD) within 5 bps of mid.
     pub near_touch_depth_usd: f64,
+
+    // Calibration fill rate controller
+    /// Gamma multiplier from calibration controller [0.3, 1.0].
+    pub calibration_gamma_mult: f64,
+    /// Calibration progress [0.0, 1.0].
+    pub calibration_progress: f64,
+    /// Whether calibration is complete.
+    pub calibration_complete: bool,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -944,6 +952,11 @@ impl ParameterAggregator {
             entropy_base_temperature: sources.stochastic_config.entropy_base_temperature,
             entropy_min_allocation_floor: sources.stochastic_config.entropy_min_allocation_floor,
             entropy_thompson_samples: sources.stochastic_config.entropy_thompson_samples,
+
+            // === Calibration Fill Rate Controller ===
+            calibration_gamma_mult: sources.calibration_gamma_mult,
+            calibration_progress: sources.calibration_progress,
+            calibration_complete: sources.calibration_complete,
         }
     }
 }
