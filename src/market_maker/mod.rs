@@ -15,6 +15,7 @@ pub mod events;
 pub mod fills;
 pub mod infra;
 pub mod messages;
+pub mod paic;
 pub mod process_models;
 pub mod quoting;
 pub mod risk;
