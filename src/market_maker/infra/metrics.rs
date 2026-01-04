@@ -195,6 +195,22 @@ struct MetricsInner {
 
     /// Start time for uptime calculation
     start_time: Instant,
+
+    // === Entropy Allocation Metrics ===
+    /// Whether entropy-based allocation is enabled (1 = enabled, 0 = disabled)
+    entropy_allocation_enabled: AtomicU64,
+    /// Shannon entropy of size distribution: H = -Σ p_i × ln(p_i)
+    entropy_value: AtomicF64,
+    /// Number of effective levels: exp(H)
+    entropy_effective_levels: AtomicF64,
+    /// Herfindahl-Hirschman Index: Σ (s_i/S)²
+    entropy_hhi: AtomicF64,
+    /// Temperature parameter used for Boltzmann allocation
+    entropy_temperature: AtomicF64,
+    /// Number of active levels (non-zero size)
+    entropy_active_levels: AtomicU64,
+    /// Diversification score [0, 1] where 1 = uniform
+    entropy_diversification_score: AtomicF64,
 }
 
 impl PrometheusMetrics {
@@ -278,6 +294,14 @@ impl PrometheusMetrics {
                 exchange_limits_valid: AtomicU64::new(0),
                 crossed_book_incidents: AtomicU64::new(0),
                 start_time: Instant::now(),
+                // Entropy allocation defaults
+                entropy_allocation_enabled: AtomicU64::new(0),
+                entropy_value: AtomicF64::new(0.0),
+                entropy_effective_levels: AtomicF64::new(0.0),
+                entropy_hhi: AtomicF64::new(1.0), // 1.0 = all in one level
+                entropy_temperature: AtomicF64::new(1.0),
+                entropy_active_levels: AtomicU64::new(0),
+                entropy_diversification_score: AtomicF64::new(0.0),
             }),
         }
     }
@@ -612,6 +636,44 @@ impl PrometheusMetrics {
         self.inner
             .quote_cycle_latency_ms
             .store(quote_cycle_latency_ms);
+    }
+
+    // === Entropy Allocation Updates ===
+
+    /// Update entropy allocation metrics.
+    ///
+    /// # Arguments
+    /// * `enabled` - Whether entropy allocation is enabled
+    /// * `entropy` - Shannon entropy of size distribution
+    /// * `effective_levels` - exp(entropy), effective number of levels
+    /// * `hhi` - Herfindahl-Hirschman Index (concentration measure)
+    /// * `temperature` - Boltzmann temperature used
+    /// * `active_levels` - Number of levels with non-zero size
+    /// * `diversification_score` - [0, 1] where 1 = uniform distribution
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_entropy_allocation(
+        &self,
+        enabled: bool,
+        entropy: f64,
+        effective_levels: f64,
+        hhi: f64,
+        temperature: f64,
+        active_levels: usize,
+        diversification_score: f64,
+    ) {
+        self.inner
+            .entropy_allocation_enabled
+            .store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
+        self.inner.entropy_value.store(entropy);
+        self.inner.entropy_effective_levels.store(effective_levels);
+        self.inner.entropy_hhi.store(hhi);
+        self.inner.entropy_temperature.store(temperature);
+        self.inner
+            .entropy_active_levels
+            .store(active_levels as u64, Ordering::Relaxed);
+        self.inner
+            .entropy_diversification_score
+            .store(diversification_score);
     }
 
     // === Getters ===
@@ -1115,6 +1177,63 @@ impl PrometheusMetrics {
              mm_exchange_limits_valid{{{}}} {}\n",
             labels,
             if limits_valid { 1 } else { 0 }
+        ));
+
+        // Entropy allocation metrics
+        output.push_str(&format!(
+            "# HELP mm_entropy_allocation_enabled Whether entropy-based allocation is enabled (1=yes, 0=no)\n\
+             # TYPE mm_entropy_allocation_enabled gauge\n\
+             mm_entropy_allocation_enabled{{{}}} {}\n",
+            labels,
+            self.inner.entropy_allocation_enabled.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_entropy_value Shannon entropy of size distribution H = -Σ p_i × ln(p_i)\n\
+             # TYPE mm_entropy_value gauge\n\
+             mm_entropy_value{{{}}} {}\n",
+            labels,
+            self.inner.entropy_value.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_entropy_effective_levels Effective number of levels exp(H)\n\
+             # TYPE mm_entropy_effective_levels gauge\n\
+             mm_entropy_effective_levels{{{}}} {}\n",
+            labels,
+            self.inner.entropy_effective_levels.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_entropy_hhi Herfindahl-Hirschman Index Σ (s_i/S)² concentration measure\n\
+             # TYPE mm_entropy_hhi gauge\n\
+             mm_entropy_hhi{{{}}} {}\n",
+            labels,
+            self.inner.entropy_hhi.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_entropy_temperature Boltzmann temperature parameter\n\
+             # TYPE mm_entropy_temperature gauge\n\
+             mm_entropy_temperature{{{}}} {}\n",
+            labels,
+            self.inner.entropy_temperature.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_entropy_active_levels Number of levels with non-zero size\n\
+             # TYPE mm_entropy_active_levels gauge\n\
+             mm_entropy_active_levels{{{}}} {}\n",
+            labels,
+            self.inner.entropy_active_levels.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_entropy_diversification_score Diversification score 0 to 1 where 1 is uniform\n\
+             # TYPE mm_entropy_diversification_score gauge\n\
+             mm_entropy_diversification_score{{{}}} {}\n",
+            labels,
+            self.inner.entropy_diversification_score.load()
         ));
 
         output

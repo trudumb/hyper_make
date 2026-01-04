@@ -9,20 +9,61 @@
 //! - GLFT inventory skew applied to entire ladder
 //! - **Constrained variational optimization** for capital-efficient allocation
 //! - **Kelly-Stochastic optimization** using first-passage fill probability
+//! - **Entropy-based stochastic order distribution** for diversified placement
+//!
+//! # Entropy-Based Order Distribution
+//!
+//! The entropy modules provide information-theoretic order placement:
+//!
+//! ## Maximum Entropy Allocation (`entropy.rs`)
+//! Sizes follow Boltzmann distribution: s_i ∝ exp(MV_i / T)
+//! - Temperature T controls concentration vs. spread
+//! - Low T: Concentrate on best levels (exploitation)
+//! - High T: Nearly uniform distribution (exploration)
+//!
+//! ## Information-Theoretic Depth Spacing (`information_spacing.rs`)
+//! Places levels where fills are most informative about price moves:
+//! - Mutual information I(Fill; ΔPrice) drives level placement
+//! - Adaptive spacing based on market regime
+//! - Asymmetric depths for trending markets
+//!
+//! ## Entropy-Regularized Optimizer (`entropy_optimizer.rs`)
+//! Unified optimizer combining:
+//! - Boltzmann size allocation for diversification
+//! - Constrained optimization for margin/position limits
+//! - HHI control for guaranteed diversification
 //!
 //! # Module Structure
 //!
 //! - `depth_generator`: Dynamic depth computation from market parameters
 //! - `generator`: Ladder generation logic and depth/size calculation
 //! - `optimizer`: Constrained optimization with multiple allocation strategies
+//! - `entropy`: Maximum entropy size allocation with Boltzmann distribution
+//! - `information_spacing`: Information-theoretic depth selection
+//! - `entropy_optimizer`: Unified entropy-regularized optimization engine
 
 mod depth_generator;
+mod entropy;
+mod entropy_optimizer;
 mod fill_probability;
 mod generator;
+mod information_spacing;
 mod optimizer;
 
 pub use depth_generator::{DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator, DynamicDepths};
+pub use entropy::{
+    compute_entropy, compute_hhi, kl_divergence, EntropyAllocator, EntropyAllocation,
+    EntropyConfig, FillCorrelationTracker, MutualInformationEstimator,
+};
+pub use entropy_optimizer::{
+    EntropyMetrics, EntropyOptimizationConfig, EntropyOptimizationResult,
+    EntropyRegularizedOptimizer, StochasticOrderEngine,
+};
 pub use fill_probability::{BayesianFillModel, DepthBucket, FirstPassageFillModel};
+pub use information_spacing::{
+    AdaptiveDepthSpacing, InformationDensityCurve, InformationDepthGenerator,
+    InformationSpacingConfig, RegimeCurves, RegimeWeights,
+};
 pub use optimizer::{
     BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, KellyStochasticParams,
     LevelOptimizationParams,

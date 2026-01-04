@@ -8,8 +8,8 @@ use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
 use crate::market_maker::quoting::{
     BayesianFillModel, ConstrainedLadderOptimizer, DepthSpacing, DynamicDepthConfig,
-    DynamicDepthGenerator, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
-    LevelOptimizationParams,
+    DynamicDepthGenerator, EntropyConfig, EntropyOptimizationConfig, KellyStochasticParams,
+    Ladder, LadderConfig, LadderParams, LevelOptimizationParams, StochasticOrderEngine,
 };
 
 use super::{MarketParams, QuotingStrategy, RiskConfig};
@@ -37,7 +37,7 @@ use super::{MarketParams, QuotingStrategy, RiskConfig};
 /// - **Depth buckets**: 2bp buckets for stable estimation
 ///
 /// Call `record_fill_observation()` when orders fill or cancel to update the model.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LadderStrategy {
     /// Risk configuration (same as GLFTStrategy)
     pub risk_config: RiskConfig,
@@ -47,6 +47,11 @@ pub struct LadderStrategy {
     depth_generator: DynamicDepthGenerator,
     /// Bayesian fill probability model (learns from observed fills)
     fill_model: BayesianFillModel,
+    /// Entropy-based stochastic order engine (optional)
+    /// When enabled, uses information-theoretic order distribution
+    entropy_engine: Option<StochasticOrderEngine>,
+    /// Enable entropy-based allocation mode
+    pub use_entropy_allocation: bool,
 }
 
 impl LadderStrategy {
@@ -61,6 +66,8 @@ impl LadderStrategy {
             depth_generator: Self::create_depth_generator(&ladder_config),
             ladder_config,
             fill_model: BayesianFillModel::default(),
+            entropy_engine: None,
+            use_entropy_allocation: false,
         }
     }
 
@@ -71,6 +78,8 @@ impl LadderStrategy {
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::default(),
+            entropy_engine: None,
+            use_entropy_allocation: false,
         }
     }
 
@@ -94,7 +103,84 @@ impl LadderStrategy {
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::new(prior_alpha, prior_beta, sigma, tau),
+            entropy_engine: None,
+            use_entropy_allocation: false,
         }
+    }
+
+    /// Enable entropy-based stochastic order distribution.
+    ///
+    /// This uses information-theoretic principles to distribute orders:
+    /// - **Boltzmann allocation**: Sizes follow exp(MV_i / T) distribution
+    /// - **Temperature control**: Low T concentrates, high T spreads
+    /// - **HHI constraint**: Ensures diversification across levels
+    /// - **Adaptive temperature**: Adjusts based on volatility regime
+    ///
+    /// # Arguments
+    /// * `temperature` - Controls concentration (0.3 = exploit, 1.0 = balanced, 3.0 = explore)
+    /// * `min_effective_levels` - Minimum number of "effective" levels to maintain
+    /// * `max_hhi` - Maximum Herfindahl-Hirschman Index (0.4 = moderate diversification)
+    pub fn with_entropy_allocation(
+        mut self,
+        temperature: f64,
+        min_effective_levels: usize,
+        max_hhi: f64,
+    ) -> Self {
+        let entropy_config = EntropyConfig {
+            temperature,
+            min_effective_levels,
+            max_hhi,
+            adaptive_temperature: true,
+            ..Default::default()
+        };
+
+        let opt_config = EntropyOptimizationConfig {
+            entropy: entropy_config,
+            ..Default::default()
+        };
+
+        self.entropy_engine = Some(StochasticOrderEngine::new(opt_config));
+        self.use_entropy_allocation = true;
+        self
+    }
+
+    /// Enable entropy allocation with default balanced settings.
+    ///
+    /// Uses:
+    /// - Temperature: 1.0 (balanced between exploitation and exploration)
+    /// - Min effective levels: 3
+    /// - Max HHI: 0.4
+    pub fn with_default_entropy_allocation(self) -> Self {
+        self.with_entropy_allocation(1.0, 3, 0.4)
+    }
+
+    /// Update entropy allocation configuration.
+    pub fn update_entropy_config(
+        &mut self,
+        margin_available: f64,
+        max_position: f64,
+        price: f64,
+        leverage: f64,
+    ) {
+        if let Some(ref mut engine) = self.entropy_engine {
+            let config = EntropyOptimizationConfig {
+                entropy: EntropyConfig::default(),
+                margin_available,
+                max_position,
+                price,
+                leverage,
+                min_notional: 10.0,
+                ..Default::default()
+            };
+            engine.update_config(config);
+        }
+    }
+
+    /// Get entropy allocation metrics (if enabled).
+    pub fn entropy_metrics(&self) -> Option<(f64, f64, usize)> {
+        self.entropy_engine.as_ref().map(|e| {
+            (e.average_diversification(), e.average_hhi(), e.recent_metrics().len())
+        })
     }
 
     // === Bayesian Fill Model Interface ===
@@ -460,6 +546,68 @@ impl LadderStrategy {
             adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,
             "Ladder spread diagnostics (gamma includes book_depth + warmup scaling)"
         );
+
+        // === ENTROPY-BASED STOCHASTIC ORDER DISTRIBUTION ===
+        // When enabled, uses information-theoretic order placement:
+        // - Boltzmann allocation: s_i ∝ exp(MV_i / T)
+        // - Temperature controls concentration vs spread
+        // - HHI constraint ensures diversification
+        // - Adaptive temperature based on volatility regime
+        if self.use_entropy_allocation && self.entropy_engine.is_some() {
+            let leverage = market_params.leverage.max(1.0);
+            let available_margin = market_params.margin_available;
+
+            if available_margin > EPSILON {
+                let entropy_opt_config = EntropyOptimizationConfig {
+                    entropy: EntropyConfig {
+                        temperature: match market_params.volatility_regime {
+                            VolatilityRegime::Low => 1.5,    // More spread in calm markets
+                            VolatilityRegime::Normal => 1.0, // Balanced
+                            VolatilityRegime::High => 0.5,   // Concentrate when volatile
+                            VolatilityRegime::Extreme => 0.3, // Very concentrated
+                        },
+                        adaptive_temperature: true,
+                        min_effective_levels: 3,
+                        max_hhi: 0.4,
+                        ..Default::default()
+                    },
+                    spacing: crate::market_maker::quoting::InformationSpacingConfig {
+                        num_levels: ladder_config.num_levels,
+                        min_depth_bps: effective_floor_bps,
+                        max_depth_bps: ladder_config.max_depth_bps,
+                        vol_scaling: true,
+                        ..Default::default()
+                    },
+                    margin_available: available_margin,
+                    max_position: effective_max_position,
+                    min_size: ladder_config.min_level_size,
+                    min_notional: config.min_notional,
+                    price: market_params.microprice,
+                    leverage,
+                    ..Default::default()
+                };
+
+                // Create a fresh engine with updated config
+                let mut engine = StochasticOrderEngine::new(entropy_opt_config);
+
+                // Generate entropy-optimized ladder
+                let result = engine.generate_ladder(&params, &ladder_config);
+
+                // Log entropy metrics
+                info!(
+                    active_levels = result.active_levels,
+                    effective_levels = %format!("{:.2}", result.effective_levels),
+                    entropy = %format!("{:.3}", result.entropy),
+                    hhi = %format!("{:.3}", result.hhi),
+                    temperature = %format!("{:.2}", result.temperature_used),
+                    position_used = %format!("{:.6}", result.position_used),
+                    expected_value = %format!("{:.6}", result.expected_value),
+                    "Entropy-based ladder generated"
+                );
+
+                return result.ladder;
+            }
+        }
 
         // === STOCHASTIC MODULE: Constrained Ladder Optimization ===
         // Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ  (expected profit)
