@@ -532,7 +532,14 @@ impl KillSwitch {
         // 2. Else: fall back to config.max_position_contracts (for backwards compat)
         let contracts = state.position.abs();
 
-        let margin_based_limit = if state.account_value > 0.0 && state.leverage > 0.0 && state.mid_price > 0.0 {
+        // Skip runaway check if no valid price yet (startup condition)
+        // The reduce-only mode in update_quotes handles existing oversized positions.
+        // We only want to kill on RUNTIME runaway, not pre-existing positions at startup.
+        if state.mid_price <= 0.0 {
+            return None;
+        }
+
+        let margin_based_limit = if state.account_value > 0.0 && state.leverage > 0.0 {
             // Same formula as startup: (account_value × leverage × 0.5) / price
             let safety_factor = 0.5;
             (state.account_value * state.leverage * safety_factor) / state.mid_price

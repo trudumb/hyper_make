@@ -365,6 +365,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.effective_max_position,
         );
 
+        // Check if existing position exceeds configured limit - will enter reduce-only mode
+        // Note: effective_max_position may be recalculated higher once price data arrives
+        // (margin-based calculation vs static config.max_position fallback)
+        let position_abs = self.position.position().abs();
+        if position_abs > self.effective_max_position {
+            warn!(
+                "Existing position {:.6} exceeds max {:.6} - will enter reduce-only mode after warmup",
+                position_abs, self.effective_max_position
+            );
+            info!(
+                "Reduce-only mode will only place orders that reduce position until within limits"
+            );
+        }
+
         Ok(())
     }
 
@@ -648,6 +662,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.tier1.liquidation_detector.cascade_severity(),
                         self.tier1.adverse_selection.realized_as_bps(),
                         self.tier1.liquidation_detector.tail_risk_multiplier(),
+                    );
+                    // V2 Bayesian estimator metrics
+                    self.infra.prometheus.update_v2_estimator(
+                        self.estimator.hierarchical_kappa_std(),
+                        self.estimator.hierarchical_kappa_ci_95().0,
+                        self.estimator.hierarchical_kappa_ci_95().1,
+                        self.estimator.soft_toxicity_score(),
+                        self.estimator.kappa_sigma_correlation(),
+                        self.estimator.hierarchical_as_factor(),
                     );
                     let (bid_exp, ask_exp) = self.orders.pending_exposure();
                     self.infra.prometheus.update_pending_exposure(

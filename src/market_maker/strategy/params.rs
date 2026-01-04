@@ -654,6 +654,13 @@ impl ParameterAggregator {
             kappa_ask: est.kappa_ask(),
             is_heavy_tailed: est.is_heavy_tailed(),
             kappa_cv: est.kappa_cv(),
+            // V2: Uncertainty quantification (wired from V2 components)
+            kappa_uncertainty: est.hierarchical_kappa_std(),
+            kappa_95_lower: est.hierarchical_kappa_ci_95().0,
+            kappa_95_upper: est.hierarchical_kappa_ci_95().1,
+            toxicity_score: est.soft_toxicity_score(),
+            param_correlation: est.kappa_sigma_correlation(),
+            as_factor: est.hierarchical_as_factor(),
             arrival_intensity,
             liquidity_gamma_mult: est.liquidity_gamma_multiplier(),
 

@@ -5,14 +5,17 @@
 
 use tracing::debug;
 
+use super::covariance::ParameterCovariance;
+use super::hierarchical_kappa::HierarchicalKappa;
 use super::jump::JumpEstimator;
 use super::kalman::KalmanPriceFilter;
 use super::kappa::{BayesianKappaEstimator, BookStructureEstimator};
 use super::microprice::MicropriceEstimator;
 use super::momentum::{MomentumDetector, MomentumModel, TradeFlowTracker};
+use super::soft_jump::SoftJumpClassifier;
 use super::volatility::{MultiScaleBipowerEstimator, StochasticVolParams, VolatilityRegimeTracker};
 use super::volume::{VolumeBucketAccumulator, VolumeTickArrivalEstimator};
-use super::{EstimatorConfig, MarketEstimator, VolatilityRegime};
+use super::{EstimatorConfig, EstimatorV2Flags, MarketEstimator, VolatilityRegime};
 
 // ============================================================================
 // ParameterEstimator
@@ -70,6 +73,16 @@ pub struct ParameterEstimator {
     momentum_model: MomentumModel,
     /// Last momentum value (for detecting continuation vs reversal)
     last_momentum_bps: f64,
+
+    // === V2 Bayesian Estimator Components ===
+    /// Feature flags for V2 components
+    v2_flags: EstimatorV2Flags,
+    /// Hierarchical kappa estimator (market kappa as prior for own fills)
+    hierarchical_kappa: HierarchicalKappa,
+    /// Soft jump classifier (P(jump) ∈ [0,1] mixture model)
+    soft_jump: SoftJumpClassifier,
+    /// (κ, σ) parameter covariance tracker
+    param_covariance: ParameterCovariance,
 }
 
 impl ParameterEstimator {
@@ -133,6 +146,18 @@ impl ParameterEstimator {
         // Uses 5-minute window and 0.1 EWMA alpha for smooth learning
         let momentum_model = MomentumModel::default_config();
 
+        // V2 Bayesian Estimator Components
+        // Hierarchical kappa uses market kappa as prior, updated on our fills
+        let hierarchical_kappa = HierarchicalKappa::new(
+            config.kappa_prior_strength,
+            config.kappa_prior_mean,
+            config.kappa_window_ms,
+        );
+        // Soft jump classifier for probabilistic toxicity detection
+        let soft_jump = SoftJumpClassifier::default_params();
+        // Parameter covariance tracker (50-tick half-life for (κ, σ) correlation)
+        let param_covariance = ParameterCovariance::with_half_life(50.0);
+
         Self {
             config,
             bucket_accumulator,
@@ -154,6 +179,11 @@ impl ParameterEstimator {
             kalman_filter,
             momentum_model,
             last_momentum_bps: 0.0,
+            // V2 Bayesian components - always enabled
+            v2_flags: EstimatorV2Flags::all_enabled(),
+            hierarchical_kappa,
+            soft_jump,
+            param_covariance,
         }
     }
 
@@ -258,6 +288,17 @@ impl ParameterEstimator {
             self.volatility_regime
                 .update_baseline(self.multi_scale.sigma_clean());
 
+            // === Bayesian Component Updates (always active) ===
+            // Update soft jump classifier with current sigma and return
+            self.soft_jump.update_sigma(sigma);
+            if let Some(ret) = log_return {
+                self.soft_jump.on_return(ret);
+            }
+
+            // Update parameter covariance tracker
+            let kappa = self.kappa();
+            self.param_covariance.update(kappa, sigma);
+
             debug!(
                 vwap = %format!("{:.4}", bucket.vwap),
                 volume = %format!("{:.4}", bucket.volume),
@@ -323,6 +364,17 @@ impl ParameterEstimator {
                 fill_size,
             );
         }
+
+        // === Hierarchical Kappa Update (always active) ===
+        // Calculate fill distance in basis points
+        let distance_bps = if placement_price > 0.0 {
+            ((fill_price - placement_price).abs() / placement_price) * 10_000.0
+        } else {
+            0.0
+        };
+        // Record fill in hierarchical kappa (adverse selection not yet available here)
+        self.hierarchical_kappa
+            .record_fill(distance_bps, timestamp_ms, None);
     }
 
     /// Legacy on_trade without aggressor info (backward compatibility).
@@ -350,6 +402,12 @@ impl ParameterEstimator {
             self.book_structure.imbalance(),
             self.flow.imbalance(),
         );
+
+        // === Hierarchical Kappa: Update market kappa as prior (always active) ===
+        let market_kappa = self.market_kappa.posterior_mean();
+        let market_conf = self.market_kappa.confidence();
+        self.hierarchical_kappa
+            .update_market_kappa(market_kappa, market_conf);
     }
 
     // === Volatility Accessors ===
@@ -898,6 +956,124 @@ impl ParameterEstimator {
     /// Check if Kalman filter is warmed up (enough observations).
     pub fn kalman_warmed_up(&self) -> bool {
         self.kalman_filter.is_warmed_up()
+    }
+
+    // === V2 Configuration ===
+
+    /// Enable V2 feature flags.
+    ///
+    /// This activates the improved Bayesian estimation components:
+    /// - Hierarchical kappa (market kappa as prior for own fills)
+    /// - Soft jump classification (probabilistic P(jump))
+    /// - Parameter covariance tracking ((κ, σ) correlation)
+    pub fn set_v2_flags(&mut self, flags: EstimatorV2Flags) {
+        self.v2_flags = flags;
+    }
+
+    /// Get current V2 feature flags.
+    pub fn v2_flags(&self) -> EstimatorV2Flags {
+        self.v2_flags
+    }
+
+    // === V2 Hierarchical Kappa Accessors ===
+
+    /// Get hierarchical kappa effective value (AS-adjusted posterior mean).
+    ///
+    /// This is the primary V2 kappa output. Uses market kappa as prior,
+    /// then updates based on our actual fills with proper Bayesian conjugacy.
+    pub fn hierarchical_kappa(&self) -> f64 {
+        self.hierarchical_kappa.effective_kappa()
+    }
+
+    /// Get hierarchical kappa posterior standard deviation.
+    pub fn hierarchical_kappa_std(&self) -> f64 {
+        self.hierarchical_kappa.posterior_std()
+    }
+
+    /// Get hierarchical kappa 95% credible interval.
+    pub fn hierarchical_kappa_ci_95(&self) -> (f64, f64) {
+        self.hierarchical_kappa.credible_interval_95()
+    }
+
+    /// Get hierarchical kappa confidence [0, 1].
+    pub fn hierarchical_kappa_confidence(&self) -> f64 {
+        self.hierarchical_kappa.confidence()
+    }
+
+    /// Get adverse selection factor φ(AS) ∈ [0.5, 1.0].
+    ///
+    /// This is the multiplier applied to posterior kappa based on observed AS.
+    /// Lower values mean more adverse selection detected → lower effective kappa.
+    pub fn hierarchical_as_factor(&self) -> f64 {
+        self.hierarchical_kappa.as_factor()
+    }
+
+    // === V2 Soft Jump Accessors ===
+
+    /// Get soft toxicity score [0, 1] from mixture model.
+    ///
+    /// This is a probabilistic alternative to the binary is_toxic_regime().
+    /// Higher values indicate more jump-like returns.
+    pub fn soft_toxicity_score(&self) -> f64 {
+        self.soft_jump.toxicity_score()
+    }
+
+    /// Get learned prior probability of jump.
+    pub fn soft_jump_pi(&self) -> f64 {
+        self.soft_jump.pi()
+    }
+
+    /// Get effective jump ratio from soft classification.
+    ///
+    /// Maps soft toxicity to a ratio for backwards compatibility.
+    /// toxicity=0 → ratio=1.0, toxicity=0.5 → ratio=3.0
+    pub fn soft_jump_ratio(&self) -> f64 {
+        self.soft_jump.effective_jump_ratio()
+    }
+
+    /// Check if soft jump classifier is calibrated.
+    pub fn soft_jump_calibrated(&self) -> bool {
+        self.soft_jump.is_calibrated()
+    }
+
+    // === V2 Parameter Covariance Accessors ===
+
+    /// Get (κ, σ) correlation coefficient.
+    ///
+    /// Positive correlation means κ and σ tend to move together.
+    /// Negative correlation (common during crises) means high vol = low fill rate.
+    pub fn kappa_sigma_correlation(&self) -> f64 {
+        self.param_covariance.correlation()
+    }
+
+    /// Get spread uncertainty from parameter covariance.
+    ///
+    /// Uses delta method to propagate kappa uncertainty to spread uncertainty.
+    pub fn spread_uncertainty(&self, gamma: f64) -> f64 {
+        self.param_covariance.spread_uncertainty(gamma)
+    }
+
+    /// Check if parameter covariance is valid (enough observations).
+    pub fn param_covariance_valid(&self) -> bool {
+        self.param_covariance.is_valid()
+    }
+
+    // === V2 Blended Kappa (Optional Use) ===
+
+    /// Get blended kappa using hierarchical model.
+    ///
+    /// Returns hierarchical kappa blended with standard kappa based on
+    /// model confidence. As fills accumulate, the hierarchical estimate
+    /// dominates.
+    pub fn kappa_v2_aware(&self) -> f64 {
+        let hier_conf = self.hierarchical_kappa.confidence();
+        let hier_kappa = self.hierarchical_kappa.effective_kappa();
+        let std_kappa = self.kappa();
+
+        // Blend based on hierarchical confidence
+        // At 0 confidence: use standard kappa
+        // At 1 confidence: use hierarchical kappa
+        hier_conf * hier_kappa + (1.0 - hier_conf) * std_kappa
     }
 }
 

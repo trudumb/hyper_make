@@ -57,6 +57,34 @@ pub struct MarketParams {
     /// CV = 1.0 for exponential, CV > 1.2 indicates heavy tail (power-law like).
     pub kappa_cv: f64,
 
+    // === V2: Uncertainty Quantification (Bayesian Estimator) ===
+    /// Kappa posterior standard deviation (√Var[κ|data]).
+    /// Use for spread uncertainty: δσ² ≈ (∂δ/∂κ)² × σ²_κ
+    pub kappa_uncertainty: f64,
+
+    /// 95% credible interval lower bound for kappa.
+    /// κ_95_lower = posterior_alpha / posterior_beta quantile(0.025)
+    pub kappa_95_lower: f64,
+
+    /// 95% credible interval upper bound for kappa.
+    /// κ_95_upper = posterior_alpha / posterior_beta quantile(0.975)
+    pub kappa_95_upper: f64,
+
+    /// Soft toxicity score [0, 1] from mixture model.
+    /// Rolling average of P(jump) - smoother than binary is_toxic_regime.
+    /// 0.0 = pure diffusion, 0.5+ = significant jump component
+    pub toxicity_score: f64,
+
+    /// (κ, σ) correlation coefficient [-1, 1].
+    /// Positive correlation means kappa and sigma move together.
+    /// Used for joint uncertainty propagation in spread calculations.
+    pub param_correlation: f64,
+
+    /// Adverse selection factor φ(AS) ∈ [0.5, 1.0].
+    /// Multiplied with kappa to get effective fill rate.
+    /// Lower values mean more informed flow → lower effective kappa.
+    pub as_factor: f64,
+
     /// Order arrival intensity (A) - volume ticks per second
     pub arrival_intensity: f64,
 
@@ -383,6 +411,13 @@ impl Default for MarketParams {
             kappa_ask: 100.0,                // Same as kappa initially
             is_heavy_tailed: false,          // Assume exponential tails
             kappa_cv: 1.0,                   // CV=1 for exponential
+            // V2: Uncertainty Quantification
+            kappa_uncertainty: 0.0,          // Will be computed from posterior
+            kappa_95_lower: 100.0,           // Conservative lower bound
+            kappa_95_upper: 100.0,           // Conservative upper bound
+            toxicity_score: 0.0,             // No toxicity initially
+            param_correlation: 0.0,          // No correlation initially
+            as_factor: 1.0,                  // No AS adjustment initially
             arrival_intensity: 0.5,          // 0.5 volume ticks per second
             is_toxic_regime: false,          // Default: not toxic
             jump_ratio: 1.0,                 // Default: normal diffusion

@@ -7,17 +7,28 @@
 //! - Regime Detection: RV/BV ratio identifies toxic jump regimes
 //! - Weighted Kappa: Proximity-weighted L2 book regression
 //!
+//! # V2 Improvements (January 2026)
+//!
+//! - **Corrected Conjugacy**: Kappa estimation now uses observation COUNT (not volume)
+//! - **Tick-Based EWMA**: Half-lives measured in ticks, not wall-clock seconds
+//! - **Credible Intervals**: 95% CI for kappa posterior uncertainty
+//! - **Soft Jump Classification**: P(jump) ∈ [0,1] mixture model (planned)
+//! - **Parameter Covariance**: Joint (κ, σ) tracking (planned)
+//!
 //! # Module Structure
 //!
 //! - `volatility`: Bipower variation, regime detection, stochastic vol
 //! - `volume`: Volume clock, bucket accumulation, arrival estimation
 //! - `momentum`: Momentum detection, trade flow tracking
-//! - `kappa`: Bayesian kappa estimation, book structure
+//! - `kappa`: Bayesian kappa estimation (V2 - corrected), book structure
 //! - `microprice`: Fair price estimation from signals
 //! - `kalman`: Price filtering, noise reduction
 //! - `jump`: Jump process estimation
+//! - `tick_ewma`: Tick-based EWMA for volume-clock aligned estimation
 //! - `parameter_estimator`: Main orchestrator
 
+mod covariance;
+mod hierarchical_kappa;
 mod jump;
 mod kalman;
 mod kappa;
@@ -25,8 +36,18 @@ mod microprice;
 mod mock;
 mod momentum;
 mod parameter_estimator;
+mod soft_jump;
+pub(crate) mod tick_ewma;
 mod volatility;
 mod volume;
+
+// V2 re-exports (will be used when integrated)
+#[allow(unused_imports)]
+pub(crate) use covariance::{MultiParameterCovariance, ParameterCovariance};
+#[allow(unused_imports)]
+pub(crate) use hierarchical_kappa::{HierarchicalKappa, HierarchicalKappaConfig};
+#[allow(unused_imports)]
+pub(crate) use soft_jump::SoftJumpClassifier;
 
 // Re-export public types
 pub use jump::{JumpEstimator, JumpEstimatorConfig};
@@ -296,5 +317,92 @@ impl EstimatorConfig {
     pub fn with_toxic_threshold(mut self, threshold: f64) -> Self {
         self.jump_ratio_threshold = threshold;
         self
+    }
+}
+
+// ============================================================================
+// V2 Feature Flags
+// ============================================================================
+
+/// Feature flags for V2 estimator components.
+///
+/// These allow incremental rollout of the corrected Bayesian estimation
+/// without breaking existing functionality. Each feature can be enabled
+/// independently for testing and validation.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let config = EstimatorConfig::default();
+/// let v2_flags = EstimatorV2Flags::disabled(); // Start conservative
+///
+/// // Enable features one at a time after validation
+/// let v2_flags = EstimatorV2Flags {
+///     use_hierarchical_kappa: true,
+///     ..EstimatorV2Flags::disabled()
+/// };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct EstimatorV2Flags {
+    /// Use hierarchical kappa model (market kappa as prior for own kappa).
+    /// This is the core fix for the linear blending bug.
+    pub use_hierarchical_kappa: bool,
+
+    /// Use soft jump classification (P(jump) ∈ [0,1] instead of binary).
+    /// Provides smoother toxicity score without threshold discontinuities.
+    pub use_soft_jumps: bool,
+
+    /// Track (κ, σ) covariance for spread uncertainty quantification.
+    /// Enables proper error propagation through GLFT formula.
+    pub use_param_covariance: bool,
+
+    /// Expose uncertainty metrics (credible intervals, posterior variance).
+    /// These are always computed; this flag controls whether they're exported.
+    pub export_uncertainty_metrics: bool,
+}
+
+impl Default for EstimatorV2Flags {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl EstimatorV2Flags {
+    /// All V2 features disabled (production default).
+    pub fn disabled() -> Self {
+        Self {
+            use_hierarchical_kappa: false,
+            use_soft_jumps: false,
+            use_param_covariance: false,
+            export_uncertainty_metrics: false,
+        }
+    }
+
+    /// All V2 features enabled (for testing/validation).
+    pub fn all_enabled() -> Self {
+        Self {
+            use_hierarchical_kappa: true,
+            use_soft_jumps: true,
+            use_param_covariance: true,
+            export_uncertainty_metrics: true,
+        }
+    }
+
+    /// Conservative rollout: only hierarchical kappa enabled.
+    pub fn hierarchical_only() -> Self {
+        Self {
+            use_hierarchical_kappa: true,
+            use_soft_jumps: false,
+            use_param_covariance: false,
+            export_uncertainty_metrics: true,
+        }
+    }
+
+    /// Check if any V2 feature is enabled.
+    pub fn any_enabled(&self) -> bool {
+        self.use_hierarchical_kappa
+            || self.use_soft_jumps
+            || self.use_param_covariance
+            || self.export_uncertainty_metrics
     }
 }

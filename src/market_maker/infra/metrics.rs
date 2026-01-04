@@ -83,6 +83,20 @@ struct MetricsInner {
     /// Kappa (fill intensity)
     kappa: AtomicF64,
 
+    // === V2 Bayesian Estimator Metrics ===
+    /// Kappa posterior standard deviation (uncertainty)
+    kappa_uncertainty: AtomicF64,
+    /// 95% credible interval lower bound
+    kappa_95_lower: AtomicF64,
+    /// 95% credible interval upper bound
+    kappa_95_upper: AtomicF64,
+    /// Soft toxicity score [0, 1] from mixture model
+    toxicity_score: AtomicF64,
+    /// (κ, σ) correlation coefficient [-1, 1]
+    param_correlation: AtomicF64,
+    /// Adverse selection factor φ(AS) [0.5, 1.0]
+    as_factor: AtomicF64,
+
     // === Estimator Metrics ===
     /// Microprice deviation from mid
     microprice_deviation_bps: AtomicF64,
@@ -214,6 +228,13 @@ impl PrometheusMetrics {
                 sigma: AtomicF64::new(0.0),
                 jump_ratio: AtomicF64::new(0.0),
                 kappa: AtomicF64::new(0.0),
+                // V2 Bayesian Estimator defaults
+                kappa_uncertainty: AtomicF64::new(0.0),
+                kappa_95_lower: AtomicF64::new(0.0),
+                kappa_95_upper: AtomicF64::new(0.0),
+                toxicity_score: AtomicF64::new(0.0),
+                param_correlation: AtomicF64::new(0.0),
+                as_factor: AtomicF64::new(1.0),
                 microprice_deviation_bps: AtomicF64::new(0.0),
                 book_imbalance: AtomicF64::new(0.0),
                 flow_imbalance: AtomicF64::new(0.0),
@@ -380,6 +401,27 @@ impl PrometheusMetrics {
         self.inner.flow_imbalance.store(flow_imbalance);
         self.inner.beta_book.store(beta_book);
         self.inner.beta_flow.store(beta_flow);
+    }
+
+    /// Update V2 Bayesian estimator metrics.
+    ///
+    /// These metrics provide uncertainty quantification for the kappa parameter
+    /// and improved toxicity detection from the soft jump classifier.
+    pub fn update_v2_estimator(
+        &self,
+        kappa_uncertainty: f64,
+        kappa_95_lower: f64,
+        kappa_95_upper: f64,
+        toxicity_score: f64,
+        param_correlation: f64,
+        as_factor: f64,
+    ) {
+        self.inner.kappa_uncertainty.store(kappa_uncertainty);
+        self.inner.kappa_95_lower.store(kappa_95_lower);
+        self.inner.kappa_95_upper.store(kappa_95_upper);
+        self.inner.toxicity_score.store(toxicity_score);
+        self.inner.param_correlation.store(param_correlation);
+        self.inner.as_factor.store(as_factor);
     }
 
     // === Risk Updates ===
@@ -740,6 +782,55 @@ impl PrometheusMetrics {
              mm_kappa{{{}}} {}\n",
             labels,
             self.inner.kappa.load()
+        ));
+
+        // V2 Bayesian Estimator metrics
+        output.push_str(&format!(
+            "# HELP mm_kappa_uncertainty Kappa posterior standard deviation\n\
+             # TYPE mm_kappa_uncertainty gauge\n\
+             mm_kappa_uncertainty{{{}}} {}\n",
+            labels,
+            self.inner.kappa_uncertainty.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_kappa_95_lower Kappa 95% credible interval lower bound\n\
+             # TYPE mm_kappa_95_lower gauge\n\
+             mm_kappa_95_lower{{{}}} {}\n",
+            labels,
+            self.inner.kappa_95_lower.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_kappa_95_upper Kappa 95% credible interval upper bound\n\
+             # TYPE mm_kappa_95_upper gauge\n\
+             mm_kappa_95_upper{{{}}} {}\n",
+            labels,
+            self.inner.kappa_95_upper.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_toxicity_score Soft toxicity score from mixture model [0,1]\n\
+             # TYPE mm_toxicity_score gauge\n\
+             mm_toxicity_score{{{}}} {}\n",
+            labels,
+            self.inner.toxicity_score.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_param_correlation Kappa-sigma correlation coefficient [-1,1]\n\
+             # TYPE mm_param_correlation gauge\n\
+             mm_param_correlation{{{}}} {}\n",
+            labels,
+            self.inner.param_correlation.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_as_factor Adverse selection adjustment factor [0.5,1.0]\n\
+             # TYPE mm_as_factor gauge\n\
+             mm_as_factor{{{}}} {}\n",
+            labels,
+            self.inner.as_factor.load()
         ));
 
         // Risk metrics
