@@ -1,563 +1,721 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with this repository.
 
-## Build Commands
+---
+
+## Table of Contents
+
+1. [Quick Reference](#quick-reference)
+2. [Design Principles](#design-principles)
+3. [Development Workflow](#development-workflow)
+4. [Code Conventions](#code-conventions)
+5. [Testing Requirements](#testing-requirements)
+6. [Session Memory Workflow](#session-memory-workflow)
+7. [Architecture Overview](#architecture-overview)
+8. [Module Reference](#module-reference)
+9. [Common Pitfalls](#common-pitfalls)
+10. [Debugging Guide](#debugging-guide)
+
+---
+
+## Quick Reference
+
+### Build Commands
 
 ```bash
 cargo build                    # Compile the project
 cargo fmt -- --check           # Format checking
 cargo clippy -- -D warnings    # Lint with warnings-as-errors
 cargo test                     # Run test suite
-./ci.sh                        # Run full CI pipeline (build, fmt, clippy, test)
+./ci.sh                        # Full CI pipeline (build, fmt, clippy, test)
 ```
 
-Run examples with:
-```bash
-cargo run --example <example_name>  # e.g., cargo run --example order_and_cancel
-```
-
-Run market maker:
-```bash
-cargo run --bin market_maker -- --asset BTC              # Run with defaults
-RUST_LOG=hyperliquid_rust_sdk::market_maker=debug cargo run --bin market_maker -- --asset BTC --log-file mm.log   #runwithdebug
-cargo run --bin market_maker -- --help                   # Show CLI options
-cargo run --bin market_maker -- generate-config          # Generate sample config
-```
-
-### Development Testing with Timestamped Logs
-
-Create `logs/` directory and run with timestamped log files for session tracking:
+### Run Market Maker
 
 ```bash
-# Create logs directory (one-time)
-mkdir -p logs
+# Testnet (development)
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
+cargo run --bin market_maker -- --asset BTC
 
-# Testnet (default)
+# Mainnet (production)
+RUST_LOG=hyperliquid_rust_sdk::market_maker=info \
+cargo run --bin market_maker -- --network mainnet --asset BTC
+
+# HIP-3 DEX
+cargo run --bin market_maker -- --network mainnet --asset BTC --dex hyna
+
+# With timestamped logs (recommended for analysis)
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
 cargo run --bin market_maker -- \
   --asset BTC \
   --log-file logs/mm_testnet_BTC_${TIMESTAMP}.log
-
-# Mainnet (validator perps)
-TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
-RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-cargo run --bin market_maker -- \
-  --network mainnet \
-  --asset BTC \
-  --log-file logs/mm_mainnet_BTC_${TIMESTAMP}.log
-
-# HIP-3 DEX
-TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
-RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-cargo run --bin market_maker -- \
-  --network mainnet \
-  --asset BTC \
-  --dex hyna \
-  --log-file logs/mm_hyna_BTC_${TIMESTAMP}.log
 ```
 
-**Log naming convention:** `logs/mm_{network|dex}_{asset}_{YYYY-MM-DD}_{HH-MM-SS}.log`
+### Key Files for Common Tasks
 
-Logs are tracked via Serena session memories for checkpoint analysis.
+| Task | Files |
+|------|-------|
+| Change quoting logic | `strategy/glft.rs`, `strategy/ladder_strat.rs` |
+| Modify spread calculation | `quoting/ladder/depth_generator.rs` |
+| Adjust risk parameters | `strategy/risk_config.rs`, `config.rs` |
+| Add new estimator | `estimator/` directory |
+| Change order execution | `infra/executor.rs` |
+| Modify kill switch | `risk/kill_switch.rs`, `risk/monitors/` |
+| Update Prometheus metrics | `infra/metrics.rs` |
 
-## Architecture
+### CLI Quick Reference
 
-This is a Rust SDK for the Hyperliquid DEX API. It provides trading, market data, and WebSocket streaming capabilities.
-
-### Core Modules
-
-**`exchange/`** - Trading operations client
-- `ExchangeClient`: Main trading interface (wallet, HTTP, metadata, coin-to-asset mapping)
-- `actions.rs`: Trade actions (UsdSend, UpdateLeverage, BulkOrder, BulkCancel, ApproveAgent, etc.)
-- `order.rs`, `cancel.rs`, `modify.rs`: Order/cancel/modify request types
-- Uses builder pattern for complex orders
-
-**`info/`** - Market data queries
-- `InfoClient`: Queries market metadata, user state, orders, fees, funding history
-
-**`ws/`** - WebSocket real-time data
-- `WsManager`: Manages connections, subscriptions, message routing
-- `Subscription` enum: AllMids, L2Book, Trades, OrderUpdates, UserEvents, Candle, etc.
-
-**`signature/`** - EIP-712 cryptographic signing
-- `sign_l1_action()`, `sign_typed_data()`: Transaction signing for Ethereum compatibility
-
-**`market_maker/`** - Modular market making system (~24K lines, 74 files)
-
-**Core:**
-- `mod.rs`: `MarketMaker<S, E>` orchestrator (1,500 lines)
-- `config.rs`: `MarketMakerConfig`, `QuoteConfig`, `Quote`
-- `core/`: Component bundles (Tier1, Tier2, Safety, Infra, Stochastic)
-
-**Estimator Pipeline** (`estimator/` - 10 files):
-- `parameter_estimator.rs`: Main orchestrator with `MarketEstimator` trait
-- `volatility.rs`: Bipower variation, regime detection, stochastic vol
-- `kappa.rs`: Bayesian order flow intensity estimation
-- `microprice.rs`: Ridge regression fair price from signals
-- `volume.rs`: Volume clock, bucket accumulation
-- `momentum.rs`: Trade flow tracking, falling knife detection
-- `kalman.rs`: Noise filtering
-- `jump.rs`: Poisson jump process estimation
-
-**Strategies** (`strategy/` - 6 files):
-- `mod.rs`: `QuotingStrategy` trait definition
-- `glft.rs`: GLFT optimal control strategy
-- `ladder_strat.rs`: Multi-level ladder quoting
-- `simple.rs`: `SymmetricStrategy`, `InventoryAwareStrategy`
-- `risk_config.rs`: Dynamic gamma configuration
-- `market_params.rs`, `params.rs`: Parameter aggregation
-
-**Quoting** (`quoting/`):
-- `ladder/`: Pure computation module
-  - `generator.rs`: Depth spacing, fill intensity, spread capture
-  - `optimizer.rs`: Constrained variational allocation
-  - `mod.rs`: `Ladder`, `LadderLevel`, `LadderConfig` types
-- `filter.rs`: Reduce-only mode enforcement
-
-**Risk Management** (`risk/`):
-- `kill_switch.rs`: Emergency shutdown triggers
-- `aggregator.rs`: Unified `RiskAggregator` evaluation
-- `state.rs`: `RiskState` snapshot
-- `monitor.rs`: `RiskMonitor` trait
-- `monitors/`: Loss, Drawdown, Position, Cascade, DataStaleness, RateLimit
-
-**Process Models** (`process_models/`):
-- `hawkes.rs`: Self-exciting order flow intensity
-- `liquidation.rs`: Cascade detection and tail risk
-- `funding.rs`: Funding rate estimation
-- `spread.rs`: Bid-ask spread dynamics
-- `hjb_control.rs`: Hamilton-Jacobi-Bellman inventory control
-
-**Infrastructure** (`infra/`):
-- `executor.rs`: `OrderExecutor` trait + `HyperliquidExecutor`
-- `margin.rs`: `MarginAwareSizer` for pre-flight checks
-- `metrics.rs`: Prometheus metrics (846 lines)
-- `reconnection.rs`: Connection health monitoring
-- `data_quality.rs`: Market data validation
-
-**Tracking** (`tracking/`):
-- `order_manager.rs`: `OrderManager`, `TrackedOrder`, `OrderState`
-- `position.rs`: `PositionTracker` with fill deduplication
-- `pnl.rs`: P&L attribution and tracking
-- `queue.rs`: Queue position estimation
-
-**Adverse Selection** (`adverse_selection/` - 3 files):
-- `estimator.rs`: E[Δp|fill] measurement, EWMA tracking
-- `depth_decay.rs`: AS(δ) = AS₀ × exp(-δ/δ_char) model
-- `mod.rs`: `AdverseSelectionConfig`
-
-**Fill Processing** (`fills/`):
-- `processor.rs`: `FillProcessor` orchestration
-- `consumer.rs`: `FillConsumer` trait for extensibility
-- `dedup.rs`: Centralized deduplication by trade ID
-
-**Message Handlers** (`messages/`):
-- Focused handlers: `all_mids.rs`, `trades.rs`, `l2_book.rs`, `user_fills.rs`
-- `context.rs`: Shared `MessageContext`
-- `processors.rs`: Processing utilities
-
-**Safety** (`safety/`):
-- `auditor.rs`: `SafetyAuditor` for state reconciliation
-
-### Supporting Files
-
-- `consts.rs`: API URLs (mainnet/testnet/localhost), constants (EPSILON, INF_BPS)
-- `errors.rs`: Error enum (client/server/parsing/validation errors)
-- `helpers.rs`: Utility functions (nonce, float formatting, BaseUrl enum)
-- `meta.rs`: Asset metadata types (Meta, AssetMeta, AssetContext)
-- `req.rs`: HTTP client wrapper with error parsing
-
-### Examples
-
-33 API examples in `examples/` (run with `cargo run --example <name>`):
-- **Exchange**: `order_and_cancel`, `leverage`, `market_order_and_cancel`, `order_and_cancel_cloid`
-- **Spot**: `spot_order`, `spot_transfer`
-- **Transfers**: `usdc_transfer`, `vault_transfer`, `class_transfer`, `bridge_withdraw`
-- **Account**: `agent`, `approve_builder_fee`, `claim_rewards`, `set_referrer`
-- **WebSocket**: `ws_all_mids`, `ws_l2_book`, `ws_trades`, `ws_orders`, `ws_candles`, `ws_bbo`, etc.
-- **Advanced**: `info` (comprehensive API reference), `using_big_blocks`
-
-### Tools
-
-Production tools in `src/bin/` (run with `cargo run --bin <name>`):
-- **market_maker**: Automated market making tool with CLI configuration, multiple strategies, and structured logging
-
-### Key Patterns
-
-- **Wallet auth**: Uses `PrivateKeySigner` from Alloy for signing
-- **Async-first**: Built on tokio with async WebSocket and HTTP
-- **MessagePack**: Uses `rmp-serde` for binary protocol efficiency
-- **Builder pattern**: Complex orders built through builder structs
-
-### Market Maker Architecture
-
-The market maker uses a modular, trait-based design with component bundles:
-
-```
-MarketMaker<S: QuotingStrategy, E: OrderExecutor>
-    │
-    ├── Core Fields
-    │   ├── config: MarketMakerConfig
-    │   ├── strategy: S                    # Pluggable pricing logic
-    │   ├── executor: E                    # Abstracted execution
-    │   ├── estimator: ParameterEstimator  # Live σ, κ, τ estimation
-    │   ├── orders: OrderManager           # Tracks resting orders
-    │   └── position: PositionTracker      # Fill dedup + position state
-    │
-    ├── tier1: Tier1Components             # Production resilience
-    │   ├── adverse_selection              # E[Δp|fill] measurement
-    │   ├── depth_decay_as                 # Depth-dependent AS model
-    │   ├── queue_tracker                  # Queue position estimation
-    │   └── liquidation_detector           # Cascade detection
-    │
-    ├── tier2: Tier2Components             # Process models
-    │   ├── hawkes                         # Self-exciting order flow
-    │   ├── funding                        # Funding rate tracking
-    │   ├── spread_tracker                 # Spread dynamics
-    │   └── pnl_tracker                    # P&L attribution
-    │
-    ├── safety: SafetyComponents           # Risk management
-    │   ├── kill_switch                    # Emergency shutdown
-    │   ├── risk_aggregator                # Unified risk evaluation
-    │   └── fill_processor                 # Centralized fill handling
-    │
-    ├── infra: InfraComponents             # Infrastructure
-    │   ├── margin_sizer                   # Pre-flight margin checks
-    │   ├── prometheus                     # Metrics endpoint
-    │   ├── connection_health              # WebSocket health
-    │   └── data_quality                   # Data validation
-    │
-    └── stochastic: StochasticComponents   # Optimal control
-        ├── hjb_controller                 # HJB inventory control
-        ├── stochastic_config              # Stochastic parameters
-        └── dynamic_risk_config            # Dynamic γ scaling
+```bash
+cargo run --bin market_maker -- --help              # All options
+cargo run --bin market_maker -- generate-config     # Sample config
+cargo run --bin market_maker -- --list-dexs         # Available DEXs
+cargo run --bin market_maker -- --dry-run           # Validate without trading
 ```
 
-**Strategies:**
+---
+
+## Design Principles
+
+### 1. First-Principles Mathematics
+
+**All decisions derive from stochastic control theory, not ad-hoc heuristics.**
+
+The GLFT (Guéant-Lehalle-Fernandez-Tapia) model is the foundation:
 ```
-QuotingStrategy (trait)
-    ├── SymmetricStrategy       # Equal spread both sides
-    ├── InventoryAwareStrategy  # Position-based skew
-    ├── GLFTStrategy            # Optimal MM (Guéant-Lehalle-Fernandez-Tapia)
-    └── LadderStrategy          # Multi-level ladder quoting
-
-OrderExecutor (trait)
-    └── HyperliquidExecutor     # Real exchange client
-```
-
-**GLFT Strategy (default):**
-
-Uses stochastic control theory for optimal market making with data-driven fair price:
-- **Microprice**: Fair price learned from book/flow imbalance signals (replaces ad-hoc adjustments)
-- **σ (sigma)**: Jump-robust volatility from bipower variation (√BV)
-- **κ (kappa)**: Order flow intensity from fill-rate estimation
-- **τ (tau)**: Time horizon estimated from trade rate (faster markets → smaller τ)
-- **γ (gamma)**: Dynamic risk aversion via `RiskConfig`, scales with volatility/toxicity/inventory
-
-Formulas:
-```
-microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)  # Data-driven fair price
-δ = (1/γ) × ln(1 + γ/κ)                    # Optimal half-spread (GLFT)
-skew = (q/Q_max) × γ × σ² × T              # Inventory skew (T = 1/λ holding time)
-bid = microprice × (1 - δ - skew)          # Quote around fair price
-ask = microprice × (1 + δ - skew)
+δ* = (1/γ) × ln(1 + γ/κ)     # Optimal half-spread
+skew = (q/Q_max) × γ × σ² × T  # Inventory skew
 ```
 
-**RiskConfig (Dynamic Gamma):**
+When adding features, ask: "What is the mathematical justification?"
 
-`RiskConfig` controls how γ adapts to market conditions:
-- `gamma_base`: Base risk aversion (0.1 aggressive → 1.0 conservative)
-- `sigma_baseline`: Reference volatility for scaling (default 0.0002 = 2bp/sec)
-- `volatility_weight`: How much high vol increases γ (0.0-1.0)
-- `max_volatility_multiplier`: Cap on vol-driven γ increase
-- `toxicity_threshold`: Jump ratio above which γ scales (default 1.5)
-- `toxicity_sensitivity`: γ increase per unit of jump_ratio
-- `inventory_threshold`: Utilization % before inventory scaling (default 0.5)
-- `inventory_sensitivity`: Quadratic scaling near position limits
-- `gamma_min`, `gamma_max`: Bounds for effective gamma
-- `min_spread_floor`: Minimum spread (default 1bp)
-- `max_holding_time`: Cap on T to prevent skew explosion (default 120s)
+**Examples of first-principles thinking:**
+- Spread floor = σ × √(2×τ_update) + fees (latency constraint)
+- Toxic hour scaling derived from empirical E[Δp|fill] analysis
+- Kelly sizing from actual win rate and edge measurements
 
-**Parameter Estimation (Econometric Pipeline):**
+### 2. Data-Driven Adaptation
 
-The `ParameterEstimator` provides HFT-grade market parameter estimation:
+**Parameters are estimated live from market data, not hardcoded.**
 
-1. **Volume Clock**: Adaptive volume-based sampling (1% of 5-min rolling volume)
-   - Normalizes by economic activity instead of wall-clock time
-   - Bucket threshold adapts to market conditions
+| Parameter | Source | Update Frequency |
+|-----------|--------|------------------|
+| σ (volatility) | Bipower variation on volume-bucketed returns | Every volume tick |
+| κ (kappa) | L2 book depth decay regression | Every L2 update |
+| microprice | Ridge regression on book/flow imbalances | Every trade |
+| γ_effective | Dynamic scaling from vol/toxicity/inventory | Every quote cycle |
 
-2. **VWAP Pre-Averaging**: Returns calculated on bucket VWAPs
-   - Filters bid-ask bounce noise from raw trade prices
+**When to hardcode vs estimate:**
+- Hardcode: Physical constraints (tick size, latency, fees)
+- Estimate: Market state (volatility, order flow, regime)
 
-3. **Bipower Variation**: Jump-robust volatility estimation
-   - RV (Realized Variance): EWMA of r²
-   - BV (Bipower Variation): EWMA of (π/2) × |r_t| × |r_{t-1}|
-   - σ = √BV (clean diffusion component)
+### 3. Defense in Depth
 
-4. **Regime Detection**: Jump ratio (RV/BV) identifies toxic flow
-   - Normal: ratio ≈ 1.0
-   - Toxic: ratio > 3.0 (jumps dominate)
+**Multiple independent safety layers prevent catastrophic losses.**
 
-5. **Weighted Kappa**: L2 book depth decay estimation
-   - Truncates orders > 1% from mid
-   - Proximity-weighted regression on first 15 levels
-   - κ = negative slope of ln(cumulative_depth) vs distance
-
-Data flow:
 ```
-Trades(px, sz, time) → VolumeBucket → VWAP → BipowerVariation → σ, RV/BV
-L2Book(bids, asks)   → WeightedKappa → κ
-                     → BookImbalance ──┐
-Trades(side, sz)     → FlowImbalance ──┴→ MicropriceEstimator → microprice, β_book, β_flow
+Layer 1: Pre-trade checks (margin, reduce-only)
+Layer 2: Position monitors (size, value limits)
+Layer 3: P&L monitors (loss, drawdown limits)
+Layer 4: Market monitors (cascade, staleness)
+Layer 5: Kill switch (emergency shutdown)
 ```
 
-Warmup: 20 volume ticks + 10 L2 updates + 50 microprice observations before quoting begins.
+Never remove a safety layer without adding an equivalent or better one.
 
-6. **Microprice Estimation**: Data-driven fair price from signal prediction
-   - Rolling online 2-variable regression (book_imbalance, flow_imbalance → returns)
-   - Window: 60 seconds, forward horizon: 300ms
-   - Learns β_book, β_flow coefficients (~0.001-0.01 typical)
-   - microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
-   - Replaces hardcoded adjustments with adaptive, market-derived coefficients
+### 4. Modular Architecture
 
-**Adding a new strategy:**
+**Components are isolated, testable, and replaceable.**
+
+The `MarketMaker<S: QuotingStrategy, E: OrderExecutor>` pattern enables:
+- Swapping strategies without changing infrastructure
+- Testing with mock executors
+- Isolated unit tests for each component
+
+### 5. Conditional Complexity
+
+**Quote tight only when conditions are safe.**
+
+```
+Can_Quote_Tight =
+    (Regime == Calm) AND
+    (Toxicity < 0.1) AND
+    (Hour NOT IN toxic_hours) AND
+    (|Inventory| < 0.3 × max_position)
+```
+
+The 8 bps floor is correct for general operation. Tighter spreads require ALL conditions met.
+
+---
+
+## Development Workflow
+
+### Standard Development Cycle
+
+```
+1. Read existing code before modifying
+2. Understand the mathematical model behind the component
+3. Write tests FIRST (unit tests for pure functions)
+4. Implement with proper error handling
+5. Run full CI: cargo fmt && cargo clippy && cargo test
+6. Test with actual market data (testnet or log analysis)
+7. Create session memory documenting changes
+```
+
+### Before Making Changes
+
+**Always do these steps:**
+
+1. **Read the target file(s)** - Never propose changes blind
+2. **Search for usages** - `grep -r "FunctionName"` before renaming
+3. **Check tests** - `cargo test` should pass before AND after
+4. **Review related components** - Changes often ripple
+
+### Log Analysis Workflow
+
+After running the market maker:
+
+```bash
+# Quick error check
+grep -c "ERROR" logs/mm_*.log
+grep -c "WARN" logs/mm_*.log
+
+# Analyze with Claude
+# Provide log file and request: sc:analyze
+```
+
+The `sc:analyze` slash command provides:
+- Behavior summary
+- Issues categorized by severity
+- Recommended fixes with code locations
+
+### Slash Commands Available
+
+| Command | Purpose |
+|---------|---------|
+| `/mm-gaps` | Track production gap implementation progress |
+
+### Creating Session Memories
+
+After significant work, create a memory in `.serena/memories/`:
+
+```markdown
+# Session: {YYYY-MM-DD} {Short Description}
+
+## Summary
+{1-2 sentence summary}
+
+## Changes Made
+{List of changes with file locations}
+
+## Files Modified
+{Table of files and changes}
+
+## Verification
+{Test results, verification steps}
+
+## Next Steps
+{Future work, follow-up tasks}
+```
+
+Naming convention: `session_{YYYY-MM-DD}_{short_description}.md`
+
+---
+
+## Code Conventions
+
+### Rust Style
+
 ```rust
-pub struct MyStrategy { /* params */ }
+// Use explicit types for clarity in financial calculations
+let spread_bps: f64 = 8.0;
+let position: f64 = tracker.position();
 
-impl QuotingStrategy for MyStrategy {
-    fn calculate_quotes(&self, config: &QuoteConfig, position: f64,
-                        max_position: f64, target_liquidity: f64,
-                        market_params: &MarketParams)
-        -> (Option<Quote>, Option<Quote>) {
-        // MarketParams contains:
-        //   microprice: f64        - Data-driven fair price (quote around this)
-        //   sigma: f64             - √BV (jump-robust volatility)
-        //   sigma_effective: f64   - σ blended with jump component
-        //   kappa: f64             - order flow intensity
-        //   arrival_intensity: f64 - volume ticks per second
-        //   is_toxic_regime: bool  - RV/BV > threshold
-        //   jump_ratio: f64        - RV/BV ratio
-        //   beta_book: f64         - Learned book imbalance coefficient
-        //   beta_flow: f64         - Learned flow imbalance coefficient
-        // Return (bid, ask) quotes
-    }
-    fn name(&self) -> &'static str { "MyStrategy" }
+// Prefer early returns for guards
+if !estimator.is_warmed_up() {
+    return None;
+}
+
+// Use descriptive constants
+const MIN_SPREAD_FLOOR_BPS: f64 = 8.0;
+const MAKER_FEE_BPS: f64 = 1.5;
+
+// Log with structured fields
+debug!(
+    spread_bps = %spread,
+    position = %pos,
+    "Calculated quotes"
+);
+```
+
+### File Organization
+
+```
+src/market_maker/
+├── mod.rs              # Main orchestrator (~1,500 lines)
+├── config.rs           # All configuration structs
+├── core/               # Component bundles (Tier1, Tier2, etc.)
+├── estimator/          # Parameter estimation pipeline
+├── strategy/           # Quoting strategies
+├── quoting/            # Quote generation (ladder, filters)
+├── risk/               # Risk management
+├── tracking/           # Order and position state
+├── infra/              # Infrastructure (executor, metrics)
+├── process_models/     # Stochastic processes (hawkes, etc.)
+├── adverse_selection/  # Fill quality measurement
+├── safety/             # Exchange reconciliation
+├── fills/              # Fill processing pipeline
+└── messages/           # WebSocket message handlers
+```
+
+### Naming Conventions
+
+| Type | Convention | Example |
+|------|------------|---------|
+| Structs | PascalCase | `ParameterEstimator` |
+| Traits | PascalCase + verb | `QuotingStrategy`, `OrderExecutor` |
+| Functions | snake_case | `calculate_quotes()` |
+| Constants | SCREAMING_SNAKE | `MIN_SPREAD_FLOOR_BPS` |
+| Config fields | snake_case | `gamma_base`, `min_spread_floor` |
+| Metrics | mm_snake_case | `mm_spread_bps`, `mm_position` |
+
+### Error Handling
+
+```rust
+// Use Result for recoverable errors
+fn fetch_metadata(&self) -> Result<Meta, Error> {
+    // ...
+}
+
+// Use Option for optional values
+fn get_fill_price(&self, oid: u64) -> Option<f64> {
+    // ...
+}
+
+// Log errors with context
+if let Err(e) = exchange.place_order(order).await {
+    error!(error = %e, order_id = %oid, "Failed to place order");
 }
 ```
 
-**Hyperliquid constraints:**
-- Minimum order notional: $10 USD
-- Price precision: 5 significant figures, max `6 - sz_decimals` decimals (perps)
-- Size precision: truncate to `sz_decimals` (from asset metadata)
+---
 
-### Tier 1 Features (Production-Critical)
+## Testing Requirements
 
-The market maker includes advanced features beyond basic quoting:
+### Before Every Commit
 
-**Adverse Selection Measurement** (`adverse_selection/`):
-- Ground truth measurement: E[Δp | fill] at 1-second horizon
-- Tracks realized adverse selection separately for buy/sell fills (EWMA)
-- Calculates predicted α (probability of informed flow)
-- Provides spread adjustment recommendations
-- Fill deduplication by trade ID prevents double-counting
-
-```
-Key metrics:
-- realized_as_bps: Actual adverse selection experienced (0.5-2 bps typical)
-- spread_adjustment: Recommended spread widening based on AS
-- alpha: Probability of trading against informed flow
+```bash
+cargo fmt       # Format code
+cargo clippy -- -D warnings  # Zero warnings allowed
+cargo test      # All tests must pass
 ```
 
-**Liquidation Cascade Detection** (`process_models/liquidation.rs`):
-- Size-weighted Hawkes process models self-exciting liquidation events
-- Cascade severity scoring (0.0 = calm, 1.0+ = extreme)
-- Quote-pulling circuit breaker when severity exceeds threshold
-- Tail risk multiplier scales γ from 1.0 to 5.0 during cascades
-- Tracks cascade direction (long/short/both liquidations)
+### Test Organization
 
-```
-Configuration:
-- cascade_pull_threshold: Severity level to pull all quotes (default 0.8)
-- tail_risk_multiplier: γ scaling factor during cascades (1.0-5.0)
-- cascade_decay: Half-life of cascade intensity decay
-```
+```rust
+// Unit tests in the same file
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-**Queue Position Tracking** (`tracking/queue.rs`):
-- Estimates depth-ahead for resting orders
-- Fill probability calculation: P(fill) = P(touch) × P(execute|touch)
-- Queue decay modeling (20% per-second default)
-- Refresh decision logic (cancel/replace vs hold)
-- Order age tracking for stale order detection
-
-```
-Key outputs:
-- queue_position: Estimated contracts ahead of our order
-- fill_probability: Likelihood of execution before cancellation
-- should_refresh: Boolean signal for order refresh
+    #[test]
+    fn test_spread_calculation() {
+        let spread = calculate_spread(0.3, 100.0);
+        assert!((spread - 0.008).abs() < 0.001);
+    }
+}
 ```
 
-### Ladder Quoting System
+### What to Test
 
-Multi-level ladder quoting for deeper liquidity provision:
+| Component | Test Focus |
+|-----------|------------|
+| Estimators | Warmup logic, edge cases (zero vol, extreme values) |
+| Strategies | Quote generation, inventory skew, edge cases |
+| Risk | Kill switch triggers, threshold boundaries |
+| Tracking | State transitions, fill deduplication |
 
-**Structure:**
-- Default 5 levels per side (configurable via `ladder_levels`)
-- Geometric size decay across levels (e.g., 0.022 → 0.01165 → 0.00557 → 0.00256 → 0.00116)
-- Price spacing increases with distance from mid
-- Inventory-aware sizing reduces exposed side
+### Integration Testing
 
-**Bulk Order Placement:**
-- All ladder levels placed in single API call (`BulkOrder`)
-- Bulk cancellation for efficient order management
-- Level-by-level margin constraint checking
-- Reconciliation detects changed levels, only updates necessary orders
-
-**Ladder Reconciliation Logic:**
-```
-1. Calculate new ladder from strategy
-2. Compare against current resting orders (by price/size)
-3. Cancel orders at levels that changed
-4. Place new orders at updated levels
-5. Track all order IDs for fill association
+Run against testnet with small sizes:
+```bash
+cargo run --bin market_maker -- \
+  --asset BTC \
+  --target-liquidity 0.001 \
+  --log-file logs/test_session.log
 ```
 
-**Size Allocation Formula:**
+Analyze results:
+```bash
+grep "Fill processed" logs/test_session.log
+grep "Quote cycle" logs/test_session.log | tail -20
 ```
+
+---
+
+## Session Memory Workflow
+
+### Why Session Memories Matter
+
+Session memories in `.serena/memories/` provide:
+- Persistent context across Claude sessions
+- Decision rationale preservation
+- Implementation checkpoint recovery
+- Debugging history for regressions
+
+### Key Memories to Reference
+
+| Memory | Purpose |
+|--------|---------|
+| `project_architecture_overview.md` | System architecture reference |
+| `tight_spread_first_principles.md` | Mathematical foundations |
+| `session_checkpoint_profitability_fixes.md` | Key profitability improvements |
+| `design_bayesian_estimator_v2.md` | V2 estimator design |
+
+### Creating Effective Memories
+
+**Good memory:**
+```markdown
+# Session: 2026-01-04 Rate Limit Fix
+
+## Summary
+Reduced API calls by 60% through bulk cancel optimization.
+
+## Root Cause
+Individual cancel calls per order exhausted rate limit in 50 minutes.
+
+## Solution
+Implemented `cancel_bulk_orders()` in OrderExecutor trait.
+
+## Files Modified
+- `infra/executor.rs:145-180` - Added bulk cancel method
+- `mod.rs:890-920` - Integration
+
+## Metrics Impact
+- Cancel API calls per requote: 10 → 1
+- Rate limit buffer exhaustion: 50 min → 250 min
+
+## Verification
+✅ cargo test (572 passed)
+✅ 5-minute live test, no rate limit warnings
+```
+
+**Bad memory:**
+```markdown
+# Fixed stuff
+
+Made some changes to the rate limiting.
+```
+
+---
+
+## Architecture Overview
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         MarketMaker<S, E>                           │
+│                     (Orchestrator / Event Loop)                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│  │   Strategy   │  │   Executor   │  │   Estimator  │               │
+│  │  (GLFT/      │  │ (Hyperliquid │  │ (σ, κ, μ)    │               │
+│  │   Ladder)    │  │   Exchange)  │  │              │               │
+│  └──────────────┘  └──────────────┘  └──────────────┘               │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    Component Bundles                         │   │
+│  ├─────────────────────────────────────────────────────────────┤   │
+│  │  Tier1: AdverseSelection, QueueTracker, LiquidationDetector │   │
+│  │  Tier2: Hawkes, Funding, Spread, PnL                        │   │
+│  │  Safety: KillSwitch, RiskAggregator, FillProcessor          │   │
+│  │  Infra: Margin, Prometheus, ConnectionHealth, DataQuality   │   │
+│  │  Stochastic: HJBController, DynamicRisk                     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Hyperliquid Exchange                            │
+│  WebSocket: AllMids, L2Book, Trades, UserFills                      │
+│  REST: Orders, Cancels, Account State                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+```
+Trades → VolumeBucket → VWAP → BipowerVariation → σ, RV/BV
+L2Book → WeightedKappa → κ
+       → BookImbalance ──┐
+Trades → FlowImbalance ──┴→ MicropriceEstimator → microprice
+
+microprice + σ + κ → GLFTStrategy → Quote(bid, ask)
+Quote → LadderGenerator → Ladder[5 levels × 2 sides]
+Ladder → Reconciler → BulkOrder/BulkCancel → Exchange
+```
+
+### Event Loop
+
+```
+loop {
+    select! {
+        AllMids(mid) => update_microprice(mid),
+        Trades(trade) => {
+            update_volatility(trade);
+            update_flow_imbalance(trade);
+        },
+        L2Book(book) => {
+            update_kappa(book);
+            update_book_imbalance(book);
+        },
+        UserFills(fill) => {
+            update_position(fill);
+            update_adverse_selection(fill);
+        },
+        timer(100ms) => {
+            if should_quote() {
+                calculate_ladder();
+                reconcile_orders();
+            }
+            check_kill_switch();
+        }
+    }
+}
+```
+
+### GLFT Strategy
+
+```
+microprice = mid × (1 + β_book × book_imb + β_flow × flow_imb)
+δ = (1/γ) × ln(1 + γ/κ)                    # Optimal half-spread
+skew = (q/Q_max) × γ × σ² × T              # Inventory skew
+bid = microprice × (1 - δ - skew)
+ask = microprice × (1 + δ - skew)
+```
+
+**Parameters:**
+- γ (gamma): Risk aversion (0.1 aggressive → 1.0 conservative)
+- σ (sigma): Volatility from bipower variation
+- κ (kappa): Order flow intensity from book depth
+- T: Holding time horizon (1/λ from trade rate)
+
+### Ladder Quoting
+
+```
+Level 0: depth = min_depth_bps (5 bps default)
+Level 1: depth = level_0 × spacing_factor
+...
+Level N: depth = max_depth_bps (50 bps default)
+
+Size allocation (geometric decay):
 size[i] = base_size × decay_factor^i
-where:
-  base_size = target_liquidity / sum(decay_factor^i for i in 0..levels)
-  decay_factor = 0.53 (default, yields ~50% size reduction per level)
+where decay_factor = 0.53 (default)
 ```
 
-### Kill Switch System
+---
 
-Production safety mechanisms to prevent catastrophic losses:
+## Module Reference
 
-**Position Value Limit:**
-- Maximum USD value of position (default $10,000)
-- Triggers graceful shutdown when exceeded
-- Formula: `position_value = |position| × mid_price`
+### Core Modules (~24K lines, 74 files)
 
-**Drawdown Limits:**
-- Maximum intraday drawdown percentage (default 5%)
-- Tracks peak P&L and current P&L
-- Formula: `drawdown_pct = (peak_pnl - current_pnl) / account_value`
+| Module | Purpose | Key Types |
+|--------|---------|-----------|
+| `strategy/` | Quote pricing logic | `GLFTStrategy`, `LadderStrategy`, `RiskConfig` |
+| `estimator/` | Live parameter estimation | `ParameterEstimator`, `BipowerVariation`, `Microprice` |
+| `tracking/` | Order & position state | `OrderManager`, `PositionTracker`, `QueueTracker` |
+| `risk/` | Risk monitoring | `KillSwitch`, `RiskAggregator`, `RiskMonitor` |
+| `quoting/` | Quote generation | `LadderGenerator`, `Optimizer` |
+| `infra/` | Infrastructure | `HyperliquidExecutor`, `PrometheusMetrics` |
+| `process_models/` | Stochastic processes | `Hawkes`, `Funding`, `Liquidation` |
+| `adverse_selection/` | Fill quality | `AdverseSelectionEstimator` |
 
-**Data Staleness:**
-- Maximum age of market data before quoting stops (default 5 seconds)
-- Separate thresholds for L2 book, trades, and user events
-- Stale data triggers quote cancellation, not full shutdown
+### Estimator Pipeline
 
-**Cascade Severity:**
-- When liquidation cascade severity exceeds threshold, quotes pulled
-- Does not trigger full shutdown, resumes when cascade subsides
+| Component | Input | Output | Update |
+|-----------|-------|--------|--------|
+| `VolumeClock` | Trades | Volume ticks | Per trade |
+| `BipowerVariation` | VWAP returns | σ, RV/BV | Per volume tick |
+| `KappaEstimator` | L2 book | κ | Per L2 update |
+| `MicropriceEstimator` | Mid, imbalances | microprice, β | Per trade |
+| `SoftJumpClassifier` | σ, returns | P(jump) | Per trade |
+| `HierarchicalKappa` | Market κ, fills | κ_own | Per fill |
 
-**Graceful Shutdown Protocol:**
+### Risk Monitors
+
+| Monitor | Trigger | Action |
+|---------|---------|--------|
+| `LossMonitor` | Daily loss > $500 | Kill switch |
+| `DrawdownMonitor` | Drawdown > 5% | Kill switch |
+| `PositionMonitor` | Value > $10K | Kill switch |
+| `CascadeMonitor` | Severity > 0.95 | Kill switch |
+| `StalenessMonitor` | Data > 5s old | Quote cancel |
+
+---
+
+## Common Pitfalls
+
+### 1. Spread Cap Override
+
+**Problem:** GLFT calculates optimal 8-9 bps, but spread gets capped.
+
+**Symptom:** Logs show `optimal_spread_bps: 8.5` but actual spread is 4-5 bps.
+
+**Fix:** Check `market_spread_cap_multiple` in `depth_generator.rs`. Should be 0.0 (disabled).
+
+### 2. Immediate Fill Double-Counting
+
+**Problem:** API returns fill on place, WebSocket also delivers fill.
+
+**Symptom:** Position jumps 2x expected on fills.
+
+**Fix:** `FillProcessor` tracks `immediate_fill_amounts` by OID. WebSocket fills deduct from this.
+
+### 3. Order State Confusion
+
+**Problem:** Orders tracked as `Resting` but already filled on exchange.
+
+**Symptom:** Orphaned orders, reconciliation warnings.
+
+**States:**
+- `Resting`: Actively on book (safe to cancel)
+- `PartialFilled`: Partially filled, rest on book
+- `FilledImmediately`: Full fill on place (terminal)
+- `CancelPending`: Cancel in flight (don't re-cancel)
+
+### 4. Warmup Bypass
+
+**Problem:** Quoting starts before estimators stabilize.
+
+**Symptom:** Wild spreads, large losses in first 30 seconds.
+
+**Check:** `estimator.is_warmed_up()` requires:
+- 20 volume ticks
+- 10 L2 updates
+- 50 microprice observations
+
+### 5. Rate Limit Exhaustion
+
+**Problem:** Individual cancel calls exhaust 10K/min limit.
+
+**Symptom:** `429 Too Many Requests` errors after ~50 minutes.
+
+**Fix:** Use `cancel_bulk_orders()` for ladder reconciliation.
+
+### 6. HIP-3 Asset Confusion
+
+**Problem:** Asset not found on HIP-3 DEX.
+
+**Fix:** Asset names auto-prefix with DEX: `--asset BTC --dex hyna` → uses `hyna:BTC`.
+
+### 7. Reduce-Only Mode Stuck
+
+**Problem:** All orders cancelled, position won't reduce.
+
+**Causes:**
+1. Liquidation proximity (`buffer_ratio < 0.5`)
+2. Margin utilization > 80%
+3. Position > `max_position` (if set)
+
+**Debug:**
+```bash
+grep "Reduce-only" logs/mm_*.log
+# Check trigger reason in log
 ```
-1. Kill switch condition detected
-2. Log ERROR with reason and metrics
-3. Cancel all resting orders (bulk cancel)
-4. Confirm all cancellations received
-5. Log final state (position, P&L, adverse selection summary)
-6. Exit process
+
+### 8. Time Zone Issues
+
+**Problem:** Toxic hour scaling not activating.
+
+**Fix:** Hours in `RiskConfig` are UTC. Check server timezone.
+
+---
+
+## Debugging Guide
+
+### Checking Market Data
+
+```bash
+# Verify data is flowing
+grep "AllMids" logs/mm_*.log | tail -5
+grep "L2Book" logs/mm_*.log | tail -5
+grep "Trades processed" logs/mm_*.log | tail -5
+```
+
+### Checking Estimator State
+
+```bash
+# Parameter estimation
+grep "sigma=" logs/mm_*.log | tail -5
+grep "kappa=" logs/mm_*.log | tail -5
+grep "microprice=" logs/mm_*.log | tail -5
+
+# Warmup status
+grep -i "warm" logs/mm_*.log
+```
+
+### Checking Quote Generation
+
+```bash
+# Ladder calculation
+grep "Calculated ladder" logs/mm_*.log | tail -10
+
+# Spread diagnostics
+grep "spread_bps" logs/mm_*.log | tail -10
+```
+
+### Checking Risk State
+
+```bash
+# Kill switch status
+grep -i "kill" logs/mm_*.log
+
+# Reduce-only triggers
+grep -i "reduce" logs/mm_*.log
+
+# Cascade detection
+grep -i "cascade" logs/mm_*.log
 ```
 
 ### Prometheus Metrics
 
-Full observability via Prometheus metrics endpoint:
+```bash
+# Check metrics endpoint
+curl -s localhost:9090/metrics | grep mm_
 
-**Position Metrics:**
-- `mm_position`: Current position in contracts
-- `mm_max_position`: Maximum allowed position
-- `mm_inventory_utilization`: position / max_position ratio
+# Key metrics to monitor
+curl -s localhost:9090/metrics | grep -E "(mm_position|mm_spread_bps|mm_daily_pnl)"
+```
 
-**P&L Metrics:**
-- `mm_daily_pnl`: Realized + unrealized P&L for session
-- `mm_peak_pnl`: Highest P&L reached during session
-- `mm_drawdown_pct`: Current drawdown from peak
-- `mm_realized_pnl`: Sum of closed trade P&L
-- `mm_unrealized_pnl`: Mark-to-market of open position
+### Common Log Patterns
 
-**Order Metrics:**
-- `mm_orders_placed`: Total orders placed
-- `mm_orders_filled`: Total orders filled
-- `mm_orders_cancelled`: Total orders cancelled
-- `mm_fill_volume_buy`: Total buy volume filled
-- `mm_fill_volume_sell`: Total sell volume filled
+| Pattern | Meaning |
+|---------|---------|
+| `Quote cycle completed` | Normal operation |
+| `Warming up` | Estimator collecting data |
+| `Reduce-only mode activated` | Risk limit hit |
+| `Kill switch condition` | Emergency threshold approaching |
+| `KILL SWITCH TRIGGERED` | Emergency shutdown |
+| `Cascade detected` | Liquidation cascade |
+| `Data staleness exceeded` | WebSocket may be disconnected |
 
-**Market Metrics:**
-- `mm_mid_price`: Current mid price
-- `mm_spread_bps`: Current bid-ask spread in basis points
-- `mm_sigma`: Current volatility estimate (σ)
-- `mm_jump_ratio`: Current RV/BV ratio
-- `mm_kappa`: Current order flow intensity (κ)
+---
 
-**Estimator Metrics:**
-- `mm_microprice_deviation_bps`: Microprice vs mid deviation
-- `mm_book_imbalance`: Current L2 book imbalance (-1 to 1)
-- `mm_flow_imbalance`: Current trade flow imbalance (-1 to 1)
-- `mm_beta_book`: Learned book imbalance coefficient
-- `mm_beta_flow`: Learned flow imbalance coefficient
+## Hyperliquid Constraints
 
-**Risk Metrics:**
-- `mm_kill_switch_triggered`: Boolean (0/1) for kill switch status
-- `mm_cascade_severity`: Current liquidation cascade severity
-- `mm_adverse_selection_bps`: Running adverse selection estimate
-- `mm_tail_risk_multiplier`: Current gamma scaling from tail risk
+- **Minimum order notional:** $10 USD
+- **Price precision:** 5 significant figures, max `6 - sz_decimals` decimals
+- **Size precision:** Truncate to `sz_decimals` (from asset metadata)
+- **Rate limits:** ~10,000 requests/minute (IP-based)
+- **WebSocket:** Max 100 subscriptions per connection
 
-**Infrastructure Metrics:**
-- `mm_data_staleness_secs`: Age of most recent market data
-- `mm_quote_cycle_latency_ms`: Time to complete quote cycle
-- `mm_volatility_regime`: Current regime (0=Normal, 1=High, 2=Extreme)
+---
 
-### Extended RiskConfig Parameters
+## Further Reading
 
-Additional parameters beyond basic gamma scaling:
-
-**Cascade/Tail Risk:**
-- `cascade_pull_threshold`: Cascade severity to pull all quotes (default 0.8)
-- `tail_risk_base`: Base tail risk multiplier (default 1.0)
-- `tail_risk_sensitivity`: How fast multiplier increases with cascade severity
-- `max_tail_risk_multiplier`: Cap on tail risk gamma scaling (default 5.0)
-
-**Hawkes Order Flow:**
-- `hawkes_decay`: Decay rate for self-exciting intensity (default 0.1)
-- `hawkes_activity_weight`: Weight of Hawkes activity in gamma scaling
-- `hawkes_baseline`: Baseline intensity for Hawkes process
-
-**Funding Rate:**
-- `funding_rate_weight`: Impact of funding on inventory target
-- `funding_rate_horizon`: Lookahead for funding cost estimation (default 1 hour)
-
-**Spread Regime:**
-- `spread_regime_tight_mult`: Gamma multiplier in tight spread regime (default 0.8)
-- `spread_regime_wide_mult`: Gamma multiplier in wide spread regime (default 1.5)
-- `spread_percentile_window`: Rolling window for spread percentile (default 300s)
-
-### Production Infrastructure
-
-**Margin-Aware Sizer** (`infra/margin.rs`):
-- Pre-flight margin checks before order placement
-- Reduces order size if margin insufficient
-- Respects leverage constraints from account settings
-- Prevents order rejections from margin failures
-
-**Connection Health Monitoring:**
-- Tracks last update time for each data feed
-- Detects WebSocket disconnections via staleness
-- Triggers reconnection or quote cancellation
-- Logged every 60 seconds in safety sync
-
-**Safety State Sync:**
-- Periodic reconciliation with exchange state (every 60s)
-- Detects orphaned orders (on exchange but not tracked locally)
-- Cancels stale orders (tracked locally but gone from exchange)
-- Logs sync status and any discrepancies
-
-**Reduce-Only Mode:**
-- Activated when position exceeds max_position
-- Cancels all orders that would increase position
-- Only allows orders that reduce exposure
-- Logged as WARN when triggered
+- [WORKFLOW.md](./WORKFLOW.md) - Operational procedures and SOP
+- [Hyperliquid Docs](https://hyperliquid.gitbook.io/) - Exchange API reference
+- [GLFT Paper](https://arxiv.org/abs/1105.3115) - Optimal market making theory
+- `.serena/memories/` - Session memories and design documents
