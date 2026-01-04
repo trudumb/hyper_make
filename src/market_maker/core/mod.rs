@@ -32,6 +32,7 @@ mod components;
 mod state;
 
 pub use components::{
-    InfraComponents, SafetyComponents, StochasticComponents, Tier1Components, Tier2Components,
+    InfraComponents, PAICComponents, SafetyComponents, StochasticComponents, Tier1Components,
+    Tier2Components,
 };
 pub use state::CoreState;

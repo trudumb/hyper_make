@@ -15,6 +15,7 @@ use crate::market_maker::{
         ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
         RejectionRateLimiter, SupervisorConfig,
     },
+    paic::{ImpulseEngine, OrderGateway, PAICConfig, StateEstimator},
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
         HawkesOrderFlowEstimator, LiquidationCascadeDetector, LiquidationConfig, SpreadConfig,
@@ -282,6 +283,43 @@ impl StochasticComponents {
     }
 }
 
+/// PAIC components: Priority-Aware Impulse Control framework.
+///
+/// This module provides queue-priority-aware order management:
+/// - State estimation (volatility, queue priority, toxicity)
+/// - Impulse control engine (HOLD/LEAK/SHADOW/RESET decisions)
+/// - Order gateway with batching and rate limit shadow pricing
+#[derive(Debug)]
+pub struct PAICComponents {
+    /// State estimator - derives hidden market states (σ, π, α)
+    pub state_estimator: StateEstimator,
+    /// Impulse control engine - makes HOLD/LEAK/SHADOW/RESET decisions
+    pub impulse_engine: ImpulseEngine,
+    /// Order gateway - batching and rate limit management
+    pub order_gateway: OrderGateway,
+}
+
+impl PAICComponents {
+    /// Create PAIC components from config.
+    pub fn new(config: PAICConfig) -> Self {
+        Self {
+            state_estimator: StateEstimator::new(config.clone()),
+            impulse_engine: ImpulseEngine::new(config.clone()),
+            order_gateway: OrderGateway::new(config),
+        }
+    }
+
+    /// Create with default configuration.
+    pub fn default_config() -> Self {
+        Self::new(PAICConfig::default())
+    }
+
+    /// Check if state estimator is warmed up.
+    pub fn is_warmed_up(&self) -> bool {
+        self.state_estimator.is_warmed_up()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +343,11 @@ mod tests {
             PnLConfig::default(),
         );
         assert!((tier2.pnl_tracker.summary(50000.0).total_pnl).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_paic_construction() {
+        let paic = PAICComponents::default_config();
+        assert!(!paic.is_warmed_up()); // Should not be warmed up initially
     }
 }
