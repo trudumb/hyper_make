@@ -48,18 +48,21 @@ impl SignalStandardizer {
     }
 
     /// Create with typical defaults for a [0, 1] bounded signal.
+    /// Uses 5 observations for warmup (down from 20) for faster adaptation.
     pub fn for_bounded_signal() -> Self {
-        Self::new(0.5, 0.25, 20)
+        Self::new(0.5, 0.25, 5)
     }
 
     /// Create with typical defaults for a ratio signal (e.g., vol_ratio).
+    /// Uses 5 observations for warmup (down from 20) for faster adaptation.
     pub fn for_ratio_signal() -> Self {
-        Self::new(1.0, 0.5, 20)
+        Self::new(1.0, 0.5, 5)
     }
 
     /// Create with typical defaults for a [-1, 1] bounded signal.
+    /// Uses 5 observations for warmup (down from 20) for faster adaptation.
     pub fn for_symmetric_signal() -> Self {
-        Self::new(0.0, 0.5, 20)
+        Self::new(0.0, 0.5, 5)
     }
 
     /// Update statistics and return standardized value.
@@ -143,10 +146,12 @@ impl Default for SignalStandardizers {
     fn default() -> Self {
         Self {
             // Vol ratio: typically 0.5 - 2.0, centered at 1.0
-            vol_ratio: SignalStandardizer::new(1.0, 0.5, 20),
+            // Reduced warmup to 5 observations for faster adaptation
+            vol_ratio: SignalStandardizer::new(1.0, 0.5, 5),
 
             // Jump ratio: typically 1.0 - 5.0, centered at 1.5
-            jump_ratio: SignalStandardizer::new(1.5, 1.0, 20),
+            // Reduced warmup to 5 observations for faster adaptation
+            jump_ratio: SignalStandardizer::new(1.5, 1.0, 5),
 
             // Inventory utilization: 0.0 - 1.0
             inventory: SignalStandardizer::for_bounded_signal(),

@@ -908,7 +908,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Update adaptive Bayesian spread calculator with fill data
         // This updates: learned floor (AS), blended kappa (fill rate), shrinkage gamma (PnL)
-        if self.stochastic.stochastic_config.use_adaptive_spreads {
+        // ALWAYS feed fills to adaptive system for learning, even if not using adaptive quotes.
+        // This ensures the system can learn from actual market behavior and be ready when enabled.
+        {
             for fill in &user_fills.data.fills {
                 if fill.coin != *self.config.asset {
                     continue;
@@ -988,8 +990,50 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             prometheus: &mut self.infra.prometheus,
         };
 
-        let _result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
+        let result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
+
+        // Feed L2 data to adaptive spread calculator's blended kappa estimator
+        // This enables book-based kappa estimation to work alongside own-fill kappa
+        if result.is_valid && self.latest_mid > 0.0 {
+            if let Some((bids, asks)) = Self::parse_l2_for_adaptive(&l2_book.data.levels) {
+                self.stochastic
+                    .adaptive_spreads
+                    .on_l2_update(&bids, &asks, self.latest_mid);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Parse L2 book levels into (bids, asks) tuples for adaptive spread calculator.
+    /// Returns None if the levels are invalid or insufficient.
+    #[allow(clippy::type_complexity)]
+    fn parse_l2_for_adaptive(
+        levels: &[Vec<crate::types::OrderBookLevel>],
+    ) -> Option<(Vec<(f64, f64)>, Vec<(f64, f64)>)> {
+        if levels.len() < 2 {
+            return None;
+        }
+
+        let bids: Vec<(f64, f64)> = levels[0]
+            .iter()
+            .filter_map(|level| {
+                let px: f64 = level.px.parse().ok()?;
+                let sz: f64 = level.sz.parse().ok()?;
+                Some((px, sz))
+            })
+            .collect();
+
+        let asks: Vec<(f64, f64)> = levels[1]
+            .iter()
+            .filter_map(|level| {
+                let px: f64 = level.px.parse().ok()?;
+                let sz: f64 = level.sz.parse().ok()?;
+                Some((px, sz))
+            })
+            .collect();
+
+        Some((bids, asks))
     }
 
     /// Handle OrderUpdates message - processes order state changes via WsOrderStateManager.
