@@ -802,11 +802,22 @@ impl ParameterAggregator {
                 let margin_available = sources.margin_sizer.state().available_margin;
                 let leverage = sources.margin_sizer.summary().max_leverage;
 
-                if margin_available > 0.0 && leverage > 0.0 && sources.latest_mid > 0.0 {
+                let capacity = if margin_available > 0.0 && leverage > 0.0 && sources.latest_mid > 0.0 {
                     (margin_available * leverage / sources.latest_mid).max(0.0)
                 } else {
                     0.0 // Will be computed dynamically via quoting_capacity()
-                }
+                };
+
+                // Debug: trace margin_quoting_capacity computation
+                tracing::debug!(
+                    margin_available = %format!("{:.2}", margin_available),
+                    leverage = %format!("{:.1}", leverage),
+                    mid = %format!("{:.4}", sources.latest_mid),
+                    computed_capacity = %format!("{:.6}", capacity),
+                    "margin_quoting_capacity computed"
+                );
+
+                capacity
             },
 
             // === Stochastic Constraints (First Principles) ===

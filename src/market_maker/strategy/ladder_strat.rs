@@ -289,15 +289,16 @@ impl LadderStrategy {
             market_params.effective_max_position(max_position)
         };
 
-        // Log when quoting capacity differs from user's config
-        if (effective_max_position - max_position).abs() > 0.01 {
-            tracing::debug!(
-                user_max_position = %format!("{:.6}", max_position),
-                margin_quoting_capacity = %format!("{:.6}", market_params.margin_quoting_capacity),
-                effective = %format!("{:.6}", effective_max_position),
-                "Controller-derived quoting capacity (user max_position is for reduce-only only)"
-            );
-        }
+        // ALWAYS log quoting capacity for debugging (INFO level for visibility)
+        tracing::info!(
+            user_max_position = %format!("{:.6}", max_position),
+            quoting_capacity = %format!("{:.6}", quoting_capacity),
+            margin_quoting_capacity = %format!("{:.6}", market_params.margin_quoting_capacity),
+            margin_available = %format!("{:.2}", market_params.margin_available),
+            leverage = %format!("{:.1}", market_params.leverage),
+            effective_max_position = %format!("{:.6}", effective_max_position),
+            "Quoting capacity: user max_position is for reduce-only only"
+        );
 
         // === GAMMA: Adaptive vs Legacy ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma

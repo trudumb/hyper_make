@@ -505,18 +505,28 @@ impl MarketParams {
     /// IMPORTANT: This is for QUOTING allocation, not reduce-only triggers.
     /// The Kelly optimizer should be able to allocate across full margin capacity.
     /// User's --max-position config is used ONLY for reduce-only filter.
+    ///
+    /// Priority order (MARGIN is the HARD solvency constraint):
+    /// 1. margin_quoting_capacity (margin × leverage / price) - can't exceed available margin
+    /// 2. dynamic_max_position (value-based from kill switch) - risk management layer
+    /// 3. static_fallback (user's --max-position) - reduce-only trigger only
     pub fn effective_max_position(&self, static_fallback: f64) -> f64 {
         const EPSILON: f64 = 1e-9;
 
-        // First choice: volatility-adjusted limit from kill switch
-        if self.dynamic_limit_valid && self.dynamic_max_position > EPSILON {
-            return self.dynamic_max_position;
+        // PRIORITY 1: Margin-based quoting capacity (HARD solvency constraint)
+        // This is the true limit from available margin - we can't exceed this
+        if self.margin_quoting_capacity > EPSILON {
+            // If dynamic_max_position is also valid, take the minimum (both are valid constraints)
+            if self.dynamic_limit_valid && self.dynamic_max_position > EPSILON {
+                return self.margin_quoting_capacity.min(self.dynamic_max_position);
+            }
+            return self.margin_quoting_capacity;
         }
 
-        // Second choice: margin-based quoting capacity (controller-derived)
-        // This allows full margin utilization for ladder allocation
-        if self.margin_quoting_capacity > EPSILON {
-            return self.margin_quoting_capacity;
+        // PRIORITY 2: Dynamic volatility-adjusted limit from kill switch
+        // Used when margin data isn't available yet
+        if self.dynamic_limit_valid && self.dynamic_max_position > EPSILON {
+            return self.dynamic_max_position;
         }
 
         // Last resort: static fallback (only during early warmup)
@@ -531,7 +541,7 @@ impl MarketParams {
         const EPSILON: f64 = 1e-9;
 
         // Prefer margin-based capacity when available
-        if self.margin_quoting_capacity > EPSILON {
+        let result = if self.margin_quoting_capacity > EPSILON {
             self.margin_quoting_capacity
         } else if self.dynamic_limit_valid && self.dynamic_max_position > EPSILON {
             self.dynamic_max_position
@@ -542,7 +552,20 @@ impl MarketParams {
             } else {
                 0.0
             }
-        }
+        };
+
+        // Debug: trace which branch was taken
+        tracing::trace!(
+            margin_quoting_capacity = %format!("{:.6}", self.margin_quoting_capacity),
+            dynamic_limit_valid = self.dynamic_limit_valid,
+            dynamic_max_position = %format!("{:.6}", self.dynamic_max_position),
+            margin_available = %format!("{:.2}", self.margin_available),
+            leverage = %format!("{:.1}", self.leverage),
+            result = %format!("{:.6}", result),
+            "quoting_capacity() returning"
+        );
+
+        result
     }
 }
 

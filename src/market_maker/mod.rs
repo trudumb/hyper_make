@@ -1168,7 +1168,46 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Get dynamic position VALUE limit from kill switch (first-principles derived)
         let dynamic_max_position_value = self.safety.kill_switch.max_position_value();
         // Margin state is valid if we've refreshed margin at least once
-        let dynamic_limit_valid = self.infra.margin_sizer.state().account_value > 0.0;
+        let margin_state = self.infra.margin_sizer.state();
+        let dynamic_limit_valid = margin_state.account_value > 0.0;
+
+        // CRITICAL: Pre-compute effective_max_position and update exchange limits BEFORE building sources
+        // This ensures sources.exchange_effective_bid/ask_limit use the margin-based capacity
+        let margin_quoting_capacity = if margin_state.available_margin > 0.0
+            && self.infra.margin_sizer.summary().max_leverage > 0.0
+            && self.latest_mid > 0.0
+        {
+            (margin_state.available_margin * self.infra.margin_sizer.summary().max_leverage
+                / self.latest_mid)
+                .max(0.0)
+        } else {
+            0.0
+        };
+
+        // Compute effective_max_position using same priority as MarketParams::effective_max_position
+        let dynamic_max_position = if dynamic_limit_valid && self.latest_mid > 0.0 {
+            dynamic_max_position_value / self.latest_mid
+        } else {
+            0.0
+        };
+
+        let pre_effective_max_position = {
+            const EPSILON: f64 = 1e-9;
+            if margin_quoting_capacity > EPSILON {
+                if dynamic_limit_valid && dynamic_max_position > EPSILON {
+                    margin_quoting_capacity.min(dynamic_max_position)
+                } else {
+                    margin_quoting_capacity
+                }
+            } else if dynamic_limit_valid && dynamic_max_position > EPSILON {
+                dynamic_max_position
+            } else {
+                self.config.max_position // Fallback to config during warmup
+            }
+        };
+
+        // Update exchange limits with margin-based capacity BEFORE building sources
+        self.infra.exchange_limits.update_local_max(pre_effective_max_position);
 
         let sources = ParameterSources {
             estimator: &self.estimator,
@@ -1224,6 +1263,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
         self.effective_max_position = new_effective;
+
+        // Note: exchange limits were already updated BEFORE building sources (line ~1210)
+        // using pre_effective_max_position which should equal new_effective
 
         // CRITICAL: Update cached effective target_liquidity from first principles
         // min_viable = MIN_ORDER_NOTIONAL / price ensures orders pass exchange minimum
@@ -3321,10 +3363,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .active_asset_data(self.user_address, self.config.asset.to_string())
             .await?;
 
-        // Update exchange limits with local max_position for effective limit calculation
+        // Update exchange limits with effective_max_position (margin-based) for proper capacity
+        // Fall back to config.max_position if effective hasn't been computed yet (early startup)
+        let local_max = if self.effective_max_position > 0.0 {
+            self.effective_max_position
+        } else {
+            self.config.max_position
+        };
         self.infra
             .exchange_limits
-            .update_from_response(&asset_data, self.config.max_position);
+            .update_from_response(&asset_data, local_max);
 
         // Log summary for diagnostics
         let summary = self.infra.exchange_limits.summary();

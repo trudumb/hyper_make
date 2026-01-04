@@ -1,7 +1,7 @@
 # Market Maker Standard Operating Procedures (SOP)
 
-**Version:** 2.0
-**Last Updated:** 2025-01-02
+**Version:** 2.1
+**Last Updated:** 2026-01-04
 **Document Type:** Standard Operating Procedure
 
 This document provides comprehensive operational guidance for the Hyperliquid market maker, including setup, daily operations, monitoring, troubleshooting, and emergency procedures.
@@ -224,7 +224,7 @@ enable_http_metrics = true       # Enable HTTP metrics endpoint
 | `--target-liquidity` | FLOAT | Config value | Order size per side |
 | `--risk-aversion` | FLOAT | `0.3` | Gamma (γ) parameter |
 | `--max-bps-diff` | FLOAT | `5` | Requote threshold |
-| `--max-position` | FLOAT | Config value | Maximum position size |
+| `--max-position` | FLOAT | *Optional* | Hard position cap (triggers reduce-only) |
 | `--leverage` | INT | Max available | Leverage setting |
 | `--decimals` | INT | Auto | Price decimals override |
 | `--network` | STRING | `testnet` | Network selection |
@@ -241,9 +241,31 @@ enable_http_metrics = true       # Enable HTTP metrics endpoint
 | `--dex` | STRING | None | HIP-3 DEX name |
 | `--list-dexs` | FLAG | false | List available DEXs |
 
+**Note on `--max-position`:** This flag is **optional**. When omitted, the system uses margin-based capacity for quoting and liquidation proximity for reduce-only triggers. When specified, it adds an additional hard cap that triggers reduce-only mode.
+
 ### 4.4 Parameter Sizing Guidelines
 
-**Position Sizing (Runtime Capped):**
+**Automatic Position Sizing (Default - Margin-Based):**
+
+When `--max-position` is not specified, the system automatically computes quoting capacity:
+```
+margin_quoting_capacity = (available_margin × leverage) / price
+effective_max_position = min(margin_quoting_capacity, dynamic_value_limit)
+```
+
+This is the recommended approach for capital-efficient operation. The system will:
+1. Use your available margin to determine maximum quoting capacity
+2. Apply leverage from your account settings
+3. Trigger reduce-only based on liquidation proximity (not arbitrary position limits)
+
+**Manual Position Cap (Optional Override):**
+
+If `--max-position` is specified, it becomes an additional constraint:
+```
+effective_max_position = min(margin_quoting_capacity, user_max_position)
+```
+
+**Legacy Position Sizing Formula:**
 ```
 max_position ≤ (account_value × leverage × 0.5) / price
 target_liquidity ≤ max_position × 0.4
@@ -412,9 +434,9 @@ The market maker automatically detects and respects OI caps:
 
 ### 6.6 HIP-3 Testing Workflow
 
-**Quick Start:**
+**Quick Start (Capital-Efficient - No Position Cap):**
 ```bash
-# Use the test script (recommended)
+# Use the test script (recommended) - uses margin-based capacity
 ./scripts/test_hip3.sh BTC hyna 60    # 1 minute test
 ./scripts/test_hip3.sh BTC hyna 300   # 5 minute test
 ./scripts/test_hip3.sh ETH flx 120    # 2 minute test on Felix
@@ -429,6 +451,19 @@ cargo run --bin market_maker -- \
   --asset BTC \
   --dex hyna \
   --log-file logs/mm_hyna_BTC_${TIMESTAMP}.log
+```
+
+**With Optional Hard Position Cap:**
+```bash
+# Only use if you want an additional position limit beyond margin-based capacity
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S) && \
+RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
+cargo run --bin market_maker -- \
+  --network mainnet \
+  --asset HYPE \
+  --dex hyna \
+  --max-position 10.0 \
+  --log-file logs/mm_hyna_HYPE_${TIMESTAMP}.log
 ```
 
 **Log Naming Convention:**
@@ -483,6 +518,25 @@ During HIP-3 testing, watch for:
 | `mm_inventory_utilization` | <50% | >80% |
 | `mm_adverse_selection_bps` | <3 bps | >10 bps |
 | Quote cycle latency | <100ms | >500ms |
+
+**Key Log Messages to Verify:**
+
+1. **Quoting Capacity** - Check `effective_max_position` is margin-based:
+   ```
+   Quoting capacity: user max_position is for reduce-only only
+     effective_max_position: 47.25  # Should be margin-based (~margin × leverage / price)
+   ```
+
+2. **Ladder Spread Diagnostics** - Confirm 5 levels each side:
+   ```
+   Ladder spread diagnostics
+     bid_levels: 5, ask_levels: 5
+   ```
+
+3. **No Concentration Fallback** - Should NOT see:
+   ```
+   Concentration fallback triggered  # Indicates max_pos too small
+   ```
 
 ---
 
@@ -656,14 +710,31 @@ When kill switch triggers:
 
 ### 8.3 Reduce-Only Mode
 
-Automatically activated when:
-- Position exceeds `max_position`
-- Position value exceeds `max_position_value`
+**Priority Order of Triggers (highest to lowest):**
 
-Behavior:
+| Priority | Trigger | Condition | Description |
+|----------|---------|-----------|-------------|
+| 1 | `ApproachingLiquidation` | `buffer_ratio < 0.5` | PRIMARY - liquidation proximity |
+| 2 | `OverMarginUtilization` | `margin_used/account_value > 80%` | Margin stress |
+| 3 | `OverValueLimit` | `position_value > max_position_value` | Kill switch value limit |
+| 4 | `OverPositionLimit` | `position > max_position` | User-specified cap (if set) |
+
+**Liquidation Buffer Ratio Formula:**
+```
+distance_to_liq = |mark_price - liquidation_px| / mark_price
+buffer_ratio = distance / (distance + maintenance_margin_rate)
+
+where:
+  maintenance_margin_rate = 0.5 / max_leverage
+  buffer_ratio = 0.0 → at liquidation
+  buffer_ratio = 0.5 → default trigger threshold
+  buffer_ratio = 1.0 → completely safe
+```
+
+**Behavior:**
 - Cancels orders that would increase position
 - Only places orders that reduce exposure
-- Logs WARN message when activated
+- Logs WARN message with reason when activated
 
 ### 8.4 Risk Parameter Tuning
 
