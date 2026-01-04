@@ -9,19 +9,43 @@
 //! - GLFT inventory skew applied to entire ladder
 //! - **Constrained variational optimization** for capital-efficient allocation
 //! - **Kelly-Stochastic optimization** using first-passage fill probability
+//! - **Entropy-based stochastic distribution** for diversity-preserving allocation
 //!
 //! # Module Structure
 //!
 //! - `depth_generator`: Dynamic depth computation from market parameters
 //! - `generator`: Ladder generation logic and depth/size calculation
 //! - `optimizer`: Constrained optimization with multiple allocation strategies
+//! - `entropy_distribution`: Entropy-based stochastic order distribution
+//! - `entropy_optimizer`: Diversity-preserving optimizer using entropy constraints
+//!
+//! # Entropy-Based Distribution (New)
+//!
+//! The entropy-based system completely replaces the old concentration fallback
+//! mechanism that could collapse orders to just 1-2 levels. Key features:
+//!
+//! - **Minimum entropy floor**: Distribution NEVER drops below H_min, ensuring
+//!   at least exp(H_min) effective levels remain active.
+//! - **Softmax temperature control**: Smooth transitions instead of hard cutoffs.
+//! - **Thompson sampling**: Stochastic allocation prevents predictability.
+//! - **Dirichlet smoothing**: Prior regularization prevents any level from zero.
 
 mod depth_generator;
+mod entropy_distribution;
+mod entropy_optimizer;
 mod fill_probability;
 mod generator;
 mod optimizer;
 
 pub use depth_generator::{DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator, DynamicDepths};
+pub use entropy_distribution::{
+    EntropyDistribution, EntropyDistributionConfig, EntropyDistributor, EntropyLevelParams,
+    MarketRegime,
+};
+pub use entropy_optimizer::{
+    create_aggressive_optimizer, create_defensive_optimizer, create_entropy_optimizer,
+    EntropyConstrainedAllocation, EntropyConstrainedOptimizer, EntropyOptimizerConfig,
+};
 pub use fill_probability::{BayesianFillModel, DepthBucket, FirstPassageFillModel};
 pub use optimizer::{
     BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, KellyStochasticParams,

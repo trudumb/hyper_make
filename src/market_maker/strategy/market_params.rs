@@ -359,6 +359,24 @@ pub struct MarketParams {
     /// > 1.0 = widen spreads proportionally
     pub stochastic_spread_multiplier: f64,
 
+    // ==================== Entropy-Based Distribution ====================
+    /// Whether to use entropy-based stochastic order distribution.
+    /// This completely replaces the concentration fallback with diversity-preserving allocation.
+    pub use_entropy_distribution: bool,
+
+    /// Minimum entropy floor (bits). Distribution NEVER drops below this.
+    /// H_min = 1.5 → at least exp(1.5) ≈ 4.5 effective levels always active.
+    pub entropy_min_entropy: f64,
+
+    /// Base temperature for softmax. Higher = more uniform distribution.
+    pub entropy_base_temperature: f64,
+
+    /// Minimum allocation floor per level (prevents zero allocations).
+    pub entropy_min_allocation_floor: f64,
+
+    /// Number of Thompson samples for stochastic allocation.
+    pub entropy_thompson_samples: usize,
+
     // ==================== Adaptive Bayesian System ====================
     /// Whether the adaptive Bayesian system is enabled.
     pub use_adaptive_spreads: bool,
@@ -510,6 +528,12 @@ impl Default for MarketParams {
             tight_quoting_allowed: false, // Conservative default
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
+            // Entropy-Based Distribution
+            use_entropy_distribution: false,  // Default OFF for backwards compatibility
+            entropy_min_entropy: 1.5,         // At least ~4.5 effective levels
+            entropy_base_temperature: 1.0,    // Standard softmax
+            entropy_min_allocation_floor: 0.02, // 2% minimum per level
+            entropy_thompson_samples: 5,      // Moderate stochasticity
             // Adaptive Bayesian System
             use_adaptive_spreads: false,       // Default OFF for safety
             adaptive_spread_floor: 0.0008,     // 8 bps fallback floor
@@ -758,6 +782,21 @@ impl MarketParams {
             near_touch_depth_usd: self.near_touch_depth_usd,
             tight_quoting_allowed: self.tight_quoting_allowed,
             stochastic_spread_multiplier: self.stochastic_spread_multiplier,
+        }
+    }
+
+    /// Extract entropy distribution parameters as a focused struct.
+    pub fn entropy_distribution(&self) -> params::EntropyDistributionParams {
+        params::EntropyDistributionParams {
+            use_entropy_distribution: self.use_entropy_distribution,
+            min_entropy: self.entropy_min_entropy,
+            base_temperature: self.entropy_base_temperature,
+            min_allocation_floor: self.entropy_min_allocation_floor,
+            thompson_samples: self.entropy_thompson_samples,
+            // Derive toxicity from jump_ratio for temperature scaling
+            toxicity: self.jump_ratio,
+            volatility_ratio: self.sigma_effective / 0.0001, // Normalized to baseline
+            cascade_severity: if self.should_pull_quotes { 1.0 } else { (self.tail_risk_multiplier - 1.0) / 4.0 },
         }
     }
 

@@ -44,6 +44,10 @@ portable-atomic = { version = "1.6", features = ["float"] }
 smallvec = "1.11"
 bumpalo = { version = "3.16", features = ["collections"] }
 
+# Random number generation for stochastic allocation
+rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
+
 [[bin]]
 name = "market_maker"
 path = "src/bin/market_maker.rs"

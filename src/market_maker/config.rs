@@ -508,6 +508,46 @@ pub struct StochasticConfig {
     /// This is duplicated from RiskConfig for module isolation.
     /// Default: 0.0002 (20 bps per second)
     pub sigma_baseline: f64,
+
+    // ==================== Entropy-Based Distribution ====================
+    /// Enable entropy-based stochastic order distribution.
+    /// Completely replaces the concentration fallback with a diversity-preserving system.
+    ///
+    /// Key features:
+    /// - Minimum entropy floor ensures at least N effective levels always active
+    /// - Softmax temperature controls distribution spread
+    /// - Thompson sampling adds controlled randomness
+    /// - Dirichlet smoothing prevents zero allocations
+    ///
+    /// Default: true (the new system is superior to concentration fallback)
+    pub use_entropy_distribution: bool,
+
+    /// Minimum entropy floor (bits).
+    /// H_min = 1.5 → at least exp(1.5) ≈ 4.5 effective levels always active.
+    /// H_min = 2.0 → at least exp(2.0) ≈ 7.4 effective levels always active.
+    /// Default: 1.5
+    pub entropy_min_entropy: f64,
+
+    /// Base temperature for softmax distribution.
+    /// Higher = more uniform distribution, lower = more concentrated.
+    /// T = 1.0: Standard softmax
+    /// T = 2.0: Twice as uniform
+    /// T = 0.5: Twice as concentrated
+    /// Default: 1.0
+    pub entropy_base_temperature: f64,
+
+    /// Minimum allocation floor per level (prevents zero allocations).
+    /// floor = 0.02 → each level gets at least 2% of total capacity.
+    /// Default: 0.02
+    pub entropy_min_allocation_floor: f64,
+
+    /// Number of Thompson samples for stochastic allocation.
+    /// Higher = more stable but less explorative.
+    /// n = 1: Pure Thompson (most random)
+    /// n = 5: Averaged Thompson (moderate)
+    /// n = 20: Quasi-deterministic
+    /// Default: 5
+    pub entropy_thompson_samples: usize,
 }
 
 impl Default for StochasticConfig {
@@ -567,6 +607,14 @@ impl Default for StochasticConfig {
             // - Fill rate targeting with spread ceiling
             use_adaptive_spreads: true,
             sigma_baseline: 0.0002, // 20 bps per second (matches RiskConfig)
+
+            // Entropy-Based Distribution
+            // ENABLED by default - replaces concentration fallback with diversity-preserving system
+            use_entropy_distribution: true,
+            entropy_min_entropy: 1.5,           // At least ~4.5 effective levels
+            entropy_base_temperature: 1.0,      // Standard softmax
+            entropy_min_allocation_floor: 0.02, // 2% minimum per level
+            entropy_thompson_samples: 5,        // Moderate stochasticity
         }
     }
 }
