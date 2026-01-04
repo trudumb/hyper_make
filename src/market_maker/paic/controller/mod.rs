@@ -15,5 +15,5 @@ mod impulse_engine;
 mod priority_value;
 
 pub use actions::{ImpulseAction, ImpulseDecision, OrderAction};
-pub use impulse_engine::ImpulseEngine;
+pub use impulse_engine::{ImpulseEngine, OrderState};
 pub use priority_value::PriorityValueCalculator;

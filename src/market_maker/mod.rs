@@ -112,6 +112,8 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     infra: core::InfraComponents,
     /// Stochastic: HJB control, dynamic risk
     stochastic: core::StochasticComponents,
+    /// PAIC: Priority-Aware Impulse Control (queue priority, rate limiting)
+    paic: core::PAICComponents,
 
     // === First-Principles Position Limit ===
     /// Effective max position SIZE (contracts), updated each quote cycle.
@@ -222,6 +224,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             DynamicRiskConfig::default(),
         );
 
+        // Initialize PAIC components with default config
+        let paic = core::PAICComponents::default_config();
+
         // Initialize effective_max_position to static fallback (used during warmup)
         let effective_max_position = config.max_position;
 
@@ -247,6 +252,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             safety,
             infra,
             stochastic,
+            paic,
             effective_max_position,
             effective_target_liquidity,
         }
@@ -826,6 +832,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_warmup_log: &mut self.last_warmup_log,
         };
 
+        // Update PAIC state estimator with trades
+        // This feeds the virtual queue tracker and toxicity estimator
+        for trade in &trades.data {
+            if trade.coin != *self.config.asset {
+                continue;
+            }
+            if let (Ok(price), Ok(size)) = (trade.px.parse::<f64>(), trade.sz.parse::<f64>()) {
+                let is_buy = trade.side == "B";
+                self.paic.state_estimator.on_trade(price, size, is_buy);
+            }
+        }
+
         let _result = messages::process_trades(&trades, &ctx, &mut state)?;
         Ok(())
     }
@@ -888,16 +906,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 continue;
             }
 
+            let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
             let fill_event = WsFillEvent {
                 oid: fill.oid,
                 tid: fill.tid,
-                size: fill.sz.parse().unwrap_or(0.0),
+                size: fill_size,
                 price: fill.px.parse().unwrap_or(0.0),
                 is_buy: fill.side == "B" || fill.side.to_lowercase() == "buy",
                 coin: fill.coin.clone(),
                 cloid: fill.cloid.clone(),
                 timestamp: fill.time,
             };
+
+            // Update PAIC state estimator with fill (queue priority tracking)
+            // Check if order is fully filled or partially filled
+            if let Some(tracked_order) = self.orders.get_order(fill.oid) {
+                let remaining = tracked_order.remaining();
+                if remaining <= EPSILON {
+                    // Full fill - remove from PAIC tracker
+                    self.paic.state_estimator.order_removed(fill.oid);
+                } else {
+                    // Partial fill - update remaining size
+                    self.paic.state_estimator.order_partially_filled(fill.oid, fill_size);
+                }
+            }
 
             // Note: ws_state.handle_fill would update position, but position is already
             // updated by the main fill processor. We call it with a no-op tracker.
@@ -1027,7 +1059,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             prometheus: &mut self.infra.prometheus,
         };
 
+        // Update PAIC state estimator with book data (spread, BBO)
+        if l2_book.data.levels.len() >= 2 {
+            if let (Some(best_bid), Some(best_ask)) = (
+                l2_book.data.levels[0].first().and_then(|l| l.px.parse::<f64>().ok()),
+                l2_book.data.levels[1].first().and_then(|l| l.px.parse::<f64>().ok()),
+            ) {
+                self.paic.state_estimator.update_book(best_bid, best_ask);
+            }
+        }
+
         let result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
+
+        // Sync PAIC volatility with main estimator
+        if self.estimator.is_warmed_up() {
+            self.paic.state_estimator.update_volatility(self.estimator.sigma_clean());
+            // Also update microprice
+            let microprice = self.estimator.microprice();
+            if microprice > 0.0 {
+                self.paic.state_estimator.update_microprice(microprice);
+            }
+        }
 
         // Feed L2 data to adaptive spread calculator's blended kappa estimator
         // This enables book-based kappa estimation to work alongside own-fill kappa
@@ -2112,12 +2164,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Initialize queue tracking for this order
                     // depth_ahead is 0.0 initially; will be updated on L2 book updates
+                    let is_bid = side == Side::Buy;
                     self.tier1.queue_tracker.order_placed(
                         result.oid,
                         spec.price,
                         result.resting_size,
                         0.0, // depth_ahead estimated; will be refined by L2 updates
-                        side == Side::Buy,
+                        is_bid,
+                    );
+                    // PAIC: Register order for priority tracking
+                    self.paic.state_estimator.order_placed(
+                        result.oid,
+                        spec.price,
+                        result.resting_size,
+                        0.0, // depth_ahead estimated from book
+                        is_bid,
                     );
                 }
             }
@@ -2166,6 +2227,85 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         false
+    }
+
+    /// Filter modify actions based on PAIC queue priority.
+    ///
+    /// High-priority orders (π ≈ 0, front of queue) should only be modified
+    /// if the price drift is large enough to justify losing queue position.
+    ///
+    /// Returns the filtered list of modifies that should be executed.
+    fn paic_filter_modifies(&self, modifies: Vec<ModifySpec>) -> Vec<ModifySpec> {
+        use crate::market_maker::paic::controller::OrderState as PAICOrderState;
+        use crate::market_maker::paic::ImpulseAction;
+
+        // If PAIC isn't warmed up yet, pass all modifies through
+        if !self.paic.is_warmed_up() {
+            return modifies;
+        }
+
+        let market_state = self.paic.state_estimator.market_state();
+        let fair_price = market_state.microprice.unwrap_or(market_state.mid_price);
+
+        let mut filtered = Vec::with_capacity(modifies.len());
+        let mut hold_count = 0u32;
+
+        for spec in modifies {
+            // Look up current order to get original price/size
+            let current_order = match self.orders.get_order(spec.oid) {
+                Some(o) => o,
+                None => {
+                    // Order not found, let it through (safety)
+                    filtered.push(spec);
+                    continue;
+                }
+            };
+
+            // Create PAIC OrderState for this order
+            let paic_order = PAICOrderState {
+                oid: spec.oid,
+                price: current_order.price,
+                size: current_order.size,
+                is_bid: spec.is_buy,
+                original_size: current_order.size,
+            };
+
+            // Get PAIC decision
+            let decision = self.paic.impulse_engine.decide_action(
+                &paic_order,
+                fair_price,
+                &self.paic.state_estimator,
+                &market_state,
+            );
+
+            match decision.action {
+                ImpulseAction::Hold => {
+                    // High priority order with small drift - don't modify
+                    hold_count += 1;
+                    debug!(
+                        oid = spec.oid,
+                        pi = %format!("{:.2}", decision.pi),
+                        drift_bps = %format!("{:.2}", decision.drift_bps),
+                        priority_premium = %format!("{:.2}", decision.priority_premium_bps),
+                        "PAIC HOLD: Skipping modify for high-priority order"
+                    );
+                }
+                _ => {
+                    // SHADOW, RESET, or LEAK - allow the modify
+                    filtered.push(spec);
+                }
+            }
+        }
+
+        if hold_count > 0 {
+            info!(
+                hold_count = hold_count,
+                passed = filtered.len(),
+                "PAIC filtered modifies (preserved queue priority)"
+            );
+        }
+
+        filtered
     }
 
     /// Smart ladder reconciliation with ORDER MODIFY for queue preservation.
@@ -2253,6 +2393,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Execute modifies (preserves queue position)
         // RATE LIMIT FIX: Check modify debounce before executing
         let all_modifies: Vec<ModifySpec> = bid_modifies.into_iter().chain(ask_modifies).collect();
+
+        // PAIC: Filter modifies based on queue priority - HOLD high-priority orders
+        let all_modifies = self.paic_filter_modifies(all_modifies);
+
         if !all_modifies.is_empty() {
             // Check if we're rate limited or modify interval hasn't passed
             if self.infra.proactive_rate_tracker.is_rate_limited() {
@@ -2785,6 +2929,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     0.0, // depth_ahead will be refined by L2 updates
                     is_buy,
                 );
+                // PAIC: Register order for priority tracking
+                self.paic.state_estimator.order_placed(
+                    result.oid,
+                    spec.price,
+                    result.resting_size,
+                    0.0, // depth_ahead estimated from book
+                    is_buy,
+                );
             }
         }
 
@@ -3014,6 +3166,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 depth_ahead,
                 is_buy,
             );
+            // PAIC: Register order for priority tracking
+            self.paic.state_estimator.order_placed(
+                result.oid,
+                quote.price,
+                result.resting_size,
+                depth_ahead,
+                is_buy,
+            );
         }
 
         Ok(())
@@ -3129,6 +3289,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let cleaned = self.orders.cleanup();
         for oid in cleaned {
             self.tier1.queue_tracker.order_removed(oid);
+            self.paic.state_estimator.order_removed(oid);
         }
 
         // === Step 2: Stale pending cleanup ===
@@ -3245,6 +3406,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             safety::SafetyAuditor::log_stale_removal(oid);
             self.orders.remove_order(oid);
             self.tier1.queue_tracker.order_removed(oid);
+            self.paic.state_estimator.order_removed(oid);
         }
 
         // Log sync status
