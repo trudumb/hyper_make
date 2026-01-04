@@ -76,7 +76,8 @@ mod tests {
         let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, true, Arc::from("USDC"));
         assert!(ctx.has_mid());
 
-        let ctx_no_mid = MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, true, Arc::from("USDC"));
+        let ctx_no_mid =
+            MessageContext::new(Arc::from("BTC"), -1.0, 0.0, 1.0, true, Arc::from("USDC"));
         assert!(!ctx_no_mid.has_mid());
     }
 }

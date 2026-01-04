@@ -347,7 +347,11 @@ impl CollateralInfo {
         }
 
         // Look up token in spot metadata
-        if let Some(token) = spot_meta.tokens.iter().find(|t| t.index == token_index as usize) {
+        if let Some(token) = spot_meta
+            .tokens
+            .iter()
+            .find(|t| t.index == token_index as usize)
+        {
             Self {
                 token_index,
                 symbol: token.name.clone(),
@@ -404,7 +408,8 @@ impl CollateralInfo {
         &self,
         balances: &[crate::types::UserTokenBalance],
     ) -> Option<f64> {
-        self.balance_from_spot(balances).map(|(total, hold)| total - hold)
+        self.balance_from_spot(balances)
+            .map(|(total, hold)| total - hold)
     }
 
     /// Get the token symbol for use in spot transfers.

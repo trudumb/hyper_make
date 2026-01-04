@@ -289,4 +289,99 @@ mod tests {
         // With 0 fills and 0 calibration, should be at min
         assert!((controller.gamma_multiplier() - 0.4).abs() < 0.01);
     }
+
+    #[test]
+    fn test_fill_rate_exceeds_target() {
+        let config = CalibrationControllerConfig::default();
+        let mut controller = CalibrationController::new(config);
+
+        // Record more fills than target (15 fills when target is 10)
+        for _ in 0..15 {
+            controller.record_fill();
+        }
+
+        // At 0% calibration progress, ratio = 15/10 = 1.5, clamped to 1.0
+        // So fill_hungry_mult should be 1.0 (no aggressive tightening needed)
+        let mult = controller.gamma_multiplier();
+        // With 0% calibration progress: blended = 1.0 + (1-1.0)*0 = 1.0
+        assert!(
+            (mult - 1.0).abs() < 0.01,
+            "When fill rate exceeds target, gamma_mult should be 1.0, got {}",
+            mult
+        );
+    }
+
+    #[test]
+    fn test_calibration_near_complete_threshold() {
+        let config = CalibrationControllerConfig::default();
+        let mut controller = CalibrationController::new(config);
+
+        // At 94% calibration (just below 95% threshold), should still be hungry
+        // AS: 18/20 = 0.90, kappa: 0.49/0.5 = 0.98, avg = 0.94
+        controller.update_calibration_status(18, 0.49);
+
+        assert!(
+            !controller.is_calibrated(),
+            "Should not be calibrated at 94%"
+        );
+        assert!(
+            controller.gamma_multiplier() < 1.0,
+            "Should still have fill-hungry adjustment below 95%"
+        );
+
+        // At 95%+, should be fully calibrated
+        controller.update_calibration_status(20, 0.5);
+        assert!(controller.is_calibrated(), "Should be calibrated at 100%");
+        assert!(
+            (controller.gamma_multiplier() - 1.0).abs() < 0.01,
+            "Gamma multiplier should be 1.0 when calibrated"
+        );
+    }
+
+    #[test]
+    fn test_blending_formula_correctness() {
+        // Test that the blending formula works as documented:
+        // blended_mult = fill_hungry_mult + (1 - fill_hungry_mult) × calibration_progress
+        let config = CalibrationControllerConfig {
+            min_gamma_mult: 0.3,
+            target_fill_rate_per_hour: 10.0,
+            ..Default::default()
+        };
+        let mut controller = CalibrationController::new(config);
+
+        // With 0 fills and 50% calibration progress:
+        // ratio = 0/10 = 0, raw_mult = 0, clamped = 0.3
+        // blended = 0.3 + (1 - 0.3) * 0.5 = 0.3 + 0.35 = 0.65
+        controller.update_calibration_status(10, 0.25); // 50% progress
+
+        let mult = controller.gamma_multiplier();
+        let expected = 0.3 + (1.0 - 0.3) * 0.5; // = 0.65
+        assert!(
+            (mult - expected).abs() < 0.05,
+            "Blending formula: expected {:.2}, got {:.2}",
+            expected,
+            mult
+        );
+    }
+
+    #[test]
+    fn test_partial_fill_rate_contribution() {
+        let config = CalibrationControllerConfig::default();
+        let mut controller = CalibrationController::new(config);
+
+        // Record exactly target fills (10)
+        for _ in 0..10 {
+            controller.record_fill();
+        }
+
+        // With target fill rate met and 0% calibration:
+        // ratio = 10/10 = 1.0, raw_mult = 1.0
+        // blended = 1.0 + (1-1.0) * 0 = 1.0
+        let mult = controller.gamma_multiplier();
+        assert!(
+            (mult - 1.0).abs() < 0.01,
+            "Meeting target fill rate should yield gamma_mult ~1.0, got {}",
+            mult
+        );
+    }
 }

@@ -897,11 +897,12 @@ impl ParameterAggregator {
                 let margin_available = sources.margin_sizer.state().available_margin;
                 let leverage = sources.margin_sizer.summary().max_leverage;
 
-                let capacity = if margin_available > 0.0 && leverage > 0.0 && sources.latest_mid > 0.0 {
-                    (margin_available * leverage / sources.latest_mid).max(0.0)
-                } else {
-                    0.0 // Will be computed dynamically via quoting_capacity()
-                };
+                let capacity =
+                    if margin_available > 0.0 && leverage > 0.0 && sources.latest_mid > 0.0 {
+                        (margin_available * leverage / sources.latest_mid).max(0.0)
+                    } else {
+                        0.0 // Will be computed dynamically via quoting_capacity()
+                    };
 
                 // Debug: trace margin_quoting_capacity computation
                 tracing::debug!(

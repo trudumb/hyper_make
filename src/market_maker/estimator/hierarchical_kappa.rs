@@ -135,9 +135,9 @@ impl HierarchicalKappa {
     /// Create with default parameters for liquid markets.
     pub(crate) fn default_liquid() -> Self {
         Self::new(
-            5.0,       // prior_alpha: moderate prior strength
-            2500.0,    // default_market_kappa: 4bp avg fill distance
-            300_000,   // window_ms: 5 minutes
+            5.0,     // prior_alpha: moderate prior strength
+            2500.0,  // default_market_kappa: 4bp avg fill distance
+            300_000, // window_ms: 5 minutes
         )
     }
 
@@ -414,10 +414,10 @@ impl HierarchicalKappaConfig {
     /// Create config for less liquid markets.
     pub(crate) fn illiquid() -> Self {
         Self {
-            prior_alpha: 10.0, // Stronger prior
+            prior_alpha: 10.0,           // Stronger prior
             default_market_kappa: 500.0, // 20bp avg fill distance
-            window_ms: 600_000, // 10 min window
-            as_decay_coefficient: 0.1, // Less AS sensitivity
+            window_ms: 600_000,          // 10 min window
+            as_decay_coefficient: 0.1,   // Less AS sensitivity
             min_observations: 5,
         }
     }
@@ -493,7 +493,10 @@ mod tests {
 
         // AS factor should reduce effective kappa
         let as_factor = est.as_factor();
-        assert!(as_factor < 1.0, "AS factor should be < 1.0 with positive AS");
+        assert!(
+            as_factor < 1.0,
+            "AS factor should be < 1.0 with positive AS"
+        );
         assert!(as_factor > 0.5, "AS factor should be > 0.5 (floor)");
 
         assert!(
@@ -509,7 +512,10 @@ mod tests {
         let initial_conf = est.confidence();
         // Initial confidence includes uncertainty factor from prior
         // With prior alpha=5, relative_uncertainty ≈ 0.45, so confidence ≈ 0.17
-        assert!(initial_conf < 0.3, "Initial confidence should be moderate (no fills)");
+        assert!(
+            initial_conf < 0.3,
+            "Initial confidence should be moderate (no fills)"
+        );
 
         // Add observations
         for i in 0..30 {
@@ -521,7 +527,10 @@ mod tests {
             final_conf > initial_conf,
             "Confidence should increase with observations"
         );
-        assert!(final_conf > 0.5, "Should have reasonable confidence after 30 fills");
+        assert!(
+            final_conf > 0.5,
+            "Should have reasonable confidence after 30 fills"
+        );
     }
 
     #[test]
@@ -578,7 +587,13 @@ mod tests {
         let (lower, upper) = est.credible_interval_95();
 
         assert!(lower > 0.0, "Lower bound should be positive");
-        assert!(lower < est.posterior_mean(), "Lower bound should be below mean");
-        assert!(upper > est.posterior_mean(), "Upper bound should be above mean");
+        assert!(
+            lower < est.posterior_mean(),
+            "Lower bound should be below mean"
+        );
+        assert!(
+            upper > est.posterior_mean(),
+            "Upper bound should be above mean"
+        );
     }
 }

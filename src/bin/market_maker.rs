@@ -249,7 +249,10 @@ pub struct TradingConfig {
     /// Maximum position in contracts (optional).
     /// If not specified, defaults to margin-based limit: (account_value × leverage × 0.5) / price
     /// This is capital-efficient: use gamma to control risk, not arbitrary position limits.
-    #[serde(default = "default_max_position", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_max_position",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_absolute_position_size: Option<f64>,
 
     /// Leverage to use (set on exchange at startup).
@@ -638,7 +641,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
     // max_position is now optional - will default to margin-based limit later
     // Priority: CLI arg > config file > margin-based default
-    let max_position_override: Option<f64> = cli.max_position.or(config.trading.max_absolute_position_size);
+    let max_position_override: Option<f64> = cli
+        .max_position
+        .or(config.trading.max_absolute_position_size);
 
     // Query metadata to get sz_decimals (always needed for size precision)
     // Use with_reconnect to automatically reconnect if WebSocket disconnects
@@ -672,7 +677,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta = info_client
         .meta_for_dex(dex.as_deref())
         .await
-        .map_err(|e| format!("Failed to get metadata for DEX '{}': {e}", dex.as_deref().unwrap_or("validator")))?;
+        .map_err(|e| {
+            format!(
+                "Failed to get metadata for DEX '{}': {e}",
+                dex.as_deref().unwrap_or("validator")
+            )
+        })?;
 
     let asset_meta = meta
         .universe
@@ -1401,12 +1411,7 @@ async fn list_available_dexs(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     for (idx, dex_opt) in dexs.iter().enumerate() {
         if let Some(dex) = dex_opt {
             found_any = true;
-            println!(
-                "  [{:>2}] {} - {}",
-                idx,
-                dex.name,
-                dex.full_name
-            );
+            println!("  [{:>2}] {} - {}", idx, dex.name, dex.full_name);
             println!("       Deployer: {}", dex.deployer);
             if let Some(ref oracle) = dex.oracle_updater {
                 println!("       Oracle:   {}", oracle);

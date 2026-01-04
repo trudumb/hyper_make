@@ -173,7 +173,14 @@ mod tests {
 
     #[test]
     fn test_process_filters_wrong_asset() {
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false, Arc::from("USDC"));
+        let ctx = MessageContext::new(
+            Arc::from("BTC"),
+            50000.0,
+            0.0,
+            1.0,
+            false,
+            Arc::from("USDC"),
+        );
 
         let mut fill_processor = FillProcessor::new();
         let mut position = PositionTracker::new(0.0);

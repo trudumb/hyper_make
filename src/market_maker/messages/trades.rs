@@ -175,7 +175,14 @@ mod tests {
             &mut last_warmup_log,
         );
 
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false, Arc::from("USDC"));
+        let ctx = MessageContext::new(
+            Arc::from("BTC"),
+            50000.0,
+            0.0,
+            1.0,
+            false,
+            Arc::from("USDC"),
+        );
 
         // Create trades for wrong asset
         let trades = Trades {

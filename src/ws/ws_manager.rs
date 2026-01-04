@@ -208,8 +208,12 @@ pub enum Subscription {
         #[serde(skip_serializing_if = "Option::is_none")]
         dex: Option<String>,
     },
-    Notification { user: Address },
-    WebData2 { user: Address },
+    Notification {
+        user: Address,
+    },
+    WebData2 {
+        user: Address,
+    },
     /// Subscribe to candle data.
     #[serde(rename_all = "camelCase")]
     Candle {
@@ -235,13 +239,28 @@ pub enum Subscription {
         #[serde(skip_serializing_if = "Option::is_none")]
         dex: Option<String>,
     },
-    OrderUpdates { user: Address },
-    UserEvents { user: Address },
-    UserFills { user: Address },
-    UserFundings { user: Address },
-    UserNonFundingLedgerUpdates { user: Address },
-    ActiveAssetCtx { coin: String },
-    ActiveAssetData { user: Address, coin: String },
+    OrderUpdates {
+        user: Address,
+    },
+    UserEvents {
+        user: Address,
+    },
+    UserFills {
+        user: Address,
+    },
+    UserFundings {
+        user: Address,
+    },
+    UserNonFundingLedgerUpdates {
+        user: Address,
+    },
+    ActiveAssetCtx {
+        coin: String,
+    },
+    ActiveAssetData {
+        user: Address,
+        coin: String,
+    },
     /// Subscribe to best bid/offer updates.
     #[serde(rename_all = "camelCase")]
     Bbo {

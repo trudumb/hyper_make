@@ -285,10 +285,7 @@ mod tests {
 
         let spread_std = cov.spread_uncertainty(0.3);
         assert!(spread_std > 0.0, "Should have positive spread uncertainty");
-        assert!(
-            spread_std < 0.01,
-            "Spread uncertainty should be reasonable"
-        );
+        assert!(spread_std < 0.01, "Spread uncertainty should be reasonable");
     }
 
     #[test]

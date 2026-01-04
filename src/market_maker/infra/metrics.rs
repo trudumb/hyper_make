@@ -638,7 +638,13 @@ impl PrometheusMetrics {
     /// - `progress`: Calibration progress [0.0, 1.0]
     /// - `fill_count`: Number of fills in lookback window
     /// - `complete`: Whether calibration is complete
-    pub fn update_calibration(&self, gamma_mult: f64, progress: f64, fill_count: usize, complete: bool) {
+    pub fn update_calibration(
+        &self,
+        gamma_mult: f64,
+        progress: f64,
+        fill_count: usize,
+        complete: bool,
+    ) {
         self.inner.calibration_gamma_mult.store(gamma_mult);
         self.inner.calibration_progress.store(progress);
         self.inner

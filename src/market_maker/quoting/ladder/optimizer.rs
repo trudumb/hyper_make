@@ -150,8 +150,14 @@ impl ConstrainedLadderOptimizer {
 
         // Diagnostic: log marginal values and spread captures
         if total_mv <= EPSILON {
-            let max_sc = levels.iter().map(|l| l.spread_capture).fold(0.0_f64, f64::max);
-            let max_fi = levels.iter().map(|l| l.fill_intensity).fold(0.0_f64, f64::max);
+            let max_sc = levels
+                .iter()
+                .map(|l| l.spread_capture)
+                .fold(0.0_f64, f64::max);
+            let max_fi = levels
+                .iter()
+                .map(|l| l.fill_intensity)
+                .fold(0.0_f64, f64::max);
             tracing::info!(
                 levels = levels.len(),
                 total_mv = %format!("{:.6}", total_mv),
@@ -398,7 +404,10 @@ impl ConstrainedLadderOptimizer {
 
         // Diagnostic: log when Kelly values are near zero
         if total_kelly <= EPSILON {
-            let max_sc = levels.iter().map(|l| l.spread_capture).fold(0.0_f64, f64::max);
+            let max_sc = levels
+                .iter()
+                .map(|l| l.spread_capture)
+                .fold(0.0_f64, f64::max);
             let max_kv = kelly_values.iter().fold(0.0_f64, |a, &b| a.max(b));
             tracing::info!(
                 levels = levels.len(),
@@ -994,12 +1003,12 @@ mod tests {
         // With dynamic min_size = max($10/$90000, 0.001*0.1) = max(0.000111, 0.0001) = 0.000111
         // If capacity = 0.0003 and 5 levels, each gets 0.00006 < 0.000111 → all filtered → concentrate
         let optimizer = ConstrainedLadderOptimizer::new(
-            50.0,     // margin_available ($50)
-            0.0003,   // max_position (extremely small - less than min_notional worth)
-            0.001,    // min_size (hardcoded, but dynamic calculation should override)
-            10.0,     // min_notional ($10 exchange minimum)
-            90000.0,  // price ($90k BTC)
-            20.0,     // leverage
+            50.0,    // margin_available ($50)
+            0.0003,  // max_position (extremely small - less than min_notional worth)
+            0.001,   // min_size (hardcoded, but dynamic calculation should override)
+            10.0,    // min_notional ($10 exchange minimum)
+            90000.0, // price ($90k BTC)
+            20.0,    // leverage
         );
 
         // Create 5 levels with varying marginal values
@@ -1047,7 +1056,10 @@ mod tests {
         // But concentration gives 0.0003 BTC which is 0.0003 * 90000 = $27 > $10 min_notional
         // So we should get exactly 1 non-zero level
         let non_zero_count = allocation.sizes.iter().filter(|&&s| s > 0.0001).count();
-        assert_eq!(non_zero_count, 1, "Expected concentration into single level");
+        assert_eq!(
+            non_zero_count, 1,
+            "Expected concentration into single level"
+        );
 
         // The single level should have ~full capacity
         let total_size: f64 = allocation.sizes.iter().sum();
@@ -1128,12 +1140,12 @@ mod tests {
         // Test that dynamic min_size is calculated from min_notional/price
         // rather than using hardcoded min_size when it's too restrictive
         let optimizer = ConstrainedLadderOptimizer::new(
-            1000.0,    // margin_available
-            0.005,     // max_position
-            0.001,     // min_size (hardcoded 0.001 BTC = $90 at $90k)
-            10.0,      // min_notional ($10 = 0.000111 BTC at $90k)
-            90000.0,   // price
-            20.0,      // leverage
+            1000.0,  // margin_available
+            0.005,   // max_position
+            0.001,   // min_size (hardcoded 0.001 BTC = $90 at $90k)
+            10.0,    // min_notional ($10 = 0.000111 BTC at $90k)
+            90000.0, // price
+            20.0,    // leverage
         );
 
         // Single level that would be filtered by 0.001 min_size

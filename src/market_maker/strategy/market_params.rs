@@ -444,24 +444,24 @@ impl Default for MarketParams {
             is_heavy_tailed: false,          // Assume exponential tails
             kappa_cv: 1.0,                   // CV=1 for exponential
             // V2: Uncertainty Quantification
-            kappa_uncertainty: 0.0,          // Will be computed from posterior
-            kappa_95_lower: 100.0,           // Conservative lower bound
-            kappa_95_upper: 100.0,           // Conservative upper bound
-            toxicity_score: 0.0,             // No toxicity initially
-            param_correlation: 0.0,          // No correlation initially
-            as_factor: 1.0,                  // No AS adjustment initially
-            arrival_intensity: 0.5,          // 0.5 volume ticks per second
-            is_toxic_regime: false,          // Default: not toxic
-            jump_ratio: 1.0,                 // Default: normal diffusion
-            momentum_bps: 0.0,               // Default: no momentum
-            flow_imbalance: 0.0,             // Default: balanced flow
-            falling_knife_score: 0.0,        // Default: no falling knife
-            rising_knife_score: 0.0,         // Default: no rising knife
-            book_imbalance: 0.0,             // Default: balanced book
-            liquidity_gamma_mult: 1.0,       // Default: normal liquidity
-            microprice: 0.0,                 // Will be set from estimator
-            beta_book: 0.0,                  // Will be learned from data
-            beta_flow: 0.0,                  // Will be learned from data
+            kappa_uncertainty: 0.0,    // Will be computed from posterior
+            kappa_95_lower: 100.0,     // Conservative lower bound
+            kappa_95_upper: 100.0,     // Conservative upper bound
+            toxicity_score: 0.0,       // No toxicity initially
+            param_correlation: 0.0,    // No correlation initially
+            as_factor: 1.0,            // No AS adjustment initially
+            arrival_intensity: 0.5,    // 0.5 volume ticks per second
+            is_toxic_regime: false,    // Default: not toxic
+            jump_ratio: 1.0,           // Default: normal diffusion
+            momentum_bps: 0.0,         // Default: no momentum
+            flow_imbalance: 0.0,       // Default: balanced flow
+            falling_knife_score: 0.0,  // Default: no falling knife
+            rising_knife_score: 0.0,   // Default: no rising knife
+            book_imbalance: 0.0,       // Default: balanced book
+            liquidity_gamma_mult: 1.0, // Default: normal liquidity
+            microprice: 0.0,           // Will be set from estimator
+            beta_book: 0.0,            // Will be learned from data
+            beta_flow: 0.0,            // Will be learned from data
             // Tier 1: Adverse Selection
             as_spread_adjustment: 0.0, // No adjustment until warmed up
             predicted_alpha: 0.0,      // Default: no informed flow detected
@@ -515,8 +515,8 @@ impl Default for MarketParams {
             kalman_warmed_up: false,     // Not warmed up initially
             // Constrained Optimizer (stochastic integration)
             use_constrained_optimizer: true, // Enable for entropy-based allocation
-            margin_available: 0.0,            // Will be fetched from margin sizer
-            leverage: 1.0,                    // Default 1x leverage
+            margin_available: 0.0,           // Will be fetched from margin sizer
+            leverage: 1.0,                   // Default 1x leverage
             // Kelly-Stochastic Allocation (stochastic integration)
             use_kelly_stochastic: false, // Default OFF for safety
             kelly_alpha_touch: 0.15,     // 15% informed at touch
@@ -532,8 +532,8 @@ impl Default for MarketParams {
             pending_bid_exposure: 0.0, // No resting orders initially
             pending_ask_exposure: 0.0, // No resting orders initially
             // Dynamic Position Limits
-            dynamic_max_position: 0.0,  // Will be set from kill switch
-            dynamic_limit_valid: false, // Not valid until margin state refreshed
+            dynamic_max_position: 0.0,    // Will be set from kill switch
+            dynamic_limit_valid: false,   // Not valid until margin state refreshed
             margin_quoting_capacity: 0.0, // Will be computed from margin_available
             // Stochastic Constraints
             tick_size_bps: 10.0,          // Default 10 bps tick
@@ -543,11 +543,11 @@ impl Default for MarketParams {
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
             // Entropy-Based Distribution (FIRST PRINCIPLES)
-            use_entropy_distribution: true,   // Entropy-based allocation (replaces concentration fallback)
-            entropy_min_entropy: 1.5,         // At least ~4.5 effective levels
-            entropy_base_temperature: 1.0,    // Standard softmax
+            use_entropy_distribution: true, // Entropy-based allocation (replaces concentration fallback)
+            entropy_min_entropy: 1.5,       // At least ~4.5 effective levels
+            entropy_base_temperature: 1.0,  // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level
-            entropy_thompson_samples: 5,      // Moderate stochasticity
+            entropy_thompson_samples: 5,    // Moderate stochasticity
             // Adaptive Bayesian System
             use_adaptive_spreads: false,       // Default OFF for safety
             adaptive_spread_floor: 0.0008,     // 8 bps fallback floor
@@ -559,9 +559,9 @@ impl Default for MarketParams {
             adaptive_warmup_progress: 0.0,     // Start at 0% progress
             adaptive_uncertainty_factor: 1.2,  // Start with 20% wider spreads
             // Calibration Fill Rate Controller
-            calibration_gamma_mult: 0.3,       // Start fill-hungry (70% gamma reduction)
-            calibration_progress: 0.0,         // Start at 0% calibration
-            calibration_complete: false,       // Not calibrated yet
+            calibration_gamma_mult: 0.3, // Start fill-hungry (70% gamma reduction)
+            calibration_progress: 0.0,   // Start at 0% calibration
+            calibration_complete: false, // Not calibrated yet
         }
     }
 }
@@ -814,7 +814,11 @@ impl MarketParams {
             // Derive toxicity from jump_ratio for temperature scaling
             toxicity: self.jump_ratio,
             volatility_ratio: self.sigma_effective / 0.0001, // Normalized to baseline
-            cascade_severity: if self.should_pull_quotes { 1.0 } else { (self.tail_risk_multiplier - 1.0) / 4.0 },
+            cascade_severity: if self.should_pull_quotes {
+                1.0
+            } else {
+                (self.tail_risk_multiplier - 1.0) / 4.0
+            },
         }
     }
 

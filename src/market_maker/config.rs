@@ -633,16 +633,16 @@ impl Default for StochasticConfig {
             // Entropy-Based Distribution
             // ENABLED by default - replaces concentration fallback with diversity-preserving system
             use_entropy_distribution: true,
-            entropy_min_entropy: 1.5,           // At least ~4.5 effective levels
-            entropy_base_temperature: 1.0,      // Standard softmax
+            entropy_min_entropy: 1.5,      // At least ~4.5 effective levels
+            entropy_base_temperature: 1.0, // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level
-            entropy_thompson_samples: 5,        // Moderate stochasticity
+            entropy_thompson_samples: 5,   // Moderate stochasticity
 
             // Calibration Fill Rate Controller
             // ENABLED by default - ensures fills for parameter calibration
             enable_calibration_fill_rate: true,
-            target_fill_rate_per_hour: 10.0,    // 10 fills/hour = ~2/level for 5 levels
-            min_fill_hungry_gamma: 0.3,          // Max 70% gamma reduction
+            target_fill_rate_per_hour: 10.0, // 10 fills/hour = ~2/level for 5 levels
+            min_fill_hungry_gamma: 0.3,      // Max 70% gamma reduction
         }
     }
 }

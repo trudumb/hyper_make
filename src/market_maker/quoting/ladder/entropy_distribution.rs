@@ -280,7 +280,10 @@ pub struct MarketRegime {
 /// - SC(δ)⁺ = max(SC, 0): positive spread capture component
 /// - SC(δ)⁻ = max(-SC, 0): negative spread capture (penalized softly)
 /// - P_fill: fill probability from first-passage model
-fn compute_utilities(levels: &[EntropyLevelParams], config: &EntropyDistributionConfig) -> Vec<f64> {
+fn compute_utilities(
+    levels: &[EntropyLevelParams],
+    config: &EntropyDistributionConfig,
+) -> Vec<f64> {
     levels
         .iter()
         .map(|level| {
@@ -292,8 +295,7 @@ fn compute_utilities(levels: &[EntropyLevelParams], config: &EntropyDistribution
 
             // Utility combines spread capture and fill probability
             // Negative SC is penalized but NOT zeroed (key difference from old system)
-            config.spread_capture_weight * sc_positive
-                - config.negative_sc_penalty * sc_negative
+            config.spread_capture_weight * sc_positive - config.negative_sc_penalty * sc_negative
                 + config.fill_prob_weight * fill_contrib
         })
         .collect()
@@ -609,8 +611,8 @@ impl EntropyDistributor {
         let eff_levels = effective_levels(&final_probs);
 
         // Update smoothed entropy
-        self.prev_entropy =
-            self.config.entropy_smoothing * self.prev_entropy + (1.0 - self.config.entropy_smoothing) * final_entropy;
+        self.prev_entropy = self.config.entropy_smoothing * self.prev_entropy
+            + (1.0 - self.config.entropy_smoothing) * final_entropy;
 
         EntropyDistribution {
             probabilities: final_probs,
@@ -798,7 +800,10 @@ mod tests {
         let hot = softmax_with_temperature(&utilities, 10.0);
 
         // Cold should be more concentrated (higher max prob)
-        assert!(cold.iter().cloned().fold(0.0f64, f64::max) > hot.iter().cloned().fold(0.0f64, f64::max));
+        assert!(
+            cold.iter().cloned().fold(0.0f64, f64::max)
+                > hot.iter().cloned().fold(0.0f64, f64::max)
+        );
 
         // Hot should have higher entropy
         assert!(shannon_entropy(&hot) > shannon_entropy(&cold));
@@ -824,7 +829,7 @@ mod tests {
     #[test]
     fn test_entropy_floor_maintained() {
         let config = EntropyDistributionConfig {
-            min_entropy: 1.5, // At least ~4.5 effective levels
+            min_entropy: 1.5,     // At least ~4.5 effective levels
             thompson_samples: 20, // More samples for stability in test
             ..Default::default()
         };

@@ -203,7 +203,9 @@ impl EntropyConstrainedOptimizer {
             levels.iter().map(EntropyLevelParams::from).collect();
 
         // 2. Compute entropy-based distribution
-        let distribution = self.distributor.compute_distribution(&entropy_levels, regime);
+        let distribution = self
+            .distributor
+            .compute_distribution(&entropy_levels, regime);
 
         // 3. Determine maximum allocable position from constraints
         let margin_per_unit = self.price / self.leverage;
@@ -226,7 +228,11 @@ impl EntropyConstrainedOptimizer {
         let mut sizes = distribution.to_sizes(max_position_total);
 
         // 5. Apply notional constraints (soft or hard)
-        sizes = self.apply_notional_constraints(&sizes, &distribution.probabilities, max_position_total);
+        sizes = self.apply_notional_constraints(
+            &sizes,
+            &distribution.probabilities,
+            max_position_total,
+        );
 
         // 6. Compute final metrics
         let position_used: f64 = sizes.iter().sum();
@@ -264,7 +270,8 @@ impl EntropyConstrainedOptimizer {
                         s
                     } else if s >= min_size_for_notional {
                         // Linear interpolation from min to soft_threshold
-                        let t = (s - min_size_for_notional) / (soft_threshold - min_size_for_notional);
+                        let t =
+                            (s - min_size_for_notional) / (soft_threshold - min_size_for_notional);
                         min_size_for_notional + t * (s - min_size_for_notional)
                     } else {
                         // Below minimum: either zero or boost to minimum
@@ -321,10 +328,7 @@ impl EntropyConstrainedOptimizer {
     }
 
     /// Optimize using old-style parameters for backward compatibility.
-    pub fn optimize_legacy(
-        &mut self,
-        levels: &[LevelOptimizationParams],
-    ) -> ConstrainedAllocation {
+    pub fn optimize_legacy(&mut self, levels: &[LevelOptimizationParams]) -> ConstrainedAllocation {
         let regime = MarketRegime::default();
         self.optimize(levels, &regime).to_legacy()
     }
@@ -359,9 +363,9 @@ pub fn create_aggressive_optimizer(
 ) -> EntropyConstrainedOptimizer {
     let config = EntropyOptimizerConfig {
         distribution: EntropyDistributionConfig {
-            min_entropy: 1.0,            // Lower floor (allows more concentration)
-            base_temperature: 0.5,       // Colder (more concentrated)
-            min_allocation_floor: 0.01,  // Lower floor per level
+            min_entropy: 1.0,           // Lower floor (allows more concentration)
+            base_temperature: 0.5,      // Colder (more concentrated)
+            min_allocation_floor: 0.01, // Lower floor per level
             ..Default::default()
         },
         ..Default::default()
@@ -379,10 +383,10 @@ pub fn create_defensive_optimizer(
 ) -> EntropyConstrainedOptimizer {
     let config = EntropyOptimizerConfig {
         distribution: EntropyDistributionConfig {
-            min_entropy: 2.0,            // Higher floor (enforces diversity)
-            base_temperature: 2.0,       // Hotter (more uniform)
-            min_allocation_floor: 0.05,  // Higher floor per level
-            toxicity_temp_scale: 1.0,    // More responsive to toxicity
+            min_entropy: 2.0,           // Higher floor (enforces diversity)
+            base_temperature: 2.0,      // Hotter (more uniform)
+            min_allocation_floor: 0.05, // Higher floor per level
+            toxicity_temp_scale: 1.0,   // More responsive to toxicity
             ..Default::default()
         },
         ..Default::default()
@@ -456,7 +460,10 @@ mod tests {
         let result = optimizer.optimize(&levels, &regime);
 
         // Should have allocated to multiple levels
-        assert!(result.active_levels >= 3, "Should have at least 3 active levels");
+        assert!(
+            result.active_levels >= 3,
+            "Should have at least 3 active levels"
+        );
 
         // Total should be near max_position
         assert!(
@@ -534,12 +541,9 @@ mod tests {
         };
 
         let mut optimizer = EntropyConstrainedOptimizer::with_seed(
-            config,
-            90000.0,
-            100.0, // Low margin to force small sizes
+            config, 90000.0, 100.0, // Low margin to force small sizes
             0.005, // Very small max position
-            20.0,
-            42,
+            20.0, 42,
         );
 
         let levels = make_levels();
@@ -609,7 +613,8 @@ mod tests {
 
         // Defensive should have more effective levels
         assert!(
-            def_result.distribution.effective_levels >= agg_result.distribution.effective_levels - 1.0,
+            def_result.distribution.effective_levels
+                >= agg_result.distribution.effective_levels - 1.0,
             "Defensive effective levels {} should be >= aggressive {}",
             def_result.distribution.effective_levels,
             agg_result.distribution.effective_levels

@@ -246,6 +246,11 @@ impl LadderStrategy {
         // FIRST PRINCIPLES: This replaces the arbitrary adaptive_uncertainty_factor
         let warmup_scalar = cfg.warmup_multiplier(market_params.adaptive_warmup_progress);
 
+        // Calibration fill-hungry scaling (reduce gamma to attract fills during warmup)
+        // FIRST PRINCIPLES: calibration_gamma_mult ∈ [0.3, 1.0]
+        // Lower values = tighter quotes = more fills for calibration
+        let calibration_scalar = market_params.calibration_gamma_mult;
+
         let gamma_effective = cfg.gamma_base
             * vol_scalar
             * toxicity_scalar
@@ -254,7 +259,8 @@ impl LadderStrategy {
             * hawkes_scalar
             * time_scalar
             * book_depth_scalar
-            * warmup_scalar;
+            * warmup_scalar
+            * calibration_scalar;
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
@@ -325,19 +331,27 @@ impl LadderStrategy {
         // === GAMMA: Adaptive vs Legacy ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma
         // When disabled: use multiplicative RiskConfig gamma
+        //
+        // In BOTH paths, apply calibration_gamma_mult for fill-hungry mode during warmup.
+        // calibration_gamma_mult ∈ [0.3, 1.0]: reduces gamma to tighten quotes for calibration fills.
+        let calibration_scalar = market_params.calibration_gamma_mult;
+
         let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
             // Adaptive gamma: log-additive scaling prevents multiplicative explosion
             // Still apply tail risk multiplier for cascade protection
+            // Apply calibration scalar for fill-hungry mode
             let adaptive_gamma = market_params.adaptive_gamma;
             debug!(
                 adaptive_gamma = %format!("{:.4}", adaptive_gamma),
                 tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
+                calibration_mult = %format!("{:.2}", calibration_scalar),
                 warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
                 "Ladder using ADAPTIVE gamma"
             );
-            adaptive_gamma * market_params.tail_risk_multiplier
+            adaptive_gamma * market_params.tail_risk_multiplier * calibration_scalar
         } else {
             // Legacy: multiplicative RiskConfig gamma
+            // Note: effective_gamma() already includes calibration_scalar
             let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
             let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
             gamma_with_liq * market_params.tail_risk_multiplier

@@ -504,7 +504,7 @@ mod tests {
             mid_price: 50000.0,
             max_position_value: 1_000_000.0, // $1M (high enough to not trigger)
             asset: "BTC".to_string(),
-            margin_used: 5000.0,   // $5k margin used
+            margin_used: 5000.0,    // $5k margin used
             account_value: 10000.0, // $10k account = 50% utilization (below 80% threshold)
             // Liquidation fields - default to None (disabled) for backward compat tests
             liquidation_price: None,

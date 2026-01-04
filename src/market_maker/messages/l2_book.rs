@@ -193,7 +193,14 @@ mod tests {
             &mut prometheus,
         );
 
-        let ctx = MessageContext::new(Arc::from("BTC"), 50000.0, 0.0, 1.0, false, Arc::from("USDC"));
+        let ctx = MessageContext::new(
+            Arc::from("BTC"),
+            50000.0,
+            0.0,
+            1.0,
+            false,
+            Arc::from("USDC"),
+        );
 
         // Create L2Book for wrong asset
         let l2_book = L2Book {

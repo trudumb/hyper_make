@@ -91,8 +91,45 @@ min_fill_hungry_gamma: 0.3,            // Max 70% gamma reduction
 ## Build Status
 
 - ✅ `cargo build` passes
-- ✅ `cargo test` passes (593 tests)
+- ✅ `cargo test` passes (597 tests)
 - ✅ `cargo clippy -- -D warnings` passes
+
+## Post-Implementation Improvements (2026-01-04)
+
+### Bug Fix 1: LadderStrategy::effective_gamma() Missing Calibration Scalar
+
+**Issue**: `LadderStrategy::effective_gamma()` was missing the `calibration_scalar` multiplication that `GLFTStrategy::effective_gamma()` had. This meant the calibration controller would only affect GLFT strategy, not the ladder strategy.
+
+**Fix**: Added `calibration_scalar = market_params.calibration_gamma_mult` to `LadderStrategy::effective_gamma()` in `src/market_maker/strategy/ladder_strat.rs:180-259`.
+
+### Bug Fix 2: LadderStrategy Adaptive Path Missing Calibration Scalar (CRITICAL)
+
+**Issue**: The **adaptive gamma path** in `LadderStrategy::calculate_quotes()` did NOT apply `calibration_gamma_mult`. When `use_adaptive_spreads=true` (the default), gamma was taken directly from `market_params.adaptive_gamma` WITHOUT the calibration scalar. This meant the calibration controller was completely ineffective in normal operation!
+
+**Symptoms**: Live testing showed `gamma=0.500` when it should have been reduced to ~0.15 (0.5 × 0.3 calibration).
+
+**Fix**: Modified `src/market_maker/strategy/ladder_strat.rs:331-358` to apply `calibration_scalar` in BOTH the adaptive and legacy paths:
+```rust
+let calibration_scalar = market_params.calibration_gamma_mult;
+// In adaptive path:
+adaptive_gamma * market_params.tail_risk_multiplier * calibration_scalar
+```
+
+**Verification**: After fix, live test shows `gamma=0.325` (properly reduced from 0.5 base).
+
+### Additional Tests Added
+
+Added 4 new edge case tests to improve coverage:
+
+1. **`test_fill_rate_exceeds_target`**: Verifies gamma_mult = 1.0 when fills exceed target (no over-tightening)
+2. **`test_calibration_near_complete_threshold`**: Tests 94% vs 95% threshold behavior
+3. **`test_blending_formula_correctness`**: Validates the blending formula: `blended = fill_hungry + (1 - fill_hungry) × progress`
+4. **`test_partial_fill_rate_contribution`**: Tests exact target fill rate scenario
+
+### Test Results
+
+- Total calibration tests: 10 (6 original + 4 new)
+- Full test suite: 597 tests passing
 
 ## Relation to Previous Work
 

@@ -360,10 +360,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Initialize metrics with current position
         // This ensures metrics show correct position from startup (not 0)
-        self.infra.prometheus.update_position(
-            self.position.position(),
-            self.effective_max_position,
-        );
+        self.infra
+            .prometheus
+            .update_position(self.position.position(), self.effective_max_position);
 
         // Check if existing position exceeds configured limit - will enter reduce-only mode
         // Note: effective_max_position may be recalculated higher once price data arrives
@@ -553,8 +552,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate())
-                    .expect("Failed to register SIGTERM handler");
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
 
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
@@ -750,7 +749,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 error!("Graceful shutdown encountered error: {e}");
             }
             Err(_) => {
-                error!("Graceful shutdown timed out after 5 seconds - orders may remain on exchange");
+                error!(
+                    "Graceful shutdown timed out after 5 seconds - orders may remain on exchange"
+                );
             }
         }
 
@@ -1295,7 +1296,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
 
         // Update exchange limits with margin-based capacity BEFORE building sources
-        self.infra.exchange_limits.update_local_max(pre_effective_max_position);
+        self.infra
+            .exchange_limits
+            .update_local_max(pre_effective_max_position);
 
         let sources = ParameterSources {
             estimator: &self.estimator,
@@ -1329,7 +1332,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
             // Calibration fill rate controller
             calibration_gamma_mult: self.stochastic.calibration_controller.gamma_multiplier(),
-            calibration_progress: self.stochastic.calibration_controller.calibration_progress(),
+            calibration_progress: self
+                .stochastic
+                .calibration_controller
+                .calibration_progress(),
             calibration_complete: self.stochastic.calibration_controller.is_calibrated(),
         };
         let mut market_params = ParameterAggregator::build(&sources);
@@ -1441,8 +1447,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let ladder = self.strategy.calculate_ladder(
             &quote_config,
             self.position.position(),
-            self.effective_max_position,         // First-principles limit
-            self.effective_target_liquidity,     // First-principles viable size
+            self.effective_max_position,     // First-principles limit
+            self.effective_target_liquidity, // First-principles viable size
             &market_params,
         );
 
@@ -1531,8 +1537,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let (mut bid, mut ask) = self.strategy.calculate_quotes(
                 &quote_config,
                 self.position.position(),
-                self.effective_max_position,         // First-principles limit
-                self.effective_target_liquidity,     // First-principles viable size
+                self.effective_max_position,     // First-principles limit
+                self.effective_target_liquidity, // First-principles viable size
                 &market_params,
             );
 
@@ -3370,7 +3376,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .and_then(|p| p.position.liquidation_px.as_ref())
                     .and_then(|px| px.parse::<f64>().ok());
 
-                (account_value, margin_used, total_notional, liquidation_price)
+                (
+                    account_value,
+                    margin_used,
+                    total_notional,
+                    liquidation_price,
+                )
             } else {
                 // Validator perps: Get all values from perps clearinghouse
                 let user_state = self.info_client.user_state(self.user_address).await?;
@@ -3398,7 +3409,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .and_then(|p| p.position.liquidation_px.as_ref())
                     .and_then(|px| px.parse::<f64>().ok());
 
-                (account_value, margin_used, total_notional, liquidation_price)
+                (
+                    account_value,
+                    margin_used,
+                    total_notional,
+                    liquidation_price,
+                )
             };
 
         // Get current position and price for liquidation proximity calculation

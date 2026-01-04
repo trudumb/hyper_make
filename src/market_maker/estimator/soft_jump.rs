@@ -92,10 +92,10 @@ impl SoftJumpClassifier {
     /// Create with default parameters for market making
     pub(crate) fn default_params() -> Self {
         Self::new(
-            0.05,  // 5% prior jump probability
-            4.0,   // Jumps are 4x larger than normal moves
-            0.01,  // Slow learning rate for pi
-            50.0,  // 50-tick half-life for toxicity
+            0.05, // 5% prior jump probability
+            4.0,  // Jumps are 4x larger than normal moves
+            0.01, // Slow learning rate for pi
+            50.0, // 50-tick half-life for toxicity
         )
     }
 
