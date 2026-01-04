@@ -372,6 +372,27 @@ pub struct MarketParams {
 
 ---
 
+## Implementation Status
+
+**V2 Refactoring Complete (2026-01-04)**
+
+All V2 components are now the permanent implementation:
+- ✅ HierarchicalKappa - Always active, no feature flag
+- ✅ SoftJumpClassifier - Always active, no feature flag  
+- ✅ ParameterCovariance - Always active, no feature flag
+- ✅ Prometheus metrics - Always exported
+
+Feature flags removed from:
+- `on_trade()` - soft_jump + param_covariance always update
+- `on_own_fill()` - hierarchical_kappa always records fills
+- `on_l2_book()` - hierarchical_kappa always gets prior
+- `kappa_v2_aware()` - always uses hierarchical blending
+- `new()` - default changed to `all_enabled()`
+
+See `session_2026-01-04_v2_refactoring_complete` for details.
+
+---
+
 ## Files Summary
 
 ### New Files (6)
