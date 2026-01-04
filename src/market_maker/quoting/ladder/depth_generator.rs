@@ -101,20 +101,15 @@ impl DynamicDepths {
 }
 
 /// Depth spacing mode for ladder generation
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum DepthSpacing {
     /// Geometric spacing: depths grow exponentially from optimal
     /// Example with ratio 1.5: [δ*, δ*×1.5, δ*×2.25, δ*×3.375, ...]
+    #[default]
     Geometric,
     /// Linear spacing: depths grow by fixed step from optimal
     /// Example with step 2bp: [δ*, δ*+2, δ*+4, δ*+6, ...]
     Linear,
-}
-
-impl Default for DepthSpacing {
-    fn default() -> Self {
-        Self::Geometric
-    }
 }
 
 /// Configuration for dynamic depth generation

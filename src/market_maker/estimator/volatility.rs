@@ -442,22 +442,17 @@ impl MultiScaleBipowerEstimator {
 /// - Normal: Standard market conditions
 /// - High: Elevated volatility (σ > 1.5 × baseline)
 /// - Extreme: Crisis/toxic conditions (σ > 3 × baseline OR high jump ratio)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VolatilityRegime {
     /// Very quiet market - can tighten spreads
     Low,
     /// Normal market conditions
+    #[default]
     Normal,
     /// Elevated volatility - widen spreads
     High,
     /// Crisis/toxic - maximum caution, consider pulling quotes
     Extreme,
-}
-
-impl Default for VolatilityRegime {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl VolatilityRegime {
