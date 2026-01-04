@@ -5,6 +5,7 @@
 # Examples:
 #   ./scripts/test_hip3.sh BTC hyna 60      # 1 minute test
 #   ./scripts/test_hip3.sh BTC hyna 600    # 5 minute test
+#   ./scripts/test_hip3.sh HYPE hyna 3600    # 30 minute test
 #   ./scripts/test_hip3.sh ETH flx 120      # 2 minute test on Felix
 
 set -e
@@ -58,11 +59,16 @@ fi
 echo -e "${GREEN}Config OK${NC}"
 
 # Run market maker with timeout
+# Note: We run the binary directly (not via cargo run) so Ctrl+C signals
+# are delivered correctly to the market_maker process
 echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+echo -e "${YELLOW}       Press Ctrl+C to stop early (graceful shutdown)${NC}"
 echo ""
 
+# Use timeout with --foreground to ensure signals are forwarded to the child
+# The binary is run directly for proper signal handling
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-timeout "${DURATION}" cargo run --bin market_maker -- \
+timeout --foreground "${DURATION}" ./target/debug/market_maker \
     --network mainnet \
     --asset "${ASSET}" \
     --dex "${DEX}" \

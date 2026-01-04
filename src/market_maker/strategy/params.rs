@@ -779,12 +779,35 @@ impl ParameterAggregator {
 
             // === Dynamic Position Limits (First Principles) ===
             // Convert VALUE limit to SIZE limit: max_position = max_value / price
-            dynamic_max_position: if sources.dynamic_limit_valid && sources.latest_mid > 0.0 {
-                sources.dynamic_max_position_value / sources.latest_mid
-            } else {
-                sources.max_position // Fall back to static limit
+            // Get margin-derived values for fallback
+            dynamic_max_position: {
+                let margin_available = sources.margin_sizer.state().available_margin;
+                let leverage = sources.margin_sizer.summary().max_leverage;
+
+                if sources.dynamic_limit_valid && sources.latest_mid > 0.0 {
+                    sources.dynamic_max_position_value / sources.latest_mid
+                } else if margin_available > 0.0 && leverage > 0.0 && sources.latest_mid > 0.0 {
+                    // CONTROLLER-DERIVED: Use margin-based capacity, not user's arbitrary limit
+                    // This ensures Kelly optimizer can allocate across full margin capacity
+                    (margin_available * leverage / sources.latest_mid).max(0.0)
+                } else {
+                    sources.max_position // Last resort: static limit during early warmup
+                }
             },
             dynamic_limit_valid: sources.dynamic_limit_valid,
+
+            // Margin-based quoting capacity (pure solvency constraint)
+            // This is the HARD limit from available margin, ignoring user's max_position
+            margin_quoting_capacity: {
+                let margin_available = sources.margin_sizer.state().available_margin;
+                let leverage = sources.margin_sizer.summary().max_leverage;
+
+                if margin_available > 0.0 && leverage > 0.0 && sources.latest_mid > 0.0 {
+                    (margin_available * leverage / sources.latest_mid).max(0.0)
+                } else {
+                    0.0 // Will be computed dynamically via quoting_capacity()
+                }
+            },
 
             // === Stochastic Constraints (First Principles) ===
             // These are computed dynamically via compute_stochastic_constraints()

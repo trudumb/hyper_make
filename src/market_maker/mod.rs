@@ -35,6 +35,7 @@ pub use tracking::*;
 use tracking::ws_order_state::{WsFillEvent, WsOrderUpdateEvent};
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -523,17 +524,49 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Skip the immediate first tick
         sync_interval.tick().await;
 
-        // Create shutdown signal listeners for both SIGINT (Ctrl+C) and SIGTERM
-        // This ensures graceful shutdown works with process managers that send SIGTERM
-        #[cfg(unix)]
-        let mut sigterm_signal = {
-            use tokio::signal::unix::{signal, SignalKind};
-            signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler")
-        };
-        #[cfg(not(unix))]
-        let mut sigterm_signal = std::future::pending::<()>();
+        // === ROBUST SIGNAL HANDLING ===
+        // Problem: tokio::select! only checks signals at the START of each iteration.
+        // When message processing is slow (HTTP calls to exchange), Ctrl+C won't be
+        // handled until the current message handler completes.
+        //
+        // Solution: Use a shared atomic flag set by a dedicated signal handler task.
+        // The main loop checks this flag frequently (after each message + periodically).
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag_clone = shutdown_flag.clone();
+
+        // Spawn dedicated signal handler task
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate())
+                    .expect("Failed to register SIGTERM handler");
+
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Shutdown signal received (SIGINT/Ctrl+C)");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("Shutdown signal received (SIGTERM)");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Shutdown signal received (SIGINT/Ctrl+C)");
+            }
+
+            shutdown_flag_clone.store(true, Ordering::SeqCst);
+        });
 
         loop {
+            // === Shutdown Check (checked EVERY iteration) ===
+            if shutdown_flag.load(Ordering::SeqCst) {
+                info!("Shutdown flag detected, initiating graceful shutdown...");
+                break;
+            }
+
             // === Kill Switch Check (before processing any message) ===
             if self.safety.kill_switch.is_triggered() {
                 let reasons = self.safety.kill_switch.trigger_reasons();
@@ -544,28 +577,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 break;
             }
 
-            // Use biased select to prioritize shutdown signals over other events
-            // This ensures graceful shutdown is responsive even during high message load
+            // Process messages - the shutdown check happens at loop start
+            // and after each message is processed
             tokio::select! {
-                biased;
-
-                // SIGINT (Ctrl+C) - highest priority
-                // Note: ctrl_c() called fresh each iteration - each call registers a new listener
-                // and all pending listeners are notified when signal arrives
-                result = tokio::signal::ctrl_c() => {
-                    match result {
-                        Ok(()) => info!("Shutdown signal received (SIGINT)"),
-                        Err(e) => error!("Failed to listen for SIGINT: {e}"),
-                    }
-                    break;
-                }
-
-                // SIGTERM (process managers, systemd, docker stop) - also high priority
-                _ = sigterm_signal.recv() => {
-                    info!("Shutdown signal received (SIGTERM)");
-                    break;
-                }
-
                 // Message processing
                 message = receiver.recv() => {
                     match message {
@@ -1311,15 +1325,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .map(|l| Quote::new(l.price, l.size))
                 .collect();
 
-            // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
+            // Reduce-only mode: when over max position, position value, OR margin utilization
             // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
-            // HARMONIZED: Use effective_max_position (first-principles derived) instead of static config
+            // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)
+            let margin_state = self.infra.margin_sizer.state();
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
-                max_position: self.effective_max_position, // First-principles limit
+                max_position: self.effective_max_position,
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.to_string(),
+                margin_used: margin_state.margin_used,
+                account_value: margin_state.account_value,
+                // Dynamic reduce-only based on liquidation proximity
+                liquidation_price: margin_state.liquidation_price,
+                liquidation_buffer_ratio: margin_state.liquidation_buffer_ratio(),
+                liquidation_trigger_threshold: quoting::DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
             };
             let reduce_only_result = quoting::QuoteFilter::apply_reduce_only_with_exchange_limits(
                 &mut bid_quotes,
@@ -1381,14 +1402,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 &market_params,
             );
 
-            // Reduce-only mode: when over max position OR position value, only allow quotes that reduce position
-            // HARMONIZED: Use effective_max_position (first-principles derived) instead of static config
+            // Reduce-only mode: when over max position, position value, OR margin utilization
+            // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)
+            let margin_state = self.infra.margin_sizer.state();
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
-                max_position: self.effective_max_position, // First-principles limit
+                max_position: self.effective_max_position,
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.to_string(),
+                margin_used: margin_state.margin_used,
+                account_value: margin_state.account_value,
+                // Dynamic reduce-only based on liquidation proximity
+                liquidation_price: margin_state.liquidation_price,
+                liquidation_buffer_ratio: margin_state.liquidation_buffer_ratio(),
+                liquidation_trigger_threshold: quoting::DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
             };
             quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
 
@@ -3167,72 +3195,118 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     ///
     /// Fetches user account state and updates the MarginAwareSizer with current values.
     /// For HIP-3 DEXs, collateral is in spot balance. For validator perps, in clearinghouse.
+    /// Also extracts liquidation price for dynamic reduce-only mode.
     async fn refresh_margin_state(&mut self) -> Result<()> {
         // For HIP-3 DEXs, collateral is in spot balance (USDE, USDH, etc.)
         // For validator perps, collateral is in perps clearinghouse (USDC)
-        let (account_value, margin_used, total_notional) = if self.config.dex.is_some() {
-            // HIP-3: Get account value from spot balance
-            let balances = self.info_client.user_token_balances(self.user_address).await?;
-            let account_value = self
-                .config
-                .collateral
-                .available_balance_from_spot(&balances.balances)
-                .unwrap_or(0.0);
+        let (account_value, margin_used, total_notional, liquidation_price) =
+            if self.config.dex.is_some() {
+                // HIP-3: Get account value from spot balance
+                let balances = self
+                    .info_client
+                    .user_token_balances(self.user_address)
+                    .await?;
+                let account_value = self
+                    .config
+                    .collateral
+                    .available_balance_from_spot(&balances.balances)
+                    .unwrap_or(0.0);
 
-            // Get margin used from DEX-specific clearinghouse
-            let user_state = self
-                .info_client
-                .user_state_for_dex(self.user_address, self.config.dex.as_deref())
-                .await?;
-            let margin_used: f64 = user_state
-                .margin_summary
-                .total_margin_used
-                .parse()
-                .unwrap_or(0.0);
-            let total_notional: f64 = user_state
-                .margin_summary
-                .total_ntl_pos
-                .parse()
-                .unwrap_or(0.0);
+                // Get margin used from DEX-specific clearinghouse
+                let user_state = self
+                    .info_client
+                    .user_state_for_dex(self.user_address, self.config.dex.as_deref())
+                    .await?;
+                let margin_used: f64 = user_state
+                    .margin_summary
+                    .total_margin_used
+                    .parse()
+                    .unwrap_or(0.0);
+                let total_notional: f64 = user_state
+                    .margin_summary
+                    .total_ntl_pos
+                    .parse()
+                    .unwrap_or(0.0);
 
-            (account_value, margin_used, total_notional)
-        } else {
-            // Validator perps: Get all values from perps clearinghouse
-            let user_state = self
-                .info_client
-                .user_state(self.user_address)
-                .await?;
-            let account_value: f64 = user_state
-                .cross_margin_summary
-                .account_value
-                .parse()
-                .unwrap_or(0.0);
-            let margin_used: f64 = user_state
-                .cross_margin_summary
-                .total_margin_used
-                .parse()
-                .unwrap_or(0.0);
-            let total_notional: f64 = user_state
-                .cross_margin_summary
-                .total_ntl_pos
-                .parse()
-                .unwrap_or(0.0);
+                // Extract liquidation price for our asset from the position data
+                let liquidation_price = user_state
+                    .asset_positions
+                    .iter()
+                    .find(|p| p.position.coin == *self.config.asset)
+                    .and_then(|p| p.position.liquidation_px.as_ref())
+                    .and_then(|px| px.parse::<f64>().ok());
 
-            (account_value, margin_used, total_notional)
-        };
+                (account_value, margin_used, total_notional, liquidation_price)
+            } else {
+                // Validator perps: Get all values from perps clearinghouse
+                let user_state = self.info_client.user_state(self.user_address).await?;
+                let account_value: f64 = user_state
+                    .cross_margin_summary
+                    .account_value
+                    .parse()
+                    .unwrap_or(0.0);
+                let margin_used: f64 = user_state
+                    .cross_margin_summary
+                    .total_margin_used
+                    .parse()
+                    .unwrap_or(0.0);
+                let total_notional: f64 = user_state
+                    .cross_margin_summary
+                    .total_ntl_pos
+                    .parse()
+                    .unwrap_or(0.0);
 
-        // Update the margin sizer with fresh values
-        self.infra
-            .margin_sizer
-            .update_state(account_value, margin_used, total_notional);
+                // Extract liquidation price for our asset from the position data
+                let liquidation_price = user_state
+                    .asset_positions
+                    .iter()
+                    .find(|p| p.position.coin == *self.config.asset)
+                    .and_then(|p| p.position.liquidation_px.as_ref())
+                    .and_then(|px| px.parse::<f64>().ok());
 
-        debug!(
-            account_value = %format!("{:.2}", account_value),
-            margin_used = %format!("{:.2}", margin_used),
-            total_notional = %format!("{:.2}", total_notional),
-            available = %format!("{:.2}", account_value - margin_used),
-            "Margin state refreshed"
+                (account_value, margin_used, total_notional, liquidation_price)
+            };
+
+        // Get current position and price for liquidation proximity calculation
+        let position_size = self.position.position();
+        let mark_price = self.latest_mid;
+
+        // Update the margin sizer with liquidation proximity data
+        self.infra.margin_sizer.update_state_with_liquidation(
+            account_value,
+            margin_used,
+            total_notional,
+            liquidation_price,
+            mark_price,
+            position_size,
         );
+
+        // Log liquidation proximity for monitoring
+        let margin_state = self.infra.margin_sizer.state();
+        if let Some(liq_px) = liquidation_price {
+            let distance_pct = if mark_price > 0.0 {
+                ((mark_price - liq_px).abs() / mark_price) * 100.0
+            } else {
+                0.0
+            };
+            debug!(
+                account_value = %format!("{:.2}", account_value),
+                margin_used = %format!("{:.2}", margin_used),
+                liquidation_px = %format!("{:.4}", liq_px),
+                mark_price = %format!("{:.4}", mark_price),
+                distance_pct = %format!("{:.2}%", distance_pct),
+                buffer_ratio = ?margin_state.liquidation_buffer_ratio().map(|r| format!("{:.2}", r)),
+                "Margin state refreshed with liquidation proximity"
+            );
+        } else {
+            debug!(
+                account_value = %format!("{:.2}", account_value),
+                margin_used = %format!("{:.2}", margin_used),
+                total_notional = %format!("{:.2}", total_notional),
+                available = %format!("{:.2}", account_value - margin_used),
+                "Margin state refreshed (no position for liquidation tracking)"
+            );
+        }
 
         Ok(())
     }
@@ -3410,6 +3484,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Build current state for kill switch check using actual P&L
         let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+        let margin_state = self.infra.margin_sizer.state();
         let state = KillSwitchState {
             daily_pnl: pnl_summary.total_pnl, // Using total as daily for now
             peak_pnl: pnl_summary.total_pnl,  // Simplified (actual peak needs tracking)
@@ -3418,6 +3493,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_data_time,
             rate_limit_errors: 0, // TODO: Track rate limit errors
             cascade_severity: self.tier1.liquidation_detector.cascade_severity(),
+            // Capital-efficient: margin data for position runaway check
+            account_value: margin_state.account_value,
+            leverage: self.infra.margin_sizer.max_leverage(),
         };
 
         // Update position in kill switch (for value calculation)

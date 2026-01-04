@@ -21,10 +21,15 @@ use tracing::warn;
 /// Reason for entering reduce-only mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReduceOnlyReason {
-    /// Position exceeds max_position limit.
-    OverPositionLimit,
+    /// Approaching liquidation (buffer ratio below threshold).
+    /// HIGHEST PRIORITY - based on exchange-provided liquidation price.
+    ApproachingLiquidation,
+    /// Margin utilization exceeds threshold (capital-efficient approach).
+    OverMarginUtilization,
     /// Position value exceeds max_position_value limit.
     OverValueLimit,
+    /// Position exceeds max_position limit (fallback/override).
+    OverPositionLimit,
 }
 
 /// Result of reduce-only filtering.
@@ -96,11 +101,19 @@ impl ReduceOnlyResult {
     }
 }
 
+/// Margin utilization threshold for reduce-only mode (80%).
+/// When margin_used/account_value exceeds this, reduce-only activates.
+const MARGIN_UTILIZATION_THRESHOLD: f64 = 0.8;
+
+/// Default threshold for liquidation proximity trigger.
+/// 0.5 = trigger when distance to liquidation equals maintenance margin rate.
+pub const DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD: f64 = 0.5;
+
 /// Configuration for reduce-only filtering.
 pub struct ReduceOnlyConfig {
     /// Current position.
     pub position: f64,
-    /// Maximum allowed position.
+    /// Maximum allowed position (fallback/override only).
     pub max_position: f64,
     /// Current mid price (for value calculation).
     pub mid_price: f64,
@@ -108,6 +121,22 @@ pub struct ReduceOnlyConfig {
     pub max_position_value: f64,
     /// Asset name (for logging).
     pub asset: String,
+    /// Current margin used (USD).
+    pub margin_used: f64,
+    /// Current account value (USD).
+    pub account_value: f64,
+
+    // === Liquidation Proximity Fields ===
+    /// Exchange-provided liquidation price (if available).
+    /// Used for dynamic reduce-only based on proximity to liquidation.
+    pub liquidation_price: Option<f64>,
+    /// Liquidation buffer ratio (0.0 = at liquidation, 1.0 = very safe).
+    /// Calculated as: distance / (distance + maintenance_margin_rate)
+    /// None if no position or liquidation price not available.
+    pub liquidation_buffer_ratio: Option<f64>,
+    /// Threshold below which reduce-only triggers (default 0.5).
+    /// Higher = more conservative (triggers earlier).
+    pub liquidation_trigger_threshold: f64,
 }
 
 /// Quote filtering utilities.
@@ -118,8 +147,15 @@ pub struct QuoteFilter;
 impl QuoteFilter {
     /// Apply reduce-only logic to ladder quotes.
     ///
-    /// When position exceeds limits, clears the side that would increase exposure.
+    /// When position exceeds limits or margin utilization is too high,
+    /// clears the side that would increase exposure.
     /// Returns a result describing what was filtered.
+    ///
+    /// Priority (highest to lowest):
+    /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    /// 2. Margin utilization > 80% (capital constraint)
+    /// 3. Position value exceeds max_position_value
+    /// 4. Position exceeds max_position (fallback/override)
     pub fn apply_reduce_only_ladder(
         bids: &mut Vec<Quote>,
         asks: &mut Vec<Quote>,
@@ -128,14 +164,40 @@ impl QuoteFilter {
         let position = config.position;
         let position_value = position.abs() * config.mid_price;
 
-        let over_position_limit = position.abs() > config.max_position;
-        let over_value_limit = position_value > config.max_position_value;
+        // Check margin utilization (capital-efficient approach)
+        let margin_utilization = if config.account_value > 0.0 {
+            config.margin_used / config.account_value
+        } else {
+            0.0
+        };
 
-        if !over_position_limit && !over_value_limit {
+        // === Priority 1: Liquidation Proximity (HIGHEST PRIORITY) ===
+        // This is the dynamic, exchange-derived trigger that replaces static max_position
+        let approaching_liquidation = config
+            .liquidation_buffer_ratio
+            .map(|ratio| ratio < config.liquidation_trigger_threshold)
+            .unwrap_or(false);
+
+        // === Priority 2-4: Fallback triggers ===
+        let over_margin_limit = margin_utilization > MARGIN_UTILIZATION_THRESHOLD;
+        let over_value_limit = position_value > config.max_position_value;
+        let over_position_limit = position.abs() > config.max_position;
+
+        // Check if any trigger is active
+        if !approaching_liquidation
+            && !over_margin_limit
+            && !over_position_limit
+            && !over_value_limit
+        {
             return ReduceOnlyResult::no_filtering();
         }
 
-        let reason = if over_value_limit {
+        // Determine primary reason (priority order)
+        let reason = if approaching_liquidation {
+            ReduceOnlyReason::ApproachingLiquidation
+        } else if over_margin_limit {
+            ReduceOnlyReason::OverMarginUtilization
+        } else if over_value_limit {
             ReduceOnlyReason::OverValueLimit
         } else {
             ReduceOnlyReason::OverPositionLimit
@@ -144,20 +206,27 @@ impl QuoteFilter {
         if position > 0.0 {
             // Long position over max: only allow sells (no bids)
             bids.clear();
-            Self::log_reduce_only(position, config, reason, true);
+            Self::log_reduce_only(position, config, reason, true, margin_utilization);
             ReduceOnlyResult::filtered_bids(reason)
         } else {
             // Short position over max: only allow buys (no asks)
             asks.clear();
-            Self::log_reduce_only(position, config, reason, false);
+            Self::log_reduce_only(position, config, reason, false, margin_utilization);
             ReduceOnlyResult::filtered_asks(reason)
         }
     }
 
     /// Apply reduce-only logic to single quotes.
     ///
-    /// When position exceeds limits, clears the side that would increase exposure.
+    /// When position exceeds limits or margin utilization is too high,
+    /// clears the side that would increase exposure.
     /// Returns a result describing what was filtered.
+    ///
+    /// Priority (highest to lowest):
+    /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    /// 2. Margin utilization > 80% (capital constraint)
+    /// 3. Position value exceeds max_position_value
+    /// 4. Position exceeds max_position (fallback/override)
     pub fn apply_reduce_only_single(
         bid: &mut Option<Quote>,
         ask: &mut Option<Quote>,
@@ -166,14 +235,38 @@ impl QuoteFilter {
         let position = config.position;
         let position_value = position.abs() * config.mid_price;
 
-        let over_position_limit = position.abs() > config.max_position;
-        let over_value_limit = position_value > config.max_position_value;
+        // Check margin utilization (capital-efficient approach)
+        let margin_utilization = if config.account_value > 0.0 {
+            config.margin_used / config.account_value
+        } else {
+            0.0
+        };
 
-        if !over_position_limit && !over_value_limit {
+        // === Priority 1: Liquidation Proximity (HIGHEST PRIORITY) ===
+        let approaching_liquidation = config
+            .liquidation_buffer_ratio
+            .map(|ratio| ratio < config.liquidation_trigger_threshold)
+            .unwrap_or(false);
+
+        // === Priority 2-4: Fallback triggers ===
+        let over_margin_limit = margin_utilization > MARGIN_UTILIZATION_THRESHOLD;
+        let over_value_limit = position_value > config.max_position_value;
+        let over_position_limit = position.abs() > config.max_position;
+
+        if !approaching_liquidation
+            && !over_margin_limit
+            && !over_position_limit
+            && !over_value_limit
+        {
             return ReduceOnlyResult::no_filtering();
         }
 
-        let reason = if over_value_limit {
+        // Determine primary reason (priority order)
+        let reason = if approaching_liquidation {
+            ReduceOnlyReason::ApproachingLiquidation
+        } else if over_margin_limit {
+            ReduceOnlyReason::OverMarginUtilization
+        } else if over_value_limit {
             ReduceOnlyReason::OverValueLimit
         } else {
             ReduceOnlyReason::OverPositionLimit
@@ -182,22 +275,45 @@ impl QuoteFilter {
         if position > 0.0 {
             // Long position over max: only allow sells (no bids)
             *bid = None;
-            Self::log_reduce_only(position, config, reason, true);
+            Self::log_reduce_only(position, config, reason, true, margin_utilization);
             ReduceOnlyResult::filtered_bids(reason)
         } else {
             // Short position over max: only allow buys (no asks)
             *ask = None;
-            Self::log_reduce_only(position, config, reason, false);
+            Self::log_reduce_only(position, config, reason, false, margin_utilization);
             ReduceOnlyResult::filtered_asks(reason)
         }
     }
 
     /// Check if we should be in reduce-only mode.
+    ///
+    /// Priority (highest to lowest):
+    /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    /// 2. Margin utilization > 80% (capital constraint)
+    /// 3. Position value exceeds max_position_value
+    /// 4. Position exceeds max_position (fallback/override)
     pub fn is_reduce_only(config: &ReduceOnlyConfig) -> Option<ReduceOnlyReason> {
         let position = config.position;
         let position_value = position.abs() * config.mid_price;
 
-        if position_value > config.max_position_value {
+        // Check margin utilization
+        let margin_utilization = if config.account_value > 0.0 {
+            config.margin_used / config.account_value
+        } else {
+            0.0
+        };
+
+        // Priority 1: Liquidation proximity (highest priority)
+        let approaching_liquidation = config
+            .liquidation_buffer_ratio
+            .map(|ratio| ratio < config.liquidation_trigger_threshold)
+            .unwrap_or(false);
+
+        if approaching_liquidation {
+            Some(ReduceOnlyReason::ApproachingLiquidation)
+        } else if margin_utilization > MARGIN_UTILIZATION_THRESHOLD {
+            Some(ReduceOnlyReason::OverMarginUtilization)
+        } else if position_value > config.max_position_value {
             Some(ReduceOnlyReason::OverValueLimit)
         } else if position.abs() > config.max_position {
             Some(ReduceOnlyReason::OverPositionLimit)
@@ -211,6 +327,12 @@ impl QuoteFilter {
     /// This enhanced version checks both local limits AND exchange capacity.
     /// If we're in reduce-only mode but the exchange has no capacity to place
     /// reducing orders, we signal that escalation (e.g., market orders) is needed.
+    ///
+    /// Priority (highest to lowest):
+    /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    /// 2. Margin utilization > 80% (capital constraint)
+    /// 3. Position value exceeds max_position_value
+    /// 4. Position exceeds max_position (fallback/override)
     ///
     /// # Arguments
     /// - `bids`: Mutable bid quotes to filter
@@ -229,14 +351,38 @@ impl QuoteFilter {
         let position = config.position;
         let position_value = position.abs() * config.mid_price;
 
-        let over_position_limit = position.abs() > config.max_position;
-        let over_value_limit = position_value > config.max_position_value;
+        // Check margin utilization (capital-efficient approach)
+        let margin_utilization = if config.account_value > 0.0 {
+            config.margin_used / config.account_value
+        } else {
+            0.0
+        };
 
-        if !over_position_limit && !over_value_limit {
+        // === Priority 1: Liquidation Proximity (HIGHEST PRIORITY) ===
+        let approaching_liquidation = config
+            .liquidation_buffer_ratio
+            .map(|ratio| ratio < config.liquidation_trigger_threshold)
+            .unwrap_or(false);
+
+        // === Priority 2-4: Fallback triggers ===
+        let over_margin_limit = margin_utilization > MARGIN_UTILIZATION_THRESHOLD;
+        let over_value_limit = position_value > config.max_position_value;
+        let over_position_limit = position.abs() > config.max_position;
+
+        if !approaching_liquidation
+            && !over_margin_limit
+            && !over_position_limit
+            && !over_value_limit
+        {
             return ReduceOnlyResult::no_filtering();
         }
 
-        let reason = if over_value_limit {
+        // Determine primary reason (priority order)
+        let reason = if approaching_liquidation {
+            ReduceOnlyReason::ApproachingLiquidation
+        } else if over_margin_limit {
+            ReduceOnlyReason::OverMarginUtilization
+        } else if over_value_limit {
             ReduceOnlyReason::OverValueLimit
         } else {
             ReduceOnlyReason::OverPositionLimit
@@ -257,11 +403,11 @@ impl QuoteFilter {
                     available_sell = %format!("{:.6}", available_sell),
                     "Reduce-only mode but no exchange capacity to sell - needs escalation"
                 );
-                Self::log_reduce_only(position, config, reason, true);
+                Self::log_reduce_only(position, config, reason, true, margin_utilization);
                 return ReduceOnlyResult::filtered_bids_needs_escalation(reason);
             }
 
-            Self::log_reduce_only(position, config, reason, true);
+            Self::log_reduce_only(position, config, reason, true, margin_utilization);
             ReduceOnlyResult::filtered_bids(reason)
         } else {
             // Short position over max: only allow buys (no asks)
@@ -275,11 +421,11 @@ impl QuoteFilter {
                     available_buy = %format!("{:.6}", available_buy),
                     "Reduce-only mode but no exchange capacity to buy - needs escalation"
                 );
-                Self::log_reduce_only(position, config, reason, false);
+                Self::log_reduce_only(position, config, reason, false, margin_utilization);
                 return ReduceOnlyResult::filtered_asks_needs_escalation(reason);
             }
 
-            Self::log_reduce_only(position, config, reason, false);
+            Self::log_reduce_only(position, config, reason, false, margin_utilization);
             ReduceOnlyResult::filtered_asks(reason)
         }
     }
@@ -289,11 +435,37 @@ impl QuoteFilter {
         config: &ReduceOnlyConfig,
         reason: ReduceOnlyReason,
         is_bid_side: bool,
+        margin_utilization: f64,
     ) {
         let side_name = if is_bid_side { "bids" } else { "asks" };
         let position_type = if position > 0.0 { "long" } else { "short" };
 
         match reason {
+            ReduceOnlyReason::ApproachingLiquidation => {
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    liquidation_price = ?config.liquidation_price.map(|p| format!("{:.4}", p)),
+                    buffer_ratio = ?config.liquidation_buffer_ratio.map(|r| format!("{:.2}%", r * 100.0)),
+                    threshold = %format!("{:.1}%", config.liquidation_trigger_threshold * 100.0),
+                    mid_price = %format!("{:.4}", config.mid_price),
+                    "APPROACHING LIQUIDATION ({}) - reduce-only mode, cancelling {}",
+                    position_type,
+                    side_name
+                );
+            }
+            ReduceOnlyReason::OverMarginUtilization => {
+                warn!(
+                    position = %format!("{:.6}", position),
+                    margin_used = %format!("${:.2}", config.margin_used),
+                    account_value = %format!("${:.2}", config.account_value),
+                    utilization = %format!("{:.1}%", margin_utilization * 100.0),
+                    threshold = %format!("{:.1}%", MARGIN_UTILIZATION_THRESHOLD * 100.0),
+                    "Margin utilization over threshold ({}) - reduce-only mode, cancelling {}",
+                    position_type,
+                    side_name
+                );
+            }
             ReduceOnlyReason::OverValueLimit => {
                 let position_value = position.abs() * config.mid_price;
                 warn!(
@@ -325,12 +497,19 @@ mod tests {
     fn make_config(position: f64) -> ReduceOnlyConfig {
         // Set value limit high enough that it won't trigger by default
         // Position 10 * 50000 = $500k, so set limit to $1M
+        // Margin utilization low enough to not trigger (50% < 80% threshold)
         ReduceOnlyConfig {
             position,
             max_position: 10.0,
             mid_price: 50000.0,
             max_position_value: 1_000_000.0, // $1M (high enough to not trigger)
             asset: "BTC".to_string(),
+            margin_used: 5000.0,   // $5k margin used
+            account_value: 10000.0, // $10k account = 50% utilization (below 80% threshold)
+            // Liquidation fields - default to None (disabled) for backward compat tests
+            liquidation_price: None,
+            liquidation_buffer_ratio: None,
+            liquidation_trigger_threshold: DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
         }
     }
 

@@ -244,6 +244,10 @@ pub struct KillSwitchState {
     pub rate_limit_errors: u32,
     /// Current liquidation cascade severity (0.0 to 1.0+)
     pub cascade_severity: f64,
+    /// Current account value in USD (for margin-based position limits)
+    pub account_value: f64,
+    /// Current leverage setting
+    pub leverage: f64,
 }
 
 impl Default for KillSwitchState {
@@ -256,6 +260,8 @@ impl Default for KillSwitchState {
             last_data_time: Instant::now(),
             rate_limit_errors: 0,
             cascade_severity: 0.0,
+            account_value: 0.0,
+            leverage: 1.0,
         }
     }
 }
@@ -517,10 +523,26 @@ impl KillSwitch {
         state: &KillSwitchState,
         config: &KillSwitchConfig,
     ) -> Option<KillReason> {
-        // Position runaway: contracts exceed 2x the configured max_position
+        // CAPITAL-EFFICIENT: Use margin-based limit when available
+        // Position runaway = contracts exceed 2× what margin SHOULD allow
         // This catches cases where reduce-only mode fails to control position growth
+        //
+        // Priority:
+        // 1. If margin data available (account_value > 0): use margin-derived limit
+        // 2. Else: fall back to config.max_position_contracts (for backwards compat)
         let contracts = state.position.abs();
-        let hard_limit = config.max_position_contracts * 2.0;
+
+        let margin_based_limit = if state.account_value > 0.0 && state.leverage > 0.0 && state.mid_price > 0.0 {
+            // Same formula as startup: (account_value × leverage × 0.5) / price
+            let safety_factor = 0.5;
+            (state.account_value * state.leverage * safety_factor) / state.mid_price
+        } else {
+            // Fall back to configured max_position if margin data not available
+            config.max_position_contracts
+        };
+
+        // Runaway = 2× the effective limit
+        let hard_limit = margin_based_limit * 2.0;
         if contracts > hard_limit {
             return Some(KillReason::PositionRunaway {
                 contracts,

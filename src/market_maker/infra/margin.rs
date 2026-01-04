@@ -279,6 +279,18 @@ pub struct MarginState {
     pub current_leverage: f64,
     /// Last update timestamp
     pub last_updated: Option<Instant>,
+
+    // === Liquidation Proximity Fields ===
+    /// Exchange-provided liquidation price (if position exists).
+    /// None if no position or exchange doesn't provide it.
+    pub liquidation_price: Option<f64>,
+    /// Current mark/mid price for distance calculations.
+    pub mark_price: f64,
+    /// Current position size (signed: positive = long, negative = short).
+    pub position_size: f64,
+    /// Maintenance margin rate (typically 0.5 / max_leverage).
+    /// Hyperliquid uses half of initial margin at max leverage.
+    pub maintenance_margin_rate: f64,
 }
 
 impl MarginState {
@@ -303,6 +315,62 @@ impl MarginState {
             available_margin,
             current_leverage,
             last_updated: Some(Instant::now()),
+            // Liquidation fields default to None/0 - use from_values_with_liquidation for full data
+            liquidation_price: None,
+            mark_price: 0.0,
+            position_size: 0.0,
+            maintenance_margin_rate: 0.0,
+        }
+    }
+
+    /// Create from user state response values with liquidation proximity data.
+    ///
+    /// This is the preferred constructor when liquidation data is available from the API.
+    ///
+    /// # Arguments
+    /// - `account_value`: Total account value in USD
+    /// - `margin_used`: Total margin currently in use
+    /// - `total_notional`: Total notional position value
+    /// - `liquidation_price`: Exchange-provided liquidation price (None if no position)
+    /// - `mark_price`: Current mark/mid price
+    /// - `position_size`: Current position size (signed)
+    /// - `max_leverage`: Max leverage for calculating maintenance margin rate
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_values_with_liquidation(
+        account_value: f64,
+        margin_used: f64,
+        total_notional: f64,
+        liquidation_price: Option<f64>,
+        mark_price: f64,
+        position_size: f64,
+        max_leverage: f64,
+    ) -> Self {
+        let available_margin = (account_value - margin_used).max(0.0);
+        let current_leverage = if account_value > 0.0 {
+            total_notional / account_value
+        } else {
+            0.0
+        };
+
+        // Hyperliquid: maintenance margin = 0.5 × initial margin at max leverage
+        // maintenance_margin_rate = 1 / (2 × max_leverage)
+        let maintenance_margin_rate = if max_leverage > 0.0 {
+            0.5 / max_leverage
+        } else {
+            0.05 // 5% default (equivalent to 10x leverage)
+        };
+
+        Self {
+            account_value,
+            margin_used,
+            total_notional,
+            available_margin,
+            current_leverage,
+            last_updated: Some(Instant::now()),
+            liquidation_price,
+            mark_price,
+            position_size,
+            maintenance_margin_rate,
         }
     }
 
@@ -312,6 +380,92 @@ impl MarginState {
             Some(t) => t.elapsed() > max_age,
             None => true,
         }
+    }
+
+    // =========================================================================
+    // Liquidation Proximity Methods
+    // =========================================================================
+
+    /// Calculate distance to liquidation as a fraction of current price.
+    ///
+    /// Returns the percentage distance from current price to liquidation price.
+    /// Returns None if no liquidation price available or no position.
+    ///
+    /// # Example
+    /// - mark_price = 100, liquidation_price = 95 → distance = 0.05 (5%)
+    /// - mark_price = 100, liquidation_price = 80 → distance = 0.20 (20%)
+    pub fn distance_to_liquidation(&self) -> Option<f64> {
+        let liq_px = self.liquidation_price?;
+        if self.mark_price <= 0.0 || liq_px <= 0.0 {
+            return None;
+        }
+        // Distance as fraction of mark price
+        Some((self.mark_price - liq_px).abs() / self.mark_price)
+    }
+
+    /// Calculate the liquidation buffer ratio (0.0 = at liquidation, 1.0 = very safe).
+    ///
+    /// This normalizes the distance to liquidation against the maintenance margin rate,
+    /// providing a scale-invariant measure of safety.
+    ///
+    /// Formula: `buffer_ratio = distance / (distance + maintenance_margin_rate)`
+    ///
+    /// # Interpretation
+    /// - 0.0 = At liquidation price (would be liquidated)
+    /// - 0.5 = Distance equals maintenance margin rate (e.g., 5% away with 5% maintenance)
+    /// - 0.9 = Distance is 9× maintenance margin rate (very safe)
+    ///
+    /// # Returns
+    /// None if no liquidation price available or no position.
+    pub fn liquidation_buffer_ratio(&self) -> Option<f64> {
+        let distance = self.distance_to_liquidation()?;
+        // Use maintenance margin rate as reference
+        // Clamp to at least 1% to avoid division issues
+        let reference = self.maintenance_margin_rate.max(0.01);
+        Some(distance / (distance + reference))
+    }
+
+    /// Calculate maintenance margin required for current position.
+    ///
+    /// Formula: `maintenance_margin = |position_size| × mark_price × maintenance_margin_rate`
+    pub fn maintenance_margin_required(&self) -> f64 {
+        self.position_size.abs() * self.mark_price * self.maintenance_margin_rate
+    }
+
+    /// Calculate margin cushion: how much margin is available above maintenance.
+    ///
+    /// Positive = safe, negative = would be liquidated (should never happen in practice).
+    pub fn margin_cushion(&self) -> f64 {
+        self.account_value - self.maintenance_margin_required()
+    }
+
+    /// Calculate margin cushion as a ratio of maintenance margin.
+    ///
+    /// # Interpretation
+    /// - 1.0 = Exactly at maintenance margin (would be liquidated)
+    /// - 2.0 = Have 2× the required margin (healthy buffer)
+    /// - 5.0 = Have 5× the required margin (very safe)
+    /// - f64::MAX = No position (infinite cushion)
+    pub fn margin_cushion_ratio(&self) -> f64 {
+        let required = self.maintenance_margin_required();
+        if required <= 0.0 {
+            return f64::MAX; // No position = infinite cushion
+        }
+        self.account_value / required
+    }
+
+    /// Check if position is approaching liquidation based on buffer ratio threshold.
+    ///
+    /// # Arguments
+    /// - `threshold`: Buffer ratio below which to trigger (e.g., 0.5)
+    ///
+    /// # Returns
+    /// - `Some(true)` if buffer_ratio < threshold (approaching liquidation)
+    /// - `Some(false)` if buffer_ratio >= threshold (safe)
+    /// - `None` if no liquidation data available (fall back to other checks)
+    pub fn is_approaching_liquidation(&self, threshold: f64) -> Option<bool> {
+        let ratio = self.liquidation_buffer_ratio()?;
+        Some(ratio < threshold)
     }
 }
 
@@ -358,6 +512,39 @@ impl MarginAwareSizer {
         self.state = MarginState::from_values(account_value, margin_used, total_notional);
     }
 
+    /// Update margin state from exchange data with liquidation proximity data.
+    ///
+    /// This is the preferred update method when liquidation data is available from the API.
+    /// Enables dynamic reduce-only based on liquidation proximity.
+    ///
+    /// # Arguments
+    /// - `account_value`: Total account value in USD
+    /// - `margin_used`: Total margin currently in use
+    /// - `total_notional`: Total notional position value
+    /// - `liquidation_price`: Exchange-provided liquidation price (None if no position)
+    /// - `mark_price`: Current mark/mid price
+    /// - `position_size`: Current position size (signed)
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_state_with_liquidation(
+        &mut self,
+        account_value: f64,
+        margin_used: f64,
+        total_notional: f64,
+        liquidation_price: Option<f64>,
+        mark_price: f64,
+        position_size: f64,
+    ) {
+        self.state = MarginState::from_values_with_liquidation(
+            account_value,
+            margin_used,
+            total_notional,
+            liquidation_price,
+            mark_price,
+            position_size,
+            self.config.max_leverage,
+        );
+    }
+
     /// Check if margin state needs refresh.
     pub fn needs_refresh(&self) -> bool {
         self.state.is_stale(self.config.refresh_interval)
@@ -366,6 +553,11 @@ impl MarginAwareSizer {
     /// Get current margin state.
     pub fn state(&self) -> &MarginState {
         &self.state
+    }
+
+    /// Get maximum leverage configured for this asset.
+    pub fn max_leverage(&self) -> f64 {
+        self.config.max_leverage
     }
 
     /// Calculate maximum order size based on margin constraints.

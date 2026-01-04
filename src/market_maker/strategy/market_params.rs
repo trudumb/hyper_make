@@ -295,6 +295,13 @@ pub struct MarketParams {
     /// If false, strategies should fall back to config.max_position.
     pub dynamic_limit_valid: bool,
 
+    /// Margin-based quoting capacity (SIZE, not value).
+    /// Formula: margin_available × leverage / microprice
+    /// This is the HARD solvency constraint - what the account can actually support.
+    /// Used for ladder allocation instead of user's arbitrary max_position.
+    /// The Kelly optimizer should allocate up to this limit.
+    pub margin_quoting_capacity: f64,
+
     // ==================== Stochastic Constraints (First Principles) ====================
     /// Asset tick size in basis points.
     /// Spread floor must be >= tick_size_bps (can't quote finer than tick).
@@ -460,6 +467,7 @@ impl Default for MarketParams {
             // Dynamic Position Limits
             dynamic_max_position: 0.0,  // Will be set from kill switch
             dynamic_limit_valid: false, // Not valid until margin state refreshed
+            margin_quoting_capacity: 0.0, // Will be computed from margin_available
             // Stochastic Constraints
             tick_size_bps: 10.0,          // Default 10 bps tick
             latency_spread_floor: 0.0003, // 3 bps default floor
@@ -487,16 +495,53 @@ impl MarketParams {
         self.pending_bid_exposure - self.pending_ask_exposure
     }
 
-    /// Get effective max_position for sizing calculations.
+    /// Get effective max_position for sizing calculations (QUOTING CAPACITY).
     ///
-    /// Returns dynamic_max_position if valid, otherwise falls back to provided static limit.
-    /// This ensures sizing adapts to equity/volatility when margin state is available,
-    /// while maintaining safe defaults during warmup.
+    /// Priority order for quoting capacity:
+    /// 1. dynamic_max_position (volatility-adjusted from kill switch)
+    /// 2. margin_quoting_capacity (pure margin-based: margin × leverage / price)
+    /// 3. static_fallback (last resort during early warmup)
+    ///
+    /// IMPORTANT: This is for QUOTING allocation, not reduce-only triggers.
+    /// The Kelly optimizer should be able to allocate across full margin capacity.
+    /// User's --max-position config is used ONLY for reduce-only filter.
     pub fn effective_max_position(&self, static_fallback: f64) -> f64 {
-        if self.dynamic_limit_valid && self.dynamic_max_position > 0.0 {
+        const EPSILON: f64 = 1e-9;
+
+        // First choice: volatility-adjusted limit from kill switch
+        if self.dynamic_limit_valid && self.dynamic_max_position > EPSILON {
+            return self.dynamic_max_position;
+        }
+
+        // Second choice: margin-based quoting capacity (controller-derived)
+        // This allows full margin utilization for ladder allocation
+        if self.margin_quoting_capacity > EPSILON {
+            return self.margin_quoting_capacity;
+        }
+
+        // Last resort: static fallback (only during early warmup)
+        static_fallback
+    }
+
+    /// Get quoting capacity (margin-based, for ladder allocation).
+    ///
+    /// Returns the margin-based capacity for quoting, ignoring user's max_position.
+    /// This is the HARD solvency constraint from available margin.
+    pub fn quoting_capacity(&self) -> f64 {
+        const EPSILON: f64 = 1e-9;
+
+        // Prefer margin-based capacity when available
+        if self.margin_quoting_capacity > EPSILON {
+            self.margin_quoting_capacity
+        } else if self.dynamic_limit_valid && self.dynamic_max_position > EPSILON {
             self.dynamic_max_position
         } else {
-            static_fallback
+            // Compute on-the-fly if fields not populated
+            if self.microprice > EPSILON && self.leverage > 0.0 {
+                (self.margin_available * self.leverage / self.microprice).max(0.0)
+            } else {
+                0.0
+            }
         }
     }
 }

@@ -7,5 +7,8 @@
 mod filter;
 mod ladder;
 
-pub use filter::{QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult};
+pub use filter::{
+    QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
+    DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
+};
 pub use ladder::*;

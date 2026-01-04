@@ -278,18 +278,24 @@ impl LadderStrategy {
             return Ladder::default();
         }
 
-        // FIRST PRINCIPLES: Use dynamic max_position derived from equity/volatility
-        // Falls back to static max_position if margin state hasn't been refreshed yet
-        let effective_max_position = market_params.effective_max_position(max_position);
+        // CONTROLLER-DERIVED POSITION SIZING:
+        // Use margin-based quoting capacity for ladder allocation.
+        // The user's max_position is ONLY used for reduce-only filter, not quoting capacity.
+        // This allows the Kelly optimizer to allocate across full margin capacity.
+        let quoting_capacity = market_params.quoting_capacity();
+        let effective_max_position = if quoting_capacity > EPSILON {
+            quoting_capacity
+        } else {
+            market_params.effective_max_position(max_position)
+        };
 
-        // Log when using dynamic limit
-        if market_params.dynamic_limit_valid
-            && (effective_max_position - max_position).abs() > EPSILON
-        {
+        // Log when quoting capacity differs from user's config
+        if (effective_max_position - max_position).abs() > 0.01 {
             tracing::debug!(
-                static_limit = %format!("{:.6}", max_position),
-                dynamic_limit = %format!("{:.6}", effective_max_position),
-                "Using first-principles dynamic position limit"
+                user_max_position = %format!("{:.6}", max_position),
+                margin_quoting_capacity = %format!("{:.6}", market_params.margin_quoting_capacity),
+                effective = %format!("{:.6}", effective_max_position),
+                "Controller-derived quoting capacity (user max_position is for reduce-only only)"
             );
         }
 

@@ -246,11 +246,11 @@ pub struct TradingConfig {
     #[serde(default = "default_max_bps_diff")]
     pub max_bps_diff: u16,
 
-    /// Maximum position size in asset units.
-    /// Default: 0.05 BTC (~$5K notional) - below kill switch limit.
-    /// Capped at runtime by: (account_value × leverage × 0.5) / price
-    #[serde(default = "default_max_position")]
-    pub max_absolute_position_size: f64,
+    /// Maximum position in contracts (optional).
+    /// If not specified, defaults to margin-based limit: (account_value × leverage × 0.5) / price
+    /// This is capital-efficient: use gamma to control risk, not arbitrary position limits.
+    #[serde(default = "default_max_position", skip_serializing_if = "Option::is_none")]
+    pub max_absolute_position_size: Option<f64>,
 
     /// Leverage to use (set on exchange at startup).
     /// Default: max available for the asset (from exchange metadata).
@@ -295,8 +295,8 @@ fn default_max_bps_diff() -> u16 {
 /// Default max position: 0.05 BTC (~$5K at $100K BTC)
 /// Conservative default below kill switch limit ($10K).
 /// Will be capped at runtime by (account_value × leverage × 0.5) / price.
-fn default_max_position() -> f64 {
-    0.05
+fn default_max_position() -> Option<f64> {
+    None // Default to margin-based limit (capital-efficient)
 }
 
 impl Default for TradingConfig {
@@ -636,9 +636,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(config.trading.target_liquidity);
     let risk_aversion = cli.risk_aversion.unwrap_or(config.trading.risk_aversion);
     let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
-    let max_position = cli
-        .max_position
-        .unwrap_or(config.trading.max_absolute_position_size);
+    // max_position is now optional - will default to margin-based limit later
+    // Priority: CLI arg > config file > margin-based default
+    let max_position_override: Option<f64> = cli.max_position.or(config.trading.max_absolute_position_size);
 
     // Query metadata to get sz_decimals (always needed for size precision)
     // Use with_reconnect to automatically reconnect if WebSocket disconnects
@@ -806,7 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_liquidity = %target_liquidity,
         risk_aversion = %risk_aversion,
         max_bps_diff = %max_bps_diff,
-        max_position = %max_position,
+        max_position_override = ?max_position_override,
         leverage = %leverage,
         decimals = %decimals,
         strategy = ?config.strategy.strategy_type,
@@ -921,55 +921,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(asset_data) => {
                 let mark_px: f64 = asset_data.mark_px.parse().unwrap_or(1.0);
 
-                // Calculate max position from account equity × leverage (we set leverage above)
-                // Use 50% safety factor to leave room for adverse moves
-                let max_from_leverage = (account_value * leverage as f64 * 0.5) / mark_px;
+                // === CAPITAL-EFFICIENT POSITION LIMITS ===
+                // From GLFT theory: max_position should be derived from MARGIN, not arbitrary config.
+                // The user controls risk via gamma (utility), not position caps.
+                //
+                // Formula: max_from_leverage = (account_value × leverage × safety_factor) / price
+                // This is the TRUE hard constraint from solvency.
+                let safety_factor = 0.5; // Leave 50% margin buffer for adverse moves
+                let max_from_leverage = (account_value * leverage as f64 * safety_factor) / mark_px;
 
-                // First-principles: ensure target_liquidity meets min_notional requirement
-                // This replaces the arbitrary 40% cap with an exchange-derived minimum
+                // Effective max_position:
+                // - If user specified: use min(user_value, margin_based) - user can only REDUCE
+                // - If not specified: use full margin capacity (capital-efficient default)
+                let capped_max_pos = match max_position_override {
+                    Some(user_limit) => {
+                        let capped = user_limit.min(max_from_leverage);
+                        info!(
+                            user_limit = %format!("{:.6}", user_limit),
+                            margin_limit = %format!("{:.6}", max_from_leverage),
+                            effective = %format!("{:.6}", capped),
+                            "User-specified max_position (capped by margin)"
+                        );
+                        capped
+                    }
+                    None => {
+                        info!(
+                            margin_limit = %format!("{:.6}", max_from_leverage),
+                            "Using margin-based max_position (capital-efficient default)"
+                        );
+                        max_from_leverage
+                    }
+                };
+
+                // Minimum notional for multi-level ladder
                 // min_notional = $10 (Hyperliquid minimum order notional)
                 let min_notional = 10.0;
                 let min_viable_liquidity = min_notional / mark_px;
 
-                // First-principles: calculate minimum position needed for multi-level ladder
-                // Each level needs min_notional / price to pass exchange requirements
-                //
-                // IMPORTANT: Size allocation uses marginal-value weighting (lambda × spread_capture),
-                // which decays exponentially with depth. The outermost level typically gets only
-                // ~6-10% of total size. To ensure ALL levels pass min_notional, we need:
-                //   smallest_level_size × price >= min_notional
-                //   (allocation_fraction × total_size) × price >= min_notional
-                //   total_size >= min_notional / (price × allocation_fraction)
-                //
-                // With 5 levels and typical decay, smallest fraction ≈ 0.065 (6.5%).
-                // Safety factor: use 0.05 (5%) to ensure all levels pass after truncation.
-                let num_ladder_levels = 5_u8; // Default ladder levels
-                let smallest_level_fraction = 0.05; // Conservative: outer level gets ~5% of total
+                // Calculate minimum liquidity needed for multi-level ladder
+                // With 5 levels and decay, smallest fraction ≈ 5% of total
+                let num_ladder_levels = 5_u8;
+                let smallest_level_fraction = 0.05;
                 let min_for_ladder = min_notional / (mark_px * smallest_level_fraction);
 
-                // Apply floor: max_position must support at least num_ladder_levels
-                // But don't exceed leverage limit
-                let capped_max_pos = max_position
-                    .min(max_from_leverage) // Don't exceed leverage
-                    .max(min_for_ladder); // But ensure enough for ladder
-
-                // Log if we auto-increased max_position for multi-level ladder
-                if max_position < min_for_ladder {
-                    info!(
-                        configured_max = %format!("{:.6}", max_position),
-                        min_for_ladder = %format!("{:.6}", min_for_ladder),
-                        using = %format!("{:.6}", capped_max_pos),
-                        "Auto-increased max_position to support {} ladder levels",
-                        num_ladder_levels
-                    );
-                }
-
-                // Target liquidity must be at least min_for_ladder for multi-level quoting
-                // Otherwise ladder generator will trigger concentration fallback
-                // Cap to max_position (can't offer more than we're willing to hold)
+                // Target liquidity: auto-scale for ladder, cap by margin (NOT by max_position)
+                // This allows full margin utilization for quoting even with reduce-only active
                 let capped_liquidity = target_liquidity
                     .max(min_for_ladder) // Ensure multi-level ladder support
-                    .min(capped_max_pos); // Respect position limits
+                    .min(max_from_leverage); // Cap by margin, not max_position
 
                 // Log if we auto-increased target_liquidity for multi-level ladder
                 if target_liquidity < min_for_ladder {
@@ -983,23 +982,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 info!(
-                    account_value = %account_value,
+                    account_value = %format!("{:.2}", account_value),
                     leverage = %leverage,
-                    mark_px = %mark_px,
+                    mark_px = %format!("{:.4}", mark_px),
                     max_from_leverage = %format!("{:.6}", max_from_leverage),
-                    min_for_ladder = %format!("{:.6}", min_for_ladder),
                     capped_max_pos = %format!("{:.6}", capped_max_pos),
-                    config_target = %format!("{:.6}", target_liquidity),
-                    min_viable = %format!("{:.6}", min_viable_liquidity),
                     capped_liquidity = %format!("{:.6}", capped_liquidity),
-                    "Position limits (first-principles: multi-level ladder support)"
+                    min_viable = %format!("{:.6}", min_viable_liquidity),
+                    "Capital-efficient position limits (use gamma to control risk)"
                 );
 
                 (capped_liquidity, capped_max_pos)
             }
             Err(e) => {
-                tracing::warn!("Failed to query asset data: {e}, using config defaults");
-                (target_liquidity, max_position)
+                // Fallback: use config values or conservative defaults
+                let fallback_max = max_position_override.unwrap_or(0.05);
+                tracing::warn!(
+                    fallback_max = %format!("{:.6}", fallback_max),
+                    "Failed to query asset data: {e}, using fallback position limit"
+                );
+                (target_liquidity, fallback_max)
             }
         }
     };
