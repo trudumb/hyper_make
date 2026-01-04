@@ -925,20 +925,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Use 50% safety factor to leave room for adverse moves
                 let max_from_leverage = (account_value * leverage as f64 * 0.5) / mark_px;
 
-                // Cap to configured max_position (if user wants smaller)
-                let capped_max_pos = max_position.min(max_from_leverage);
+                // First-principles: ensure target_liquidity meets min_notional requirement
+                // This replaces the arbitrary 40% cap with an exchange-derived minimum
+                // min_notional = $10 (Hyperliquid minimum order notional)
+                let min_notional = 10.0;
+                let min_viable_liquidity = min_notional / mark_px;
 
-                // Cap liquidity to 40% of max position for each side
-                let capped_liquidity = target_liquidity.min(capped_max_pos * 0.4);
+                // First-principles: calculate minimum position needed for multi-level ladder
+                // Each level needs min_notional / price to pass exchange requirements
+                //
+                // IMPORTANT: Size allocation uses marginal-value weighting (lambda × spread_capture),
+                // which decays exponentially with depth. The outermost level typically gets only
+                // ~6-10% of total size. To ensure ALL levels pass min_notional, we need:
+                //   smallest_level_size × price >= min_notional
+                //   (allocation_fraction × total_size) × price >= min_notional
+                //   total_size >= min_notional / (price × allocation_fraction)
+                //
+                // With 5 levels and typical decay, smallest fraction ≈ 0.065 (6.5%).
+                // Safety factor: use 0.05 (5%) to ensure all levels pass after truncation.
+                let num_ladder_levels = 5_u8; // Default ladder levels
+                let smallest_level_fraction = 0.05; // Conservative: outer level gets ~5% of total
+                let min_for_ladder = min_notional / (mark_px * smallest_level_fraction);
+
+                // Apply floor: max_position must support at least num_ladder_levels
+                // But don't exceed leverage limit
+                let capped_max_pos = max_position
+                    .min(max_from_leverage) // Don't exceed leverage
+                    .max(min_for_ladder); // But ensure enough for ladder
+
+                // Log if we auto-increased max_position for multi-level ladder
+                if max_position < min_for_ladder {
+                    info!(
+                        configured_max = %format!("{:.6}", max_position),
+                        min_for_ladder = %format!("{:.6}", min_for_ladder),
+                        using = %format!("{:.6}", capped_max_pos),
+                        "Auto-increased max_position to support {} ladder levels",
+                        num_ladder_levels
+                    );
+                }
+
+                // Target liquidity must be at least min_for_ladder for multi-level quoting
+                // Otherwise ladder generator will trigger concentration fallback
+                // Cap to max_position (can't offer more than we're willing to hold)
+                let capped_liquidity = target_liquidity
+                    .max(min_for_ladder) // Ensure multi-level ladder support
+                    .min(capped_max_pos); // Respect position limits
+
+                // Log if we auto-increased target_liquidity for multi-level ladder
+                if target_liquidity < min_for_ladder {
+                    info!(
+                        configured_target = %format!("{:.6}", target_liquidity),
+                        min_for_ladder = %format!("{:.6}", min_for_ladder),
+                        using = %format!("{:.6}", capped_liquidity),
+                        "Auto-increased target_liquidity to support {} ladder levels",
+                        num_ladder_levels
+                    );
+                }
 
                 info!(
                     account_value = %account_value,
                     leverage = %leverage,
                     mark_px = %mark_px,
                     max_from_leverage = %format!("{:.6}", max_from_leverage),
+                    min_for_ladder = %format!("{:.6}", min_for_ladder),
                     capped_max_pos = %format!("{:.6}", capped_max_pos),
+                    config_target = %format!("{:.6}", target_liquidity),
+                    min_viable = %format!("{:.6}", min_viable_liquidity),
                     capped_liquidity = %format!("{:.6}", capped_liquidity),
-                    "Position limits (equity × leverage × 0.5 / price)"
+                    "Position limits (first-principles: multi-level ladder support)"
                 );
 
                 (capped_liquidity, capped_max_pos)

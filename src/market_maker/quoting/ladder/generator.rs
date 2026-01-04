@@ -29,9 +29,15 @@ impl Ladder {
         // Check if we have asymmetric depths (bid ≠ ask)
         if let Some(ref dynamic) = config.dynamic_depths {
             if dynamic.bid != dynamic.ask {
+                tracing::debug!(
+                    bid_levels = dynamic.bid.len(),
+                    ask_levels = dynamic.ask.len(),
+                    "Ladder::generate using asymmetric path"
+                );
                 return Self::generate_asymmetric(config, params);
             }
         }
+        tracing::debug!("Ladder::generate using symmetric path");
 
         // 1. Compute depth spacing (symmetric)
         let depths = compute_depths(config);
@@ -361,15 +367,52 @@ pub(crate) fn allocate_sizes(
         .collect();
 
     let total: f64 = marginal_values.iter().sum();
+
+    // Always log allocation parameters for debugging
+    let max_mv = marginal_values.iter().fold(0.0_f64, |a, &b| a.max(b));
+    let max_spread = spreads.iter().fold(0.0_f64, |a, &b| a.max(b));
+    tracing::debug!(
+        total_mv = %format!("{:.6}", total),
+        max_mv = %format!("{:.6}", max_mv),
+        max_spread = %format!("{:.4}", max_spread),
+        total_size = %format!("{:.6}", total_size),
+        min_size = %format!("{:.6}", min_size),
+        num_levels = marginal_values.len(),
+        "allocate_sizes called"
+    );
+
     if total <= EPSILON {
-        // No profitable levels - return zeros
+        // All marginal values near zero - but we may still have positive spread capture
+        // Use concentration fallback: put all size on first level (tightest depth)
+        // Only if at least one spread is positive (otherwise truly unprofitable)
+        let has_positive_spread = spreads.iter().any(|&sc| sc > EPSILON);
+        tracing::info!(
+            has_positive_spread = has_positive_spread,
+            total_size = %format!("{:.6}", total_size),
+            min_size = %format!("{:.6}", min_size),
+            "allocate_sizes: total MV <= EPSILON, checking fallback conditions"
+        );
+        if has_positive_spread && total_size >= min_size {
+            let mut result = DepthVec::new();
+            result.resize(marginal_values.len(), 0.0);
+            if !result.is_empty() {
+                result[0] = total_size; // Concentrate on tightest level
+                tracing::info!(
+                    levels = result.len(),
+                    total_size = %format!("{:.6}", total_size),
+                    "Ladder allocate_sizes: MV=0 fallback, concentrating on tightest level"
+                );
+            }
+            return result;
+        }
+        // Truly no profitable levels - return zeros
         let mut zeros = DepthVec::new();
         zeros.resize(marginal_values.len(), 0.0);
         return zeros;
     }
 
     // Normalize to total_size
-    marginal_values
+    let mut result: DepthVec = marginal_values
         .iter()
         .map(|&v| {
             let raw = total_size * v / total;
@@ -379,7 +422,22 @@ pub(crate) fn allocate_sizes(
                 raw
             }
         })
-        .collect()
+        .collect();
+
+    // Check if all sizes were filtered out due to min_size
+    // Use concentration fallback: put all size on first level (tightest depth)
+    let all_filtered = result.iter().all(|&s| s < EPSILON);
+    if all_filtered && total_size >= min_size {
+        result[0] = total_size;
+        tracing::info!(
+            levels = result.len(),
+            total_size = %format!("{:.6}", total_size),
+            min_size = %format!("{:.6}", min_size),
+            "Ladder allocate_sizes: min_size fallback, concentrating on tightest level"
+        );
+    }
+
+    result
 }
 
 /// Build raw ladder from depths and sizes (before inventory skew).
@@ -395,6 +453,17 @@ pub(crate) fn build_raw_ladder(
     sz_decimals: u32,
     min_notional: f64,
 ) -> Ladder {
+    // DEBUG: log entry to verify code path
+    let total_size: f64 = sizes.iter().sum();
+    tracing::debug!(
+        num_depths = depths.len(),
+        num_sizes = sizes.len(),
+        total_size = %format!("{:.6}", total_size),
+        mid = %format!("{:.4}", mid),
+        min_notional = %format!("{:.2}", min_notional),
+        "build_raw_ladder called"
+    );
+
     let mut bids = LadderLevels::new();
     let mut asks = LadderLevels::new();
 
@@ -427,6 +496,56 @@ pub(crate) fn build_raw_ladder(
                 size,
                 depth_bps,
             });
+        }
+    }
+
+    // Concentration fallback: if all levels filtered by min_notional,
+    // but total size meets min_notional, create single level at tightest depth
+    if bids.is_empty() && !depths.is_empty() && !sizes.is_empty() {
+        let total_size: f64 = sizes.iter().sum();
+        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
+        if let Some(&tightest_depth) = depths.first() {
+            let offset = mid * (tightest_depth / 10000.0);
+            let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
+
+            if bid_price * total_size_truncated >= min_notional {
+                tracing::info!(
+                    total_size = %format!("{:.6}", total_size_truncated),
+                    price = %format!("{:.4}", bid_price),
+                    notional = %format!("{:.2}", bid_price * total_size_truncated),
+                    depth_bps = %format!("{:.2}", tightest_depth),
+                    "Bid concentration fallback: single order at tightest depth"
+                );
+                bids.push(LadderLevel {
+                    price: bid_price,
+                    size: total_size_truncated,
+                    depth_bps: tightest_depth,
+                });
+            }
+        }
+    }
+
+    if asks.is_empty() && !depths.is_empty() && !sizes.is_empty() {
+        let total_size: f64 = sizes.iter().sum();
+        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
+        if let Some(&tightest_depth) = depths.first() {
+            let offset = mid * (tightest_depth / 10000.0);
+            let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+
+            if ask_price * total_size_truncated >= min_notional {
+                tracing::info!(
+                    total_size = %format!("{:.6}", total_size_truncated),
+                    price = %format!("{:.4}", ask_price),
+                    notional = %format!("{:.2}", ask_price * total_size_truncated),
+                    depth_bps = %format!("{:.2}", tightest_depth),
+                    "Ask concentration fallback: single order at tightest depth"
+                );
+                asks.push(LadderLevel {
+                    price: ask_price,
+                    size: total_size_truncated,
+                    depth_bps: tightest_depth,
+                });
+            }
         }
     }
 
@@ -499,6 +618,56 @@ pub(crate) fn build_asymmetric_ladder(
                 size,
                 depth_bps,
             });
+        }
+    }
+
+    // Concentration fallback for bids (asymmetric)
+    if bids.is_empty() && !bid_depths.is_empty() && !bid_sizes.is_empty() {
+        let total_size: f64 = bid_sizes.iter().sum();
+        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
+        if let Some(&tightest_depth) = bid_depths.first() {
+            let offset = mid * (tightest_depth / 10000.0);
+            let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
+
+            if bid_price * total_size_truncated >= min_notional {
+                tracing::info!(
+                    total_size = %format!("{:.6}", total_size_truncated),
+                    price = %format!("{:.4}", bid_price),
+                    notional = %format!("{:.2}", bid_price * total_size_truncated),
+                    depth_bps = %format!("{:.2}", tightest_depth),
+                    "Bid concentration fallback (asymmetric): single order at tightest depth"
+                );
+                bids.push(LadderLevel {
+                    price: bid_price,
+                    size: total_size_truncated,
+                    depth_bps: tightest_depth,
+                });
+            }
+        }
+    }
+
+    // Concentration fallback for asks (asymmetric)
+    if asks.is_empty() && !ask_depths.is_empty() && !ask_sizes.is_empty() {
+        let total_size: f64 = ask_sizes.iter().sum();
+        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
+        if let Some(&tightest_depth) = ask_depths.first() {
+            let offset = mid * (tightest_depth / 10000.0);
+            let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+
+            if ask_price * total_size_truncated >= min_notional {
+                tracing::info!(
+                    total_size = %format!("{:.6}", total_size_truncated),
+                    price = %format!("{:.4}", ask_price),
+                    notional = %format!("{:.2}", ask_price * total_size_truncated),
+                    depth_bps = %format!("{:.2}", tightest_depth),
+                    "Ask concentration fallback (asymmetric): single order at tightest depth"
+                );
+                asks.push(LadderLevel {
+                    price: ask_price,
+                    size: total_size_truncated,
+                    depth_bps: tightest_depth,
+                });
+            }
         }
     }
 

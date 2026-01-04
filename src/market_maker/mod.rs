@@ -126,6 +126,16 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// This is THE source of truth for all position limit checks.
     /// NEVER use config.max_position directly for runtime decisions.
     effective_max_position: f64,
+
+    /// Effective target liquidity SIZE (contracts), updated each quote cycle.
+    ///
+    /// Derived from first principles:
+    /// - min_viable = MIN_ORDER_NOTIONAL / mid_price (exchange requirement)
+    /// - effective = max(config.target_liquidity, min_viable).min(effective_max_position)
+    ///
+    /// This ensures orders are viable for ANY asset on ANY DEX, regardless of price.
+    /// NEVER use config.target_liquidity directly for runtime quoting.
+    effective_target_liquidity: f64,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -213,6 +223,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Initialize effective_max_position to static fallback (used during warmup)
         let effective_max_position = config.max_position;
 
+        // Initialize effective_target_liquidity to static fallback (used during warmup)
+        // Will be updated with first-principles min_viable floor once we have price data
+        let effective_target_liquidity = config.target_liquidity;
+
         Self {
             config,
             strategy,
@@ -232,6 +246,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             infra,
             stochastic,
             effective_max_position,
+            effective_target_liquidity,
         }
     }
 
@@ -341,6 +356,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 exchange_position
             );
         }
+
+        // Initialize metrics with current position
+        // This ensures metrics show correct position from startup (not 0)
+        self.infra.prometheus.update_position(
+            self.position.position(),
+            self.effective_max_position,
+        );
 
         Ok(())
     }
@@ -1189,6 +1211,35 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
         self.effective_max_position = new_effective;
 
+        // CRITICAL: Update cached effective target_liquidity from first principles
+        // min_viable = MIN_ORDER_NOTIONAL / price ensures orders pass exchange minimum
+        // This is THE source of truth for all sizing calculations
+        //
+        // Account for size truncation: sz_decimals truncation can lose up to 10^(-sz_decimals)
+        // Example: sz_decimals=2 → truncation can lose 0.01 → add buffer of 1.5× tick
+        // Formula: min_viable = min_notional / price + 1.5 × 10^(-sz_decimals)
+        let truncation_buffer = 1.5 * (10.0_f64).powi(-(self.config.sz_decimals as i32));
+        let min_viable_liquidity =
+            (MIN_ORDER_NOTIONAL / market_params.microprice) + truncation_buffer;
+        let new_effective_liquidity = self
+            .config
+            .target_liquidity
+            .max(min_viable_liquidity) // Ensure orders pass min_notional after truncation
+            .min(self.effective_max_position); // Can't exceed position limit
+
+        if (new_effective_liquidity - self.effective_target_liquidity).abs() > 0.001 {
+            info!(
+                old = %format!("{:.6}", self.effective_target_liquidity),
+                new = %format!("{:.6}", new_effective_liquidity),
+                config_target = %format!("{:.6}", self.config.target_liquidity),
+                min_viable = %format!("{:.6}", min_viable_liquidity),
+                truncation_buffer = %format!("{:.6}", truncation_buffer),
+                max_position = %format!("{:.6}", self.effective_max_position),
+                "Effective target liquidity updated (first-principles with truncation buffer)"
+            );
+        }
+        self.effective_target_liquidity = new_effective_liquidity;
+
         // Log adaptive system status if enabled
         if self.stochastic.stochastic_config.use_adaptive_spreads {
             let adaptive = &self.stochastic.adaptive_spreads;
@@ -1218,7 +1269,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             dynamic_max_pos = %format!("{:.6}", market_params.dynamic_max_position),
             effective_max_pos = %format!("{:.6}", self.effective_max_position),
             dynamic_valid = market_params.dynamic_limit_valid,
-            target_liq = self.config.target_liquidity,
+            config_target_liq = self.config.target_liquidity,
+            effective_target_liq = %format!("{:.6}", self.effective_target_liquidity),
             sigma_clean = %format!("{:.6}", market_params.sigma),
             sigma_effective = %format!("{:.6}", market_params.sigma_effective),
             kappa = %format!("{:.2}", market_params.kappa),
@@ -1237,11 +1289,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .update_fill_model_params(market_params.sigma, market_params.kelly_time_horizon);
 
         // Try multi-level ladder quoting first
+        // HARMONIZED: Use effective_target_liquidity (first-principles derived)
         let ladder = self.strategy.calculate_ladder(
             &quote_config,
             self.position.position(),
-            self.config.max_position,
-            self.config.target_liquidity,
+            self.effective_max_position,         // First-principles limit
+            self.effective_target_liquidity,     // First-principles viable size
             &market_params,
         );
 
@@ -1289,6 +1342,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "Calculated ladder quotes"
             );
 
+            // DIAGNOSTIC: Warn when ladder is completely empty after processing
+            // This helps diagnose min_notional and capacity issues at INFO level
+            if bid_quotes.is_empty() && ask_quotes.is_empty() {
+                let pos = self.position.position();
+                let max_pos = self.effective_max_position;
+                let mid = self.latest_mid;
+                warn!(
+                    position = %format!("{:.6}", pos),
+                    max_position = %format!("{:.6}", max_pos),
+                    mid_price = %format!("{:.2}", mid),
+                    bid_capacity_notional = %format!("{:.2}", (max_pos - pos).max(0.0) * mid),
+                    ask_capacity_notional = %format!("{:.2}", (max_pos + pos).max(0.0) * mid),
+                    min_notional = %format!("{:.2}", MIN_ORDER_NOTIONAL),
+                    reduce_only_was_filtered = reduce_only_result.was_filtered,
+                    "No orders to place: ladder empty after filtering (check min_notional vs capacity)"
+                );
+                return Ok(());
+            }
+
             // Reconcile ladder quotes
             if self.config.smart_reconcile {
                 // Smart reconciliation with ORDER MODIFY for queue preservation
@@ -1300,11 +1372,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         } else {
             // Fallback to single-quote mode for non-ladder strategies
+            // HARMONIZED: Use effective values (first-principles derived)
             let (mut bid, mut ask) = self.strategy.calculate_quotes(
                 &quote_config,
                 self.position.position(),
-                self.config.max_position,
-                self.config.target_liquidity,
+                self.effective_max_position,         // First-principles limit
+                self.effective_target_liquidity,     // First-principles viable size
                 &market_params,
             );
 

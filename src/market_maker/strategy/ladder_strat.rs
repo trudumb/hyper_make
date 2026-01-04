@@ -459,11 +459,27 @@ impl LadderStrategy {
         // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
         //      Σ sᵢ ≤ effective_max_position (position constraint - first principles)
         //      Σ sᵢ ≤ exchange_limit (exchange-enforced constraint)
+        tracing::debug!(
+            use_constrained_optimizer = market_params.use_constrained_optimizer,
+            "Checking constrained optimizer path"
+        );
         if market_params.use_constrained_optimizer {
             // 1. Available margin comes from the exchange (already accounts for position margin)
             // NOTE: margin_available is already net of position margin, don't double-count!
             let leverage = market_params.leverage.max(1.0);
             let available_margin = market_params.margin_available;
+
+            // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
+            // This prevents the optimizer from producing empty ladders due to margin=0
+            if available_margin < EPSILON {
+                warn!(
+                    margin_available = %format!("{:.2}", available_margin),
+                    leverage = %format!("{:.1}", leverage),
+                    "Constrained optimizer skipped: margin not yet available (warmup incomplete?)"
+                );
+                // Fall through to legacy path at end of function
+                return Ladder::generate(&ladder_config, &params);
+            }
 
             // 2. Calculate ASYMMETRIC position limits per side
             // CRITICAL BUG FIX: When over max position, we need to allow reduce-only orders
@@ -763,6 +779,22 @@ impl LadderStrategy {
                     min_level_size = %format!("{:.6}", ladder_config.min_level_size),
                     mid_price = %format!("{:.2}", market_params.microprice),
                     "All ask levels filtered out (sizes too small)"
+                );
+            }
+
+            // DIAGNOSTIC: Detailed warning when ladder is completely empty
+            // Helps identify margin, min_notional, or capacity constraints
+            if ladder.bids.is_empty() && ladder.asks.is_empty() {
+                let dynamic_min_size = config.min_notional / market_params.microprice;
+                warn!(
+                    available_for_bids = %format!("{:.6}", available_for_bids),
+                    available_for_asks = %format!("{:.6}", available_for_asks),
+                    min_notional = %format!("{:.2}", config.min_notional),
+                    dynamic_min_size = %format!("{:.6}", dynamic_min_size),
+                    margin_available = %format!("{:.2}", available_margin),
+                    bid_notional = %format!("{:.2}", available_for_bids * market_params.microprice),
+                    ask_notional = %format!("{:.2}", available_for_asks * market_params.microprice),
+                    "Ladder completely empty: all levels below min_notional or margin constraint"
                 );
             }
 

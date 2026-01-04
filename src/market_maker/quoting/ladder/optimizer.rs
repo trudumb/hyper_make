@@ -117,6 +117,7 @@ impl ConstrainedLadderOptimizer {
     /// rather than concentrating in a single level.
     pub fn optimize(&self, levels: &[LevelOptimizationParams]) -> ConstrainedAllocation {
         if levels.is_empty() {
+            tracing::warn!("Optimizer called with empty levels array");
             return ConstrainedAllocation {
                 sizes: vec![],
                 shadow_price: 0.0,
@@ -133,16 +134,22 @@ impl ConstrainedLadderOptimizer {
             .collect();
 
         let total_mv: f64 = marginal_values.iter().sum();
+
+        // Diagnostic: log marginal values and spread captures
         if total_mv <= EPSILON {
-            // No profitable levels
-            return ConstrainedAllocation {
-                sizes: vec![0.0; levels.len()],
-                shadow_price: 0.0,
-                margin_used: 0.0,
-                position_used: 0.0,
-                binding_constraint: BindingConstraint::None,
-            };
+            let max_sc = levels.iter().map(|l| l.spread_capture).fold(0.0_f64, f64::max);
+            let max_fi = levels.iter().map(|l| l.fill_intensity).fold(0.0_f64, f64::max);
+            tracing::info!(
+                levels = levels.len(),
+                total_mv = %format!("{:.6}", total_mv),
+                max_spread_capture = %format!("{:.4}", max_sc),
+                max_fill_intensity = %format!("{:.4}", max_fi),
+                max_position = %format!("{:.6}", self.max_position),
+                "Optimizer: total_mv near zero, will use concentration fallback"
+            );
         }
+        // NOTE: Don't early-return when total_mv <= EPSILON!
+        // Let the concentration fallback handle this case.
 
         // 2. Determine maximum allocable position from constraints
         // Use first level's margin_per_unit (they should all be the same)
@@ -169,10 +176,17 @@ impl ConstrainedLadderOptimizer {
         let effective_min_size = dynamic_min_size.max(1e-8); // Absolute floor for precision
 
         // 4. Allocate sizes proportional to marginal value
-        let mut raw_sizes: Vec<f64> = marginal_values
-            .iter()
-            .map(|&mv| max_position_total * mv / total_mv)
-            .collect();
+        // Guard against division by zero when total_mv is near zero
+        let mut raw_sizes: Vec<f64> = if total_mv > EPSILON {
+            marginal_values
+                .iter()
+                .map(|&mv| max_position_total * mv / total_mv)
+                .collect()
+        } else {
+            // All marginal values are zero - set all sizes to zero
+            // The concentration fallback below will handle this case
+            vec![0.0; levels.len()]
+        };
 
         // 5. Filter out levels below effective min_size or min_notional thresholds
         for size in raw_sizes.iter_mut() {
@@ -186,30 +200,81 @@ impl ConstrainedLadderOptimizer {
         // concentrate into the single best level to guarantee at least one quote
         let valid_count = raw_sizes.iter().filter(|&&s| s > EPSILON).count();
         if valid_count == 0 && max_position_total >= effective_min_size {
-            // Find best level by marginal value
-            if let Some((best_idx, best_mv)) = marginal_values
+            // Try to find best level by marginal value first
+            let best_by_mv = marginal_values
                 .iter()
                 .enumerate()
                 .filter(|(_, &mv)| mv > EPSILON)
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                // Concentrate entire capacity into best level
-                raw_sizes = vec![0.0; levels.len()];
-                let concentrated_size = max_position_total.max(effective_min_size);
-                let notional = concentrated_size * self.price;
-                // Only place if meets notional minimum
-                if notional >= self.min_notional {
-                    raw_sizes[best_idx] = concentrated_size;
-                    tracing::info!(
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // If all marginal values are zero (e.g., spread capture <= 0),
+            // fall back to the tightest level (smallest depth = highest fill probability)
+            let (best_idx, fallback_reason) = if let Some((idx, mv)) = best_by_mv {
+                tracing::info!(
+                    levels = levels.len(),
+                    best_level = idx,
+                    best_mv = %format!("{:.6}", mv),
+                    "Concentration fallback (MV): selected by marginal value"
+                );
+                (idx, "mv")
+            } else {
+                // All marginal values zero - check if any level has positive spread capture
+                // Only fall back to tightest level if at least one spread_capture > 0
+                // (otherwise the quotes would be unprofitable)
+                let has_profitable_level = levels.iter().any(|l| l.spread_capture > EPSILON);
+                if !has_profitable_level {
+                    tracing::debug!(
                         levels = levels.len(),
-                        best_level = best_idx,
-                        concentrated_size = %format!("{:.6}", concentrated_size),
-                        notional = %format!("{:.2}", notional),
-                        max_position_total = %format!("{:.6}", max_position_total),
-                        best_mv = %format!("{:.6}", best_mv),
-                        "Concentration fallback: single quote at best level"
+                        "No fallback: all spread captures non-positive (unprofitable)"
                     );
+                    // Return early without placing any orders
+                    return ConstrainedAllocation {
+                        sizes: raw_sizes,
+                        shadow_price: 0.0,
+                        margin_used: 0.0,
+                        position_used: 0.0,
+                        binding_constraint,
+                    };
                 }
+
+                // Use tightest level with positive spread capture
+                let tightest_idx = levels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.spread_capture > EPSILON)
+                    .min_by(|a, b| {
+                        a.1.depth_bps
+                            .partial_cmp(&b.1.depth_bps)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                tracing::info!(
+                    levels = levels.len(),
+                    best_level = tightest_idx,
+                    depth_bps = %format!("{:.2}", levels.get(tightest_idx).map(|l| l.depth_bps).unwrap_or(0.0)),
+                    spread_capture = %format!("{:.4}", levels.get(tightest_idx).map(|l| l.spread_capture).unwrap_or(0.0)),
+                    "Concentration fallback (depth): all MV zero but spread positive, using tightest level"
+                );
+                (tightest_idx, "depth")
+            };
+
+            // Concentrate entire capacity into best level
+            raw_sizes = vec![0.0; levels.len()];
+            let concentrated_size = max_position_total.max(effective_min_size);
+            let notional = concentrated_size * self.price;
+            // Only place if meets notional minimum
+            if notional >= self.min_notional {
+                raw_sizes[best_idx] = concentrated_size;
+                tracing::info!(
+                    levels = levels.len(),
+                    best_level = best_idx,
+                    concentrated_size = %format!("{:.6}", concentrated_size),
+                    notional = %format!("{:.2}", notional),
+                    max_position_total = %format!("{:.6}", max_position_total),
+                    fallback_reason = fallback_reason,
+                    "Concentration fallback: single quote at best level"
+                );
             }
         }
 
@@ -281,6 +346,7 @@ impl ConstrainedLadderOptimizer {
         kelly_params: &KellyStochasticParams,
     ) -> ConstrainedAllocation {
         if levels.is_empty() {
+            tracing::warn!("Kelly optimizer called with empty levels array");
             return ConstrainedAllocation {
                 sizes: vec![],
                 shadow_price: 0.0,
@@ -316,15 +382,25 @@ impl ConstrainedLadderOptimizer {
             .collect();
 
         let total_kelly: f64 = kelly_values.iter().sum();
+
+        // Diagnostic: log when Kelly values are near zero
         if total_kelly <= EPSILON {
-            return ConstrainedAllocation {
-                sizes: vec![0.0; levels.len()],
-                shadow_price: 0.0,
-                margin_used: 0.0,
-                position_used: 0.0,
-                binding_constraint: BindingConstraint::None,
-            };
+            let max_sc = levels.iter().map(|l| l.spread_capture).fold(0.0_f64, f64::max);
+            let max_kv = kelly_values.iter().fold(0.0_f64, |a, &b| a.max(b));
+            tracing::info!(
+                levels = levels.len(),
+                total_kelly = %format!("{:.6}", total_kelly),
+                max_spread_capture = %format!("{:.4}", max_sc),
+                max_kelly_value = %format!("{:.6}", max_kv),
+                max_position = %format!("{:.6}", self.max_position),
+                alpha_touch = %format!("{:.4}", kelly_params.alpha_touch),
+                sigma = %format!("{:.6}", kelly_params.sigma),
+                time_horizon = %format!("{:.1}", kelly_params.time_horizon),
+                "Kelly optimizer: total_kelly near zero, will use concentration fallback"
+            );
         }
+        // NOTE: Don't early-return when total_kelly <= EPSILON!
+        // Let the concentration fallback handle this case.
 
         // 2. Determine maximum allocable position from constraints
         let margin_per_unit = levels[0].margin_per_unit;
@@ -349,10 +425,17 @@ impl ConstrainedLadderOptimizer {
         let effective_min_size = dynamic_min_size.max(1e-8); // Absolute floor for precision
 
         // 4. Allocate sizes proportional to Kelly-weighted values
-        let mut raw_sizes: Vec<f64> = kelly_values
-            .iter()
-            .map(|&kv| max_position_total * kv / total_kelly)
-            .collect();
+        // Guard against division by zero when total_kelly is near zero
+        let mut raw_sizes: Vec<f64> = if total_kelly > EPSILON {
+            kelly_values
+                .iter()
+                .map(|&kv| max_position_total * kv / total_kelly)
+                .collect()
+        } else {
+            // All Kelly values are zero - set all sizes to zero
+            // The concentration fallback below will handle this case
+            vec![0.0; levels.len()]
+        };
 
         // 5. Filter out levels below effective min_size or min_notional thresholds
         for size in raw_sizes.iter_mut() {
@@ -366,30 +449,81 @@ impl ConstrainedLadderOptimizer {
         // concentrate into the single best level to guarantee at least one quote
         let valid_count = raw_sizes.iter().filter(|&&s| s > EPSILON).count();
         if valid_count == 0 && max_position_total >= effective_min_size {
-            // Find best level by Kelly value
-            if let Some((best_idx, best_kv)) = kelly_values
+            // Try to find best level by Kelly value first
+            let best_by_kelly = kelly_values
                 .iter()
                 .enumerate()
                 .filter(|(_, &kv)| kv > EPSILON)
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                // Concentrate entire capacity into best level
-                raw_sizes = vec![0.0; levels.len()];
-                let concentrated_size = max_position_total.max(effective_min_size);
-                let notional = concentrated_size * self.price;
-                // Only place if meets notional minimum
-                if notional >= self.min_notional {
-                    raw_sizes[best_idx] = concentrated_size;
-                    tracing::info!(
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // If all Kelly values are zero (e.g., all expected returns negative),
+            // fall back to the tightest level (smallest depth = highest fill probability)
+            let (best_idx, fallback_reason) = if let Some((idx, kv)) = best_by_kelly {
+                tracing::info!(
+                    levels = levels.len(),
+                    best_level = idx,
+                    best_kelly = %format!("{:.6}", kv),
+                    "Concentration fallback (Kelly): selected by Kelly value"
+                );
+                (idx, "kelly")
+            } else {
+                // All Kelly values zero - check if any level has positive spread capture
+                // Only fall back to tightest level if at least one spread_capture > 0
+                // (otherwise the quotes would be unprofitable)
+                let has_profitable_level = levels.iter().any(|l| l.spread_capture > EPSILON);
+                if !has_profitable_level {
+                    tracing::debug!(
                         levels = levels.len(),
-                        best_level = best_idx,
-                        concentrated_size = %format!("{:.6}", concentrated_size),
-                        notional = %format!("{:.2}", notional),
-                        max_position_total = %format!("{:.6}", max_position_total),
-                        best_kelly = %format!("{:.6}", best_kv),
-                        "Concentration fallback (Kelly): single quote at best level"
+                        "No fallback (Kelly): all spread captures non-positive (unprofitable)"
                     );
+                    // Return early without placing any orders
+                    return ConstrainedAllocation {
+                        sizes: raw_sizes,
+                        shadow_price: 0.0,
+                        margin_used: 0.0,
+                        position_used: 0.0,
+                        binding_constraint,
+                    };
                 }
+
+                // Use tightest level with positive spread capture
+                let tightest_idx = levels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.spread_capture > EPSILON)
+                    .min_by(|a, b| {
+                        a.1.depth_bps
+                            .partial_cmp(&b.1.depth_bps)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                tracing::info!(
+                    levels = levels.len(),
+                    best_level = tightest_idx,
+                    depth_bps = %format!("{:.2}", levels.get(tightest_idx).map(|l| l.depth_bps).unwrap_or(0.0)),
+                    spread_capture = %format!("{:.4}", levels.get(tightest_idx).map(|l| l.spread_capture).unwrap_or(0.0)),
+                    "Concentration fallback (depth): all Kelly zero but spread positive, using tightest level"
+                );
+                (tightest_idx, "depth")
+            };
+
+            // Concentrate entire capacity into best level
+            raw_sizes = vec![0.0; levels.len()];
+            let concentrated_size = max_position_total.max(effective_min_size);
+            let notional = concentrated_size * self.price;
+            // Only place if meets notional minimum
+            if notional >= self.min_notional {
+                raw_sizes[best_idx] = concentrated_size;
+                tracing::info!(
+                    levels = levels.len(),
+                    best_level = best_idx,
+                    concentrated_size = %format!("{:.6}", concentrated_size),
+                    notional = %format!("{:.2}", notional),
+                    max_position_total = %format!("{:.6}", max_position_total),
+                    fallback_reason = fallback_reason,
+                    "Concentration fallback: single quote at best level"
+                );
             }
         }
 
