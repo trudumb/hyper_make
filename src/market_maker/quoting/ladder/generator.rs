@@ -1,5 +1,12 @@
 //! Ladder generation logic.
 //!
+//! **NOTE**: The concentration fallback logic in this module (collapsing to 1-2 orders
+//! when spread capture is negative) is superseded by the entropy-based allocation in
+//! `entropy_distribution.rs`. When `use_entropy_distribution=true`, the entropy system
+//! maintains diversity through entropy constraints instead of collapsing.
+//!
+//! This module's fallback code is retained for backward compatibility.
+//!
 //! Implements multi-level quote generation with:
 //! - Geometric or linear depth spacing
 //! - Fill intensity modeling: λ(δ) = σ²/δ²

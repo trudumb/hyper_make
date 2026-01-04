@@ -1,5 +1,10 @@
 //! Constrained ladder optimization with multiple allocation strategies.
 //!
+//! **DEPRECATED**: This module is superseded by `entropy_optimizer.rs` which provides
+//! entropy-constrained allocation. Use `EntropyConstrainedOptimizer` instead.
+//!
+//! This module is retained for backward compatibility when `use_entropy_distribution=false`.
+//!
 //! Supports two allocation methods:
 //! 1. **Proportional MV**: Sizes proportional to marginal value λ(δ) × SC(δ)
 //! 2. **Kelly-Stochastic**: Uses first-passage fill probability and Kelly criterion
@@ -61,6 +66,9 @@ impl Default for KellyStochasticParams {
 
 /// Constrained ladder optimizer implementing proportional allocation.
 ///
+/// **DEPRECATED**: Use `EntropyConstrainedOptimizer` instead, which provides entropy-based
+/// allocation that maintains diversity and prevents concentration fallback to 1-2 orders.
+///
 /// Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ
 /// subject to:
 ///   - Σ margin(sᵢ) ≤ M_available (margin constraint)
@@ -69,6 +77,10 @@ impl Default for KellyStochasticParams {
 ///
 /// Uses proportional allocation: sizes proportional to marginal value MV(δ) = λ(δ) × SC(δ).
 /// This distributes capital across all profitable levels for robust ladder quoting.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use EntropyConstrainedOptimizer for entropy-based allocation"
+)]
 #[derive(Debug, Clone)]
 pub struct ConstrainedLadderOptimizer {
     /// Available margin for placing orders
@@ -85,6 +97,7 @@ pub struct ConstrainedLadderOptimizer {
     pub leverage: f64,
 }
 
+#[allow(deprecated)]
 impl ConstrainedLadderOptimizer {
     /// Create new optimizer with constraints.
     pub fn new(

@@ -500,7 +500,7 @@ impl Default for MarketParams {
             kalman_spread_widening: 0.0, // Will be computed from Kalman filter
             kalman_warmed_up: false,     // Not warmed up initially
             // Constrained Optimizer (stochastic integration)
-            use_constrained_optimizer: false, // Default OFF for safety
+            use_constrained_optimizer: true, // Enable for entropy-based allocation
             margin_available: 0.0,            // Will be fetched from margin sizer
             leverage: 1.0,                    // Default 1x leverage
             // Kelly-Stochastic Allocation (stochastic integration)
@@ -528,8 +528,8 @@ impl Default for MarketParams {
             tight_quoting_allowed: false, // Conservative default
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
-            // Entropy-Based Distribution
-            use_entropy_distribution: false,  // Default OFF for backwards compatibility
+            // Entropy-Based Distribution (FIRST PRINCIPLES)
+            use_entropy_distribution: true,   // Entropy-based allocation (replaces concentration fallback)
             entropy_min_entropy: 1.5,         // At least ~4.5 effective levels
             entropy_base_temperature: 1.0,    // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level

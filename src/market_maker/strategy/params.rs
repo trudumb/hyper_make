@@ -352,7 +352,7 @@ pub struct MarginConstraintParams {
 impl Default for MarginConstraintParams {
     fn default() -> Self {
         Self {
-            use_constrained_optimizer: false,
+            use_constrained_optimizer: true, // Enable for entropy-based allocation
             margin_available: 0.0,
             leverage: 1.0,
         }
@@ -565,7 +565,7 @@ pub struct EntropyDistributionParams {
 impl Default for EntropyDistributionParams {
     fn default() -> Self {
         Self {
-            use_entropy_distribution: false,
+            use_entropy_distribution: true, // First principles: entropy-based allocation
             min_entropy: 1.5,
             base_temperature: 1.0,
             min_allocation_floor: 0.02,

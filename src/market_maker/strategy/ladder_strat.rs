@@ -6,10 +6,12 @@ use crate::{truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
+#[allow(deprecated)] // ConstrainedLadderOptimizer is deprecated but kept for legacy path
 use crate::market_maker::quoting::{
     BayesianFillModel, ConstrainedLadderOptimizer, DepthSpacing, DynamicDepthConfig,
-    DynamicDepthGenerator, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
-    LevelOptimizationParams,
+    DynamicDepthGenerator, EntropyConstrainedOptimizer, EntropyDistributionConfig,
+    EntropyOptimizerConfig, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
+    LevelOptimizationParams, MarketRegime,
 };
 
 use super::{MarketParams, QuotingStrategy, RiskConfig};
@@ -260,6 +262,26 @@ impl LadderStrategy {
     fn holding_time(&self, arrival_intensity: f64) -> f64 {
         let safe_intensity = arrival_intensity.max(0.01);
         (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
+    }
+
+    /// Build a MarketRegime from MarketParams for entropy-based allocation.
+    ///
+    /// The MarketRegime provides market state signals that the entropy optimizer
+    /// uses to adapt its temperature and allocation behavior:
+    /// - Higher toxicity → higher temperature → more uniform distribution
+    /// - Higher cascade severity → more conservative allocation
+    fn build_market_regime(market_params: &MarketParams) -> MarketRegime {
+        MarketRegime {
+            toxicity: market_params.jump_ratio,
+            volatility_ratio: market_params.sigma_effective / 0.0001, // Normalized to 1bp baseline
+            cascade_severity: if market_params.should_pull_quotes {
+                1.0
+            } else {
+                // Scale from tail_risk_multiplier: 1.0 → 0.0, 5.0 → 1.0
+                (market_params.tail_risk_multiplier - 1.0) / 4.0
+            },
+            book_imbalance: market_params.book_imbalance,
+        }
     }
 
     /// Generate full ladder from market params.
@@ -596,6 +618,8 @@ impl LadderStrategy {
             let mut ladder = Ladder::generate(&ladder_config, &params);
 
             // 5. Create separate optimizers for bids and asks with their respective limits
+            // These are only used when use_entropy_distribution=false (legacy path)
+            #[allow(deprecated)]
             let optimizer_bids = ConstrainedLadderOptimizer::new(
                 available_margin,
                 available_for_bids,
@@ -604,6 +628,7 @@ impl LadderStrategy {
                 market_params.microprice,
                 leverage,
             );
+            #[allow(deprecated)]
             let optimizer_asks = ConstrainedLadderOptimizer::new(
                 available_margin,
                 available_for_asks,
@@ -641,9 +666,46 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 6. Optimize bid sizes (use Kelly-Stochastic if enabled)
+            // 6. Optimize bid sizes (entropy-based > Kelly-Stochastic > proportional MV)
             if !bid_level_params.is_empty() {
-                let allocation = if market_params.use_kelly_stochastic {
+                let allocation = if market_params.use_entropy_distribution {
+                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                    // Uses information-theoretic entropy constraints to maintain diversity
+                    // and prevent collapse to 1-2 orders even under adverse conditions.
+                    let entropy_config = EntropyOptimizerConfig {
+                        distribution: EntropyDistributionConfig {
+                            min_entropy: market_params.entropy_min_entropy,
+                            base_temperature: market_params.entropy_base_temperature,
+                            min_allocation_floor: market_params.entropy_min_allocation_floor,
+                            thompson_samples: market_params.entropy_thompson_samples,
+                            ..Default::default()
+                        },
+                        min_notional: config.min_notional,
+                        ..Default::default()
+                    };
+
+                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                        entropy_config,
+                        market_params.microprice,
+                        available_margin,
+                        available_for_bids,
+                        leverage,
+                    );
+
+                    let regime = Self::build_market_regime(market_params);
+                    let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
+
+                    info!(
+                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                        entropy_floor_active = entropy_alloc.entropy_floor_active,
+                        active_levels = entropy_alloc.active_levels,
+                        "Entropy optimizer applied to bids"
+                    );
+
+                    entropy_alloc.to_legacy()
+                } else if market_params.use_kelly_stochastic {
+                    // === KELLY-STOCHASTIC ALLOCATION (LEGACY) ===
                     // Apply volatility regime adjustment to Kelly fraction
                     // High vol → more conservative (lower Kelly)
                     // Low vol → more aggressive (higher Kelly)
@@ -654,37 +716,31 @@ impl LadderStrategy {
 
                     let kelly_params = KellyStochasticParams {
                         sigma: market_params.sigma,
-                        time_horizon: market_params.kelly_time_horizon, // Diffusion-based tau for correct P(fill)
+                        time_horizon: market_params.kelly_time_horizon,
                         alpha_touch: market_params.kelly_alpha_touch,
                         alpha_decay_bps: market_params.kelly_alpha_decay_bps,
                         kelly_fraction: dynamic_kelly,
                     };
+
+                    debug!(
+                        kelly_fraction = %format!("{:.3}", dynamic_kelly),
+                        regime = ?market_params.volatility_regime,
+                        "Kelly-stochastic optimizer applied to bids (legacy)"
+                    );
+
                     optimizer_bids.optimize_kelly_stochastic(&bid_level_params, &kelly_params)
                 } else {
+                    // === PROPORTIONAL MV ALLOCATION (LEGACY) ===
+                    debug!("Proportional MV optimizer applied to bids (legacy)");
                     optimizer_bids.optimize(&bid_level_params)
                 };
+
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.bids.len() {
                         // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
                         ladder.bids[i].size = truncate_float(size, config.sz_decimals, false);
                     }
                 }
-                let effective_kelly = if market_params.use_kelly_stochastic {
-                    let regime_mult = market_params.volatility_regime.kelly_fraction_multiplier();
-                    (market_params.kelly_fraction * regime_mult).clamp(0.05, 0.75)
-                } else {
-                    0.0
-                };
-                debug!(
-                    binding = ?allocation.binding_constraint,
-                    margin_used = %format!("{:.2}", allocation.margin_used),
-                    position_used = %format!("{:.4}", allocation.position_used),
-                    shadow_price = %format!("{:.6}", allocation.shadow_price),
-                    kelly_stochastic = market_params.use_kelly_stochastic,
-                    kelly_fraction = %format!("{:.3}", effective_kelly),
-                    regime = ?market_params.volatility_regime,
-                    "Constrained optimizer applied to bids"
-                );
             }
 
             // 7. Build LevelOptimizationParams for asks
@@ -713,9 +769,46 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 8. Optimize ask sizes (use Kelly-Stochastic if enabled)
+            // 8. Optimize ask sizes (entropy-based > Kelly-Stochastic > proportional MV)
             if !ask_level_params.is_empty() {
-                let allocation = if market_params.use_kelly_stochastic {
+                let allocation = if market_params.use_entropy_distribution {
+                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                    // Uses information-theoretic entropy constraints to maintain diversity
+                    // and prevent collapse to 1-2 orders even under adverse conditions.
+                    let entropy_config = EntropyOptimizerConfig {
+                        distribution: EntropyDistributionConfig {
+                            min_entropy: market_params.entropy_min_entropy,
+                            base_temperature: market_params.entropy_base_temperature,
+                            min_allocation_floor: market_params.entropy_min_allocation_floor,
+                            thompson_samples: market_params.entropy_thompson_samples,
+                            ..Default::default()
+                        },
+                        min_notional: config.min_notional,
+                        ..Default::default()
+                    };
+
+                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                        entropy_config,
+                        market_params.microprice,
+                        available_margin,
+                        available_for_asks,
+                        leverage,
+                    );
+
+                    let regime = Self::build_market_regime(market_params);
+                    let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
+
+                    info!(
+                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                        entropy_floor_active = entropy_alloc.entropy_floor_active,
+                        active_levels = entropy_alloc.active_levels,
+                        "Entropy optimizer applied to asks"
+                    );
+
+                    entropy_alloc.to_legacy()
+                } else if market_params.use_kelly_stochastic {
+                    // === KELLY-STOCHASTIC ALLOCATION (LEGACY) ===
                     // Apply volatility regime adjustment to Kelly fraction
                     // High vol → more conservative (lower Kelly)
                     // Low vol → more aggressive (higher Kelly)
@@ -726,37 +819,31 @@ impl LadderStrategy {
 
                     let kelly_params = KellyStochasticParams {
                         sigma: market_params.sigma,
-                        time_horizon: market_params.kelly_time_horizon, // Diffusion-based tau for correct P(fill)
+                        time_horizon: market_params.kelly_time_horizon,
                         alpha_touch: market_params.kelly_alpha_touch,
                         alpha_decay_bps: market_params.kelly_alpha_decay_bps,
                         kelly_fraction: dynamic_kelly,
                     };
+
+                    debug!(
+                        kelly_fraction = %format!("{:.3}", dynamic_kelly),
+                        regime = ?market_params.volatility_regime,
+                        "Kelly-stochastic optimizer applied to asks (legacy)"
+                    );
+
                     optimizer_asks.optimize_kelly_stochastic(&ask_level_params, &kelly_params)
                 } else {
+                    // === PROPORTIONAL MV ALLOCATION (LEGACY) ===
+                    debug!("Proportional MV optimizer applied to asks (legacy)");
                     optimizer_asks.optimize(&ask_level_params)
                 };
+
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.asks.len() {
                         // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
                         ladder.asks[i].size = truncate_float(size, config.sz_decimals, false);
                     }
                 }
-                let effective_kelly = if market_params.use_kelly_stochastic {
-                    let regime_mult = market_params.volatility_regime.kelly_fraction_multiplier();
-                    (market_params.kelly_fraction * regime_mult).clamp(0.05, 0.75)
-                } else {
-                    0.0
-                };
-                debug!(
-                    binding = ?allocation.binding_constraint,
-                    margin_used = %format!("{:.2}", allocation.margin_used),
-                    position_used = %format!("{:.4}", allocation.position_used),
-                    shadow_price = %format!("{:.6}", allocation.shadow_price),
-                    kelly_stochastic = market_params.use_kelly_stochastic,
-                    kelly_fraction = %format!("{:.3}", effective_kelly),
-                    regime = ?market_params.volatility_regime,
-                    "Constrained optimizer applied to asks"
-                );
             }
 
             // 9. Filter out zero-size levels

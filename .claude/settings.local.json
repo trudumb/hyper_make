@@ -81,7 +81,8 @@
       "Bash(echo:*)",
       "mcp__serena__initial_instructions",
       "Bash(git -C:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::strategy::ladder_strat=trace timeout:*)"
     ]
   }
 }
