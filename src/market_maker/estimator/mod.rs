@@ -30,6 +30,7 @@
 mod book_kappa;
 mod calibration_controller;
 mod covariance;
+mod directional_risk;
 mod hierarchical_kappa;
 mod jump;
 mod kalman;
@@ -63,6 +64,9 @@ pub(crate) use robust_kappa::RobustKappaEstimator;
 
 // Re-export public types
 pub use calibration_controller::{CalibrationController, CalibrationControllerConfig};
+pub use directional_risk::{
+    DirectionalRiskConfig, DirectionalRiskEstimator, DirectionalRiskOutput,
+};
 pub use jump::{JumpEstimator, JumpEstimatorConfig};
 pub use kalman::{KalmanPriceFilter, NoiseFilter};
 pub use mock::MockEstimator;

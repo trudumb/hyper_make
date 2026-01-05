@@ -270,6 +270,22 @@ pub struct MarketParams {
     /// Whether HJB controller is in terminal zone (near session end)
     pub hjb_is_terminal_zone: bool,
 
+    // === Drift-Adjusted Skew (First Principles Extension) ===
+    /// Whether to use drift-adjusted skew from momentum signals.
+    /// When true, HJB skew incorporates predicted price drift.
+    pub use_drift_adjusted_skew: bool,
+    /// Drift urgency component of HJB skew (from momentum-position opposition).
+    /// Positive when position needs urgent reduction (opposed to momentum).
+    pub hjb_drift_urgency: f64,
+    /// Variance multiplier from directional risk.
+    /// > 1.0 when position opposes momentum (increased risk).
+    pub directional_variance_mult: f64,
+    /// Whether position opposes momentum (short + rising, long + falling).
+    pub position_opposes_momentum: bool,
+    /// Urgency score [0, 5] combining all urgency factors.
+    /// 0 = no urgency, 5 = maximum urgency (should cover/liquidate ASAP).
+    pub urgency_score: f64,
+
     // === Stochastic Module Integration (Kalman Filter) ===
     /// Whether to use Kalman filter spread widening
     pub use_kalman_filter: bool,
@@ -542,6 +558,12 @@ impl Default for MarketParams {
             hjb_gamma_multiplier: 1.0,   // No multiplier by default
             hjb_inventory_target: 0.0,   // Zero inventory target
             hjb_is_terminal_zone: false, // Not in terminal zone
+            // Drift-Adjusted Skew (first-principles momentum integration)
+            use_drift_adjusted_skew: true,       // ON by default for first-principles trading
+            hjb_drift_urgency: 0.0,              // No urgency initially
+            directional_variance_mult: 1.0,      // No variance adjustment initially
+            position_opposes_momentum: false,    // No opposition initially
+            urgency_score: 0.0,                  // No urgency initially
             // Kalman Filter (stochastic integration)
             use_kalman_filter: false,    // Default OFF for safety
             kalman_fair_price: 0.0,      // Will be computed from Kalman filter

@@ -608,7 +608,7 @@ use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::MarginAwareSizer;
 use crate::market_maker::process_models::{
-    FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,
+    DriftAdjustedSkew, FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,
     LiquidationCascadeDetector, SpreadProcessEstimator,
 };
 
@@ -636,6 +636,9 @@ pub struct ParameterSources<'a> {
     pub hjb_controller: &'a HJBInventoryController,
     pub margin_sizer: &'a MarginAwareSizer,
     pub stochastic_config: &'a StochasticConfig,
+
+    // Drift-adjusted skew (pre-computed from HJB controller + momentum)
+    pub drift_adjusted_skew: DriftAdjustedSkew,
 
     // Adaptive Bayesian system
     pub adaptive_spreads: &'a AdaptiveSpreadCalculator,
@@ -845,6 +848,14 @@ impl ParameterAggregator {
             hjb_gamma_multiplier: sources.hjb_controller.gamma_multiplier(),
             hjb_inventory_target: sources.hjb_controller.optimal_inventory_target(),
             hjb_is_terminal_zone: sources.hjb_controller.is_terminal_zone(),
+
+            // === Drift-Adjusted Skew (First Principles Extension) ===
+            // Compute drift-adjusted skew if momentum data available
+            use_drift_adjusted_skew: sources.stochastic_config.use_hjb_skew, // Enabled when HJB is enabled
+            hjb_drift_urgency: sources.drift_adjusted_skew.drift_urgency,
+            directional_variance_mult: sources.drift_adjusted_skew.variance_multiplier,
+            position_opposes_momentum: sources.drift_adjusted_skew.is_opposed,
+            urgency_score: sources.drift_adjusted_skew.urgency_score,
 
             // === Stochastic Module: Kalman Filter ===
             use_kalman_filter: sources.stochastic_config.use_kalman_filter,

@@ -1334,6 +1334,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .exchange_limits
             .update_local_max(pre_effective_max_position);
 
+        // Pre-compute drift-adjusted skew from HJB controller + momentum signals
+        let drift_adjusted_skew = self.stochastic.hjb_controller.optimal_skew_with_drift(
+            self.position.position(),
+            self.config.max_position,
+            self.estimator.momentum_bps(),
+            self.estimator.momentum_continuation_probability(),
+        );
+
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
@@ -1345,6 +1353,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             hjb_controller: &self.stochastic.hjb_controller,
             margin_sizer: &self.infra.margin_sizer,
             stochastic_config: &self.stochastic.stochastic_config,
+            drift_adjusted_skew,
             adaptive_spreads: &self.stochastic.adaptive_spreads,
             position: self.position.position(),
             max_position: self.config.max_position,
