@@ -638,6 +638,109 @@ impl MicropriceEstimator {
         }
     }
 
+    /// Get momentum-aware microprice with dynamic adjustment clamps.
+    ///
+    /// During strong momentum regimes with high continuation probability,
+    /// the microprice adjustment clamp is widened to allow larger shifts
+    /// in the fair price estimate.
+    ///
+    /// # Theory (First Principles)
+    ///
+    /// Standard microprice uses ±50 bps clamp which is conservative.
+    /// When momentum signals are strong with high continuation probability:
+    /// - The expected price move is larger than normal
+    /// - The microprice should shift more aggressively toward the predicted direction
+    /// - Dynamic clamp: ±50 bps + (momentum_bps × p_continuation × 0.3)
+    ///
+    /// # Arguments
+    /// * `mid` - Current mid price
+    /// * `book_imbalance` - Book imbalance signal [-1, 1]
+    /// * `flow_imbalance` - Flow imbalance signal [-1, 1]
+    /// * `momentum_bps` - Momentum in basis points (positive = rising)
+    /// * `p_continuation` - Probability momentum continues [0, 1]
+    /// * `urgency_score` - Urgency score [0, 5] from directional risk
+    #[allow(dead_code)] // Reserved for future integration with momentum-aware quoting
+    pub(crate) fn microprice_momentum_aware(
+        &self,
+        mid: f64,
+        book_imbalance: f64,
+        flow_imbalance: f64,
+        momentum_bps: f64,
+        p_continuation: f64,
+        urgency_score: f64,
+    ) -> f64 {
+        if !self.is_warmed_up() {
+            return mid;
+        }
+
+        // If R² is too low, the model has no predictive power - use mid
+        if self.r_squared < self.min_r_squared {
+            return mid;
+        }
+
+        // Mode-based adjustment (same as standard microprice)
+        let adjustment = match self.correlation_mode {
+            CorrelationMode::Combined => {
+                let net_pressure = book_imbalance - flow_imbalance;
+                self.beta_net * net_pressure
+            }
+            CorrelationMode::Orthogonalized | CorrelationMode::Independent => {
+                self.beta_book * book_imbalance + self.beta_flow * flow_imbalance
+            }
+        };
+
+        // === Dynamic Clamp Based on Momentum ===
+        // Base clamp: ±50 bps
+        // During strong momentum with high continuation:
+        // - Widen clamp proportionally to momentum strength
+        // - Max widening: 50 bps → 150 bps (3x) at extreme momentum
+        let base_clamp_bps = 50.0;
+
+        // Momentum-based widening factor
+        // momentum_factor = |momentum_bps| / 100 × p_continuation × (1 + urgency/5)
+        // Capped at 2.0 (allows up to 150 bps total clamp)
+        let momentum_factor = if momentum_bps.abs() > 15.0 && p_continuation > 0.5 {
+            let strength = (momentum_bps.abs() / 100.0).min(1.0);
+            let urgency_boost = 1.0 + (urgency_score / 5.0).min(1.0);
+            (strength * p_continuation * urgency_boost).min(2.0)
+        } else {
+            0.0
+        };
+
+        let dynamic_clamp_bps = base_clamp_bps * (1.0 + momentum_factor);
+        let dynamic_clamp = dynamic_clamp_bps / 10000.0;
+
+        // Clamp adjustment with dynamic bounds
+        let adjustment_clamped = adjustment.clamp(-dynamic_clamp, dynamic_clamp);
+
+        let raw_microprice = mid * (1.0 + adjustment_clamped);
+
+        // Apply EMA smoothing if enabled (same as standard)
+        if self.ema_alpha > 0.0 {
+            let prev_bits = self.ema_microprice_bits.load(Ordering::Relaxed);
+
+            if prev_bits == EMA_NONE {
+                self.ema_microprice_bits
+                    .store(raw_microprice.to_bits(), Ordering::Relaxed);
+                raw_microprice
+            } else {
+                let prev = f64::from_bits(prev_bits);
+                let change_bps = ((raw_microprice - prev) / prev).abs() * 10_000.0;
+
+                if change_bps < self.ema_min_change_bps {
+                    return prev;
+                }
+
+                let smoothed = self.ema_alpha * raw_microprice + (1.0 - self.ema_alpha) * prev;
+                self.ema_microprice_bits
+                    .store(smoothed.to_bits(), Ordering::Relaxed);
+                smoothed
+            }
+        } else {
+            raw_microprice
+        }
+    }
+
     pub(crate) fn is_warmed_up(&self) -> bool {
         self.n >= self.min_observations
     }

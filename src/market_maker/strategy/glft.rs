@@ -598,20 +598,51 @@ impl QuotingStrategy for GLFTStrategy {
         // This replaces all ad-hoc adjustments with data-driven signal integration.
         let fair_price = market_params.microprice;
 
-        // === 5a. MOMENTUM-CONDITIONAL SKEW AMPLIFICATION ===
-        // Theory: When position opposes strong momentum, increase skew to exit faster.
+        // === 5a. DRIFT-ADJUSTED SKEW (First Principles) ===
+        // Theory: When position opposes strong momentum with high continuation probability,
+        // we need URGENT position reduction. This is derived from the extended HJB equation
+        // with price drift: dS = μdt + σdW
         //
-        // Falling knife: market falling + long position = urgent need to sell
-        // Rising knife: market rising + short position = urgent need to cover
+        // The drift-adjusted skew replaces the ad-hoc momentum_skew_multiplier with a
+        // first-principles approach based on:
+        // - Drift rate (μ) estimated from momentum
+        // - Continuation probability P(momentum continues)
+        // - Directional variance (increased risk when opposed to momentum)
         //
-        // The flow-dampened skew handles mild flow opposition, but during strong
-        // momentum (falling/rising knife), we need MORE aggressive inventory reduction.
-        // This is a first-principles response to autocorrelated momentum.
-        let momentum_skew_multiplier = {
-            // Position direction: positive = long, negative = short
-            let pos_direction = position.signum();
+        // When drift adjustment is enabled AND position opposes momentum:
+        // - drift_urgency is added to base skew (accelerates position reduction)
+        // - directional_variance_mult scales effective variance (higher risk)
+        let (drift_urgency, momentum_skew_multiplier) = if market_params.use_drift_adjusted_skew
+            && market_params.position_opposes_momentum
+            && market_params.urgency_score > 0.5
+        {
+            // Use first-principles drift urgency from MarketParams
+            // The drift_urgency is computed by HJB controller using:
+            // - sensitivity × drift_rate × P(continue) × |q| × T
+            let drift_urg = market_params.hjb_drift_urgency;
 
-            // Momentum direction: falling_knife > rising_knife = falling
+            // Variance multiplier also affects the effective gamma
+            // Higher variance when opposed = more risk aversion = wider spreads
+            let var_mult = market_params.directional_variance_mult;
+
+            if market_params.urgency_score > 1.5 {
+                debug!(
+                    position = %format!("{:.4}", position),
+                    momentum_bps = %format!("{:.1}", market_params.momentum_bps),
+                    p_continue = %format!("{:.2}", market_params.p_momentum_continue),
+                    drift_urgency_bps = %format!("{:.2}", drift_urg * 10000.0),
+                    variance_mult = %format!("{:.2}", var_mult),
+                    urgency_score = %format!("{:.1}", market_params.urgency_score),
+                    "DRIFT-ADJUSTED SKEW: Position opposes momentum with high continuation prob"
+                );
+            }
+
+            // Convert variance multiplier to skew multiplier
+            // Higher variance = need stronger skew for same risk reduction
+            (drift_urg, var_mult.sqrt())
+        } else {
+            // Fallback to legacy momentum_skew_multiplier (ad-hoc approach)
+            let pos_direction = position.signum();
             let momentum_direction =
                 if market_params.falling_knife_score > market_params.rising_knife_score {
                     -1.0 // Falling
@@ -621,42 +652,39 @@ impl QuotingStrategy for GLFTStrategy {
                     0.0 // Neutral
                 };
 
-            // Momentum severity: max of falling/rising knife scores
             let momentum_severity = market_params
                 .falling_knife_score
                 .max(market_params.rising_knife_score);
 
-            // Opposition: position and momentum in opposite directions
             let is_opposed = pos_direction * momentum_direction < 0.0;
 
-            if is_opposed && momentum_severity > 0.5 {
-                // Amplify skew when opposed to strong momentum
-                // Up to 2x amplification at maximum momentum severity (score = 3)
+            let legacy_mult = if is_opposed && momentum_severity > 0.5 {
                 let amplification = 1.0 + (momentum_severity / 3.0).min(1.0);
-
                 if momentum_severity > 1.0 {
                     debug!(
                         position = %format!("{:.4}", position),
                         falling_knife = %format!("{:.2}", market_params.falling_knife_score),
                         rising_knife = %format!("{:.2}", market_params.rising_knife_score),
                         skew_amplifier = %format!("{:.2}x", amplification),
-                        "Momentum-opposed position: amplifying inventory skew"
+                        "Legacy momentum-opposed position: amplifying inventory skew"
                     );
                 }
-
                 amplification
             } else {
-                1.0 // No amplification
-            }
+                1.0
+            };
+
+            (0.0, legacy_mult)
         };
 
         // === 6. COMBINED SKEW WITH TIER 2 ADJUSTMENTS ===
         // Combine all skew components:
         // - base_skew: GLFT inventory skew × flow modifier (exp(-β × alignment))
+        // - drift_urgency: First-principles urgency from momentum-position opposition (HJB)
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
-        // - momentum amplification: when opposed to strong momentum
-        let skew = (base_skew + hawkes_skew + funding_skew) * momentum_skew_multiplier;
+        // - momentum amplification: variance-derived multiplier when opposed
+        let skew = (base_skew + drift_urgency + hawkes_skew + funding_skew) * momentum_skew_multiplier;
 
         // Calculate flow modifier for logging (same as in inventory_skew_with_flow)
         let flow_alignment = inventory_ratio.signum() * market_params.flow_imbalance;
@@ -687,9 +715,11 @@ impl QuotingStrategy for GLFTStrategy {
             flow_imb = %format!("{:.3}", market_params.flow_imbalance),
             flow_mod = %format!("{:.3}", flow_modifier),
             base_skew_bps = %format!("{:.4}", base_skew * 10000.0),
+            drift_urgency_bps = %format!("{:.4}", drift_urgency * 10000.0),
             hawkes_skew_bps = %format!("{:.4}", hawkes_skew * 10000.0),
             funding_skew_bps = %format!("{:.4}", funding_skew * 10000.0),
             total_skew_bps = %format!("{:.4}", skew * 10000.0),
+            urgency_score = %format!("{:.1}", market_params.urgency_score),
             spread_regime = ?market_params.spread_regime,
             vol_regime = ?market_params.volatility_regime,
             hawkes_activity = %format!("{:.2}", market_params.hawkes_activity_percentile),

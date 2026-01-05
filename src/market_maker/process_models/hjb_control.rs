@@ -48,6 +48,23 @@ pub struct HJBConfig {
     /// Maximum terminal skew multiplier
     /// Caps the terminal penalty contribution to prevent extreme skews
     pub max_terminal_multiplier: f64,
+
+    // === Drift-Adjusted Skew (First Principles Extension) ===
+    /// Enable drift-adjusted skew from momentum signals.
+    /// When true, incorporates predicted price drift into optimal skew.
+    pub use_drift_adjusted_skew: bool,
+
+    /// Sensitivity to momentum-position opposition [0.5, 3.0].
+    /// Higher values increase skew urgency when position opposes momentum.
+    pub opposition_sensitivity: f64,
+
+    /// Maximum drift urgency multiplier [1.5, 5.0].
+    /// Caps the drift contribution to prevent extreme skews.
+    pub max_drift_urgency: f64,
+
+    /// Minimum continuation probability to apply drift adjustment [0.3, 0.7].
+    /// Below this, momentum is considered noise.
+    pub min_continuation_prob: f64,
 }
 
 impl Default for HJBConfig {
@@ -59,6 +76,11 @@ impl Default for HJBConfig {
             funding_ewma_half_life: 3600.0, // 1 hour
             min_time_remaining: 60.0,       // 1 minute minimum
             max_terminal_multiplier: 5.0,   // Cap at 5x normal skew
+            // Drift-adjusted skew (enabled by default for first-principles trading)
+            use_drift_adjusted_skew: true,
+            opposition_sensitivity: 1.5,
+            max_drift_urgency: 3.0,
+            min_continuation_prob: 0.5,
         }
     }
 }
@@ -214,6 +236,165 @@ impl HJBInventoryController {
         self.optimal_skew(position, max_position) * 10000.0
     }
 
+    /// Compute drift-adjusted optimal skew from HJB solution with momentum.
+    ///
+    /// # Theory
+    ///
+    /// Standard HJB assumes price follows martingale: dS = σdW
+    /// With momentum signals, price has drift: dS = μdt + σdW
+    ///
+    /// The extended HJB optimal skew becomes:
+    /// ```text
+    /// skew = γσ²qT + terminal_penalty + funding_bias + drift_urgency
+    /// ```
+    ///
+    /// Where drift_urgency = μ × P(continuation) × time_exposure × opposition_factor
+    ///
+    /// When position **opposes** momentum (short + rising, long + falling):
+    /// - Adverse moves are more likely (momentum predicts unfavorable direction)
+    /// - We add urgency to accelerate position reduction
+    ///
+    /// When position **aligns** with momentum:
+    /// - Risk is lower, we slightly reduce urgency but stay conservative
+    ///
+    /// # Arguments
+    /// * `position` - Current position (positive = long, negative = short)
+    /// * `max_position` - Maximum position for normalization
+    /// * `momentum_bps` - Momentum in basis points (positive = rising)
+    /// * `p_continuation` - Probability momentum continues [0, 1]
+    ///
+    /// # Returns
+    /// Optimal skew in fractional units (multiply by price for absolute value).
+    pub fn optimal_skew_with_drift(
+        &self,
+        position: f64,
+        max_position: f64,
+        momentum_bps: f64,
+        p_continuation: f64,
+    ) -> DriftAdjustedSkew {
+        // Start with base HJB skew
+        let base_skew = self.optimal_skew(position, max_position);
+
+        if !self.config.use_drift_adjusted_skew {
+            return DriftAdjustedSkew {
+                total_skew: base_skew,
+                base_skew,
+                drift_urgency: 0.0,
+                variance_multiplier: 1.0,
+                is_opposed: false,
+                urgency_score: 0.0,
+            };
+        }
+
+        // Normalize position
+        let q = if max_position > 1e-10 {
+            (position / max_position).clamp(-1.0, 1.0)
+        } else {
+            return DriftAdjustedSkew {
+                total_skew: base_skew,
+                base_skew,
+                drift_urgency: 0.0,
+                variance_multiplier: 1.0,
+                is_opposed: false,
+                urgency_score: 0.0,
+            };
+        };
+
+        // Check if position opposes momentum
+        // Short (q < 0) + rising (momentum > 0) = opposed
+        // Long (q > 0) + falling (momentum < 0) = opposed
+        let is_opposed = q * momentum_bps < 0.0;
+
+        // Only apply drift adjustment if:
+        // 1. Position opposes momentum
+        // 2. Continuation probability exceeds threshold
+        // 3. Momentum is significant (> 10 bps)
+        let momentum_significant = momentum_bps.abs() > 10.0;
+        let continuation_confident = p_continuation >= self.config.min_continuation_prob;
+
+        if !is_opposed || !momentum_significant || !continuation_confident {
+            // No drift adjustment needed
+            return DriftAdjustedSkew {
+                total_skew: base_skew,
+                base_skew,
+                drift_urgency: 0.0,
+                variance_multiplier: 1.0,
+                is_opposed,
+                urgency_score: 0.0,
+            };
+        }
+
+        // === Compute Drift Urgency ===
+        // From optimal control with drift: urgency ∝ μ × P(continue) × |q| × T
+        let time_remaining = self.time_remaining().min(300.0); // Cap at 5 min exposure
+
+        // Convert momentum_bps to fractional drift rate
+        // Assume momentum measured over 500ms, so drift = momentum_bps / 10000 / 0.5
+        let drift_rate = (momentum_bps / 10000.0) / 0.5;
+
+        // Urgency formula:
+        // drift_urgency = sensitivity × drift_rate × P(continue) × |q| × T
+        let raw_urgency = self.config.opposition_sensitivity
+            * drift_rate.abs()
+            * p_continuation
+            * q.abs()
+            * time_remaining;
+
+        // Cap urgency
+        let max_base_urgency = base_skew.abs() * self.config.max_drift_urgency;
+        let drift_urgency_magnitude = raw_urgency.min(max_base_urgency);
+
+        // Sign: urgency should amplify the base skew direction
+        // If short (q < 0), base skew is negative (quotes shift up)
+        // Urgency should make it MORE negative (more aggressive buying)
+        let drift_urgency = drift_urgency_magnitude * q.signum();
+
+        // === Compute Variance Multiplier ===
+        // When opposed, increase effective variance for inventory risk
+        // σ²_eff = σ² × (1 + κ × |momentum/σ| × P(continue))
+        let momentum_vol_ratio = if self.sigma > 1e-10 {
+            ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+        } else {
+            0.0
+        };
+
+        let variance_multiplier = 1.0
+            + self.config.opposition_sensitivity * momentum_vol_ratio * p_continuation * q.abs();
+        let variance_multiplier_capped = variance_multiplier.min(self.config.max_drift_urgency);
+
+        // Urgency score for diagnostics [0, 5]
+        let urgency_score = (momentum_bps.abs() / 50.0).min(1.0) // Momentum strength
+            + p_continuation // Continuation confidence
+            + q.abs() // Position size
+            + momentum_vol_ratio.min(1.0) // Vol-adjusted momentum
+            + if self.is_terminal_zone() { 1.0 } else { 0.0 }; // Terminal zone boost
+
+        DriftAdjustedSkew {
+            total_skew: base_skew + drift_urgency,
+            base_skew,
+            drift_urgency,
+            variance_multiplier: variance_multiplier_capped,
+            is_opposed,
+            urgency_score: urgency_score.min(5.0),
+        }
+    }
+
+    /// Compute drift-adjusted skew in basis points.
+    pub fn optimal_skew_with_drift_bps(
+        &self,
+        position: f64,
+        max_position: f64,
+        momentum_bps: f64,
+        p_continuation: f64,
+    ) -> DriftAdjustedSkew {
+        let mut result =
+            self.optimal_skew_with_drift(position, max_position, momentum_bps, p_continuation);
+        result.total_skew *= 10000.0;
+        result.base_skew *= 10000.0;
+        result.drift_urgency *= 10000.0;
+        result
+    }
+
     /// Compute the optimal inventory target (not always zero for perpetuals).
     ///
     /// Theory: With non-zero funding rate, the optimal inventory is:
@@ -306,6 +487,32 @@ impl HJBInventoryController {
             sigma: self.sigma,
         }
     }
+}
+
+/// Output from drift-adjusted skew calculation.
+///
+/// Contains both the total skew and its components for analysis.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriftAdjustedSkew {
+    /// Total optimal skew (base + drift urgency).
+    pub total_skew: f64,
+
+    /// Base HJB skew (γσ²qT + terminal + funding).
+    pub base_skew: f64,
+
+    /// Additional urgency from momentum-position opposition.
+    /// Same sign as base_skew when opposed (amplifies reduction).
+    pub drift_urgency: f64,
+
+    /// Variance multiplier for inventory risk.
+    /// > 1.0 when opposed, used for σ²_effective calculation.
+    pub variance_multiplier: f64,
+
+    /// Whether position is opposed to momentum.
+    pub is_opposed: bool,
+
+    /// Urgency score [0, 5] for diagnostics.
+    pub urgency_score: f64,
 }
 
 /// Summary of HJB controller state for diagnostics.
