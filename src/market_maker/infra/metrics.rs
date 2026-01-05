@@ -97,6 +97,16 @@ struct MetricsInner {
     /// Adverse selection factor φ(AS) [0.5, 1.0]
     as_factor: AtomicF64,
 
+    // === Robust Kappa Metrics ===
+    /// Robust kappa effective sample size (accounts for outlier downweighting)
+    robust_kappa_ess: AtomicF64,
+    /// Robust kappa outlier count (observations with weight < 0.5)
+    robust_kappa_outliers: AtomicU64,
+    /// Robust kappa degrees of freedom (tail heaviness, ν parameter)
+    robust_kappa_nu: AtomicF64,
+    /// Robust kappa observation count
+    robust_kappa_obs_count: AtomicU64,
+
     // === Estimator Metrics ===
     /// Microprice deviation from mid
     microprice_deviation_bps: AtomicF64,
@@ -263,6 +273,11 @@ impl PrometheusMetrics {
                 toxicity_score: AtomicF64::new(0.0),
                 param_correlation: AtomicF64::new(0.0),
                 as_factor: AtomicF64::new(1.0),
+                // Robust kappa defaults
+                robust_kappa_ess: AtomicF64::new(0.0),
+                robust_kappa_outliers: AtomicU64::new(0),
+                robust_kappa_nu: AtomicF64::new(4.0), // Default Student-t ν
+                robust_kappa_obs_count: AtomicU64::new(0),
                 microprice_deviation_bps: AtomicF64::new(0.0),
                 book_imbalance: AtomicF64::new(0.0),
                 flow_imbalance: AtomicF64::new(0.0),
@@ -464,6 +479,20 @@ impl PrometheusMetrics {
         self.inner.toxicity_score.store(toxicity_score);
         self.inner.param_correlation.store(param_correlation);
         self.inner.as_factor.store(as_factor);
+    }
+
+    /// Update robust kappa diagnostic metrics.
+    ///
+    /// These metrics track the outlier-resistant Student-t kappa estimator.
+    pub fn update_robust_kappa(&self, ess: f64, outliers: u64, nu: f64, obs_count: u64) {
+        self.inner.robust_kappa_ess.store(ess);
+        self.inner
+            .robust_kappa_outliers
+            .store(outliers, Ordering::Relaxed);
+        self.inner.robust_kappa_nu.store(nu);
+        self.inner
+            .robust_kappa_obs_count
+            .store(obs_count, Ordering::Relaxed);
     }
 
     // === Risk Updates ===
@@ -961,6 +990,39 @@ impl PrometheusMetrics {
              mm_as_factor{{{}}} {}\n",
             labels,
             self.inner.as_factor.load()
+        ));
+
+        // Robust kappa diagnostics
+        output.push_str(&format!(
+            "# HELP mm_robust_kappa_ess Robust kappa effective sample size\n\
+             # TYPE mm_robust_kappa_ess gauge\n\
+             mm_robust_kappa_ess{{{}}} {:.2}\n",
+            labels,
+            self.inner.robust_kappa_ess.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_robust_kappa_outliers Outliers detected by robust kappa\n\
+             # TYPE mm_robust_kappa_outliers gauge\n\
+             mm_robust_kappa_outliers{{{}}} {}\n",
+            labels,
+            self.inner.robust_kappa_outliers.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_robust_kappa_nu Student-t degrees of freedom\n\
+             # TYPE mm_robust_kappa_nu gauge\n\
+             mm_robust_kappa_nu{{{}}} {:.2}\n",
+            labels,
+            self.inner.robust_kappa_nu.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_robust_kappa_obs_count Robust kappa observation count\n\
+             # TYPE mm_robust_kappa_obs_count gauge\n\
+             mm_robust_kappa_obs_count{{{}}} {}\n",
+            labels,
+            self.inner.robust_kappa_obs_count.load(Ordering::Relaxed)
         ));
 
         // Risk metrics

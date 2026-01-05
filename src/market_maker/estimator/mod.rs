@@ -54,8 +54,11 @@ pub(crate) use hierarchical_kappa::{HierarchicalKappa, HierarchicalKappaConfig};
 pub(crate) use soft_jump::SoftJumpClassifier;
 
 // Robust kappa orchestrator (V2 - outlier-resistant estimation)
+#[allow(unused_imports)]
 pub(crate) use book_kappa::BookKappaEstimator;
+#[allow(unused_imports)]
 pub(crate) use kappa_orchestrator::{KappaOrchestrator, KappaOrchestratorConfig};
+#[allow(unused_imports)]
 pub(crate) use robust_kappa::RobustKappaEstimator;
 
 // Re-export public types

@@ -687,6 +687,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.estimator.kappa_sigma_correlation(),
                         self.estimator.hierarchical_as_factor(),
                     );
+                    // Robust kappa diagnostic metrics
+                    self.infra.prometheus.update_robust_kappa(
+                        self.estimator.robust_kappa_ess(),
+                        self.estimator.kappa_outlier_count(),
+                        self.estimator.robust_kappa_nu(),
+                        self.estimator.robust_kappa_obs_count(),
+                    );
                     let (bid_exp, ask_exp) = self.orders.pending_exposure();
                     self.infra.prometheus.update_pending_exposure(
                         bid_exp,

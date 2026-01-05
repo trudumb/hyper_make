@@ -121,6 +121,7 @@ impl RobustKappaEstimator {
     }
 
     /// Create with default parameters for illiquid markets.
+    #[allow(dead_code)] // Used in tests; production uses explicit config
     pub(crate) fn default_illiquid() -> Self {
         // Heavier tails (lower ν) and stronger prior for illiquid markets
         Self::new(1500.0, 20.0, 3.0, 600_000) // 10 min window
@@ -180,13 +181,12 @@ impl RobustKappaEstimator {
 
         // Initialize with prior-weighted mean
         let mut kappa_est = self.kappa;
-        let n = self.observations.len() as f64;
+        let _n = self.observations.len() as f64;
 
-        for iteration in 0..MAX_IRLS_ITERATIONS {
+        for _iteration in 0..MAX_IRLS_ITERATIONS {
             // Step 1: Compute weights based on current κ estimate
             // w_i = (ν + 1) / (ν + (κ × δ_i)²)
             let mut sum_weights = self.prior_strength; // Prior contributes
-            let mut sum_weighted_inv_distance = self.prior_strength / self.prior_kappa; // Prior term
 
             self.outlier_count = 0;
 
@@ -203,7 +203,6 @@ impl RobustKappaEstimator {
                 }
 
                 sum_weights += *weight;
-                sum_weighted_inv_distance += *weight / *distance;
             }
 
             // Step 2: Update κ estimate

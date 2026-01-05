@@ -25,7 +25,7 @@
 use super::book_kappa::BookKappaEstimator;
 use super::kappa::BayesianKappaEstimator;
 use super::robust_kappa::RobustKappaEstimator;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Minimum weight for prior (always contributes some regularization)
 const PRIOR_MIN_WEIGHT: f64 = 0.05;
@@ -71,6 +71,7 @@ impl Default for KappaOrchestratorConfig {
 
 impl KappaOrchestratorConfig {
     /// Config for liquid markets (BTC, ETH on main perps).
+    #[allow(dead_code)] // Used in tests and future CLI integration
     pub(crate) fn liquid() -> Self {
         Self {
             prior_kappa: 2500.0,
@@ -81,6 +82,7 @@ impl KappaOrchestratorConfig {
     }
 
     /// Config for illiquid markets (HIP-3 DEX, altcoins).
+    #[allow(dead_code)] // Used in tests and future CLI integration
     pub(crate) fn illiquid() -> Self {
         Self {
             prior_kappa: 1500.0,
@@ -99,6 +101,7 @@ impl KappaOrchestratorConfig {
     ///
     /// Disables book_kappa because HIP-3 books are too thin for reliable
     /// exponential decay regression.
+    #[allow(dead_code)] // Used in tests and future CLI integration
     pub(crate) fn hip3() -> Self {
         Self {
             prior_kappa: 1500.0,        // Target ~18 bps total (1/1500 + fees)
@@ -177,11 +180,13 @@ impl KappaOrchestrator {
     }
 
     /// Create with default liquid market configuration.
+    #[allow(dead_code)] // Used in tests and future CLI integration
     pub(crate) fn default_liquid() -> Self {
         Self::new(KappaOrchestratorConfig::liquid())
     }
 
     /// Create with default illiquid market configuration.
+    #[allow(dead_code)] // Used in tests and future CLI integration
     pub(crate) fn default_illiquid() -> Self {
         Self::new(KappaOrchestratorConfig::illiquid())
     }
@@ -346,6 +351,7 @@ impl KappaOrchestrator {
     }
 
     /// Record fill distance directly (when we know the distance already).
+    #[allow(dead_code)] // API completeness for future use
     pub(crate) fn record_own_fill_distance(&mut self, timestamp_ms: u64, distance_bps: f64) {
         let distance = distance_bps / 10000.0; // Convert bps to fraction
         // Create synthetic trade at that distance
@@ -396,6 +402,7 @@ impl KappaOrchestrator {
     }
 
     /// Get the prior κ value.
+    #[allow(dead_code)] // Used in tests
     pub(crate) fn prior_kappa(&self) -> f64 {
         self.prior_kappa
     }
@@ -408,6 +415,21 @@ impl KappaOrchestrator {
     /// Get own-fill observation count for diagnostics.
     pub(crate) fn own_kappa_observation_count(&self) -> usize {
         self.own_kappa.observation_count()
+    }
+
+    /// Get robust kappa effective sample size.
+    pub(crate) fn robust_kappa_ess(&self) -> f64 {
+        self.robust_kappa.effective_sample_size()
+    }
+
+    /// Get robust kappa nu (degrees of freedom).
+    pub(crate) fn robust_kappa_nu(&self) -> f64 {
+        self.robust_kappa.nu()
+    }
+
+    /// Get robust kappa observation count.
+    pub(crate) fn robust_kappa_obs_count(&self) -> u64 {
+        self.robust_kappa.observation_count()
     }
 }
 
@@ -454,7 +476,7 @@ mod tests {
         }
 
         // Book kappa should have some weight now
-        let (_, (_, w_book), _, _) = orch.component_breakdown();
+        let (_, (_, w_book), _, _, _) = orch.component_breakdown();
         assert!(
             w_book > 0.1,
             "Book should have significant weight after updates, got {}",
@@ -503,7 +525,7 @@ mod tests {
         }
 
         // Own-fill should dominate
-        let ((_, w_own), _, _, _) = orch.component_breakdown();
+        let ((_, w_own), _, _, _, _) = orch.component_breakdown();
         assert!(
             w_own > 0.5,
             "Own-fill should dominate after many fills, got weight {}",

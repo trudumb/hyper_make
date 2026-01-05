@@ -253,6 +253,7 @@ impl BookKappaEstimator {
     }
 
     /// Get raw κ estimate (without prior fallback).
+    #[allow(dead_code)] // API completeness for diagnostics
     pub(crate) fn kappa_raw(&self) -> f64 {
         self.kappa
     }
@@ -278,16 +279,19 @@ impl BookKappaEstimator {
     }
 
     /// Get bid-side κ estimate (for diagnostics).
+    #[allow(dead_code)] // API completeness for diagnostics
     pub(crate) fn kappa_bid(&self) -> f64 {
         self.kappa_bid
     }
 
     /// Get ask-side κ estimate (for diagnostics).
+    #[allow(dead_code)] // API completeness for diagnostics
     pub(crate) fn kappa_ask(&self) -> f64 {
         self.kappa_ask
     }
 
     /// Get number of updates received.
+    #[allow(dead_code)] // API completeness for diagnostics
     pub(crate) fn update_count(&self) -> u64 {
         self.update_count
     }

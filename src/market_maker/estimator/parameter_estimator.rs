@@ -732,6 +732,21 @@ impl ParameterEstimator {
         self.kappa_orchestrator.outlier_count()
     }
 
+    /// Get robust kappa effective sample size.
+    pub fn robust_kappa_ess(&self) -> f64 {
+        self.kappa_orchestrator.robust_kappa_ess()
+    }
+
+    /// Get robust kappa nu (degrees of freedom).
+    pub fn robust_kappa_nu(&self) -> f64 {
+        self.kappa_orchestrator.robust_kappa_nu()
+    }
+
+    /// Get robust kappa observation count.
+    pub fn robust_kappa_obs_count(&self) -> u64 {
+        self.kappa_orchestrator.robust_kappa_obs_count()
+    }
+
     /// Get coefficient of variation for fill distance distribution.
     ///
     /// For exponential: CV ≈ 1.0
