@@ -235,7 +235,8 @@ impl DirectionalRiskEstimator {
         let estimated_drift = momentum_frac / 0.5; // Per-second drift
 
         // Smooth the drift estimate
-        self.drift_ewma = self.ewma_alpha * estimated_drift + (1.0 - self.ewma_alpha) * self.drift_ewma;
+        self.drift_ewma =
+            self.ewma_alpha * estimated_drift + (1.0 - self.ewma_alpha) * self.drift_ewma;
 
         // === 1. Compute Position-Momentum Alignment ===
         // alignment = sign(position) × sign(momentum)
@@ -285,30 +286,27 @@ impl DirectionalRiskEstimator {
         // === 3. Compute Drift Urgency ===
         // Urgency = μ × P(continuation) × time_exposure × inventory_pressure
         // This adds to skew to accelerate position reduction when opposed
-        let drift_urgency = if is_opposed
-            && momentum_bps.abs() > self.config.momentum_urgency_threshold_bps
-        {
-            // Urgency proportional to:
-            // - Drift magnitude (how fast price is moving against us)
-            // - Continuation probability (how likely it continues)
-            // - Position size (how much exposure we have)
-            // - Time horizon (how long we're exposed)
+        let drift_urgency =
+            if is_opposed && momentum_bps.abs() > self.config.momentum_urgency_threshold_bps {
+                // Urgency proportional to:
+                // - Drift magnitude (how fast price is moving against us)
+                // - Continuation probability (how likely it continues)
+                // - Position size (how much exposure we have)
+                // - Time horizon (how long we're exposed)
 
-            let urgency_base = self.drift_ewma.abs()
-                * p_continuation
-                * q.abs()
-                * time_horizon.min(60.0); // Cap time contribution
+                let urgency_base =
+                    self.drift_ewma.abs() * p_continuation * q.abs() * time_horizon.min(60.0); // Cap time contribution
 
-            // Scale by continuation sensitivity
-            let urgency_scaled = urgency_base * self.config.continuation_urgency_sensitivity;
+                // Scale by continuation sensitivity
+                let urgency_scaled = urgency_base * self.config.continuation_urgency_sensitivity;
 
-            // Sign: positive urgency when we need to reduce
-            // If short and rising, urgency should push quotes UP (negative skew → more aggressive buying)
-            // If long and falling, urgency should push quotes DOWN (positive skew → more aggressive selling)
-            urgency_scaled * pos_sign
-        } else {
-            0.0
-        };
+                // Sign: positive urgency when we need to reduce
+                // If short and rising, urgency should push quotes UP (negative skew → more aggressive buying)
+                // If long and falling, urgency should push quotes DOWN (positive skew → more aggressive selling)
+                urgency_scaled * pos_sign
+            } else {
+                0.0
+            };
 
         // === 4. Compute Urgency Score for Diagnostics ===
         // Combines all urgency factors into a single score [0, 5]
@@ -318,8 +316,7 @@ impl DirectionalRiskEstimator {
             let position_factor = q.abs();
             let volatility_factor = momentum_sigma_ratio.min(1.0);
 
-            (momentum_factor + continuation_factor + position_factor + volatility_factor)
-                .min(4.0)
+            (momentum_factor + continuation_factor + position_factor + volatility_factor).min(4.0)
                 * (1.0 + 0.25 * (momentum_bps.abs() / 100.0).min(1.0)) // Boost for extreme momentum
         } else {
             0.0
@@ -360,7 +357,8 @@ impl DirectionalRiskEstimator {
         let sum: f64 = self.momentum_history.iter().sum();
         let mean = sum / self.momentum_history.len() as f64;
 
-        let variance: f64 = self.momentum_history
+        let variance: f64 = self
+            .momentum_history
             .iter()
             .map(|x| (x - mean).powi(2))
             .sum::<f64>()
@@ -425,8 +423,7 @@ mod tests {
             100.0, // max_position
             50.0,  // Strong momentum
             0.8,   // High continuation
-            0.0001,
-            60.0,
+            0.0001, 60.0,
         );
 
         // No position = no directional adjustment
@@ -441,11 +438,9 @@ mod tests {
         // Short position, rising momentum (opposed)
         let output = est.update(
             -50.0, // Short
-            100.0,
-            50.0, // Rising (opposed to short)
+            100.0, 50.0, // Rising (opposed to short)
             0.8,  // High continuation
-            0.0001,
-            60.0,
+            0.0001, 60.0,
         );
 
         assert!(output.is_opposed);
@@ -459,12 +454,9 @@ mod tests {
 
         // Long position, rising momentum (aligned)
         let output = est.update(
-            50.0,  // Long
-            100.0,
-            50.0, // Rising (aligned with long)
-            0.8,
-            0.0001,
-            60.0,
+            50.0, // Long
+            100.0, 50.0, // Rising (aligned with long)
+            0.8, 0.0001, 60.0,
         );
 
         assert!(!output.is_opposed);
@@ -482,11 +474,9 @@ mod tests {
 
         let output = est.update(
             -50.0, // Short
-            100.0,
-            50.0, // Rising strongly (opposed)
+            100.0, 50.0, // Rising strongly (opposed)
             0.9,  // Very high continuation
-            0.0001,
-            60.0,
+            0.0001, 60.0,
         );
 
         // Should have positive drift urgency (push quotes up to buy faster)
@@ -500,12 +490,8 @@ mod tests {
 
         // Opposed but low continuation probability
         let output = est.update(
-            -50.0,
-            100.0,
-            50.0,
-            0.2, // Low continuation
-            0.0001,
-            60.0,
+            -50.0, 100.0, 50.0, 0.2, // Low continuation
+            0.0001, 60.0,
         );
 
         // Low continuation should reduce urgency
@@ -547,9 +533,8 @@ mod tests {
         // Extreme opposition
         let output = est.update(
             -100.0, // Max short
-            100.0,
-            200.0, // Extreme rising momentum
-            1.0,   // Certain continuation
+            100.0, 200.0,   // Extreme rising momentum
+            1.0,     // Certain continuation
             0.00001, // Low vol (high momentum/vol ratio)
             60.0,
         );

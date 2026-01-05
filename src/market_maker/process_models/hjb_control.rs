@@ -16,6 +16,7 @@
 //! - Funding rate integration for perpetuals (carry cost affects optimal inventory)
 //! - Theoretically rigorous position management
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 // ============================================================================
@@ -65,6 +66,20 @@ pub struct HJBConfig {
     /// Minimum continuation probability to apply drift adjustment [0.3, 0.7].
     /// Below this, momentum is considered noise.
     pub min_continuation_prob: f64,
+
+    // === EWMA Smoothing for Stability ===
+    /// EWMA half-life for smoothing drift estimates (seconds).
+    /// Longer values give more stable but slower-reacting signals.
+    /// Range: [5.0, 60.0], Default: 15.0
+    pub drift_ewma_half_life_secs: f64,
+
+    /// Window size for momentum statistics (data points).
+    /// Range: [20, 200], Default: 50
+    pub momentum_stats_window: usize,
+
+    /// Minimum observations before using smoothed signals.
+    /// Range: [10, 50], Default: 20
+    pub min_warmup_observations: usize,
 }
 
 impl Default for HJBConfig {
@@ -81,6 +96,10 @@ impl Default for HJBConfig {
             opposition_sensitivity: 1.5,
             max_drift_urgency: 3.0,
             min_continuation_prob: 0.5,
+            // EWMA smoothing for stability
+            drift_ewma_half_life_secs: 15.0,
+            momentum_stats_window: 50,
+            min_warmup_observations: 20,
         }
     }
 }
@@ -120,12 +139,38 @@ pub struct HJBInventoryController {
 
     /// Whether controller is initialized
     initialized: bool,
+
+    // === EWMA Smoothing State ===
+    /// EWMA alpha for drift smoothing
+    drift_alpha: f64,
+
+    /// Smoothed drift estimate (per-second)
+    drift_ewma: f64,
+
+    /// Smoothed variance multiplier
+    variance_mult_ewma: f64,
+
+    /// Recent momentum observations (bps)
+    momentum_history: VecDeque<f64>,
+
+    /// Recent continuation probability observations
+    continuation_history: VecDeque<f64>,
+
+    /// Number of drift updates received
+    drift_update_count: u64,
 }
 
 impl HJBInventoryController {
     /// Create a new HJB inventory controller.
     pub fn new(config: HJBConfig) -> Self {
         let funding_alpha = (2.0_f64.ln() / config.funding_ewma_half_life).clamp(0.0001, 1.0);
+
+        // Compute drift EWMA alpha from half-life
+        // Assume ~10 updates per second
+        let updates_per_half_life = config.drift_ewma_half_life_secs * 10.0;
+        let drift_alpha = (1.0 - (-2.0_f64.ln() / updates_per_half_life).exp()).clamp(0.01, 0.5);
+
+        let momentum_capacity = config.momentum_stats_window + 10;
 
         Self {
             config,
@@ -134,6 +179,13 @@ impl HJBInventoryController {
             funding_rate_ewma: 0.0,
             funding_alpha,
             initialized: false,
+            // EWMA state
+            drift_alpha,
+            drift_ewma: 0.0,
+            variance_mult_ewma: 1.0,
+            momentum_history: VecDeque::with_capacity(momentum_capacity),
+            continuation_history: VecDeque::with_capacity(momentum_capacity),
+            drift_update_count: 0,
         }
     }
 
@@ -167,6 +219,142 @@ impl HJBInventoryController {
                 + (1.0 - self.funding_alpha) * self.funding_rate_ewma;
         } else {
             self.funding_rate_ewma = annualized;
+        }
+    }
+
+    /// Update momentum/drift signals with EWMA smoothing.
+    ///
+    /// This method should be called on each quote cycle to maintain
+    /// smooth drift estimates that reduce noise in skew adjustments.
+    ///
+    /// # Arguments
+    /// * `momentum_bps` - Current momentum in basis points (positive = rising)
+    /// * `p_continuation` - Probability momentum continues [0, 1]
+    /// * `position` - Current position (for variance multiplier calculation)
+    /// * `max_position` - Maximum position for normalization
+    pub fn update_momentum_signals(
+        &mut self,
+        momentum_bps: f64,
+        p_continuation: f64,
+        position: f64,
+        max_position: f64,
+    ) {
+        self.drift_update_count += 1;
+
+        // Track momentum history
+        self.momentum_history.push_back(momentum_bps);
+        if self.momentum_history.len() > self.config.momentum_stats_window {
+            self.momentum_history.pop_front();
+        }
+
+        // Track continuation history
+        self.continuation_history.push_back(p_continuation);
+        if self.continuation_history.len() > self.config.momentum_stats_window {
+            self.continuation_history.pop_front();
+        }
+
+        // Convert momentum to fractional drift estimate
+        // μ = momentum_bps / 10000 / expected_duration
+        // We estimate expected duration as 500ms for momentum signal
+        let momentum_frac = momentum_bps / 10000.0;
+        let estimated_drift = momentum_frac / 0.5; // Per-second drift
+
+        // EWMA smooth the drift estimate
+        self.drift_ewma =
+            self.drift_alpha * estimated_drift + (1.0 - self.drift_alpha) * self.drift_ewma;
+
+        // Compute and smooth variance multiplier
+        let q = if max_position.abs() > 1e-10 {
+            (position / max_position).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // is_opposed = position and momentum are in opposite directions
+        let is_opposed = q * momentum_bps < 0.0;
+
+        // Compute raw variance multiplier
+        let variance_multiplier = if is_opposed && q.abs() > 0.05 {
+            // Opposed: increase variance proportionally to opposition strength
+            let momentum_sigma_ratio = if self.sigma > 1e-10 {
+                (momentum_frac.abs() / self.sigma).min(5.0)
+            } else {
+                0.0
+            };
+            let opposition_strength = q.abs() * (momentum_bps.abs() / 100.0).min(1.0);
+            let increase = self.config.opposition_sensitivity
+                * opposition_strength
+                * (1.0 + momentum_sigma_ratio * 0.5)
+                * p_continuation;
+
+            (1.0 + increase).min(self.config.max_drift_urgency)
+        } else {
+            1.0
+        };
+
+        // EWMA smooth variance multiplier
+        self.variance_mult_ewma =
+            self.drift_alpha * variance_multiplier + (1.0 - self.drift_alpha) * self.variance_mult_ewma;
+    }
+
+    /// Check if drift smoothing is warmed up.
+    pub fn is_drift_warmed_up(&self) -> bool {
+        self.drift_update_count >= self.config.min_warmup_observations as u64
+    }
+
+    /// Get smoothed drift estimate (per-second).
+    pub fn smoothed_drift(&self) -> f64 {
+        self.drift_ewma
+    }
+
+    /// Get smoothed variance multiplier.
+    pub fn smoothed_variance_multiplier(&self) -> f64 {
+        self.variance_mult_ewma
+    }
+
+    /// Get momentum statistics for diagnostics.
+    pub fn momentum_stats(&self) -> MomentumStats {
+        if self.momentum_history.is_empty() {
+            return MomentumStats::default();
+        }
+
+        let sum: f64 = self.momentum_history.iter().sum();
+        let mean = sum / self.momentum_history.len() as f64;
+
+        let variance: f64 = self
+            .momentum_history
+            .iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>()
+            / self.momentum_history.len() as f64;
+
+        let std_dev = variance.sqrt();
+
+        // Count directional changes
+        let mut direction_changes = 0;
+        let mut prev_sign = 0.0_f64;
+        for &m in &self.momentum_history {
+            if prev_sign != 0.0 && m.signum() != prev_sign {
+                direction_changes += 1;
+            }
+            if m.abs() > 1e-10 {
+                prev_sign = m.signum();
+            }
+        }
+
+        // Compute average continuation probability
+        let avg_continuation = if self.continuation_history.is_empty() {
+            0.5
+        } else {
+            self.continuation_history.iter().sum::<f64>() / self.continuation_history.len() as f64
+        };
+
+        MomentumStats {
+            mean_bps: mean,
+            std_dev_bps: std_dev,
+            direction_changes,
+            sample_count: self.momentum_history.len(),
+            avg_continuation,
         }
     }
 
@@ -307,9 +495,19 @@ impl HJBInventoryController {
 
         // Only apply drift adjustment if:
         // 1. Position opposes momentum
-        // 2. Continuation probability exceeds threshold
-        // 3. Momentum is significant (> 10 bps)
-        let momentum_significant = momentum_bps.abs() > 10.0;
+        // 2. Continuation probability exceeds threshold (or we're using prior during warmup)
+        // 3. Momentum is significant (dynamic threshold based on position size)
+        //
+        // Position-dependent threshold: larger positions need smaller momentum to trigger
+        // - |q| = 0.1: threshold = 8 bps (small position, need clearer signal)
+        // - |q| = 0.5: threshold = 5 bps (medium position)
+        // - |q| = 1.0: threshold = 3 bps (max position, react to any trend)
+        let base_threshold = 8.0;
+        let position_factor = (1.0 - 0.6 * q.abs()).max(0.3); // Range: 0.3 to 1.0
+        let momentum_threshold = base_threshold * position_factor;
+        let momentum_significant = momentum_bps.abs() > momentum_threshold;
+
+        // Accept 0.5 prior during warmup - better to react than ignore
         let continuation_confident = p_continuation >= self.config.min_continuation_prob;
 
         if !is_opposed || !momentum_significant || !continuation_confident {
@@ -328,9 +526,15 @@ impl HJBInventoryController {
         // From optimal control with drift: urgency ∝ μ × P(continue) × |q| × T
         let time_remaining = self.time_remaining().min(300.0); // Cap at 5 min exposure
 
-        // Convert momentum_bps to fractional drift rate
-        // Assume momentum measured over 500ms, so drift = momentum_bps / 10000 / 0.5
-        let drift_rate = (momentum_bps / 10000.0) / 0.5;
+        // Use EWMA-smoothed drift if warmed up, otherwise compute from raw momentum
+        // Smoothed drift gives more stable signals and reduces whipsawing
+        let drift_rate = if self.is_drift_warmed_up() {
+            // Use smoothed drift for stable signals
+            self.drift_ewma
+        } else {
+            // Fall back to raw momentum during warmup
+            (momentum_bps / 10000.0) / 0.5
+        };
 
         // Urgency formula:
         // drift_urgency = sensitivity × drift_rate × P(continue) × |q| × T
@@ -350,17 +554,30 @@ impl HJBInventoryController {
         let drift_urgency = drift_urgency_magnitude * q.signum();
 
         // === Compute Variance Multiplier ===
-        // When opposed, increase effective variance for inventory risk
-        // σ²_eff = σ² × (1 + κ × |momentum/σ| × P(continue))
+        // Use EWMA-smoothed variance multiplier if warmed up for stability
+        let variance_multiplier_capped = if self.is_drift_warmed_up() {
+            // Use pre-computed smoothed variance multiplier
+            self.variance_mult_ewma
+        } else {
+            // Compute inline during warmup
+            // σ²_eff = σ² × (1 + κ × |momentum/σ| × P(continue))
+            let momentum_vol_ratio = if self.sigma > 1e-10 {
+                ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+            } else {
+                0.0
+            };
+
+            let variance_multiplier = 1.0
+                + self.config.opposition_sensitivity * momentum_vol_ratio * p_continuation * q.abs();
+            variance_multiplier.min(self.config.max_drift_urgency)
+        };
+
+        // Compute momentum_vol_ratio for urgency_score (needed below)
         let momentum_vol_ratio = if self.sigma > 1e-10 {
             ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
         } else {
             0.0
         };
-
-        let variance_multiplier = 1.0
-            + self.config.opposition_sensitivity * momentum_vol_ratio * p_continuation * q.abs();
-        let variance_multiplier_capped = variance_multiplier.min(self.config.max_drift_urgency);
 
         // Urgency score for diagnostics [0, 5]
         let urgency_score = (momentum_bps.abs() / 50.0).min(1.0) // Momentum strength
@@ -528,6 +745,60 @@ pub struct HJBSummary {
     pub sigma: f64,
 }
 
+/// Momentum statistics for diagnostics and confidence estimation.
+#[derive(Debug, Clone, Default)]
+pub struct MomentumStats {
+    /// Mean momentum over window (bps).
+    pub mean_bps: f64,
+    /// Standard deviation of momentum (bps).
+    pub std_dev_bps: f64,
+    /// Number of direction changes in window.
+    pub direction_changes: usize,
+    /// Number of samples in window.
+    pub sample_count: usize,
+    /// Average continuation probability.
+    pub avg_continuation: f64,
+}
+
+impl MomentumStats {
+    /// Check if momentum signal is noisy (many direction changes).
+    pub fn is_noisy(&self) -> bool {
+        if self.sample_count < 10 {
+            return true;
+        }
+        // More than 40% direction changes = noisy
+        (self.direction_changes as f64 / self.sample_count as f64) > 0.4
+    }
+
+    /// Get signal quality score [0, 1].
+    /// Higher = more reliable momentum signal.
+    pub fn signal_quality(&self) -> f64 {
+        if self.sample_count < 10 {
+            return 0.0;
+        }
+
+        // Factors that increase quality:
+        // 1. Mean momentum magnitude (stronger signals)
+        let magnitude_score = (self.mean_bps.abs() / 50.0).min(1.0);
+
+        // 2. Low direction changes (consistent trend)
+        let consistency = 1.0 - (self.direction_changes as f64 / self.sample_count as f64).min(0.5) * 2.0;
+
+        // 3. High continuation probability
+        let continuation_score = self.avg_continuation;
+
+        // 4. Low volatility relative to mean (high signal-to-noise)
+        let snr = if self.std_dev_bps > 0.0 {
+            (self.mean_bps.abs() / self.std_dev_bps).min(2.0) / 2.0
+        } else {
+            0.0
+        };
+
+        // Combine factors
+        (magnitude_score * 0.2 + consistency * 0.3 + continuation_score * 0.3 + snr * 0.2).clamp(0.0, 1.0)
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -626,9 +897,17 @@ mod tests {
             mult
         );
 
-        // Effective gamma should be base × multiplier
+        // Effective gamma should be base × multiplier (computed at same instant)
+        // Get both from effective_gamma method which computes mult internally
         let eff = ctrl.effective_gamma();
-        assert!((eff - ctrl.config.gamma_base * mult).abs() < 1e-6);
+        let expected = ctrl.config.gamma_base * ctrl.gamma_multiplier();
+        assert!(
+            (eff - expected).abs() < 0.01,
+            "Effective gamma {} should be close to gamma_base {} × multiplier: expected {}",
+            eff,
+            ctrl.config.gamma_base,
+            expected
+        );
     }
 
     #[test]
@@ -774,5 +1053,134 @@ mod tests {
             skew_low_vol,
             skew_high_vol
         );
+    }
+
+    #[test]
+    fn test_hjb_drift_warmup() {
+        let mut ctrl = make_controller();
+
+        // Initially not warmed up
+        assert!(!ctrl.is_drift_warmed_up());
+
+        // Update momentum signals
+        for _ in 0..25 {
+            ctrl.update_momentum_signals(10.0, 0.6, -0.5, 1.0);
+        }
+
+        // Now should be warmed up
+        assert!(ctrl.is_drift_warmed_up());
+    }
+
+    #[test]
+    fn test_hjb_ewma_smoothing() {
+        let mut ctrl = make_controller();
+
+        // Start with no drift
+        assert!((ctrl.smoothed_drift()).abs() < 1e-10);
+        assert!((ctrl.smoothed_variance_multiplier() - 1.0).abs() < 1e-10);
+
+        // Add positive momentum (opposed to short position)
+        for _ in 0..30 {
+            ctrl.update_momentum_signals(20.0, 0.7, -0.5, 1.0);
+        }
+
+        // Drift should be positive (rising)
+        assert!(
+            ctrl.smoothed_drift() > 0.0,
+            "Positive momentum should give positive drift: {}",
+            ctrl.smoothed_drift()
+        );
+
+        // Variance multiplier should be > 1 (opposed position)
+        assert!(
+            ctrl.smoothed_variance_multiplier() > 1.0,
+            "Opposed position should increase variance: {}",
+            ctrl.smoothed_variance_multiplier()
+        );
+    }
+
+    #[test]
+    fn test_hjb_momentum_stats() {
+        let mut ctrl = make_controller();
+
+        // Add momentum signals
+        for i in 0..30 {
+            let momentum = if i % 5 == 0 { -5.0 } else { 15.0 };
+            ctrl.update_momentum_signals(momentum, 0.6, -0.3, 1.0);
+        }
+
+        let stats = ctrl.momentum_stats();
+
+        assert!(stats.sample_count > 0);
+        assert!(stats.mean_bps > 0.0); // Mostly positive momentum
+        assert!(stats.std_dev_bps > 0.0); // Some variance
+        assert!(stats.direction_changes > 0); // Some direction changes
+    }
+
+    #[test]
+    fn test_hjb_drift_adjusted_skew_uses_smoothed() {
+        let mut ctrl = make_controller();
+        ctrl.start_session();
+
+        // Warm up with consistent momentum
+        for _ in 0..30 {
+            ctrl.update_momentum_signals(25.0, 0.7, -0.5, 1.0);
+        }
+
+        assert!(ctrl.is_drift_warmed_up());
+
+        // Get drift-adjusted skew
+        let result = ctrl.optimal_skew_with_drift(-0.5, 1.0, 25.0, 0.7);
+
+        // Should be opposed (short + rising)
+        assert!(result.is_opposed);
+
+        // Should have drift urgency
+        assert!(
+            result.drift_urgency.abs() > 0.0,
+            "Expected drift urgency: {}",
+            result.drift_urgency
+        );
+
+        // Should use smoothed variance multiplier (> 1.0 for opposed)
+        assert!(
+            result.variance_multiplier > 1.0,
+            "Expected variance > 1.0 for opposed: {}",
+            result.variance_multiplier
+        );
+    }
+
+    #[test]
+    fn test_momentum_stats_signal_quality() {
+        // Create high quality signal
+        let high_quality = MomentumStats {
+            mean_bps: 30.0,
+            std_dev_bps: 5.0,
+            direction_changes: 2,
+            sample_count: 50,
+            avg_continuation: 0.75,
+        };
+
+        // Create low quality signal
+        let low_quality = MomentumStats {
+            mean_bps: 5.0,
+            std_dev_bps: 20.0,
+            direction_changes: 25,
+            sample_count: 50,
+            avg_continuation: 0.45,
+        };
+
+        assert!(
+            high_quality.signal_quality() > low_quality.signal_quality(),
+            "High quality signal should have higher score: {} vs {}",
+            high_quality.signal_quality(),
+            low_quality.signal_quality()
+        );
+
+        assert!(
+            !high_quality.is_noisy(),
+            "High quality signal should not be noisy"
+        );
+        assert!(low_quality.is_noisy(), "Low quality signal should be noisy");
     }
 }

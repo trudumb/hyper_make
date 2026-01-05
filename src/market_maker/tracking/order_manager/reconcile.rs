@@ -42,13 +42,13 @@ impl Default for ReconcileConfig {
             // NOTE: On Hyperliquid, price modifications always reset queue position (new OID).
             // Only SIZE-only modifications preserve queue. Therefore, these tolerances
             // primarily affect API call frequency, not queue preservation.
-            max_modify_price_bps: 50,      // Modify if price ≤ 50 bps change (was 10)
-            max_modify_size_pct: 0.50,     // Modify if size ≤ 50% change
-            skip_price_tolerance_bps: 10,  // Skip if price ≤ 10 bps (was 1 - reduces churn ~50%)
+            max_modify_price_bps: 50, // Modify if price ≤ 50 bps change (was 10)
+            max_modify_size_pct: 0.50, // Modify if size ≤ 50% change
+            skip_price_tolerance_bps: 10, // Skip if price ≤ 10 bps (was 1 - reduces churn ~50%)
             skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
-            use_queue_aware: false,        // Disabled by default until validated
-            queue_horizon_seconds: 1.0,    // 1-second fill horizon
-            use_impulse_filter: false,     // Disabled by default until validated
+            use_queue_aware: false,   // Disabled by default until validated
+            queue_horizon_seconds: 1.0, // 1-second fill horizon
+            use_impulse_filter: false, // Disabled by default until validated
         }
     }
 }
@@ -105,11 +105,7 @@ pub fn reconcile_side_smart(
     config: &ReconcileConfig,
 ) -> Vec<LadderAction> {
     let (actions, _stats) = reconcile_side_smart_with_impulse(
-        current,
-        target,
-        side,
-        config,
-        None, // No queue tracker
+        current, target, side, config, None, // No queue tracker
         None, // No impulse filter
         None, // No mid price
     );

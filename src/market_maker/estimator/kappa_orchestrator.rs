@@ -86,8 +86,8 @@ impl KappaOrchestratorConfig {
     pub(crate) fn illiquid() -> Self {
         Self {
             prior_kappa: 1500.0,
-            prior_strength: 20.0, // Strong prior to resist collapse
-            robust_nu: 3.0,       // Heavy tails for outlier resistance
+            prior_strength: 20.0,      // Strong prior to resist collapse
+            robust_nu: 3.0,            // Heavy tails for outlier resistance
             robust_window_ms: 600_000, // Longer window (10 min)
             own_fill_window_ms: 600_000,
             ..Default::default()
@@ -104,12 +104,12 @@ impl KappaOrchestratorConfig {
     #[allow(dead_code)] // Used in tests and future CLI integration
     pub(crate) fn hip3() -> Self {
         Self {
-            prior_kappa: 1500.0,        // Target ~18 bps total (1/1500 + fees)
-            prior_strength: 15.0,       // Moderate prior confidence
-            robust_nu: 3.0,             // Heavy tails for outlier resistance
-            robust_window_ms: 600_000,  // 10 min window
+            prior_kappa: 1500.0,       // Target ~18 bps total (1/1500 + fees)
+            prior_strength: 15.0,      // Moderate prior confidence
+            robust_nu: 3.0,            // Heavy tails for outlier resistance
+            robust_window_ms: 600_000, // 10 min window
             own_fill_window_ms: 600_000,
-            use_book_kappa: false,      // Books too thin for reliable regression
+            use_book_kappa: false, // Books too thin for reliable regression
             use_robust_kappa: true,
         }
     }
@@ -265,11 +265,11 @@ impl KappaOrchestrator {
         // During warmup: all weights are 0 except prior (100%)
         if is_warmup {
             return (
-                (self.own_kappa.posterior_mean(), 0.0),  // own disabled
-                (self.book_kappa.kappa(), 0.0),          // book disabled
-                (self.robust_kappa.kappa(), 0.0),        // robust disabled
-                (self.config.prior_kappa, 1.0),          // prior = 100%
-                true,                                     // is_warmup
+                (self.own_kappa.posterior_mean(), 0.0), // own disabled
+                (self.book_kappa.kappa(), 0.0),         // book disabled
+                (self.robust_kappa.kappa(), 0.0),       // robust disabled
+                (self.config.prior_kappa, 1.0),         // prior = 100%
+                true,                                   // is_warmup
             );
         }
 
@@ -293,7 +293,7 @@ impl KappaOrchestrator {
             (self.book_kappa.kappa(), book_conf / total),
             (self.robust_kappa.kappa(), robust_conf / total),
             (self.config.prior_kappa, PRIOR_MIN_WEIGHT / total),
-            false,  // not warmup
+            false, // not warmup
         )
     }
 
@@ -320,8 +320,13 @@ impl KappaOrchestrator {
 
         // Log periodically (every 10 trades for diagnostics)
         if self.update_count % 10 == 0 {
-            let ((k_own, w_own), (k_book, w_book), (k_robust, w_robust), (k_prior, w_prior), is_warmup) =
-                self.component_breakdown();
+            let (
+                (k_own, w_own),
+                (k_book, w_book),
+                (k_robust, w_robust),
+                (k_prior, w_prior),
+                is_warmup,
+            ) = self.component_breakdown();
 
             info!(
                 kappa_effective = %format!("{:.0}", self.kappa_effective()),
@@ -354,9 +359,10 @@ impl KappaOrchestrator {
     #[allow(dead_code)] // API completeness for future use
     pub(crate) fn record_own_fill_distance(&mut self, timestamp_ms: u64, distance_bps: f64) {
         let distance = distance_bps / 10000.0; // Convert bps to fraction
-        // Create synthetic trade at that distance
-        // Using 1.0 as mid and 1.0 + distance as price
-        self.own_kappa.on_trade(timestamp_ms, 1.0 + distance, 1.0, 1.0);
+                                               // Create synthetic trade at that distance
+                                               // Using 1.0 as mid and 1.0 + distance as price
+        self.own_kappa
+            .on_trade(timestamp_ms, 1.0 + distance, 1.0, 1.0);
     }
 
     /// Get overall confidence in the κ estimate.

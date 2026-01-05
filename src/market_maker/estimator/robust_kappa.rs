@@ -212,12 +212,9 @@ impl RobustKappaEstimator {
             //
             // Actually, for exponential with rate κ: MLE is κ̂ = n / Σδ_i
             // Weighted version: κ̂ = Σw_i / Σ(w_i × δ_i)
-            let sum_weighted_distance: f64 = self
-                .observations
-                .iter()
-                .map(|(d, w, _)| w * d)
-                .sum::<f64>()
-                + self.prior_strength * (1.0 / self.prior_kappa); // Prior term
+            let sum_weighted_distance: f64 =
+                self.observations.iter().map(|(d, w, _)| w * d).sum::<f64>()
+                    + self.prior_strength * (1.0 / self.prior_kappa); // Prior term
 
             let new_kappa = sum_weights / sum_weighted_distance;
             let new_kappa = new_kappa.clamp(MIN_KAPPA, MAX_KAPPA);
@@ -420,7 +417,10 @@ mod tests {
     fn test_confidence_growth() {
         let mut estimator = RobustKappaEstimator::new(2000.0, 10.0, 4.0, 300_000);
 
-        assert!(estimator.confidence() < 0.1, "Initial confidence should be low");
+        assert!(
+            estimator.confidence() < 0.1,
+            "Initial confidence should be low"
+        );
 
         for i in 0..50 {
             estimator.on_trade(i * 1000, 0.001);

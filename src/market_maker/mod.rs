@@ -1335,12 +1335,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .update_local_max(pre_effective_max_position);
 
         // Pre-compute drift-adjusted skew from HJB controller + momentum signals
+        let momentum_bps = self.estimator.momentum_bps();
+        let p_continuation = self.estimator.momentum_continuation_probability();
+        let position = self.position.position();
+
         let drift_adjusted_skew = self.stochastic.hjb_controller.optimal_skew_with_drift(
-            self.position.position(),
+            position,
             self.config.max_position,
-            self.estimator.momentum_bps(),
-            self.estimator.momentum_continuation_probability(),
+            momentum_bps,
+            p_continuation,
         );
+
+        // Log momentum diagnostics for drift-adjusted skew debugging
+        if drift_adjusted_skew.is_opposed || momentum_bps.abs() > 5.0 {
+            debug!(
+                momentum_bps = %format!("{:.2}", momentum_bps),
+                p_continuation = %format!("{:.3}", p_continuation),
+                position = %format!("{:.2}", position),
+                is_opposed = drift_adjusted_skew.is_opposed,
+                drift_urgency_bps = %format!("{:.2}", drift_adjusted_skew.drift_urgency * 10000.0),
+                variance_mult = %format!("{:.3}", drift_adjusted_skew.variance_multiplier),
+                urgency_score = %format!("{:.1}", drift_adjusted_skew.urgency_score),
+                "Momentum-position alignment check"
+            );
+        }
 
         let sources = ParameterSources {
             estimator: &self.estimator,
@@ -2229,7 +2247,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         ask_quotes: Vec<Quote>,
     ) -> Result<()> {
         use crate::market_maker::quoting::LadderLevel;
-        use crate::market_maker::tracking::{reconcile_side_smart, reconcile_side_smart_with_impulse};
+        use crate::market_maker::tracking::{
+            reconcile_side_smart, reconcile_side_smart_with_impulse,
+        };
 
         let reconcile_config = &self.config.reconcile;
 
@@ -2277,13 +2297,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
 
         // Impulse Control: Check execution budget before proceeding
-        let impulse_enabled = self.infra.impulse_control_enabled && reconcile_config.use_impulse_filter;
+        let impulse_enabled =
+            self.infra.impulse_control_enabled && reconcile_config.use_impulse_filter;
         if impulse_enabled {
             // Estimate potential actions: at most (current + target) per side
-            let max_potential_actions = current_bids.len() + bid_levels.len()
-                + current_asks.len() + ask_levels.len();
+            let max_potential_actions =
+                current_bids.len() + bid_levels.len() + current_asks.len() + ask_levels.len();
 
-            if !self.infra.execution_budget.can_afford_bulk(max_potential_actions) {
+            if !self
+                .infra
+                .execution_budget
+                .can_afford_bulk(max_potential_actions)
+            {
                 debug!(
                     budget = %format!("{:.1}", self.infra.execution_budget.available()),
                     potential_actions = max_potential_actions,
@@ -2321,8 +2346,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
 
             // Log impulse filter statistics
-            if bid_st.impulse_filtered_count > 0 || ask_st.impulse_filtered_count > 0
-                || bid_st.queue_locked_count > 0 || ask_st.queue_locked_count > 0
+            if bid_st.impulse_filtered_count > 0
+                || ask_st.impulse_filtered_count > 0
+                || bid_st.queue_locked_count > 0
+                || ask_st.queue_locked_count > 0
             {
                 debug!(
                     bid_impulse_filtered = bid_st.impulse_filtered_count,
@@ -2336,8 +2363,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             (bid_acts, Some(bid_st), ask_acts, Some(ask_st))
         } else {
             // Standard reconciliation without impulse filtering
-            let bid_acts = reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, reconcile_config);
-            let ask_acts = reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, reconcile_config);
+            let bid_acts =
+                reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, reconcile_config);
+            let ask_acts =
+                reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, reconcile_config);
             (bid_acts, None, ask_acts, None)
         };
 

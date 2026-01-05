@@ -491,9 +491,9 @@ impl Default for MarketParams {
             is_heavy_tailed: false,          // Assume exponential tails
             kappa_cv: 1.0,                   // CV=1 for exponential
             // V3: Robust Kappa Orchestrator
-            kappa_robust: 2000.0,            // Start at prior (will be updated from orchestrator)
-            use_kappa_robust: true,          // Default ON - use robust kappa for spreads
-            kappa_outlier_count: 0,          // No outliers detected yet
+            kappa_robust: 2000.0, // Start at prior (will be updated from orchestrator)
+            use_kappa_robust: true, // Default ON - use robust kappa for spreads
+            kappa_outlier_count: 0, // No outliers detected yet
             // V2: Uncertainty Quantification
             kappa_uncertainty: 0.0,    // Will be computed from posterior
             kappa_95_lower: 100.0,     // Conservative lower bound
@@ -559,11 +559,11 @@ impl Default for MarketParams {
             hjb_inventory_target: 0.0,   // Zero inventory target
             hjb_is_terminal_zone: false, // Not in terminal zone
             // Drift-Adjusted Skew (first-principles momentum integration)
-            use_drift_adjusted_skew: true,       // ON by default for first-principles trading
-            hjb_drift_urgency: 0.0,              // No urgency initially
-            directional_variance_mult: 1.0,      // No variance adjustment initially
-            position_opposes_momentum: false,    // No opposition initially
-            urgency_score: 0.0,                  // No urgency initially
+            use_drift_adjusted_skew: true, // ON by default for first-principles trading
+            hjb_drift_urgency: 0.0,        // No urgency initially
+            directional_variance_mult: 1.0, // No variance adjustment initially
+            position_opposes_momentum: false, // No opposition initially
+            urgency_score: 0.0,            // No urgency initially
             // Kalman Filter (stochastic integration)
             use_kalman_filter: false,    // Default OFF for safety
             kalman_fair_price: 0.0,      // Will be computed from Kalman filter
@@ -612,13 +612,13 @@ impl Default for MarketParams {
             adaptive_gamma: 0.3,               // Base gamma fallback
             adaptive_spread_ceiling: f64::MAX, // No ceiling by default
             // Dynamic bounds (model-driven, replaces hardcoded CLI values)
-            dynamic_kappa_floor: None,          // Computed at runtime from Bayesian CI
-            dynamic_spread_ceiling_bps: None,   // Computed at runtime from fill rate + market p80
-            use_dynamic_bounds: true,           // Default ON - use model-driven bounds
-            adaptive_warmed_up: false,         // Not warmed up initially
-            adaptive_can_estimate: true,       // Can estimate immediately via priors
-            adaptive_warmup_progress: 0.0,     // Start at 0% progress
-            adaptive_uncertainty_factor: 1.2,  // Start with 20% wider spreads
+            dynamic_kappa_floor: None, // Computed at runtime from Bayesian CI
+            dynamic_spread_ceiling_bps: None, // Computed at runtime from fill rate + market p80
+            use_dynamic_bounds: true,  // Default ON - use model-driven bounds
+            adaptive_warmed_up: false, // Not warmed up initially
+            adaptive_can_estimate: true, // Can estimate immediately via priors
+            adaptive_warmup_progress: 0.0, // Start at 0% progress
+            adaptive_uncertainty_factor: 1.2, // Start with 20% wider spreads
             // Calibration Fill Rate Controller
             calibration_gamma_mult: 0.3, // Start fill-hungry (70% gamma reduction)
             calibration_progress: 0.0,   // Start at 0% calibration

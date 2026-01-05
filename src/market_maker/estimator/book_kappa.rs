@@ -325,7 +325,7 @@ mod tests {
 
         for i in 1..=10 {
             let delta = i as f64 * 0.001; // 0.1% steps
-            // Each level has exponentially decaying depth
+                                          // Each level has exponentially decaying depth
             let level_depth = 100.0 * (-kappa_true * delta).exp();
 
             let bid_price = mid * (1.0 - delta);

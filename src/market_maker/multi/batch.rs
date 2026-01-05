@@ -88,7 +88,11 @@ impl BatchResults {
 
     /// Count of successful operations.
     pub fn successful_ops(&self) -> usize {
-        let cancel_ok = self.cancels.iter().filter(|(_, _, r)| r.order_is_gone()).count();
+        let cancel_ok = self
+            .cancels
+            .iter()
+            .filter(|(_, _, r)| r.order_is_gone())
+            .count();
         let modify_ok = self.modifies.iter().filter(|(_, _, r)| r.success).count();
         let place_ok = self.places.iter().filter(|(_, _, r)| r.oid > 0).count();
         cancel_ok + modify_ok + place_ok
@@ -359,7 +363,9 @@ mod tests {
         // Add some mock results
         let btc = AssetId::new("BTC", None);
         results.cancels.push((btc, 1, CancelResult::Cancelled));
-        results.cancels.push((btc, 2, CancelResult::AlreadyCancelled));
+        results
+            .cancels
+            .push((btc, 2, CancelResult::AlreadyCancelled));
 
         assert_eq!(results.total_ops(), 2);
         assert_eq!(results.successful_ops(), 2); // Both are "success" in the sense of not failing

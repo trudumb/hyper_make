@@ -179,9 +179,9 @@ impl MicropriceEstimator {
             sum_xx_net: 0.0,
             sum_xy_net: 0.0,
             // EMA smoothing (defaults - can be overridden via set_ema_config)
-            ema_alpha: 0.2,                         // 5-update half-life
+            ema_alpha: 0.2,                                // 5-update half-life
             ema_microprice_bits: AtomicU64::new(EMA_NONE), // No smoothed value until first update
-            ema_min_change_bps: 2.0,                // 2 bps noise filter
+            ema_min_change_bps: 2.0,                       // 2 bps noise filter
         }
     }
 

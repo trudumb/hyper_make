@@ -181,7 +181,7 @@ impl ParameterEstimator {
         let kappa_orchestrator = KappaOrchestrator::new(KappaOrchestratorConfig {
             prior_kappa: config.kappa_prior_mean,
             prior_strength: config.kappa_prior_strength,
-            robust_nu: 4.0,                          // Moderate heavy tails
+            robust_nu: 4.0, // Moderate heavy tails
             robust_window_ms: config.kappa_window_ms,
             own_fill_window_ms: config.kappa_window_ms,
             use_book_kappa: true,
@@ -425,8 +425,12 @@ impl ParameterEstimator {
         // V3: Feed into kappa orchestrator's own-fill estimator (gold standard)
         // Own fills are the most accurate source - they dominate as fills accumulate
         if self.current_mid > 0.0 {
-            self.kappa_orchestrator
-                .on_own_fill(timestamp_ms, fill_price, fill_size, self.current_mid);
+            self.kappa_orchestrator.on_own_fill(
+                timestamp_ms,
+                fill_price,
+                fill_size,
+                self.current_mid,
+            );
         }
     }
 
@@ -706,9 +710,7 @@ impl ParameterEstimator {
     ///
     /// Returns ((own_kappa, own_weight), (book_kappa, book_weight),
     ///          (robust_kappa, robust_weight), (prior_kappa, prior_weight), is_warmup)
-    pub fn kappa_robust_breakdown(
-        &self,
-    ) -> ((f64, f64), (f64, f64), (f64, f64), (f64, f64), bool) {
+    pub fn kappa_robust_breakdown(&self) -> ((f64, f64), (f64, f64), (f64, f64), (f64, f64), bool) {
         self.kappa_orchestrator.component_breakdown()
     }
 
@@ -1195,7 +1197,8 @@ impl ParameterEstimator {
     /// - `alpha`: Smoothing factor (0.0-1.0). 0.0 disables smoothing.
     /// - `min_change_bps`: Minimum change in bps to update EMA (noise filter).
     pub fn set_microprice_ema(&mut self, alpha: f64, min_change_bps: f64) {
-        self.microprice_estimator.set_ema_config(alpha, min_change_bps);
+        self.microprice_estimator
+            .set_ema_config(alpha, min_change_bps);
     }
 
     // === V2 Hierarchical Kappa Accessors ===

@@ -684,7 +684,8 @@ impl QuotingStrategy for GLFTStrategy {
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
         // - momentum amplification: variance-derived multiplier when opposed
-        let skew = (base_skew + drift_urgency + hawkes_skew + funding_skew) * momentum_skew_multiplier;
+        let skew =
+            (base_skew + drift_urgency + hawkes_skew + funding_skew) * momentum_skew_multiplier;
 
         // Calculate flow modifier for logging (same as in inventory_skew_with_flow)
         let flow_alignment = inventory_ratio.signum() * market_params.flow_imbalance;

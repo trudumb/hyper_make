@@ -22,11 +22,10 @@ use hyperliquid_rust_sdk::{
     DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, FundingConfig,
     GLFTStrategy, HawkesConfig, HyperliquidExecutor, ImpulseControlConfig, InfoClient,
     InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
-    LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker,
-    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
-    QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
-    RejectionRateLimitConfig, RiskConfig, SpreadConfig, SpreadProfile, StochasticConfig,
-    SymmetricStrategy,
+    LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker, MarketMakerConfig as MmConfig,
+    MarketMakerMetricsRecorder, PnLConfig, QueueConfig, QuotingStrategy, ReconcileConfig,
+    ReconciliationConfig, RecoveryConfig, RejectionRateLimitConfig, RiskConfig, SpreadConfig,
+    SpreadProfile, StochasticConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -1138,7 +1137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Enable impulse filtering by default (matches ImpulseControlConfig default)
             // Can be explicitly enabled via --use-impulse-control even if default changes
-            rc.use_impulse_filter = ImpulseControlConfig::default().enabled || cli.use_impulse_control;
+            rc.use_impulse_filter =
+                ImpulseControlConfig::default().enabled || cli.use_impulse_control;
             rc
         },
         // HIP-3 support: pre-computed runtime config for zero hot-path overhead

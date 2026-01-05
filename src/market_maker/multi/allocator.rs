@@ -320,7 +320,9 @@ impl AssetAllocator {
 
     /// Orders remaining (limit - allocated).
     pub fn orders_remaining(&self) -> usize {
-        self.config.total_order_limit.saturating_sub(self.total_allocated)
+        self.config
+            .total_order_limit
+            .saturating_sub(self.total_allocated)
     }
 
     /// Number of assets.

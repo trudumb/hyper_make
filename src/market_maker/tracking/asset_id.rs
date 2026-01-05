@@ -164,10 +164,7 @@ mod tests {
     #[test]
     fn test_canonical_key() {
         assert_eq!(AssetId::canonical_key("BTC", None), "validator:BTC");
-        assert_eq!(
-            AssetId::canonical_key("HYPE", Some("hyna")),
-            "hyna:HYPE"
-        );
+        assert_eq!(AssetId::canonical_key("HYPE", Some("hyna")), "hyna:HYPE");
     }
 
     #[test]

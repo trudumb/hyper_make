@@ -35,7 +35,7 @@ impl Default for ExecutionBudgetConfig {
             max_tokens: 500.0,
             emergency_reserve: 20.0,
             reward_per_1000_usd: 0.5,
-            min_tokens_per_fill: 0.5,  // Floor for HIP-3 small notional fills
+            min_tokens_per_fill: 0.5, // Floor for HIP-3 small notional fills
             cost_per_action: 1.0,
             bulk_discount_factor: 0.8,
         }
@@ -128,7 +128,8 @@ impl ExecutionBudget {
         }
         // First action at full cost, rest at discounted rate
         let first_cost = self.config.cost_per_action;
-        let rest_cost = (count - 1) as f64 * self.config.cost_per_action * self.config.bulk_discount_factor;
+        let rest_cost =
+            (count - 1) as f64 * self.config.cost_per_action * self.config.bulk_discount_factor;
         first_cost + rest_cost
     }
 
@@ -170,7 +171,8 @@ impl ExecutionBudget {
 
         // Spend what we can, potentially going negative (up to reserve)
         let actual_cost = cost.min(total_available);
-        self.available_tokens = (self.available_tokens - actual_cost).max(-self.config.emergency_reserve);
+        self.available_tokens =
+            (self.available_tokens - actual_cost).max(-self.config.emergency_reserve);
         self.total_spent += actual_cost;
     }
 
@@ -243,7 +245,7 @@ mod tests {
     #[test]
     fn test_on_fill_standard() {
         let mut budget = default_budget();
-        budget.available_tokens = 50.0;  // Start lower to see the effect
+        budget.available_tokens = 50.0; // Start lower to see the effect
 
         // $2000 fill = 2 * 0.5 = 1.0 tokens
         budget.on_fill(2000.0);
@@ -268,8 +270,8 @@ mod tests {
         budget.available_tokens = 495.0;
 
         // Large fill that would exceed max
-        budget.on_fill(100_000.0);  // 50 tokens
-        assert!((budget.available() - 500.0).abs() < f64::EPSILON);  // Capped at max
+        budget.on_fill(100_000.0); // 50 tokens
+        assert!((budget.available() - 500.0).abs() < f64::EPSILON); // Capped at max
     }
 
     #[test]
@@ -289,7 +291,7 @@ mod tests {
         assert!(budget.can_afford_bulk(10));
         assert!(budget.spend(10));
 
-        let expected_cost = 1.0 + 9.0 * 0.8;  // 8.2
+        let expected_cost = 1.0 + 9.0 * 0.8; // 8.2
         assert!((budget.total_spent - expected_cost).abs() < 0.001);
     }
 
@@ -305,7 +307,7 @@ mod tests {
         assert!(!budget.can_afford_bulk(10));
         assert!(!budget.spend(10));
         assert_eq!(budget.skipped_count(), 1);
-        assert!((budget.available() - 5.0).abs() < f64::EPSILON);  // Unchanged
+        assert!((budget.available() - 5.0).abs() < f64::EPSILON); // Unchanged
     }
 
     #[test]
@@ -330,8 +332,8 @@ mod tests {
     fn test_metrics() {
         let mut budget = default_budget();
 
-        budget.on_fill(5000.0);  // 2.5 tokens
-        budget.spend(5);  // 1.0 + 4*0.8 = 4.2 tokens
+        budget.on_fill(5000.0); // 2.5 tokens
+        budget.spend(5); // 1.0 + 4*0.8 = 4.2 tokens
 
         let metrics = budget.get_metrics();
         assert!((metrics.total_earned - 2.5).abs() < f64::EPSILON);

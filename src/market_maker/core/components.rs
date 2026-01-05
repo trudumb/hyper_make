@@ -21,10 +21,7 @@ use crate::market_maker::{
         SpreadProcessEstimator,
     },
     risk::{KillSwitch, KillSwitchConfig, RiskAggregator},
-    tracking::{
-        ImpulseFilter, PnLConfig, PnLTracker, QueueConfig,
-        QueuePositionTracker,
-    },
+    tracking::{ImpulseFilter, PnLConfig, PnLTracker, QueueConfig, QueuePositionTracker},
     DynamicRiskConfig, StochasticConfig,
 };
 

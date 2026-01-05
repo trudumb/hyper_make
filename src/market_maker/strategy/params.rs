@@ -976,11 +976,14 @@ impl ParameterAggregator {
                 // Get market p80 from spread tracker
                 let market_p80_bps = sources.spread_tracker.spread_p80_bps();
                 // Combine with fill controller ceiling
-                sources.adaptive_spreads.dynamic_spread_ceiling(market_p80_bps)
+                sources
+                    .adaptive_spreads
+                    .dynamic_spread_ceiling(market_p80_bps)
             } else {
                 None // CLI override active, static ceiling in use
             },
-            use_dynamic_bounds: sources.use_dynamic_kappa_floor || sources.use_dynamic_spread_ceiling,
+            use_dynamic_bounds: sources.use_dynamic_kappa_floor
+                || sources.use_dynamic_spread_ceiling,
 
             adaptive_warmed_up: sources.adaptive_spreads.is_warmed_up(),
             adaptive_can_estimate: sources.adaptive_spreads.can_provide_estimates(),

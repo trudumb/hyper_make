@@ -727,8 +727,8 @@ impl Default for StochasticConfig {
 
             // Microprice EMA Smoothing
             // ENABLED by default - reduces quote volatility from microprice noise
-            microprice_ema_alpha: 0.2,              // 5-update half-life
-            microprice_ema_min_change_bps: 2.0,     // 2 bps noise filter
+            microprice_ema_alpha: 0.2,          // 5-update half-life
+            microprice_ema_min_change_bps: 2.0, // 2 bps noise filter
         }
     }
 }

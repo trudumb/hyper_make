@@ -84,7 +84,8 @@
       "Bash(chmod:*)",
       "Bash(RUST_LOG=hyperliquid_rust_sdk::market_maker::strategy::ladder_strat=trace timeout:*)",
       "mcp__serena__insert_after_symbol",
-      "Bash(git grep:*)"
+      "Bash(git grep:*)",
+      "mcp__serena__replace_content"
     ]
   }
 }

@@ -92,8 +92,6 @@ pub use market_maker::{
     MarketMakerConfig,
     MarketMakerMetricsRecorder,
     MarketParams,
-    // Spread profiles for different market types
-    SpreadProfile,
     MetricsRecorder,
     // Prometheus Metrics
     MetricsSummary,
@@ -118,10 +116,10 @@ pub use market_maker::{
     QueuePositionTracker,
     QueueSummary,
     Quote,
-    // Reconciliation config for smart ladder updates
-    ReconcileConfig,
     QuoteConfig,
     QuotingStrategy,
+    // Reconciliation config for smart ladder updates
+    ReconcileConfig,
     ReconciliationConfig,
     ReconciliationTrigger,
     ReconnectionConfig,
@@ -138,6 +136,8 @@ pub use market_maker::{
     // Tier 2: Spread Process
     SpreadConfig,
     SpreadProcessEstimator,
+    // Spread profiles for different market types
+    SpreadProfile,
     SpreadRegime,
     SpreadSummary,
     // Stochastic Module Integration

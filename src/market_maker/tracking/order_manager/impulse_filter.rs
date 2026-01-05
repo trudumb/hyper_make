@@ -34,10 +34,10 @@ pub struct ImpulseFilterConfig {
 impl Default for ImpulseFilterConfig {
     fn default() -> Self {
         Self {
-            improvement_threshold: 0.10,     // 10% Δλ required (user preference: responsive)
-            fill_horizon_seconds: 1.0,       // 1-second fill horizon
-            queue_lock_threshold: 0.30,      // Lock orders with >30% P(fill)
-            queue_lock_override_bps: 25.0,   // Override lock if price moved >25bps
+            improvement_threshold: 0.10, // 10% Δλ required (user preference: responsive)
+            fill_horizon_seconds: 1.0,   // 1-second fill horizon
+            queue_lock_threshold: 0.30,  // Lock orders with >30% P(fill)
+            queue_lock_override_bps: 25.0, // Override lock if price moved >25bps
         }
     }
 }
@@ -146,9 +146,9 @@ impl ImpulseFilter {
         } else {
             // If current P(fill) is essentially zero, any improvement is significant
             if p_fill_new > 1e-10 {
-                1.0  // Treat as 100% improvement
+                1.0 // Treat as 100% improvement
             } else {
-                0.0  // Both zero, no improvement
+                0.0 // Both zero, no improvement
             }
         };
 
@@ -223,11 +223,11 @@ impl ImpulseFilter {
     /// Φ(-x) ≈ exp(-x²/2) / (x * √(2π)) for x > 0
     fn approximate_p_touch(normalized_distance: f64) -> f64 {
         if normalized_distance <= 0.0 {
-            return 1.0;  // At or beyond mid, P(touch) = 1
+            return 1.0; // At or beyond mid, P(touch) = 1
         }
 
         if normalized_distance > 5.0 {
-            return 0.0;  // Very far from mid, P(touch) ≈ 0
+            return 0.0; // Very far from mid, P(touch) ≈ 0
         }
 
         // Fast approximation using exponential

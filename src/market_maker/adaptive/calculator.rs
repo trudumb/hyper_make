@@ -522,10 +522,7 @@ impl AdaptiveSpreadCalculator {
         }
 
         // Get fill controller ceiling (returns None if meeting target)
-        let fill_ceiling_bps = self
-            .fill_controller
-            .spread_ceiling()
-            .map(|c| c * 10000.0); // Convert fraction to bps
+        let fill_ceiling_bps = self.fill_controller.spread_ceiling().map(|c| c * 10000.0); // Convert fraction to bps
 
         // Combine with market p80 using max (more permissive wins)
         match (fill_ceiling_bps, market_spread_p80_bps) {
