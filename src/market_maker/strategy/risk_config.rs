@@ -233,3 +233,46 @@ impl Default for RiskConfig {
         }
     }
 }
+
+impl RiskConfig {
+    /// Config for HIP-3 DEX with 15-25 bps target spreads.
+    ///
+    /// Key changes from default:
+    /// - Lower gamma_base (0.15 vs 0.3) for tighter spreads
+    /// - Lower spread floor (6 bps vs 8 bps)
+    /// - Disable time-of-day scaling (HIP-3 has different trading patterns)
+    /// - Disable book depth scaling (always thin, causes unnecessary widening)
+    /// - Reduced warmup penalty
+    ///
+    /// GLFT math: With κ=1500 and γ=0.15, δ* ≈ 1/κ ≈ 6.7 bps per side
+    /// Total spread: 2 × 6.7 + 3 bps fees = ~16.4 bps (within 15-25 target)
+    pub fn hip3() -> Self {
+        Self {
+            gamma_base: 0.15,                    // Aggressive (vs 0.3 default)
+            gamma_min: 0.08,                     // Allow tight quotes
+            gamma_max: 2.0,                      // Lower ceiling
+            sigma_baseline: 0.00015,             // 15 bps/sec (lower vol expectation)
+            volatility_weight: 0.3,              // Less vol scaling
+            max_volatility_multiplier: 2.0,      // Lower cap
+            toxicity_threshold: 2.0,             // Higher tolerance (less informed flow on HIP-3)
+            toxicity_sensitivity: 0.2,           // Less sensitive
+            inventory_threshold: 0.4,            // Higher inventory tolerance
+            inventory_sensitivity: 1.5,          // Less aggressive scaling
+            min_spread_floor: 0.0006,            // 6 bps floor (vs 8 bps)
+            max_holding_time: 300.0,             // 5 minutes (slower markets)
+            flow_sensitivity: 0.3,               // Less flow adjustment
+            maker_fee_rate: 0.00015,             // Same fee
+            // DISABLE time-of-day scaling for HIP-3 (different patterns)
+            enable_time_of_day_scaling: false,
+            toxic_hour_gamma_multiplier: 1.0,
+            toxic_hours: vec![],
+            // DISABLE book depth scaling (always thin, would cause perpetual widening)
+            enable_book_depth_scaling: false,
+            book_depth_threshold_usd: 0.0,
+            max_book_depth_gamma_mult: 1.0,
+            // Reduced warmup penalty
+            enable_warmup_gamma_scaling: true,
+            max_warmup_gamma_mult: 1.05,         // Minimal warmup penalty (5% vs 10%)
+        }
+    }
+}

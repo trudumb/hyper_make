@@ -98,6 +98,12 @@ impl QueuePositionTracker {
         }
     }
 
+    /// Get the current volatility (sigma per second).
+    #[inline]
+    pub fn sigma(&self) -> f64 {
+        self.sigma
+    }
+
     /// Update tracker with new L2 book data.
     ///
     /// This decays queue positions and updates best bid/ask.

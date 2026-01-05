@@ -11,13 +11,18 @@
 //! - `types`: Core types (`Side`, `OrderState`, `TrackedOrder`, `PendingOrder`)
 //! - `manager`: `OrderManager` implementation
 //! - `reconcile`: Ladder reconciliation logic
+//! - `impulse_filter`: Statistical impulse control for API churn reduction
 
+mod impulse_filter;
 mod manager;
 mod reconcile;
 mod types;
 
+pub use impulse_filter::{ImpulseDecision, ImpulseFilter, ImpulseFilterConfig, ImpulseFilterStats};
 pub use manager::OrderManager;
-pub use reconcile::{reconcile_side_smart, ReconcileConfig};
+pub use reconcile::{
+    reconcile_side_smart, reconcile_side_smart_with_impulse, ReconcileConfig, ReconcileStats,
+};
 pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder};
 
 #[cfg(test)]

@@ -57,6 +57,20 @@ pub struct MarketParams {
     /// CV = 1.0 for exponential, CV > 1.2 indicates heavy tail (power-law like).
     pub kappa_cv: f64,
 
+    // === V3: Robust Kappa Orchestrator ===
+    /// Robust kappa from V3 orchestrator (outlier-resistant).
+    /// Blends book-structure κ, Student-t robust κ, and own-fill κ.
+    /// Use this instead of `kappa` for illiquid/HIP-3 markets.
+    pub kappa_robust: f64,
+
+    /// Whether to use kappa_robust instead of kappa for spread calculation.
+    /// When true, ladder_strat uses kappa_robust for GLFT formula.
+    pub use_kappa_robust: bool,
+
+    /// Number of outliers detected by robust estimator.
+    /// High count indicates market has heavy-tailed trade distances.
+    pub kappa_outlier_count: u64,
+
     // === V2: Uncertainty Quantification (Bayesian Estimator) ===
     /// Kappa posterior standard deviation (√Var[κ|data]).
     /// Use for spread uncertainty: δσ² ≈ (∂δ/∂κ)² × σ²_κ
@@ -460,6 +474,10 @@ impl Default for MarketParams {
             kappa_ask: 100.0,                // Same as kappa initially
             is_heavy_tailed: false,          // Assume exponential tails
             kappa_cv: 1.0,                   // CV=1 for exponential
+            // V3: Robust Kappa Orchestrator
+            kappa_robust: 2000.0,            // Start at prior (will be updated from orchestrator)
+            use_kappa_robust: true,          // Default ON - use robust kappa for spreads
+            kappa_outlier_count: 0,          // No outliers detected yet
             // V2: Uncertainty Quantification
             kappa_uncertainty: 0.0,    // Will be computed from posterior
             kappa_95_lower: 100.0,     // Conservative lower bound

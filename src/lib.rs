@@ -62,6 +62,8 @@ pub use market_maker::{
     HawkesSummary,
     HealthSummary,
     HyperliquidExecutor,
+    // Statistical Impulse Control
+    ImpulseControlConfig,
     InventoryAwareStrategy,
     // Production Safety: Kill Switch
     KillReason,
@@ -90,6 +92,8 @@ pub use market_maker::{
     MarketMakerConfig,
     MarketMakerMetricsRecorder,
     MarketParams,
+    // Spread profiles for different market types
+    SpreadProfile,
     MetricsRecorder,
     // Prometheus Metrics
     MetricsSummary,

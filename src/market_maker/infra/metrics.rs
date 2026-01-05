@@ -203,6 +203,24 @@ struct MetricsInner {
     /// Whether calibration is complete (1 = yes, 0 = no)
     calibration_complete: AtomicU64,
 
+    // === Impulse Control Metrics ===
+    /// Whether impulse control is enabled (1 = enabled, 0 = disabled)
+    impulse_control_enabled: AtomicU64,
+    /// Available execution budget tokens
+    impulse_budget_available: AtomicF64,
+    /// Budget utilization (spent / (earned + initial))
+    impulse_budget_utilization: AtomicF64,
+    /// Total tokens earned from fills
+    impulse_budget_earned: AtomicF64,
+    /// Total tokens spent on actions
+    impulse_budget_spent: AtomicF64,
+    /// Actions blocked by Δλ filter (improvement too small)
+    impulse_filter_blocked: AtomicU64,
+    /// Actions blocked by queue lock (high P(fill) orders)
+    impulse_queue_locked: AtomicU64,
+    /// Full cycles skipped due to insufficient budget
+    impulse_budget_skipped: AtomicU64,
+
     /// Start time for uptime calculation
     start_time: Instant,
 }
@@ -292,6 +310,15 @@ impl PrometheusMetrics {
                 calibration_progress: AtomicF64::new(0.0),
                 calibration_fill_count: AtomicU64::new(0),
                 calibration_complete: AtomicU64::new(0),
+                // Impulse Control defaults
+                impulse_control_enabled: AtomicU64::new(0),
+                impulse_budget_available: AtomicF64::new(0.0),
+                impulse_budget_utilization: AtomicF64::new(0.0),
+                impulse_budget_earned: AtomicF64::new(0.0),
+                impulse_budget_spent: AtomicF64::new(0.0),
+                impulse_filter_blocked: AtomicU64::new(0),
+                impulse_queue_locked: AtomicU64::new(0),
+                impulse_budget_skipped: AtomicU64::new(0),
                 start_time: Instant::now(),
             }),
         }
@@ -653,6 +680,68 @@ impl PrometheusMetrics {
         self.inner
             .calibration_complete
             .store(if complete { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Update impulse control metrics.
+    ///
+    /// # Arguments
+    /// * `enabled` - Whether impulse control is active
+    /// * `available` - Current available tokens
+    /// * `utilization` - Budget utilization ratio
+    /// * `earned` - Total tokens earned from fills
+    /// * `spent` - Total tokens spent on actions
+    /// * `filter_blocked` - Actions blocked by Δλ filter
+    /// * `queue_locked` - Actions blocked by queue lock
+    /// * `budget_skipped` - Cycles skipped due to budget
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_impulse_control(
+        &self,
+        enabled: bool,
+        available: f64,
+        utilization: f64,
+        earned: f64,
+        spent: f64,
+        filter_blocked: u64,
+        queue_locked: u64,
+        budget_skipped: u64,
+    ) {
+        self.inner
+            .impulse_control_enabled
+            .store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
+        self.inner.impulse_budget_available.store(available);
+        self.inner.impulse_budget_utilization.store(utilization);
+        self.inner.impulse_budget_earned.store(earned);
+        self.inner.impulse_budget_spent.store(spent);
+        self.inner
+            .impulse_filter_blocked
+            .store(filter_blocked, Ordering::Relaxed);
+        self.inner
+            .impulse_queue_locked
+            .store(queue_locked, Ordering::Relaxed);
+        self.inner
+            .impulse_budget_skipped
+            .store(budget_skipped, Ordering::Relaxed);
+    }
+
+    /// Increment impulse filter blocked counter.
+    pub fn incr_impulse_filter_blocked(&self, count: u64) {
+        self.inner
+            .impulse_filter_blocked
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment impulse queue locked counter.
+    pub fn incr_impulse_queue_locked(&self, count: u64) {
+        self.inner
+            .impulse_queue_locked
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment impulse budget skipped counter.
+    pub fn incr_impulse_budget_skipped(&self) {
+        self.inner
+            .impulse_budget_skipped
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // === Getters ===
@@ -1192,6 +1281,72 @@ impl PrometheusMetrics {
             if calibration_complete { 1 } else { 0 }
         ));
 
+        // Impulse Control metrics
+        let impulse_enabled = self.inner.impulse_control_enabled.load(Ordering::Relaxed) == 1;
+        output.push_str(&format!(
+            "# HELP mm_impulse_control_enabled Whether impulse control is active (1=yes, 0=no)\n\
+             # TYPE mm_impulse_control_enabled gauge\n\
+             mm_impulse_control_enabled{{{}}} {}\n",
+            labels,
+            if impulse_enabled { 1 } else { 0 }
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_budget_available Available execution budget tokens\n\
+             # TYPE mm_impulse_budget_available gauge\n\
+             mm_impulse_budget_available{{{}}} {}\n",
+            labels,
+            self.inner.impulse_budget_available.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_budget_utilization Budget utilization ratio (spent / total)\n\
+             # TYPE mm_impulse_budget_utilization gauge\n\
+             mm_impulse_budget_utilization{{{}}} {}\n",
+            labels,
+            self.inner.impulse_budget_utilization.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_budget_earned Total tokens earned from fills\n\
+             # TYPE mm_impulse_budget_earned counter\n\
+             mm_impulse_budget_earned{{{}}} {}\n",
+            labels,
+            self.inner.impulse_budget_earned.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_budget_spent Total tokens spent on actions\n\
+             # TYPE mm_impulse_budget_spent counter\n\
+             mm_impulse_budget_spent{{{}}} {}\n",
+            labels,
+            self.inner.impulse_budget_spent.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_filter_blocked Actions blocked by delta-lambda filter\n\
+             # TYPE mm_impulse_filter_blocked counter\n\
+             mm_impulse_filter_blocked{{{}}} {}\n",
+            labels,
+            self.inner.impulse_filter_blocked.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_queue_locked Actions blocked by queue lock (high P fill)\n\
+             # TYPE mm_impulse_queue_locked counter\n\
+             mm_impulse_queue_locked{{{}}} {}\n",
+            labels,
+            self.inner.impulse_queue_locked.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_impulse_budget_skipped Cycles skipped due to insufficient budget\n\
+             # TYPE mm_impulse_budget_skipped counter\n\
+             mm_impulse_budget_skipped{{{}}} {}\n",
+            labels,
+            self.inner.impulse_budget_skipped.load(Ordering::Relaxed)
+        ));
+
         output
     }
 
@@ -1280,6 +1435,28 @@ impl PrometheusMetrics {
         map.insert(
             "kelly_alpha_decay_bps".to_string(),
             self.inner.kelly_alpha_decay_bps.load(),
+        );
+
+        // Impulse Control metrics
+        map.insert(
+            "impulse_control_enabled".to_string(),
+            self.inner.impulse_control_enabled.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "impulse_budget_available".to_string(),
+            self.inner.impulse_budget_available.load(),
+        );
+        map.insert(
+            "impulse_budget_utilization".to_string(),
+            self.inner.impulse_budget_utilization.load(),
+        );
+        map.insert(
+            "impulse_filter_blocked".to_string(),
+            self.inner.impulse_filter_blocked.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "impulse_queue_locked".to_string(),
+            self.inner.impulse_queue_locked.load(Ordering::Relaxed) as f64,
         );
 
         map

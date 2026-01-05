@@ -10,6 +10,7 @@ use super::hierarchical_kappa::HierarchicalKappa;
 use super::jump::JumpEstimator;
 use super::kalman::KalmanPriceFilter;
 use super::kappa::{BayesianKappaEstimator, BookStructureEstimator};
+use super::kappa_orchestrator::{KappaOrchestrator, KappaOrchestratorConfig};
 use super::microprice::MicropriceEstimator;
 use super::momentum::{MomentumDetector, MomentumModel, TradeFlowTracker};
 use super::soft_jump::SoftJumpClassifier;
@@ -83,6 +84,12 @@ pub struct ParameterEstimator {
     soft_jump: SoftJumpClassifier,
     /// (κ, σ) parameter covariance tracker
     param_covariance: ParameterCovariance,
+
+    // === V3 Robust Kappa Orchestrator ===
+    /// Robust kappa orchestrator: confidence-weighted blending of
+    /// book-structure κ, robust (Student-t) κ, and own-fill κ.
+    /// Resists outlier poisoning from liquidation cascades.
+    kappa_orchestrator: KappaOrchestrator,
 
     // === Competitive Spread Control ===
     /// Optional minimum floor for kappa output.
@@ -168,6 +175,19 @@ impl ParameterEstimator {
         // Parameter covariance tracker (50-tick half-life for (κ, σ) correlation)
         let param_covariance = ParameterCovariance::with_half_life(50.0);
 
+        // V3 Robust Kappa Orchestrator: confidence-weighted blending of multiple estimators
+        // Uses book-structure κ (L2 depth decay), robust κ (Student-t), and own-fill κ
+        // Resists outlier poisoning from liquidation cascades
+        let kappa_orchestrator = KappaOrchestrator::new(KappaOrchestratorConfig {
+            prior_kappa: config.kappa_prior_mean,
+            prior_strength: config.kappa_prior_strength,
+            robust_nu: 4.0,                          // Moderate heavy tails
+            robust_window_ms: config.kappa_window_ms,
+            own_fill_window_ms: config.kappa_window_ms,
+            use_book_kappa: true,
+            use_robust_kappa: true,
+        });
+
         // Kappa floor for competitive spread control on illiquid assets
         let kappa_floor = config.kappa_floor;
         // Max spread ceiling for spread control (CLI override)
@@ -199,6 +219,8 @@ impl ParameterEstimator {
             hierarchical_kappa,
             soft_jump,
             param_covariance,
+            // V3 Robust kappa orchestrator
+            kappa_orchestrator,
             // Competitive spread control
             kappa_floor,
             max_spread_ceiling_bps,
@@ -233,18 +255,24 @@ impl ParameterEstimator {
             self.flow.on_trade(timestamp_ms, size, is_buy);
         }
 
-        // Feed into MARKET kappa estimator (trade distance from mid)
-        // This is the FALLBACK source - used when own_kappa confidence is low
-        //
         // Initialize current_mid from trade price if not yet set.
         // This prevents warmup deadlock where trades arrive before L2Book/AllMids.
         // The trade price is close enough to mid for initial kappa estimates.
         if self.current_mid <= 0.0 && price > 0.0 {
             self.current_mid = price;
         }
+
+        // Feed into MARKET kappa estimator (LEGACY - kept for backwards compatibility)
+        // WARNING: This is vulnerable to outlier poisoning from liquidations!
+        // The V3 KappaOrchestrator uses a robust Student-t estimator instead.
         if self.current_mid > 0.0 {
             self.market_kappa
                 .on_trade(timestamp_ms, price, size, self.current_mid);
+
+            // V3: Feed into robust kappa orchestrator (outlier-resistant)
+            // Uses Student-t likelihood to resist liquidation cascade poisoning
+            self.kappa_orchestrator
+                .on_market_trade(timestamp_ms, price, self.current_mid);
         }
 
         // Feed into volume bucket accumulator
@@ -393,6 +421,13 @@ impl ParameterEstimator {
         // Record fill in hierarchical kappa (adverse selection not yet available here)
         self.hierarchical_kappa
             .record_fill(distance_bps, timestamp_ms, None);
+
+        // V3: Feed into kappa orchestrator's own-fill estimator (gold standard)
+        // Own fills are the most accurate source - they dominate as fills accumulate
+        if self.current_mid > 0.0 {
+            self.kappa_orchestrator
+                .on_own_fill(timestamp_ms, fill_price, fill_size, self.current_mid);
+        }
     }
 
     /// Legacy on_trade without aggressor info (backward compatibility).
@@ -402,11 +437,15 @@ impl ParameterEstimator {
 
     /// Process L2 order book update for book structure analysis.
     /// bids and asks are slices of (price, size) tuples, best first.
-    /// Note: Kappa is now estimated from trade distances (Bayesian), not book shape.
+    /// V3: Also feeds into book-structure kappa estimator (L2 depth decay regression).
     pub fn on_l2_book(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) {
         self.current_mid = mid;
         // Book structure for imbalance and liquidity signals (still valid uses)
         self.book_structure.update(bids, asks, mid);
+
+        // V3: Feed into kappa orchestrator for book-structure κ estimation
+        // Fits exponential decay model: Depth(δ) = D₀ × exp(-κδ)
+        self.kappa_orchestrator.on_l2_book(bids, asks, mid);
 
         // Adapt microprice forward horizon to current arrival intensity
         // Fast markets → shorter horizon, slow markets → longer horizon
@@ -625,6 +664,72 @@ impl ParameterEstimator {
     /// Get market kappa confidence [0, 1].
     pub fn kappa_market_confidence(&self) -> f64 {
         self.market_kappa.confidence()
+    }
+
+    // === V3 Robust Kappa Orchestrator Accessors ===
+
+    /// Get robust kappa from the V3 orchestrator (outlier-resistant).
+    ///
+    /// This is the PRIMARY κ estimate for illiquid/HIP-3 markets.
+    /// It combines three sources with confidence-weighted blending:
+    /// 1. Book-structure κ: From L2 depth decay (exponential fit)
+    /// 2. Robust κ: From market trades with Student-t likelihood (resists outliers)
+    /// 3. Own-fill κ: From our actual order fills (gold standard when available)
+    ///
+    /// The orchestrator automatically selects the best source based on confidence.
+    /// During warmup, book-structure dominates. As fills accumulate, own-fill takes over.
+    pub fn kappa_robust(&self) -> f64 {
+        let kappa = self.kappa_orchestrator.kappa_effective();
+        let final_kappa = self.apply_kappa_floor(kappa);
+        // Debug: Log every call to trace source of drop
+        debug!(
+            orchestrator_kappa = %format!("{:.0}", kappa),
+            floor_applied = self.kappa_floor.is_some(),
+            final_kappa = %format!("{:.0}", final_kappa),
+            own_fills = self.kappa_orchestrator.own_kappa_observation_count(),
+            "kappa_robust computed"
+        );
+        final_kappa
+    }
+
+    /// Get robust kappa confidence from orchestrator [0, 1].
+    pub fn kappa_robust_confidence(&self) -> f64 {
+        self.kappa_orchestrator.confidence()
+    }
+
+    /// Check if robust kappa orchestrator is warmed up.
+    pub fn kappa_robust_warmed_up(&self) -> bool {
+        self.kappa_orchestrator.is_warmed_up()
+    }
+
+    /// Get component breakdown from kappa orchestrator for diagnostics.
+    ///
+    /// Returns ((own_kappa, own_weight), (book_kappa, book_weight),
+    ///          (robust_kappa, robust_weight), (prior_kappa, prior_weight), is_warmup)
+    pub fn kappa_robust_breakdown(
+        &self,
+    ) -> ((f64, f64), (f64, f64), (f64, f64), (f64, f64), bool) {
+        self.kappa_orchestrator.component_breakdown()
+    }
+
+    /// Get book-structure kappa from L2 depth regression.
+    pub fn kappa_book(&self) -> f64 {
+        self.kappa_orchestrator.book_kappa()
+    }
+
+    /// Get robust kappa from Student-t estimator.
+    pub fn kappa_studentt(&self) -> f64 {
+        self.kappa_orchestrator.robust_kappa()
+    }
+
+    /// Get own-fill kappa from Bayesian estimator (in orchestrator).
+    pub fn kappa_own_robust(&self) -> f64 {
+        self.kappa_orchestrator.own_kappa()
+    }
+
+    /// Get number of outliers detected by robust estimator.
+    pub fn kappa_outlier_count(&self) -> u64 {
+        self.kappa_orchestrator.outlier_count()
     }
 
     /// Get coefficient of variation for fill distance distribution.

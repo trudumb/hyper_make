@@ -5,15 +5,15 @@
 use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
-    config::MetricsRecorder,
+    config::{ImpulseControlConfig, MetricsRecorder},
     estimator::{CalibrationController, CalibrationControllerConfig},
     fills::FillProcessor,
     infra::{
         ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
-        ExchangePositionLimits, MarginAwareSizer, MarginConfig, OrphanTracker, OrphanTrackerConfig,
-        PositionReconciler, ProactiveRateLimitConfig, ProactiveRateLimitTracker, PrometheusMetrics,
-        ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
-        RejectionRateLimiter, SupervisorConfig,
+        ExchangePositionLimits, ExecutionBudget, MarginAwareSizer, MarginConfig, OrphanTracker,
+        OrphanTrackerConfig, PositionReconciler, ProactiveRateLimitConfig,
+        ProactiveRateLimitTracker, PrometheusMetrics, ReconciliationConfig, RecoveryConfig,
+        RecoveryManager, RejectionRateLimitConfig, RejectionRateLimiter, SupervisorConfig,
     },
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
@@ -21,7 +21,10 @@ use crate::market_maker::{
         SpreadProcessEstimator,
     },
     risk::{KillSwitch, KillSwitchConfig, RiskAggregator},
-    tracking::{PnLConfig, PnLTracker, QueueConfig, QueuePositionTracker},
+    tracking::{
+        ImpulseFilter, PnLConfig, PnLTracker, QueueConfig,
+        QueuePositionTracker,
+    },
     DynamicRiskConfig, StochasticConfig,
 };
 
@@ -144,6 +147,14 @@ pub struct InfraComponents {
     /// Orphan order tracker (Phase 7)
     /// Prevents false orphan detection during order lifecycle
     pub orphan_tracker: OrphanTracker,
+    /// Execution budget for statistical impulse control (Phase 8)
+    /// Token-based budget for gating API calls
+    pub execution_budget: ExecutionBudget,
+    /// Impulse filter for Δλ-based update gating (Phase 8)
+    /// Only updates orders when fill probability improvement exceeds threshold
+    pub impulse_filter: ImpulseFilter,
+    /// Whether impulse control is enabled
+    pub impulse_control_enabled: bool,
 }
 
 impl InfraComponents {
@@ -207,6 +218,34 @@ impl InfraComponents {
         supervisor_config: SupervisorConfig,
         orphan_config: OrphanTrackerConfig,
     ) -> Self {
+        Self::with_impulse_config(
+            margin_config,
+            data_quality_config,
+            metrics,
+            recovery_config,
+            reconciliation_config,
+            rate_limit_config,
+            proactive_rate_config,
+            supervisor_config,
+            orphan_config,
+            ImpulseControlConfig::default(),
+        )
+    }
+
+    /// Create infrastructure components with impulse control config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_impulse_config(
+        margin_config: MarginConfig,
+        data_quality_config: DataQualityConfig,
+        metrics: MetricsRecorder,
+        recovery_config: RecoveryConfig,
+        reconciliation_config: ReconciliationConfig,
+        rate_limit_config: RejectionRateLimitConfig,
+        proactive_rate_config: ProactiveRateLimitConfig,
+        supervisor_config: SupervisorConfig,
+        orphan_config: OrphanTrackerConfig,
+        impulse_config: ImpulseControlConfig,
+    ) -> Self {
         let connection_supervisor = ConnectionSupervisor::with_config(supervisor_config);
         Self {
             margin_sizer: MarginAwareSizer::new(margin_config),
@@ -223,6 +262,9 @@ impl InfraComponents {
             rate_limiter: RejectionRateLimiter::with_config(rate_limit_config),
             proactive_rate_tracker: ProactiveRateLimitTracker::with_config(proactive_rate_config),
             orphan_tracker: OrphanTracker::with_config(orphan_config),
+            execution_budget: impulse_config.create_budget(),
+            impulse_filter: ImpulseFilter::new(impulse_config.filter.clone()),
+            impulse_control_enabled: impulse_config.enabled,
         }
     }
 }

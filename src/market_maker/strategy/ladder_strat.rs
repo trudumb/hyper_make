@@ -359,10 +359,19 @@ impl LadderStrategy {
             gamma_with_liq * market_params.tail_risk_multiplier
         };
 
-        // === KAPPA: Adaptive vs Legacy ===
-        // When adaptive spreads enabled: use blended book/own-fill kappa
-        // When disabled: use book-only kappa with AS adjustment
-        let kappa = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+        // === KAPPA: Robust V3 > Adaptive > Legacy ===
+        // Priority: 1. Robust kappa (outlier-resistant), 2. Adaptive, 3. Legacy
+        let kappa = if market_params.use_kappa_robust {
+            // V3 Robust kappa: from KappaOrchestrator (outlier-resistant)
+            // Blends book-structure κ, Student-t robust κ, and own-fill κ
+            info!(
+                kappa_robust = %format!("{:.0}", market_params.kappa_robust),
+                legacy_kappa = %format!("{:.0}", market_params.kappa),
+                outlier_count = market_params.kappa_outlier_count,
+                "Ladder using ROBUST kappa (V3)"
+            );
+            market_params.kappa_robust
+        } else if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
             // Adaptive kappa: blended from book depth + own fill experience
             debug!(
                 adaptive_kappa = %format!("{:.0}", market_params.adaptive_kappa),

@@ -27,16 +27,19 @@
 //! - `tick_ewma`: Tick-based EWMA for volume-clock aligned estimation
 //! - `parameter_estimator`: Main orchestrator
 
+mod book_kappa;
 mod calibration_controller;
 mod covariance;
 mod hierarchical_kappa;
 mod jump;
 mod kalman;
 mod kappa;
+mod kappa_orchestrator;
 mod microprice;
 mod mock;
 mod momentum;
 mod parameter_estimator;
+mod robust_kappa;
 mod soft_jump;
 pub(crate) mod tick_ewma;
 mod volatility;
@@ -49,6 +52,11 @@ pub(crate) use covariance::{MultiParameterCovariance, ParameterCovariance};
 pub(crate) use hierarchical_kappa::{HierarchicalKappa, HierarchicalKappaConfig};
 #[allow(unused_imports)]
 pub(crate) use soft_jump::SoftJumpClassifier;
+
+// Robust kappa orchestrator (V2 - outlier-resistant estimation)
+pub(crate) use book_kappa::BookKappaEstimator;
+pub(crate) use kappa_orchestrator::{KappaOrchestrator, KappaOrchestratorConfig};
+pub(crate) use robust_kappa::RobustKappaEstimator;
 
 // Re-export public types
 pub use calibration_controller::{CalibrationController, CalibrationControllerConfig};

@@ -300,6 +300,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
+        // Log impulse control status
+        info!(
+            impulse_control_enabled = %self.infra.impulse_control_enabled,
+            budget_tokens = %self.infra.execution_budget.available(),
+            improvement_threshold = %self.infra.impulse_filter.config().improvement_threshold,
+            queue_lock_threshold = %self.infra.impulse_filter.config().queue_lock_threshold,
+            "Impulse control status"
+        );
+
         // Track any remaining orders (should be empty after cancel-all, but be safe)
         // Use DEX-aware open_orders for HIP-3 support
         let open_orders = self
@@ -990,6 +999,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.infra
                 .proactive_rate_tracker
                 .record_fill_volume(result.total_volume_usd);
+
+            // Earn execution budget tokens from fills (impulse control)
+            if self.infra.impulse_control_enabled {
+                self.infra.execution_budget.on_fill(result.total_volume_usd);
+                debug!(
+                    volume_usd = %format!("{:.2}", result.total_volume_usd),
+                    budget_available = %format!("{:.1}", self.infra.execution_budget.available()),
+                    "Earned execution budget tokens from fill"
+                );
+            }
+
             debug!(
                 volume_usd = %format!("{:.2}", result.total_volume_usd),
                 "Recorded fill volume for rate limit budget"
@@ -2192,7 +2212,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         ask_quotes: Vec<Quote>,
     ) -> Result<()> {
         use crate::market_maker::quoting::LadderLevel;
-        use crate::market_maker::tracking::reconcile_side_smart;
+        use crate::market_maker::tracking::{reconcile_side_smart, reconcile_side_smart_with_impulse};
 
         let reconcile_config = &self.config.reconcile;
 
@@ -2215,15 +2235,97 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             })
             .collect();
 
+        // Log quote positions relative to market mid for diagnosing fill issues
+        // Shows where our quotes are placed vs the exchange mid price
+        if !bid_levels.is_empty() && !ask_levels.is_empty() && self.latest_mid > 0.0 {
+            let our_best_bid = bid_levels.first().map(|l| l.price).unwrap_or(0.0);
+            let our_best_ask = ask_levels.first().map(|l| l.price).unwrap_or(0.0);
+            let bid_distance_bps = (self.latest_mid - our_best_bid) / self.latest_mid * 10000.0;
+            let ask_distance_bps = (our_best_ask - self.latest_mid) / self.latest_mid * 10000.0;
+            let total_spread_bps = bid_distance_bps + ask_distance_bps;
+
+            info!(
+                market_mid = %format!("{:.4}", self.latest_mid),
+                our_bid = %format!("{:.4}", our_best_bid),
+                our_ask = %format!("{:.4}", our_best_ask),
+                bid_from_mid_bps = %format!("{:.1}", bid_distance_bps),
+                ask_from_mid_bps = %format!("{:.1}", ask_distance_bps),
+                total_spread_bps = %format!("{:.1}", total_spread_bps),
+                "Quote positions vs market"
+            );
+        }
+
         // Get current orders for each side
         let current_bids: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Buy);
         let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
 
+        // Impulse Control: Check execution budget before proceeding
+        let impulse_enabled = self.infra.impulse_control_enabled && reconcile_config.use_impulse_filter;
+        if impulse_enabled {
+            // Estimate potential actions: at most (current + target) per side
+            let max_potential_actions = current_bids.len() + bid_levels.len()
+                + current_asks.len() + ask_levels.len();
+
+            if !self.infra.execution_budget.can_afford_bulk(max_potential_actions) {
+                debug!(
+                    budget = %format!("{:.1}", self.infra.execution_budget.available()),
+                    potential_actions = max_potential_actions,
+                    "Impulse control: skipping reconciliation due to insufficient execution budget"
+                );
+                return Ok(());
+            }
+        }
+
         // Generate actions for each side using smart reconciliation
-        let mut bid_actions =
-            reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, reconcile_config);
-        let mut ask_actions =
-            reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, reconcile_config);
+        // When impulse control is enabled, use the impulse-aware version with Δλ filtering
+        let (mut bid_actions, bid_stats, mut ask_actions, ask_stats) = if impulse_enabled {
+            // Get mid price for P(fill) estimation
+            let mid_price = Some(self.latest_mid);
+
+            // Use impulse-aware reconciliation with queue tracker and impulse filter
+            let (bid_acts, bid_st) = reconcile_side_smart_with_impulse(
+                &current_bids,
+                &bid_levels,
+                Side::Buy,
+                reconcile_config,
+                Some(&self.tier1.queue_tracker),
+                Some(&mut self.infra.impulse_filter),
+                mid_price,
+            );
+
+            let (ask_acts, ask_st) = reconcile_side_smart_with_impulse(
+                &current_asks,
+                &ask_levels,
+                Side::Sell,
+                reconcile_config,
+                Some(&self.tier1.queue_tracker),
+                Some(&mut self.infra.impulse_filter),
+                mid_price,
+            );
+
+            // Log impulse filter statistics
+            if bid_st.impulse_filtered_count > 0 || ask_st.impulse_filtered_count > 0
+                || bid_st.queue_locked_count > 0 || ask_st.queue_locked_count > 0
+            {
+                debug!(
+                    bid_impulse_filtered = bid_st.impulse_filtered_count,
+                    ask_impulse_filtered = ask_st.impulse_filtered_count,
+                    bid_queue_locked = bid_st.queue_locked_count,
+                    ask_queue_locked = ask_st.queue_locked_count,
+                    "Impulse control: filtered low-value updates"
+                );
+            }
+
+            (bid_acts, Some(bid_st), ask_acts, Some(ask_st))
+        } else {
+            // Standard reconciliation without impulse filtering
+            let bid_acts = reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, reconcile_config);
+            let ask_acts = reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, reconcile_config);
+            (bid_acts, None, ask_acts, None)
+        };
+
+        // Track impulse stats for metrics
+        let _impulse_stats = (bid_stats, ask_stats);
 
         // Queue-aware enhancement: Check if any "skipped" orders should be refreshed
         // based on queue position analysis
@@ -2308,6 +2410,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             partition_ladder_actions(&bid_actions, Side::Buy);
         let (ask_cancels, ask_modifies, ask_places) =
             partition_ladder_actions(&ask_actions, Side::Sell);
+
+        // Track action counts for impulse control budget spending
+        let cancel_count = bid_cancels.len() + ask_cancels.len();
+        let modify_count = bid_modifies.len() + ask_modifies.len();
 
         // Log action summary (skip count only considers existing orders minus those modified/cancelled)
         let _total_skips = (current_bids.len() + current_asks.len()).saturating_sub(
@@ -2638,12 +2744,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Execute places (new orders)
+        let bid_place_count = bid_places.len();
+        let ask_place_count = ask_places.len();
         if !bid_places.is_empty() {
             self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
         }
         if !ask_places.is_empty() {
             self.place_bulk_ladder_orders(Side::Sell, ask_places)
                 .await?;
+        }
+
+        // Impulse Control: Spend execution budget tokens for actions executed
+        if impulse_enabled {
+            let total_actions = cancel_count + modify_count + bid_place_count + ask_place_count;
+            if total_actions > 0 {
+                self.infra.execution_budget.spend(total_actions);
+                debug!(
+                    actions = total_actions,
+                    budget_remaining = %format!("{:.1}", self.infra.execution_budget.available()),
+                    "Impulse control: spent execution budget tokens"
+                );
+            }
         }
 
         Ok(())

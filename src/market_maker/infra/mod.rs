@@ -15,12 +15,14 @@
 //! - **Capacity**: Pre-allocation constants for latency optimization
 //! - **Arena**: Quote cycle arena allocator for latency optimization
 //! - **OrphanTracker**: Prevents false orphan detection during order lifecycle
+//! - **ExecutionBudget**: Token-based budget for statistical impulse control
 
 mod arena;
 pub mod capacity;
 mod connection_supervisor;
 mod data_quality;
 mod exchange_limits;
+mod execution_budget;
 mod executor;
 mod logging;
 mod margin;
@@ -35,6 +37,7 @@ pub use arena::*;
 pub use connection_supervisor::*;
 pub use data_quality::*;
 pub use exchange_limits::*;
+pub use execution_budget::*;
 pub use executor::*;
 pub use logging::*;
 pub use margin::*;

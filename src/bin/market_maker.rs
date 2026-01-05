@@ -20,12 +20,13 @@ use tracing::{info, warn};
 use hyperliquid_rust_sdk::{
     init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CollateralInfo,
     DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, FundingConfig,
-    GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient, InventoryAwareStrategy,
-    KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig, LogConfig,
-    LogFormat as MmLogFormat, MarginConfig, MarketMaker, MarketMakerConfig as MmConfig,
-    MarketMakerMetricsRecorder, PnLConfig, QueueConfig, QuotingStrategy, ReconcileConfig,
-    ReconciliationConfig, RecoveryConfig, RejectionRateLimitConfig, RiskConfig, SpreadConfig,
-    StochasticConfig, SymmetricStrategy,
+    GLFTStrategy, HawkesConfig, HyperliquidExecutor, ImpulseControlConfig, InfoClient,
+    InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
+    LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker,
+    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
+    QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
+    RejectionRateLimitConfig, RiskConfig, SpreadConfig, SpreadProfile, StochasticConfig,
+    SymmetricStrategy,
 };
 
 // ============================================================================
@@ -121,6 +122,13 @@ struct Cli {
     #[arg(long)]
     dex: Option<String>,
 
+    /// Spread profile for target spread ranges (default, hip3, aggressive)
+    /// - default: 40-50 bps for liquid perps
+    /// - hip3: 15-25 bps for HIP-3 DEX (tighter spreads)
+    /// - aggressive: 10-20 bps (experimental)
+    #[arg(long, default_value = "default")]
+    spread_profile: String,
+
     /// List available HIP-3 DEXs and exit
     #[arg(long)]
     list_dexs: bool,
@@ -153,6 +161,27 @@ struct Cli {
     /// Time horizon in seconds for queue fill probability calculation (default: 1.0)
     #[arg(long)]
     queue_horizon_seconds: Option<f64>,
+
+    // === Statistical Impulse Control Flags ===
+    /// Enable statistical impulse control to reduce API churn by 50-70%
+    /// Uses token budget + Δλ filtering to gate order updates
+    #[arg(long)]
+    use_impulse_control: bool,
+
+    /// Minimum fill probability improvement (Δλ) required to justify an update (default: 0.10)
+    /// E.g., 0.10 means 10% improvement in P(fill) required to update an order
+    #[arg(long)]
+    impulse_threshold: Option<f64>,
+
+    /// P(fill) threshold above which orders are "locked" (protected from updates) (default: 0.30)
+    /// E.g., 0.30 means orders with >30% fill probability are protected
+    #[arg(long)]
+    queue_lock_threshold: Option<f64>,
+
+    /// Price movement in bps that overrides queue lock (default: 25.0)
+    /// If price moved more than this, update even if order is locked
+    #[arg(long)]
+    queue_lock_override_bps: Option<f64>,
 
     // === Competitive Spread Control Flags ===
     /// Minimum kappa floor for order arrival intensity estimation.
@@ -1107,6 +1136,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(v) = cli.queue_horizon_seconds {
                 rc.queue_horizon_seconds = v;
             }
+            // Enable impulse filtering by default (matches ImpulseControlConfig default)
+            // Can be explicitly enabled via --use-impulse-control even if default changes
+            rc.use_impulse_filter = ImpulseControlConfig::default().enabled || cli.use_impulse_control;
             rc
         },
         // HIP-3 support: pre-computed runtime config for zero hot-path overhead
@@ -1116,6 +1148,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dex: dex.clone(),
         // Collateral/quote asset (USDC, USDE, USDH, etc.)
         collateral,
+        // Statistical impulse control
+        impulse_control: {
+            let mut ic = ImpulseControlConfig::default();
+            if cli.use_impulse_control {
+                ic.enabled = true;
+            }
+            if let Some(v) = cli.impulse_threshold {
+                ic.filter.improvement_threshold = v;
+            }
+            if let Some(v) = cli.queue_lock_threshold {
+                ic.filter.queue_lock_threshold = v;
+            }
+            if let Some(v) = cli.queue_lock_override_bps {
+                ic.filter.queue_lock_override_bps = v;
+            }
+            ic
+        },
+        // Spread profile for target spread ranges
+        spread_profile: SpreadProfile::from_str(&cli.spread_profile),
     };
 
     // Extract EMA config before mm_config is moved
@@ -1146,14 +1197,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         StrategyType::Ladder => {
-            let risk_cfg = config
-                .strategy
-                .risk_config
-                .clone()
-                .unwrap_or_else(|| RiskConfig {
-                    gamma_base: risk_aversion,
-                    ..Default::default()
-                });
+            // Parse spread profile to determine risk configuration
+            let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
+
+            // Risk config priority: spread_profile > config file > default with gamma from CLI
+            let risk_cfg = match spread_profile {
+                SpreadProfile::Hip3 => {
+                    // HIP-3 profile: use optimized risk config for 15-25 bps spreads
+                    info!(
+                        spread_profile = "hip3",
+                        gamma_base = 0.15,
+                        "Using HIP-3 RiskConfig for tighter spreads"
+                    );
+                    RiskConfig::hip3()
+                }
+                SpreadProfile::Aggressive => {
+                    // Aggressive profile: use low gamma for 10-20 bps spreads
+                    info!(
+                        spread_profile = "aggressive",
+                        gamma_base = 0.10,
+                        "Using Aggressive RiskConfig (experimental)"
+                    );
+                    RiskConfig {
+                        gamma_base: 0.10,
+                        gamma_min: 0.05,
+                        gamma_max: 1.5,
+                        min_spread_floor: 0.0004, // 4 bps floor
+                        enable_time_of_day_scaling: false,
+                        enable_book_depth_scaling: false,
+                        max_warmup_gamma_mult: 1.02,
+                        ..RiskConfig::hip3() // Base on HIP-3 for other params
+                    }
+                }
+                SpreadProfile::Default => {
+                    // Default: use config file or CLI gamma
+                    config
+                        .strategy
+                        .risk_config
+                        .clone()
+                        .unwrap_or_else(|| RiskConfig {
+                            gamma_base: risk_aversion,
+                            ..Default::default()
+                        })
+                }
+            };
             let mut ladder_cfg = config.strategy.ladder_config.clone().unwrap_or_default();
 
             // Max spread handling: CLI override takes precedence, otherwise use dynamic bounds
@@ -1201,13 +1288,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.strategy.min_warmup_trades,
     );
 
-    // Kappa floor handling: CLI override takes precedence, otherwise use dynamic bounds
-    // Dynamic bounds are computed at runtime from Bayesian confidence + credible intervals
-    if dex.is_some() {
-        // Lower kappa prior for DEX assets (illiquid → trades execute far from mid)
-        // Standard perps: 2500 (trades at 4 bps from mid)
-        // HIP-3 DEX: 500 (trades at 20 bps from mid)
-        estimator_config.kappa_prior_mean = 500.0;
+    // Kappa prior handling based on spread profile (GLFT first principles)
+    // GLFT: δ* ≈ 1/κ when γ/κ is small, so κ directly controls target spread
+    let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
+    match spread_profile {
+        SpreadProfile::Hip3 => {
+            // HIP-3 profile: Target 15-25 bps spreads
+            // κ=1500 → 1/1500 = 6.7 bps GLFT + 1.5 bps fee ≈ 16 bps total
+            estimator_config.kappa_prior_mean = 1500.0;
+            info!(
+                spread_profile = "hip3",
+                kappa_prior = 1500.0,
+                target_spread_bps = "15-25",
+                "Using HIP-3 spread profile for tighter spreads"
+            );
+        }
+        SpreadProfile::Aggressive => {
+            // Aggressive profile: Target 10-20 bps spreads (EXPERIMENTAL)
+            // κ=2000 → 1/2000 = 5 bps GLFT + 1.5 bps fee ≈ 13 bps total
+            estimator_config.kappa_prior_mean = 2000.0;
+            info!(
+                spread_profile = "aggressive",
+                kappa_prior = 2000.0,
+                target_spread_bps = "10-20",
+                "Using AGGRESSIVE spread profile (experimental)"
+            );
+        }
+        SpreadProfile::Default => {
+            // Default profile: Target 40-50 bps for liquid perps
+            // Legacy behavior: adjust for DEX vs perps
+            if dex.is_some() {
+                // HIP-3 DEX without explicit profile: use conservative default
+                estimator_config.kappa_prior_mean = 500.0;
+                info!(
+                    spread_profile = "default",
+                    kappa_prior = 500.0,
+                    dex = ?dex,
+                    "Using default DEX kappa (use --spread-profile hip3 for tighter spreads)"
+                );
+            } else {
+                // Standard perps: κ=2500 → ~4 bps GLFT spread
+                // (Already default from EstimatorConfig)
+                info!(
+                    spread_profile = "default",
+                    kappa_prior = %estimator_config.kappa_prior_mean,
+                    "Using default perps kappa"
+                );
+            }
+        }
     }
 
     if let Some(floor) = cli.kappa_floor {

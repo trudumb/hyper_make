@@ -7,8 +7,10 @@ use std::collections::HashSet;
 
 use crate::{bps_diff, EPSILON};
 
+use super::impulse_filter::{ImpulseDecision, ImpulseFilter};
 use super::types::{LadderAction, Side, TrackedOrder};
 use crate::market_maker::quoting::LadderLevel;
+use crate::market_maker::tracking::queue::QueuePositionTracker;
 
 /// Configuration for smart reconciliation thresholds.
 ///
@@ -29,6 +31,9 @@ pub struct ReconcileConfig {
     /// Time horizon in seconds for queue fill probability calculation
     /// Orders with low P(fill) within this horizon may be refreshed
     pub queue_horizon_seconds: f64,
+    /// Enable impulse filtering (Δλ-based update gating).
+    /// When true, only updates orders when fill probability improvement exceeds threshold.
+    pub use_impulse_filter: bool,
 }
 
 impl Default for ReconcileConfig {
@@ -43,7 +48,32 @@ impl Default for ReconcileConfig {
             skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
             use_queue_aware: false,        // Disabled by default until validated
             queue_horizon_seconds: 1.0,    // 1-second fill horizon
+            use_impulse_filter: false,     // Disabled by default until validated
         }
+    }
+}
+
+/// Statistics from reconciliation.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileStats {
+    /// Number of orders skipped (within tolerance).
+    pub skipped_count: usize,
+    /// Number of orders modified (preserve queue).
+    pub modified_count: usize,
+    /// Number of orders cancelled.
+    pub cancelled_count: usize,
+    /// Number of new orders placed.
+    pub placed_count: usize,
+    /// Number of updates blocked by impulse filter (Δλ too small).
+    pub impulse_filtered_count: usize,
+    /// Number of orders locked by impulse filter (high P(fill)).
+    pub queue_locked_count: usize,
+}
+
+impl ReconcileStats {
+    /// Total number of API actions (non-skip).
+    pub fn total_actions(&self) -> usize {
+        self.modified_count + self.cancelled_count + self.placed_count
     }
 }
 
@@ -64,15 +94,60 @@ struct MatchResult<'a> {
 /// 3. Order exists but price/size moved too far -> CANCEL + PLACE
 /// 4. No order at target level -> PLACE
 /// 5. Order exists with no matching target -> CANCEL
+///
+/// When impulse filtering is enabled (via config + queue_tracker + impulse_filter):
+/// - Orders with high P(fill) are "locked" and protected from updates
+/// - Updates only proceed if Δλ (fill probability improvement) exceeds threshold
 pub fn reconcile_side_smart(
     current: &[&TrackedOrder],
     target: &[LadderLevel],
     side: Side,
     config: &ReconcileConfig,
 ) -> Vec<LadderAction> {
+    let (actions, _stats) = reconcile_side_smart_with_impulse(
+        current,
+        target,
+        side,
+        config,
+        None, // No queue tracker
+        None, // No impulse filter
+        None, // No mid price
+    );
+    actions
+}
+
+/// Smart reconciliation with optional impulse filtering.
+///
+/// Extended version that accepts queue tracker and impulse filter for
+/// Δλ-based update gating. Returns both actions and reconciliation statistics.
+///
+/// # Arguments
+/// * `current` - Current orders on this side
+/// * `target` - Target ladder levels
+/// * `side` - Buy or Sell side
+/// * `config` - Reconciliation configuration
+/// * `queue_tracker` - Optional queue position tracker for P(fill) calculation
+/// * `impulse_filter` - Optional impulse filter for Δλ gating
+/// * `mid_price` - Optional mid price for new order P(fill) estimation
+pub fn reconcile_side_smart_with_impulse(
+    current: &[&TrackedOrder],
+    target: &[LadderLevel],
+    side: Side,
+    config: &ReconcileConfig,
+    queue_tracker: Option<&QueuePositionTracker>,
+    mut impulse_filter: Option<&mut ImpulseFilter>,
+    mid_price: Option<f64>,
+) -> (Vec<LadderAction>, ReconcileStats) {
     let mut actions = Vec::new();
+    let mut stats = ReconcileStats::default();
     let mut matched_targets: HashSet<usize> = HashSet::new();
     let mut matched_orders: HashSet<u64> = HashSet::new();
+
+    // Determine if impulse filtering is active
+    let impulse_active = config.use_impulse_filter
+        && queue_tracker.is_some()
+        && impulse_filter.is_some()
+        && mid_price.is_some();
 
     // Phase 1: Find best matches between current orders and target levels
     let matches = find_best_matches(current, target, &matched_orders);
@@ -88,8 +163,45 @@ pub fn reconcile_side_smart(
             && m.size_diff_pct <= config.skip_size_tolerance_pct
         {
             // SKIP - order is close enough, preserve queue position
+            stats.skipped_count += 1;
             continue;
-        } else if m.price_diff_bps <= config.max_modify_price_bps as f64
+        }
+
+        // Apply impulse filter if active
+        if impulse_active {
+            let qt = queue_tracker.unwrap();
+            let filter = impulse_filter.as_mut().unwrap();
+            let mid = mid_price.unwrap();
+
+            let decision = filter.evaluate(
+                qt,
+                m.order.oid,
+                m.order.price,
+                target_level.price,
+                m.price_diff_bps,
+                mid,
+                side == Side::Buy,
+            );
+
+            match decision {
+                ImpulseDecision::Skip => {
+                    stats.impulse_filtered_count += 1;
+                    stats.skipped_count += 1;
+                    continue; // Δλ too small, skip update
+                }
+                ImpulseDecision::Locked => {
+                    stats.queue_locked_count += 1;
+                    stats.skipped_count += 1;
+                    continue; // High P(fill), don't disturb
+                }
+                ImpulseDecision::Update => {
+                    // Proceed with normal logic
+                }
+            }
+        }
+
+        // Standard MODIFY vs CANCEL+PLACE decision
+        if m.price_diff_bps <= config.max_modify_price_bps as f64
             && m.size_diff_pct <= config.max_modify_size_pct
         {
             // MODIFY - small change, preserve queue position
@@ -99,15 +211,18 @@ pub fn reconcile_side_smart(
                 new_size: target_level.size,
                 side,
             });
+            stats.modified_count += 1;
         } else {
             // CANCEL + PLACE - too large a change, fresh queue
             actions.push(LadderAction::Cancel { oid: m.order.oid });
+            stats.cancelled_count += 1;
             if target_level.size > EPSILON {
                 actions.push(LadderAction::Place {
                     side,
                     price: target_level.price,
                     size: target_level.size,
                 });
+                stats.placed_count += 1;
             }
         }
     }
@@ -116,6 +231,7 @@ pub fn reconcile_side_smart(
     for order in current {
         if !matched_orders.contains(&order.oid) {
             actions.push(LadderAction::Cancel { oid: order.oid });
+            stats.cancelled_count += 1;
         }
     }
 
@@ -127,10 +243,11 @@ pub fn reconcile_side_smart(
                 price: level.price,
                 size: level.size,
             });
+            stats.placed_count += 1;
         }
     }
 
-    actions
+    (actions, stats)
 }
 
 /// Find best matching order for each target level.

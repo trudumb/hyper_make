@@ -752,6 +752,12 @@ impl ParameterAggregator {
             kappa_uncertainty: est.hierarchical_kappa_std(),
             kappa_95_lower: est.hierarchical_kappa_ci_95().0,
             kappa_95_upper: est.hierarchical_kappa_ci_95().1,
+
+            // V3: Robust Kappa Orchestrator (outlier-resistant)
+            kappa_robust: est.kappa_robust(),
+            use_kappa_robust: true, // Always enabled - uses confidence-weighted blending
+            kappa_outlier_count: est.kappa_outlier_count(),
+
             toxicity_score: est.soft_toxicity_score(),
             param_correlation: est.kappa_sigma_correlation(),
             as_factor: est.hierarchical_as_factor(),
