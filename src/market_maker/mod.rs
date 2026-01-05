@@ -1339,6 +1339,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let p_continuation = self.estimator.momentum_continuation_probability();
         let position = self.position.position();
 
+        // Update momentum EWMA signals for smoothing (reduces whipsawing)
+        self.stochastic.hjb_controller.update_momentum_signals(
+            momentum_bps,
+            p_continuation,
+            position,
+            self.config.max_position,
+        );
+
         let drift_adjusted_skew = self.stochastic.hjb_controller.optimal_skew_with_drift(
             position,
             self.config.max_position,
@@ -1347,7 +1355,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
 
         // Log momentum diagnostics for drift-adjusted skew debugging
-        if drift_adjusted_skew.is_opposed || momentum_bps.abs() > 5.0 {
+        // Only log when: (a) position opposes momentum, or (b) momentum exceeds threshold
+        // Note: Short-term momentum may differ from medium-term trend (bounces within trends)
+        if drift_adjusted_skew.is_opposed || momentum_bps.abs() > 10.0 {
+            let ewma_warmed = self.stochastic.hjb_controller.is_drift_warmed_up();
+            let smoothed_drift = self.stochastic.hjb_controller.smoothed_drift();
             debug!(
                 momentum_bps = %format!("{:.2}", momentum_bps),
                 p_continuation = %format!("{:.3}", p_continuation),
@@ -1356,7 +1368,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 drift_urgency_bps = %format!("{:.2}", drift_adjusted_skew.drift_urgency * 10000.0),
                 variance_mult = %format!("{:.3}", drift_adjusted_skew.variance_multiplier),
                 urgency_score = %format!("{:.1}", drift_adjusted_skew.urgency_score),
-                "Momentum-position alignment check"
+                ewma_warmed = ewma_warmed,
+                smoothed_drift = %format!("{:.6}", smoothed_drift),
+                "Momentum-position alignment"
             );
         }
 
