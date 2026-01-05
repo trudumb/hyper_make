@@ -19,6 +19,8 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::market_maker::estimator::TrendSignal;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -606,6 +608,208 @@ impl HJBInventoryController {
     ) -> DriftAdjustedSkew {
         let mut result =
             self.optimal_skew_with_drift(position, max_position, momentum_bps, p_continuation);
+        result.total_skew *= 10000.0;
+        result.base_skew *= 10000.0;
+        result.drift_urgency *= 10000.0;
+        result
+    }
+
+    /// Compute drift-adjusted skew with multi-timeframe trend detection.
+    ///
+    /// This is an enhanced version that uses the TrendSignal to detect
+    /// sustained trends even when short-term momentum flips due to bounces.
+    ///
+    /// # Opposition Detection (Enhanced)
+    ///
+    /// Position is considered "opposed to trend" if ANY of:
+    /// 1. Short-term momentum opposes position (original logic)
+    /// 2. Medium-term (30s) momentum opposes position with agreement > 0.5
+    /// 3. Long-term (5min) momentum opposes position
+    /// 4. Position is significantly underwater (severity > 0.3)
+    ///
+    /// # Urgency Scaling
+    ///
+    /// When trend_confidence is high (multiple timeframes agree), the
+    /// drift urgency is boosted by up to 2x (configurable via TrendConfig).
+    pub fn optimal_skew_with_trend(
+        &self,
+        position: f64,
+        max_position: f64,
+        momentum_bps: f64,
+        p_continuation: f64,
+        trend: &TrendSignal,
+    ) -> DriftAdjustedSkew {
+        // Start with base HJB skew
+        let base_skew = self.optimal_skew(position, max_position);
+
+        if !self.config.use_drift_adjusted_skew {
+            return DriftAdjustedSkew {
+                total_skew: base_skew,
+                base_skew,
+                drift_urgency: 0.0,
+                variance_multiplier: 1.0,
+                is_opposed: false,
+                urgency_score: 0.0,
+            };
+        }
+
+        // Normalize position
+        let q = if max_position > 1e-10 {
+            (position / max_position).clamp(-1.0, 1.0)
+        } else {
+            return DriftAdjustedSkew {
+                total_skew: base_skew,
+                base_skew,
+                drift_urgency: 0.0,
+                variance_multiplier: 1.0,
+                is_opposed: false,
+                urgency_score: 0.0,
+            };
+        };
+
+        // === Enhanced Opposition Detection ===
+        // Check if position opposes momentum at ANY timeframe, or is underwater
+
+        // Short-term opposition (original logic)
+        let short_opposed = q * momentum_bps < 0.0;
+
+        // Medium-term opposition (30s window, requires some agreement)
+        let medium_opposed = if trend.is_warmed_up && trend.timeframe_agreement > 0.5 {
+            q * trend.medium_momentum_bps < 0.0 && trend.medium_momentum_bps.abs() > 3.0
+        } else {
+            false
+        };
+
+        // Long-term opposition (5min window, more authoritative)
+        let long_opposed = if trend.is_warmed_up {
+            q * trend.long_momentum_bps < 0.0 && trend.long_momentum_bps.abs() > 5.0
+        } else {
+            false
+        };
+
+        // Underwater opposition (position losing money in a sustained way)
+        let underwater_opposed = trend.underwater_severity > 0.3;
+
+        // Combined opposition: any trigger counts
+        let is_opposed = short_opposed || medium_opposed || long_opposed || underwater_opposed;
+
+        // Position-dependent threshold (same as original)
+        let base_threshold = 8.0;
+        let position_factor = (1.0 - 0.6 * q.abs()).max(0.3);
+        let momentum_threshold = base_threshold * position_factor;
+
+        // Use the strongest momentum signal for threshold check
+        let effective_momentum = if trend.is_warmed_up {
+            // When long-term has a clear signal, use it
+            if trend.long_momentum_bps.abs() > 10.0 {
+                trend.long_momentum_bps.abs()
+            } else if trend.medium_momentum_bps.abs() > 5.0 {
+                trend.medium_momentum_bps.abs()
+            } else {
+                momentum_bps.abs()
+            }
+        } else {
+            momentum_bps.abs()
+        };
+
+        let momentum_significant = effective_momentum > momentum_threshold;
+        let continuation_confident = p_continuation >= self.config.min_continuation_prob;
+
+        if !is_opposed || !momentum_significant || !continuation_confident {
+            return DriftAdjustedSkew {
+                total_skew: base_skew,
+                base_skew,
+                drift_urgency: 0.0,
+                variance_multiplier: 1.0,
+                is_opposed,
+                urgency_score: 0.0,
+            };
+        }
+
+        // === Compute Drift Urgency (with trend boost) ===
+        let time_remaining = self.time_remaining().min(300.0);
+
+        // Use EWMA-smoothed drift if warmed up
+        let drift_rate = if self.is_drift_warmed_up() {
+            self.drift_ewma
+        } else {
+            (momentum_bps / 10000.0) / 0.5
+        };
+
+        // Base urgency calculation
+        let raw_urgency = self.config.opposition_sensitivity
+            * drift_rate.abs()
+            * p_continuation
+            * q.abs()
+            * time_remaining;
+
+        // Boost urgency when trend is confident (multi-timeframe agreement)
+        // trend_confidence is 0.0-1.0, boost factor is 1.0-2.0
+        let trend_boost = if trend.is_warmed_up {
+            1.0 + trend.trend_confidence // 1.0 to 2.0
+        } else {
+            1.0
+        };
+
+        let boosted_urgency = raw_urgency * trend_boost;
+        let max_base_urgency = base_skew.abs() * self.config.max_drift_urgency;
+        let drift_urgency_magnitude = boosted_urgency.min(max_base_urgency);
+        let drift_urgency = drift_urgency_magnitude * q.signum();
+
+        // === Compute Variance Multiplier ===
+        let variance_multiplier_capped = if self.is_drift_warmed_up() {
+            self.variance_mult_ewma * trend_boost.min(1.5) // Additional boost, capped
+        } else {
+            let momentum_vol_ratio = if self.sigma > 1e-10 {
+                ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+            } else {
+                0.0
+            };
+            let variance_multiplier = 1.0
+                + self.config.opposition_sensitivity * momentum_vol_ratio * p_continuation * q.abs();
+            variance_multiplier.min(self.config.max_drift_urgency)
+        };
+
+        // Urgency score for diagnostics
+        let momentum_vol_ratio = if self.sigma > 1e-10 {
+            ((momentum_bps / 10000.0) / self.sigma).abs().min(3.0)
+        } else {
+            0.0
+        };
+
+        let urgency_score = (momentum_bps.abs() / 50.0).min(1.0)
+            + p_continuation
+            + q.abs()
+            + momentum_vol_ratio.min(1.0)
+            + if self.is_terminal_zone() { 1.0 } else { 0.0 }
+            + trend.trend_confidence; // Add trend confidence to score
+
+        DriftAdjustedSkew {
+            total_skew: base_skew + drift_urgency,
+            base_skew,
+            drift_urgency,
+            variance_multiplier: variance_multiplier_capped,
+            is_opposed,
+            urgency_score: urgency_score.min(6.0), // Max now 6.0 with trend
+        }
+    }
+
+    /// Compute drift-adjusted skew with trend in basis points.
+    pub fn optimal_skew_with_trend_bps(
+        &self,
+        position: f64,
+        max_position: f64,
+        momentum_bps: f64,
+        p_continuation: f64,
+        trend: &TrendSignal,
+    ) -> DriftAdjustedSkew {
+        let mut result = self.optimal_skew_with_trend(
+            position,
+            max_position,
+            momentum_bps,
+            p_continuation,
+            trend,
+        );
         result.total_skew *= 10000.0;
         result.base_skew *= 10000.0;
         result.drift_urgency *= 10000.0;

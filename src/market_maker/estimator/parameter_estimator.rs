@@ -14,6 +14,7 @@ use super::kappa_orchestrator::{KappaOrchestrator, KappaOrchestratorConfig};
 use super::microprice::MicropriceEstimator;
 use super::momentum::{MomentumDetector, MomentumModel, TradeFlowTracker};
 use super::soft_jump::SoftJumpClassifier;
+use super::trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 use super::volatility::{MultiScaleBipowerEstimator, StochasticVolParams, VolatilityRegimeTracker};
 use super::volume::{VolumeBucketAccumulator, VolumeTickArrivalEstimator};
 use super::{EstimatorConfig, EstimatorV2Flags, MarketEstimator, VolatilityRegime};
@@ -100,6 +101,11 @@ pub struct ParameterEstimator {
     /// Optional maximum spread ceiling from CLI override.
     /// When set, static ceiling is used instead of dynamic model-driven ceiling.
     max_spread_ceiling_bps: Option<f64>,
+
+    // === Multi-Timeframe Trend Detection ===
+    /// Trend persistence tracker for detecting sustained trends vs bounces.
+    /// Combines 30s and 5min momentum windows with underwater P&L tracking.
+    trend_tracker: TrendPersistenceTracker,
 }
 
 impl ParameterEstimator {
@@ -193,6 +199,9 @@ impl ParameterEstimator {
         // Max spread ceiling for spread control (CLI override)
         let max_spread_ceiling_bps = config.max_spread_ceiling_bps;
 
+        // Multi-timeframe trend tracker (30s + 5min windows, underwater P&L tracking)
+        let trend_tracker = TrendPersistenceTracker::new(TrendConfig::default());
+
         Self {
             config,
             bucket_accumulator,
@@ -224,6 +233,8 @@ impl ParameterEstimator {
             // Competitive spread control
             kappa_floor,
             max_spread_ceiling_bps,
+            // Multi-timeframe trend detection
+            trend_tracker,
         }
     }
 
@@ -287,6 +298,9 @@ impl ParameterEstimator {
             // Update momentum detector with signed return
             if let Some(ret) = log_return {
                 self.momentum.on_bucket(bucket.end_time_ms, ret);
+
+                // Update trend persistence tracker with signed return (multi-timeframe)
+                self.trend_tracker.on_bucket(bucket.end_time_ms, ret);
 
                 // Update probabilistic momentum model with continuation observation
                 // Continuation = return has same sign as previous momentum
@@ -997,6 +1011,53 @@ impl ParameterEstimator {
     /// Check if momentum model is calibrated (enough observations).
     pub fn momentum_model_calibrated(&self) -> bool {
         self.momentum_model.is_calibrated()
+    }
+
+    // === Multi-Timeframe Trend Detection ===
+
+    /// Get trend signal combining multi-timeframe momentum and underwater detection.
+    ///
+    /// Returns a TrendSignal with:
+    /// - Medium (30s) and long (5min) momentum
+    /// - Timeframe agreement score (how aligned are the windows)
+    /// - Underwater severity (how deep below high water mark)
+    /// - Overall trend confidence
+    ///
+    /// Use this to override short-term momentum when sustained trends are detected.
+    pub fn trend_signal(&self, position_value: f64) -> TrendSignal {
+        self.trend_tracker.evaluate(
+            self.current_time_ms,
+            self.momentum_bps(),
+            position_value,
+        )
+    }
+
+    /// Update unrealized P&L for underwater tracking.
+    ///
+    /// Call this regularly with current unrealized P&L to enable
+    /// underwater severity detection (position losing money in a trend).
+    pub fn update_trend_pnl(&mut self, unrealized_pnl: f64) {
+        self.trend_tracker.update_pnl(unrealized_pnl);
+    }
+
+    /// Reset trend tracker high-water mark (call when position is closed).
+    pub fn reset_trend_high_water(&mut self) {
+        self.trend_tracker.reset_high_water();
+    }
+
+    /// Check if trend tracker is warmed up.
+    pub fn trend_tracker_warmed_up(&self) -> bool {
+        self.trend_tracker.is_warmed_up()
+    }
+
+    /// Get medium-term momentum (30s window) in basis points.
+    pub fn medium_momentum_bps(&self) -> f64 {
+        self.trend_tracker.medium_momentum_bps(self.current_time_ms)
+    }
+
+    /// Get long-term momentum (5min window) in basis points.
+    pub fn long_momentum_bps(&self) -> f64 {
+        self.trend_tracker.long_momentum_bps(self.current_time_ms)
     }
 
     // === Jump Process Accessors (First Principles Gap 1) ===

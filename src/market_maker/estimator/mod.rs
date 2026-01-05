@@ -43,6 +43,7 @@ mod parameter_estimator;
 mod robust_kappa;
 mod soft_jump;
 pub(crate) mod tick_ewma;
+mod trend_persistence;
 mod volatility;
 mod volume;
 
@@ -72,6 +73,7 @@ pub use kalman::{KalmanPriceFilter, NoiseFilter};
 pub use mock::MockEstimator;
 pub use momentum::MomentumModel;
 pub use parameter_estimator::ParameterEstimator;
+pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 pub use volatility::{StochasticVolParams, VolatilityRegime};
 
 // ============================================================================

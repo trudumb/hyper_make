@@ -654,6 +654,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // === Update Prometheus metrics ===
                     let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+
+                    // Update trend tracker with unrealized P&L for underwater detection
+                    self.estimator.update_trend_pnl(pnl_summary.unrealized_pnl);
+
                     // HARMONIZED: Use effective_max_position for accurate utilization metrics
                     self.infra.prometheus.update_position(
                         self.position.position(),
@@ -1347,21 +1351,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.config.max_position,
         );
 
-        let drift_adjusted_skew = self.stochastic.hjb_controller.optimal_skew_with_drift(
+        // Get multi-timeframe trend signal for enhanced opposition detection
+        // Position value for underwater severity calculation
+        let position_value = (position.abs() * self.latest_mid).max(1.0);
+        let trend_signal = self.estimator.trend_signal(position_value);
+
+        // Use enhanced drift-adjusted skew with multi-timeframe trend detection
+        let drift_adjusted_skew = self.stochastic.hjb_controller.optimal_skew_with_trend(
             position,
             self.config.max_position,
             momentum_bps,
             p_continuation,
+            &trend_signal,
         );
 
         // Log momentum diagnostics for drift-adjusted skew debugging
-        // Only log when: (a) position opposes momentum, or (b) momentum exceeds threshold
-        // Note: Short-term momentum may differ from medium-term trend (bounces within trends)
-        if drift_adjusted_skew.is_opposed || momentum_bps.abs() > 10.0 {
+        // Enhanced: Now includes multi-timeframe trend data
+        // Log at INFO when: (a) position opposes trend, (b) significant momentum, or (c) high trend confidence
+        if drift_adjusted_skew.is_opposed || momentum_bps.abs() > 10.0 || trend_signal.trend_confidence > 0.3 {
             let ewma_warmed = self.stochastic.hjb_controller.is_drift_warmed_up();
             let smoothed_drift = self.stochastic.hjb_controller.smoothed_drift();
-            debug!(
-                momentum_bps = %format!("{:.2}", momentum_bps),
+            info!(
+                short_bps = %format!("{:.2}", momentum_bps),
+                medium_bps = %format!("{:.2}", trend_signal.medium_momentum_bps),
+                long_bps = %format!("{:.2}", trend_signal.long_momentum_bps),
+                agreement = %format!("{:.2}", trend_signal.timeframe_agreement),
+                underwater = %format!("{:.2}", trend_signal.underwater_severity),
+                trend_conf = %format!("{:.2}", trend_signal.trend_confidence),
                 p_continuation = %format!("{:.3}", p_continuation),
                 position = %format!("{:.2}", position),
                 is_opposed = drift_adjusted_skew.is_opposed,
@@ -1370,7 +1386,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 urgency_score = %format!("{:.1}", drift_adjusted_skew.urgency_score),
                 ewma_warmed = ewma_warmed,
                 smoothed_drift = %format!("{:.6}", smoothed_drift),
-                "Momentum-position alignment"
+                "Multi-timeframe trend detection"
             );
         }
 
