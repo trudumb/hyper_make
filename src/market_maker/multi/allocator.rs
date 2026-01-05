@@ -205,15 +205,31 @@ impl AssetAllocator {
         }
 
         // Step 2: Normalize weights with concentration cap
+        // First normalize
         for weight in weights.values_mut() {
             *weight /= total_weight;
-            *weight = weight.min(self.config.max_concentration);
         }
 
-        // Renormalize after capping
-        let capped_sum: f64 = weights.values().sum();
-        for weight in weights.values_mut() {
-            *weight /= capped_sum;
+        // Check if any weight exceeds cap
+        let needs_capping = weights.values().any(|&w| w > self.config.max_concentration);
+
+        if needs_capping {
+            // Cap weights that exceed the limit
+            for weight in weights.values_mut() {
+                *weight = weight.min(self.config.max_concentration);
+            }
+
+            // Only renormalize if it won't cause any capped weights to exceed the cap again
+            let capped_sum: f64 = weights.values().sum();
+            let max_after_renorm = weights.values().cloned().fold(0.0f64, f64::max) / capped_sum;
+
+            if max_after_renorm <= self.config.max_concentration + 1e-10 {
+                // Safe to renormalize - no weight will exceed cap after
+                for weight in weights.values_mut() {
+                    *weight /= capped_sum;
+                }
+            }
+            // Otherwise, don't renormalize - sum will be < 1.0 but cap is respected
         }
 
         // Step 3: Calculate minimum allocation

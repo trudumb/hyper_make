@@ -161,7 +161,8 @@ impl BookKappaEstimator {
 
     /// Fit exponential decay model to one side of the book.
     ///
-    /// Uses log-linear regression: log(cum_depth) = log(D₀) - κ × distance
+    /// Uses log-linear regression: log(depth) = log(D₀) - κ × distance
+    /// where depth is the individual level size (not cumulative).
     ///
     /// # Returns
     /// (κ, R²) tuple
@@ -170,16 +171,14 @@ impl BookKappaEstimator {
             return (self.prior_kappa, 0.0);
         }
 
-        // Compute cumulative depth at each level
-        let mut cum_depth = 0.0;
+        // Use individual level depth (not cumulative) - this matches the exponential decay model
+        // where marginal liquidity decreases as you move away from mid
         let mut points: Vec<(f64, f64)> = Vec::with_capacity(levels.len());
 
         for (price, size) in levels {
             if *size <= 0.0 || *price <= 0.0 {
                 continue;
             }
-
-            cum_depth += size;
 
             // Distance from mid as fraction
             let distance = if is_bid {
@@ -188,9 +187,9 @@ impl BookKappaEstimator {
                 (price - mid) / mid
             };
 
-            // Only include positive distances
-            if distance > 0.0 && cum_depth > 0.0 {
-                points.push((distance, cum_depth.ln()));
+            // Only include positive distances with positive depth
+            if distance > 0.0 && *size > 0.0 {
+                points.push((distance, size.ln()));
             }
         }
 
@@ -317,7 +316,7 @@ mod tests {
         let mut estimator = BookKappaEstimator::new(2000.0);
 
         // Create perfect exponential decay with κ = 1000
-        // Depth(δ) = 100 × exp(-1000 × δ)
+        // Individual level depth: Depth(δ) = 100 × exp(-1000 × δ)
         let kappa_true = 1000.0;
         let mid = 100.0;
 
@@ -326,12 +325,8 @@ mod tests {
 
         for i in 1..=10 {
             let delta = i as f64 * 0.001; // 0.1% steps
-            let depth = 100.0 * (-kappa_true * delta).exp();
-
-            // Incremental depth at each level
-            let prev_delta = (i - 1) as f64 * 0.001;
-            let prev_depth = 100.0 * (-kappa_true * prev_delta).exp();
-            let level_depth = prev_depth - depth;
+            // Each level has exponentially decaying depth
+            let level_depth = 100.0 * (-kappa_true * delta).exp();
 
             let bid_price = mid * (1.0 - delta);
             let ask_price = mid * (1.0 + delta);
@@ -349,7 +344,7 @@ mod tests {
         let estimated_kappa = estimator.kappa();
         let r_squared = estimator.confidence();
 
-        // Allow 20% error due to numerical issues
+        // Allow 30% error due to numerical issues
         assert!(
             (estimated_kappa - kappa_true).abs() / kappa_true < 0.3,
             "Expected κ ≈ {}, got {}",

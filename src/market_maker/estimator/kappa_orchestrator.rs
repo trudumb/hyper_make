@@ -380,10 +380,15 @@ impl KappaOrchestrator {
     }
 
     /// Check if any estimator is warmed up.
+    ///
+    /// Returns true only after receiving actual observations (not from prior alone).
     pub(crate) fn is_warmed_up(&self) -> bool {
-        self.own_kappa.confidence() > 0.3
-            || (self.config.use_book_kappa && self.book_kappa.is_warmed_up())
-            || (self.config.use_robust_kappa && self.robust_kappa.is_warmed_up())
+        // Require actual observations, not just prior confidence
+        let own_has_data = self.own_kappa.observation_count() >= 5;
+        let book_warmed = self.config.use_book_kappa && self.book_kappa.is_warmed_up();
+        let robust_warmed = self.config.use_robust_kappa && self.robust_kappa.is_warmed_up();
+
+        own_has_data || book_warmed || robust_warmed
     }
 
     /// Get the book-structure κ estimate directly.
@@ -470,13 +475,23 @@ mod tests {
             asks.push((mid * (1.0 + delta), depth.max(1.0)));
         }
 
+        // First, provide own fills to exit warmup mode (requires 5 fills)
+        for i in 0..5 {
+            let fill_price = mid * (1.0 + 0.001); // 10 bps from mid
+            orch.on_own_fill(i * 1000, fill_price, 1.0, mid);
+        }
+
         // Feed book updates
         for _ in 0..20 {
             orch.on_l2_book(&bids, &asks, mid);
         }
 
-        // Book kappa should have some weight now
-        let (_, (_, w_book), _, _, _) = orch.component_breakdown();
+        // Book kappa should have some weight now (after warmup)
+        let (_, (_, w_book), _, _, is_warmup) = orch.component_breakdown();
+        assert!(
+            !is_warmup,
+            "Should not be in warmup mode after providing own fills"
+        );
         assert!(
             w_book > 0.1,
             "Book should have significant weight after updates, got {}",
