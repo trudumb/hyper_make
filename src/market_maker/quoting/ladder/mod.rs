@@ -112,6 +112,14 @@ pub struct LadderConfig {
     /// This enables GLFT-optimal depth selection that adapts to γ, κ, and market regime.
     #[serde(skip)]
     pub dynamic_depths: Option<DynamicDepths>,
+
+    /// Hard maximum spread per side in basis points (absolute cap).
+    /// Applied after all other spread calculations as a final safety valve.
+    /// Use for illiquid assets where GLFT may produce very wide spreads.
+    /// Set to 0.0 to disable (default, no hard cap).
+    /// Example: max_spread_per_side_bps = 15.0 → never quote wider than 15 bps per side
+    #[serde(default)]
+    pub max_spread_per_side_bps: f64,
 }
 
 impl Default for LadderConfig {
@@ -129,6 +137,7 @@ impl Default for LadderConfig {
             fees_bps: 3.5,
             as_decay_bps: 10.0,
             dynamic_depths: None,
+            max_spread_per_side_bps: 0.0, // Disabled by default
         }
     }
 }
@@ -222,6 +231,7 @@ mod tests {
             fees_bps: 0.5,
             as_decay_bps: 10.0,
             dynamic_depths: None,
+            max_spread_per_side_bps: 0.0,
         };
 
         let params = LadderParams {
@@ -305,6 +315,7 @@ mod tests {
             fees_bps: 0.5,
             as_decay_bps: 10.0, // Ignored when depth_decay_as is Some
             dynamic_depths: None,
+            max_spread_per_side_bps: 0.0,
         };
 
         // Calibrated AS model with higher AS at touch

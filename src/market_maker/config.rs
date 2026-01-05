@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::market_maker::tracking::ReconcileConfig;
 use crate::meta::{AssetMeta, CollateralInfo};
 
 // ============================================================================
@@ -168,6 +169,15 @@ pub struct MarketMakerConfig {
     /// queue position when possible. This improves spread capturing competitiveness.
     /// Default: true (recommended for production)
     pub smart_reconcile: bool,
+
+    /// Reconciliation thresholds for smart ladder updates.
+    /// Controls when to SKIP (unchanged), MODIFY (small change), or CANCEL+PLACE.
+    /// Only used when smart_reconcile = true.
+    ///
+    /// NOTE: On Hyperliquid, price modifications always reset queue position (new OID).
+    /// Only SIZE-only modifications preserve queue. These tolerances primarily affect
+    /// API call frequency rather than queue preservation.
+    pub reconcile: ReconcileConfig,
 
     // === HIP-3 Support Fields ===
     /// Pre-computed runtime config (resolved at startup).
@@ -570,6 +580,20 @@ pub struct StochasticConfig {
     ///
     /// Default: 0.3
     pub min_fill_hungry_gamma: f64,
+
+    // ==================== Microprice EMA Smoothing ====================
+    /// EMA smoothing factor for microprice output (0.0-1.0).
+    /// Higher = more weight to new observations (more reactive).
+    /// 0.2 = 5-update half-life, 0.1 = 10-update half-life, 0.0 = disabled
+    ///
+    /// Default: 0.2
+    pub microprice_ema_alpha: f64,
+
+    /// Minimum change in bps to update microprice EMA (noise filter).
+    /// Changes smaller than this are ignored to reduce quote volatility.
+    ///
+    /// Default: 2.0
+    pub microprice_ema_min_change_bps: f64,
 }
 
 impl Default for StochasticConfig {
@@ -643,6 +667,11 @@ impl Default for StochasticConfig {
             enable_calibration_fill_rate: true,
             target_fill_rate_per_hour: 10.0, // 10 fills/hour = ~2/level for 5 levels
             min_fill_hungry_gamma: 0.3,      // Max 70% gamma reduction
+
+            // Microprice EMA Smoothing
+            // ENABLED by default - reduces quote volatility from microprice noise
+            microprice_ema_alpha: 0.2,              // 5-update half-life
+            microprice_ema_min_change_bps: 2.0,     // 2 bps noise filter
         }
     }
 }

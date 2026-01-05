@@ -114,6 +114,8 @@ pub use market_maker::{
     QueuePositionTracker,
     QueueSummary,
     Quote,
+    // Reconciliation config for smart ladder updates
+    ReconcileConfig,
     QuoteConfig,
     QuotingStrategy,
     ReconciliationConfig,

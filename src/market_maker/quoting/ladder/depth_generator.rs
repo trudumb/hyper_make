@@ -156,6 +156,13 @@ pub struct DynamicDepthConfig {
     /// Caps GLFT optimal to prevent quoting excessively wide
     /// Set to 0.0 to disable (use only GLFT optimal)
     pub market_spread_cap_multiple: f64,
+
+    /// Hard maximum spread per side in basis points (absolute cap).
+    /// Applied after all other spread calculations as a final safety valve.
+    /// Use for illiquid assets where GLFT may produce very wide spreads.
+    /// Set to 0.0 to disable (no hard cap).
+    /// Example: max_spread_per_side_bps = 15.0 → never quote wider than 15 bps per side
+    pub max_spread_per_side_bps: f64,
 }
 
 impl Default for DynamicDepthConfig {
@@ -185,6 +192,10 @@ impl Default for DynamicDepthConfig {
             // If competitive quoting is needed, set to 15.0+ (7.5× per side)
             // to allow most GLFT optimal spreads through.
             market_spread_cap_multiple: 0.0, // DISABLED - trust GLFT theory
+
+            // Hard cap disabled by default - trust GLFT theory.
+            // Enable via --max-spread-bps CLI for illiquid assets.
+            max_spread_per_side_bps: 0.0,
         }
     }
 }
@@ -275,12 +286,18 @@ impl DynamicDepthGenerator {
         let optimal_ask_bps = Self::to_bps(optimal_ask);
 
         // Apply floor and ceiling
-        let optimal_bid_bps = optimal_bid_bps
+        let mut optimal_bid_bps = optimal_bid_bps
             .max(self.config.min_spread_floor_bps)
             .max(self.config.min_depth_bps);
-        let optimal_ask_bps = optimal_ask_bps
+        let mut optimal_ask_bps = optimal_ask_bps
             .max(self.config.min_spread_floor_bps)
             .max(self.config.min_depth_bps);
+
+        // Apply hard cap if configured (for competitive spreads on illiquid assets)
+        if self.config.max_spread_per_side_bps > 0.0 {
+            optimal_bid_bps = optimal_bid_bps.min(self.config.max_spread_per_side_bps);
+            optimal_ask_bps = optimal_ask_bps.min(self.config.max_spread_per_side_bps);
+        }
 
         // Generate depth arrays
         let bid_depths = self.generate_depth_array(optimal_bid_bps);
@@ -359,12 +376,18 @@ impl DynamicDepthGenerator {
         let capped_ask_bps = glft_ask_bps.min(cap_bps);
 
         // Apply floor
-        let optimal_bid_bps = capped_bid_bps
+        let mut optimal_bid_bps = capped_bid_bps
             .max(self.config.min_spread_floor_bps)
             .max(self.config.min_depth_bps);
-        let optimal_ask_bps = capped_ask_bps
+        let mut optimal_ask_bps = capped_ask_bps
             .max(self.config.min_spread_floor_bps)
             .max(self.config.min_depth_bps);
+
+        // Apply hard cap if configured (for competitive spreads on illiquid assets)
+        if self.config.max_spread_per_side_bps > 0.0 {
+            optimal_bid_bps = optimal_bid_bps.min(self.config.max_spread_per_side_bps);
+            optimal_ask_bps = optimal_ask_bps.min(self.config.max_spread_per_side_bps);
+        }
 
         // Generate depth arrays
         let bid_depths = self.generate_depth_array(optimal_bid_bps);
@@ -392,6 +415,109 @@ impl DynamicDepthGenerator {
             best_bid_depth = ?depths.best_bid_depth(),
             best_ask_depth = ?depths.best_ask_depth(),
             "Dynamic depths computed with market cap"
+        );
+
+        depths
+    }
+
+    /// Compute depths with dynamic Bayesian bounds.
+    ///
+    /// This method replaces hardcoded CLI arguments with principled model-driven bounds:
+    /// - `dynamic_kappa_floor`: From Bayesian confidence + credible intervals
+    /// - `dynamic_spread_ceiling`: From fill rate controller + market spread p80
+    ///
+    /// # Arguments
+    /// * `gamma` - Effective risk aversion
+    /// * `kappa_bid` - Bid-side order flow intensity (before floor)
+    /// * `kappa_ask` - Ask-side order flow intensity (before floor)
+    /// * `sigma` - Volatility
+    /// * `dynamic_kappa_floor` - Optional floor for kappa values (higher = tighter spreads)
+    /// * `dynamic_spread_ceiling_bps` - Optional ceiling for spreads in bps (tighter = more competitive)
+    ///
+    /// # Mathematical Flow
+    ///
+    /// 1. Apply kappa floor: `kappa_eff = kappa.max(floor)`
+    ///    - Higher kappa floor → tighter GLFT spreads
+    ///    - Floor derived from Bayesian CI: principled, not arbitrary
+    ///
+    /// 2. Compute GLFT optimal spread: `δ* = (1/γ) × ln(1 + γ/κ_eff)`
+    ///
+    /// 3. Apply spread ceiling: `depth = depth.min(ceiling)`
+    ///    - Ceiling from fill rate controller or market p80
+    ///    - Ensures competitiveness even when GLFT is conservative
+    pub fn compute_depths_with_dynamic_bounds(
+        &self,
+        gamma: f64,
+        kappa_bid: f64,
+        kappa_ask: f64,
+        _sigma: f64,
+        dynamic_kappa_floor: Option<f64>,
+        dynamic_spread_ceiling_bps: Option<f64>,
+    ) -> DynamicDepths {
+        // Apply dynamic kappa floor (if provided)
+        let effective_kappa_bid = match dynamic_kappa_floor {
+            Some(floor) => kappa_bid.max(floor),
+            None => kappa_bid,
+        };
+        let effective_kappa_ask = match dynamic_kappa_floor {
+            Some(floor) => kappa_ask.max(floor),
+            None => kappa_ask,
+        };
+
+        // Compute GLFT optimal spreads with floored kappa
+        let optimal_bid = self.glft_optimal_spread(gamma, effective_kappa_bid);
+        let optimal_ask = self.glft_optimal_spread(gamma, effective_kappa_ask);
+
+        // Convert to basis points
+        let optimal_bid_bps = Self::to_bps(optimal_bid);
+        let optimal_ask_bps = Self::to_bps(optimal_ask);
+
+        // Apply floor (minimum spread)
+        let mut optimal_bid_bps = optimal_bid_bps
+            .max(self.config.min_spread_floor_bps)
+            .max(self.config.min_depth_bps);
+        let mut optimal_ask_bps = optimal_ask_bps
+            .max(self.config.min_spread_floor_bps)
+            .max(self.config.min_depth_bps);
+
+        // Apply dynamic spread ceiling (if provided) - this is the model-driven cap
+        if let Some(ceiling_bps) = dynamic_spread_ceiling_bps {
+            optimal_bid_bps = optimal_bid_bps.min(ceiling_bps);
+            optimal_ask_bps = optimal_ask_bps.min(ceiling_bps);
+        }
+
+        // Also apply hard cap from config if set (CLI override takes precedence)
+        if self.config.max_spread_per_side_bps > 0.0 {
+            optimal_bid_bps = optimal_bid_bps.min(self.config.max_spread_per_side_bps);
+            optimal_ask_bps = optimal_ask_bps.min(self.config.max_spread_per_side_bps);
+        }
+
+        // Generate depth arrays
+        let bid_depths = self.generate_depth_array(optimal_bid_bps);
+        let ask_depths = if self.config.enable_asymmetric {
+            self.generate_depth_array(optimal_ask_bps)
+        } else {
+            bid_depths.clone()
+        };
+
+        let depths = DynamicDepths {
+            bid: bid_depths,
+            ask: ask_depths,
+        };
+
+        debug!(
+            gamma = %format!("{:.3}", gamma),
+            kappa_bid = %format!("{:.1}", kappa_bid),
+            kappa_ask = %format!("{:.1}", kappa_ask),
+            kappa_floor = ?dynamic_kappa_floor.map(|f| format!("{:.1}", f)),
+            effective_kappa_bid = %format!("{:.1}", effective_kappa_bid),
+            effective_kappa_ask = %format!("{:.1}", effective_kappa_ask),
+            spread_ceiling_bps = ?dynamic_spread_ceiling_bps.map(|c| format!("{:.2}", c)),
+            optimal_bid_bps = %format!("{:.2}", optimal_bid_bps),
+            optimal_ask_bps = %format!("{:.2}", optimal_ask_bps),
+            best_bid_depth = ?depths.best_bid_depth(),
+            best_ask_depth = ?depths.best_ask_depth(),
+            "Dynamic depths computed with Bayesian bounds"
         );
 
         depths
@@ -752,6 +878,7 @@ mod tests {
             min_spread_floor_bps: 2.0,
             enable_asymmetric: true,
             market_spread_cap_multiple: 5.0,
+            max_spread_per_side_bps: 0.0, // Disabled for this test
         };
         let generator = DynamicDepthGenerator::new(config);
 

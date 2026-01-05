@@ -23,9 +23,9 @@ use hyperliquid_rust_sdk::{
     GLFTStrategy, HawkesConfig, HyperliquidExecutor, InfoClient, InventoryAwareStrategy,
     KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig, LogConfig,
     LogFormat as MmLogFormat, MarginConfig, MarketMaker, MarketMakerConfig as MmConfig,
-    MarketMakerMetricsRecorder, PnLConfig, QueueConfig, QuotingStrategy, ReconciliationConfig,
-    RecoveryConfig, RejectionRateLimitConfig, RiskConfig, SpreadConfig, StochasticConfig,
-    SymmetricStrategy,
+    MarketMakerMetricsRecorder, PnLConfig, QueueConfig, QuotingStrategy, ReconcileConfig,
+    ReconciliationConfig, RecoveryConfig, RejectionRateLimitConfig, RiskConfig, SpreadConfig,
+    StochasticConfig, SymmetricStrategy,
 };
 
 // ============================================================================
@@ -124,6 +124,49 @@ struct Cli {
     /// List available HIP-3 DEXs and exit
     #[arg(long)]
     list_dexs: bool,
+
+    // === Reconciliation Tuning Flags ===
+    /// Price tolerance in bps for skipping order updates (default: 10)
+    /// Higher values reduce API calls but allow more price drift
+    #[arg(long)]
+    skip_price_tolerance_bps: Option<u16>,
+
+    /// Max price change in bps for using MODIFY vs CANCEL+PLACE (default: 50)
+    /// On Hyperliquid, price modifications reset queue, so this only affects API call count
+    #[arg(long)]
+    max_modify_price_bps: Option<u16>,
+
+    /// Size tolerance as fraction for skipping order updates (default: 0.05)
+    /// E.g., 0.05 means skip if size change is ≤ 5%
+    #[arg(long)]
+    skip_size_tolerance_pct: Option<f64>,
+
+    /// Max size change as fraction for using MODIFY vs CANCEL+PLACE (default: 0.50)
+    #[arg(long)]
+    max_modify_size_pct: Option<f64>,
+
+    /// Enable queue-aware reconciliation that uses fill probability to decide refreshes
+    /// When enabled, orders with low fill probability may be refreshed even if price is close
+    #[arg(long)]
+    use_queue_aware: bool,
+
+    /// Time horizon in seconds for queue fill probability calculation (default: 1.0)
+    #[arg(long)]
+    queue_horizon_seconds: Option<f64>,
+
+    // === Competitive Spread Control Flags ===
+    /// Minimum kappa floor for order arrival intensity estimation.
+    /// Higher kappa = tighter GLFT spreads. Use to force competitive spreads on illiquid assets.
+    /// GLFT formula: δ* = (1/γ) × ln(1 + γ/κ) + maker_fee
+    /// Example: --kappa-floor 2000 → spreads ~5-8 bps instead of 44 bps with low natural kappa
+    #[arg(long)]
+    kappa_floor: Option<f64>,
+
+    /// Maximum spread per side in basis points (hard cap regardless of GLFT output).
+    /// Use as a safety valve to prevent extremely wide spreads on illiquid assets.
+    /// Example: --max-spread-bps 15 → never quote wider than 15 bps per side
+    #[arg(long)]
+    max_spread_bps: Option<f64>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1044,6 +1087,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         multi_asset: false, // Single-asset mode by default
         stochastic: StochasticConfig::default(),
         smart_reconcile: true, // Enable queue-preserving ORDER MODIFY by default
+        reconcile: {
+            let mut rc = ReconcileConfig::default();
+            if let Some(v) = cli.skip_price_tolerance_bps {
+                rc.skip_price_tolerance_bps = v;
+            }
+            if let Some(v) = cli.max_modify_price_bps {
+                rc.max_modify_price_bps = v;
+            }
+            if let Some(v) = cli.skip_size_tolerance_pct {
+                rc.skip_size_tolerance_pct = v;
+            }
+            if let Some(v) = cli.max_modify_size_pct {
+                rc.max_modify_size_pct = v;
+            }
+            if cli.use_queue_aware {
+                rc.use_queue_aware = true;
+            }
+            if let Some(v) = cli.queue_horizon_seconds {
+                rc.queue_horizon_seconds = v;
+            }
+            rc
+        },
         // HIP-3 support: pre-computed runtime config for zero hot-path overhead
         runtime: runtime_config,
         initial_isolated_margin,
@@ -1052,6 +1117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Collateral/quote asset (USDC, USDE, USDH, etc.)
         collateral,
     };
+
+    // Extract EMA config before mm_config is moved
+    let microprice_ema_alpha = mm_config.stochastic.microprice_ema_alpha;
+    let microprice_ema_min_change_bps = mm_config.stochastic.microprice_ema_min_change_bps;
 
     // Create strategy based on config
     let strategy: Box<dyn QuotingStrategy> = match config.strategy.strategy_type {
@@ -1085,13 +1154,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gamma_base: risk_aversion,
                     ..Default::default()
                 });
-            let ladder_cfg = config.strategy.ladder_config.clone().unwrap_or_default();
+            let mut ladder_cfg = config.strategy.ladder_config.clone().unwrap_or_default();
+
+            // Max spread handling: CLI override takes precedence, otherwise use dynamic bounds
+            // Dynamic bounds are computed at runtime from fill rate controller + market spread p80
+            if let Some(max_spread) = cli.max_spread_bps {
+                // Explicit CLI override - use static cap
+                info!(
+                    max_spread_per_side_bps = %max_spread,
+                    mode = "CLI override",
+                    "Max spread cap: using explicit CLI value"
+                );
+                ladder_cfg.max_spread_per_side_bps = max_spread;
+            } else {
+                // No CLI arg - use dynamic bounds (model-driven spread ceiling)
+                // Set to 0.0 to signal that dynamic ceiling should be used at runtime
+                ladder_cfg.max_spread_per_side_bps = 0.0;
+                info!(
+                    dex = ?dex,
+                    mode = "dynamic",
+                    "Max spread cap: using model-driven dynamic ceiling"
+                );
+            }
+
             info!(
                 gamma_base = risk_cfg.gamma_base,
                 num_levels = ladder_cfg.num_levels,
                 min_depth_bps = ladder_cfg.min_depth_bps,
                 max_depth_bps = ladder_cfg.max_depth_bps,
                 geometric_spacing = ladder_cfg.geometric_spacing,
+                max_spread_per_side_bps = ladder_cfg.max_spread_per_side_bps,
                 "Using LadderStrategy (multi-level GLFT)"
             );
             Box::new(LadderStrategy::with_config(risk_cfg, ladder_cfg))
@@ -1099,7 +1191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create estimator config for live parameter estimation (using legacy compatibility)
-    let estimator_config = EstimatorConfig::from_legacy(
+    let mut estimator_config = EstimatorConfig::from_legacy(
         config.strategy.estimation_window_secs * 1000,
         config.strategy.min_trades,
         config.strategy.default_sigma,
@@ -1109,11 +1201,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.strategy.min_warmup_trades,
     );
 
+    // Kappa floor handling: CLI override takes precedence, otherwise use dynamic bounds
+    // Dynamic bounds are computed at runtime from Bayesian confidence + credible intervals
+    if dex.is_some() {
+        // Lower kappa prior for DEX assets (illiquid → trades execute far from mid)
+        // Standard perps: 2500 (trades at 4 bps from mid)
+        // HIP-3 DEX: 500 (trades at 20 bps from mid)
+        estimator_config.kappa_prior_mean = 500.0;
+    }
+
+    if let Some(floor) = cli.kappa_floor {
+        // Explicit CLI override - use static floor
+        info!(
+            kappa_floor = %floor,
+            mode = "CLI override",
+            "Kappa floor: using explicit CLI value"
+        );
+        estimator_config.kappa_floor = Some(floor);
+    } else {
+        // No CLI arg - use dynamic bounds (model-driven kappa floor)
+        // Leave kappa_floor as None to signal dynamic floor should be computed at runtime
+        estimator_config.kappa_floor = None;
+        info!(
+            dex = ?dex,
+            kappa_prior_mean = %estimator_config.kappa_prior_mean,
+            mode = "dynamic",
+            "Kappa floor: using model-driven dynamic floor from Bayesian CI"
+        );
+    }
+
+    // Set max spread ceiling on estimator config for dynamic bounds detection
+    if let Some(max_spread) = cli.max_spread_bps {
+        estimator_config.max_spread_ceiling_bps = Some(max_spread);
+    } else {
+        estimator_config.max_spread_ceiling_bps = None;
+    }
+
     info!(
         estimation_window_secs = config.strategy.estimation_window_secs,
         min_trades = config.strategy.min_trades,
         warmup_decay_secs = config.strategy.warmup_decay_secs,
         min_warmup_trades = config.strategy.min_warmup_trades,
+        kappa_floor = ?estimator_config.kappa_floor,
+        kappa_prior_mean = %estimator_config.kappa_prior_mean,
         "Live parameter estimation enabled (adaptive warmup)"
     );
 
@@ -1181,7 +1311,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconciliation_config,
         rate_limit_config,
     )
-    .with_dynamic_risk_config(dynamic_risk_config);
+    .with_dynamic_risk_config(dynamic_risk_config)
+    .with_microprice_ema(microprice_ema_alpha, microprice_ema_min_change_bps);
 
     // Sync open orders
     market_maker

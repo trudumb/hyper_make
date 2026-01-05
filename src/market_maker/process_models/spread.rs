@@ -208,6 +208,40 @@ impl SpreadProcessEstimator {
         position as f64 / spreads.len() as f64
     }
 
+    /// Get the spread value at a given percentile (0.0 to 1.0).
+    ///
+    /// # Arguments
+    /// - `p`: Percentile in [0.0, 1.0], e.g., 0.8 for 80th percentile
+    ///
+    /// # Returns
+    /// - Spread value at that percentile as fraction of mid
+    /// - Returns None if insufficient history
+    ///
+    /// # Example
+    /// ```ignore
+    /// let p80 = estimator.percentile_value(0.8);
+    /// // If p80 = Some(0.0012), market spread was below 12 bps 80% of the time
+    /// ```
+    pub fn percentile_value(&self, p: f64) -> Option<f64> {
+        if self.spread_history.len() < 10 {
+            return None;
+        }
+
+        let mut spreads: Vec<f64> = self.spread_history.iter().map(|o| o.spread).collect();
+        spreads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let idx = ((p * spreads.len() as f64) as usize).min(spreads.len() - 1);
+        Some(spreads[idx])
+    }
+
+    /// Get spread value at 80th percentile in basis points.
+    ///
+    /// Returns the spread below which 80% of observations fall.
+    /// Useful for setting competitive spread ceilings.
+    pub fn spread_p80_bps(&self) -> Option<f64> {
+        self.percentile_value(0.8).map(|s| s * 10000.0)
+    }
+
     /// Check if spread is tight (below fair value).
     pub fn is_spread_tight(&self) -> bool {
         self.current_spread < self.fair_spread() * 0.8

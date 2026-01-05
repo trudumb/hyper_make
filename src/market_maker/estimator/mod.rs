@@ -243,6 +243,20 @@ pub struct EstimatorConfig {
     pub default_kappa: f64,
     /// Default arrival intensity during warmup (ticks per second)
     pub default_arrival_intensity: f64,
+
+    // === Kappa Floor (Competitive Spread Control) ===
+    /// Optional minimum floor for kappa output (applies after Bayesian estimation).
+    /// Does not affect internal estimation, only final kappa() return values.
+    /// Use for illiquid assets where measured kappa is too low for competitive fills.
+    /// GLFT: δ* = (1/γ) × ln(1 + γ/κ) - higher κ = tighter spreads
+    /// Example: kappa_floor = 2000 → δ* ≈ 5-8 bps instead of 44 bps
+    pub kappa_floor: Option<f64>,
+
+    // === Max Spread Ceiling (Competitive Spread Control) ===
+    /// Optional maximum spread ceiling from CLI override.
+    /// When set, this value is used instead of dynamic model-driven ceiling.
+    /// When None, the system uses dynamic ceiling from fill rate controller + market p80.
+    pub max_spread_ceiling_bps: Option<f64>,
 }
 
 impl Default for EstimatorConfig {
@@ -291,6 +305,12 @@ impl Default for EstimatorConfig {
             default_sigma: 0.0001,          // 0.01% per-second
             default_kappa: 100.0,           // Moderate depth decay
             default_arrival_intensity: 0.5, // 0.5 ticks per second
+
+            // Kappa floor - disabled by default (trust Bayesian estimation)
+            kappa_floor: None,
+
+            // Max spread ceiling - disabled by default (use dynamic model-driven ceiling)
+            max_spread_ceiling_bps: None,
         }
     }
 }

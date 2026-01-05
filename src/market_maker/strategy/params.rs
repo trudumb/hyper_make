@@ -676,6 +676,12 @@ pub struct ParameterSources<'a> {
     pub calibration_progress: f64,
     /// Whether calibration is complete.
     pub calibration_complete: bool,
+
+    // Dynamic bounds (model-driven, replaces hardcoded CLI values)
+    /// Whether to use dynamic kappa floor (true if no CLI override).
+    pub use_dynamic_kappa_floor: bool,
+    /// Whether to use dynamic spread ceiling (true if no CLI override).
+    pub use_dynamic_spread_ceiling: bool,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -941,6 +947,24 @@ impl ParameterAggregator {
                 sources.liquidation_detector.cascade_severity(),
             ),
             adaptive_spread_ceiling: sources.adaptive_spreads.spread_ceiling(),
+
+            // === Dynamic Bounds (Model-Driven, Replaces Hardcoded CLI Values) ===
+            // These are computed from Bayesian models to replace arbitrary --kappa-floor and --max-spread-bps
+            dynamic_kappa_floor: if sources.use_dynamic_kappa_floor {
+                Some(sources.estimator.dynamic_kappa_floor())
+            } else {
+                None // CLI override active, static floor in use
+            },
+            dynamic_spread_ceiling_bps: if sources.use_dynamic_spread_ceiling {
+                // Get market p80 from spread tracker
+                let market_p80_bps = sources.spread_tracker.spread_p80_bps();
+                // Combine with fill controller ceiling
+                sources.adaptive_spreads.dynamic_spread_ceiling(market_p80_bps)
+            } else {
+                None // CLI override active, static ceiling in use
+            },
+            use_dynamic_bounds: sources.use_dynamic_kappa_floor || sources.use_dynamic_spread_ceiling,
+
             adaptive_warmed_up: sources.adaptive_spreads.is_warmed_up(),
             adaptive_can_estimate: sources.adaptive_spreads.can_provide_estimates(),
             adaptive_warmup_progress: sources.adaptive_spreads.warmup_progress(),

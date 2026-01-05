@@ -4,7 +4,11 @@
 //! replacing magic number adjustments with data-driven coefficients.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
+
+/// Sentinel value for "no EMA value" (NaN bits)
+const EMA_NONE: u64 = u64::MAX;
 
 // ============================================================================
 // Microprice Observation
@@ -122,6 +126,16 @@ pub(crate) struct MicropriceEstimator {
     sum_x_net: f64,
     sum_xx_net: f64,
     sum_xy_net: f64,
+
+    // EMA smoothing for microprice output
+    /// EMA smoothing factor (0.0-1.0). Higher = more weight to new observation.
+    /// 0.2 = 5-update half-life, 0.1 = 10-update half-life
+    ema_alpha: f64,
+    /// Current EMA smoothed microprice as bits (uses AtomicU64 for Sync-safe interior mutability)
+    /// EMA_NONE (u64::MAX) represents "no value yet"
+    ema_microprice_bits: AtomicU64,
+    /// Minimum change in bps to update EMA (noise filter)
+    ema_min_change_bps: f64,
 }
 
 impl MicropriceEstimator {
@@ -164,7 +178,21 @@ impl MicropriceEstimator {
             sum_x_net: 0.0,
             sum_xx_net: 0.0,
             sum_xy_net: 0.0,
+            // EMA smoothing (defaults - can be overridden via set_ema_config)
+            ema_alpha: 0.2,                         // 5-update half-life
+            ema_microprice_bits: AtomicU64::new(EMA_NONE), // No smoothed value until first update
+            ema_min_change_bps: 2.0,                // 2 bps noise filter
         }
+    }
+
+    /// Configure EMA smoothing parameters.
+    ///
+    /// - `alpha`: Smoothing factor (0.0-1.0). Higher = more weight to new observation.
+    ///   0.2 = 5-update half-life, 0.1 = 10-update half-life, 0.0 = disabled
+    /// - `min_change_bps`: Minimum change in bps to update EMA (noise filter)
+    pub(crate) fn set_ema_config(&mut self, alpha: f64, min_change_bps: f64) {
+        self.ema_alpha = alpha.clamp(0.0, 1.0);
+        self.ema_min_change_bps = min_change_bps.max(0.0);
     }
 
     /// Update forward horizon based on arrival intensity.
@@ -537,7 +565,7 @@ impl MicropriceEstimator {
         }
     }
 
-    /// Get microprice adjusted for current signals.
+    /// Get microprice adjusted for current signals with optional EMA smoothing.
     ///
     /// Returns mid price if:
     /// - Not warmed up (insufficient data)
@@ -546,6 +574,10 @@ impl MicropriceEstimator {
     /// Uses mode-based adjustment depending on signal correlation:
     /// - Combined: uses net_pressure = book - flow when correlation >= 0.95
     /// - Orthogonalized/Independent: uses both signals
+    ///
+    /// EMA smoothing (if ema_alpha > 0):
+    /// - Applies exponential moving average to smooth microprice output
+    /// - Noise filter: skips EMA update if change < ema_min_change_bps
     pub(crate) fn microprice(&self, mid: f64, book_imbalance: f64, flow_imbalance: f64) -> f64 {
         if !self.is_warmed_up() {
             return mid;
@@ -572,7 +604,38 @@ impl MicropriceEstimator {
         // Clamp adjustment to ±50 bps for safety
         let adjustment_clamped = adjustment.clamp(-0.005, 0.005);
 
-        mid * (1.0 + adjustment_clamped)
+        let raw_microprice = mid * (1.0 + adjustment_clamped);
+
+        // Apply EMA smoothing if enabled (alpha > 0)
+        if self.ema_alpha > 0.0 {
+            let prev_bits = self.ema_microprice_bits.load(Ordering::Relaxed);
+
+            if prev_bits == EMA_NONE {
+                // First observation - initialize EMA
+                self.ema_microprice_bits
+                    .store(raw_microprice.to_bits(), Ordering::Relaxed);
+                raw_microprice
+            } else {
+                let prev = f64::from_bits(prev_bits);
+
+                // Calculate change in bps
+                let change_bps = ((raw_microprice - prev) / prev).abs() * 10_000.0;
+
+                // Noise filter: skip update if change is too small
+                if change_bps < self.ema_min_change_bps {
+                    return prev;
+                }
+
+                // EMA update: new = alpha * raw + (1 - alpha) * prev
+                let smoothed = self.ema_alpha * raw_microprice + (1.0 - self.ema_alpha) * prev;
+                self.ema_microprice_bits
+                    .store(smoothed.to_bits(), Ordering::Relaxed);
+                smoothed
+            }
+        } else {
+            // No smoothing - return raw microprice
+            raw_microprice
+        }
     }
 
     pub(crate) fn is_warmed_up(&self) -> bool {

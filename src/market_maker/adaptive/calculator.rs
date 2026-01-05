@@ -494,6 +494,48 @@ impl AdaptiveSpreadCalculator {
         self.fill_controller.spread_ceiling().unwrap_or(f64::MAX)
     }
 
+    /// Compute dynamic spread ceiling from Bayesian models.
+    ///
+    /// Replaces hardcoded `--max-spread-bps` CLI argument with principled model-driven bounds:
+    /// - Fill rate controller ceiling: Ensures we meet fill rate targets
+    /// - Market spread p80: Ensures competitiveness vs other market makers
+    ///
+    /// # Arguments
+    /// - `market_spread_p80_bps`: 80th percentile of observed market spreads (in bps)
+    ///
+    /// # Returns
+    /// - `Some(ceiling)` in basis points if warmed up
+    /// - `None` during warmup (trust GLFT, no ceiling)
+    ///
+    /// # Why `max()` not `min()`
+    ///
+    /// Taking the more permissive ceiling ensures we satisfy EITHER:
+    /// - Fill rate targets (tight enough to get fills)
+    /// - Market competitiveness (not wider than market)
+    ///
+    /// If fill controller wants 15 bps but market is at 20 bps, we use 20 bps
+    /// (being wider than market is never good, but tighter than needed wastes edge).
+    pub fn dynamic_spread_ceiling(&self, market_spread_p80_bps: Option<f64>) -> Option<f64> {
+        // Don't apply ceiling during warmup - trust GLFT
+        if !self.is_warmed_up() {
+            return None;
+        }
+
+        // Get fill controller ceiling (returns None if meeting target)
+        let fill_ceiling_bps = self
+            .fill_controller
+            .spread_ceiling()
+            .map(|c| c * 10000.0); // Convert fraction to bps
+
+        // Combine with market p80 using max (more permissive wins)
+        match (fill_ceiling_bps, market_spread_p80_bps) {
+            (Some(fc), Some(mc)) => Some(fc.max(mc)),
+            (Some(fc), None) => Some(fc),
+            (None, Some(mc)) => Some(mc),
+            (None, None) => None, // No ceiling needed
+        }
+    }
+
     /// Compute inventory utilization.
     pub fn inventory_utilization(&self, position: f64, max_position: f64) -> f64 {
         if max_position > 0.0 {

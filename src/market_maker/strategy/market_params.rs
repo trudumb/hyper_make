@@ -398,6 +398,23 @@ pub struct MarketParams {
     /// Ensures minimum fill rate to maintain market presence.
     pub adaptive_spread_ceiling: f64,
 
+    /// Dynamic kappa floor from Bayesian confidence + credible intervals.
+    /// Replaces hardcoded --kappa-floor CLI argument with principled model-driven bounds.
+    /// Formula: blend(prior, ci_95_lower) based on confidence level.
+    /// None during warmup or when CLI override is active.
+    pub dynamic_kappa_floor: Option<f64>,
+
+    /// Dynamic spread ceiling from fill rate controller + market spread p80.
+    /// Replaces hardcoded --max-spread-bps CLI argument with model-driven bounds.
+    /// Formula: max(fill_controller_ceiling, market_spread_p80)
+    /// None during warmup or when CLI override is active.
+    pub dynamic_spread_ceiling_bps: Option<f64>,
+
+    /// Whether dynamic bounds are enabled (no CLI overrides).
+    /// When true, use dynamic_kappa_floor and dynamic_spread_ceiling_bps.
+    /// When false, static config values are in effect.
+    pub use_dynamic_bounds: bool,
+
     /// Whether adaptive system is warmed up with enough data.
     /// NOTE: For deciding to USE adaptive values, check `adaptive_can_estimate` instead.
     /// This field indicates full calibration (20+ fills).
@@ -554,6 +571,10 @@ impl Default for MarketParams {
             adaptive_kappa: 100.0,             // Moderate kappa fallback
             adaptive_gamma: 0.3,               // Base gamma fallback
             adaptive_spread_ceiling: f64::MAX, // No ceiling by default
+            // Dynamic bounds (model-driven, replaces hardcoded CLI values)
+            dynamic_kappa_floor: None,          // Computed at runtime from Bayesian CI
+            dynamic_spread_ceiling_bps: None,   // Computed at runtime from fill rate + market p80
+            use_dynamic_bounds: true,           // Default ON - use model-driven bounds
             adaptive_warmed_up: false,         // Not warmed up initially
             adaptive_can_estimate: true,       // Can estimate immediately via priors
             adaptive_warmup_progress: 0.0,     // Start at 0% progress

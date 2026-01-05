@@ -23,15 +23,26 @@ pub struct ReconcileConfig {
     pub skip_price_tolerance_bps: u16,
     /// Size tolerance as fraction for considering an order unchanged (SKIP)
     pub skip_size_tolerance_pct: f64,
+    /// Enable queue-aware reconciliation that uses QueuePositionTracker
+    /// to make refresh decisions based on expected fill value
+    pub use_queue_aware: bool,
+    /// Time horizon in seconds for queue fill probability calculation
+    /// Orders with low P(fill) within this horizon may be refreshed
+    pub queue_horizon_seconds: f64,
 }
 
 impl Default for ReconcileConfig {
     fn default() -> Self {
         Self {
-            max_modify_price_bps: 10,      // Modify if price ≤ 10 bps change
+            // NOTE: On Hyperliquid, price modifications always reset queue position (new OID).
+            // Only SIZE-only modifications preserve queue. Therefore, these tolerances
+            // primarily affect API call frequency, not queue preservation.
+            max_modify_price_bps: 50,      // Modify if price ≤ 50 bps change (was 10)
             max_modify_size_pct: 0.50,     // Modify if size ≤ 50% change
-            skip_price_tolerance_bps: 1,   // Skip if price ≤ 1 bps (unchanged)
+            skip_price_tolerance_bps: 10,  // Skip if price ≤ 10 bps (was 1 - reduces churn ~50%)
             skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
+            use_queue_aware: false,        // Disabled by default until validated
+            queue_horizon_seconds: 1.0,    // 1-second fill horizon
         }
     }
 }

@@ -174,6 +174,8 @@ impl LadderStrategy {
             // DISABLED: Trust GLFT optimal spreads from first principles
             // Trade history showed spread cap caused -$562 loss over 9 days
             market_spread_cap_multiple: 0.0,
+            // Pass through hard cap for competitive spreads on illiquid assets
+            max_spread_per_side_bps: ladder_config.max_spread_per_side_bps,
         };
         DynamicDepthGenerator::new(config)
     }
@@ -430,22 +432,35 @@ impl LadderStrategy {
         };
         let effective_floor_bps = effective_floor_frac * 10_000.0;
 
-        // === DYNAMIC DEPTHS: GLFT-optimal depth computation ===
+        // === DYNAMIC DEPTHS: GLFT-optimal depth computation with Bayesian bounds ===
         // Compute depths from effective gamma and kappa using GLFT formula:
         // δ* = (1/γ) × ln(1 + γ/κ)
         //
-        // With market spread cap: GLFT optimal is capped at 5× observed market spread
-        // to ensure competitive quotes even when GLFT parameters suggest wider spreads.
+        // Dynamic bounds (when no CLI override):
+        // - dynamic_kappa_floor: From Bayesian confidence + 95% credible interval
+        // - dynamic_spread_ceiling_bps: From fill rate controller + market spread p80
         //
-        // For asymmetric depths, we could use separate bid/ask kappa estimates.
-        // Currently using symmetric kappa (same for both sides).
-        let mut dynamic_depths = self.depth_generator.compute_depths_with_market_cap(
-            gamma,
-            kappa,
-            kappa,
-            market_params.sigma,
-            market_params.market_spread_bps,
-        );
+        // This replaces arbitrary hardcoded values with principled model-driven bounds.
+        let mut dynamic_depths = if market_params.use_dynamic_bounds {
+            // Use model-driven bounds from Bayesian estimation
+            self.depth_generator.compute_depths_with_dynamic_bounds(
+                gamma,
+                kappa,
+                kappa,
+                market_params.sigma,
+                market_params.dynamic_kappa_floor,
+                market_params.dynamic_spread_ceiling_bps,
+            )
+        } else {
+            // Use legacy path with market spread cap (CLI overrides in effect)
+            self.depth_generator.compute_depths_with_market_cap(
+                gamma,
+                kappa,
+                kappa,
+                market_params.sigma,
+                market_params.market_spread_bps,
+            )
+        };
 
         // Apply stochastic floor to dynamic depths
         // Ensure all levels are at least at effective_floor_bps

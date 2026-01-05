@@ -83,6 +83,16 @@ pub struct ParameterEstimator {
     soft_jump: SoftJumpClassifier,
     /// (κ, σ) parameter covariance tracker
     param_covariance: ParameterCovariance,
+
+    // === Competitive Spread Control ===
+    /// Optional minimum floor for kappa output.
+    /// Applied after Bayesian estimation to force competitive spreads on illiquid assets.
+    /// Higher kappa = tighter GLFT spreads.
+    kappa_floor: Option<f64>,
+
+    /// Optional maximum spread ceiling from CLI override.
+    /// When set, static ceiling is used instead of dynamic model-driven ceiling.
+    max_spread_ceiling_bps: Option<f64>,
 }
 
 impl ParameterEstimator {
@@ -158,6 +168,11 @@ impl ParameterEstimator {
         // Parameter covariance tracker (50-tick half-life for (κ, σ) correlation)
         let param_covariance = ParameterCovariance::with_half_life(50.0);
 
+        // Kappa floor for competitive spread control on illiquid assets
+        let kappa_floor = config.kappa_floor;
+        // Max spread ceiling for spread control (CLI override)
+        let max_spread_ceiling_bps = config.max_spread_ceiling_bps;
+
         Self {
             config,
             bucket_accumulator,
@@ -184,6 +199,9 @@ impl ParameterEstimator {
             hierarchical_kappa,
             soft_jump,
             param_covariance,
+            // Competitive spread control
+            kappa_floor,
+            max_spread_ceiling_bps,
         }
     }
 
@@ -468,6 +486,74 @@ impl ParameterEstimator {
 
     // === Order Book Accessors ===
 
+    /// Apply kappa floor if configured.
+    /// Returns the kappa value clamped to at least the floor value.
+    #[inline]
+    fn apply_kappa_floor(&self, kappa: f64) -> f64 {
+        match self.kappa_floor {
+            Some(floor) => kappa.max(floor),
+            None => kappa,
+        }
+    }
+
+    /// Compute dynamic kappa floor based on Bayesian confidence.
+    ///
+    /// This replaces hardcoded CLI arguments with principled model-driven bounds:
+    /// - Low confidence (< 0.3): Use prior_mean × 0.8 (conservative during warmup)
+    /// - Medium confidence: Blend between prior and 95% credible interval lower bound
+    /// - High confidence (> 0.7): Use ci_95_lower (data-driven, principled)
+    ///
+    /// # Mathematical Justification
+    ///
+    /// - Prior provides regularization during warmup (Bayesian shrinkage)
+    /// - 95% CI lower bound is principled: P(true κ ≥ ci_lower) = 0.975
+    /// - Smooth blending prevents discontinuities in spread during transition
+    /// - Floor never exceeds posterior mean (would invert the logic)
+    ///
+    /// # Returns
+    ///
+    /// Dynamic kappa floor value. Higher floor = tighter GLFT spreads.
+    pub fn dynamic_kappa_floor(&self) -> f64 {
+        let conf = self.own_kappa.confidence().clamp(0.0, 1.0);
+        let prior = self.config.kappa_prior_mean;
+
+        // During warmup (low confidence): use prior mean with slight discount
+        // The 0.8 factor provides conservatism - we'd rather quote slightly wider
+        // than too tight when we don't have confidence in the estimate
+        if conf < 0.3 {
+            return prior * 0.8;
+        }
+
+        // Get 95% credible interval lower bound from own kappa
+        // This is data-driven: 95% posterior probability that true κ ≥ ci_lower
+        let ci_lower = self.own_kappa.ci_95_lower().max(100.0); // Minimum sensible kappa
+
+        // Transition zone: blend prior and CI lower bound based on confidence
+        // At conf=0.3: blend_weight=0, floor=prior
+        // At conf=1.0: blend_weight=1, floor=ci_lower
+        let blend_weight = (conf - 0.3) / 0.7;
+        let blended = (1.0 - blend_weight) * prior + blend_weight * ci_lower;
+
+        // Never allow floor above posterior mean (would invert GLFT logic)
+        // If ci_lower > posterior_mean, something is wrong with the posterior
+        let posterior_mean = self.own_kappa.posterior_mean();
+        blended.min(posterior_mean)
+    }
+
+    /// Check if a static kappa floor is configured (CLI override).
+    ///
+    /// Returns true if a static floor was set via CLI, false if dynamic bounds should be used.
+    pub fn has_static_kappa_floor(&self) -> bool {
+        self.kappa_floor.is_some()
+    }
+
+    /// Check if a static max spread ceiling is configured (CLI override).
+    ///
+    /// Returns true if a static ceiling was set via CLI, false if dynamic bounds should be used.
+    pub fn has_static_max_spread_ceiling(&self) -> bool {
+        self.max_spread_ceiling_bps.is_some()
+    }
+
     /// Get current kappa estimate (blended from own fills and market data).
     ///
     /// Blending formula:
@@ -494,7 +580,10 @@ impl ParameterEstimator {
         // With proper prior calibration:
         // - κ=2500 → δ* ≈ 4-6bp (competitive)
         // - As fills accumulate, κ adapts to true fill rate
-        own_conf * own + (1.0 - own_conf) * market
+        let blended = own_conf * own + (1.0 - own_conf) * market;
+
+        // Apply floor for competitive spread control on illiquid assets
+        self.apply_kappa_floor(blended)
     }
 
     /// Get kappa from our own order fills only (no blending).
@@ -572,7 +661,10 @@ impl ParameterEstimator {
         // market_scale smoothly transitions from 0.5 to 1.0 based on market confidence
         // This avoids the hard 0.3 threshold that caused spread discontinuities
         let market_scale = 0.5 + 0.5 * market_conf;
-        own_conf * own + (1.0 - own_conf) * market * market_scale
+        let blended = own_conf * own + (1.0 - own_conf) * market * market_scale;
+
+        // Apply floor for competitive spread control on illiquid assets
+        self.apply_kappa_floor(blended)
     }
 
     /// Get directional kappa for ask side (our sell fills).
@@ -594,7 +686,10 @@ impl ParameterEstimator {
         // market_scale smoothly transitions from 0.5 to 1.0 based on market confidence
         // This avoids the hard 0.3 threshold that caused spread discontinuities
         let market_scale = 0.5 + 0.5 * market_conf;
-        own_conf * own + (1.0 - own_conf) * market * market_scale
+        let blended = own_conf * own + (1.0 - own_conf) * market * market_scale;
+
+        // Apply floor for competitive spread control on illiquid assets
+        self.apply_kappa_floor(blended)
     }
 
     /// Get confidence for directional kappa estimates.
@@ -975,6 +1070,14 @@ impl ParameterEstimator {
         self.v2_flags
     }
 
+    /// Configure microprice EMA smoothing.
+    ///
+    /// - `alpha`: Smoothing factor (0.0-1.0). 0.0 disables smoothing.
+    /// - `min_change_bps`: Minimum change in bps to update EMA (noise filter).
+    pub fn set_microprice_ema(&mut self, alpha: f64, min_change_bps: f64) {
+        self.microprice_estimator.set_ema_config(alpha, min_change_bps);
+    }
+
     // === V2 Hierarchical Kappa Accessors ===
 
     /// Get hierarchical kappa effective value (AS-adjusted posterior mean).
@@ -1068,12 +1171,16 @@ impl ParameterEstimator {
     pub fn kappa_v2_aware(&self) -> f64 {
         let hier_conf = self.hierarchical_kappa.confidence();
         let hier_kappa = self.hierarchical_kappa.effective_kappa();
-        let std_kappa = self.kappa();
+        let std_kappa = self.kappa(); // Already has floor applied
 
         // Blend based on hierarchical confidence
         // At 0 confidence: use standard kappa
         // At 1 confidence: use hierarchical kappa
-        hier_conf * hier_kappa + (1.0 - hier_conf) * std_kappa
+        let blended = hier_conf * hier_kappa + (1.0 - hier_conf) * std_kappa;
+
+        // Apply floor for competitive spread control on illiquid assets
+        // (redundant when std_kappa dominates, but ensures hier_kappa respects floor too)
+        self.apply_kappa_floor(blended)
     }
 }
 

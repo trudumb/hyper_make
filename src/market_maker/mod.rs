@@ -257,6 +257,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self
     }
 
+    /// Configure microprice EMA smoothing from StochasticConfig.
+    pub fn with_microprice_ema(mut self, alpha: f64, min_change_bps: f64) -> Self {
+        self.estimator.set_microprice_ema(alpha, min_change_bps);
+        self
+    }
+
     /// Sync open orders from the exchange.
     /// Call this after creating the market maker to recover state.
     ///
@@ -1337,6 +1343,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .calibration_controller
                 .calibration_progress(),
             calibration_complete: self.stochastic.calibration_controller.is_calibrated(),
+            // Dynamic bounds (model-driven, replaces hardcoded CLI values)
+            // true when no CLI override is active (kappa_floor/max_spread_ceiling_bps = None)
+            use_dynamic_kappa_floor: !self.estimator.has_static_kappa_floor(),
+            use_dynamic_spread_ceiling: !self.estimator.has_static_max_spread_ceiling(),
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
@@ -2182,9 +2192,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         ask_quotes: Vec<Quote>,
     ) -> Result<()> {
         use crate::market_maker::quoting::LadderLevel;
-        use crate::market_maker::tracking::{reconcile_side_smart, ReconcileConfig};
+        use crate::market_maker::tracking::reconcile_side_smart;
 
-        let reconcile_config = ReconcileConfig::default();
+        let reconcile_config = &self.config.reconcile;
 
         // Convert Quote to LadderLevel for reconciliation
         let bid_levels: Vec<LadderLevel> = bid_quotes
@@ -2210,10 +2220,88 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
 
         // Generate actions for each side using smart reconciliation
-        let bid_actions =
-            reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, &reconcile_config);
-        let ask_actions =
-            reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, &reconcile_config);
+        let mut bid_actions =
+            reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, reconcile_config);
+        let mut ask_actions =
+            reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, reconcile_config);
+
+        // Queue-aware enhancement: Check if any "skipped" orders should be refreshed
+        // based on queue position analysis
+        if reconcile_config.use_queue_aware {
+            // Find orders that were skipped (in current but not in any action)
+            let bid_action_oids: std::collections::HashSet<u64> = bid_actions
+                .iter()
+                .filter_map(|a| match a {
+                    LadderAction::Cancel { oid } | LadderAction::Modify { oid, .. } => Some(*oid),
+                    _ => None,
+                })
+                .collect();
+            let ask_action_oids: std::collections::HashSet<u64> = ask_actions
+                .iter()
+                .filter_map(|a| match a {
+                    LadderAction::Cancel { oid } | LadderAction::Modify { oid, .. } => Some(*oid),
+                    _ => None,
+                })
+                .collect();
+
+            // Check skipped bids for queue refresh
+            for order in &current_bids {
+                if !bid_action_oids.contains(&order.oid) {
+                    // This order was skipped - check if queue tracker says refresh
+                    if self
+                        .tier1
+                        .queue_tracker
+                        .should_refresh(order.oid, reconcile_config.queue_horizon_seconds)
+                    {
+                        debug!(
+                            oid = order.oid,
+                            price = %order.price,
+                            "Queue-aware refresh: forcing bid order refresh due to low fill probability"
+                        );
+                        // Add cancel action for this skipped order
+                        bid_actions.push(LadderAction::Cancel { oid: order.oid });
+                        // Find matching target level to place
+                        for level in &bid_levels {
+                            if (level.price - order.price).abs() < crate::EPSILON * order.price {
+                                bid_actions.push(LadderAction::Place {
+                                    side: Side::Buy,
+                                    price: level.price,
+                                    size: level.size,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check skipped asks for queue refresh
+            for order in &current_asks {
+                if !ask_action_oids.contains(&order.oid)
+                    && self
+                        .tier1
+                        .queue_tracker
+                        .should_refresh(order.oid, reconcile_config.queue_horizon_seconds)
+                {
+                    debug!(
+                        oid = order.oid,
+                        price = %order.price,
+                        "Queue-aware refresh: forcing ask order refresh due to low fill probability"
+                    );
+                    ask_actions.push(LadderAction::Cancel { oid: order.oid });
+                    for level in &ask_levels {
+                        if (level.price - order.price).abs() < crate::EPSILON * order.price {
+                            ask_actions.push(LadderAction::Place {
+                                side: Side::Sell,
+                                price: level.price,
+                                size: level.size,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         // Partition actions by type for batching
         let (bid_cancels, bid_modifies, bid_places) =
