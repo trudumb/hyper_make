@@ -106,8 +106,16 @@ impl ReduceOnlyResult {
 const MARGIN_UTILIZATION_THRESHOLD: f64 = 0.8;
 
 /// Default threshold for liquidation proximity trigger.
-/// 0.5 = trigger when distance to liquidation equals maintenance margin rate.
-pub const DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD: f64 = 0.5;
+/// The buffer_ratio formula: distance / (distance + maintenance_margin_rate)
+/// - 0.5 = distance equals maintenance margin rate (too aggressive for high leverage)
+/// - 0.3 = distance is ~43% of maintenance rate (better for 10x+ leverage)
+/// - 0.2 = distance is ~25% of maintenance rate (conservative)
+///
+/// For 10x leverage (5% maintenance), thresholds translate to:
+/// - 0.5 → triggers at 5% price distance (too early)
+/// - 0.3 → triggers at ~2.1% price distance (reasonable)
+/// - 0.2 → triggers at ~1.25% price distance (conservative)
+pub const DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD: f64 = 0.3;
 
 /// Configuration for reduce-only filtering.
 pub struct ReduceOnlyConfig {
