@@ -2715,13 +2715,52 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
 
         // DIAGNOSTIC: Log order counts to help debug reconciliation issues
-        // If local counts are 0 but we expect orders on exchange, there's a tracking issue
+        // Compare local tracking (OrderManager) vs WebSocket state (exchange truth)
+        // If ws_* differs from local_*, there's a state synchronization issue
+        let ws_bids = self.ws_state.get_orders_by_side(Side::Buy);
+        let ws_asks = self.ws_state.get_orders_by_side(Side::Sell);
+        
+        // Format order details as "price@size" for compact logging
+        let format_orders = |orders: &[&TrackedOrder]| -> String {
+            let mut sorted: Vec<_> = orders.iter().collect();
+            sorted.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+            sorted
+                .iter()
+                .map(|o| format!("{:.4}@{:.4}", o.price, o.size))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        
+        let format_levels = |levels: &[LadderLevel]| -> String {
+            levels
+                .iter()
+                .map(|l| format!("{:.4}@{:.4}", l.price, l.size))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        
         info!(
             local_bids = current_bids.len(),
             local_asks = current_asks.len(),
+            ws_bids = ws_bids.len(),
+            ws_asks = ws_asks.len(),
             target_bid_levels = bid_levels.len(),
             target_ask_levels = ask_levels.len(),
-            "[Reconcile] Order counts"
+            "[Reconcile] Order counts (local vs exchange)"
+        );
+        
+        // Log detailed order levels for debugging price/size discrepancies
+        info!(
+            local = %format_orders(&current_bids),
+            ws = %format_orders(&ws_bids),
+            target = %format_levels(&bid_levels),
+            "[Reconcile] BID levels (price@size)"
+        );
+        info!(
+            local = %format_orders(&current_asks),
+            ws = %format_orders(&ws_asks),
+            target = %format_levels(&ask_levels),
+            "[Reconcile] ASK levels (price@size)"
         );
 
         // === DRIFT DETECTION: Force full reconciliation on large price drift ===
@@ -2992,23 +3031,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let _total_skips = (current_bids.len() + current_asks.len()).saturating_sub(
             bid_cancels.len() + bid_modifies.len() + ask_cancels.len() + ask_modifies.len(),
         );
-        if !bid_actions.is_empty() || !ask_actions.is_empty() {
-            debug!(
-                bid_skip = current_bids
-                    .len()
-                    .saturating_sub(bid_cancels.len() + bid_modifies.len()),
-                bid_modify = bid_modifies.len(),
-                bid_cancel = bid_cancels.len(),
-                bid_place = bid_places.len(),
-                ask_skip = current_asks
-                    .len()
-                    .saturating_sub(ask_cancels.len() + ask_modifies.len()),
-                ask_modify = ask_modifies.len(),
-                ask_cancel = ask_cancels.len(),
-                ask_place = ask_places.len(),
-                "Smart reconciliation actions"
-            );
-        }
+        
+        // DIAGNOSTIC: Always log reconciliation results at INFO level to debug order placement issues
+        // This helps identify if Place actions are generated but silently dropped
+        info!(
+            raw_bid_actions = bid_actions.len(),
+            raw_ask_actions = ask_actions.len(),
+            bid_cancel = bid_cancels.len(),
+            bid_modify = bid_modifies.len(),
+            bid_place = bid_places.len(),
+            ask_cancel = ask_cancels.len(),
+            ask_modify = ask_modifies.len(),
+            ask_place = ask_places.len(),
+            "[Reconcile] Actions generated and partitioned"
+        );
 
         // Execute cancels first (bulk cancel is efficient)
         let all_cancels: Vec<u64> = bid_cancels.into_iter().chain(ask_cancels).collect();
@@ -3373,6 +3409,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         orders: Vec<(f64, f64)>, // (price, size) tuples
     ) -> Result<()> {
         let is_buy = side == Side::Buy;
+        let side_str = if is_buy { "bid" } else { "ask" };
+        let input_count = orders.len();
+        
+        info!(
+            side = %side_str,
+            input_orders = input_count,
+            "[PlaceBulk] Entering place_bulk_ladder_orders"
+        );
 
         let mut order_specs: Vec<OrderSpec> = Vec::new();
         for (price, size) in orders {
@@ -3413,7 +3457,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             order_specs.push(OrderSpec::with_cloid(price, truncated_size, is_buy, cloid));
         }
 
+        // DIAGNOSTIC: Log how many orders passed filtering
+        info!(
+            side = %side_str,
+            input_orders = input_count,
+            orders_passed_filter = order_specs.len(),
+            orders_filtered_out = input_count - order_specs.len(),
+            "[PlaceBulk] Order filtering complete"
+        );
+
         if order_specs.is_empty() {
+            warn!(
+                side = %side_str,
+                input_orders = input_count,
+                "[PlaceBulk] All orders filtered out - NOT PLACING ANY ORDERS"
+            );
             return Ok(());
         }
 
