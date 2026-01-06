@@ -703,8 +703,6 @@ pub(crate) fn build_asymmetric_ladder(
     Ladder { bids, asks }
 }
 
-
-
 /// Apply GLFT inventory skew with drift adjustment.
 ///
 /// Extended version that includes HJB drift urgency when position opposes momentum.
@@ -739,52 +737,50 @@ pub(crate) fn apply_inventory_skew_with_drift(
 
     // CRITICAL FIX: Cap drift urgency relative to depth from MARKET MID (not microprice).
     // The drift urgency must NEVER cause ask prices to go below market_mid or bids above.
-    let drift_skew_fraction = if use_drift_adjusted_skew
-        && position_opposes_momentum
-        && urgency_score > 0.5
-    {
-        // Calculate depth from MARKET MID (not microprice) - this is what matters for crossing
-        // Safety factor of 0.5 ensures we never cross more than 50% toward market mid
-        let min_bid_depth_bps = ladder
-            .bids
-            .iter()
-            .map(|l| ((market_mid - l.price) / market_mid * 10000.0).abs())
-            .filter(|d| *d > 0.0)
-            .fold(f64::INFINITY, f64::min);
-        let min_ask_depth_bps = ladder
-            .asks
-            .iter()
-            .map(|l| ((l.price - market_mid) / market_mid * 10000.0).abs())
-            .filter(|d| *d > 0.0)
-            .fold(f64::INFINITY, f64::min);
+    let drift_skew_fraction =
+        if use_drift_adjusted_skew && position_opposes_momentum && urgency_score > 0.5 {
+            // Calculate depth from MARKET MID (not microprice) - this is what matters for crossing
+            // Safety factor of 0.5 ensures we never cross more than 50% toward market mid
+            let min_bid_depth_bps = ladder
+                .bids
+                .iter()
+                .map(|l| ((market_mid - l.price) / market_mid * 10000.0).abs())
+                .filter(|d| *d > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            let min_ask_depth_bps = ladder
+                .asks
+                .iter()
+                .map(|l| ((l.price - market_mid) / market_mid * 10000.0).abs())
+                .filter(|d| *d > 0.0)
+                .fold(f64::INFINITY, f64::min);
 
-        // The max safe drift is the minimum of bid/ask depths from market mid
-        let min_depth_bps = min_bid_depth_bps.min(min_ask_depth_bps);
-        let max_safe_drift_fraction = if min_depth_bps.is_finite() && min_depth_bps > 0.0 {
-            (min_depth_bps * 0.5) / 10000.0 // 50% of min depth, convert to fraction
+            // The max safe drift is the minimum of bid/ask depths from market mid
+            let min_depth_bps = min_bid_depth_bps.min(min_ask_depth_bps);
+            let max_safe_drift_fraction = if min_depth_bps.is_finite() && min_depth_bps > 0.0 {
+                (min_depth_bps * 0.5) / 10000.0 // 50% of min depth, convert to fraction
+            } else {
+                0.0005 // 5 bps absolute cap if no safe margin
+            };
+
+            // Cap drift urgency to prevent crossed spreads
+            let raw_drift = hjb_drift_urgency;
+            let capped_drift = raw_drift.abs().min(max_safe_drift_fraction) * raw_drift.signum();
+
+            if (raw_drift - capped_drift).abs() > 1e-8 {
+                tracing::warn!(
+                    raw_drift_bps = %format!("{:.2}", raw_drift * 10000.0),
+                    capped_drift_bps = %format!("{:.2}", capped_drift * 10000.0),
+                    min_depth_from_market_mid_bps = %format!("{:.2}", min_depth_bps),
+                    market_mid = %format!("{:.4}", market_mid),
+                    microprice = %format!("{:.4}", mid),
+                    "Drift urgency capped to prevent crossing market mid"
+                );
+            }
+
+            capped_drift
         } else {
-            0.0005 // 5 bps absolute cap if no safe margin
+            0.0
         };
-
-        // Cap drift urgency to prevent crossed spreads
-        let raw_drift = hjb_drift_urgency;
-        let capped_drift = raw_drift.abs().min(max_safe_drift_fraction) * raw_drift.signum();
-
-        if (raw_drift - capped_drift).abs() > 1e-8 {
-            tracing::warn!(
-                raw_drift_bps = %format!("{:.2}", raw_drift * 10000.0),
-                capped_drift_bps = %format!("{:.2}", capped_drift * 10000.0),
-                min_depth_from_market_mid_bps = %format!("{:.2}", min_depth_bps),
-                market_mid = %format!("{:.4}", market_mid),
-                microprice = %format!("{:.4}", mid),
-                "Drift urgency capped to prevent crossing market mid"
-            );
-        }
-
-        capped_drift
-    } else {
-        0.0
-    };
 
     // === COMBINED SKEW ===
     let total_skew_fraction = base_skew_fraction + drift_skew_fraction;
@@ -1080,7 +1076,21 @@ mod tests {
         };
 
         // Long inventory: bids should move down, bid sizes reduced
-        apply_inventory_skew_with_drift(&mut ladder, 0.5, 0.3, 0.01, 10.0, 100.0, 100.0, 2, 4, false, 0.0, false, 0.0);
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            0.5,
+            0.3,
+            0.01,
+            10.0,
+            100.0,
+            100.0,
+            2,
+            4,
+            false,
+            0.0,
+            false,
+            0.0,
+        );
 
         assert!(ladder.bids[0].price < 100.0); // Price shifted down
         assert!(ladder.bids[0].size < 1.0); // Size reduced
@@ -1103,7 +1113,21 @@ mod tests {
         };
 
         // Short inventory: prices shift up, ask sizes reduced
-        apply_inventory_skew_with_drift(&mut ladder, -0.5, 0.3, 0.01, 10.0, 100.0, 100.0, 2, 4, false, 0.0, false, 0.0);
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            -0.5,
+            0.3,
+            0.01,
+            10.0,
+            100.0,
+            100.0,
+            2,
+            4,
+            false,
+            0.0,
+            false,
+            0.0,
+        );
 
         assert!(ladder.bids[0].price > 99.0); // Price shifted up
         assert!(ladder.asks[0].size < 1.0); // Ask size reduced
@@ -1126,7 +1150,21 @@ mod tests {
         };
 
         // Zero inventory: no changes
-        apply_inventory_skew_with_drift(&mut ladder, 0.0, 0.3, 0.01, 10.0, 100.0, 100.0, 2, 4, false, 0.0, false, 0.0);
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            0.0,
+            0.3,
+            0.01,
+            10.0,
+            100.0,
+            100.0,
+            2,
+            4,
+            false,
+            0.0,
+            false,
+            0.0,
+        );
 
         assert!((ladder.bids[0].price - 100.0).abs() < EPSILON);
         assert!((ladder.bids[0].size - 1.0).abs() < EPSILON);
@@ -1150,7 +1188,21 @@ mod tests {
         };
 
         // Apply skew with 0 decimal places (BTC)
-        apply_inventory_skew_with_drift(&mut ladder, 0.5, 0.3, 0.0001, 10.0, 87840.0, 87840.0, 0, 5, false, 0.0, false, 0.0);
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            0.5,
+            0.3,
+            0.0001,
+            10.0,
+            87840.0,
+            87840.0,
+            0,
+            5,
+            false,
+            0.0,
+            false,
+            0.0,
+        );
 
         // Prices should be integers (no fractional part)
         assert_eq!(ladder.bids[0].price, ladder.bids[0].price.round());

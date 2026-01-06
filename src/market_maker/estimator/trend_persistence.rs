@@ -36,12 +36,12 @@ pub struct TrendConfig {
 impl Default for TrendConfig {
     fn default() -> Self {
         Self {
-            short_window_ms: 500,       // 500ms (matches existing)
-            medium_window_ms: 30_000,   // 30 seconds
-            long_window_ms: 300_000,    // 5 minutes
+            short_window_ms: 500,           // 500ms (matches existing)
+            medium_window_ms: 30_000,       // 30 seconds
+            long_window_ms: 300_000,        // 5 minutes
             underwater_threshold_bps: 20.0, // 20 bps loss = underwater
-            agreement_boost: 2.0,       // 2x urgency when timeframes agree
-            underwater_min_ticks: 5,    // 5 ticks = ~500ms sustained
+            agreement_boost: 2.0,           // 2x urgency when timeframes agree
+            underwater_min_ticks: 5,        // 5 ticks = ~500ms sustained
         }
     }
 }
@@ -165,14 +165,13 @@ impl TrendPersistenceTracker {
         short_momentum_bps: f64,
         position_value: f64,
     ) -> TrendSignal {
-        let medium_momentum_bps = self.momentum_bps(&self.medium_returns, now_ms, self.config.medium_window_ms);
-        let long_momentum_bps = self.momentum_bps(&self.long_returns, now_ms, self.config.long_window_ms);
+        let medium_momentum_bps =
+            self.momentum_bps(&self.medium_returns, now_ms, self.config.medium_window_ms);
+        let long_momentum_bps =
+            self.momentum_bps(&self.long_returns, now_ms, self.config.long_window_ms);
 
-        let timeframe_agreement = self.calculate_agreement(
-            short_momentum_bps,
-            medium_momentum_bps,
-            long_momentum_bps,
-        );
+        let timeframe_agreement =
+            self.calculate_agreement(short_momentum_bps, medium_momentum_bps, long_momentum_bps);
 
         let underwater_severity = self.calculate_underwater_severity(position_value);
 
@@ -197,12 +196,7 @@ impl TrendPersistenceTracker {
     }
 
     /// Calculate momentum in bps from a returns window.
-    fn momentum_bps(
-        &self,
-        returns: &VecDeque<(u64, f64)>,
-        now_ms: u64,
-        window_ms: u64,
-    ) -> f64 {
+    fn momentum_bps(&self, returns: &VecDeque<(u64, f64)>, now_ms: u64, window_ms: u64) -> f64 {
         let cutoff = now_ms.saturating_sub(window_ms);
         let sum: f64 = returns
             .iter()
@@ -213,12 +207,7 @@ impl TrendPersistenceTracker {
     }
 
     /// Calculate timeframe agreement (0.0 to 1.0).
-    fn calculate_agreement(
-        &self,
-        short_bps: f64,
-        medium_bps: f64,
-        long_bps: f64,
-    ) -> f64 {
+    fn calculate_agreement(&self, short_bps: f64, medium_bps: f64, long_bps: f64) -> f64 {
         // Treat near-zero as neutral (no opinion)
         const THRESHOLD: f64 = 1.0; // 1 bps minimum to count
 
@@ -283,11 +272,7 @@ impl TrendPersistenceTracker {
         let depth_bps = (depth / position_value) * 10_000.0;
 
         // Severity scales from 0 at threshold to 1 at 5x threshold
-        let severity = (depth_bps / self.config.underwater_threshold_bps - 1.0)
-            .max(0.0)
-            .min(1.0);
-
-        severity
+        (depth_bps / self.config.underwater_threshold_bps - 1.0).clamp(0.0, 1.0)
     }
 
     /// Calculate overall trend confidence.
@@ -420,7 +405,11 @@ mod tests {
         // Short positive, medium/long negative
         let agreement = tracker.calculate_agreement(10.0, -20.0, -30.0);
         // 2/3 agree (medium-long), 1/3 disagree (short-medium, short-long)
-        assert!(agreement < 0.5, "Mixed signs should have low agreement: {}", agreement);
+        assert!(
+            agreement < 0.5,
+            "Mixed signs should have low agreement: {}",
+            agreement
+        );
     }
 
     #[test]

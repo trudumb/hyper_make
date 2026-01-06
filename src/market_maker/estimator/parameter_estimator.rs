@@ -724,6 +724,7 @@ impl ParameterEstimator {
     ///
     /// Returns ((own_kappa, own_weight), (book_kappa, book_weight),
     ///          (robust_kappa, robust_weight), (prior_kappa, prior_weight), is_warmup)
+    #[allow(clippy::type_complexity)]
     pub fn kappa_robust_breakdown(&self) -> ((f64, f64), (f64, f64), (f64, f64), (f64, f64), bool) {
         self.kappa_orchestrator.component_breakdown()
     }
@@ -1025,11 +1026,8 @@ impl ParameterEstimator {
     ///
     /// Use this to override short-term momentum when sustained trends are detected.
     pub fn trend_signal(&self, position_value: f64) -> TrendSignal {
-        self.trend_tracker.evaluate(
-            self.current_time_ms,
-            self.momentum_bps(),
-            position_value,
-        )
+        self.trend_tracker
+            .evaluate(self.current_time_ms, self.momentum_bps(), position_value)
     }
 
     /// Update unrealized P&L for underwater tracking.

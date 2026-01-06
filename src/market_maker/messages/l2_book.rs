@@ -10,7 +10,9 @@ use super::context::MessageContext;
 use super::processors::L2BookProcessingResult;
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::events::{L2Level, ParsedL2Book};
-use crate::market_maker::infra::{AnomalyType, DataQualityMonitor, PrometheusMetrics};
+use crate::market_maker::infra::{
+    AnomalyType, ConnectionSupervisor, DataQualityMonitor, PrometheusMetrics,
+};
 use crate::market_maker::process_models::SpreadProcessEstimator;
 use crate::market_maker::tracking::QueuePositionTracker;
 use crate::types::OrderBookLevel;
@@ -27,6 +29,8 @@ pub struct L2BookState<'a> {
     pub data_quality: &'a mut DataQualityMonitor,
     /// Prometheus metrics
     pub prometheus: &'a mut PrometheusMetrics,
+    /// Connection supervisor for health tracking
+    pub connection_supervisor: &'a ConnectionSupervisor,
 }
 
 /// Process an L2Book message.
@@ -92,6 +96,12 @@ pub fn process_l2_book(
             .update(best_bid, best_ask, state.estimator.sigma_clean());
     }
 
+    // Record market data freshness for valid book updates
+    // This is critical for WebSocket health monitoring and reconnection logic
+    if result.best_bid.is_some() || result.best_ask.is_some() {
+        state.connection_supervisor.record_market_data();
+    }
+
     debug!(
         asset = %ctx.asset,
         best_bid = ?result.best_bid,
@@ -145,6 +155,7 @@ mod tests {
         spread_tracker: &'a mut SpreadProcessEstimator,
         data_quality: &'a mut DataQualityMonitor,
         prometheus: &'a mut PrometheusMetrics,
+        connection_supervisor: &'a ConnectionSupervisor,
     ) -> L2BookState<'a> {
         L2BookState {
             estimator,
@@ -152,6 +163,7 @@ mod tests {
             spread_tracker,
             data_quality,
             prometheus,
+            connection_supervisor,
         }
     }
 
@@ -184,6 +196,7 @@ mod tests {
         let mut spread_tracker = SpreadProcessEstimator::new(SpreadConfig::default());
         let mut data_quality = DataQualityMonitor::new(DataQualityConfig::default());
         let mut prometheus = PrometheusMetrics::new();
+        let connection_supervisor = ConnectionSupervisor::new();
 
         let mut state = make_test_state(
             &mut estimator,
@@ -191,6 +204,7 @@ mod tests {
             &mut spread_tracker,
             &mut data_quality,
             &mut prometheus,
+            &connection_supervisor,
         );
 
         let ctx = MessageContext::new(

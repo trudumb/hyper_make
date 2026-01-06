@@ -378,7 +378,10 @@ impl ExchangeClient {
                 let info = info_client.read().await;
                 if info.has_ws_manager() {
                     debug!("Attempting WS POST for action");
-                    match info.ws_post_action(payload_json.clone(), self.ws_post_timeout).await {
+                    match info
+                        .ws_post_action(payload_json.clone(), self.ws_post_timeout)
+                        .await
+                    {
                         Ok(response) => {
                             debug!("WS POST successful");
                             // Parse the WS response into ExchangeResponseStatus
@@ -389,7 +392,10 @@ impl ExchangeClient {
                                         .map_err(|e| Error::JsonParse(e.to_string()));
                                 }
                                 WsPostResponsePayload::Error { payload } => {
-                                    debug!("WS POST returned error: {}, falling back to REST", payload);
+                                    debug!(
+                                        "WS POST returned error: {}, falling back to REST",
+                                        payload
+                                    );
                                     // Fall through to REST
                                 }
                                 WsPostResponsePayload::Info { .. } => {

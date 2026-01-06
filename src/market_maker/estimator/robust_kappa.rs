@@ -147,7 +147,7 @@ impl RobustKappaEstimator {
         self.update_kappa();
 
         // Log periodically
-        if self.observation_count % 50 == 0 {
+        if self.observation_count.is_multiple_of(50) {
             debug!(
                 kappa = %format!("{:.0}", self.kappa),
                 ess = %format!("{:.1}", self.effective_sample_size),

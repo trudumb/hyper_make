@@ -149,7 +149,7 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     last_active_asset_data_time: Option<std::time::Instant>,
     /// Timestamp of last WebData2 WS message (for user/margin state).
     last_web_data2_time: Option<std::time::Instant>,
-    
+
     /// Local cache of spot balances (coin -> balance).
     /// Initialized via REST, updated via WebSocket ledger updates.
     spot_balance_cache: std::collections::HashMap<String, f64>,
@@ -617,13 +617,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         drop(sender); // Explicitly drop the sender since we're done with subscriptions
 
         // Phase 3 Init: Populate spot balance cache via REST once
-        match self.info_client.user_token_balances(self.user_address).await {
+        match self
+            .info_client
+            .user_token_balances(self.user_address)
+            .await
+        {
             Ok(balances) => {
                 for balance in balances.balances {
                     let total = balance.total.parse::<f64>().unwrap_or(0.0);
                     self.spot_balance_cache.insert(balance.coin, total);
                 }
-                info!("Initialized spot balance cache with {} assets", self.spot_balance_cache.len());
+                info!(
+                    "Initialized spot balance cache with {} assets",
+                    self.spot_balance_cache.len()
+                );
             }
             Err(e) => {
                 error!("Failed to fetch initial spot balances: {}. Spot margin tracking may be incorrect until next update.", e);
@@ -827,22 +834,41 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // Check if supervisor recommends reconnection and act on it
                     if self.infra.connection_supervisor.is_reconnect_recommended() {
+                        let attempt = self.infra.connection_health.current_attempt() + 1;
                         warn!(
                             time_since_market_data_secs = supervisor_stats.time_since_market_data.as_secs_f64(),
                             connection_state = %supervisor_stats.connection_state,
+                            reconnection_attempt = attempt,
                             "Connection supervisor recommends reconnection - initiating"
                         );
-                        
-                        // Mark that we're starting reconnection
+
+                        // Mark that we're starting reconnection (increments attempt counter)
                         self.infra.connection_supervisor.record_reconnection_start();
-                        
+
                         // Force reconnect the WebSocket
                         if let Err(e) = self.info_client.reconnect().await {
-                            warn!("Failed to initiate reconnection: {e}");
+                            warn!(
+                                error = %e,
+                                attempt = attempt,
+                                "Failed to initiate WebSocket reconnection"
+                            );
+                            // Track the failure - this will eventually set connection_failed=true
+                            // after max_consecutive_failures is reached
+                            if !self.infra.connection_supervisor.record_reconnection_failed() {
+                                error!(
+                                    "Reconnection permanently failed after max retries - kill switch will trigger"
+                                );
+                            }
                         } else {
-                            info!("WebSocket reconnection initiated successfully");
+                            info!(
+                                attempt = attempt,
+                                "WebSocket reconnection initiated - waiting for data to resume"
+                            );
+                            // Note: We do NOT call reconnection_success() here because the
+                            // reconnect is async. Success is detected when record_market_data()
+                            // is called and sees we were in Reconnecting state.
                         }
-                        
+
                         // Clear the recommendation (the supervisor will set it again if still stale)
                         self.infra.connection_supervisor.clear_reconnect_recommendation();
                     }
@@ -962,6 +988,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             hawkes: &mut self.tier2.hawkes,
             data_quality: &mut self.infra.data_quality,
             prometheus: &mut self.infra.prometheus,
+            connection_supervisor: &self.infra.connection_supervisor,
             last_warmup_log: &mut self.last_warmup_log,
         };
 
@@ -1175,6 +1202,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             spread_tracker: &mut self.tier2.spread_tracker,
             data_quality: &mut self.infra.data_quality,
             prometheus: &mut self.infra.prometheus,
+            connection_supervisor: &self.infra.connection_supervisor,
         };
 
         let result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
@@ -1366,7 +1394,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     order.sz.parse().unwrap_or(0.0),
                 );
                 self.ws_state.add_order(tracked);
-                debug!(oid = order.oid, "Added order from OpenOrders snapshot to ws_state");
+                debug!(
+                    oid = order.oid,
+                    "Added order from OpenOrders snapshot to ws_state"
+                );
             }
         }
 
@@ -1408,28 +1439,42 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Handle WebData2 message - real-time margin and position updates.
     ///
     /// This replaces the periodic REST polling in `refresh_margin_state` and `sync_position_from_exchange`.
-    fn handle_web_data2(
-        &mut self,
-        web_data2: crate::ws::message_types::WebData2,
-    ) -> Result<()> {
+    fn handle_web_data2(&mut self, web_data2: crate::ws::message_types::WebData2) -> Result<()> {
         // Note: web_data2.data does not contain 'user', so we assume it matches our subscription.
 
         let state = &web_data2.data.clearinghouse_state;
 
         // 1. Parse margin summary
-        let account_value = state.margin_summary.account_value.parse::<f64>().unwrap_or(0.0);
-        let margin_used = state.margin_summary.total_margin_used.parse::<f64>().unwrap_or(0.0);
-        let total_notional = state.margin_summary.total_ntl_pos.parse::<f64>().unwrap_or(0.0);
-        
+        let account_value = state
+            .margin_summary
+            .account_value
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let margin_used = state
+            .margin_summary
+            .total_margin_used
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let total_notional = state
+            .margin_summary
+            .total_ntl_pos
+            .parse::<f64>()
+            .unwrap_or(0.0);
+
         // 2. Find position and liquidation price for our asset
         let (exchange_position, liquidation_price) = state
             .asset_positions
             .iter()
             .find(|p| p.position.coin == *self.config.asset)
-            .map(|p| (
-                p.position.szi.parse::<f64>().unwrap_or(0.0),
-                p.position.liquidation_px.as_ref().and_then(|px| px.parse::<f64>().ok())
-            ))
+            .map(|p| {
+                (
+                    p.position.szi.parse::<f64>().unwrap_or(0.0),
+                    p.position
+                        .liquidation_px
+                        .as_ref()
+                        .and_then(|px| px.parse::<f64>().ok()),
+                )
+            })
             .unwrap_or((0.0, None));
 
         // Update staleness timestamp
@@ -1438,7 +1483,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // 3. Update local position tracking if relevant
         let local_position = self.position.position();
         let drift = (exchange_position - local_position).abs();
-        
+
         if drift > crate::EPSILON {
             self.position.set_position(exchange_position);
             debug!(
@@ -1481,7 +1526,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     ) -> Result<()> {
         let data = update.data;
         if data.user != self.user_address {
-             return Ok(());
+            return Ok(());
         }
 
         use crate::types::LedgerUpdate;
@@ -1490,26 +1535,42 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             match item.delta {
                 LedgerUpdate::Deposit(d) => {
                     let amount = d.usdc.parse::<f64>().unwrap_or(0.0);
-                    let entry = self.spot_balance_cache.entry("USDC".to_string()).or_insert(0.0);
+                    let entry = self
+                        .spot_balance_cache
+                        .entry("USDC".to_string())
+                        .or_insert(0.0);
                     *entry += amount;
-                    debug!(coin = "USDC", amount = amount, total = *entry, "Deposit processed");
+                    debug!(
+                        coin = "USDC",
+                        amount = amount,
+                        total = *entry,
+                        "Deposit processed"
+                    );
                 }
                 LedgerUpdate::Withdraw(w) => {
                     let amount = w.usdc.parse::<f64>().unwrap_or(0.0);
-                    let entry = self.spot_balance_cache.entry("USDC".to_string()).or_insert(0.0);
+                    let entry = self
+                        .spot_balance_cache
+                        .entry("USDC".to_string())
+                        .or_insert(0.0);
                     *entry -= amount;
-                    debug!(coin = "USDC", amount = amount, total = *entry, "Withdraw processed");
+                    debug!(
+                        coin = "USDC",
+                        amount = amount,
+                        total = *entry,
+                        "Withdraw processed"
+                    );
                 }
                 LedgerUpdate::SpotTransfer(t) => {
-                    let token = t.token.clone(); 
+                    let token = t.token.clone();
                     let amount = t.amount.parse::<f64>().unwrap_or(0.0);
-                    
+
                     if t.destination == self.user_address {
-                         let entry = self.spot_balance_cache.entry(token.clone()).or_insert(0.0);
-                         *entry += amount;
+                        let entry = self.spot_balance_cache.entry(token.clone()).or_insert(0.0);
+                        *entry += amount;
                     } else {
-                         let entry = self.spot_balance_cache.entry(token.clone()).or_insert(0.0);
-                         *entry -= amount;
+                        let entry = self.spot_balance_cache.entry(token.clone()).or_insert(0.0);
+                        *entry -= amount;
                     }
                     debug!(coin = token, amount = amount, "SpotTransfer processed");
                 }
@@ -1604,7 +1665,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let exchange_limits = &self.infra.exchange_limits;
         // Get pending exposure from resting orders (prevents position breach from multiple fills)
         let (pending_bid_exposure, pending_ask_exposure) = self.orders.pending_exposure();
-        
+
         // DEBUG: Log open order details for diagnosing skew issues
         let (bid_count, ask_count) = self.orders.order_counts();
         debug!(
@@ -1692,7 +1753,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Log momentum diagnostics for drift-adjusted skew debugging
         // Enhanced: Now includes multi-timeframe trend data
         // Log at INFO when: (a) position opposes trend, (b) significant momentum, or (c) high trend confidence
-        if drift_adjusted_skew.is_opposed || momentum_bps.abs() > 10.0 || trend_signal.trend_confidence > 0.3 {
+        if drift_adjusted_skew.is_opposed
+            || momentum_bps.abs() > 10.0
+            || trend_signal.trend_confidence > 0.3
+        {
             let ewma_warmed = self.stochastic.hjb_controller.is_drift_warmed_up();
             let smoothed_drift = self.stochastic.hjb_controller.smoothed_drift();
             info!(
@@ -2724,10 +2788,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Place all target orders as new
             let mut order_specs = Vec::new();
             for level in &bid_levels {
-                order_specs.push(OrderSpec::new(level.price, level.size, true)); // is_buy=true
+                order_specs.push(OrderSpec::new(level.price, level.size, true));
+                // is_buy=true
             }
             for level in &ask_levels {
-                order_specs.push(OrderSpec::new(level.price, level.size, false)); // is_buy=false
+                order_specs.push(OrderSpec::new(level.price, level.size, false));
+                // is_buy=false
             }
 
             if !order_specs.is_empty() {
@@ -3845,8 +3911,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // IMPORTANT: Fetch from exchange API (not local tracking) to catch orphans
         let exchange_oids: Vec<u64> = if let Some(dex) = &self.config.dex {
             // HIP-3 DEX: use dex-specific API
-            match self.info_client.open_orders_for_dex(self.user_address, Some(dex.as_str())).await {
-                Ok(orders) => orders.iter().filter(|o| o.coin == *self.config.asset).map(|o| o.oid).collect(),
+            match self
+                .info_client
+                .open_orders_for_dex(self.user_address, Some(dex.as_str()))
+                .await
+            {
+                Ok(orders) => orders
+                    .iter()
+                    .filter(|o| o.coin == *self.config.asset)
+                    .map(|o| o.oid)
+                    .collect(),
                 Err(e) => {
                     warn!(error = %e, "Failed to fetch orders from exchange at shutdown, using local tracking");
                     self.orders.order_ids()
@@ -3855,17 +3929,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         } else {
             // Validator perps: use standard API
             match self.info_client.open_orders(self.user_address).await {
-                Ok(orders) => orders.iter().filter(|o| o.coin == *self.config.asset).map(|o| o.oid).collect(),
+                Ok(orders) => orders
+                    .iter()
+                    .filter(|o| o.coin == *self.config.asset)
+                    .map(|o| o.oid)
+                    .collect(),
                 Err(e) => {
                     warn!(error = %e, "Failed to fetch orders from exchange at shutdown, using local tracking");
                     self.orders.order_ids()
                 }
             }
         };
-        
+
         let local_oids: Vec<u64> = self.orders.order_ids();
         let total_orders = exchange_oids.len();
-        
+
         if exchange_oids.len() != local_oids.len() {
             warn!(
                 exchange = exchange_oids.len(),
@@ -3878,7 +3956,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if total_orders == 0 {
             info!("No resting orders to cancel");
         } else {
-            info!("Bulk cancelling {} resting orders (from exchange)...", total_orders);
+            info!(
+                "Bulk cancelling {} resting orders (from exchange)...",
+                total_orders
+            );
             self.initiate_bulk_cancel(exchange_oids).await;
             info!(cancelled = total_orders, "Bulk cancel completed");
         }
@@ -3931,7 +4012,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // PHASE 2 FIX: Use WebSocket snapshot instead of REST API to eliminate race condition.
         // The WS snapshot is pushed by the exchange and received via the same WebSocket stream
         // as fills, ensuring consistency between order state and fill events.
-        let exchange_oids: HashSet<u64> = if let Some(ref ws_snapshot) = self.last_ws_open_orders_snapshot {
+        let exchange_oids: HashSet<u64> = if let Some(ref ws_snapshot) =
+            self.last_ws_open_orders_snapshot
+        {
             // Use the WS snapshot (authoritative, no race condition)
             let snapshot_age = self
                 .last_ws_snapshot_time
@@ -4051,10 +4134,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             is_in_cancel_window,
             |oid| {
                 // Keep order if it's less than 5 seconds old (grace period for sync)
-                self.orders.get_order(oid)
+                self.orders
+                    .get_order(oid)
                     .map(|o| o.placed_at.elapsed() < std::time::Duration::from_secs(5))
                     .unwrap_or(false)
-            }
+            },
         );
         for oid in stale_local {
             safety::SafetyAuditor::log_stale_removal(oid);
@@ -4157,12 +4241,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // If we are on standard perps (not HIP-3 DEX) and have fresh WebData2,
         // we can skip the REST call entirely because handle_web_data2 updates the state.
         if self.config.dex.is_none() {
-             if let Some(last_ws_time) = self.last_web_data2_time {
+            if let Some(last_ws_time) = self.last_web_data2_time {
                 if last_ws_time.elapsed() < std::time::Duration::from_secs(10) {
                     debug!("[MarginSync] Skipping REST - WebData2 is fresh");
                     return Ok(());
                 }
-             }
+            }
         }
 
         // For HIP-3 DEXs, collateral is in spot balance (USDE, USDH, etc.)

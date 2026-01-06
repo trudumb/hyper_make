@@ -139,8 +139,6 @@ pub struct NotificationData {
     pub notification: String,
 }
 
-
-
 /// Clearinghouse state from WebData2.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]

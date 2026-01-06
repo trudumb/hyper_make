@@ -566,7 +566,8 @@ impl LadderStrategy {
             // - inventory_ratio < 0 (short): bid_weight increases, ask_weight decreases
             // - Range: 0.3 to 0.7 (never fully one-sided to maintain two-sided quoting)
             const MARGIN_SPLIT_SENSITIVITY: f64 = 0.2; // How much inventory affects split
-            let ask_margin_weight = (0.5 + inventory_ratio * MARGIN_SPLIT_SENSITIVITY).clamp(0.3, 0.7);
+            let ask_margin_weight =
+                (0.5 + inventory_ratio * MARGIN_SPLIT_SENSITIVITY).clamp(0.3, 0.7);
             let bid_margin_weight = 1.0 - ask_margin_weight;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;

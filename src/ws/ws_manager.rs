@@ -321,6 +321,7 @@ fn normalize_identifier(identifier: &str) -> Result<String> {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "channel")]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     NoData,
     HyperliquidError(String),
@@ -689,23 +690,23 @@ impl WsManager {
     ) -> Result<WsPostResponseData> {
         // Generate unique request ID
         let request_id = self.next_post_id.fetch_add(1, Ordering::SeqCst);
-        
+
         // Create the request
         let request = if is_action {
             WsPostRequest::action(request_id, payload)
         } else {
             WsPostRequest::info(request_id, payload)
         };
-        
+
         // Create channel for response
         let (tx, rx) = oneshot::channel();
-        
+
         // Register pending request
         {
             let mut pending = self.pending_posts.lock().await;
             pending.insert(request_id, tx);
         }
-        
+
         // Serialize and send
         let message_text = match serde_json::to_string(&request) {
             Ok(s) => s,
@@ -716,9 +717,12 @@ impl WsManager {
                 return Err(Error::JsonParse(e.to_string()));
             }
         };
-        
-        debug!("Sending WS post request id={}: {}", request_id, &message_text);
-        
+
+        debug!(
+            "Sending WS post request id={}: {}",
+            request_id, &message_text
+        );
+
         {
             let mut writer = self.writer.lock().await;
             if let Err(e) = writer.send(protocol::Message::Text(message_text)).await {
@@ -728,7 +732,7 @@ impl WsManager {
                 return Err(Error::WsSend(e.to_string()));
             }
         }
-        
+
         // Wait for response with timeout
         match time::timeout(timeout, rx).await {
             Ok(Ok(response)) => Ok(response),
@@ -740,7 +744,10 @@ impl WsManager {
                 // Timeout - remove pending request
                 let mut pending = self.pending_posts.lock().await;
                 pending.remove(&request_id);
-                Err(Error::WsSend(format!("WS post request {} timed out after {:?}", request_id, timeout)))
+                Err(Error::WsSend(format!(
+                    "WS post request {} timed out after {:?}",
+                    request_id, timeout
+                )))
             }
         }
     }
@@ -842,6 +849,7 @@ impl WsManager {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     async fn parse_and_send_data(
         data: std::result::Result<protocol::Message, tungstenite::Error>,
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
@@ -869,10 +877,7 @@ impl WsManager {
                                     // Send response to waiting receiver
                                     let _ = sender.send(post_response.data);
                                 } else {
-                                    warn!(
-                                        "WS post response for unknown request ID={}",
-                                        request_id
-                                    );
+                                    warn!("WS post response for unknown request ID={}", request_id);
                                 }
                                 return Ok(());
                             }

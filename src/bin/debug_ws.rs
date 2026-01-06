@@ -9,8 +9,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Load private key from env (standard for this project)
-    let private_key = env::var("HYPERLIQUID_PRIVATE_KEY").expect("HYPERLIQUID_PRIVATE_KEY must be set");
-    let wallet: alloy::signers::local::PrivateKeySigner = private_key.parse().expect("Invalid private key");
+    let private_key =
+        env::var("HYPERLIQUID_PRIVATE_KEY").expect("HYPERLIQUID_PRIVATE_KEY must be set");
+    let wallet: alloy::signers::local::PrivateKeySigner =
+        private_key.parse().expect("Invalid private key");
     let user_address = wallet.address();
 
     log::info!("Starting WS Debugger for user: {}", user_address);
@@ -46,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Log everything that looks like data
             if !text.contains("\"channel\":\"pong\"") {
                 log::info!("RECEIVED: {}", text);
-                
+
                 // If we get a valid WebData2 message, break after a few
                 if text.contains("webData2") {
                     log::info!("Got WebData2! Analyze the JSON above.");
