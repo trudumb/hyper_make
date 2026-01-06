@@ -205,6 +205,18 @@ pub struct LadderParams {
     /// If Some, uses first-principles exponential decay: AS(δ) = AS₀ × exp(-δ/δ_char)
     /// If None, falls back to legacy config-based decay
     pub depth_decay_as: Option<DepthDecayAS>,
+
+    // === Drift-Adjusted Skew (First Principles Extension) ===
+    /// Whether to apply drift-adjusted skew when position opposes momentum
+    pub use_drift_adjusted_skew: bool,
+    /// HJB-derived drift urgency (fractional, e.g., 0.001579 = 15.79 bps)
+    pub hjb_drift_urgency: f64,
+    /// Whether current position opposes market momentum direction
+    pub position_opposes_momentum: bool,
+    /// Variance multiplier from directional risk (>1 when opposing trend)
+    pub directional_variance_mult: f64,
+    /// Combined urgency score (0-5 scale)
+    pub urgency_score: f64,
 }
 
 #[cfg(test)]
@@ -248,6 +260,12 @@ mod tests {
             sz_decimals: 4,
             min_notional: 10.0,
             depth_decay_as: None, // Use legacy AS config
+            // Drift-adjusted skew disabled for this test
+            use_drift_adjusted_skew: false,
+            hjb_drift_urgency: 0.0,
+            position_opposes_momentum: false,
+            directional_variance_mult: 1.0,
+            urgency_score: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -286,6 +304,12 @@ mod tests {
             sz_decimals: 4,
             min_notional: 10.0,
             depth_decay_as: None,
+            // Drift-adjusted skew disabled for this test
+            use_drift_adjusted_skew: false,
+            hjb_drift_urgency: 0.0,
+            position_opposes_momentum: false,
+            directional_variance_mult: 1.0,
+            urgency_score: 0.0,
         };
 
         let params_long = LadderParams {
@@ -335,6 +359,12 @@ mod tests {
             sz_decimals: 4,
             min_notional: 10.0,
             depth_decay_as: Some(depth_decay),
+            // Drift-adjusted skew disabled for this test
+            use_drift_adjusted_skew: false,
+            hjb_drift_urgency: 0.0,
+            position_opposes_momentum: false,
+            directional_variance_mult: 1.0,
+            urgency_score: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -351,5 +381,84 @@ mod tests {
         let total_ask = ladder.total_ask_size();
         assert!(total_bid > 0.0);
         assert!(total_ask > 0.0);
+    }
+
+    #[test]
+    fn test_ladder_with_drift_adjusted_skew() {
+        let config = LadderConfig::default();
+
+        // Base params with LONG position opposing bearish momentum
+        let params_with_drift = LadderParams {
+            mid_price: 100.0,
+            sigma: 0.001,
+            kappa: 100.0,
+            arrival_intensity: 1.0,
+            as_at_touch_bps: 1.0,
+            total_size: 1.0,
+            inventory_ratio: 0.3, // LONG position
+            gamma: 0.5,
+            time_horizon: 10.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional: 10.0,
+            depth_decay_as: None,
+            // Drift-adjusted skew ENABLED - position opposes momentum
+            use_drift_adjusted_skew: true,
+            hjb_drift_urgency: 0.001579, // 15.79 bps as fractional
+            position_opposes_momentum: true,
+            directional_variance_mult: 1.5,
+            urgency_score: 2.0, // Above 0.5 threshold
+        };
+
+        // Same params but WITHOUT drift adjustment
+        let params_no_drift = LadderParams {
+            use_drift_adjusted_skew: false,
+            position_opposes_momentum: false,
+            urgency_score: 0.0,
+            ..params_with_drift.clone()
+        };
+
+        let ladder_drift = Ladder::generate(&config, &params_with_drift);
+        let ladder_no_drift = Ladder::generate(&config, &params_no_drift);
+
+        // With drift adjustment, quotes should be shifted MORE (extra skew)
+        // When LONG + bearish: lower both bid and ask to encourage selling
+        let best_bid_drift = ladder_drift.best_bid().unwrap();
+        let best_ask_drift = ladder_drift.best_ask().unwrap();
+        let best_bid_no_drift = ladder_no_drift.best_bid().unwrap();
+        let best_ask_no_drift = ladder_no_drift.best_ask().unwrap();
+
+        // With additional drift skew, both prices should be LOWER
+        // (extra offset in the direction to reduce long position)
+        assert!(
+            best_bid_drift < best_bid_no_drift,
+            "Drift skew should lower bid: {:.4} should be < {:.4}",
+            best_bid_drift,
+            best_bid_no_drift
+        );
+        assert!(
+            best_ask_drift < best_ask_no_drift,
+            "Drift skew should lower ask: {:.4} should be < {:.4}",
+            best_ask_drift,
+            best_ask_no_drift
+        );
+
+        // The shift should be approximately hjb_drift_urgency × mid = 0.001579 × 100 ≈ 0.16
+        let bid_shift = best_bid_no_drift - best_bid_drift;
+        let ask_shift = best_ask_no_drift - best_ask_drift;
+        let expected_shift = 0.001579 * 100.0; // ~0.16
+
+        assert!(
+            (bid_shift - expected_shift).abs() < 0.05,
+            "Bid shift {:.4} should be ~{:.4}",
+            bid_shift,
+            expected_shift
+        );
+        assert!(
+            (ask_shift - expected_shift).abs() < 0.05,
+            "Ask shift {:.4} should be ~{:.4}",
+            ask_shift,
+            expected_shift
+        );
     }
 }

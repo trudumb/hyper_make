@@ -418,6 +418,12 @@ impl LadderStrategy {
             sz_decimals: config.sz_decimals,
             min_notional: config.min_notional,
             depth_decay_as: market_params.depth_decay_as.clone(),
+            // Drift-adjusted skew from MarketParams (first-principles momentum opposition)
+            use_drift_adjusted_skew: market_params.use_drift_adjusted_skew,
+            hjb_drift_urgency: market_params.hjb_drift_urgency,
+            position_opposes_momentum: market_params.position_opposes_momentum,
+            directional_variance_mult: market_params.directional_variance_mult,
+            urgency_score: market_params.urgency_score,
         };
 
         // === SPREAD FLOOR: Adaptive vs Static ===

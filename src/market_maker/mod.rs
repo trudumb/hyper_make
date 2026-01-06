@@ -548,8 +548,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.stochastic.hjb_controller.start_session();
         debug!("HJB inventory controller session started");
 
-        // Safety sync interval (60 seconds) - fallback to catch any state divergence
-        let mut sync_interval = tokio::time::interval(Duration::from_secs(60));
+        // Safety sync interval (15 seconds) - catch orphan orders and state divergence more quickly
+        // Reduced from 60s to help catch orders that get out of sync with local tracking
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(15));
         // Skip the immediate first tick
         sync_interval.tick().await;
 
@@ -2326,6 +2327,113 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let current_bids: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Buy);
         let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
 
+        // DIAGNOSTIC: Log order counts to help debug reconciliation issues
+        // If local counts are 0 but we expect orders on exchange, there's a tracking issue
+        info!(
+            local_bids = current_bids.len(),
+            local_asks = current_asks.len(),
+            target_bid_levels = bid_levels.len(),
+            target_ask_levels = ask_levels.len(),
+            "[Reconcile] Order counts"
+        );
+
+        // === DRIFT DETECTION: Force full reconciliation on large price drift ===
+        // If existing orders are too far from targets, cancel all and place new
+        // This catches cases where orders become "orphaned" from reconciliation
+        const MAX_ACCEPTABLE_DRIFT_BPS: f64 = 100.0;
+
+        let bid_drift = if !current_bids.is_empty() && !bid_levels.is_empty() {
+            // Calculate max drift between current bids and target bid levels
+            current_bids
+                .iter()
+                .filter_map(|order| {
+                    bid_levels
+                        .iter()
+                        .map(|level| crate::bps_diff(order.price, level.price) as f64)
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                })
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let ask_drift = if !current_asks.is_empty() && !ask_levels.is_empty() {
+            // Calculate max drift between current asks and target ask levels
+            current_asks
+                .iter()
+                .filter_map(|order| {
+                    ask_levels
+                        .iter()
+                        .map(|level| crate::bps_diff(order.price, level.price) as f64)
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                })
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let max_drift = bid_drift.max(ask_drift);
+        if max_drift > MAX_ACCEPTABLE_DRIFT_BPS {
+            warn!(
+                bid_drift_bps = %format!("{:.1}", bid_drift),
+                ask_drift_bps = %format!("{:.1}", ask_drift),
+                threshold_bps = MAX_ACCEPTABLE_DRIFT_BPS,
+                "[Reconcile] Large price drift detected! Forcing full cancel + replace"
+            );
+
+            // Cancel all current orders
+            let all_oids: Vec<u64> = current_bids
+                .iter()
+                .chain(current_asks.iter())
+                .map(|o| o.oid)
+                .collect();
+
+            if !all_oids.is_empty() {
+                self.initiate_bulk_cancel(all_oids.clone()).await;
+                info!(
+                    cancelled = all_oids.len(),
+                    "[Reconcile] Cancelled all stale orders due to drift"
+                );
+            }
+
+            // Place all target orders as new
+            let mut order_specs = Vec::new();
+            for level in &bid_levels {
+                order_specs.push(OrderSpec::new(level.price, level.size, true)); // is_buy=true
+            }
+            for level in &ask_levels {
+                order_specs.push(OrderSpec::new(level.price, level.size, false)); // is_buy=false
+            }
+
+            if !order_specs.is_empty() {
+                let results = self
+                    .executor
+                    .place_bulk_orders(&self.config.asset, order_specs.clone())
+                    .await;
+
+                // Track the new orders
+                for (spec, result) in order_specs.iter().zip(results.iter()) {
+                    if result.oid != 0 {
+                        let oid = result.oid;
+                        let side = if spec.is_buy { Side::Buy } else { Side::Sell };
+                        let tracked = TrackedOrder::new(oid, side, spec.price, spec.size);
+                        self.orders.add_order(tracked.clone());
+                        self.ws_state.add_order(tracked);
+                    }
+                }
+
+                info!(
+                    placed = order_specs.len(),
+                    "[Reconcile] Placed new orders after drift correction"
+                );
+            }
+
+            // Skip normal reconciliation since we did a full replace
+            return Ok(());
+        }
+
         // Impulse Control: Check execution budget before proceeding
         let impulse_enabled =
             self.infra.impulse_control_enabled && reconcile_config.use_impulse_filter;
@@ -3449,12 +3557,45 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .info_client
             .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
             .await?;
-        let exchange_oids: HashSet<u64> = exchange_orders
+
+        // DIAGNOSTIC: Log exchange orders to debug HIP-3 asset matching
+        let total_exchange_orders = exchange_orders.len();
+        let matching_orders: Vec<_> = exchange_orders
             .iter()
             .filter(|o| o.coin == *self.config.asset)
-            .map(|o| o.oid)
             .collect();
+
+        // Log if there's a mismatch between total and matching (possible HIP-3 asset name issue)
+        if total_exchange_orders > 0 && matching_orders.is_empty() {
+            let sample_coins: Vec<_> = exchange_orders.iter().take(3).map(|o| &o.coin).collect();
+            warn!(
+                total_exchange_orders = total_exchange_orders,
+                our_asset = %self.config.asset,
+                sample_coins = ?sample_coins,
+                "[SafetySync] No matching orders! Possible HIP-3 asset name mismatch"
+            );
+        }
+
+        info!(
+            total_exchange_orders = total_exchange_orders,
+            matching_orders = matching_orders.len(),
+            our_asset = %self.config.asset,
+            "[SafetySync] Exchange order check"
+        );
+
+        let exchange_oids: HashSet<u64> = matching_orders.iter().map(|o| o.oid).collect();
         let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
+
+        // DIAGNOSTIC: Show orphan/stale counts
+        let potential_orphans = exchange_oids.difference(&local_oids).count();
+        let potential_stale = local_oids.difference(&exchange_oids).count();
+        info!(
+            exchange_count = exchange_oids.len(),
+            local_count = local_oids.len(),
+            potential_orphans = potential_orphans,
+            potential_stale = potential_stale,
+            "[SafetySync] Order sync status"
+        );
 
         // Phase 7: Clean up expired entries in orphan tracker
         self.infra.orphan_tracker.cleanup();

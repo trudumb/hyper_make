@@ -95,8 +95,8 @@ impl Ladder {
             params.min_notional,
         );
 
-        // 5. Apply inventory skew (with re-rounding for exchange precision)
-        apply_inventory_skew(
+        // 5. Apply inventory skew with drift adjustment (re-rounds for exchange precision)
+        apply_inventory_skew_with_drift(
             &mut ladder,
             params.inventory_ratio,
             params.gamma,
@@ -105,6 +105,10 @@ impl Ladder {
             params.mid_price,
             params.decimals,
             params.sz_decimals,
+            params.use_drift_adjusted_skew,
+            params.hjb_drift_urgency,
+            params.position_opposes_momentum,
+            params.urgency_score,
         );
 
         ladder
@@ -196,8 +200,8 @@ impl Ladder {
             params.min_notional,
         );
 
-        // 6. Apply inventory skew
-        apply_inventory_skew(
+        // 6. Apply inventory skew with drift adjustment
+        apply_inventory_skew_with_drift(
             &mut ladder,
             params.inventory_ratio,
             params.gamma,
@@ -206,6 +210,10 @@ impl Ladder {
             params.mid_price,
             params.decimals,
             params.sz_decimals,
+            params.use_drift_adjusted_skew,
+            params.hjb_drift_urgency,
+            params.position_opposes_momentum,
+            params.urgency_score,
         );
 
         ladder
@@ -696,8 +704,9 @@ pub(crate) fn build_asymmetric_ladder(
 /// Apply GLFT inventory skew to the ladder.
 ///
 /// 1. Shift all prices by reservation price offset: γσ²qT
-/// 2. Reduce sizes on the side that would increase inventory
-/// 3. Re-round prices and truncate sizes to maintain exchange precision
+/// 2. Add drift urgency when position opposes momentum
+/// 3. Reduce sizes on the side that would increase inventory
+/// 4. Re-round prices and truncate sizes to maintain exchange precision
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_inventory_skew(
     ladder: &mut Ladder,
@@ -709,16 +718,70 @@ pub(crate) fn apply_inventory_skew(
     decimals: u32,
     sz_decimals: u32,
 ) {
-    if inventory_ratio.abs() < EPSILON {
-        return; // No inventory, no skew needed
-    }
+    // Call extended version with no drift adjustment (backward compatible)
+    apply_inventory_skew_with_drift(
+        ladder,
+        inventory_ratio,
+        gamma,
+        sigma,
+        time_horizon,
+        mid,
+        decimals,
+        sz_decimals,
+        false, // use_drift_adjusted_skew
+        0.0,   // hjb_drift_urgency
+        false, // position_opposes_momentum
+        0.0,   // urgency_score
+    );
+}
 
+/// Apply GLFT inventory skew with drift adjustment.
+///
+/// Extended version that includes HJB drift urgency when position opposes momentum.
+/// This creates asymmetric quotes: wider on the side that would worsen position.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_inventory_skew_with_drift(
+    ladder: &mut Ladder,
+    inventory_ratio: f64,
+    gamma: f64,
+    sigma: f64,
+    time_horizon: f64,
+    mid: f64,
+    decimals: u32,
+    sz_decimals: u32,
+    use_drift_adjusted_skew: bool,
+    hjb_drift_urgency: f64,
+    position_opposes_momentum: bool,
+    urgency_score: f64,
+) {
+    // === BASE INVENTORY SKEW (GLFT) ===
     // Reservation price offset: γσ²qT (as fraction of mid)
     // Positive inventory → positive skew → shift prices down
-    let skew_fraction = inventory_ratio * gamma * sigma.powi(2) * time_horizon;
-    let offset = mid * skew_fraction;
+    let base_skew_fraction = inventory_ratio * gamma * sigma.powi(2) * time_horizon;
 
-    // Shift all prices by reservation price offset and RE-ROUND to exchange precision
+    // === DRIFT URGENCY (when position opposes momentum) ===
+    // Add extra skew to accelerate inventory reduction when fighting the trend
+    let drift_skew_fraction = if use_drift_adjusted_skew
+        && position_opposes_momentum
+        && urgency_score > 0.5
+    {
+        // hjb_drift_urgency is already in fractional terms (e.g., 0.001579 = 15.79 bps)
+        hjb_drift_urgency
+    } else {
+        0.0
+    };
+
+    // === COMBINED SKEW ===
+    let total_skew_fraction = base_skew_fraction + drift_skew_fraction;
+
+    // Early return only if there's no inventory AND no drift adjustment
+    if inventory_ratio.abs() < EPSILON && drift_skew_fraction.abs() < EPSILON {
+        return;
+    }
+
+    let offset = mid * total_skew_fraction;
+
+    // Shift all prices by combined offset and RE-ROUND to exchange precision
     for level in &mut ladder.bids {
         level.price = round_to_significant_and_decimal(level.price - offset, 5, decimals);
     }
@@ -728,17 +791,21 @@ pub(crate) fn apply_inventory_skew(
 
     // Size skew: reduce side that increases position
     // Cap reduction at 90% to never completely remove quotes
-    let size_reduction = inventory_ratio.abs().min(0.9);
+    if inventory_ratio.abs() >= EPSILON {
+        let size_reduction = inventory_ratio.abs().min(0.9);
 
-    if inventory_ratio > 0.0 {
-        // Long inventory: reduce bid sizes (don't want to buy more)
-        for level in &mut ladder.bids {
-            level.size = truncate_float(level.size * (1.0 - size_reduction), sz_decimals, false);
-        }
-    } else {
-        // Short inventory: reduce ask sizes (don't want to sell more)
-        for level in &mut ladder.asks {
-            level.size = truncate_float(level.size * (1.0 - size_reduction), sz_decimals, false);
+        if inventory_ratio > 0.0 {
+            // Long inventory: reduce bid sizes (don't want to buy more)
+            for level in &mut ladder.bids {
+                level.size =
+                    truncate_float(level.size * (1.0 - size_reduction), sz_decimals, false);
+            }
+        } else {
+            // Short inventory: reduce ask sizes (don't want to sell more)
+            for level in &mut ladder.asks {
+                level.size =
+                    truncate_float(level.size * (1.0 - size_reduction), sz_decimals, false);
+            }
         }
     }
 }
