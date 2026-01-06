@@ -1026,11 +1026,8 @@ impl ParameterEstimator {
     ///
     /// Use this to override short-term momentum when sustained trends are detected.
     pub fn trend_signal(&self, position_value: f64) -> TrendSignal {
-        self.trend_tracker.evaluate(
-            self.current_time_ms,
-            self.momentum_bps(),
-            position_value,
-        )
+        self.trend_tracker
+            .evaluate(self.current_time_ms, self.momentum_bps(), position_value)
     }
 
     /// Update unrealized P&L for underwater tracking.

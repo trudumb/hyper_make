@@ -414,10 +414,7 @@ impl CollateralInfo {
 
     /// Get available balance from a HashMap cache (Phase 3).
     /// Assumes map contains total balance and hold is negligible or not tracked in map.
-    pub fn available_balance_from_spot_map(
-        &self,
-        balances: &HashMap<String, f64>,
-    ) -> Option<f64> {
+    pub fn available_balance_from_spot_map(&self, balances: &HashMap<String, f64>) -> Option<f64> {
         balances.get(&self.symbol).copied()
     }
 

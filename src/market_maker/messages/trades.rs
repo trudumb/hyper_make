@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use super::context::MessageContext;
 use super::processors::TradeProcessingResult;
 use crate::market_maker::estimator::ParameterEstimator;
-use crate::market_maker::infra::{DataQualityMonitor, PrometheusMetrics};
+use crate::market_maker::infra::{ConnectionSupervisor, DataQualityMonitor, PrometheusMetrics};
 use crate::market_maker::process_models::HawkesOrderFlowEstimator;
 
 /// Mutable references needed by Trades handler.
@@ -22,6 +22,8 @@ pub struct TradesState<'a> {
     pub data_quality: &'a mut DataQualityMonitor,
     /// Prometheus metrics
     pub prometheus: &'a mut PrometheusMetrics,
+    /// Connection supervisor for health tracking
+    pub connection_supervisor: &'a ConnectionSupervisor,
     /// Last logged warmup progress (for throttling)
     pub last_warmup_log: &'a mut usize,
 }
@@ -86,6 +88,12 @@ pub fn process_trades(
         result.trades_processed += 1;
     }
 
+    // Record market data freshness if we processed any trades for our asset
+    // This is critical for WebSocket health monitoring and reconnection logic
+    if result.trades_processed > 0 {
+        state.connection_supervisor.record_market_data();
+    }
+
     // Warmup progress logging
     log_warmup_progress(state.estimator, state.last_warmup_log);
 
@@ -148,6 +156,7 @@ mod tests {
         hawkes: &'a mut HawkesOrderFlowEstimator,
         data_quality: &'a mut DataQualityMonitor,
         prometheus: &'a mut PrometheusMetrics,
+        connection_supervisor: &'a ConnectionSupervisor,
         last_warmup_log: &'a mut usize,
     ) -> TradesState<'a> {
         TradesState {
@@ -155,6 +164,7 @@ mod tests {
             hawkes,
             data_quality,
             prometheus,
+            connection_supervisor,
             last_warmup_log,
         }
     }
@@ -165,6 +175,7 @@ mod tests {
         let mut hawkes = HawkesOrderFlowEstimator::new(HawkesConfig::default());
         let mut data_quality = DataQualityMonitor::new(DataQualityConfig::default());
         let mut prometheus = PrometheusMetrics::new();
+        let connection_supervisor = ConnectionSupervisor::new();
         let mut last_warmup_log = 0;
 
         let mut state = make_test_state(
@@ -172,6 +183,7 @@ mod tests {
             &mut hawkes,
             &mut data_quality,
             &mut prometheus,
+            &connection_supervisor,
             &mut last_warmup_log,
         );
 

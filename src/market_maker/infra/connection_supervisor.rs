@@ -138,7 +138,15 @@ impl ConnectionSupervisor {
     }
 
     /// Record that market data was received (AllMids, Trades, L2Book).
+    ///
+    /// This is the critical function that confirms WebSocket health.
+    /// When data arrives after a reconnection attempt, this automatically
+    /// clears the reconnecting state to prevent kill switch false positives.
     pub fn record_market_data(&self) {
+        // Check if we were reconnecting BEFORE recording data
+        // (state check must happen before record_data_received updates timestamps)
+        let was_reconnecting = self.health_monitor.state() == ConnectionState::Reconnecting;
+
         let nanos = self.inner.start_time.elapsed().as_nanos() as u64;
         self.inner
             .last_market_data_nanos
@@ -152,6 +160,13 @@ impl ConnectionSupervisor {
         self.inner
             .reconnect_recommended
             .store(false, Ordering::Relaxed);
+
+        // CRITICAL FIX: Auto-clear reconnection state when data resumes
+        // This prevents the attempt counter from accumulating across reconnection
+        // cycles, which would eventually trigger the kill switch erroneously.
+        if was_reconnecting {
+            self.health_monitor.reconnection_success();
+        }
     }
 
     /// Record that a user event was received (UserFills, OrderUpdates).

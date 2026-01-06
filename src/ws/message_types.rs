@@ -120,7 +120,7 @@ pub struct OpenOrderEntry {
 /// Used to send actions (orders, cancels) or info requests over WebSocket.
 #[derive(Serialize, Clone, Debug)]
 pub struct WsPostRequest {
-    pub method: &'static str,  // Always "post"
+    pub method: &'static str, // Always "post"
     pub id: u64,
     pub request: WsPostPayload,
 }
@@ -134,7 +134,7 @@ impl WsPostRequest {
             request: WsPostPayload::Action { payload },
         }
     }
-    
+
     /// Create a new WS post request for an info query.
     pub fn info(id: u64, payload: serde_json::Value) -> Self {
         Self {
@@ -150,19 +150,15 @@ impl WsPostRequest {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsPostPayload {
     /// Signed action (order, cancel, etc.)
-    Action {
-        payload: serde_json::Value,
-    },
+    Action { payload: serde_json::Value },
     /// Info request (l2Book, openOrders, etc.)
-    Info {
-        payload: serde_json::Value,
-    },
+    Info { payload: serde_json::Value },
 }
 
 /// WebSocket post response wrapper.
 #[derive(Deserialize, Clone, Debug)]
 pub struct WsPostResponse {
-    pub channel: String,  // Always "post"
+    pub channel: String, // Always "post"
     pub data: WsPostResponseData,
 }
 
@@ -178,17 +174,11 @@ pub struct WsPostResponseData {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsPostResponsePayload {
     /// Successful action response
-    Action {
-        payload: serde_json::Value,
-    },
+    Action { payload: serde_json::Value },
     /// Successful info response
-    Info {
-        payload: serde_json::Value,
-    },
+    Info { payload: serde_json::Value },
     /// Error response (HTTP status code + description)
-    Error {
-        payload: String,
-    },
+    Error { payload: String },
 }
 
 impl WsPostResponsePayload {
@@ -196,7 +186,7 @@ impl WsPostResponsePayload {
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error { .. })
     }
-    
+
     /// Get error message if this is an error.
     pub fn error_message(&self) -> Option<&str> {
         match self {

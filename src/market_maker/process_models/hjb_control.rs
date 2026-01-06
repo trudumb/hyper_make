@@ -295,8 +295,8 @@ impl HJBInventoryController {
         };
 
         // EWMA smooth variance multiplier
-        self.variance_mult_ewma =
-            self.drift_alpha * variance_multiplier + (1.0 - self.drift_alpha) * self.variance_mult_ewma;
+        self.variance_mult_ewma = self.drift_alpha * variance_multiplier
+            + (1.0 - self.drift_alpha) * self.variance_mult_ewma;
     }
 
     /// Check if drift smoothing is warmed up.
@@ -570,7 +570,10 @@ impl HJBInventoryController {
             };
 
             let variance_multiplier = 1.0
-                + self.config.opposition_sensitivity * momentum_vol_ratio * p_continuation * q.abs();
+                + self.config.opposition_sensitivity
+                    * momentum_vol_ratio
+                    * p_continuation
+                    * q.abs();
             variance_multiplier.min(self.config.max_drift_urgency)
         };
 
@@ -766,7 +769,10 @@ impl HJBInventoryController {
                 0.0
             };
             let variance_multiplier = 1.0
-                + self.config.opposition_sensitivity * momentum_vol_ratio * p_continuation * q.abs();
+                + self.config.opposition_sensitivity
+                    * momentum_vol_ratio
+                    * p_continuation
+                    * q.abs();
             variance_multiplier.min(self.config.max_drift_urgency)
         };
 
@@ -986,7 +992,8 @@ impl MomentumStats {
         let magnitude_score = (self.mean_bps.abs() / 50.0).min(1.0);
 
         // 2. Low direction changes (consistent trend)
-        let consistency = 1.0 - (self.direction_changes as f64 / self.sample_count as f64).min(0.5) * 2.0;
+        let consistency =
+            1.0 - (self.direction_changes as f64 / self.sample_count as f64).min(0.5) * 2.0;
 
         // 3. High continuation probability
         let continuation_score = self.avg_continuation;
@@ -999,7 +1006,8 @@ impl MomentumStats {
         };
 
         // Combine factors
-        (magnitude_score * 0.2 + consistency * 0.3 + continuation_score * 0.3 + snr * 0.2).clamp(0.0, 1.0)
+        (magnitude_score * 0.2 + consistency * 0.3 + continuation_score * 0.3 + snr * 0.2)
+            .clamp(0.0, 1.0)
     }
 }
 
