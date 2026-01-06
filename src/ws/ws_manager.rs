@@ -321,6 +321,7 @@ fn normalize_identifier(identifier: &str) -> Result<String> {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "channel")]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     NoData,
     HyperliquidError(String),
@@ -842,6 +843,7 @@ impl WsManager {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     async fn parse_and_send_data(
         data: std::result::Result<protocol::Message, tungstenite::Error>,
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,

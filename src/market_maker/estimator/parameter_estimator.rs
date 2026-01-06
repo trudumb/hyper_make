@@ -724,6 +724,7 @@ impl ParameterEstimator {
     ///
     /// Returns ((own_kappa, own_weight), (book_kappa, book_weight),
     ///          (robust_kappa, robust_weight), (prior_kappa, prior_weight), is_warmup)
+    #[allow(clippy::type_complexity)]
     pub fn kappa_robust_breakdown(&self) -> ((f64, f64), (f64, f64), (f64, f64), (f64, f64), bool) {
         self.kappa_orchestrator.component_breakdown()
     }

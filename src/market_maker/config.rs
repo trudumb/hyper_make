@@ -36,6 +36,7 @@ pub enum SpreadProfile {
 
 impl SpreadProfile {
     /// Parse from string (CLI argument).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "hip3" | "hip-3" => Self::Hip3,

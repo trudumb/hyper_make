@@ -147,7 +147,7 @@ impl BookKappaEstimator {
         self.update_count += 1;
 
         // Log periodically
-        if self.update_count % 100 == 0 {
+        if self.update_count.is_multiple_of(100) {
             debug!(
                 kappa = %format!("{:.0}", self.kappa),
                 r_squared = %format!("{:.2}", self.r_squared),

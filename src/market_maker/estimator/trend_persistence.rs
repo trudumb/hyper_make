@@ -283,11 +283,7 @@ impl TrendPersistenceTracker {
         let depth_bps = (depth / position_value) * 10_000.0;
 
         // Severity scales from 0 at threshold to 1 at 5x threshold
-        let severity = (depth_bps / self.config.underwater_threshold_bps - 1.0)
-            .max(0.0)
-            .min(1.0);
-
-        severity
+        (depth_bps / self.config.underwater_threshold_bps - 1.0).clamp(0.0, 1.0)
     }
 
     /// Calculate overall trend confidence.

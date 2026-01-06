@@ -248,6 +248,7 @@ impl KappaOrchestrator {
 
     /// Get individual component κ values and weights for diagnostics.
     /// Returns ((kappa, weight) for own, book, robust, prior) and warmup status.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn component_breakdown(
         &self,
     ) -> (
@@ -319,7 +320,7 @@ impl KappaOrchestrator {
         self.update_count += 1;
 
         // Log periodically (every 10 trades for diagnostics)
-        if self.update_count % 10 == 0 {
+        if self.update_count.is_multiple_of(10) {
             let (
                 (k_own, w_own),
                 (k_book, w_book),
