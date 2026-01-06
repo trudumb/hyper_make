@@ -406,6 +406,7 @@ impl LadderStrategy {
 
         let params = LadderParams {
             mid_price: market_params.microprice,
+            market_mid: market_params.market_mid, // Actual exchange mid for safety checks
             sigma: market_params.sigma,
             kappa, // Use AS-adjusted kappa
             arrival_intensity: market_params.arrival_intensity,
@@ -542,6 +543,44 @@ impl LadderStrategy {
             let leverage = market_params.leverage.max(1.0);
             let available_margin = market_params.margin_available;
 
+            // === MARGIN RESERVE BUFFER ===
+            // Only use a fraction of available margin for quoting to maintain safety buffer.
+            // 33% total utilization = 16.5% per side when flat.
+            // This prevents over-leveraging and leaves margin for adverse price moves.
+            const MAX_MARGIN_UTILIZATION: f64 = 0.33; // Use only 33% of available margin
+            let usable_margin = available_margin * MAX_MARGIN_UTILIZATION;
+
+            // === TWO-SIDED MARGIN ALLOCATION ===
+            // Split usable margin between sides using inventory-weighted allocation:
+            // - When LONG (positive inventory): allocate more margin to asks (reduce position)
+            // - When SHORT (negative inventory): allocate more margin to bids (reduce position)
+            // - When FLAT: 50/50 split
+            let inventory_ratio = if effective_max_position > EPSILON {
+                (position / effective_max_position).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+
+            // Inventory-weighted margin split:
+            // - inventory_ratio > 0 (long): ask_weight increases, bid_weight decreases
+            // - inventory_ratio < 0 (short): bid_weight increases, ask_weight decreases
+            // - Range: 0.3 to 0.7 (never fully one-sided to maintain two-sided quoting)
+            const MARGIN_SPLIT_SENSITIVITY: f64 = 0.2; // How much inventory affects split
+            let ask_margin_weight = (0.5 + inventory_ratio * MARGIN_SPLIT_SENSITIVITY).clamp(0.3, 0.7);
+            let bid_margin_weight = 1.0 - ask_margin_weight;
+            let margin_for_bids = usable_margin * bid_margin_weight;
+            let margin_for_asks = usable_margin * ask_margin_weight;
+
+            info!(
+                available_margin = %format!("{:.2}", available_margin),
+                usable_margin = %format!("{:.2}", usable_margin),
+                utilization_pct = %format!("{:.0}%", MAX_MARGIN_UTILIZATION * 100.0),
+                inventory_ratio = %format!("{:.3}", inventory_ratio),
+                margin_for_bids = %format!("{:.2}", margin_for_bids),
+                margin_for_asks = %format!("{:.2}", margin_for_asks),
+                "Margin allocation (33% utilization, inventory-weighted split)"
+            );
+
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
             // This prevents the optimizer from producing empty ladders due to margin=0
             if available_margin < EPSILON {
@@ -663,9 +702,10 @@ impl LadderStrategy {
 
             // 5. Create separate optimizers for bids and asks with their respective limits
             // These are only used when use_entropy_distribution=false (legacy path)
+            // NOTE: Use inventory-weighted margin split (margin_for_bids/asks) not full available_margin
             #[allow(deprecated)]
             let optimizer_bids = ConstrainedLadderOptimizer::new(
-                available_margin,
+                margin_for_bids, // Inventory-weighted margin split
                 available_for_bids,
                 ladder_config.min_level_size,
                 config.min_notional,
@@ -674,7 +714,7 @@ impl LadderStrategy {
             );
             #[allow(deprecated)]
             let optimizer_asks = ConstrainedLadderOptimizer::new(
-                available_margin,
+                margin_for_asks, // Inventory-weighted margin split
                 available_for_asks,
                 ladder_config.min_level_size,
                 config.min_notional,
@@ -731,7 +771,7 @@ impl LadderStrategy {
                     let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
                         entropy_config,
                         market_params.microprice,
-                        available_margin,
+                        margin_for_bids, // Use inventory-weighted margin split (not full margin)
                         available_for_bids,
                         leverage,
                     );
@@ -834,7 +874,7 @@ impl LadderStrategy {
                     let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
                         entropy_config,
                         market_params.microprice,
-                        available_margin,
+                        margin_for_asks, // Use inventory-weighted margin split (not full margin)
                         available_for_asks,
                         leverage,
                     );

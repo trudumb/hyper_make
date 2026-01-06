@@ -782,6 +782,7 @@ impl ParameterAggregator {
 
             // === Microprice: data-driven fair price ===
             microprice: est.microprice(),
+            market_mid: sources.latest_mid, // Raw exchange mid for safety checks
             beta_book: est.beta_book(),
             beta_flow: est.beta_flow(),
 

@@ -38,6 +38,25 @@ pub enum LedgerUpdate {
     AccountClassTransfer(AccountClassTransfer),
     SpotTransfer(SpotTransferLedger),
     SpotGenesis(SpotGenesis),
+    /// HIP token send (e.g., on-chain transfers)
+    Send(TokenSend),
+    /// Catch-all for unknown ledger update types to prevent deserialization failures
+    #[serde(other)]
+    Unknown,
+}
+
+/// Token send event (HIP transfers, etc.)
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenSend {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub amount: Option<String>,
+    #[serde(default)]
+    pub destination: Option<Address>,
+    #[serde(default)]
+    pub fee: Option<String>,
 }
 
 /// Deposit event.

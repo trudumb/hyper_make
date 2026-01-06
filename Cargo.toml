@@ -51,3 +51,15 @@ rand_distr = "0.4"
 [[bin]]
 name = "market_maker"
 path = "src/bin/market_maker.rs"
+
+# Fast release builds (for dev iteration)
+[profile.release]
+incremental = true
+debug = 0
+
+# Production builds (max performance, slower compile)
+[profile.release-prod]
+inherits = "release"
+incremental = false
+lto = "thin"
+codegen-units = 1

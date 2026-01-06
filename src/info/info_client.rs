@@ -5,6 +5,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
+use std::time::Duration;
+
 use crate::{
     info::response_structs::{
         ActiveAssetDataResponse, CandlesSnapshotResponse, FundingHistoryResponse,
@@ -16,7 +18,7 @@ use crate::{
     prelude::*,
     req::HttpClient,
     types::OrderInfo,
-    ws::{Subscription, WsManager},
+    ws::{message_types::WsPostResponseData, Subscription, WsManager},
     BaseUrl, Error, Message,
 };
 
@@ -484,5 +486,84 @@ impl InfoClient {
     ) -> Result<ActiveAssetDataResponse> {
         let input = InfoRequest::ActiveAssetData { user, coin };
         self.send_info_request(input).await
+    }
+
+    /// Force a WebSocket reconnection.
+    ///
+    /// Call this when the ConnectionSupervisor detects stale data and
+    /// recommends reconnection. This proactively restarts the connection
+    /// rather than waiting for ping/pong timeout.
+    ///
+    /// Returns Ok(()) if reconnection was initiated, Err if no WebSocket
+    /// manager exists (subscriptions were never set up).
+    pub async fn reconnect(&self) -> Result<()> {
+        if let Some(ref ws) = self.ws_manager {
+            ws.force_reconnect().await;
+            Ok(())
+        } else {
+            Err(crate::Error::WsManagerNotFound)
+        }
+    }
+
+    /// Send an action request via WebSocket POST.
+    ///
+    /// This provides lower latency than REST for order placement, cancellation,
+    /// and modification operations. The WebSocket connection must be established
+    /// (typically via a prior `subscribe()` call).
+    ///
+    /// # Arguments
+    /// * `payload` - The signed action payload (order, cancel, modify, etc.)
+    /// * `timeout` - Maximum time to wait for response
+    ///
+    /// # Returns
+    /// The response data if successful, or an error on timeout/failure.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let payload = serde_json::json!({
+    ///     "type": "order",
+    ///     "orders": [...],
+    ///     "grouping": "na"
+    /// });
+    /// let response = info_client.ws_post_action(payload, Duration::from_secs(5)).await?;
+    /// ```
+    pub async fn ws_post_action(
+        &self,
+        payload: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<WsPostResponseData> {
+        if let Some(ref ws) = self.ws_manager {
+            ws.post(payload, true, timeout).await
+        } else {
+            Err(crate::Error::WsManagerNotFound)
+        }
+    }
+
+    /// Send an info request via WebSocket POST.
+    ///
+    /// This provides lower latency than REST for info queries like L2 book,
+    /// open orders, etc. The WebSocket connection must be established.
+    ///
+    /// # Arguments
+    /// * `payload` - The info request payload
+    /// * `timeout` - Maximum time to wait for response
+    ///
+    /// # Returns
+    /// The response data if successful, or an error on timeout/failure.
+    pub async fn ws_post_info(
+        &self,
+        payload: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<WsPostResponseData> {
+        if let Some(ref ws) = self.ws_manager {
+            ws.post(payload, false, timeout).await
+        } else {
+            Err(crate::Error::WsManagerNotFound)
+        }
+    }
+
+    /// Check if WebSocket manager is available for WS POST.
+    pub fn has_ws_manager(&self) -> bool {
+        self.ws_manager.is_some()
     }
 }

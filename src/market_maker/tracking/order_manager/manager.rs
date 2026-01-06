@@ -623,6 +623,15 @@ impl OrderManager {
         (bid_exposure, ask_exposure)
     }
 
+    /// Get the count of active orders on each side.
+    ///
+    /// Returns (bid_count, ask_count) where each is the number of active resting orders.
+    pub fn order_counts(&self) -> (usize, usize) {
+        let bid_count = self.get_all_by_side(Side::Buy).len();
+        let ask_count = self.get_all_by_side(Side::Sell).len();
+        (bid_count, ask_count)
+    }
+
     /// Calculate net pending inventory change.
     ///
     /// Positive = net long exposure if all orders fill

@@ -138,6 +138,21 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// This ensures orders are viable for ANY asset on ANY DEX, regardless of price.
     /// NEVER use config.target_liquidity directly for runtime quoting.
     effective_target_liquidity: f64,
+
+    // === WebSocket State Sync (Phase 2) ===
+    /// Latest OpenOrders snapshot received via WebSocket.
+    /// Used by safety_sync to avoid REST API race conditions.
+    last_ws_open_orders_snapshot: Option<std::collections::HashSet<u64>>,
+    /// Timestamp of the last WS snapshot.
+    last_ws_snapshot_time: Option<std::time::Instant>,
+    /// Timestamp of last ActiveAssetData WS message (for exchange limits).
+    last_active_asset_data_time: Option<std::time::Instant>,
+    /// Timestamp of last WebData2 WS message (for user/margin state).
+    last_web_data2_time: Option<std::time::Instant>,
+    
+    /// Local cache of spot balances (coin -> balance).
+    /// Initialized via REST, updated via WebSocket ledger updates.
+    spot_balance_cache: std::collections::HashMap<String, f64>,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -249,6 +264,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             stochastic,
             effective_max_position,
             effective_target_liquidity,
+            last_ws_open_orders_snapshot: None,
+            last_ws_snapshot_time: None,
+            last_active_asset_data_time: None,
+            last_web_data2_time: None,
+            spot_balance_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -343,6 +363,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Sync position from exchange - the exchange is the authoritative source.
     async fn sync_position_from_exchange(&mut self) -> Result<()> {
+        // Check if WebSocket data is fresh - skip REST if so
+        if let Some(last_ws_time) = self.last_web_data2_time {
+            let ws_age = last_ws_time.elapsed();
+            if ws_age < std::time::Duration::from_secs(30) {
+                debug!(
+                    ws_age_secs = ws_age.as_secs(),
+                    "[PositionSync] Skipping REST - WebSocket data is fresh"
+                );
+                return Ok(());
+            } else {
+                warn!(
+                    ws_age_secs = ws_age.as_secs(),
+                    "[PositionSync] WebSocket data is stale, falling back to REST"
+                );
+            }
+        }
+
         let user_state = self
             .info_client
             .user_state_for_dex(self.user_address, self.config.dex.as_deref())
@@ -535,7 +572,63 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             )
             .await?;
 
+        // Subscribe to OpenOrders for initial state sync and periodic snapshots
+        self.info_client
+            .subscribe(
+                Subscription::OpenOrders {
+                    user: self.user_address,
+                    dex: self.config.dex.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to ActiveAssetData for real-time exchange limit updates
+        self.info_client
+            .subscribe(
+                Subscription::ActiveAssetData {
+                    user: self.user_address,
+                    coin: self.config.asset.to_string(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to WebData2 for real-time margin/position updates (Phase 2)
+        self.info_client
+            .subscribe(
+                Subscription::WebData2 {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to UserNonFundingLedgerUpdates for spot balance deltas (Phase 3)
+        self.info_client
+            .subscribe(
+                Subscription::UserNonFundingLedgerUpdates {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
         drop(sender); // Explicitly drop the sender since we're done with subscriptions
+
+        // Phase 3 Init: Populate spot balance cache via REST once
+        match self.info_client.user_token_balances(self.user_address).await {
+            Ok(balances) => {
+                for balance in balances.balances {
+                    let total = balance.total.parse::<f64>().unwrap_or(0.0);
+                    self.spot_balance_cache.insert(balance.coin, total);
+                }
+                info!("Initialized spot balance cache with {} assets", self.spot_balance_cache.len());
+            }
+            Err(e) => {
+                error!("Failed to fetch initial spot balances: {}. Spot margin tracking may be incorrect until next update.", e);
+            }
+        }
 
         info!(
             "Market maker started for {} with {} strategy",
@@ -732,13 +825,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.stochastic.calibration_controller.is_calibrated(),
                     );
 
-                    // Check if supervisor recommends reconnection
+                    // Check if supervisor recommends reconnection and act on it
                     if self.infra.connection_supervisor.is_reconnect_recommended() {
                         warn!(
                             time_since_market_data_secs = supervisor_stats.time_since_market_data.as_secs_f64(),
                             connection_state = %supervisor_stats.connection_state,
-                            "Connection supervisor recommends reconnection"
+                            "Connection supervisor recommends reconnection - initiating"
                         );
+                        
+                        // Mark that we're starting reconnection
+                        self.infra.connection_supervisor.record_reconnection_start();
+                        
+                        // Force reconnect the WebSocket
+                        if let Err(e) = self.info_client.reconnect().await {
+                            warn!("Failed to initiate reconnection: {e}");
+                        } else {
+                            info!("WebSocket reconnection initiated successfully");
+                        }
+                        
+                        // Clear the recommendation (the supervisor will set it again if still stale)
+                        self.infra.connection_supervisor.clear_reconnect_recommendation();
                     }
 
                     // === Update P&L inventory snapshot for carry calculation ===
@@ -796,6 +902,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             Message::UserFills(user_fills) => self.handle_user_fills(user_fills).await,
             Message::L2Book(l2_book) => self.handle_l2_book(l2_book),
             Message::OrderUpdates(order_updates) => self.handle_order_updates(order_updates),
+            Message::OpenOrders(open_orders) => self.handle_open_orders(open_orders),
+            Message::ActiveAssetData(active_asset_data) => {
+                self.handle_active_asset_data(active_asset_data)
+            }
+            Message::WebData2(web_data2) => self.handle_web_data2(web_data2),
+            Message::UserNonFundingLedgerUpdates(update) => self.handle_ledger_update(update),
             _ => Ok(()),
         }
     }
@@ -1207,6 +1319,206 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Ok(())
     }
 
+    /// Handle OpenOrders message - syncs WS order snapshot to local state.
+    ///
+    /// This subscription provides a reliable snapshot of all open orders directly from
+    /// the WebSocket stream, avoiding the race conditions inherent in REST-based polling.
+    /// The snapshot is used for:
+    /// 1. Initial state synchronization on startup
+    /// 2. Periodic state reconciliation (replaces REST-based safety_sync)
+    fn handle_open_orders(
+        &mut self,
+        open_orders: crate::ws::message_types::OpenOrders,
+    ) -> Result<()> {
+        // Filter to our asset
+        let our_orders: Vec<_> = open_orders
+            .data
+            .orders
+            .iter()
+            .filter(|o| o.coin == *self.config.asset)
+            .collect();
+
+        let ws_open_oids: std::collections::HashSet<u64> =
+            our_orders.iter().map(|o| o.oid).collect();
+
+        // Store the latest WS snapshot for use by safety_sync
+        self.last_ws_open_orders_snapshot = Some(ws_open_oids);
+        self.last_ws_snapshot_time = Some(std::time::Instant::now());
+
+        info!(
+            orders = our_orders.len(),
+            "Received OpenOrders snapshot from WebSocket"
+        );
+
+        // Add any orders from the snapshot that we don't already track in ws_state
+        for order in &our_orders {
+            if self.ws_state.get_order(order.oid).is_none() {
+                let side = if order.side == "B" || order.side.to_lowercase() == "buy" {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let tracked = TrackedOrder::with_cloid(
+                    order.oid,
+                    order.cloid.clone().unwrap_or_default(),
+                    side,
+                    order.limit_px.parse().unwrap_or(0.0),
+                    order.sz.parse().unwrap_or(0.0),
+                );
+                self.ws_state.add_order(tracked);
+                debug!(oid = order.oid, "Added order from OpenOrders snapshot to ws_state");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle ActiveAssetData message - real-time exchange limit updates.
+    ///
+    /// This replaces the periodic REST polling in `refresh_exchange_limits`.
+    /// Updates position limits (max long/short) and available margin in real-time.
+    fn handle_active_asset_data(
+        &mut self,
+        active_asset_data: crate::ws::message_types::ActiveAssetData,
+    ) -> Result<()> {
+        // Filter to our asset (should already match since we subscribed per-coin)
+        if active_asset_data.data.coin != *self.config.asset {
+            return Ok(());
+        }
+
+        // Update exchange limits using WebSocket data
+        // Note: WS message lacks mark_px, so we use our tracked latest_mid
+        self.infra.exchange_limits.update_from_ws(
+            &active_asset_data.data,
+            self.latest_mid,
+            self.effective_max_position,
+        );
+
+        // Update staleness timestamp
+        self.last_active_asset_data_time = Some(std::time::Instant::now());
+
+        debug!(
+            coin = %active_asset_data.data.coin,
+            "Exchange limits updated from WebSocket"
+        );
+
+        Ok(())
+    }
+
+    /// Handle WebData2 message - real-time margin and position updates.
+    ///
+    /// This replaces the periodic REST polling in `refresh_margin_state` and `sync_position_from_exchange`.
+    fn handle_web_data2(
+        &mut self,
+        web_data2: crate::ws::message_types::WebData2,
+    ) -> Result<()> {
+        // Note: web_data2.data does not contain 'user', so we assume it matches our subscription.
+
+        let state = &web_data2.data.clearinghouse_state;
+
+        // 1. Parse margin summary
+        let account_value = state.margin_summary.account_value.parse::<f64>().unwrap_or(0.0);
+        let margin_used = state.margin_summary.total_margin_used.parse::<f64>().unwrap_or(0.0);
+        let total_notional = state.margin_summary.total_ntl_pos.parse::<f64>().unwrap_or(0.0);
+        
+        // 2. Find position and liquidation price for our asset
+        let (exchange_position, liquidation_price) = state
+            .asset_positions
+            .iter()
+            .find(|p| p.position.coin == *self.config.asset)
+            .map(|p| (
+                p.position.szi.parse::<f64>().unwrap_or(0.0),
+                p.position.liquidation_px.as_ref().and_then(|px| px.parse::<f64>().ok())
+            ))
+            .unwrap_or((0.0, None));
+
+        // Update staleness timestamp
+        self.last_web_data2_time = Some(std::time::Instant::now());
+
+        // 3. Update local position tracking if relevant
+        let local_position = self.position.position();
+        let drift = (exchange_position - local_position).abs();
+        
+        if drift > crate::EPSILON {
+            self.position.set_position(exchange_position);
+            debug!(
+                local = local_position,
+                exchange = exchange_position,
+                "Position synced from WebData2"
+            );
+        }
+
+        // 4. Update MarginSizer state
+        // IMPORTANT: For HIP-3 DEXs, account_value comes from spot balances (Phase 3).
+        // WebData2's clearinghouseState reports the USDC clearinghouse (=0 for HIP-3 users).
+        // Only update margin for validator perps (non-HIP-3).
+        if self.config.dex.is_none() {
+            self.infra.margin_sizer.update_state_with_liquidation(
+                account_value,
+                margin_used,
+                total_notional,
+                liquidation_price,
+                self.latest_mid,
+                self.position.position(),
+            );
+
+            // Log occasionally
+            debug!(
+                account_value = account_value,
+                margin_used = margin_used,
+                liquidation_price = ?liquidation_price,
+                "Margin state updated from WebData2"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Handle ledger updates (spot balance deltas).
+    fn handle_ledger_update(
+        &mut self,
+        update: crate::ws::message_types::UserNonFundingLedgerUpdates,
+    ) -> Result<()> {
+        let data = update.data;
+        if data.user != self.user_address {
+             return Ok(());
+        }
+
+        use crate::types::LedgerUpdate;
+
+        for item in data.non_funding_ledger_updates {
+            match item.delta {
+                LedgerUpdate::Deposit(d) => {
+                    let amount = d.usdc.parse::<f64>().unwrap_or(0.0);
+                    let entry = self.spot_balance_cache.entry("USDC".to_string()).or_insert(0.0);
+                    *entry += amount;
+                    debug!(coin = "USDC", amount = amount, total = *entry, "Deposit processed");
+                }
+                LedgerUpdate::Withdraw(w) => {
+                    let amount = w.usdc.parse::<f64>().unwrap_or(0.0);
+                    let entry = self.spot_balance_cache.entry("USDC".to_string()).or_insert(0.0);
+                    *entry -= amount;
+                    debug!(coin = "USDC", amount = amount, total = *entry, "Withdraw processed");
+                }
+                LedgerUpdate::SpotTransfer(t) => {
+                    let token = t.token.clone(); 
+                    let amount = t.amount.parse::<f64>().unwrap_or(0.0);
+                    
+                    if t.destination == self.user_address {
+                         let entry = self.spot_balance_cache.entry(token.clone()).or_insert(0.0);
+                         *entry += amount;
+                    } else {
+                         let entry = self.spot_balance_cache.entry(token.clone()).or_insert(0.0);
+                         *entry -= amount;
+                    }
+                    debug!(coin = token, amount = amount, "SpotTransfer processed");
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Update quotes based on current market state.
     #[tracing::instrument(name = "quote_cycle", skip_all, fields(asset = %self.config.asset))]
     async fn update_quotes(&mut self) -> Result<()> {
@@ -1292,6 +1604,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let exchange_limits = &self.infra.exchange_limits;
         // Get pending exposure from resting orders (prevents position breach from multiple fills)
         let (pending_bid_exposure, pending_ask_exposure) = self.orders.pending_exposure();
+        
+        // DEBUG: Log open order details for diagnosing skew issues
+        let (bid_count, ask_count) = self.orders.order_counts();
+        debug!(
+            bid_orders = bid_count,
+            ask_orders = ask_count,
+            pending_bid_exposure = %format!("{:.4}", pending_bid_exposure),
+            pending_ask_exposure = %format!("{:.4}", pending_ask_exposure),
+            total_orders = bid_count + ask_count,
+            "Open order state"
+        );
 
         // Get dynamic position VALUE limit from kill switch (first-principles derived)
         let dynamic_max_position_value = self.safety.kill_switch.max_position_value();
@@ -2674,6 +2997,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                 // Log at DEBUG to reduce verbosity - summary logged at end of cycle
                                 debug!(old_oid = spec.oid, new_oid = result.oid, "OID remapped");
                                 oid_remap_count += 1;
+                            } else {
+                                // ORPHAN FIX: replace_oid failed (old order not found in tracking,
+                                // e.g., was already cleaned up). But the modify SUCCEEDED on exchange,
+                                // so we have a new order with new OID that we're not tracking!
+                                // Create a new tracked order to prevent orphan.
+                                warn!(
+                                    old_oid = spec.oid,
+                                    new_oid = result.oid,
+                                    "replace_oid failed but modify succeeded - creating new tracked order to prevent orphan"
+                                );
+                                let side = if spec.is_buy {
+                                    tracking::Side::Buy
+                                } else {
+                                    tracking::Side::Sell
+                                };
+                                let new_order = tracking::TrackedOrder::new(
+                                    result.oid,
+                                    side,
+                                    spec.new_price,
+                                    spec.new_size,
+                                );
+                                self.orders.add_order(new_order);
+                                oid_remap_count += 1;
                             }
                             result.oid
                         } else {
@@ -3496,14 +3842,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
 
         // Cancel all resting orders with confirmation
-        let oids: Vec<u64> = self.orders.order_ids();
-        let total_orders = oids.len();
+        // IMPORTANT: Fetch from exchange API (not local tracking) to catch orphans
+        let exchange_oids: Vec<u64> = if let Some(dex) = &self.config.dex {
+            // HIP-3 DEX: use dex-specific API
+            match self.info_client.open_orders_for_dex(self.user_address, Some(dex.as_str())).await {
+                Ok(orders) => orders.iter().filter(|o| o.coin == *self.config.asset).map(|o| o.oid).collect(),
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch orders from exchange at shutdown, using local tracking");
+                    self.orders.order_ids()
+                }
+            }
+        } else {
+            // Validator perps: use standard API
+            match self.info_client.open_orders(self.user_address).await {
+                Ok(orders) => orders.iter().filter(|o| o.coin == *self.config.asset).map(|o| o.oid).collect(),
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch orders from exchange at shutdown, using local tracking");
+                    self.orders.order_ids()
+                }
+            }
+        };
+        
+        let local_oids: Vec<u64> = self.orders.order_ids();
+        let total_orders = exchange_oids.len();
+        
+        if exchange_oids.len() != local_oids.len() {
+            warn!(
+                exchange = exchange_oids.len(),
+                local = local_oids.len(),
+                "Order count mismatch detected at shutdown"
+            );
+            // Don't panic/assert, just proceed to sync logic via cancel-all below
+        }
 
         if total_orders == 0 {
             info!("No resting orders to cancel");
         } else {
-            info!("Bulk cancelling {} resting orders...", total_orders);
-            self.initiate_bulk_cancel(oids).await;
+            info!("Bulk cancelling {} resting orders (from exchange)...", total_orders);
+            self.initiate_bulk_cancel(exchange_oids).await;
             info!(cancelled = total_orders, "Bulk cancel completed");
         }
 
@@ -3552,38 +3928,45 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // === Step 5: Exchange reconciliation ===
-        // Use DEX-aware open_orders for HIP-3 support
-        let exchange_orders = self
-            .info_client
-            .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
-            .await?;
+        // PHASE 2 FIX: Use WebSocket snapshot instead of REST API to eliminate race condition.
+        // The WS snapshot is pushed by the exchange and received via the same WebSocket stream
+        // as fills, ensuring consistency between order state and fill events.
+        let exchange_oids: HashSet<u64> = if let Some(ref ws_snapshot) = self.last_ws_open_orders_snapshot {
+            // Use the WS snapshot (authoritative, no race condition)
+            let snapshot_age = self
+                .last_ws_snapshot_time
+                .map(|t| t.elapsed())
+                .unwrap_or(std::time::Duration::from_secs(999));
 
-        // DIAGNOSTIC: Log exchange orders to debug HIP-3 asset matching
-        let total_exchange_orders = exchange_orders.len();
-        let matching_orders: Vec<_> = exchange_orders
-            .iter()
-            .filter(|o| o.coin == *self.config.asset)
-            .collect();
+            if snapshot_age > std::time::Duration::from_secs(30) {
+                warn!(
+                    snapshot_age_secs = snapshot_age.as_secs(),
+                    "[SafetySync] WS OpenOrders snapshot is stale (>30s), reconciliation may be less accurate"
+                );
+            }
 
-        // Log if there's a mismatch between total and matching (possible HIP-3 asset name issue)
-        if total_exchange_orders > 0 && matching_orders.is_empty() {
-            let sample_coins: Vec<_> = exchange_orders.iter().take(3).map(|o| &o.coin).collect();
-            warn!(
-                total_exchange_orders = total_exchange_orders,
-                our_asset = %self.config.asset,
-                sample_coins = ?sample_coins,
-                "[SafetySync] No matching orders! Possible HIP-3 asset name mismatch"
+            debug!(
+                snapshot_orders = ws_snapshot.len(),
+                snapshot_age_ms = snapshot_age.as_millis(),
+                "[SafetySync] Using WebSocket OpenOrders snapshot (no REST call)"
             );
-        }
 
-        info!(
-            total_exchange_orders = total_exchange_orders,
-            matching_orders = matching_orders.len(),
-            our_asset = %self.config.asset,
-            "[SafetySync] Exchange order check"
-        );
+            ws_snapshot.clone()
+        } else {
+            // Fallback to REST if no WS snapshot available yet (startup race)
+            warn!("[SafetySync] No WS snapshot available yet, falling back to REST API (one-time on startup)");
+            let exchange_orders = self
+                .info_client
+                .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+                .await?;
 
-        let exchange_oids: HashSet<u64> = matching_orders.iter().map(|o| o.oid).collect();
+            exchange_orders
+                .iter()
+                .filter(|o| o.coin == *self.config.asset)
+                .map(|o| o.oid)
+                .collect()
+        };
+
         let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
 
         // DIAGNOSTIC: Show orphan/stale counts
@@ -3594,6 +3977,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             local_count = local_oids.len(),
             potential_orphans = potential_orphans,
             potential_stale = potential_stale,
+            is_ws_source = self.last_ws_open_orders_snapshot.is_some(),
             "[SafetySync] Order sync status"
         );
 
@@ -3665,6 +4049,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &exchange_oids,
             &local_oids,
             is_in_cancel_window,
+            |oid| {
+                // Keep order if it's less than 5 seconds old (grace period for sync)
+                self.orders.get_order(oid)
+                    .map(|o| o.placed_at.elapsed() < std::time::Duration::from_secs(5))
+                    .unwrap_or(false)
+            }
         );
         for oid in stale_local {
             safety::SafetyAuditor::log_stale_removal(oid);
@@ -3763,20 +4153,40 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// For HIP-3 DEXs, collateral is in spot balance. For validator perps, in clearinghouse.
     /// Also extracts liquidation price for dynamic reduce-only mode.
     async fn refresh_margin_state(&mut self) -> Result<()> {
+        // Phase 2 Optimization:
+        // If we are on standard perps (not HIP-3 DEX) and have fresh WebData2,
+        // we can skip the REST call entirely because handle_web_data2 updates the state.
+        if self.config.dex.is_none() {
+             if let Some(last_ws_time) = self.last_web_data2_time {
+                if last_ws_time.elapsed() < std::time::Duration::from_secs(10) {
+                    debug!("[MarginSync] Skipping REST - WebData2 is fresh");
+                    return Ok(());
+                }
+             }
+        }
+
         // For HIP-3 DEXs, collateral is in spot balance (USDE, USDH, etc.)
         // For validator perps, collateral is in perps clearinghouse (USDC)
         let (account_value, margin_used, total_notional, liquidation_price) =
             if self.config.dex.is_some() {
                 // HIP-3: Get account value from spot balance
-                let balances = self
-                    .info_client
-                    .user_token_balances(self.user_address)
-                    .await?;
-                let account_value = self
-                    .config
-                    .collateral
-                    .available_balance_from_spot(&balances.balances)
-                    .unwrap_or(0.0);
+                // Phase 3: Use local cache if available and populated
+                let account_value = if !self.spot_balance_cache.is_empty() {
+                    self.config
+                        .collateral
+                        .available_balance_from_spot_map(&self.spot_balance_cache)
+                        .unwrap_or(0.0)
+                } else {
+                    // Fallback to REST if cache is empty (e.g. startup failed)
+                    let balances = self
+                        .info_client
+                        .user_token_balances(self.user_address)
+                        .await?;
+                    self.config
+                        .collateral
+                        .available_balance_from_spot(&balances.balances)
+                        .unwrap_or(0.0)
+                };
 
                 // Get margin used from DEX-specific clearinghouse
                 let user_state = self
@@ -3891,7 +4301,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     ///
     /// Fetches `active_asset_data` to get exchange-enforced position limits.
     /// This prevents order rejections due to position limit violations.
+    ///
+    /// NOTE: This is now a FALLBACK. If WebSocket `ActiveAssetData` is fresh (<30s),
+    /// we skip the REST call entirely.
     async fn refresh_exchange_limits(&mut self) -> Result<()> {
+        // Check if WebSocket data is fresh - skip REST if so
+        if let Some(last_ws_time) = self.last_active_asset_data_time {
+            let ws_age = last_ws_time.elapsed();
+            if ws_age < std::time::Duration::from_secs(30) {
+                debug!(
+                    ws_age_secs = ws_age.as_secs(),
+                    "[ExchangeLimits] Skipping REST - WebSocket data is fresh"
+                );
+                return Ok(());
+            } else {
+                warn!(
+                    ws_age_secs = ws_age.as_secs(),
+                    "[ExchangeLimits] WebSocket data is stale, falling back to REST"
+                );
+            }
+        }
+
         let asset_data = self
             .info_client
             .active_asset_data(self.user_address, self.config.asset.to_string())

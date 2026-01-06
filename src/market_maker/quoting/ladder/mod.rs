@@ -177,8 +177,10 @@ impl LadderConfig {
 /// Parameters for ladder generation derived from market state
 #[derive(Debug, Clone)]
 pub struct LadderParams {
-    /// Mid/fair price to quote around
+    /// Mid/fair price to quote around (microprice - used for quote generation)
     pub mid_price: f64,
+    /// Actual market mid price (from AllMids - used for safety checks to prevent crossing)
+    pub market_mid: f64,
     /// Volatility (per-second)
     pub sigma: f64,
     /// Order flow intensity (κ)
@@ -248,6 +250,7 @@ mod tests {
 
         let params = LadderParams {
             mid_price: 100.0,
+            market_mid: 100.0, // Same as mid_price for tests (no microprice adj)
             sigma: 0.001,
             kappa: 100.0,
             arrival_intensity: 1.0,
@@ -292,6 +295,7 @@ mod tests {
 
         let params_neutral = LadderParams {
             mid_price: 1000.0,
+            market_mid: 1000.0, // Same as mid_price for tests
             sigma: 0.001,
             kappa: 100.0,
             arrival_intensity: 1.0,
@@ -347,6 +351,7 @@ mod tests {
 
         let params = LadderParams {
             mid_price: 100.0,
+            market_mid: 100.0, // Same as mid_price for tests
             sigma: 0.001,
             kappa: 100.0,
             arrival_intensity: 1.0,
@@ -385,11 +390,17 @@ mod tests {
 
     #[test]
     fn test_ladder_with_drift_adjusted_skew() {
-        let config = LadderConfig::default();
+        // Use wider ladder (50bps min) so that the 15.79bps drift isn't capped by the 50% depth safety check
+        // (If min depth is 2bps, max drift is 1bp, which would cap our 15.79bps drift)
+        let config = LadderConfig {
+            min_depth_bps: 50.0,
+            ..Default::default()
+        };
 
         // Base params with LONG position opposing bearish momentum
         let params_with_drift = LadderParams {
             mid_price: 100.0,
+            market_mid: 100.0, // Same as mid_price for tests
             sigma: 0.001,
             kappa: 100.0,
             arrival_intensity: 1.0,

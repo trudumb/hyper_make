@@ -8,6 +8,7 @@
 //! - **ExchangeLimits**: Exchange-enforced position limits from API
 //! - **Metrics**: Prometheus metrics for observability
 //! - **Executor**: Order execution abstraction
+//! - **WsExecutor**: WebSocket POST executor with REST fallback
 //! - **Recovery**: Stuck position recovery state machine (Phase 3)
 //! - **Reconciliation**: Event-driven position sync (Phase 4)
 //! - **RateLimit**: Rejection-aware rate limiting (Phase 5)
@@ -32,6 +33,7 @@ mod rate_limit;
 mod reconciliation;
 mod reconnection;
 mod recovery;
+mod ws_executor;
 
 pub use arena::*;
 pub use connection_supervisor::*;
@@ -47,3 +49,4 @@ pub use rate_limit::*;
 pub use reconciliation::*;
 pub use reconnection::*;
 pub use recovery::*;
+pub use ws_executor::*;

@@ -121,17 +121,21 @@ impl SafetyAuditor {
     ///
     /// Returns OIDs of orders that should be removed from local tracking.
     /// Excludes orders in cancel window (CancelPending/CancelConfirmed).
-    pub fn find_stale_local<F>(
+    /// exclude_young: filter returns true if order should be KEPT (e.g. it is young)
+    pub fn find_stale_local<F, G>(
         exchange_oids: &HashSet<u64>,
         local_oids: &HashSet<u64>,
         is_in_cancel_window: F,
+        is_young: G,
     ) -> Vec<u64>
     where
         F: Fn(u64) -> bool,
+        G: Fn(u64) -> bool,
     {
         local_oids
             .difference(exchange_oids)
             .filter(|oid| !is_in_cancel_window(**oid))
+            .filter(|oid| !is_young(**oid)) // Logic: if young, don't remove (keep it)
             .copied()
             .collect()
     }
@@ -310,14 +314,16 @@ mod tests {
     #[test]
     fn test_find_stale_local() {
         let exchange: HashSet<u64> = [1, 2].into_iter().collect();
-        let local: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        let local: HashSet<u64> = [1, 2, 3, 4, 5].into_iter().collect();
 
         // Simulate order 3 being in cancel window
         let is_cancel = |oid: u64| oid == 3;
+        // Simulate order 5 being young
+        let is_young = |oid: u64| oid == 5;
 
-        let stale = SafetyAuditor::find_stale_local(&exchange, &local, is_cancel);
+        let stale = SafetyAuditor::find_stale_local(&exchange, &local, is_cancel, is_young);
         assert_eq!(stale.len(), 1);
-        assert!(stale.contains(&4)); // 3 is excluded (in cancel window)
+        assert!(stale.contains(&4)); // 3 excluded (cancel), 5 excluded (young)
     }
 
     #[test]

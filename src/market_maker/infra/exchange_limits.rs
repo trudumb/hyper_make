@@ -174,6 +174,69 @@ impl ExchangePositionLimits {
         );
     }
 
+    /// Update limits from WebSocket message.
+    ///
+    /// Unlike `update_from_response`, the WebSocket `ActiveAssetData` message
+    /// does NOT include `mark_px`, so we must pass it from local state.
+    ///
+    /// # Arguments
+    /// - `data`: Data from `ActiveAssetData` WebSocket message.
+    /// - `mark_price`: Current mark price from `latest_mid`.
+    /// - `local_max_position`: User-configured max position limit.
+    pub fn update_from_ws(
+        &self,
+        data: &crate::types::ActiveAssetDataData,
+        mark_price: f64,
+        local_max_position: f64,
+    ) {
+        let max_long = parse_f64_or_max(&data.max_trade_szs, 0);
+        let max_short = parse_f64_or_max(&data.max_trade_szs, 1);
+        let available_buy_usd = parse_f64_or_max(&data.available_to_trade, 0);
+        let available_sell_usd = parse_f64_or_max(&data.available_to_trade, 1);
+
+        // Convert available notional (USD) to position size (contracts)
+        let available_buy = if mark_price > 0.0 && mark_price < f64::MAX {
+            available_buy_usd / mark_price
+        } else {
+            f64::MAX
+        };
+        let available_sell = if mark_price > 0.0 && mark_price < f64::MAX {
+            available_sell_usd / mark_price
+        } else {
+            f64::MAX
+        };
+
+        // Store raw values
+        self.inner.max_long.store(max_long);
+        self.inner.max_short.store(max_short);
+        self.inner.available_buy.store(available_buy);
+        self.inner.available_sell.store(available_sell);
+
+        // Pre-compute effective limits
+        let effective_bid = local_max_position.min(max_long).min(available_buy);
+        let effective_ask = local_max_position.min(max_short).min(available_sell);
+        self.inner.effective_bid_limit.store(effective_bid);
+        self.inner.effective_ask_limit.store(effective_ask);
+
+        // Update metadata
+        self.inner.local_max_position.store(local_max_position);
+        self.inner
+            .last_refresh_epoch_ms
+            .store(now_epoch_ms(), Ordering::Relaxed);
+
+        tracing::debug!(
+            max_long = %format!("{:.6}", max_long),
+            max_short = %format!("{:.6}", max_short),
+            available_buy = %format!("{:.6}", available_buy),
+            available_sell = %format!("{:.6}", available_sell),
+            mark_price = %format!("{:.2}", mark_price),
+            effective_bid = %format!("{:.6}", effective_bid),
+            effective_ask = %format!("{:.6}", effective_ask),
+            source = "WebSocket",
+            "Exchange position limits updated from WS"
+        );
+    }
+
     /// Update only the local max position (re-computes effective limits).
     ///
     /// Use when local config changes but exchange limits are still valid.

@@ -142,6 +142,11 @@ pub struct MarketParams {
     /// Quote around this instead of raw mid.
     pub microprice: f64,
 
+    /// Actual market mid price (from AllMids exchange data).
+    /// Used for safety checks to prevent crossing the spread.
+    /// This is the raw exchange mid, NOT adjusted by microprice model.
+    pub market_mid: f64,
+
     /// β_book coefficient (return prediction per unit book imbalance).
     /// For diagnostics: expected range ~0.001-0.01 (1-10 bps per unit signal).
     pub beta_book: f64,
@@ -511,6 +516,7 @@ impl Default for MarketParams {
             book_imbalance: 0.0,       // Default: balanced book
             liquidity_gamma_mult: 1.0, // Default: normal liquidity
             microprice: 0.0,           // Will be set from estimator
+            market_mid: 0.0,           // Will be set from latest AllMids
             beta_book: 0.0,            // Will be learned from data
             beta_flow: 0.0,            // Will be learned from data
             // Tier 1: Adverse Selection

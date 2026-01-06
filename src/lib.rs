@@ -146,6 +146,8 @@ pub use market_maker::{
     TrackedOrder,
     // Volatility Regime
     VolatilityRegime,
+    // WebSocket POST Configuration
+    WsPostConfig,
 };
 pub use meta::{
     AssetContext, AssetMeta, CollateralInfo, Meta, MetaAndAssetCtxs, PerpDex, PerpDexLimits,
@@ -156,7 +158,7 @@ pub use types::*;
 pub use ws::message_types::{
     ActiveAssetCtx, ActiveAssetData, ActiveSpotAssetCtx, AllMids, Bbo, CandleMessage, L2Book,
     Notification, OrderUpdates, Trades, User, UserFills, UserFundings, UserNonFundingLedgerUpdates,
-    WebData2,
+    WebData2, WsPostRequest, WsPostResponse, WsPostResponseData, WsPostResponsePayload,
 };
 // Backwards-compatible alias - ws::Candle is now CandleMessage to avoid conflict with types::Candle
 pub use ws::message_types::Candle as WsCandle;

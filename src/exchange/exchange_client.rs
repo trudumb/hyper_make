@@ -19,6 +19,10 @@ use log::debug;
 use reqwest::Client;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+
 use crate::{
     exchange::actions::{
         ApproveAgent, ApproveBuilderFee, BulkCancel, BulkModify, BulkOrder, ClaimRewards,
@@ -29,6 +33,7 @@ use crate::{
     meta::Meta,
     prelude::*,
     req::HttpClient,
+    ws::message_types::WsPostResponsePayload,
     BaseUrl, BulkCancelCloid, Error, ExchangeResponseStatus, SpotSend, SpotUser, VaultTransfer,
     Withdraw3,
 };
@@ -39,6 +44,14 @@ pub struct ExchangeClient {
     pub meta: Meta,
     pub vault_address: Option<Address>,
     pub coin_to_asset: HashMap<String, u32>,
+    /// Optional InfoClient for WS POST support.
+    /// When set, actions will be sent via WebSocket for lower latency,
+    /// with automatic fallback to REST on failure.
+    ws_info_client: Option<Arc<RwLock<InfoClient>>>,
+    /// WS POST timeout (default: 5 seconds)
+    ws_post_timeout: Duration,
+    /// Whether to use WS POST when available
+    ws_post_enabled: bool,
 }
 
 // ============================================================================
@@ -133,6 +146,8 @@ impl std::fmt::Debug for ExchangeClient {
                 "coin_to_asset",
                 &format!("{} entries", self.coin_to_asset.len()),
             )
+            .field("ws_post_enabled", &self.ws_post_enabled)
+            .field("ws_info_client", &self.ws_info_client.is_some())
             .finish()
     }
 }
@@ -289,7 +304,56 @@ impl ExchangeClient {
                 base_url: base_url.get_url(),
             },
             coin_to_asset,
+            ws_info_client: None,
+            ws_post_timeout: Duration::from_secs(5),
+            ws_post_enabled: false,
         })
+    }
+
+    /// Enable WebSocket POST for lower-latency order execution.
+    ///
+    /// When enabled, actions (orders, cancels, modifies) will be sent via WebSocket
+    /// with automatic fallback to REST on failure.
+    ///
+    /// # Arguments
+    /// - `info_client`: Shared InfoClient with established WebSocket connection
+    /// - `timeout`: Optional timeout for WS responses (default: 5s)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let info_client = Arc::new(RwLock::new(info_client));
+    /// exchange_client.enable_ws_post(Arc::clone(&info_client), None);
+    /// ```
+    pub fn enable_ws_post(
+        &mut self,
+        info_client: Arc<RwLock<InfoClient>>,
+        timeout: Option<Duration>,
+    ) {
+        self.ws_info_client = Some(info_client);
+        if let Some(t) = timeout {
+            self.ws_post_timeout = t;
+        }
+        self.ws_post_enabled = true;
+        debug!("WS POST enabled with timeout {:?}", self.ws_post_timeout);
+    }
+
+    /// Disable WebSocket POST (revert to REST only).
+    pub fn disable_ws_post(&mut self) {
+        self.ws_post_enabled = false;
+        debug!("WS POST disabled");
+    }
+
+    /// Check if WS POST is currently enabled and available.
+    pub async fn is_ws_post_available(&self) -> bool {
+        if !self.ws_post_enabled {
+            return false;
+        }
+        if let Some(ref info) = self.ws_info_client {
+            let client = info.read().await;
+            client.has_ws_manager()
+        } else {
+            false
+        }
     }
 
     pub(crate) async fn post(
@@ -298,30 +362,62 @@ impl ExchangeClient {
         signature: Signature,
         nonce: u64,
     ) -> Result<ExchangeResponseStatus> {
-        // let signature = ExchangeSignature {
-        //     r: signature.r(),
-        //     s: signature.s(),
-        //     v: 27 + signature.v() as u64,
-        // };
-
         let exchange_payload = ExchangePayload {
             action,
             signature,
             nonce,
             vault_address: self.vault_address,
         };
+
+        // Try WS POST if enabled and available
+        if self.ws_post_enabled {
+            if let Some(ref info_client) = self.ws_info_client {
+                let payload_json = serde_json::to_value(&exchange_payload)
+                    .map_err(|e| Error::JsonParse(e.to_string()))?;
+
+                let info = info_client.read().await;
+                if info.has_ws_manager() {
+                    debug!("Attempting WS POST for action");
+                    match info.ws_post_action(payload_json.clone(), self.ws_post_timeout).await {
+                        Ok(response) => {
+                            debug!("WS POST successful");
+                            // Parse the WS response into ExchangeResponseStatus
+                            match response.response {
+                                WsPostResponsePayload::Action { payload } => {
+                                    // The payload contains {"status":"ok","response":{...}}
+                                    return serde_json::from_value(payload)
+                                        .map_err(|e| Error::JsonParse(e.to_string()));
+                                }
+                                WsPostResponsePayload::Error { payload } => {
+                                    debug!("WS POST returned error: {}, falling back to REST", payload);
+                                    // Fall through to REST
+                                }
+                                WsPostResponsePayload::Info { .. } => {
+                                    debug!("WS POST returned unexpected info response, falling back to REST");
+                                    // Fall through to REST
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("WS POST failed: {}, falling back to REST", e);
+                            // Fall through to REST
+                        }
+                    }
+                }
+            }
+        }
+
+        // REST fallback (or primary path if WS not enabled)
         let res = serde_json::to_string(&exchange_payload)
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        // Note: Not logging request payload as it contains signatures
-        debug!("Sending exchange request");
+        debug!("Sending exchange request via REST");
 
         let output = &self
             .http_client
             .post("/exchange", res)
             .await
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        // Note: Not logging response as it may contain sensitive data
-        debug!("Received exchange response");
+        debug!("Received exchange response via REST");
         serde_json::from_str(output).map_err(|e| Error::JsonParse(e.to_string()))
     }
 }

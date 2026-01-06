@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpStream,
     spawn,
-    sync::{mpsc::UnboundedSender, Mutex},
+    sync::{mpsc::UnboundedSender, oneshot, Mutex},
     time,
 };
 use tokio_tungstenite::{
@@ -28,8 +28,8 @@ use tokio_tungstenite::{
 use crate::{
     prelude::*,
     ws::message_types::{
-        ActiveAssetData, ActiveSpotAssetCtx, AllMids, Bbo, Candle, L2Book, OrderUpdates, Trades,
-        User,
+        ActiveAssetData, ActiveSpotAssetCtx, AllMids, Bbo, Candle, L2Book, OpenOrders,
+        OrderUpdates, Trades, User, WsPostRequest, WsPostResponse, WsPostResponseData,
     },
     ActiveAssetCtx, Error, Notification, UserFills, UserFundings, UserNonFundingLedgerUpdates,
     WebData2,
@@ -194,6 +194,10 @@ pub(crate) struct WsManager {
     health_state: Arc<HealthState>,
     /// Health configuration
     health_config: WsHealthConfig,
+    /// Pending WS post requests awaiting response, keyed by request ID
+    pending_posts: Arc<Mutex<HashMap<u64, oneshot::Sender<WsPostResponseData>>>>,
+    /// Counter for generating unique post request IDs
+    next_post_id: Arc<AtomicU64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -269,6 +273,15 @@ pub enum Subscription {
         #[serde(skip_serializing_if = "Option::is_none")]
         dex: Option<String>,
     },
+    /// Subscribe to open orders snapshot.
+    /// For HIP-3 DEXs, use `dex` to specify which DEX.
+    #[serde(rename_all = "camelCase")]
+    OpenOrders {
+        user: Address,
+        /// Optional HIP-3 DEX name (e.g., "hyna", "felix").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dex: Option<String>,
+    },
 }
 
 /// Normalize subscription identifier for HashMap lookup.
@@ -327,6 +340,7 @@ pub enum Message {
     ActiveAssetData(ActiveAssetData),
     ActiveSpotAssetCtx(ActiveSpotAssetCtx),
     Bbo(Bbo),
+    OpenOrders(OpenOrders),
     Pong,
 }
 
@@ -370,6 +384,11 @@ impl WsManager {
         let jitter = health_config.jitter_factor;
         let max_failures = health_config.max_consecutive_failures;
 
+        // Create pending_posts Arc before reader task
+        let pending_posts: Arc<Mutex<HashMap<u64, oneshot::Sender<WsPostResponseData>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pending_posts_reader = Arc::clone(&pending_posts);
+
         // Reader task with enhanced reconnection logic
         {
             let writer = writer.clone();
@@ -390,6 +409,7 @@ impl WsManager {
                             data,
                             &subscriptions_copy,
                             Some(&health_state),
+                            Some(&pending_posts_reader),
                         )
                         .await
                         {
@@ -585,6 +605,8 @@ impl WsManager {
             subscription_identifiers: HashMap::new(),
             health_state,
             health_config,
+            pending_posts,
+            next_post_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -646,6 +668,83 @@ impl WsManager {
             && self.health_state.time_since_last_pong() < self.health_config.pong_timeout
     }
 
+    /// Send a POST request over WebSocket and await the response.
+    ///
+    /// This is the unified method for sending actions (orders, cancels) and info
+    /// requests over WebSocket instead of REST. The response is delivered via
+    /// a oneshot channel.
+    ///
+    /// # Arguments
+    /// * `payload` - The signed action or info request payload as JSON
+    /// * `is_action` - true for action (order/cancel), false for info request
+    /// * `timeout` - Maximum time to wait for response
+    ///
+    /// # Returns
+    /// The response data if successful, or an error if timeout/send failure.
+    pub(crate) async fn post(
+        &self,
+        payload: serde_json::Value,
+        is_action: bool,
+        timeout: Duration,
+    ) -> Result<WsPostResponseData> {
+        // Generate unique request ID
+        let request_id = self.next_post_id.fetch_add(1, Ordering::SeqCst);
+        
+        // Create the request
+        let request = if is_action {
+            WsPostRequest::action(request_id, payload)
+        } else {
+            WsPostRequest::info(request_id, payload)
+        };
+        
+        // Create channel for response
+        let (tx, rx) = oneshot::channel();
+        
+        // Register pending request
+        {
+            let mut pending = self.pending_posts.lock().await;
+            pending.insert(request_id, tx);
+        }
+        
+        // Serialize and send
+        let message_text = match serde_json::to_string(&request) {
+            Ok(s) => s,
+            Err(e) => {
+                // Remove pending on serialization error
+                let mut pending = self.pending_posts.lock().await;
+                pending.remove(&request_id);
+                return Err(Error::JsonParse(e.to_string()));
+            }
+        };
+        
+        debug!("Sending WS post request id={}: {}", request_id, &message_text);
+        
+        {
+            let mut writer = self.writer.lock().await;
+            if let Err(e) = writer.send(protocol::Message::Text(message_text)).await {
+                // Remove pending on send error
+                let mut pending = self.pending_posts.lock().await;
+                pending.remove(&request_id);
+                return Err(Error::WsSend(e.to_string()));
+            }
+        }
+        
+        // Wait for response with timeout
+        match time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                // Channel closed (shouldn't happen normally)
+                Err(Error::WsSend("Response channel closed".to_string()))
+            }
+            Err(_) => {
+                // Timeout - remove pending request
+                let mut pending = self.pending_posts.lock().await;
+                pending.remove(&request_id);
+                Err(Error::WsSend(format!("WS post request {} timed out after {:?}", request_id, timeout)))
+            }
+        }
+    }
+
     async fn connect(url: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         Ok(connect_async(url)
             .await
@@ -699,10 +798,7 @@ impl WsManager {
                 .map_err(|e| Error::JsonParse(e.to_string()))
             }
             Message::Notification(_) => Ok("notification".to_string()),
-            Message::WebData2(web_data2) => serde_json::to_string(&Subscription::WebData2 {
-                user: web_data2.data.user,
-            })
-            .map_err(|e| Error::JsonParse(e.to_string())),
+            Message::WebData2(_) => Ok("__WEBDATA2__".to_string()),
             Message::ActiveAssetCtx(active_asset_ctx) => {
                 serde_json::to_string(&Subscription::ActiveAssetCtx {
                     coin: active_asset_ctx.data.coin.clone(),
@@ -727,6 +823,19 @@ impl WsManager {
                 dex: None,
             })
             .map_err(|e| Error::JsonParse(e.to_string())),
+            Message::OpenOrders(open_orders) => {
+                // Extract dex from the message if present
+                let dex = if open_orders.data.dex.is_empty() {
+                    None
+                } else {
+                    Some(open_orders.data.dex.clone())
+                };
+                serde_json::to_string(&Subscription::OpenOrders {
+                    user: open_orders.data.user,
+                    dex,
+                })
+                .map_err(|e| Error::JsonParse(e.to_string()))
+            }
             Message::SubscriptionResponse | Message::Pong => Ok(String::default()),
             Message::NoData => Ok("".to_string()),
             Message::HyperliquidError(err) => Ok(format!("hyperliquid error: {err:?}")),
@@ -737,6 +846,7 @@ impl WsManager {
         data: std::result::Result<protocol::Message, tungstenite::Error>,
         subscriptions: &Arc<Mutex<HashMap<String, Vec<SubscriptionData>>>>,
         health_state: Option<&HealthState>,
+        pending_posts: Option<&Arc<Mutex<HashMap<u64, oneshot::Sender<WsPostResponseData>>>>>,
     ) -> Result<()> {
         match data {
             Ok(data) => match data.into_text() {
@@ -744,6 +854,31 @@ impl WsManager {
                     if !data.starts_with('{') {
                         return Ok(());
                     }
+
+                    // Check if this is a WS post response first (channel: "post")
+                    if let Some(pending) = pending_posts {
+                        if let Ok(post_response) = serde_json::from_str::<WsPostResponse>(&data) {
+                            if post_response.channel == "post" {
+                                let request_id = post_response.data.id;
+                                let mut pending_guard = pending.lock().await;
+                                if let Some(sender) = pending_guard.remove(&request_id) {
+                                    debug!(
+                                        "Routing WS post response to pending request id={}",
+                                        request_id
+                                    );
+                                    // Send response to waiting receiver
+                                    let _ = sender.send(post_response.data);
+                                } else {
+                                    warn!(
+                                        "WS post response for unknown request ID={}",
+                                        request_id
+                                    );
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+
                     let message = serde_json::from_str::<Message>(&data)
                         .map_err(|e| Error::JsonParse(e.to_string()))?;
 
@@ -765,7 +900,23 @@ impl WsManager {
 
                     let mut subscriptions = subscriptions.lock().await;
                     let mut res = Ok(());
-                    if let Some(subscription_datas) = subscriptions.get_mut(&identifier) {
+
+                    // Special handling for WebData2 which lacks user field in response
+                    if identifier == "__WEBDATA2__" {
+                        for (key, subscription_datas) in subscriptions.iter_mut() {
+                            if key.contains("webData2") {
+                                for subscription_data in subscription_datas {
+                                    if let Err(e) = subscription_data
+                                        .sending_channel
+                                        .send(Arc::clone(&arc_message))
+                                        .map_err(|e| Error::WsSend(e.to_string()))
+                                    {
+                                        res = Err(e);
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(subscription_datas) = subscriptions.get_mut(&identifier) {
                         for subscription_data in subscription_datas {
                             if let Err(e) = subscription_data
                                 .sending_channel
@@ -941,6 +1092,23 @@ impl WsManager {
             Self::unsubscribe(self.writer.lock().await.borrow_mut(), identifier.as_str()).await?;
         }
         Ok(())
+    }
+}
+
+impl WsManager {
+    /// Force a reconnection by closing the current WebSocket connection.
+    ///
+    /// This sends a Close frame to the server, which will cause the reader task
+    /// to enter its reconnection loop with exponential backoff.
+    ///
+    /// Use this when the ConnectionSupervisor detects stale data and recommends
+    /// reconnection, rather than waiting for the ping/pong timeout.
+    pub(crate) async fn force_reconnect(&self) {
+        info!("Force reconnect requested - sending Close frame");
+        let mut writer = self.writer.lock().await;
+        if let Err(err) = writer.send(protocol::Message::Close(None)).await {
+            warn!("Error sending Close frame during force_reconnect: {err}");
+        }
     }
 }
 

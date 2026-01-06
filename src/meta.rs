@@ -412,6 +412,15 @@ impl CollateralInfo {
             .map(|(total, hold)| total - hold)
     }
 
+    /// Get available balance from a HashMap cache (Phase 3).
+    /// Assumes map contains total balance and hold is negligible or not tracked in map.
+    pub fn available_balance_from_spot_map(
+        &self,
+        balances: &HashMap<String, f64>,
+    ) -> Option<f64> {
+        balances.get(&self.symbol).copied()
+    }
+
     /// Get the token symbol for use in spot transfers.
     ///
     /// This is the token name used in `ExchangeClient::spot_transfer()`.

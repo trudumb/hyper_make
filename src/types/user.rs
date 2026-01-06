@@ -3,7 +3,7 @@
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use super::{Liquidation, NonUserCancel, TradeInfo};
+use super::{AssetPosition, Liquidation, MarginSummary, NonUserCancel, TradeInfo};
 
 /// User funding event.
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -139,9 +139,30 @@ pub struct NotificationData {
     pub notification: String,
 }
 
+
+
+/// Clearinghouse state from WebData2.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearinghouseState {
+    pub asset_positions: Vec<AssetPosition>,
+    pub cross_margin_summary: MarginSummary,
+    pub margin_summary: MarginSummary,
+    pub withdrawable: String,
+    pub cross_maintenance_margin_used: String,
+    pub time: u64,
+}
+
 /// WebData2 user data.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct WebData2Data {
-    pub user: Address,
+    pub clearinghouse_state: ClearinghouseState,
+    pub leading_vaults: Option<Vec<serde_json::Value>>, // Placeholder
+    pub total_vault_equity: String,
+    pub open_orders: Option<Vec<serde_json::Value>>, // Placeholder
+    pub agent_address: Option<Address>,
+    pub agent_valid_until: Option<u64>,
+    pub cum_ledger: String,
+    // Ignoring "meta" as it's massive and optional
 }
