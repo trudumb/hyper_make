@@ -21,7 +21,8 @@ mod types;
 pub use impulse_filter::{ImpulseDecision, ImpulseFilter, ImpulseFilterConfig, ImpulseFilterStats};
 pub use manager::OrderManager;
 pub use reconcile::{
-    reconcile_side_smart, reconcile_side_smart_with_impulse, ReconcileConfig, ReconcileStats,
+    priority_based_matching, reconcile_side_smart, reconcile_side_smart_with_impulse,
+    DynamicReconcileConfig, ReconcileConfig, ReconcileStats,
 };
 pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder};
 

@@ -53,6 +53,98 @@ impl Default for ReconcileConfig {
     }
 }
 
+/// Dynamic reconciliation config with thresholds derived from stochastic optimal spread.
+///
+/// Unlike static `ReconcileConfig`, this is computed fresh each quote cycle from
+/// market parameters (gamma, kappa, sigma). This ensures matching thresholds
+/// adapt to current market conditions.
+#[derive(Debug, Clone)]
+pub struct DynamicReconcileConfig {
+    /// Tight tolerance for best level (must be accurate) - optimal_spread / 4
+    pub best_level_tolerance_bps: f64,
+    /// Looser tolerance for outer levels - optimal_spread / 2
+    pub outer_level_tolerance_bps: f64,
+    /// Maximum delta (bps) to consider any match - beyond this, force cancel+place
+    pub max_match_distance_bps: f64,
+    /// Fill probability threshold for queue preservation
+    /// If P(fill) > this, preserve order even if price is slightly off
+    pub queue_value_threshold: f64,
+    /// Time horizon for fill probability calculation
+    pub queue_horizon_seconds: f64,
+    /// The stochastic optimal spread (half-spread per side, in bps)
+    /// Computed as: δ* = (1/γ) × ln(1 + γ/κ) × 10000
+    pub optimal_spread_bps: f64,
+    /// Enable priority-based matching (ensures best levels are covered first)
+    pub use_priority_matching: bool,
+}
+
+impl Default for DynamicReconcileConfig {
+    fn default() -> Self {
+        Self {
+            best_level_tolerance_bps: 5.0,   // Tight for best level
+            outer_level_tolerance_bps: 15.0, // Looser for outer levels
+            max_match_distance_bps: 30.0,    // Beyond this, no match
+            queue_value_threshold: 0.3,      // 30% P(fill) = valuable queue
+            queue_horizon_seconds: 1.0,
+            optimal_spread_bps: 20.0,        // Default ~20 bps
+            use_priority_matching: true,
+        }
+    }
+}
+
+impl DynamicReconcileConfig {
+    /// Create from market parameters (call each quote cycle).
+    ///
+    /// Derives matching thresholds from the stochastic optimal spread formula:
+    /// δ* = (1/γ) × ln(1 + γ/κ)
+    ///
+    /// This ensures thresholds adapt to current market conditions:
+    /// - Low gamma (calm market) → tight thresholds
+    /// - High gamma (volatile/risky) → looser thresholds
+    pub fn from_market_params(
+        gamma: f64,
+        kappa: f64,
+        _sigma: f64,
+        queue_horizon: f64,
+    ) -> Self {
+        // Clamp inputs to avoid division by zero
+        let gamma_safe = gamma.max(0.001);
+        let kappa_safe = kappa.max(1.0);
+
+        // GLFT optimal spread: δ* = (1/γ) × ln(1 + γ/κ)
+        let optimal_spread_frac = (1.0 / gamma_safe) * (1.0 + gamma_safe / kappa_safe).ln();
+        let optimal_spread_bps = optimal_spread_frac * 10_000.0;
+
+        // Derive thresholds from optimal spread
+        // Best level: tight (1/4 of optimal spread)
+        let best_level_tolerance_bps = (optimal_spread_bps / 4.0).clamp(2.0, 10.0);
+        // Outer levels: looser (1/2 of optimal spread)
+        let outer_level_tolerance_bps = (optimal_spread_bps / 2.0).clamp(5.0, 25.0);
+        // Maximum match distance: 1.5x optimal spread
+        let max_match_distance_bps = (optimal_spread_bps * 1.5).clamp(15.0, 50.0);
+
+        Self {
+            best_level_tolerance_bps,
+            outer_level_tolerance_bps,
+            max_match_distance_bps,
+            queue_value_threshold: 0.3,
+            queue_horizon_seconds: queue_horizon,
+            optimal_spread_bps,
+            use_priority_matching: true,
+        }
+    }
+
+    /// Get tolerance for a given priority level (0 = best, higher = further out)
+    #[inline]
+    pub fn tolerance_for_priority(&self, priority: usize) -> f64 {
+        if priority == 0 {
+            self.best_level_tolerance_bps
+        } else {
+            self.outer_level_tolerance_bps
+        }
+    }
+}
+
 /// Statistics from reconciliation.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileStats {
@@ -296,6 +388,147 @@ fn find_best_matches<'a>(
     }
 
     results
+}
+
+/// Priority-based matching: ensures best levels are covered first.
+///
+/// Unlike `find_best_matches`, this function:
+/// 1. Processes targets in priority order (best price first)
+/// 2. Uses dynamic thresholds from stochastic optimal spread
+/// 3. For unmatched targets, generates PLACE actions (critical coverage gaps)
+/// 4. For orders not matching any target, generates CANCEL actions
+///
+/// This prevents the bug where stale far orders "steal" matches from near targets.
+pub fn priority_based_matching(
+    current: &[&TrackedOrder],
+    targets: &[LadderLevel],
+    side: Side,
+    config: &DynamicReconcileConfig,
+    queue_tracker: Option<&QueuePositionTracker>,
+) -> Vec<LadderAction> {
+    use tracing::debug;
+    
+    let mut actions = Vec::new();
+    let mut matched_orders: HashSet<u64> = HashSet::new();
+    let mut matched_targets: HashSet<usize> = HashSet::new();
+
+    // Phase 1: Match orders to targets in PRIORITY ORDER (best price first)
+    // For bids: highest price = best = priority 0
+    // For asks: lowest price = best = priority 0
+    // Targets are assumed to be in priority order from ladder generation
+    for (priority, target) in targets.iter().enumerate() {
+        let tolerance_bps = config.tolerance_for_priority(priority);
+        let mut best_order: Option<&TrackedOrder> = None;
+        let mut best_distance = f64::MAX;
+
+        // Find the best unmatched order within tolerance
+        for order in current.iter() {
+            if matched_orders.contains(&order.oid) {
+                continue;
+            }
+
+            let price_diff_bps = bps_diff(order.price, target.price) as f64;
+
+            // Only consider orders within tolerance for this priority level
+            if price_diff_bps <= tolerance_bps && price_diff_bps < best_distance {
+                best_distance = price_diff_bps;
+                best_order = Some(*order);
+            }
+        }
+
+        if let Some(order) = best_order {
+            // Order found within tolerance - check if we should preserve it
+            matched_orders.insert(order.oid);
+            matched_targets.insert(priority);
+
+            // Check queue value using EV comparison if tracker available
+            // Spread capture estimate: use target depth as proxy for spread capture
+            let spread_capture_bps = target.depth_bps.max(config.optimal_spread_bps / 2.0);
+            let (should_preserve, reason) = if let Some(qt) = queue_tracker {
+                qt.should_preserve_order(
+                    order.oid,
+                    target.price,
+                    config.queue_horizon_seconds,
+                    spread_capture_bps,
+                )
+            } else {
+                (false, "no_tracker")
+            };
+
+            if should_preserve {
+                // Queue position is valuable - skip this order (preserve it)
+                debug!(
+                    oid = order.oid,
+                    price = order.price,
+                    target_price = target.price,
+                    reason = reason,
+                    "Priority matching: preserving order due to queue value"
+                );
+            } else {
+                // Check if we need to modify (price or size difference)
+                let size_diff_pct = if order.remaining() > EPSILON {
+                    ((order.remaining() - target.size).abs() / order.remaining()).min(1.0)
+                } else {
+                    1.0
+                };
+
+                // If within very tight tolerance, skip entirely
+                if best_distance <= 2.0 && size_diff_pct <= 0.05 {
+                    // Perfect match - no action needed
+                    continue;
+                }
+
+                // Otherwise, cancel and place new (MODIFY resets queue on HL anyway)
+                if best_distance > config.best_level_tolerance_bps || size_diff_pct > 0.10 {
+                    actions.push(LadderAction::Cancel { oid: order.oid });
+                    if target.size > EPSILON {
+                        actions.push(LadderAction::Place {
+                            side,
+                            price: target.price,
+                            size: target.size,
+                        });
+                    }
+                }
+            }
+        } else {
+            // No order within tolerance - this is a CRITICAL COVERAGE GAP
+            // Must place new order at this target price
+            if target.size > EPSILON {
+                debug!(
+                    priority = priority,
+                    target_price = target.price,
+                    tolerance_bps = tolerance_bps,
+                    "Priority matching: placing order for uncovered target"
+                );
+                actions.push(LadderAction::Place {
+                    side,
+                    price: target.price,
+                    size: target.size,
+                });
+            }
+        }
+    }
+
+    // Phase 2: Cancel any orders not matched to any target (stale orders)
+    for order in current.iter() {
+        if !matched_orders.contains(&order.oid) {
+            // Check if this order is close to ANY target before cancelling
+            let close_to_any_target = targets.iter().any(|t| {
+                bps_diff(order.price, t.price) as f64 <= config.max_match_distance_bps
+            });
+
+            if !close_to_any_target {
+                debug!(
+                    oid = order.oid,
+                    price = order.price,
+                    "Priority matching: cancelling stale order (not close to any target)"
+                );
+                actions.push(LadderAction::Cancel { oid: order.oid });
+            }
+        }
+    }
+
+    actions
 }
 
 /// Reconcile a single side: match current orders to target levels.

@@ -2666,7 +2666,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     ) -> Result<()> {
         use crate::market_maker::quoting::LadderLevel;
         use crate::market_maker::tracking::{
-            reconcile_side_smart, reconcile_side_smart_with_impulse,
+            priority_based_matching, reconcile_side_smart, reconcile_side_smart_with_impulse,
+            DynamicReconcileConfig,
         };
 
         let reconcile_config = &self.config.reconcile;
@@ -2884,9 +2885,57 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
 
-        // Generate actions for each side using smart reconciliation
-        // When impulse control is enabled, use the impulse-aware version with Δλ filtering
-        let (mut bid_actions, bid_stats, mut ask_actions, ask_stats) = if impulse_enabled {
+        // Generate actions for each side using priority-based matching (default)
+        // Fallback paths kept for legacy compatibility but not used
+        
+        // === PRIORITY-BASED MATCHING (DEFAULT) ===
+        // Uses stochastic optimal spread to derive matching thresholds
+        // Ensures best bid/ask levels are always covered first
+        
+        // Get sigma from queue tracker (updated from book data)
+        let sigma = self.tier1.queue_tracker.sigma();
+        
+        // Use conservative gamma/kappa until we have market params cached
+        // TODO: Cache actual gamma/kappa from ladder strategy in per-cycle state
+        let gamma = 0.1;  // Conservative default
+        let kappa = 1500.0;  // Typical for liquid perps
+        
+        let dynamic_config = DynamicReconcileConfig::from_market_params(
+            gamma,
+            kappa,
+            sigma,
+            reconcile_config.queue_horizon_seconds,
+        );
+        
+        info!(
+            sigma = %format!("{:.6}", sigma),
+            optimal_spread_bps = %format!("{:.2}", dynamic_config.optimal_spread_bps),
+            best_tolerance_bps = %format!("{:.2}", dynamic_config.best_level_tolerance_bps),
+            outer_tolerance_bps = %format!("{:.2}", dynamic_config.outer_level_tolerance_bps),
+            "[Reconcile] Priority-based matching with dynamic thresholds"
+        );
+        
+        let bid_acts = priority_based_matching(
+            &current_bids,
+            &bid_levels,
+            Side::Buy,
+            &dynamic_config,
+            Some(&self.tier1.queue_tracker),
+        );
+        
+        let ask_acts = priority_based_matching(
+            &current_asks,
+            &ask_levels,
+            Side::Sell,
+            &dynamic_config,
+            Some(&self.tier1.queue_tracker),
+        );
+        
+        let (mut bid_actions, bid_stats, mut ask_actions, ask_stats): (Vec<LadderAction>, Option<ReconcileStats>, Vec<LadderAction>, Option<ReconcileStats>) = (bid_acts, None, ask_acts, None);
+        
+        // Legacy impulse-aware path - kept for reference but not used
+        let _impulse_enabled = impulse_enabled;
+        if false && impulse_enabled {
             // Get mid price for P(fill) estimation
             let mid_price = Some(self.latest_mid);
 

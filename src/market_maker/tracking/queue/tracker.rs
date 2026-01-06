@@ -232,6 +232,71 @@ impl QueuePositionTracker {
         p_fill < self.config.refresh_threshold
     }
 
+    /// Determine if an order should be preserved despite being off-target.
+    ///
+    /// Compares expected value of keeping the order (with queue advantage)
+    /// vs refreshing to the target price (fresh queue).
+    ///
+    /// Returns (should_preserve, reason) where:
+    /// - should_preserve: true if keeping is better than refreshing
+    /// - reason: explanation for logging
+    ///
+    /// # Arguments
+    /// * `oid` - Order ID to evaluate
+    /// * `target_price` - The optimal price we'd like to be at
+    /// * `horizon_seconds` - Time horizon for fill probability
+    /// * `spread_capture_bps` - Expected profit if filled (basis points)
+    pub fn should_preserve_order(
+        &self,
+        oid: u64,
+        _target_price: f64,
+        horizon_seconds: f64,
+        spread_capture_bps: f64,
+    ) -> (bool, &'static str) {
+        let position = match self.positions.get(&oid) {
+            Some(p) => p,
+            None => return (false, "order_not_tracked"),
+        };
+
+        // Calculate current order's expected value
+        let p_fill_current = self.fill_probability(oid, horizon_seconds).unwrap_or(0.0);
+        let ev_keep = p_fill_current * spread_capture_bps;
+
+        // Estimate queue position at target price (assume back of queue)
+        // Use current best bid/ask depth as estimate
+        let estimated_depth_at_target = if position.is_bid {
+            // For bids: if moving to a better (higher) price, we're at back
+            // Estimate based on typical touch depth
+            self.config.expected_volume_per_second * 0.5 // ~0.5 second of volume
+        } else {
+            self.config.expected_volume_per_second * 0.5
+        };
+
+        // Calculate P(fill) at new position (fresh queue)
+        let p_touch = self.probability_touch(oid, horizon_seconds).unwrap_or(0.0);
+        let expected_volume = self.config.expected_volume_per_second * horizon_seconds;
+        let p_exec_new = if expected_volume > 0.0 {
+            (-estimated_depth_at_target / expected_volume).exp()
+        } else {
+            0.0
+        };
+        let p_fill_new = p_touch * p_exec_new;
+        let ev_refresh = p_fill_new * spread_capture_bps;
+
+        // Preserve if current EV > refresh EV by meaningful margin (10%)
+        if ev_keep > ev_refresh * 1.1 {
+            (true, "queue_value_exceeds_refresh")
+        } else if p_fill_current > 0.5 {
+            // High fill probability - preserve even if EV is similar
+            (true, "high_fill_probability")
+        } else if position.age_seconds() < 0.5 {
+            // Very young order - give it time to build queue value
+            (true, "order_too_young")
+        } else {
+            (false, "refresh_has_better_ev")
+        }
+    }
+
     /// Calculate the expected value of keeping an order vs refreshing.
     ///
     /// Returns (keep_value, refresh_value) where:
