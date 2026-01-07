@@ -465,21 +465,53 @@ pub fn priority_based_matching(
                     "Priority matching: preserving order due to queue value"
                 );
             } else {
-                // Check if we need to modify (price or size difference)
-                let size_diff_pct = if order.remaining() > EPSILON {
-                    ((order.remaining() - target.size).abs() / order.remaining()).min(1.0)
+                // Evaluate what action is needed based on FIFO queue rules:
+                // - Size reduction: MODIFY preserves queue position ✓
+                // - Price change: Loses queue (goes to back of new level)
+                // - Size increase: Loses queue (treated as new order)
+                
+                let price_diff_bps = best_distance;
+                let current_size = order.remaining();
+                let target_size = target.size;
+                let size_change = target_size - current_size;
+                let size_diff_pct = if current_size > EPSILON {
+                    (size_change.abs() / current_size).min(1.0)
                 } else {
                     1.0
                 };
 
-                // If within very tight tolerance, skip entirely
-                if best_distance <= 2.0 && size_diff_pct <= 0.05 {
-                    // Perfect match - no action needed
+                // Case 1: Perfect match - no action needed
+                if price_diff_bps <= 2.0 && size_diff_pct <= 0.05 {
                     continue;
                 }
 
-                // Otherwise, cancel and place new (MODIFY resets queue on HL anyway)
-                if best_distance > config.best_level_tolerance_bps || size_diff_pct > 0.10 {
+                // Case 2: Price is good, only SIZE REDUCTION needed
+                // → Use MODIFY to preserve queue position (FIFO advantage!)
+                if price_diff_bps <= config.best_level_tolerance_bps && size_change < 0.0 && size_diff_pct > 0.05 {
+                    debug!(
+                        oid = order.oid,
+                        current_size = current_size,
+                        target_size = target_size,
+                        "Priority matching: MODIFY (size down) to preserve queue"
+                    );
+                    actions.push(LadderAction::Modify {
+                        oid: order.oid,
+                        new_price: order.price,  // Keep same price
+                        new_size: target_size,   // Reduce size
+                    });
+                    continue;
+                }
+
+                // Case 3: Price change required OR size increase needed
+                // → Must CANCEL+PLACE (loses queue, but necessary)
+                if price_diff_bps > config.best_level_tolerance_bps || size_change > current_size * 0.10 {
+                    debug!(
+                        oid = order.oid,
+                        price_diff_bps = price_diff_bps,
+                        size_change_pct = %format!("{:.1}%", size_change / current_size * 100.0),
+                        reason = if price_diff_bps > config.best_level_tolerance_bps { "price_change" } else { "size_increase" },
+                        "Priority matching: CANCEL+PLACE (queue lost)"
+                    );
                     actions.push(LadderAction::Cancel { oid: order.oid });
                     if target.size > EPSILON {
                         actions.push(LadderAction::Place {
