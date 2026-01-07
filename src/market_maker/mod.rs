@@ -2888,6 +2888,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Generate actions for each side using priority-based matching (default)
         // Fallback paths kept for legacy compatibility but not used
         
+        // DIAGNOSTIC: Checkpoint to verify we reach this point
+        info!(
+            local_bids = current_bids.len(),
+            local_asks = current_asks.len(),
+            target_bids = bid_levels.len(),
+            target_asks = ask_levels.len(),
+            bid_drift_bps = %format!("{:.1}", bid_drift),
+            ask_drift_bps = %format!("{:.1}", ask_drift),
+            impulse_enabled = impulse_enabled,
+            "[Reconcile] Checkpoint: passed drift and impulse checks"
+        );
+        
         // === PRIORITY-BASED MATCHING (DEFAULT) ===
         // Uses stochastic optimal spread to derive matching thresholds
         // Ensures best bid/ask levels are always covered first

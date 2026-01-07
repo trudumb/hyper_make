@@ -498,6 +498,7 @@ pub fn priority_based_matching(
                         oid: order.oid,
                         new_price: order.price,  // Keep same price
                         new_size: target_size,   // Reduce size
+                        side,
                     });
                     continue;
                 }
