@@ -5,7 +5,7 @@
 # Examples:
 #   ./scripts/test_testnet.sh BTC 60       # 1 minute test
 #   ./scripts/test_testnet.sh ETH 300      # 5 minute test
-#   ./scripts/test_testnet.sh BTC 3600     # 1 hour test
+#   ./scripts/test_testnet.sh BTC 7200     # 2 hour test
 #
 # Notes:
 #   - Uses testnet (no real funds at risk)

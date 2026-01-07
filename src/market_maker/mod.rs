@@ -2665,10 +2665,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         ask_quotes: Vec<Quote>,
     ) -> Result<()> {
         use crate::market_maker::quoting::LadderLevel;
-        use crate::market_maker::tracking::{
-            priority_based_matching, reconcile_side_smart, reconcile_side_smart_with_impulse,
-            DynamicReconcileConfig,
-        };
+        use crate::market_maker::tracking::{priority_based_matching, DynamicReconcileConfig};
 
         let reconcile_config = &self.config.reconcile;
 
@@ -2763,6 +2760,58 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             target = %format_levels(&ask_levels),
             "[Reconcile] ASK levels (price@size)"
         );
+
+        // === EMPTY LADDER RECOVERY ===
+        // When local tracking is completely empty but we have target quotes,
+        // this is a CRITICAL recovery situation. Bypass drift/impulse checks
+        // and immediately place all target orders to restore quoting.
+        let ladder_empty = current_bids.is_empty() && current_asks.is_empty();
+        let has_targets = !bid_levels.is_empty() || !ask_levels.is_empty();
+
+        if ladder_empty && has_targets {
+            warn!(
+                target_bids = bid_levels.len(),
+                target_asks = ask_levels.len(),
+                "EMPTY LADDER DETECTED - forcing immediate replenishment (bypassing all checks)"
+            );
+
+            // Place all target orders directly
+            let mut order_specs = Vec::new();
+            for level in &bid_levels {
+                order_specs.push(OrderSpec::new(level.price, level.size, true)); // is_buy=true
+            }
+            for level in &ask_levels {
+                order_specs.push(OrderSpec::new(level.price, level.size, false)); // is_buy=false
+            }
+
+            if !order_specs.is_empty() {
+                let results = self
+                    .executor
+                    .place_bulk_orders(&self.config.asset, order_specs.clone())
+                    .await;
+
+                let mut placed_count = 0usize;
+                for (spec, result) in order_specs.iter().zip(results.iter()) {
+                    if result.oid != 0 {
+                        let oid = result.oid;
+                        let side = if spec.is_buy { Side::Buy } else { Side::Sell };
+                        let tracked = TrackedOrder::new(oid, side, spec.price, spec.size);
+                        self.orders.add_order(tracked.clone());
+                        self.ws_state.add_order(tracked);
+                        placed_count += 1;
+                    }
+                }
+
+                info!(
+                    placed = placed_count,
+                    target = order_specs.len(),
+                    "[Reconcile] Empty ladder recovery complete"
+                );
+            }
+
+            // Skip normal reconciliation since we just replenished
+            return Ok(());
+        }
 
         // === DRIFT DETECTION: Force full reconciliation on large price drift ===
         // If existing orders are too far from targets, cancel all and place new
@@ -2863,25 +2912,52 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
-        // Impulse Control: Check execution budget before proceeding
+        // Impulse Control: Check exchange rate limits before proceeding
+        // Uses actual Hyperliquid API instead of arbitrary token bucket
         let impulse_enabled =
             self.infra.impulse_control_enabled && reconcile_config.use_impulse_filter;
         if impulse_enabled {
-            // Estimate potential actions: at most (current + target) per side
-            let max_potential_actions =
-                current_bids.len() + bid_levels.len() + current_asks.len() + ask_levels.len();
-
-            if !self
-                .infra
-                .execution_budget
-                .can_afford_bulk(max_potential_actions)
-            {
-                debug!(
-                    budget = %format!("{:.1}", self.infra.execution_budget.available()),
-                    potential_actions = max_potential_actions,
-                    "Impulse control: skipping reconciliation due to insufficient execution budget"
-                );
-                return Ok(());
+            use crate::market_maker::core::CachedRateLimit;
+            use std::time::Duration;
+            
+            // Refresh rate limit cache if stale (every 60 seconds)
+            let cache_max_age = Duration::from_secs(60);
+            let should_refresh = self.infra.cached_rate_limit
+                .as_ref()
+                .map_or(true, |c| c.is_stale(cache_max_age));
+            
+            if should_refresh {
+                match self.info_client.user_rate_limit(self.user_address).await {
+                    Ok(response) => {
+                        self.infra.cached_rate_limit = Some(CachedRateLimit::from_response(&response));
+                        debug!(
+                            used = response.n_requests_used,
+                            cap = response.n_requests_cap,
+                            headroom_pct = %format!("{:.1}%", response.headroom_pct() * 100.0),
+                            "Refreshed exchange rate limit cache"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "Failed to refresh rate limit cache - proceeding without limit check"
+                        );
+                    }
+                }
+            }
+            
+            // Only throttle if headroom < 5% (approaching rate limit)
+            if let Some(ref cache) = self.infra.cached_rate_limit {
+                let headroom = cache.headroom_pct();
+                if headroom < 0.05 {
+                    warn!(
+                        headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                        used = cache.n_requests_used,
+                        cap = cache.n_requests_cap,
+                        "Exchange rate limit low (<5% headroom) - throttling reconciliation"
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -2945,59 +3021,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         
         let (mut bid_actions, bid_stats, mut ask_actions, ask_stats): (Vec<LadderAction>, Option<ReconcileStats>, Vec<LadderAction>, Option<ReconcileStats>) = (bid_acts, None, ask_acts, None);
         
-        // Legacy impulse-aware path - kept for reference but not used
-        let _impulse_enabled = impulse_enabled;
-        if false && impulse_enabled {
-            // Get mid price for P(fill) estimation
-            let mid_price = Some(self.latest_mid);
-
-            // Use impulse-aware reconciliation with queue tracker and impulse filter
-            let (bid_acts, bid_st) = reconcile_side_smart_with_impulse(
-                &current_bids,
-                &bid_levels,
-                Side::Buy,
-                reconcile_config,
-                Some(&self.tier1.queue_tracker),
-                Some(&mut self.infra.impulse_filter),
-                mid_price,
-            );
-
-            let (ask_acts, ask_st) = reconcile_side_smart_with_impulse(
-                &current_asks,
-                &ask_levels,
-                Side::Sell,
-                reconcile_config,
-                Some(&self.tier1.queue_tracker),
-                Some(&mut self.infra.impulse_filter),
-                mid_price,
-            );
-
-            // Log impulse filter statistics
-            if bid_st.impulse_filtered_count > 0
-                || ask_st.impulse_filtered_count > 0
-                || bid_st.queue_locked_count > 0
-                || ask_st.queue_locked_count > 0
-            {
-                debug!(
-                    bid_impulse_filtered = bid_st.impulse_filtered_count,
-                    ask_impulse_filtered = ask_st.impulse_filtered_count,
-                    bid_queue_locked = bid_st.queue_locked_count,
-                    ask_queue_locked = ask_st.queue_locked_count,
-                    "Impulse control: filtered low-value updates"
-                );
-            }
-
-            (bid_acts, Some(bid_st), ask_acts, Some(ask_st))
-        } else {
-            // Standard reconciliation without impulse filtering
-            let bid_acts =
-                reconcile_side_smart(&current_bids, &bid_levels, Side::Buy, reconcile_config);
-            let ask_acts =
-                reconcile_side_smart(&current_asks, &ask_levels, Side::Sell, reconcile_config);
-            (bid_acts, None, ask_acts, None)
-        };
-
-        // Track impulse stats for metrics
+        // Track impulse stats for metrics (priority_based_matching doesn't produce stats)
         let _impulse_stats = (bid_stats, ask_stats);
 
         // Queue-aware enhancement: Check if any "skipped" orders should be refreshed

@@ -153,3 +153,43 @@ pub struct ActiveAssetDataResponse {
     pub available_to_trade: Vec<String>,
     pub mark_px: String,
 }
+
+/// Response for user rate limit query.
+///
+/// Contains information about the user's API rate limit status.
+/// Hyperliquid allows 1 request per $1 USD traded, with an initial
+/// buffer of 10,000 requests.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRateLimitResponse {
+    /// Cumulative volume traded (in USD string)
+    pub cum_vlm: String,
+    /// Number of requests used (max(0, cumulative_used - reserved))
+    pub n_requests_used: u64,
+    /// Current request cap (10000 + cumulative_volume)
+    pub n_requests_cap: u64,
+    /// Requests surplus (max(0, reserved - cumulative_used))
+    pub n_requests_surplus: u64,
+}
+
+impl UserRateLimitResponse {
+    /// Calculate headroom as a fraction (0.0 to 1.0).
+    /// Returns the percentage of rate limit capacity remaining.
+    pub fn headroom_pct(&self) -> f64 {
+        if self.n_requests_cap == 0 {
+            return 0.0;
+        }
+        (self.n_requests_cap - self.n_requests_used) as f64 / self.n_requests_cap as f64
+    }
+
+    /// Check if rate limited (no headroom remaining).
+    pub fn is_rate_limited(&self) -> bool {
+        self.n_requests_used >= self.n_requests_cap
+    }
+
+    /// Get remaining requests before hitting limit.
+    pub fn remaining_requests(&self) -> u64 {
+        self.n_requests_cap.saturating_sub(self.n_requests_used)
+    }
+}
+

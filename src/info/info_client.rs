@@ -12,7 +12,7 @@ use crate::{
         ActiveAssetDataResponse, CandlesSnapshotResponse, FundingHistoryResponse,
         L2SnapshotResponse, OpenOrdersResponse, OrderStatusResponse, RecentTradesResponse,
         ReferralResponse, UserFeesResponse, UserFillsResponse, UserFundingResponse,
-        UserStateResponse, UserTokenBalanceResponse,
+        UserRateLimitResponse, UserStateResponse, UserTokenBalanceResponse,
     },
     meta::{AssetContext, Meta, PerpDex, PerpDexLimits, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
@@ -135,6 +135,12 @@ pub enum InfoRequest {
     ActiveAssetData {
         user: Address,
         coin: String,
+    },
+    /// Query user rate limit status.
+    /// Returns cumulative volume, requests used/cap, and surplus.
+    #[serde(rename = "userRateLimit")]
+    UserRateLimit {
+        user: Address,
     },
 }
 
@@ -485,6 +491,26 @@ impl InfoClient {
         coin: String,
     ) -> Result<ActiveAssetDataResponse> {
         let input = InfoRequest::ActiveAssetData { user, coin };
+        self.send_info_request(input).await
+    }
+
+    /// Query user rate limit status.
+    ///
+    /// Returns cumulative volume, requests used, requests cap, and surplus.
+    /// Hyperliquid allows 1 request per $1 USD traded, with a 10,000 request
+    /// initial buffer.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let limits = info_client.user_rate_limit(address).await?;
+    /// println!("Used: {}/{}, Headroom: {:.1}%",
+    ///     limits.n_requests_used,
+    ///     limits.n_requests_cap,
+    ///     limits.headroom_pct() * 100.0
+    /// );
+    /// ```
+    pub async fn user_rate_limit(&self, address: Address) -> Result<UserRateLimitResponse> {
+        let input = InfoRequest::UserRateLimit { user: address };
         self.send_info_request(input).await
     }
 

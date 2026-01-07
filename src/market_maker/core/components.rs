@@ -152,6 +152,46 @@ pub struct InfraComponents {
     pub impulse_filter: ImpulseFilter,
     /// Whether impulse control is enabled
     pub impulse_control_enabled: bool,
+    /// Cached exchange rate limit (from userRateLimit API)
+    pub cached_rate_limit: Option<CachedRateLimit>,
+}
+
+/// Cached exchange rate limit with timestamp.
+#[derive(Debug, Clone)]
+pub struct CachedRateLimit {
+    /// Requests used (from exchange)
+    pub n_requests_used: u64,
+    /// Requests cap (from exchange)
+    pub n_requests_cap: u64,
+    /// Requests surplus
+    pub n_requests_surplus: u64,
+    /// When this was last fetched
+    pub fetched_at: std::time::Instant,
+}
+
+impl CachedRateLimit {
+    /// Create from UserRateLimitResponse.
+    pub fn from_response(resp: &crate::info::response_structs::UserRateLimitResponse) -> Self {
+        Self {
+            n_requests_used: resp.n_requests_used,
+            n_requests_cap: resp.n_requests_cap,
+            n_requests_surplus: resp.n_requests_surplus,
+            fetched_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Calculate headroom as a fraction (0.0 to 1.0).
+    pub fn headroom_pct(&self) -> f64 {
+        if self.n_requests_cap == 0 {
+            return 0.0;
+        }
+        (self.n_requests_cap.saturating_sub(self.n_requests_used)) as f64 / self.n_requests_cap as f64
+    }
+
+    /// Check if cache is stale (older than given duration).
+    pub fn is_stale(&self, max_age: std::time::Duration) -> bool {
+        self.fetched_at.elapsed() > max_age
+    }
 }
 
 impl InfraComponents {
@@ -262,6 +302,7 @@ impl InfraComponents {
             execution_budget: impulse_config.create_budget(),
             impulse_filter: ImpulseFilter::new(impulse_config.filter.clone()),
             impulse_control_enabled: impulse_config.enabled,
+            cached_rate_limit: None,
         }
     }
 }
