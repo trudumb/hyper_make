@@ -46,7 +46,7 @@ impl Default for ReconcileConfig {
             max_modify_size_pct: 0.50, // Modify if size ≤ 50% change
             skip_price_tolerance_bps: 10, // Skip if price ≤ 10 bps (was 1 - reduces churn ~50%)
             skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
-            use_queue_aware: false,   // Disabled by default until validated
+            use_queue_aware: true,   // Enabled by default (verified)
             queue_horizon_seconds: 1.0, // 1-second fill horizon
             use_impulse_filter: false, // Disabled by default until validated
         }
@@ -74,6 +74,8 @@ pub struct DynamicReconcileConfig {
     /// The stochastic optimal spread (half-spread per side, in bps)
     /// Computed as: δ* = (1/γ) × ln(1 + γ/κ) × 10000
     pub optimal_spread_bps: f64,
+    /// Maximum price modification allowed (dynamically computed from vol)
+    pub max_modify_price_bps: f64,
     /// Enable priority-based matching (ensures best levels are covered first)
     pub use_priority_matching: bool,
 }
@@ -87,6 +89,7 @@ impl Default for DynamicReconcileConfig {
             queue_value_threshold: 0.3,      // 30% P(fill) = valuable queue
             queue_horizon_seconds: 1.0,
             optimal_spread_bps: 20.0,        // Default ~20 bps
+            max_modify_price_bps: 50.0,      // Default 50 bps
             use_priority_matching: true,
         }
     }
@@ -104,7 +107,7 @@ impl DynamicReconcileConfig {
     pub fn from_market_params(
         gamma: f64,
         kappa: f64,
-        _sigma: f64,
+        sigma: f64,
         queue_horizon: f64,
     ) -> Self {
         // Clamp inputs to avoid division by zero
@@ -116,10 +119,16 @@ impl DynamicReconcileConfig {
         let optimal_spread_bps = optimal_spread_frac * 10_000.0;
 
         // Derive thresholds from optimal spread
-        // Best level: tight (1/4 of optimal spread)
-        let best_level_tolerance_bps = (optimal_spread_bps / 4.0).clamp(2.0, 10.0);
-        // Outer levels: looser (1/2 of optimal spread)
-        let outer_level_tolerance_bps = (optimal_spread_bps / 2.0).clamp(5.0, 25.0);
+        // Volatility-driven max modify: 2 standard deviations over queue horizon
+        // 2 * sigma * sqrt(T) converted to bps
+        let vol_bps = sigma * queue_horizon.sqrt() * 10_000.0;
+        let max_modify_price_bps = (2.0 * vol_bps).max(optimal_spread_bps).clamp(10.0, 100.0);
+
+        // Derive matching tolerances from volatility/modify capability
+        // We must be able to match orders up to max_modify to utilize it
+        let best_level_tolerance_bps = (max_modify_price_bps / 2.0).clamp(2.0, 50.0);
+        let outer_level_tolerance_bps = (max_modify_price_bps).clamp(5.0, 100.0);
+
         // Maximum match distance: 1.5x optimal spread
         let max_match_distance_bps = (optimal_spread_bps * 1.5).clamp(15.0, 50.0);
 
@@ -130,6 +139,7 @@ impl DynamicReconcileConfig {
             queue_value_threshold: 0.3,
             queue_horizon_seconds: queue_horizon,
             optimal_spread_bps,
+            max_modify_price_bps,
             use_priority_matching: true,
         }
     }
@@ -487,11 +497,12 @@ pub fn priority_based_matching(
 
                 // Case 2: Price is good, only SIZE REDUCTION needed
                 // → Use MODIFY to preserve queue position (FIFO advantage!)
-                if price_diff_bps <= config.best_level_tolerance_bps && size_change < 0.0 && size_diff_pct > 0.05 {
+                if price_diff_bps <= config.max_modify_price_bps && size_change < 0.0 && size_diff_pct > 0.05 {
                     debug!(
                         oid = order.oid,
                         current_size = current_size,
                         target_size = target_size,
+                        max_modify_bps = config.max_modify_price_bps,
                         "Priority matching: MODIFY (size down) to preserve queue"
                     );
                     actions.push(LadderAction::Modify {

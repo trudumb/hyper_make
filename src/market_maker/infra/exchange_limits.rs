@@ -485,6 +485,93 @@ impl ExchangePositionLimits {
             is_stale: self.is_stale(),
         }
     }
+
+    /// Filter a batch of orders to stay within exchange limits.
+    ///
+    /// This method processes orders in sequence, tracking cumulative exposure
+    /// and filtering out orders that would cause the total to exceed limits.
+    ///
+    /// # Arguments
+    /// - `orders`: Slice of (size, is_buy) tuples representing proposed orders
+    /// - `current_position`: Current position (positive = long)
+    ///
+    /// # Returns
+    /// Vector of booleans indicating which orders are allowed (true = OK, false = skip)
+    pub fn filter_orders_to_limits(
+        &self,
+        orders: &[(f64, bool)],
+        current_position: f64,
+    ) -> Vec<bool> {
+        if !self.is_initialized() {
+            // Not initialized - allow all optimistically
+            return vec![true; orders.len()];
+        }
+
+        let available_buy = self.inner.available_buy.load();
+        let available_sell = self.inner.available_sell.load();
+        let max_long = self.inner.max_long.load();
+        let max_short = self.inner.max_short.load();
+
+        let mut cumulative_buy = 0.0;
+        let mut cumulative_sell = 0.0;
+        let mut result = Vec::with_capacity(orders.len());
+
+        for &(size, is_buy) in orders {
+            let allowed = if is_buy {
+                // Check if cumulative buys + this order would exceed available
+                let new_cumulative = cumulative_buy + size;
+                let within_available = new_cumulative <= available_buy;
+                
+                // Check if new position would exceed max long
+                let new_position = current_position + new_cumulative;
+                let within_max = new_position <= max_long;
+                
+                within_available && within_max
+            } else {
+                // Check if cumulative sells + this order would exceed available
+                let new_cumulative = cumulative_sell + size;
+                let within_available = new_cumulative <= available_sell;
+                
+                // Check if new position would exceed max short
+                let new_position = current_position - new_cumulative;
+                let within_max = new_position >= -max_short;
+                
+                within_available && within_max
+            };
+
+            if allowed {
+                if is_buy {
+                    cumulative_buy += size;
+                } else {
+                    cumulative_sell += size;
+                }
+            }
+
+            result.push(allowed);
+        }
+
+        result
+    }
+
+    /// Calculate remaining capacity after accounting for proposed orders.
+    ///
+    /// Use this to check how much more exposure we can add after a batch of orders.
+    ///
+    /// # Arguments
+    /// - `buy_exposure`: Total buy order size being placed
+    /// - `sell_exposure`: Total sell order size being placed
+    ///
+    /// # Returns
+    /// (remaining_buy_capacity, remaining_sell_capacity)
+    pub fn remaining_capacity(&self, buy_exposure: f64, sell_exposure: f64) -> (f64, f64) {
+        let available_buy = self.inner.available_buy.load();
+        let available_sell = self.inner.available_sell.load();
+
+        let remaining_buy = (available_buy - buy_exposure).max(0.0);
+        let remaining_sell = (available_sell - sell_exposure).max(0.0);
+
+        (remaining_buy, remaining_sell)
+    }
 }
 
 impl Default for ExchangePositionLimits {

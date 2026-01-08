@@ -280,7 +280,7 @@ mod tests {
     use super::*;
 
     fn make_order_spec(price: f64, size: f64, is_buy: bool) -> OrderSpec {
-        OrderSpec::new(price, size, is_buy)
+        OrderSpec::new(price, size, is_buy, true)
     }
 
     fn make_modify_spec(oid: u64, price: f64, size: f64, is_buy: bool) -> ModifySpec {
@@ -289,6 +289,7 @@ mod tests {
             new_price: price,
             new_size: size,
             is_buy,
+            post_only: true, // ALO
         }
     }
 

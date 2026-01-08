@@ -125,7 +125,7 @@ pub struct LadderConfig {
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            num_levels: 5,
+            num_levels: 25, // Increased from 5 to 25 (max capacity) to let entropy/stochastics dictate effective levels
             min_depth_bps: 2.0,
             max_depth_bps: 200.0,
             geometric_spacing: true,
@@ -219,6 +219,12 @@ pub struct LadderParams {
     pub directional_variance_mult: f64,
     /// Combined urgency score (0-5 scale)
     pub urgency_score: f64,
+
+    // === Funding/Cost of Carry ===
+    /// Per-second funding rate (derived from annualized or hourly)
+    pub funding_rate: f64,
+    /// Whether to apply funding skew to the ladder
+    pub use_funding_skew: bool,
 }
 
 #[cfg(test)]

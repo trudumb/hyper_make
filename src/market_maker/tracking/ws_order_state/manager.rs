@@ -658,6 +658,15 @@ impl WsOrderStateManager {
         self.orders.keys().copied().collect()
     }
 
+    /// Get all active (open) order IDs.
+    pub fn open_order_ids(&self) -> HashSet<u64> {
+        self.orders
+            .values()
+            .filter(|o| o.is_active())
+            .map(|o| o.oid)
+            .collect()
+    }
+
     /// Get count of inflight requests.
     pub fn inflight_count(&self) -> usize {
         self.inflight.len()

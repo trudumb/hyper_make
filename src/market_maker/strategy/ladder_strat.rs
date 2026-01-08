@@ -425,6 +425,10 @@ impl LadderStrategy {
             position_opposes_momentum: market_params.position_opposes_momentum,
             directional_variance_mult: market_params.directional_variance_mult,
             urgency_score: market_params.urgency_score,
+            // Convert annualized funding rate to per-second rate
+            // 365.25 * 24 * 60 * 60 = 31,557,600 seconds/year
+            funding_rate: market_params.funding_rate / 31557_600.0,
+            use_funding_skew: true,
         };
 
         // === SPREAD FLOOR: Adaptive vs Static ===
@@ -545,9 +549,9 @@ impl LadderStrategy {
 
             // === MARGIN RESERVE BUFFER ===
             // Only use a fraction of available margin for quoting to maintain safety buffer.
-            // 33% total utilization = 16.5% per side when flat.
+            // 15% total utilization = 7.5% per side when flat.
             // This prevents over-leveraging and leaves margin for adverse price moves.
-            const MAX_MARGIN_UTILIZATION: f64 = 0.33; // Use only 33% of available margin
+            const MAX_MARGIN_UTILIZATION: f64 = 0.15; // Use only 15% of available margin
             let usable_margin = available_margin * MAX_MARGIN_UTILIZATION;
 
             // === TWO-SIDED MARGIN ALLOCATION ===
@@ -698,8 +702,54 @@ impl LadderStrategy {
                 }
             }
 
+            // === DYNAMIC LEVEL COUNT BASED ON EXCHANGE LIMITS ===
+            // When exchange limits are tight, we must reduce the number of levels
+            // to avoid placing many sub-minimum orders that would be rejected.
+            //
+            // Formula: max_levels = available_capacity / min_meaningful_size
+            // where min_meaningful_size = 1.5 × (min_notional / price) to ensure each order
+            // is comfortably above exchange minimum notional requirements.
+            let min_meaningful_size = (config.min_notional * 1.5) / market_params.microprice;
+            
+            let max_bid_levels = if available_for_bids > EPSILON {
+                ((available_for_bids / min_meaningful_size).floor() as usize).max(1)
+            } else {
+                0
+            };
+            let max_ask_levels = if available_for_asks > EPSILON {
+                ((available_for_asks / min_meaningful_size).floor() as usize).max(1)
+            } else {
+                0
+            };
+            
+            // Get configured number of levels
+            let configured_levels = ladder_config.num_levels;
+            
+            // Use the smaller of: configured levels, capacity-based max (taking minimum of bid/ask)
+            // We use the minimum to ensure both sides can be quoted with meaningful sizes
+            let effective_bid_levels = configured_levels.min(max_bid_levels);
+            let effective_ask_levels = configured_levels.min(max_ask_levels);
+            
+            // Log if we're reducing levels due to capacity constraints
+            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels {
+                tracing::warn!(
+                    configured = configured_levels,
+                    effective_bid = effective_bid_levels,
+                    effective_ask = effective_ask_levels,
+                    available_bids = %format!("{:.6}", available_for_bids),
+                    available_asks = %format!("{:.6}", available_for_asks),
+                    min_meaningful_size = %format!("{:.6}", min_meaningful_size),
+                    "Reducing ladder levels due to tight exchange limits"
+                );
+            }
+
             // 4. Generate ladder to get depth levels and prices (using dynamic depths)
+            // Use effective level counts based on capacity constraints
             let mut ladder = Ladder::generate(&ladder_config, &params);
+            
+            // Truncate ladder to effective level counts
+            ladder.bids.truncate(effective_bid_levels);
+            ladder.asks.truncate(effective_ask_levels);
 
             // 5. Create separate optimizers for bids and asks with their respective limits
             // These are only used when use_entropy_distribution=false (legacy path)

@@ -933,8 +933,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enable WebSocket posting for low-latency order execution
     // Create a separate InfoClient for WS POST sharing (MarketMaker keeps the original)
-    let ws_post_info_client = InfoClient::with_reconnect(None, Some(base_url)).await
+    let mut ws_post_info_client = InfoClient::with_reconnect(None, Some(base_url)).await
         .map_err(|e| format!("Failed to create WS POST InfoClient: {e}"))?;
+    // Explicitly connect the WS client since we won't be adding subscriptions
+    ws_post_info_client.ensure_connected().await
+        .map_err(|e| format!("Failed to connect WS POST client: {e}"))?;
+        
     let ws_post_info_shared = Arc::new(tokio::sync::RwLock::new(ws_post_info_client));
     exchange_client.enable_ws_post(Arc::clone(&ws_post_info_shared), Some(std::time::Duration::from_secs(3)));
     info!("WebSocket posting enabled for low-latency order execution");

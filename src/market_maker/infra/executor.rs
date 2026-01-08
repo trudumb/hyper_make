@@ -156,26 +156,36 @@ pub struct OrderSpec {
     /// Client Order ID (UUID) for deterministic fill tracking.
     /// If provided, this CLOID is sent to the exchange and returned in fill notifications.
     pub cloid: Option<String>,
+    /// Whether to use ALO (Add Liquidity Only) / Post-Only TIF.
+    pub post_only: bool,
 }
 
 impl OrderSpec {
     /// Create a new order spec without CLOID (legacy).
-    pub fn new(price: f64, size: f64, is_buy: bool) -> Self {
+    pub fn new(price: f64, size: f64, is_buy: bool, post_only: bool) -> Self {
         Self {
             price,
             size,
             is_buy,
             cloid: None,
+            post_only,
         }
     }
 
     /// Create a new order spec with CLOID for deterministic tracking.
-    pub fn with_cloid(price: f64, size: f64, is_buy: bool, cloid: String) -> Self {
+    pub fn with_cloid(
+        price: f64,
+        size: f64,
+        is_buy: bool,
+        cloid: String,
+        post_only: bool,
+    ) -> Self {
         Self {
             price,
             size,
             is_buy,
             cloid: Some(cloid),
+            post_only,
         }
     }
 }
@@ -192,6 +202,8 @@ pub struct ModifySpec {
     pub new_size: f64,
     /// Whether this is a buy order
     pub is_buy: bool,
+    /// Whether to use ALO (Add Liquidity Only) / Post-Only TIF.
+    pub post_only: bool,
 }
 
 /// Trait for order execution.
@@ -215,6 +227,7 @@ pub trait OrderExecutor: Send + Sync {
         size: f64,
         is_buy: bool,
         cloid: Option<String>,
+        post_only: bool,
     ) -> OrderResult;
 
     /// Place multiple orders in a single API call.
@@ -294,6 +307,7 @@ pub trait OrderExecutor: Send + Sync {
         new_price: f64,
         new_size: f64,
         is_buy: bool,
+        post_only: bool,
     ) -> ModifyResult;
 
     /// Modify multiple orders in a single API call.
@@ -333,6 +347,7 @@ impl OrderExecutor for HyperliquidExecutor {
         size: f64,
         is_buy: bool,
         caller_cloid: Option<String>,
+        post_only: bool,
     ) -> OrderResult {
         let side = if is_buy { "BUY" } else { "SELL" };
 
@@ -353,7 +368,11 @@ impl OrderExecutor for HyperliquidExecutor {
                     sz: size,
                     cloid: Some(cloid),
                     order_type: ClientOrder::Limit(ClientLimit {
-                        tif: "Gtc".to_string(),
+                        tif: if post_only {
+                            "Alo".to_string()
+                        } else {
+                            "Gtc".to_string()
+                        },
                     }),
                 },
                 None,
@@ -459,7 +478,11 @@ impl OrderExecutor for HyperliquidExecutor {
                 sz: spec.size,
                 cloid: cloid.as_ref().and_then(|c| uuid::Uuid::parse_str(c).ok()),
                 order_type: ClientOrder::Limit(ClientLimit {
-                    tif: "Gtc".to_string(),
+                    tif: if spec.post_only {
+                        "Alo".to_string()
+                    } else {
+                        "Gtc".to_string()
+                    },
                 }),
             })
             .collect();
@@ -842,6 +865,7 @@ impl OrderExecutor for HyperliquidExecutor {
         new_price: f64,
         new_size: f64,
         is_buy: bool,
+        post_only: bool,
     ) -> ModifyResult {
         let side = if is_buy { "BUY" } else { "SELL" };
 
@@ -855,7 +879,11 @@ impl OrderExecutor for HyperliquidExecutor {
                 sz: new_size,
                 cloid: None,
                 order_type: ClientOrder::Limit(ClientLimit {
-                    tif: "Gtc".to_string(),
+                    tif: if post_only {
+                        "Alo".to_string()
+                    } else {
+                        "Gtc".to_string()
+                    },
                 }),
             },
         };
@@ -948,7 +976,11 @@ impl OrderExecutor for HyperliquidExecutor {
                     sz: spec.new_size,
                     cloid: None,
                     order_type: ClientOrder::Limit(ClientLimit {
-                        tif: "Gtc".to_string(),
+                        tif: if spec.post_only {
+                            "Alo".to_string()
+                        } else {
+                            "Gtc".to_string()
+                        },
                     }),
                 },
             })

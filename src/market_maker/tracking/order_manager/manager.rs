@@ -575,6 +575,18 @@ impl OrderManager {
         self.orders.keys().copied().collect()
     }
 
+    /// Get all ACTIVE order IDs (Resting or PartialFilled only).
+    /// 
+    /// This matches the semantics of `WsOrderStateManager::open_order_ids()` for proper
+    /// comparison in SafetySync. Orders in cancel/filled states are excluded.
+    pub fn active_order_ids(&self) -> std::collections::HashSet<u64> {
+        self.orders
+            .values()
+            .filter(|o| o.is_active())
+            .map(|o| o.oid)
+            .collect()
+    }
+
     /// Check if there are any orders.
     pub fn is_empty(&self) -> bool {
         self.orders.is_empty()

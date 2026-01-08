@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json;
 use alloy::primitives::Address;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, warn};
@@ -1370,35 +1371,73 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             our_orders.iter().map(|o| o.oid).collect();
 
         // Store the latest WS snapshot for use by safety_sync
-        self.last_ws_open_orders_snapshot = Some(ws_open_oids);
+        self.last_ws_open_orders_snapshot = Some(ws_open_oids.clone());
         self.last_ws_snapshot_time = Some(std::time::Instant::now());
 
-        info!(
-            orders = our_orders.len(),
-            "Received OpenOrders snapshot from WebSocket"
-        );
-
-        // Add any orders from the snapshot that we don't already track in ws_state
-        for order in &our_orders {
-            if self.ws_state.get_order(order.oid).is_none() {
-                let side = if order.side == "B" || order.side.to_lowercase() == "buy" {
-                    Side::Buy
-                } else {
-                    Side::Sell
-                };
-                let tracked = TrackedOrder::with_cloid(
-                    order.oid,
-                    order.cloid.clone().unwrap_or_default(),
-                    side,
-                    order.limit_px.parse().unwrap_or(0.0),
-                    order.sz.parse().unwrap_or(0.0),
-                );
-                self.ws_state.add_order(tracked);
-                debug!(
-                    oid = order.oid,
-                    "Added order from OpenOrders snapshot to ws_state"
+        // === Full Synchronization: ws_state should mirror the snapshot ===
+        // Step 1: Get current ws_state OIDs
+        let current_ws_oids = self.ws_state.open_order_ids();
+        
+        // Step 2: Identify orders to REMOVE (in ws_state but NOT in snapshot)
+        let stale_oids: Vec<u64> = current_ws_oids
+            .iter()
+            .filter(|oid| !ws_open_oids.contains(oid))
+            .copied()
+            .collect();
+        
+        // Step 3: Identify orders to ADD (in snapshot but NOT in ws_state)
+        let new_oids: Vec<_> = our_orders
+            .iter()
+            .filter(|o| !current_ws_oids.contains(&o.oid))
+            .collect();
+        
+        // Log sync activity
+        if !stale_oids.is_empty() || !new_oids.is_empty() {
+            info!(
+                snapshot_count = our_orders.len(),
+                ws_state_count = current_ws_oids.len(),
+                removed = stale_oids.len(),
+                added = new_oids.len(),
+                "[OpenOrders] Synchronizing ws_state with exchange snapshot"
+            );
+        } else {
+            debug!(
+                orders = our_orders.len(),
+                "Received OpenOrders snapshot (ws_state already in sync)"
+            );
+        }
+        
+        // Step 4: Remove stale orders from ws_state
+        for oid in &stale_oids {
+            if self.ws_state.remove_order(*oid).is_some() {
+                warn!(
+                    oid = oid,
+                    "[OpenOrders] Removed order from ws_state (not in exchange snapshot)"
                 );
             }
+            // Also clear from orphan tracker if present
+            self.infra.orphan_tracker.clear_orphan(*oid);
+        }
+        
+        // Step 5: Add new orders to ws_state
+        for order in new_oids {
+            let side = if order.side == "B" || order.side.to_lowercase() == "buy" {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let tracked = TrackedOrder::with_cloid(
+                order.oid,
+                order.cloid.clone().unwrap_or_default(),
+                side,
+                order.limit_px.parse().unwrap_or(0.0),
+                order.sz.parse().unwrap_or(0.0),
+            );
+            self.ws_state.add_order(tracked);
+            debug!(
+                oid = order.oid,
+                "Added order from OpenOrders snapshot to ws_state"
+            );
         }
 
         Ok(())
@@ -2388,6 +2427,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     truncated_size,
                     is_buy,
                     cloid,
+                    true, // post_only (ALO)
                 ));
             }
 
@@ -3305,6 +3345,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                 spec.new_size,
                                 spec.is_buy,
                                 Some(cloid.clone()),
+                                true, // post_only
                             )
                             .await;
 
@@ -3478,6 +3519,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
 
         let mut order_specs: Vec<OrderSpec> = Vec::new();
+        let mut cumulative_size = 0.0; // Track cumulative exposure for exchange limits
+        
         for (price, size) in orders {
             if size <= 0.0 {
                 continue;
@@ -3493,7 +3536,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 continue;
             }
 
-            let truncated_size =
+            let mut truncated_size =
                 truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, false);
             if truncated_size <= 0.0 {
                 continue;
@@ -3512,8 +3555,57 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 continue;
             }
 
+            // Exchange limits pre-flight check - prevent orders that would exceed position limits
+            let total_exposure = cumulative_size + truncated_size;
+            let (safe_size, was_clamped, reason) = self
+                .infra
+                .exchange_limits
+                .calculate_safe_order_size(total_exposure, is_buy, self.position.position());
+
+            if safe_size <= cumulative_size {
+                // No additional capacity - skip this level
+                if let Some(reason) = reason {
+                    debug!(
+                        side = %side_str,
+                        price = price,
+                        requested_size = truncated_size,
+                        reason = %reason,
+                        "[PlaceBulk] Order blocked by exchange limits"
+                    );
+                }
+                continue;
+            }
+
+            // Clamp to available capacity if needed
+            let available_for_this = safe_size - cumulative_size;
+            if was_clamped && available_for_this < truncated_size {
+                truncated_size = truncate_float(available_for_this, self.config.sz_decimals, false);
+                if truncated_size <= 0.0 {
+                    continue;
+                }
+                // Re-check notional after clamping
+                let clamped_notional = truncated_size * price;
+                if clamped_notional < MIN_ORDER_NOTIONAL {
+                    continue;
+                }
+                debug!(
+                    side = %side_str,
+                    price = price,
+                    clamped_size = truncated_size,
+                    "[PlaceBulk] Order size clamped by exchange limits"
+                );
+            }
+
+            cumulative_size += truncated_size;
+
             let cloid = uuid::Uuid::new_v4().to_string();
-            order_specs.push(OrderSpec::with_cloid(price, truncated_size, is_buy, cloid));
+            order_specs.push(OrderSpec::with_cloid(
+                price,
+                truncated_size,
+                is_buy,
+                cloid,
+                true, // post_only (ALO)
+            ));
         }
 
         // DIAGNOSTIC: Log how many orders passed filtering
@@ -3896,7 +3988,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let result = self
             .executor
-            .place_order(&self.config.asset, quote.price, adjusted_size, is_buy, None)
+            .place_order(
+                &self.config.asset,
+                quote.price,
+                adjusted_size,
+                is_buy,
+                None,
+                true, // post_only
+            )
             .await;
 
         if result.oid != 0 {
@@ -4077,8 +4176,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "Bulk cancelling {} resting orders (from exchange)...",
                 total_orders
             );
-            self.initiate_bulk_cancel(exchange_oids).await;
-            info!(cancelled = total_orders, "Bulk cancel completed");
+            // IMPORTANT: Call executor DIRECTLY, not initiate_bulk_cancel.
+            // initiate_bulk_cancel filters by OrderManager state, which skips orders
+            // that aren't tracked locally (orphans, race conditions, previous sessions).
+            // At shutdown, we want to cancel ALL orders from the exchange unconditionally.
+            let results = self
+                .executor
+                .cancel_bulk_orders(&self.config.asset, exchange_oids.clone())
+                .await;
+            
+            // Count successes
+            let cancelled_count = results.iter().filter(|r| {
+                matches!(r, CancelResult::Cancelled | CancelResult::AlreadyCancelled | CancelResult::AlreadyFilled)
+            }).count();
+            info!(
+                total = total_orders,
+                cancelled = cancelled_count,
+                "Bulk cancel completed"
+            );
         }
 
         info!("=== GRACEFUL SHUTDOWN COMPLETE ===");
@@ -4126,63 +4241,52 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // === Step 5: Exchange reconciliation ===
-        // PHASE 2 FIX: Use WebSocket snapshot instead of REST API to eliminate race condition.
-        // The WS snapshot is pushed by the exchange and received via the same WebSocket stream
-        // as fills, ensuring consistency between order state and fill events.
-        let exchange_oids: HashSet<u64> = if let Some(ref ws_snapshot) =
-            self.last_ws_open_orders_snapshot
-        {
-            // Use the WS snapshot (authoritative, no race condition)
-            let snapshot_age = self
-                .last_ws_snapshot_time
-                .map(|t| t.elapsed())
-                .unwrap_or(std::time::Duration::from_secs(999));
-
-            if snapshot_age > std::time::Duration::from_secs(30) {
-                warn!(
-                    snapshot_age_secs = snapshot_age.as_secs(),
-                    "[SafetySync] WS OpenOrders snapshot is stale (>30s), reconciliation may be less accurate"
-                );
-            }
-
-            debug!(
-                snapshot_orders = ws_snapshot.len(),
-                snapshot_age_ms = snapshot_age.as_millis(),
-                "[SafetySync] Using WebSocket OpenOrders snapshot (no REST call)"
-            );
-
-            ws_snapshot.clone()
-        } else {
-            // Fallback to REST if no WS snapshot available yet (startup race)
-            warn!("[SafetySync] No WS snapshot available yet, falling back to REST API (one-time on startup)");
-            let exchange_orders = self
-                .info_client
-                .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
-                .await?;
-
-            exchange_orders
-                .iter()
-                .filter(|o| o.coin == *self.config.asset)
-                .map(|o| o.oid)
-                .collect()
-        };
-
-        let local_oids: HashSet<u64> = self.orders.order_ids().into_iter().collect();
-
-        // DIAGNOSTIC: Show orphan/stale counts
-        let potential_orphans = exchange_oids.difference(&local_oids).count();
-        let potential_stale = local_oids.difference(&exchange_oids).count();
+        // TRUST ORDERMANAGER: OrderManager is the source of truth for orders WE placed.
+        // The OpenOrders snapshot lags behind order placements by 500ms-2s, so we should
+        // NEVER use it to remove orders from local tracking. We trust that if we placed
+        // an order and got an OID back, it exists on the exchange.
+        //
+        // The ONLY valid use of OpenOrders snapshot is to detect ORPHANS: orders that
+        // exist on the exchange but we didn't place (from previous sessions, race conditions,
+        // or other sources).
+        
+        let local_oids: HashSet<u64> = self.orders.active_order_ids();
+        
+        // Check if we have a recent snapshot for orphan detection
+        const MAX_SNAPSHOT_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+        let snapshot_age = self.last_ws_snapshot_time
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::MAX);
+        let snapshot_is_fresh = snapshot_age < MAX_SNAPSHOT_AGE;
+        
+        // Get exchange state from snapshot (for orphan detection only)
+        let exchange_oids = self.last_ws_open_orders_snapshot.clone().unwrap_or_default();
+        
+        // For diagnostics - lagging_count is EXPECTED due to snapshot latency
+        let orphan_count = exchange_oids.difference(&local_oids).count();
+        let lagging_count = local_oids.difference(&exchange_oids).count();
+        
         info!(
-            exchange_count = exchange_oids.len(),
             local_count = local_oids.len(),
-            potential_orphans = potential_orphans,
-            potential_stale = potential_stale,
-            is_ws_source = self.last_ws_open_orders_snapshot.is_some(),
-            "[SafetySync] Order sync status"
+            snapshot_count = exchange_oids.len(),
+            snapshot_age_ms = snapshot_age.as_millis(),
+            orphans_in_snapshot = orphan_count,
+            orders_not_in_snapshot = lagging_count,
+            "[SafetySync] Order state (OrderManager is source of truth)"
         );
 
         // Phase 7: Clean up expired entries in orphan tracker
         self.infra.orphan_tracker.cleanup();
+        
+        // Skip orphan cancellation if snapshot is stale or empty
+        if !snapshot_is_fresh || exchange_oids.is_empty() {
+            debug!(
+                snapshot_age_ms = snapshot_age.as_millis(),
+                snapshot_empty = exchange_oids.is_empty(),
+                "[SafetySync] Skipping orphan detection (snapshot stale or empty)"
+            );
+            return Ok(());
+        }
 
         // Cancel orphan orders (on exchange but not tracked locally)
         // Phase 7: Use orphan tracker with grace period instead of immediate cancellation.
@@ -4215,53 +4319,184 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Log each OID for debugging
             for &oid in &aged_orphans {
                 warn!(
-                    "[SafetySync] Orphan order aged past grace period: oid={} - queued for bulk cancel",
+                    "[SafetySync] Orphan order aged past grace period: oid={} - initiating WS verification",
                     oid
                 );
             }
 
-            // Bulk cancel for efficiency (single API call)
-            let cancel_results = self
-                .executor
-                .cancel_bulk_orders(&self.config.asset, aged_orphans.clone())
-                .await;
+            // OPTIMIZATION: Verify orphans via WebSocket Request before cancelling.
+            // This prevents "consuming api requests on submissions that will fail" (Ghost orders).
+            // By fetching a fresh snapshot via WS (Info Request = Unlimited), we can distinguish:
+            // 1. Real Orphans (In Snapshot) -> Send CANCEL (Consumes Action Limit)
+            // 2. Ghost Orders (Not in Snapshot) -> Remove Locally (No Cost)
+            let mut confirmed_orphans = Vec::new();
+            let mut ghost_orphans = Vec::new();
 
-            // Process results and clear from orphan tracking
-            for (oid, result) in aged_orphans.iter().zip(cancel_results.iter()) {
-                safety::SafetyAuditor::log_orphan_cancellation(*oid, result.order_is_gone());
-                self.infra.orphan_tracker.clear_orphan(*oid);
+            // OPTIMIZATION: Verify orphans via WebSocket Request before cancelling.
+            // This prevents "consuming api requests on submissions that will fail" (Ghost orders).
+            // By fetching a fresh snapshot via WS (Info Request = Unlimited), we can distinguish:
+            // 1. Real Orphans (In Snapshot) -> Send CANCEL (Consumes Action Limit)
+            // 2. Ghost Orders (Not in Snapshot) -> Remove Locally (No Cost)
+            
+            // Step 1: Build the request payload
+            use crate::info::info_client::InfoRequest;
+            let payload_result = serde_json::to_value(InfoRequest::OpenOrders {
+                user: self.user_address,
+                dex: None,
+            });
+            
+            let verification_result: Option<Vec<crate::info::response_structs::OpenOrdersResponse>> = match payload_result {
+                Ok(payload) => {
+                    debug!("[SafetySync] Sending WS POST info request for OpenOrders verification");
+                    
+                    // Step 2: Send via WS POST
+                    match self.info_client.ws_post_info(payload, std::time::Duration::from_secs(5)).await {
+                        Ok(response_data) => {
+                            debug!("[SafetySync] WS POST response received, parsing...");
+                            
+                            // Step 3: Extract payload from response
+                            match response_data.response {
+                                crate::ws::message_types::WsPostResponsePayload::Info { payload } => {
+                                    // Step 4: Deserialize to OpenOrdersResponse
+                                    match serde_json::from_value::<Vec<crate::info::response_structs::OpenOrdersResponse>>(payload.clone()) {
+                                        Ok(orders) => {
+                                            info!(
+                                                count = orders.len(),
+                                                "[SafetySync] WS verification successful, got {} orders from exchange",
+                                                orders.len()
+                                            );
+                                            Some(orders)
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                payload = %payload,
+                                                "[SafetySync] Failed to deserialize OpenOrders from WS POST response"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                crate::ws::message_types::WsPostResponsePayload::Error { payload } => {
+                                    warn!(
+                                        error = %payload,
+                                        "[SafetySync] WS POST returned error response"
+                                    );
+                                    None
+                                }
+                                crate::ws::message_types::WsPostResponsePayload::Action { .. } => {
+                                    warn!("[SafetySync] WS POST returned unexpected Action response for Info request");
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "[SafetySync] WS POST info request failed"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "[SafetySync] Failed to serialize InfoRequest payload"
+                    );
+                    None
+                }
+            };
+
+            if let Some(open_orders) = verification_result {
+                // Convert to Set for fast lookup
+                let exchange_oids_set: std::collections::HashSet<u64> = open_orders.iter().map(|o| o.oid).collect();
+
+                for &oid in &aged_orphans {
+                    if exchange_oids_set.contains(&oid) {
+                        confirmed_orphans.push(oid);
+                    } else {
+                        ghost_orphans.push(oid);
+                    }
+                }
+                
+                if !ghost_orphans.is_empty() {
+                    info!(
+                        count = ghost_orphans.len(),
+                        "[SafetySync] Detected {} ghost orders (present in WS state but gone on Exchange). Removing locally without Cancel.",
+                        ghost_orphans.len()
+                    );
+                    
+                    for &oid in &ghost_orphans {
+                        // Remove from tracker
+                        self.infra.orphan_tracker.clear_orphan(oid);
+                        
+                        // Force remove from WS State (Fix synchronization)
+                        if self.ws_state.remove_order(oid).is_some() {
+                             warn!(oid = oid, "[SafetySync] Ghost order removed from ws_state (Verified gone via WS Snapshot)");
+                        }
+                    }
+                }
+            } else {
+                // specific warning if verification failed
+                warn!("[SafetySync] WS Verification failed (timeout/error). Proceeding with bulk cancel for ALL candidates to be safe.");
+                confirmed_orphans = aged_orphans.clone();
+            }
+
+            // Only cancel confirmed orphans
+            if !confirmed_orphans.is_empty() {
+                info!(
+                    count = confirmed_orphans.len(),
+                    "[SafetySync] Bulk cancelling {} CONFIRMED orphan orders",
+                    confirmed_orphans.len()
+                );
+                
+                // Bulk cancel for efficiency (single API call)
+                let cancel_results = self
+                    .executor
+                    .cancel_bulk_orders(&self.config.asset, confirmed_orphans.clone())
+                    .await;
+
+                // Process results and clear from orphan tracking
+                for (oid, result) in confirmed_orphans.iter().zip(cancel_results.iter()) {
+                    safety::SafetyAuditor::log_orphan_cancellation(*oid, result.order_is_gone());
+                    self.infra.orphan_tracker.clear_orphan(*oid);
+
+                    // CRITICAL FIX: If the order is confirmed gone (Cancelled OR AlreadyFilled),
+                    // we MUST remove it from ws_state.
+                    if result.order_is_gone() {
+                        if self.ws_state.remove_order(*oid).is_some() {
+                            warn!(
+                                oid = oid,
+                                "Forced removal from ws_state to correct synchronization (cancel confirmed/filled)"
+                            );
+                        }
+                    }
+                }
+            } else if !ghost_orphans.is_empty() {
+                 info!("[SafetySync] All candidates were ghost orders. No Cancel Actions sent.");
             }
         }
 
-        // Remove stale local orders (tracked but not on exchange)
-        let is_in_cancel_window = |oid: u64| {
-            self.orders
-                .get_order(oid)
-                .map(|o| {
-                    matches!(
-                        o.state,
-                        OrderState::CancelPending | OrderState::CancelConfirmed
-                    )
-                })
-                .unwrap_or(false)
-        };
-        let stale_local = safety::SafetyAuditor::find_stale_local(
-            &exchange_oids,
-            &local_oids,
-            is_in_cancel_window,
-            |oid| {
-                // Keep order if it's less than 5 seconds old (grace period for sync)
-                self.orders
-                    .get_order(oid)
-                    .map(|o| o.placed_at.elapsed() < std::time::Duration::from_secs(5))
-                    .unwrap_or(false)
-            },
-        );
-        for oid in stale_local {
-            safety::SafetyAuditor::log_stale_removal(oid);
-            self.orders.remove_order(oid);
-            self.tier1.queue_tracker.order_removed(oid);
-        }
+        // DISABLED: Stale local order removal.
+        // 
+        // This was the ROOT CAUSE of the state mismatch bug. The logic was:
+        // "If order is in local but not in snapshot → it's stale → remove it"
+        // 
+        // But the OpenOrders snapshot LAGS order placements by 1-5 seconds!
+        // So this was DELETING valid orders that simply hadn't appeared in the snapshot yet.
+        // 
+        // TRUST ORDERMANAGER: If we placed an order and got an OID back, it exists.
+        // The snapshot not having it is expected latency, not a problem.
+        //
+        // The ONLY time to remove from OrderManager is:
+        // 1. When we get a fill confirmation (order filled)
+        // 2. When we get a cancel confirmation (order cancelled)
+        // 3. Never based on snapshot absence
+        //
+        // Keeping this code commented for reference:
+        // let stale_local = safety::SafetyAuditor::find_stale_local(...);
+        // for oid in stale_local { self.orders.remove_order(oid); }
 
         // Log sync status
         let active_local_oids: HashSet<u64> = self
@@ -4824,6 +5059,7 @@ fn partition_ladder_actions(
                     new_price: *new_price,
                     new_size: *new_size,
                     is_buy,
+                    post_only: true, // ALO on modify
                 });
             }
             LadderAction::Place { price, size, .. } => {

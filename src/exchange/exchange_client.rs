@@ -15,7 +15,7 @@ use alloy::{
     primitives::{keccak256, Address, Signature, B256},
     signers::local::PrivateKeySigner,
 };
-use log::debug;
+use tracing::{debug, error, warn};
 use reqwest::Client;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 
@@ -383,29 +383,60 @@ impl ExchangeClient {
                         .await
                     {
                         Ok(response) => {
-                            debug!("WS POST successful");
                             // Parse the WS response into ExchangeResponseStatus
                             match response.response {
                                 WsPostResponsePayload::Action { payload } => {
-                                    // The payload contains {"status":"ok","response":{...}}
-                                    return serde_json::from_value(payload)
-                                        .map_err(|e| Error::JsonParse(e.to_string()));
+                                    // DIAGNOSTIC: Log the raw payload for debugging cancel/modify issues
+                                    let action_type = payload
+                                        .get("response")
+                                        .and_then(|r| r.get("type"))
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("unknown");
+                                    
+                                    debug!(
+                                        action_type = %action_type,
+                                        "WS POST successful - attempting to parse response"
+                                    );
+                                    
+                                    // Attempt to parse and log failures with full context
+                                    match serde_json::from_value::<ExchangeResponseStatus>(payload.clone()) {
+                                        Ok(status) => {
+                                            debug!(
+                                                action_type = %action_type,
+                                                "WS POST response parsed successfully"
+                                            );
+                                            return Ok(status);
+                                        }
+                                        Err(e) => {
+                                            // DIAGNOSTIC: Log parse failure with full payload
+                                            error!(
+                                                error = %e,
+                                                action_type = %action_type,
+                                                payload = %serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "serialize_failed".to_string()),
+                                                "WS POST parse failed - falling back to REST. This may indicate a response format mismatch."
+                                            );
+                                            // Fall through to REST
+                                        }
+                                    }
                                 }
                                 WsPostResponsePayload::Error { payload } => {
-                                    debug!(
-                                        "WS POST returned error: {}, falling back to REST",
-                                        payload
+                                    warn!(
+                                        error = %payload,
+                                        "WS POST returned error response, falling back to REST"
                                     );
                                     // Fall through to REST
                                 }
                                 WsPostResponsePayload::Info { .. } => {
-                                    debug!("WS POST returned unexpected info response, falling back to REST");
+                                    warn!("WS POST returned unexpected info response, falling back to REST");
                                     // Fall through to REST
                                 }
                             }
                         }
                         Err(e) => {
-                            debug!("WS POST failed: {}, falling back to REST", e);
+                            warn!(
+                                error = %e,
+                                "WS POST request failed, falling back to REST"
+                            );
                             // Fall through to REST
                         }
                     }

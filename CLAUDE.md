@@ -719,3 +719,21 @@ curl -s localhost:9090/metrics | grep -E "(mm_position|mm_spread_bps|mm_daily_pn
 - [Hyperliquid Docs](https://hyperliquid.gitbook.io/) - Exchange API reference
 - [GLFT Paper](https://arxiv.org/abs/1105.3115) - Optimal market making theory
 - `.serena/memories/` - Session memories and design documents
+
+---
+
+## Empirical Verification
+
+**"Real validation through actual tests with data."**
+
+When exploring complex behaviors, API interactions, or verifying fixes, do not rely solely on unit tests or theoretical code analysis. Create dedicated diagnostic binaries to validate hypotheses against the live environment (Testnet).
+
+**Workflow:**
+1. **Identify the Hypothesis**: Defined clearly (e.g., "Are orders actually Post-Only?").
+2. **Create Diagnostic Binary**: Create a focused binary in `src/bin/` (e.g., `src/bin/verify_alo.rs`) that:
+   - Connects to the exchange (Testnet).
+   - Performs specific read/write operations.
+   - Outputs raw data confirming or disproving the hypothesis.
+3. **Execute**: Run against the live network.
+4. **Analyze**: Check if we "see what we are suspecting".
+5. **Troubleshoot**: If results differ from expectations, investigate based on the *actual data*.

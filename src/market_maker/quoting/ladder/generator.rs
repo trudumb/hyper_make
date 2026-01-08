@@ -110,6 +110,8 @@ impl Ladder {
             params.hjb_drift_urgency,
             params.position_opposes_momentum,
             params.urgency_score,
+            params.funding_rate,
+            params.use_funding_skew,
         );
 
         ladder
@@ -216,6 +218,8 @@ impl Ladder {
             params.hjb_drift_urgency,
             params.position_opposes_momentum,
             params.urgency_score,
+            params.funding_rate,
+            params.use_funding_skew,
         );
 
         ladder
@@ -726,6 +730,8 @@ pub(crate) fn apply_inventory_skew_with_drift(
     hjb_drift_urgency: f64,
     position_opposes_momentum: bool,
     urgency_score: f64,
+    funding_rate: f64,
+    use_funding_skew: bool,
 ) {
     // === BASE INVENTORY SKEW (GLFT) ===
     // Reservation price offset: γσ²qT (as fraction of mid)
@@ -782,11 +788,22 @@ pub(crate) fn apply_inventory_skew_with_drift(
             0.0
         };
 
-    // === COMBINED SKEW ===
-    let total_skew_fraction = base_skew_fraction + drift_skew_fraction;
+    // === FUNDING SKEW ===
+    // Account for cost of carry over the holding horizon.
+    // If funding > 0: Longs pay shorts. Asset effectively depreciates by funding_rate * T relative to cash.
+    // skew = -funding_rate * T
+    // This lowers bids and asks, encouraging selling (to avoid paying funding) and buying lower.
+    let funding_skew_fraction = if use_funding_skew {
+        -funding_rate * time_horizon
+    } else {
+        0.0
+    };
 
-    // Early return only if there's no inventory AND no drift adjustment
-    if inventory_ratio.abs() < EPSILON && drift_skew_fraction.abs() < EPSILON {
+    // === COMBINED SKEW ===
+    let total_skew_fraction = base_skew_fraction + drift_skew_fraction + funding_skew_fraction;
+
+    // Early return only if there's no inventory AND no drift/funding adjustment
+    if inventory_ratio.abs() < EPSILON && drift_skew_fraction.abs() < EPSILON && funding_skew_fraction.abs() < EPSILON {
         return;
     }
 

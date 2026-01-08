@@ -219,6 +219,22 @@ impl InfoClient {
             .await
     }
 
+    /// Ensure the WebSocket connection is established.
+    ///
+    /// This is useful for clients that only use WS POST (no subscriptions)
+    /// but need the connection to be active.
+    pub async fn ensure_connected(&mut self) -> Result<()> {
+        if self.ws_manager.is_none() {
+            let ws_manager = WsManager::new(
+                format!("ws{}/ws", &self.http_client.base_url[4..]),
+                self.reconnect,
+            )
+            .await?;
+            self.ws_manager = Some(ws_manager);
+        }
+        Ok(())
+    }
+
     async fn send_info_request<T: for<'a> Deserialize<'a>>(
         &self,
         info_request: InfoRequest,

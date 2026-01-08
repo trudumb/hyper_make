@@ -852,6 +852,16 @@ curl -s localhost:9090/metrics | grep mm_data_staleness
 | `AssetNotFound` | Invalid asset | Check spelling, use --dex for HIP-3 |
 | `DexNotFound` | Invalid HIP-3 DEX | Run --list-dexs |
 
+### 9.5 Diagnostic Verification
+
+For complex issues that cannot be reproduced in unit tests, create and run ad-hoc diagnostic binaries against Testnet.
+
+**Process:**
+1. Create `src/bin/debug_issue.rs`
+2. Implement specific API queries or order flows
+3. Run: `cargo run --bin debug_issue`
+4. Analyze real-world behavior to confirm hypotheses with actual data.
+
 ---
 
 ## 10. Emergency Procedures
