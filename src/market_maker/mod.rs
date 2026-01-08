@@ -2775,39 +2775,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "EMPTY LADDER DETECTED - forcing immediate replenishment (bypassing all checks)"
             );
 
-            // Place all target orders directly
-            let mut order_specs = Vec::new();
-            for level in &bid_levels {
-                order_specs.push(OrderSpec::new(level.price, level.size, true)); // is_buy=true
+            // Delegate to place_bulk_ladder_orders for proper CLOID tracking
+            // This prevents orphan orders by using the pending registration flow
+            let bid_places: Vec<(f64, f64)> = bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let ask_places: Vec<(f64, f64)> = ask_levels.iter().map(|l| (l.price, l.size)).collect();
+
+            let mut placed_count = 0usize;
+            if !bid_places.is_empty() {
+                placed_count += bid_places.len();
+                self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
             }
-            for level in &ask_levels {
-                order_specs.push(OrderSpec::new(level.price, level.size, false)); // is_buy=false
+            if !ask_places.is_empty() {
+                placed_count += ask_places.len();
+                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
             }
 
-            if !order_specs.is_empty() {
-                let results = self
-                    .executor
-                    .place_bulk_orders(&self.config.asset, order_specs.clone())
-                    .await;
-
-                let mut placed_count = 0usize;
-                for (spec, result) in order_specs.iter().zip(results.iter()) {
-                    if result.oid != 0 {
-                        let oid = result.oid;
-                        let side = if spec.is_buy { Side::Buy } else { Side::Sell };
-                        let tracked = TrackedOrder::new(oid, side, spec.price, spec.size);
-                        self.orders.add_order(tracked.clone());
-                        self.ws_state.add_order(tracked);
-                        placed_count += 1;
-                    }
-                }
-
-                info!(
-                    placed = placed_count,
-                    target = order_specs.len(),
-                    "[Reconcile] Empty ladder recovery complete"
-                );
-            }
+            info!(
+                placed = placed_count,
+                "[Reconcile] Empty ladder recovery complete"
+            );
 
             // Skip normal reconciliation since we just replenished
             return Ok(());
@@ -2874,39 +2860,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 );
             }
 
-            // Place all target orders as new
-            let mut order_specs = Vec::new();
-            for level in &bid_levels {
-                order_specs.push(OrderSpec::new(level.price, level.size, true));
-                // is_buy=true
+            // Delegate to place_bulk_ladder_orders for proper CLOID tracking
+            // This prevents orphan orders by using the pending registration flow
+            let bid_places: Vec<(f64, f64)> = bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let ask_places: Vec<(f64, f64)> = ask_levels.iter().map(|l| (l.price, l.size)).collect();
+
+            if !bid_places.is_empty() {
+                self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
             }
-            for level in &ask_levels {
-                order_specs.push(OrderSpec::new(level.price, level.size, false));
-                // is_buy=false
+            if !ask_places.is_empty() {
+                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
             }
 
-            if !order_specs.is_empty() {
-                let results = self
-                    .executor
-                    .place_bulk_orders(&self.config.asset, order_specs.clone())
-                    .await;
-
-                // Track the new orders
-                for (spec, result) in order_specs.iter().zip(results.iter()) {
-                    if result.oid != 0 {
-                        let oid = result.oid;
-                        let side = if spec.is_buy { Side::Buy } else { Side::Sell };
-                        let tracked = TrackedOrder::new(oid, side, spec.price, spec.size);
-                        self.orders.add_order(tracked.clone());
-                        self.ws_state.add_order(tracked);
-                    }
-                }
-
-                info!(
-                    placed = order_specs.len(),
-                    "[Reconcile] Placed new orders after drift correction"
-                );
-            }
+            info!(
+                bid_targets = bid_levels.len(),
+                ask_targets = ask_levels.len(),
+                "[Reconcile] Placed new orders after drift correction"
+            );
 
             // Skip normal reconciliation since we did a full replace
             return Ok(());
@@ -3134,7 +3104,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Execute cancels first (bulk cancel is efficient)
         let all_cancels: Vec<u64> = bid_cancels.into_iter().chain(ask_cancels).collect();
         if !all_cancels.is_empty() {
-            self.initiate_bulk_cancel(all_cancels).await;
+            self.initiate_bulk_cancel(all_cancels.clone()).await;
+            // Sync ws_state by removing cancelled orders
+            for oid in &all_cancels {
+                self.ws_state.remove_order(*oid);
+            }
         }
 
         // Execute modifies (preserves queue position)
