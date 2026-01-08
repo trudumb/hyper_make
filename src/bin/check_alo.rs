@@ -1,5 +1,4 @@
 use std::env;
-use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
