@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json;
 use alloy::primitives::Address;
+use serde_json;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{debug, error, info, warn};
 
@@ -154,6 +154,10 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Local cache of spot balances (coin -> balance).
     /// Initialized via REST, updated via WebSocket ledger updates.
     spot_balance_cache: std::collections::HashMap<String, f64>,
+
+    /// Tracks whether we're in high risk state to avoid log spam.
+    /// Only logs transitions (normal → high risk, high risk → normal).
+    last_high_risk_state: bool,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -270,6 +274,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_active_asset_data_time: None,
             last_web_data2_time: None,
             spot_balance_cache: std::collections::HashMap::new(),
+            last_high_risk_state: false,
         }
     }
 
@@ -1377,20 +1382,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // === Full Synchronization: ws_state should mirror the snapshot ===
         // Step 1: Get current ws_state OIDs
         let current_ws_oids = self.ws_state.open_order_ids();
-        
+
         // Step 2: Identify orders to REMOVE (in ws_state but NOT in snapshot)
         let stale_oids: Vec<u64> = current_ws_oids
             .iter()
             .filter(|oid| !ws_open_oids.contains(oid))
             .copied()
             .collect();
-        
+
         // Step 3: Identify orders to ADD (in snapshot but NOT in ws_state)
         let new_oids: Vec<_> = our_orders
             .iter()
             .filter(|o| !current_ws_oids.contains(&o.oid))
             .collect();
-        
+
         // Log sync activity
         if !stale_oids.is_empty() || !new_oids.is_empty() {
             info!(
@@ -1406,11 +1411,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "Received OpenOrders snapshot (ws_state already in sync)"
             );
         }
-        
+
         // Step 4: Remove stale orders from ws_state
+        let mut removed_count = 0usize;
         for oid in &stale_oids {
             if self.ws_state.remove_order(*oid).is_some() {
-                warn!(
+                removed_count += 1;
+                debug!(
                     oid = oid,
                     "[OpenOrders] Removed order from ws_state (not in exchange snapshot)"
                 );
@@ -1418,7 +1425,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Also clear from orphan tracker if present
             self.infra.orphan_tracker.clear_orphan(*oid);
         }
-        
+        // Log summary at INFO level if any were removed
+        if removed_count > 0 {
+            info!(
+                removed_count = removed_count,
+                "[OpenOrders] Cleaned up stale orders from ws_state"
+            );
+        }
+
         // Step 5: Add new orders to ws_state
         for order in new_oids {
             let side = if order.side == "B" || order.side.to_lowercase() == "buy" {
@@ -1893,9 +1907,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Default ladder has 25 levels - this constant is used for sizing only
         const DEFAULT_NUM_LEVELS: usize = 25;
         market_params.compute_derived_target_liquidity(
-            self.config.risk_aversion,              // User preference (γ)
-            DEFAULT_NUM_LEVELS,                     // Ladder config (default 25 levels)
-            MIN_ORDER_NOTIONAL,                     // Exchange minimum ($10)
+            self.config.risk_aversion, // User preference (γ)
+            DEFAULT_NUM_LEVELS,        // Ladder config (default 25 levels)
+            MIN_ORDER_NOTIONAL,        // Exchange minimum ($10)
         );
 
         // CRITICAL: Update cached effective max_position from first principles
@@ -1932,8 +1946,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             market_params
                 .derived_target_liquidity
                 .min(self.config.target_liquidity) // User cap
-                .max(min_viable_liquidity)         // Exchange minimum
-                .min(self.effective_max_position)  // Position limit
+                .max(min_viable_liquidity) // Exchange minimum
+                .min(self.effective_max_position) // Position limit
         } else {
             // Fallback: use config (warmup or zero account_value)
             self.config
@@ -2797,18 +2811,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // If ws_* differs from local_*, there's a state synchronization issue
         let ws_bids = self.ws_state.get_orders_by_side(Side::Buy);
         let ws_asks = self.ws_state.get_orders_by_side(Side::Sell);
-        
+
         // Format order details as "price@size" for compact logging
         let format_orders = |orders: &[&TrackedOrder]| -> String {
             let mut sorted: Vec<_> = orders.iter().collect();
-            sorted.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.sort_by(|a, b| {
+                b.price
+                    .partial_cmp(&a.price)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             sorted
                 .iter()
                 .map(|o| format!("{:.4}@{:.4}", o.price, o.size))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        
+
         let format_levels = |levels: &[LadderLevel]| -> String {
             levels
                 .iter()
@@ -2816,7 +2834,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        
+
         info!(
             local_bids = current_bids.len(),
             local_asks = current_asks.len(),
@@ -2826,18 +2844,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             target_ask_levels = ask_levels.len(),
             "[Reconcile] Order counts (local vs exchange)"
         );
-        
+
         // Log detailed order levels for debugging price/size discrepancies
+        // Note: Use 'ladder' instead of 'target' to avoid collision with tracing's target field
         info!(
             local = %format_orders(&current_bids),
             ws = %format_orders(&ws_bids),
-            target = %format_levels(&bid_levels),
+            ladder = %format_levels(&bid_levels),
             "[Reconcile] BID levels (price@size)"
         );
         info!(
             local = %format_orders(&current_asks),
             ws = %format_orders(&ws_asks),
-            target = %format_levels(&ask_levels),
+            ladder = %format_levels(&ask_levels),
             "[Reconcile] ASK levels (price@size)"
         );
 
@@ -2857,8 +2876,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Delegate to place_bulk_ladder_orders for proper CLOID tracking
             // This prevents orphan orders by using the pending registration flow
-            let bid_places: Vec<(f64, f64)> = bid_levels.iter().map(|l| (l.price, l.size)).collect();
-            let ask_places: Vec<(f64, f64)> = ask_levels.iter().map(|l| (l.price, l.size)).collect();
+            let bid_places: Vec<(f64, f64)> =
+                bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let ask_places: Vec<(f64, f64)> =
+                ask_levels.iter().map(|l| (l.price, l.size)).collect();
 
             let mut placed_count = 0usize;
             if !bid_places.is_empty() {
@@ -2867,7 +2888,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
             if !ask_places.is_empty() {
                 placed_count += ask_places.len();
-                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+                self.place_bulk_ladder_orders(Side::Sell, ask_places)
+                    .await?;
             }
 
             info!(
@@ -2942,14 +2964,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Delegate to place_bulk_ladder_orders for proper CLOID tracking
             // This prevents orphan orders by using the pending registration flow
-            let bid_places: Vec<(f64, f64)> = bid_levels.iter().map(|l| (l.price, l.size)).collect();
-            let ask_places: Vec<(f64, f64)> = ask_levels.iter().map(|l| (l.price, l.size)).collect();
+            let bid_places: Vec<(f64, f64)> =
+                bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let ask_places: Vec<(f64, f64)> =
+                ask_levels.iter().map(|l| (l.price, l.size)).collect();
 
             if !bid_places.is_empty() {
                 self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
             }
             if !ask_places.is_empty() {
-                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+                self.place_bulk_ladder_orders(Side::Sell, ask_places)
+                    .await?;
             }
 
             info!(
@@ -2969,17 +2994,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if impulse_enabled {
             use crate::market_maker::core::CachedRateLimit;
             use std::time::Duration;
-            
+
             // Refresh rate limit cache if stale (every 60 seconds)
             let cache_max_age = Duration::from_secs(60);
-            let should_refresh = self.infra.cached_rate_limit
+            let should_refresh = self
+                .infra
+                .cached_rate_limit
                 .as_ref()
                 .is_none_or(|c| c.is_stale(cache_max_age));
-            
+
             if should_refresh {
                 match self.info_client.user_rate_limit(self.user_address).await {
                     Ok(response) => {
-                        self.infra.cached_rate_limit = Some(CachedRateLimit::from_response(&response));
+                        self.infra.cached_rate_limit =
+                            Some(CachedRateLimit::from_response(&response));
                         debug!(
                             used = response.n_requests_used,
                             cap = response.n_requests_cap,
@@ -2995,7 +3023,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     }
                 }
             }
-            
+
             // Only throttle if headroom < 5% (approaching rate limit)
             if let Some(ref cache) = self.infra.cached_rate_limit {
                 let headroom = cache.headroom_pct();
@@ -3013,7 +3041,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Generate actions for each side using priority-based matching (default)
         // Fallback paths kept for legacy compatibility but not used
-        
+
         // DIAGNOSTIC: Checkpoint to verify we reach this point
         info!(
             local_bids = current_bids.len(),
@@ -3025,26 +3053,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             impulse_enabled = impulse_enabled,
             "[Reconcile] Checkpoint: passed drift and impulse checks"
         );
-        
+
         // === PRIORITY-BASED MATCHING (DEFAULT) ===
         // Uses stochastic optimal spread to derive matching thresholds
         // Ensures best bid/ask levels are always covered first
-        
+
         // Get sigma from queue tracker (updated from book data)
         let sigma = self.tier1.queue_tracker.sigma();
-        
+
         // Use conservative gamma/kappa until we have market params cached
         // TODO: Cache actual gamma/kappa from ladder strategy in per-cycle state
-        let gamma = 0.1;  // Conservative default
-        let kappa = 1500.0;  // Typical for liquid perps
-        
+        let gamma = 0.1; // Conservative default
+        let kappa = 1500.0; // Typical for liquid perps
+
         let dynamic_config = DynamicReconcileConfig::from_market_params(
             gamma,
             kappa,
             sigma,
             reconcile_config.queue_horizon_seconds,
         );
-        
+
         info!(
             sigma = %format!("{:.6}", sigma),
             optimal_spread_bps = %format!("{:.2}", dynamic_config.optimal_spread_bps),
@@ -3052,7 +3080,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             outer_tolerance_bps = %format!("{:.2}", dynamic_config.outer_level_tolerance_bps),
             "[Reconcile] Priority-based matching with dynamic thresholds"
         );
-        
+
         let bid_acts = priority_based_matching(
             &current_bids,
             &bid_levels,
@@ -3060,7 +3088,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &dynamic_config,
             Some(&self.tier1.queue_tracker),
         );
-        
+
         let ask_acts = priority_based_matching(
             &current_asks,
             &ask_levels,
@@ -3068,9 +3096,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &dynamic_config,
             Some(&self.tier1.queue_tracker),
         );
-        
-        let (mut bid_actions, bid_stats, mut ask_actions, ask_stats): (Vec<LadderAction>, Option<ReconcileStats>, Vec<LadderAction>, Option<ReconcileStats>) = (bid_acts, None, ask_acts, None);
-        
+
+        let (mut bid_actions, bid_stats, mut ask_actions, ask_stats): (
+            Vec<LadderAction>,
+            Option<ReconcileStats>,
+            Vec<LadderAction>,
+            Option<ReconcileStats>,
+        ) = (bid_acts, None, ask_acts, None);
+
         // Track impulse stats for metrics (priority_based_matching doesn't produce stats)
         let _impulse_stats = (bid_stats, ask_stats);
 
@@ -3166,7 +3199,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let _total_skips = (current_bids.len() + current_asks.len()).saturating_sub(
             bid_cancels.len() + bid_modifies.len() + ask_cancels.len() + ask_modifies.len(),
         );
-        
+
         // DIAGNOSTIC: Always log reconciliation results at INFO level to debug order placement issues
         // This helps identify if Place actions are generated but silently dropped
         info!(
@@ -3551,16 +3584,48 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let is_buy = side == Side::Buy;
         let side_str = if is_buy { "bid" } else { "ask" };
         let input_count = orders.len();
-        
+
+        // FIX: Get total available capacity from exchange limits UPFRONT
+        // This is the key fix - we track remaining capacity directly instead of
+        // using calculate_safe_order_size which doesn't handle cumulative properly
+        //
+        // CRITICAL: Also check is_initialized() - if not initialized, the available_buy/sell
+        // values will be f64::MAX, which would pass all orders through without any filtering.
+        let limits_initialized = self.infra.exchange_limits.is_initialized();
+        let total_available = if !limits_initialized {
+            // Not initialized - be conservative and block all orders
+            // This prevents mass rejections when we don't know actual limits
+            0.0
+        } else if is_buy {
+            self.infra.exchange_limits.available_buy()
+        } else {
+            self.infra.exchange_limits.available_sell()
+        };
+
         info!(
             side = %side_str,
             input_orders = input_count,
+            total_available = %format!("{:.6}", total_available),
+            limits_initialized = limits_initialized,
             "[PlaceBulk] Entering place_bulk_ladder_orders"
         );
 
+        // EARLY EXIT: No capacity at all OR limits not initialized
+        if total_available < EPSILON {
+            warn!(
+                side = %side_str,
+                available = %format!("{:.6}", total_available),
+                requested_orders = input_count,
+                limits_initialized = limits_initialized,
+                "[PlaceBulk] Skipping ALL orders: no exchange capacity or limits not initialized"
+            );
+            return Ok(());
+        }
+
         let mut order_specs: Vec<OrderSpec> = Vec::new();
         let mut cumulative_size = 0.0; // Track cumulative exposure for exchange limits
-        
+        let mut orders_blocked_by_capacity = 0usize;
+
         for (price, size) in orders {
             if size <= 0.0 {
                 continue;
@@ -3595,44 +3660,46 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 continue;
             }
 
-            // Exchange limits pre-flight check - prevent orders that would exceed position limits
-            let total_exposure = cumulative_size + truncated_size;
-            let (safe_size, was_clamped, reason) = self
-                .infra
-                .exchange_limits
-                .calculate_safe_order_size(total_exposure, is_buy, self.position.position());
+            // FIX: Exchange limits pre-flight check using REMAINING capacity
+            // Compare directly against remaining capacity instead of calling
+            // calculate_safe_order_size which doesn't understand cumulative tracking
+            let remaining_capacity = total_available - cumulative_size;
 
-            if safe_size <= cumulative_size {
-                // No additional capacity - skip this level
-                if let Some(reason) = reason {
-                    debug!(
-                        side = %side_str,
-                        price = price,
-                        requested_size = truncated_size,
-                        reason = %reason,
-                        "[PlaceBulk] Order blocked by exchange limits"
-                    );
-                }
+            if remaining_capacity < EPSILON {
+                // No more capacity - skip all remaining orders
+                orders_blocked_by_capacity += 1;
+                debug!(
+                    side = %side_str,
+                    price = price,
+                    requested_size = truncated_size,
+                    cumulative = cumulative_size,
+                    total_available = total_available,
+                    "[PlaceBulk] Order blocked: no remaining capacity"
+                );
                 continue;
             }
 
-            // Clamp to available capacity if needed
-            let available_for_this = safe_size - cumulative_size;
-            if was_clamped && available_for_this < truncated_size {
-                truncated_size = truncate_float(available_for_this, self.config.sz_decimals, false);
+            // Clamp to remaining capacity if needed
+            if truncated_size > remaining_capacity {
+                let old_size = truncated_size;
+                truncated_size = truncate_float(remaining_capacity, self.config.sz_decimals, false);
                 if truncated_size <= 0.0 {
+                    orders_blocked_by_capacity += 1;
                     continue;
                 }
                 // Re-check notional after clamping
                 let clamped_notional = truncated_size * price;
                 if clamped_notional < MIN_ORDER_NOTIONAL {
+                    orders_blocked_by_capacity += 1;
                     continue;
                 }
                 debug!(
                     side = %side_str,
                     price = price,
+                    original_size = old_size,
                     clamped_size = truncated_size,
-                    "[PlaceBulk] Order size clamped by exchange limits"
+                    remaining_capacity = remaining_capacity,
+                    "[PlaceBulk] Order size clamped to remaining capacity"
                 );
             }
 
@@ -3654,6 +3721,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             input_orders = input_count,
             orders_passed_filter = order_specs.len(),
             orders_filtered_out = input_count - order_specs.len(),
+            orders_blocked_by_capacity = orders_blocked_by_capacity,
+            cumulative_size = %format!("{:.6}", cumulative_size),
+            total_available = %format!("{:.6}", total_available),
             "[PlaceBulk] Order filtering complete"
         );
 
@@ -4224,11 +4294,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .executor
                 .cancel_bulk_orders(&self.config.asset, exchange_oids.clone())
                 .await;
-            
+
             // Count successes
-            let cancelled_count = results.iter().filter(|r| {
-                matches!(r, CancelResult::Cancelled | CancelResult::AlreadyCancelled | CancelResult::AlreadyFilled)
-            }).count();
+            let cancelled_count = results
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        CancelResult::Cancelled
+                            | CancelResult::AlreadyCancelled
+                            | CancelResult::AlreadyFilled
+                    )
+                })
+                .count();
             info!(
                 total = total_orders,
                 cancelled = cancelled_count,
@@ -4289,23 +4367,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // The ONLY valid use of OpenOrders snapshot is to detect ORPHANS: orders that
         // exist on the exchange but we didn't place (from previous sessions, race conditions,
         // or other sources).
-        
+
         let local_oids: HashSet<u64> = self.orders.active_order_ids();
-        
+
         // Check if we have a recent snapshot for orphan detection
         const MAX_SNAPSHOT_AGE: std::time::Duration = std::time::Duration::from_secs(10);
-        let snapshot_age = self.last_ws_snapshot_time
+        let snapshot_age = self
+            .last_ws_snapshot_time
             .map(|t| t.elapsed())
             .unwrap_or(std::time::Duration::MAX);
         let snapshot_is_fresh = snapshot_age < MAX_SNAPSHOT_AGE;
-        
+
         // Get exchange state from snapshot (for orphan detection only)
-        let exchange_oids = self.last_ws_open_orders_snapshot.clone().unwrap_or_default();
-        
+        let exchange_oids = self
+            .last_ws_open_orders_snapshot
+            .clone()
+            .unwrap_or_default();
+
         // For diagnostics - lagging_count is EXPECTED due to snapshot latency
         let orphan_count = exchange_oids.difference(&local_oids).count();
         let lagging_count = local_oids.difference(&exchange_oids).count();
-        
+
         info!(
             local_count = local_oids.len(),
             snapshot_count = exchange_oids.len(),
@@ -4317,7 +4399,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Phase 7: Clean up expired entries in orphan tracker
         self.infra.orphan_tracker.cleanup();
-        
+
         // Skip orphan cancellation if snapshot is stale or empty
         if !snapshot_is_fresh || exchange_oids.is_empty() {
             debug!(
@@ -4377,28 +4459,39 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // By fetching a fresh snapshot via WS (Info Request = Unlimited), we can distinguish:
             // 1. Real Orphans (In Snapshot) -> Send CANCEL (Consumes Action Limit)
             // 2. Ghost Orders (Not in Snapshot) -> Remove Locally (No Cost)
-            
+
             // Step 1: Build the request payload
             use crate::info::info_client::InfoRequest;
             let payload_result = serde_json::to_value(InfoRequest::OpenOrders {
                 user: self.user_address,
                 dex: None,
             });
-            
-            let verification_result: Option<Vec<crate::info::response_structs::OpenOrdersResponse>> = match payload_result {
+
+            let verification_result: Option<
+                Vec<crate::info::response_structs::OpenOrdersResponse>,
+            > = match payload_result {
                 Ok(payload) => {
                     debug!("[SafetySync] Sending WS POST info request for OpenOrders verification");
-                    
+
                     // Step 2: Send via WS POST
-                    match self.info_client.ws_post_info(payload, std::time::Duration::from_secs(5)).await {
+                    match self
+                        .info_client
+                        .ws_post_info(payload, std::time::Duration::from_secs(5))
+                        .await
+                    {
                         Ok(response_data) => {
                             debug!("[SafetySync] WS POST response received, parsing...");
-                            
+
                             // Step 3: Extract payload from response
                             match response_data.response {
-                                crate::ws::message_types::WsPostResponsePayload::Info { payload } => {
+                                crate::ws::message_types::WsPostResponsePayload::Info {
+                                    payload,
+                                } => {
                                     // Step 4: Deserialize to OpenOrdersResponse
-                                    match serde_json::from_value::<Vec<crate::info::response_structs::OpenOrdersResponse>>(payload.clone()) {
+                                    match serde_json::from_value::<
+                                        Vec<crate::info::response_structs::OpenOrdersResponse>,
+                                    >(payload.clone())
+                                    {
                                         Ok(orders) => {
                                             info!(
                                                 count = orders.len(),
@@ -4417,14 +4510,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                         }
                                     }
                                 }
-                                crate::ws::message_types::WsPostResponsePayload::Error { payload } => {
+                                crate::ws::message_types::WsPostResponsePayload::Error {
+                                    payload,
+                                } => {
                                     warn!(
                                         error = %payload,
                                         "[SafetySync] WS POST returned error response"
                                     );
                                     None
                                 }
-                                crate::ws::message_types::WsPostResponsePayload::Action { .. } => {
+                                crate::ws::message_types::WsPostResponsePayload::Action {
+                                    ..
+                                } => {
                                     warn!("[SafetySync] WS POST returned unexpected Action response for Info request");
                                     None
                                 }
@@ -4450,7 +4547,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             if let Some(open_orders) = verification_result {
                 // Convert to Set for fast lookup
-                let exchange_oids_set: std::collections::HashSet<u64> = open_orders.iter().map(|o| o.oid).collect();
+                let exchange_oids_set: std::collections::HashSet<u64> =
+                    open_orders.iter().map(|o| o.oid).collect();
 
                 for &oid in &aged_orphans {
                     if exchange_oids_set.contains(&oid) {
@@ -4459,21 +4557,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         ghost_orphans.push(oid);
                     }
                 }
-                
+
                 if !ghost_orphans.is_empty() {
                     info!(
                         count = ghost_orphans.len(),
                         "[SafetySync] Detected {} ghost orders (present in WS state but gone on Exchange). Removing locally without Cancel.",
                         ghost_orphans.len()
                     );
-                    
+
                     for &oid in &ghost_orphans {
                         // Remove from tracker
                         self.infra.orphan_tracker.clear_orphan(oid);
-                        
+
                         // Force remove from WS State (Fix synchronization)
                         if self.ws_state.remove_order(oid).is_some() {
-                             warn!(oid = oid, "[SafetySync] Ghost order removed from ws_state (Verified gone via WS Snapshot)");
+                            warn!(oid = oid, "[SafetySync] Ghost order removed from ws_state (Verified gone via WS Snapshot)");
                         }
                     }
                 }
@@ -4490,7 +4588,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "[SafetySync] Bulk cancelling {} CONFIRMED orphan orders",
                     confirmed_orphans.len()
                 );
-                
+
                 // Bulk cancel for efficiency (single API call)
                 let cancel_results = self
                     .executor
@@ -4504,9 +4602,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // CRITICAL FIX: If the order is confirmed gone (Cancelled OR AlreadyFilled),
                     // we MUST remove it from ws_state.
-                    if result.order_is_gone()
-                        && self.ws_state.remove_order(*oid).is_some()
-                    {
+                    if result.order_is_gone() && self.ws_state.remove_order(*oid).is_some() {
                         warn!(
                             oid = oid,
                             "Forced removal from ws_state to correct synchronization (cancel confirmed/filled)"
@@ -4514,18 +4610,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     }
                 }
             } else if !ghost_orphans.is_empty() {
-                 info!("[SafetySync] All candidates were ghost orders. No Cancel Actions sent.");
+                info!("[SafetySync] All candidates were ghost orders. No Cancel Actions sent.");
             }
         }
 
         // DISABLED: Stale local order removal.
-        // 
+        //
         // This was the ROOT CAUSE of the state mismatch bug. The logic was:
         // "If order is in local but not in snapshot → it's stale → remove it"
-        // 
+        //
         // But the OpenOrders snapshot LAGS order placements by 1-5 seconds!
         // So this was DELETING valid orders that simply hadn't appeared in the snapshot yet.
-        // 
+        //
         // TRUST ORDERMANAGER: If we placed an order and got an OID back, it exists.
         // The snapshot not having it is expected latency, not a problem.
         //
@@ -4963,7 +5059,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Check kill switch conditions and update state.
     /// Called after each message and periodically.
-    fn check_kill_switch(&self) {
+    fn check_kill_switch(&mut self) {
         // Calculate data age from connection health
         let data_age = self.infra.connection_health.time_since_last_data();
         let last_data_time = std::time::Instant::now()
@@ -5018,11 +5114,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 reasons = ?aggregated.kill_reasons,
                 "RiskAggregator kill condition triggered"
             );
-        } else if aggregated.max_severity >= risk::RiskSeverity::High {
-            warn!(
-                summary = %aggregated.summary(),
-                "High risk detected by RiskAggregator"
-            );
+        } else {
+            // Use state-transition logging to reduce spam
+            let is_high_risk = aggregated.max_severity >= risk::RiskSeverity::High;
+            if is_high_risk && !self.last_high_risk_state {
+                // Transition: normal → high risk
+                warn!(
+                    summary = %aggregated.summary(),
+                    "High risk detected by RiskAggregator"
+                );
+            } else if !is_high_risk && self.last_high_risk_state {
+                // Transition: high risk → normal
+                info!("Risk returned to normal");
+            }
+            self.last_high_risk_state = is_high_risk;
         }
     }
 

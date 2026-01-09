@@ -576,7 +576,7 @@ impl OrderManager {
     }
 
     /// Get all ACTIVE order IDs (Resting or PartialFilled only).
-    /// 
+    ///
     /// This matches the semantics of `WsOrderStateManager::open_order_ids()` for proper
     /// comparison in SafetySync. Orders in cancel/filled states are excluded.
     pub fn active_order_ids(&self) -> std::collections::HashSet<u64> {

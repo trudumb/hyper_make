@@ -10,7 +10,10 @@ use crate::{bps_diff, EPSILON};
 use super::impulse_filter::{ImpulseDecision, ImpulseFilter};
 use super::types::{LadderAction, Side, TrackedOrder};
 use crate::market_maker::quoting::LadderLevel;
-use crate::market_maker::tracking::queue::QueuePositionTracker;
+use crate::market_maker::tracking::queue::{
+    QueueKeepReason, QueuePositionTracker, QueueValueComparator, QueueValueConfig,
+    QueueValueDecision, QueueValueStats,
+};
 
 /// Configuration for smart reconciliation thresholds.
 ///
@@ -33,7 +36,14 @@ pub struct ReconcileConfig {
     pub queue_horizon_seconds: f64,
     /// Enable impulse filtering (Δλ-based update gating).
     /// When true, only updates orders when fill probability improvement exceeds threshold.
+    /// DEPRECATED: Use queue_value_config instead for EV-based decisions.
     pub use_impulse_filter: bool,
+    /// Enable queue value comparison (EV-based update gating).
+    /// When true, orders are kept if their queue position EV exceeds replacement EV.
+    /// This subsumes and replaces impulse filtering with a more principled approach.
+    pub use_queue_value_comparison: bool,
+    /// Configuration for queue value EV comparison.
+    pub queue_value_config: QueueValueConfig,
 }
 
 impl Default for ReconcileConfig {
@@ -46,9 +56,11 @@ impl Default for ReconcileConfig {
             max_modify_size_pct: 0.50, // Modify if size ≤ 50% change
             skip_price_tolerance_bps: 10, // Skip if price ≤ 10 bps (was 1 - reduces churn ~50%)
             skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
-            use_queue_aware: true,   // Enabled by default (verified)
+            use_queue_aware: true,    // Enabled by default (verified)
             queue_horizon_seconds: 1.0, // 1-second fill horizon
-            use_impulse_filter: false, // Disabled by default until validated
+            use_impulse_filter: false, // Disabled - superseded by queue value comparison
+            use_queue_value_comparison: true, // Enabled by default - EV-based decisions
+            queue_value_config: QueueValueConfig::default(),
         }
     }
 }
@@ -88,8 +100,8 @@ impl Default for DynamicReconcileConfig {
             max_match_distance_bps: 30.0,    // Beyond this, no match
             queue_value_threshold: 0.3,      // 30% P(fill) = valuable queue
             queue_horizon_seconds: 1.0,
-            optimal_spread_bps: 20.0,        // Default ~20 bps
-            max_modify_price_bps: 50.0,      // Default 50 bps
+            optimal_spread_bps: 20.0,   // Default ~20 bps
+            max_modify_price_bps: 50.0, // Default 50 bps
             use_priority_matching: true,
         }
     }
@@ -104,12 +116,7 @@ impl DynamicReconcileConfig {
     /// This ensures thresholds adapt to current market conditions:
     /// - Low gamma (calm market) → tight thresholds
     /// - High gamma (volatile/risky) → looser thresholds
-    pub fn from_market_params(
-        gamma: f64,
-        kappa: f64,
-        sigma: f64,
-        queue_horizon: f64,
-    ) -> Self {
+    pub fn from_market_params(gamma: f64, kappa: f64, sigma: f64, queue_horizon: f64) -> Self {
         // Clamp inputs to avoid division by zero
         let gamma_safe = gamma.max(0.001);
         let kappa_safe = kappa.max(1.0);
@@ -170,6 +177,14 @@ pub struct ReconcileStats {
     pub impulse_filtered_count: usize,
     /// Number of orders locked by impulse filter (high P(fill)).
     pub queue_locked_count: usize,
+    /// Number of orders kept due to queue value comparison (EV-based).
+    pub queue_value_kept_count: usize,
+    /// Number of orders replaced after queue value comparison approved.
+    pub queue_value_replaced_count: usize,
+    /// Number of orders with no queue data (fallback to tolerance).
+    pub queue_value_no_data_count: usize,
+    /// Aggregate queue value statistics for this reconciliation cycle.
+    pub queue_value_stats: Option<QueueValueStats>,
 }
 
 impl ReconcileStats {
@@ -214,10 +229,16 @@ pub fn reconcile_side_smart(
     actions
 }
 
-/// Smart reconciliation with optional impulse filtering.
+/// Smart reconciliation with optional impulse filtering and queue value comparison.
 ///
 /// Extended version that accepts queue tracker and impulse filter for
-/// Δλ-based update gating. Returns both actions and reconciliation statistics.
+/// Δλ-based update gating, plus EV-based queue value comparison.
+/// Returns both actions and reconciliation statistics.
+///
+/// # Decision Hierarchy
+/// 1. Queue value comparison (if enabled): Keep orders where EV(current) > EV(new)
+/// 2. Impulse filter (legacy, if enabled): Δλ-based gating
+/// 3. Tolerance-based: SKIP/MODIFY/CANCEL+PLACE based on price/size thresholds
 ///
 /// # Arguments
 /// * `current` - Current orders on this side
@@ -225,7 +246,7 @@ pub fn reconcile_side_smart(
 /// * `side` - Buy or Sell side
 /// * `config` - Reconciliation configuration
 /// * `queue_tracker` - Optional queue position tracker for P(fill) calculation
-/// * `impulse_filter` - Optional impulse filter for Δλ gating
+/// * `impulse_filter` - Optional impulse filter for Δλ gating (legacy)
 /// * `mid_price` - Optional mid price for new order P(fill) estimation
 pub fn reconcile_side_smart_with_impulse(
     current: &[&TrackedOrder],
@@ -236,16 +257,39 @@ pub fn reconcile_side_smart_with_impulse(
     mut impulse_filter: Option<&mut ImpulseFilter>,
     mid_price: Option<f64>,
 ) -> (Vec<LadderAction>, ReconcileStats) {
+    use tracing::debug;
+
     let mut actions = Vec::new();
     let mut stats = ReconcileStats::default();
     let mut matched_targets: HashSet<usize> = HashSet::new();
     let mut matched_orders: HashSet<u64> = HashSet::new();
+    let mut queue_stats = QueueValueStats::default();
 
-    // Determine if impulse filtering is active
+    // Determine if queue value comparison is active
+    let queue_value_active = config.use_queue_value_comparison
+        && config.queue_value_config.enabled
+        && queue_tracker.is_some()
+        && mid_price.is_some();
+
+    // Determine if impulse filtering is active (legacy fallback)
     let impulse_active = config.use_impulse_filter
+        && !queue_value_active // Queue value takes precedence
         && queue_tracker.is_some()
         && impulse_filter.is_some()
         && mid_price.is_some();
+
+    // Create queue value comparator if active
+    let comparator = if queue_value_active {
+        let qt = queue_tracker.unwrap();
+        let sigma = qt.sigma();
+        Some(QueueValueComparator::new(
+            qt,
+            config.queue_value_config.clone(),
+            sigma,
+        ))
+    } else {
+        None
+    };
 
     // Phase 1: Find best matches between current orders and target levels
     let matches = find_best_matches(current, target, &matched_orders);
@@ -265,7 +309,60 @@ pub fn reconcile_side_smart_with_impulse(
             continue;
         }
 
-        // Apply impulse filter if active
+        // Apply queue value comparison if active (takes precedence)
+        if let Some(ref comp) = comparator {
+            let mid = mid_price.unwrap();
+            let decision = comp.compare(m.order.oid, m.order.price, target_level.price, mid);
+
+            match decision {
+                QueueValueDecision::Keep {
+                    reason,
+                    current_ev,
+                    replacement_ev,
+                } => {
+                    debug!(
+                        oid = m.order.oid,
+                        reason = ?reason,
+                        current_ev = %format!("{:.4}", current_ev),
+                        replacement_ev = %format!("{:.4}", replacement_ev),
+                        price_diff_bps = %format!("{:.2}", m.price_diff_bps),
+                        "Queue value: KEEP order (EV comparison)"
+                    );
+                    // Update stats based on reason
+                    match reason {
+                        QueueKeepReason::QueueLocked => {
+                            queue_stats.kept_queue_locked += 1;
+                        }
+                        QueueKeepReason::InsufficientImprovement => {
+                            queue_stats.kept_insufficient_improvement += 1;
+                        }
+                        QueueKeepReason::OrderTooYoung => {
+                            queue_stats.kept_too_young += 1;
+                        }
+                    }
+                    stats.queue_value_kept_count += 1;
+                    stats.skipped_count += 1;
+                    continue; // Keep order - queue value too high to sacrifice
+                }
+                QueueValueDecision::Replace { improvement_pct } => {
+                    debug!(
+                        oid = m.order.oid,
+                        improvement_pct = %format!("{:.1}%", improvement_pct * 100.0),
+                        "Queue value: REPLACE order (sufficient improvement)"
+                    );
+                    queue_stats.replaced += 1;
+                    stats.queue_value_replaced_count += 1;
+                    // Fall through to normal logic
+                }
+                QueueValueDecision::NoData => {
+                    queue_stats.no_data += 1;
+                    stats.queue_value_no_data_count += 1;
+                    // Fall through to tolerance-based decision
+                }
+            }
+        }
+
+        // Apply impulse filter if active (legacy fallback)
         if impulse_active {
             let qt = queue_tracker.unwrap();
             let filter = impulse_filter.as_mut().unwrap();
@@ -345,6 +442,16 @@ pub fn reconcile_side_smart_with_impulse(
         }
     }
 
+    // Record queue value stats if comparator was used
+    if comparator.is_some() {
+        // Calculate requests saved: each kept order saves 2 requests (cancel + place)
+        let total_kept = queue_stats.kept_queue_locked
+            + queue_stats.kept_insufficient_improvement
+            + queue_stats.kept_too_young;
+        queue_stats.requests_saved = total_kept * 2;
+        stats.queue_value_stats = Some(queue_stats);
+    }
+
     (actions, stats)
 }
 
@@ -417,7 +524,7 @@ pub fn priority_based_matching(
     queue_tracker: Option<&QueuePositionTracker>,
 ) -> Vec<LadderAction> {
     use tracing::debug;
-    
+
     let mut actions = Vec::new();
     let mut matched_orders: HashSet<u64> = HashSet::new();
     let mut matched_targets: HashSet<usize> = HashSet::new();
@@ -479,7 +586,7 @@ pub fn priority_based_matching(
                 // - Size reduction: MODIFY preserves queue position ✓
                 // - Price change: Loses queue (goes to back of new level)
                 // - Size increase: Loses queue (treated as new order)
-                
+
                 let price_diff_bps = best_distance;
                 let current_size = order.remaining();
                 let target_size = target.size;
@@ -497,7 +604,10 @@ pub fn priority_based_matching(
 
                 // Case 2: Price is good, only SIZE REDUCTION needed
                 // → Use MODIFY to preserve queue position (FIFO advantage!)
-                if price_diff_bps <= config.max_modify_price_bps && size_change < 0.0 && size_diff_pct > 0.05 {
+                if price_diff_bps <= config.max_modify_price_bps
+                    && size_change < 0.0
+                    && size_diff_pct > 0.05
+                {
                     debug!(
                         oid = order.oid,
                         current_size = current_size,
@@ -507,8 +617,8 @@ pub fn priority_based_matching(
                     );
                     actions.push(LadderAction::Modify {
                         oid: order.oid,
-                        new_price: order.price,  // Keep same price
-                        new_size: target_size,   // Reduce size
+                        new_price: order.price, // Keep same price
+                        new_size: target_size,  // Reduce size
                         side,
                     });
                     continue;
@@ -516,7 +626,9 @@ pub fn priority_based_matching(
 
                 // Case 3: Price change required OR size increase needed
                 // → Must CANCEL+PLACE (loses queue, but necessary)
-                if price_diff_bps > config.best_level_tolerance_bps || size_change > current_size * 0.10 {
+                if price_diff_bps > config.best_level_tolerance_bps
+                    || size_change > current_size * 0.10
+                {
                     debug!(
                         oid = order.oid,
                         price_diff_bps = price_diff_bps,
@@ -557,9 +669,9 @@ pub fn priority_based_matching(
     for order in current.iter() {
         if !matched_orders.contains(&order.oid) {
             // Check if this order is close to ANY target before cancelling
-            let close_to_any_target = targets.iter().any(|t| {
-                bps_diff(order.price, t.price) as f64 <= config.max_match_distance_bps
-            });
+            let close_to_any_target = targets
+                .iter()
+                .any(|t| bps_diff(order.price, t.price) as f64 <= config.max_match_distance_bps);
 
             if !close_to_any_target {
                 debug!(

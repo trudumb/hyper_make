@@ -752,7 +752,7 @@ impl LadderStrategy {
             // where min_meaningful_size = 1.5 × (min_notional / price) to ensure each order
             // is comfortably above exchange minimum notional requirements.
             let min_meaningful_size = (config.min_notional * 1.5) / market_params.microprice;
-            
+
             let max_bid_levels = if available_for_bids > EPSILON {
                 ((available_for_bids / min_meaningful_size).floor() as usize).max(1)
             } else {
@@ -763,17 +763,18 @@ impl LadderStrategy {
             } else {
                 0
             };
-            
+
             // Get configured number of levels
             let configured_levels = ladder_config.num_levels;
-            
+
             // Use the smaller of: configured levels, capacity-based max (taking minimum of bid/ask)
             // We use the minimum to ensure both sides can be quoted with meaningful sizes
             let effective_bid_levels = configured_levels.min(max_bid_levels);
             let effective_ask_levels = configured_levels.min(max_ask_levels);
-            
+
             // Log if we're reducing levels due to capacity constraints
-            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels {
+            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels
+            {
                 tracing::warn!(
                     configured = configured_levels,
                     effective_bid = effective_bid_levels,
@@ -791,7 +792,8 @@ impl LadderStrategy {
             let mut ladder = Ladder::generate(&ladder_config, &params);
 
             // Log if capacity is tight (for debugging), but don't truncate
-            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels {
+            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels
+            {
                 tracing::debug!(
                     configured = configured_levels,
                     capacity_bid = effective_bid_levels,

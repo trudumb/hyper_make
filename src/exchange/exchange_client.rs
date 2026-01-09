@@ -15,9 +15,9 @@ use alloy::{
     primitives::{keccak256, Address, Signature, B256},
     signers::local::PrivateKeySigner,
 };
-use tracing::{debug, error, warn};
 use reqwest::Client;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
+use tracing::{debug, error, warn};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -392,14 +392,16 @@ impl ExchangeClient {
                                         .and_then(|r| r.get("type"))
                                         .and_then(|t| t.as_str())
                                         .unwrap_or("unknown");
-                                    
+
                                     debug!(
                                         action_type = %action_type,
                                         "WS POST successful - attempting to parse response"
                                     );
-                                    
+
                                     // Attempt to parse and log failures with full context
-                                    match serde_json::from_value::<ExchangeResponseStatus>(payload.clone()) {
+                                    match serde_json::from_value::<ExchangeResponseStatus>(
+                                        payload.clone(),
+                                    ) {
                                         Ok(status) => {
                                             debug!(
                                                 action_type = %action_type,

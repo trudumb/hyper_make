@@ -185,7 +185,8 @@ impl CachedRateLimit {
         if self.n_requests_cap == 0 {
             return 0.0;
         }
-        (self.n_requests_cap.saturating_sub(self.n_requests_used)) as f64 / self.n_requests_cap as f64
+        (self.n_requests_cap.saturating_sub(self.n_requests_used)) as f64
+            / self.n_requests_cap as f64
     }
 
     /// Check if cache is stale (older than given duration).

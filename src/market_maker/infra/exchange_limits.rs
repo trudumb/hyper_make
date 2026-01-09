@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::info::response_structs::ActiveAssetDataResponse;
+use tracing::info;
 
 /// Exchange-enforced position limits with lock-free access.
 ///
@@ -521,21 +522,21 @@ impl ExchangePositionLimits {
                 // Check if cumulative buys + this order would exceed available
                 let new_cumulative = cumulative_buy + size;
                 let within_available = new_cumulative <= available_buy;
-                
+
                 // Check if new position would exceed max long
                 let new_position = current_position + new_cumulative;
                 let within_max = new_position <= max_long;
-                
+
                 within_available && within_max
             } else {
                 // Check if cumulative sells + this order would exceed available
                 let new_cumulative = cumulative_sell + size;
                 let within_available = new_cumulative <= available_sell;
-                
+
                 // Check if new position would exceed max short
                 let new_position = current_position - new_cumulative;
                 let within_max = new_position >= -max_short;
-                
+
                 within_available && within_max
             };
 
@@ -571,6 +572,26 @@ impl ExchangePositionLimits {
         let remaining_sell = (available_sell - sell_exposure).max(0.0);
 
         (remaining_buy, remaining_sell)
+    }
+
+    /// Log current exchange limits status for diagnostic purposes.
+    ///
+    /// Call this at key points (e.g., before quote generation, after refresh)
+    /// to help debug position limit issues.
+    pub fn log_status(&self, context: &str) {
+        info!(
+            context = %context,
+            available_buy = %format!("{:.6}", self.available_buy()),
+            available_sell = %format!("{:.6}", self.available_sell()),
+            effective_bid = %format!("{:.6}", self.effective_bid_limit()),
+            effective_ask = %format!("{:.6}", self.effective_ask_limit()),
+            max_long = %format!("{:.6}", self.max_long()),
+            max_short = %format!("{:.6}", self.max_short()),
+            age_ms = self.age_ms(),
+            initialized = self.is_initialized(),
+            stale = self.is_stale(),
+            "Exchange limits status"
+        );
     }
 }
 

@@ -173,13 +173,7 @@ impl OrderSpec {
     }
 
     /// Create a new order spec with CLOID for deterministic tracking.
-    pub fn with_cloid(
-        price: f64,
-        size: f64,
-        is_buy: bool,
-        cloid: String,
-        post_only: bool,
-    ) -> Self {
+    pub fn with_cloid(price: f64, size: f64, is_buy: bool, cloid: String, post_only: bool) -> Self {
         Self {
             price,
             size,
@@ -501,11 +495,13 @@ impl OrderExecutor for HyperliquidExecutor {
                         let mut filled_oids = Vec::new();
                         let mut error_count = 0u32;
 
+                        // Collect rejection details for summary logging
+                        let mut rejection_errors: Vec<(usize, String)> = Vec::new();
+
                         // Each status corresponds to one order in sequence
                         for (i, status) in data.statuses.iter().enumerate() {
                             let spec = &orders[i];
                             let cloid = cloids[i].clone();
-                            let side = if spec.is_buy { "BUY" } else { "SELL" };
 
                             match status {
                                 ExchangeDataStatus::Filled(order) => {
@@ -535,10 +531,8 @@ impl OrderExecutor for HyperliquidExecutor {
                                     });
                                 }
                                 ExchangeDataStatus::Error(e) => {
-                                    error!(
-                                        "Bulk order {} rejected: asset={} side={} sz={} price={} cloid={:?} error={}",
-                                        i, asset, side, spec.size, spec.price, cloid, e
-                                    );
+                                    // Collect for summary instead of individual logs
+                                    rejection_errors.push((i, e.clone()));
                                     error_count += 1;
                                     // Phase 5: Capture error for rate limiter
                                     results.push(OrderResult::failed_with_cloid_and_error(
@@ -555,6 +549,33 @@ impl OrderExecutor for HyperliquidExecutor {
                         }
 
                         // Log consolidated summary instead of per-order logs
+                        if !rejection_errors.is_empty() {
+                            // Single ERROR summary for batch rejections
+                            let sample_error = &rejection_errors[0].1;
+                            error!(
+                                rejected_count = rejection_errors.len(),
+                                total_count = num_orders,
+                                sample_error = %sample_error,
+                                "[PlaceBulk] Batch rejected: {}/{} orders failed",
+                                rejection_errors.len(),
+                                num_orders
+                            );
+
+                            // DEBUG level for individual rejection details if needed
+                            for (idx, err) in &rejection_errors {
+                                let spec = &orders[*idx];
+                                let side = if spec.is_buy { "BUY" } else { "SELL" };
+                                debug!(
+                                    order_index = idx,
+                                    side = %side,
+                                    size = spec.size,
+                                    price = spec.price,
+                                    error = %err,
+                                    "Individual rejection detail"
+                                );
+                            }
+                        }
+
                         if !resting_oids.is_empty() || !filled_oids.is_empty() {
                             info!(
                                 resting = resting_oids.len(),

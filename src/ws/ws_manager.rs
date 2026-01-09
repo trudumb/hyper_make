@@ -30,6 +30,7 @@ use crate::{
     ws::message_types::{
         ActiveAssetData, ActiveSpotAssetCtx, AllMids, Bbo, Candle, L2Book, OpenOrders,
         OrderUpdates, Trades, User, WsPostRequest, WsPostResponse, WsPostResponseData,
+        WsPostResponsePayload,
     },
     ActiveAssetCtx, Error, Notification, UserFills, UserFundings, UserNonFundingLedgerUpdates,
     WebData2,
@@ -454,6 +455,29 @@ impl WsManager {
                                         reader = new_reader;
                                         let mut writer_guard = writer.lock().await;
                                         *writer_guard = new_writer;
+
+                                        // Clean up orphaned WS POST requests from before reconnection
+                                        // These requests will never receive responses on the new connection
+                                        {
+                                            let mut pending = pending_posts_reader.lock().await;
+                                            let orphaned_count = pending.len();
+                                            if orphaned_count > 0 {
+                                                warn!(
+                                                    "Cleaning up {} orphaned WS POST requests after reconnection",
+                                                    orphaned_count
+                                                );
+                                                // Send error to all pending requests so they fail fast
+                                                // instead of waiting for timeout
+                                                for (id, sender) in pending.drain() {
+                                                    let _ = sender.send(WsPostResponseData {
+                                                        id,
+                                                        response: WsPostResponsePayload::Error {
+                                                            payload: "Connection reset during WS reconnection".to_string(),
+                                                        },
+                                                    });
+                                                }
+                                            }
+                                        }
 
                                         // Resubscribe to all subscriptions
                                         for (identifier, v) in

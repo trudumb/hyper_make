@@ -91,7 +91,12 @@
       "Bash(lld:*)",
       "Bash(sccache --version:*)",
       "mcp__serena__read_file",
-      "mcp__serena__replace_symbol_body"
+      "mcp__serena__replace_symbol_body",
+      "Bash(jq:*)",
+      "Bash(while read line)",
+      "Bash(do echo \"$line\")",
+      "mcp__serena__insert_before_symbol",
+      "Bash(LOGFILE=logs/mm_testnet_BTC_2026-01-09_15-49-36.log echo '=== REJECTIONS ===' grep -c 'would exceed' $LOGFILE)"
     ]
   }
 }

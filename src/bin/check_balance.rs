@@ -8,8 +8,8 @@ use std::env;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get wallet address from environment or use a test address
-    let wallet_key = env::var("HL_PRIVATE_KEY")
-        .expect("HL_PRIVATE_KEY environment variable not set");
+    let wallet_key =
+        env::var("HL_PRIVATE_KEY").expect("HL_PRIVATE_KEY environment variable not set");
 
     // Parse wallet address from private key
     let wallet = wallet_key.parse::<alloy::signers::local::PrivateKeySigner>()?;
@@ -25,16 +25,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_state = info_client.user_state(user_address).await?;
 
     println!("\n--- margin_summary (isolated margin) ---");
-    println!("  account_value:     {}", user_state.margin_summary.account_value);
-    println!("  total_margin_used: {}", user_state.margin_summary.total_margin_used);
-    println!("  total_ntl_pos:     {}", user_state.margin_summary.total_ntl_pos);
-    println!("  total_raw_usd:     {}", user_state.margin_summary.total_raw_usd);
+    println!(
+        "  account_value:     {}",
+        user_state.margin_summary.account_value
+    );
+    println!(
+        "  total_margin_used: {}",
+        user_state.margin_summary.total_margin_used
+    );
+    println!(
+        "  total_ntl_pos:     {}",
+        user_state.margin_summary.total_ntl_pos
+    );
+    println!(
+        "  total_raw_usd:     {}",
+        user_state.margin_summary.total_raw_usd
+    );
 
     println!("\n--- cross_margin_summary (cross margin) ---");
-    println!("  account_value:     {}", user_state.cross_margin_summary.account_value);
-    println!("  total_margin_used: {}", user_state.cross_margin_summary.total_margin_used);
-    println!("  total_ntl_pos:     {}", user_state.cross_margin_summary.total_ntl_pos);
-    println!("  total_raw_usd:     {}", user_state.cross_margin_summary.total_raw_usd);
+    println!(
+        "  account_value:     {}",
+        user_state.cross_margin_summary.account_value
+    );
+    println!(
+        "  total_margin_used: {}",
+        user_state.cross_margin_summary.total_margin_used
+    );
+    println!(
+        "  total_ntl_pos:     {}",
+        user_state.cross_margin_summary.total_ntl_pos
+    );
+    println!(
+        "  total_raw_usd:     {}",
+        user_state.cross_margin_summary.total_raw_usd
+    );
 
     println!("\n--- withdrawable ---");
     println!("  {}", user_state.withdrawable);
@@ -45,7 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for balance in &spot_balances.balances {
         let total: f64 = balance.total.parse().unwrap_or(0.0);
         if total > 0.0 {
-            println!("  {}: total={}, hold={}", balance.coin, balance.total, balance.hold);
+            println!(
+                "  {}: total={}, hold={}",
+                balance.coin, balance.total, balance.hold
+            );
         }
     }
 
@@ -55,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  No positions");
     } else {
         for pos in &user_state.asset_positions {
-            println!("  {}: szi={}, entry_px={:?}, liquidation_px={:?}",
+            println!(
+                "  {}: szi={}, entry_px={:?}, liquidation_px={:?}",
                 pos.position.coin,
                 pos.position.szi,
                 pos.position.entry_px,

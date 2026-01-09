@@ -803,7 +803,10 @@ pub(crate) fn apply_inventory_skew_with_drift(
     let total_skew_fraction = base_skew_fraction + drift_skew_fraction + funding_skew_fraction;
 
     // Early return only if there's no inventory AND no drift/funding adjustment
-    if inventory_ratio.abs() < EPSILON && drift_skew_fraction.abs() < EPSILON && funding_skew_fraction.abs() < EPSILON {
+    if inventory_ratio.abs() < EPSILON
+        && drift_skew_fraction.abs() < EPSILON
+        && funding_skew_fraction.abs() < EPSILON
+    {
         return;
     }
 

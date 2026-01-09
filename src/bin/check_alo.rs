@@ -1,25 +1,24 @@
+use hyperliquid_rust_sdk::{BaseUrl, InfoClient};
 use std::env;
 use tokio::time::Duration;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
-use hyperliquid_rust_sdk::{BaseUrl, InfoClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    
+
     // Setup logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     // Get configuration
-    let private_key = env::var("HYPERLIQUID_PRIVATE_KEY")
-        .expect("HYPERLIQUID_PRIVATE_KEY must be set");
-    let wallet: alloy::signers::local::PrivateKeySigner = private_key.parse()
-        .expect("Invalid private key");
+    let private_key =
+        env::var("HYPERLIQUID_PRIVATE_KEY").expect("HYPERLIQUID_PRIVATE_KEY must be set");
+    let wallet: alloy::signers::local::PrivateKeySigner =
+        private_key.parse().expect("Invalid private key");
     let user_address = wallet.address();
 
     // Determine network (default to Testnet for safety)
@@ -45,19 +44,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    info!("Found {} open orders. Checking TIF status...", open_orders.len());
+    info!(
+        "Found {} open orders. Checking TIF status...",
+        open_orders.len()
+    );
 
     let mut alo_count = 0;
     let mut non_alo_count = 0;
 
     for order in open_orders {
         // Query detailed info for each order to get TIF
-        match info_client.query_order_by_oid(user_address, order.oid).await {
+        match info_client
+            .query_order_by_oid(user_address, order.oid)
+            .await
+        {
             Ok(status_response) => {
                 if let Some(order_info) = status_response.order {
-                    let tif = order_info.order.tif.unwrap_or_else(|| "Unknown".to_string());
+                    let tif = order_info
+                        .order
+                        .tif
+                        .unwrap_or_else(|| "Unknown".to_string());
                     let is_alo = tif == "Alo";
-                    
+
                     if is_alo {
                         alo_count += 1;
                     } else {
@@ -72,10 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         order.limit_px,
                         order.sz,
                         tif,
-                        if is_alo { "OK (Post-Only)" } else { "WARNING (Not ALO)" }
+                        if is_alo {
+                            "OK (Post-Only)"
+                        } else {
+                            "WARNING (Not ALO)"
+                        }
                     );
                 } else {
-                    warn!("OID: {} - Order info not found (might be filled/cancelled)", order.oid);
+                    warn!(
+                        "OID: {} - Order info not found (might be filled/cancelled)",
+                        order.oid
+                    );
                 }
             }
             Err(e) => {

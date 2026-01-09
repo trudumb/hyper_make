@@ -128,12 +128,8 @@ impl RejectionRateLimiter {
 
             state.backoff_until = Some(Instant::now() + backoff);
 
-            tracing::warn!(
-                is_buy = is_buy,
-                consecutive_rejections = state.consecutive_rejections,
-                backoff_secs = %format!("{:.1}", backoff_secs),
-                "Entering backoff due to consecutive rejections"
-            );
+            // Note: Caller logs the backoff with more context (side, error)
+            // We just return the backoff duration for the caller to log
 
             Some(backoff)
         } else {
@@ -515,6 +511,51 @@ impl ProactiveRateLimitTracker {
             address_warning: self.address_budget_low(),
             is_rate_limited: self.is_rate_limited(),
             consecutive_429s: self.consecutive_429s,
+        }
+    }
+
+    /// Get adaptive queue value config adjusted for current budget pressure.
+    ///
+    /// When address budget is running low, we want to be MORE conservative
+    /// about replacing orders (require higher improvement threshold, lock more
+    /// orders). This prevents burning through the remaining budget.
+    ///
+    /// # Arguments
+    /// * `base_config` - The base QueueValueConfig to adapt
+    ///
+    /// # Returns
+    /// An adapted QueueValueConfig with tighter thresholds under budget pressure.
+    pub fn get_adaptive_queue_config(
+        &self,
+        base_config: &crate::market_maker::QueueValueConfig,
+    ) -> crate::market_maker::QueueValueConfig {
+        let budget = self.address_budget_remaining();
+
+        // Adaptive thresholds based on budget pressure
+        let (improvement_threshold, queue_lock_threshold) = match budget {
+            // Healthy budget (>5000 remaining): use base config
+            r if r > 5000 => (
+                base_config.improvement_threshold,
+                base_config.queue_lock_threshold,
+            ),
+            // Moderate pressure (2000-5000): increase improvement threshold by 10%
+            r if r > 2000 => (
+                base_config.improvement_threshold + 0.10,
+                base_config.queue_lock_threshold - 0.05,
+            ),
+            // High pressure (500-2000): increase by 20%, lock more orders
+            r if r > 500 => (
+                base_config.improvement_threshold + 0.20,
+                base_config.queue_lock_threshold - 0.15,
+            ),
+            // Critical pressure (<500): very conservative
+            _ => (0.50, 0.30),
+        };
+
+        crate::market_maker::QueueValueConfig {
+            improvement_threshold: improvement_threshold.min(0.50),
+            queue_lock_threshold: queue_lock_threshold.max(0.25),
+            ..base_config.clone()
         }
     }
 }

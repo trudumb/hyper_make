@@ -1,7 +1,7 @@
+use hyperliquid_rust_sdk::market_maker::quoting::LadderLevel;
 use hyperliquid_rust_sdk::market_maker::tracking::{
     priority_based_matching, DynamicReconcileConfig, LadderAction, Side, TrackedOrder,
 };
-use hyperliquid_rust_sdk::market_maker::quoting::LadderLevel;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -20,7 +20,7 @@ fn main() {
 
 fn test_low_volatility_behavior() {
     info!("\n--- Test: Low Volatility (Calm Market) ---");
-    
+
     // Low vol (1bps/sec), High Liquidity (kappa=5000)
     let gamma = 0.1;
     let kappa = 5000.0;
@@ -28,10 +28,19 @@ fn test_low_volatility_behavior() {
     let horizon = 10.0; // 10s horizon
 
     let config = DynamicReconcileConfig::from_market_params(gamma, kappa, sigma, horizon);
-    
-    info!("Low Vol Params: Gamma={}, Kappa={}, Sigma={:.6}", gamma, kappa, sigma);
-    info!(" Calculated optimal_spread_bps: {:.2}", config.optimal_spread_bps);
-    info!(" Calculated max_modify_price_bps: {:.2}", config.max_modify_price_bps);
+
+    info!(
+        "Low Vol Params: Gamma={}, Kappa={}, Sigma={:.6}",
+        gamma, kappa, sigma
+    );
+    info!(
+        " Calculated optimal_spread_bps: {:.2}",
+        config.optimal_spread_bps
+    );
+    info!(
+        " Calculated max_modify_price_bps: {:.2}",
+        config.max_modify_price_bps
+    );
 
     // Current order at 100.00
     let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0);
@@ -44,12 +53,13 @@ fn test_low_volatility_behavior() {
     // Move to 100.20 (20bps move).
     let target_level = LadderLevel {
         price: 100.20,
-        size: 1.0, 
+        size: 1.0,
         depth_bps: 10.0,
     };
     let targets = vec![target_level];
 
-    let actions: Vec<LadderAction> = priority_based_matching(&current, &targets, Side::Buy, &config, None);
+    let actions: Vec<LadderAction> =
+        priority_based_matching(&current, &targets, Side::Buy, &config, None);
 
     info!("Actions for 20bps price move (Low Vol):");
     for action in &actions {
@@ -68,9 +78,18 @@ fn test_high_volatility_behavior() {
 
     let config = DynamicReconcileConfig::from_market_params(gamma, kappa, sigma, horizon);
 
-    info!("High Vol Params: Gamma={}, Kappa={}, Sigma={:.6}", gamma, kappa, sigma);
-    info!(" Calculated optimal_spread_bps: {:.2}", config.optimal_spread_bps);
-    info!(" Calculated max_modify_price_bps: {:.2}", config.max_modify_price_bps);
+    info!(
+        "High Vol Params: Gamma={}, Kappa={}, Sigma={:.6}",
+        gamma, kappa, sigma
+    );
+    info!(
+        " Calculated optimal_spread_bps: {:.2}",
+        config.optimal_spread_bps
+    );
+    info!(
+        " Calculated max_modify_price_bps: {:.2}",
+        config.max_modify_price_bps
+    );
 
     // Current order at 100.00
     let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0);
@@ -80,16 +99,17 @@ fn test_high_volatility_behavior() {
     // But here sigma=20bps, horizon=10 -> vol_bps = 20 * sqrt(10) ~ 63bps.
     // max_modify should be ~100bps (clamped) or ~126bps?
     // So 20bps should be well within modify tolerance.
-    
+
     // Force size change to trigger modify
     let target_level = LadderLevel {
         price: 100.20, // 20bps away
-        size: 0.5,    // Size change
+        size: 0.5,     // Size change
         depth_bps: 10.0,
     };
     let targets = vec![target_level];
 
-    let actions: Vec<LadderAction> = priority_based_matching(&current, &targets, Side::Buy, &config, None);
+    let actions: Vec<LadderAction> =
+        priority_based_matching(&current, &targets, Side::Buy, &config, None);
 
     info!("Actions for 20bps price move (High Vol):");
     for action in &actions {

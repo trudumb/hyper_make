@@ -18,11 +18,15 @@
 //! - Fill probability: P(fill) = P(touch) × P(execute|touch)
 //! - Refresh decisions: When to replace degraded queue positions
 
+mod comparator;
 mod config;
 mod model;
 mod position;
 mod tracker;
 
+pub use comparator::{
+    QueueKeepReason, QueueValueComparator, QueueValueConfig, QueueValueDecision, QueueValueStats,
+};
 pub use config::QueueConfig;
 pub use model::CalibratedQueueModel;
 pub use position::{OrderQueuePosition, QueuePositionSummary, QueueSummary};

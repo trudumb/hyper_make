@@ -182,6 +182,32 @@ struct Cli {
     #[arg(long)]
     queue_lock_override_bps: Option<f64>,
 
+    // === Queue Value Comparison Flags ===
+    /// Enable EV-based queue value comparison for reconciliation decisions
+    /// When enabled, orders are kept if their queue position EV exceeds replacement EV
+    /// This provides more principled rate limit optimization than impulse control
+    #[arg(long)]
+    use_queue_value_comparison: bool,
+
+    /// Minimum improvement percentage required to justify replacing an order (default: 0.15)
+    /// E.g., 0.15 means 15% improvement in EV required to justify the API call
+    #[arg(long)]
+    queue_improvement_threshold: Option<f64>,
+
+    /// Estimated spread capture in bps for EV calculation (default: 8.0)
+    /// Used to convert fill probability to expected value
+    #[arg(long)]
+    queue_spread_capture_bps: Option<f64>,
+
+    /// Minimum order age in seconds before considering replacement (default: 0.3)
+    /// Very young orders are protected to give them time to build queue position
+    #[arg(long)]
+    queue_min_order_age_secs: Option<f64>,
+
+    /// Time horizon in seconds for fill probability calculation (default: 1.0)
+    #[arg(long)]
+    queue_fill_horizon_secs: Option<f64>,
+
     // === Competitive Spread Control Flags ===
     /// Minimum kappa floor for order arrival intensity estimation.
     /// Higher kappa = tighter GLFT spreads. Use to force competitive spreads on illiquid assets.
@@ -716,9 +742,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_position
         .or(config.trading.max_absolute_position_size);
 
+    // Create HTTP client with proper timeouts to prevent 502 errors from stale connections
+    // This client is shared across InfoClient and ExchangeClient for REST fallback
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30)) // Total request timeout
+        .connect_timeout(std::time::Duration::from_secs(10)) // Connection establishment
+        .pool_idle_timeout(std::time::Duration::from_secs(60)) // Close idle connections before server does
+        .pool_max_idle_per_host(8) // Limit pooled connections per host
+        .tcp_keepalive(std::time::Duration::from_secs(30)) // Detect dead connections
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
     // Query metadata to get sz_decimals (always needed for size precision)
     // Use with_reconnect to automatically reconnect if WebSocket disconnects
-    let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
+    let info_client = InfoClient::with_reconnect(Some(http_client.clone()), Some(base_url)).await?;
 
     // Use DEX-specific metadata query if --dex is specified
     let dex = cli.dex.clone();
@@ -920,8 +957,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create exchange client (pass DEX-specific meta and DEX name for HIP-3 support)
     // For HIP-3 DEXs, this applies the correct asset index formula:
     // asset_index = 100000 + (perp_dex_index × 10000) + index_in_meta
+    // Use the same HTTP client with timeouts for REST fallback
     let mut exchange_client = ExchangeClient::new_for_dex(
-        None,
+        Some(http_client.clone()),
         wallet.clone(),
         Some(base_url),
         Some(meta.clone()),
@@ -933,16 +971,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enable WebSocket posting for low-latency order execution
     // Create a separate InfoClient for WS POST sharing (MarketMaker keeps the original)
-    let mut ws_post_info_client = InfoClient::with_reconnect(None, Some(base_url)).await
-        .map_err(|e| format!("Failed to create WS POST InfoClient: {e}"))?;
+    // Use the same HTTP client with timeouts for REST fallback
+    let mut ws_post_info_client =
+        InfoClient::with_reconnect(Some(http_client.clone()), Some(base_url))
+            .await
+            .map_err(|e| format!("Failed to create WS POST InfoClient: {e}"))?;
     // Explicitly connect the WS client since we won't be adding subscriptions
-    ws_post_info_client.ensure_connected().await
+    ws_post_info_client
+        .ensure_connected()
+        .await
         .map_err(|e| format!("Failed to connect WS POST client: {e}"))?;
-        
-    let ws_post_info_shared = Arc::new(tokio::sync::RwLock::new(ws_post_info_client));
-    exchange_client.enable_ws_post(Arc::clone(&ws_post_info_shared), Some(std::time::Duration::from_secs(3)));
-    info!("WebSocket posting enabled for low-latency order execution");
 
+    let ws_post_info_shared = Arc::new(tokio::sync::RwLock::new(ws_post_info_client));
+    exchange_client.enable_ws_post(
+        Arc::clone(&ws_post_info_shared),
+        Some(std::time::Duration::from_secs(3)),
+    );
+    info!("WebSocket posting enabled for low-latency order execution");
 
     // Set leverage on the exchange (use is_cross from runtime config for HIP-3 support)
     info!(
@@ -1005,7 +1050,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // NOTE: Use cross_margin_summary for cross margin accounts (default).
             // margin_summary only has value for isolated margin positions.
             match info_client.user_state(user_address).await {
-                Ok(state) => state.cross_margin_summary.account_value.parse().unwrap_or(0.0),
+                Ok(state) => state
+                    .cross_margin_summary
+                    .account_value
+                    .parse()
+                    .unwrap_or(0.0),
                 Err(e) => {
                     warn!("Failed to query user state: {e}, using 0");
                     0.0
@@ -1154,6 +1203,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Can be explicitly enabled via --use-impulse-control even if default changes
             rc.use_impulse_filter =
                 ImpulseControlConfig::default().enabled || cli.use_impulse_control;
+
+            // Queue value comparison (EV-based reconciliation) - enabled by default
+            // Supersedes impulse filtering with more principled EV-based decisions
+            if cli.use_queue_value_comparison {
+                rc.use_queue_value_comparison = true;
+            }
+            // Apply queue value config parameters from CLI
+            if let Some(v) = cli.queue_improvement_threshold {
+                rc.queue_value_config.improvement_threshold = v;
+            }
+            if let Some(v) = cli.queue_lock_threshold {
+                // Use this for both impulse filter and queue value config
+                rc.queue_value_config.queue_lock_threshold = v;
+            }
+            if let Some(v) = cli.queue_lock_override_bps {
+                rc.queue_value_config.queue_lock_override_bps = v;
+            }
+            if let Some(v) = cli.queue_spread_capture_bps {
+                rc.queue_value_config.spread_capture_bps = v;
+            }
+            if let Some(v) = cli.queue_min_order_age_secs {
+                rc.queue_value_config.min_order_age_secs = v;
+            }
+            if let Some(v) = cli.queue_fill_horizon_secs {
+                rc.queue_value_config.fill_horizon_secs = v;
+            }
             rc
         },
         // HIP-3 support: pre-computed runtime config for zero hot-path overhead

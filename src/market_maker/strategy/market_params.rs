@@ -656,10 +656,10 @@ impl Default for MarketParams {
             calibration_progress: 0.0,   // Start at 0% calibration
             calibration_complete: false, // Not calibrated yet
             // Model-Derived Sizing (GLFT First Principles)
-            account_value: 0.0,              // Will be set from margin state
-            measured_latency_ms: 50.0,       // Default 50ms until measured
-            estimated_fill_rate: 0.001,      // Conservative 0.001/sec until observed
-            derived_target_liquidity: 0.0,   // Will be computed from GLFT formula
+            account_value: 0.0,            // Will be set from margin state
+            measured_latency_ms: 50.0,     // Default 50ms until measured
+            estimated_fill_rate: 0.001,    // Conservative 0.001/sec until observed
+            derived_target_liquidity: 0.0, // Will be computed from GLFT formula
         }
     }
 }
@@ -1092,8 +1092,8 @@ impl MarketParams {
         // T = 1/fill_rate, so Q_soft scales with sqrt(fill_rate)
         let fill_rate_factor = self.estimated_fill_rate.sqrt().max(0.01);
 
-        let q_soft = ((2.0 * acceptable_loss) / (gamma_eff * sigma_sq)).sqrt()
-            * fill_rate_factor / 2.0;
+        let q_soft =
+            ((2.0 * acceptable_loss) / (gamma_eff * sigma_sq)).sqrt() * fill_rate_factor / 2.0;
 
         // === Latency Penalty: Reduce exposure when slow ===
         // At high latency, price moves σ√τ during round-trip

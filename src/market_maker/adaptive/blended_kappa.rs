@@ -349,7 +349,8 @@ impl BlendedKappaEstimator {
         let distance = distance.max(0.00001); // Floor at 0.1 bps
 
         // Add observation with unit size weight
-        self.own_fill_observations.push_back((distance, 1.0, timestamp_ms));
+        self.own_fill_observations
+            .push_back((distance, 1.0, timestamp_ms));
         self.own_fill_count += 1;
         self.own_sum_vw_distance += distance;
         self.own_sum_volume += 1.0;

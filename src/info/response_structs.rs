@@ -192,4 +192,3 @@ impl UserRateLimitResponse {
         self.n_requests_cap.saturating_sub(self.n_requests_used)
     }
 }
-
