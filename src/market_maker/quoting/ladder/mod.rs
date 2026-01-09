@@ -129,7 +129,11 @@ impl Default for LadderConfig {
             min_depth_bps: 2.0,
             max_depth_bps: 200.0,
             geometric_spacing: true,
-            min_level_size: 0.001,
+            // FIXED: min_level_size was too high (0.001 BTC = $90 at BTC=$90k)
+            // causing all levels to be filtered out when total_size < num_levels * min_level_size.
+            // Exchange min notional is $10, so for BTC we need min_size ≈ $10/$90k ≈ 0.000111.
+            // Set to 0.00012 to provide a small buffer above exchange minimum.
+            min_level_size: 0.00012,
             // Hyperliquid fees: maker ~1-2bp, taker ~3.5bp
             // Round-trip = maker + taker ≈ 4.5-5.5bp
             // We use 3.5bp as spread capture fee (half of round-trip)

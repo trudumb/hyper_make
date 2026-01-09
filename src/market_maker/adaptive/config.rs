@@ -136,10 +136,11 @@ impl Default for AdaptiveBayesianConfig {
         Self {
             // Learned Floor - calibrated from trade history analysis
             // Trade history showed: fee 1.5 bps + AS ~3 bps = ~4.5 bps break-even per side
-            // floor = fee + E[AS] + k×σ = 1.5 + 3 + 0.5×3 = 6 bps (half-spread)
+            // FIXED: Increased safety margin to achieve 8 bps floor per CLAUDE.md recommendation
+            // floor = fee + E[AS] + k×σ = 1.5 + 3 + 1.17×3 = 8 bps (half-spread)
             as_prior_mean: 0.0003, // 3 bps prior AS (calibrated from Dec 2025 trades)
             as_prior_std: 0.0003,  // 3 bps uncertainty (tightened from 5 bps)
-            floor_risk_k: 0.5,     // 0.5σ safety margin → floor = 1.5 + 3 + 1.5 = 6 bps
+            floor_risk_k: 1.17,    // 1.17σ safety margin → floor = 1.5 + 3 + 3.5 = 8 bps
             floor_absolute_min: 0.0001, // 1 bp hard floor (tick size)
             as_horizon_ms: 1000,   // 1 second AS measurement
             as_ewma_decay: 0.995,  // ~200 obs half-life

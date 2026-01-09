@@ -1002,8 +1002,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             // Validator perps: Get account value from perps clearinghouse
+            // NOTE: Use cross_margin_summary for cross margin accounts (default).
+            // margin_summary only has value for isolated margin positions.
             match info_client.user_state(user_address).await {
-                Ok(state) => state.margin_summary.account_value.parse().unwrap_or(0.0),
+                Ok(state) => state.cross_margin_summary.account_value.parse().unwrap_or(0.0),
                 Err(e) => {
                     warn!("Failed to query user state: {e}, using 0");
                     0.0
@@ -1752,9 +1754,10 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     println!();
 
     // Account summary
+    // NOTE: Use cross_margin_summary for cross margin accounts (default)
     println!(
         "  Account Value:   ${}",
-        user_state.margin_summary.account_value
+        user_state.cross_margin_summary.account_value
     );
     println!(
         "  Total Notional:  ${}",

@@ -563,9 +563,14 @@ impl AdaptiveSpreadCalculator {
         // 1. Update learned floor with realized AS
         self.floor.update(as_realized);
 
-        // 2. Update kappa blend weight (fill indicates our kappa is accurate)
-        // Since we don't have the full fill info, just update the blend weight
-        self.kappa.increment_fill_count();
+        // 2. Update kappa with fill distance
+        // FIX: Previously only incremented count without updating Bayesian posterior.
+        // Now we record the actual fill distance for proper kappa learning.
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.kappa.on_fill_distance(fill_distance, timestamp_ms);
 
         // 3. Update fill rate controller
         self.fill_controller

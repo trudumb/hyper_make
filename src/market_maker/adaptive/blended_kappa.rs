@@ -121,7 +121,7 @@ impl BlendedKappaEstimator {
             config.kappa_blend_min_fills,
             config.kappa_blend_scale,
             config.kappa_warmup_factor,
-            300_000, // 5 minute window
+            600_000, // 10 minute window (increased from 5 min for sparse fills)
         )
     }
 
@@ -334,6 +334,42 @@ impl BlendedKappaEstimator {
     /// update the blend weight based on receiving a fill.
     pub fn increment_fill_count(&mut self) {
         self.own_fill_count += 1;
+    }
+
+    /// Record a fill with known distance (for simplified fill processing).
+    ///
+    /// This updates both the fill count AND the Bayesian posterior,
+    /// using a unit size weight. Use when fill_price/mid aren't available
+    /// but the distance is known.
+    ///
+    /// # Arguments
+    /// * `distance` - Fill distance as fraction of mid (e.g., 0.0004 = 4 bps)
+    /// * `timestamp_ms` - Fill timestamp for windowing
+    pub fn on_fill_distance(&mut self, distance: f64, timestamp_ms: u64) {
+        let distance = distance.max(0.00001); // Floor at 0.1 bps
+
+        // Add observation with unit size weight
+        self.own_fill_observations.push_back((distance, 1.0, timestamp_ms));
+        self.own_fill_count += 1;
+        self.own_sum_vw_distance += distance;
+        self.own_sum_volume += 1.0;
+
+        // Expire old observations
+        self.expire_old_observations(timestamp_ms);
+
+        // Update Bayesian posterior
+        // For Gamma-Exponential conjugacy: posterior = Gamma(α₀ + n, β₀ + Σdᵢ)
+        let n = self.own_fill_observations.len() as f64;
+        let sum_distances: f64 = self.own_fill_observations.iter().map(|(d, _, _)| d).sum();
+        self.own_alpha = self.prior_strength + n;
+        self.own_beta = self.prior_strength / self.prior_mean + sum_distances;
+
+        debug!(
+            distance_bps = %format!("{:.2}", distance * 10000.0),
+            own_kappa = %format!("{:.0}", self.own_kappa()),
+            fill_count = self.own_fill_count,
+            "BlendedKappa: fill distance recorded"
+        );
     }
 
     /// Check if we have enough own-fill data to be reliable.

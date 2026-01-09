@@ -202,8 +202,8 @@ impl Default for RiskConfig {
             max_volatility_multiplier: 3.0,
             toxicity_threshold: 1.5,
             toxicity_sensitivity: 0.3,
-            inventory_threshold: 0.5,
-            inventory_sensitivity: 2.0,
+            inventory_threshold: 0.3,       // Lowered from 0.5 - start scaling earlier
+            inventory_sensitivity: 3.0,     // Increased from 2.0 - stronger inventory effect on gamma
             gamma_min: 0.05,
             gamma_max: 5.0,
             // FIRST PRINCIPLES: min_spread_floor = fees + AS + buffer + toxic_margin

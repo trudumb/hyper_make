@@ -61,8 +61,8 @@ impl Default for KappaOrchestratorConfig {
             prior_kappa: 2000.0,
             prior_strength: 10.0,
             robust_nu: 4.0,
-            robust_window_ms: 300_000, // 5 min
-            own_fill_window_ms: 300_000,
+            robust_window_ms: 600_000, // 10 min (increased from 5 min for sparse fills)
+            own_fill_window_ms: 600_000,
             use_book_kappa: true,
             use_robust_kappa: true,
         }

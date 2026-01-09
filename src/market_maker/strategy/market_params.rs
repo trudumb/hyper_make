@@ -499,10 +499,12 @@ pub struct MarketParams {
 
     /// Model-derived target liquidity (SIZE, not value).
     /// Formula: min(Q_hard, Q_soft × latency_penalty).max(exchange_min)
+    ///
     /// Where:
     /// - Q_hard = account_value × leverage × 0.5 / mark_price (margin solvency)
     /// - Q_soft = √(2 × acceptable_loss / (γ × σ²)) (GLFT risk budget)
     /// - latency_penalty = max(0.3, 1 - 0.5×√(τ/30ms)) (MEASURED τ)
+    ///
     /// This replaces hardcoded target_liquidity when > 0.
     pub derived_target_liquidity: f64,
 }

@@ -174,7 +174,7 @@ fn create_production_levels() -> Vec<LevelOptimizationParams> {
 
     (0..num_levels)
         .map(|i| {
-            let depth_bps = min_depth * ratio.powi(i as i32);
+            let depth_bps = min_depth * ratio.powi(i);
             let depth = depth_bps / 10000.0; // Convert to fraction
 
             // Fill intensity: λ(δ) = κ × min(1, (σ×√τ / δ)²)

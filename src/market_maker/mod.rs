@@ -2974,7 +2974,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let cache_max_age = Duration::from_secs(60);
             let should_refresh = self.infra.cached_rate_limit
                 .as_ref()
-                .map_or(true, |c| c.is_stale(cache_max_age));
+                .is_none_or(|c| c.is_stale(cache_max_age));
             
             if should_refresh {
                 match self.info_client.user_rate_limit(self.user_address).await {
@@ -4504,13 +4504,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // CRITICAL FIX: If the order is confirmed gone (Cancelled OR AlreadyFilled),
                     // we MUST remove it from ws_state.
-                    if result.order_is_gone() {
-                        if self.ws_state.remove_order(*oid).is_some() {
-                            warn!(
-                                oid = oid,
-                                "Forced removal from ws_state to correct synchronization (cancel confirmed/filled)"
-                            );
-                        }
+                    if result.order_is_gone()
+                        && self.ws_state.remove_order(*oid).is_some()
+                    {
+                        warn!(
+                            oid = oid,
+                            "Forced removal from ws_state to correct synchronization (cancel confirmed/filled)"
+                        );
                     }
                 }
             } else if !ghost_orphans.is_empty() {

@@ -427,7 +427,7 @@ impl LadderStrategy {
             urgency_score: market_params.urgency_score,
             // Convert annualized funding rate to per-second rate
             // 365.25 * 24 * 60 * 60 = 31,557,600 seconds/year
-            funding_rate: market_params.funding_rate / 31557_600.0,
+            funding_rate: market_params.funding_rate / 31_557_600.0,
             use_funding_skew: true,
         };
 
@@ -554,24 +554,63 @@ impl LadderStrategy {
             const MAX_MARGIN_UTILIZATION: f64 = 0.15; // Use only 15% of available margin
             let usable_margin = available_margin * MAX_MARGIN_UTILIZATION;
 
-            // === TWO-SIDED MARGIN ALLOCATION ===
-            // Split usable margin between sides using inventory-weighted allocation:
-            // - When LONG (positive inventory): allocate more margin to asks (reduce position)
-            // - When SHORT (negative inventory): allocate more margin to bids (reduce position)
-            // - When FLAT: 50/50 split
+            // === TWO-SIDED MARGIN ALLOCATION (STOCHASTIC-WEIGHTED) ===
+            // Split usable margin using three components:
+            // 1. INVENTORY: Mean-revert position (primary driver)
+            // 2. MOMENTUM: Follow flow when flat to capture directional edge
+            // 3. URGENCY: Amplify reduction when position opposes momentum (danger zone)
+            //
+            // FIRST PRINCIPLES:
+            // - When flat: follow momentum to capture directional alpha
+            // - When positioned: prioritize mean-reversion
+            // - When position opposes momentum: urgently reduce exposure
+
             let inventory_ratio = if effective_max_position > EPSILON {
                 (position / effective_max_position).clamp(-1.0, 1.0)
             } else {
                 0.0
             };
 
-            // Inventory-weighted margin split:
-            // - inventory_ratio > 0 (long): ask_weight increases, bid_weight decreases
-            // - inventory_ratio < 0 (short): bid_weight increases, ask_weight decreases
-            // - Range: 0.3 to 0.7 (never fully one-sided to maintain two-sided quoting)
-            const MARGIN_SPLIT_SENSITIVITY: f64 = 0.2; // How much inventory affects split
-            let ask_margin_weight =
-                (0.5 + inventory_ratio * MARGIN_SPLIT_SENSITIVITY).clamp(0.3, 0.7);
+            // Component weights (sum to 1.0)
+            const INVENTORY_WEIGHT: f64 = 0.6; // Primary: inventory reduction
+            const MOMENTUM_WEIGHT: f64 = 0.3; // Secondary: follow flow direction
+            const URGENCY_WEIGHT: f64 = 0.1; // Amplifier: danger detection
+
+            // Sensitivity factors
+            const INVENTORY_SENSITIVITY: f64 = 0.4; // How much inventory affects split
+            const MOMENTUM_SENSITIVITY: f64 = 0.3; // How much flow affects split (when flat)
+
+            // 1. INVENTORY COMPONENT: Mean-revert position
+            // Long → more margin to asks, Short → more margin to bids
+            let inventory_signal = inventory_ratio * INVENTORY_SENSITIVITY;
+
+            // 2. MOMENTUM COMPONENT: Follow flow direction
+            // Positive flow (bullish) → allocate more to asks to capture rises
+            // Negative flow (bearish) → allocate more to bids to capture falls
+            // Scale by (1 - |inventory_ratio|) so momentum matters more when flat
+            let inventory_flat_factor = 1.0 - inventory_ratio.abs();
+            let momentum_signal =
+                market_params.flow_imbalance * MOMENTUM_SENSITIVITY * inventory_flat_factor;
+
+            // 3. URGENCY COMPONENT: Amplify when position opposes momentum
+            // If long and price falling, or short and price rising → urgent reduction needed
+            let urgency_signal = if market_params.position_opposes_momentum {
+                // Use HJB drift urgency direction with urgency score magnitude
+                // This gives strong directional pressure when in danger
+                let urgency_direction = if inventory_ratio > 0.0 { 1.0 } else { -1.0 };
+                urgency_direction * market_params.urgency_score.min(1.0) * 0.2
+            } else {
+                0.0
+            };
+
+            // Combine weighted components
+            let combined_signal = inventory_signal * INVENTORY_WEIGHT
+                + momentum_signal * MOMENTUM_WEIGHT
+                + urgency_signal * URGENCY_WEIGHT;
+
+            // Apply to base 0.5 split with wider clamp range [0.25, 0.75]
+            // This allows stronger skew when signals are aligned
+            let ask_margin_weight = (0.5 + combined_signal).clamp(0.25, 0.75);
             let bid_margin_weight = 1.0 - ask_margin_weight;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;
@@ -581,9 +620,12 @@ impl LadderStrategy {
                 usable_margin = %format!("{:.2}", usable_margin),
                 utilization_pct = %format!("{:.0}%", MAX_MARGIN_UTILIZATION * 100.0),
                 inventory_ratio = %format!("{:.3}", inventory_ratio),
+                flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
+                position_opposes = %market_params.position_opposes_momentum,
+                urgency_score = %format!("{:.2}", market_params.urgency_score),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
-                "Margin allocation (33% utilization, inventory-weighted split)"
+                "Margin allocation (stochastic-weighted split)"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
