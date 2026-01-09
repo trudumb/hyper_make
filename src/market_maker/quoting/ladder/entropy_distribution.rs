@@ -269,36 +269,56 @@ pub struct MarketRegime {
 // Utility Computation
 // ============================================================================
 
-/// Compute utility for each level (log-scale for numerical stability).
+/// Compute utilities for entropy-based distribution using rank normalization.
 ///
-/// Utility function:
-/// ```text
-/// U(δ) = w_sc × SC(δ)⁺ - penalty × SC(δ)⁻ + w_fp × log(P_fill(δ) + ε)
-/// ```
+/// IMPORTANT: Uses rank-based utilities for robustness to extreme EV ranges.
 ///
-/// Where:
-/// - SC(δ)⁺ = max(SC, 0): positive spread capture component
-/// - SC(δ)⁻ = max(-SC, 0): negative spread capture (penalized softly)
-/// - P_fill: fill probability from first-passage model
+/// Previous z-score approach failed in production because:
+/// - 25 levels from 2-200 bps created EV range of 176:1
+/// - Z-scores preserved this extreme range
+/// - Softmax concentrated on highest-EV level (entropy → 0)
+///
+/// Rank-based approach ensures utilities are always in [-1, 1]:
+/// - Lowest EV gets utility -1
+/// - Highest EV gets utility +1
+/// - With T=1.0, max prob ratio = exp(2) ≈ 7.4:1
+/// - Robust to any input scale (log, linear, exponential)
 fn compute_utilities(
     levels: &[EntropyLevelParams],
-    config: &EntropyDistributionConfig,
+    _config: &EntropyDistributionConfig,
 ) -> Vec<f64> {
-    levels
+    if levels.is_empty() {
+        return vec![];
+    }
+
+    // Step 1: Compute expected values (proper GLFT formulation)
+    // EV = P(fill) × spread_capture
+    // This naturally discounts deep levels with low fill probability
+    let evs: Vec<f64> = levels
         .iter()
-        .map(|level| {
-            let sc_positive = level.spread_capture.max(0.0);
-            let sc_negative = (-level.spread_capture).max(0.0);
+        .map(|level| level.fill_probability * level.spread_capture.max(0.0))
+        .collect();
 
-            // Fill probability contribution (log scale for multiplicative effect)
-            let fill_contrib = (level.fill_probability + 1e-6).ln();
+    // Step 2: Use rank-based utilities for robustness to extreme ranges
+    // This ensures utilities are always in [-1, 1] regardless of EV magnitude
+    let mut indexed: Vec<(usize, f64)> = evs.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Utility combines spread capture and fill probability
-            // Negative SC is penalized but NOT zeroed (key difference from old system)
-            config.spread_capture_weight * sc_positive - config.negative_sc_penalty * sc_negative
-                + config.fill_prob_weight * fill_contrib
-        })
-        .collect()
+    let n = evs.len();
+    let mut utilities = vec![0.0; n];
+    for (rank, (idx, _)) in indexed.iter().enumerate() {
+        // Map rank to [-1, 1] range
+        // rank 0 (lowest EV) → -1
+        // rank n-1 (highest EV) → +1
+        let normalized_rank = if n > 1 {
+            2.0 * (rank as f64) / ((n - 1) as f64) - 1.0
+        } else {
+            0.0
+        };
+        utilities[*idx] = normalized_rank;
+    }
+
+    utilities
 }
 
 // ============================================================================

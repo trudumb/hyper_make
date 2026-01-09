@@ -89,7 +89,9 @@
       "Bash(cargo tree:*)",
       "Bash(mold:*)",
       "Bash(lld:*)",
-      "Bash(sccache --version:*)"
+      "Bash(sccache --version:*)",
+      "mcp__serena__read_file",
+      "mcp__serena__replace_symbol_body"
     ]
   }
 }

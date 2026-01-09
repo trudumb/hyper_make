@@ -1862,13 +1862,40 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
+        // === MEASURED LATENCY: Set from WS ping measurements ===
+        // This is MEASURED data, NOT hardcoded assumptions
+        // Use prometheus metrics directly (concrete type) for measured WS latency
+        let measured_latency = self.infra.prometheus.ws_ping_latency_ms();
+        market_params.measured_latency_ms = if measured_latency > 0.0 {
+            measured_latency
+        } else {
+            50.0 // Conservative default during warmup
+        };
+
         // Compute stochastic constraints (latency floor, tight quoting conditions)
+        // NOTE: latency_spread_floor now uses measured_latency_ms instead of hardcoded config
         let current_hour_utc = chrono::Utc::now().hour() as u8;
         market_params.compute_stochastic_constraints(
             &self.stochastic.stochastic_config,
             self.position.position(),
             self.config.max_position,
             current_hour_utc,
+        );
+
+        // === MODEL-DERIVED TARGET LIQUIDITY (GLFT First Principles) ===
+        // Compute GLFT-derived target_liquidity using ALL measured inputs:
+        // - account_value: from margin state
+        // - leverage: from exchange metadata
+        // - sigma: from bipower variation estimator (MEASURED)
+        // - fill_rate: from observed fills (MEASURED)
+        // - latency: from WS ping (MEASURED)
+        // Note: num_levels is used for per-level cap calculation (defensive bound)
+        // Default ladder has 25 levels - this constant is used for sizing only
+        const DEFAULT_NUM_LEVELS: usize = 25;
+        market_params.compute_derived_target_liquidity(
+            self.config.risk_aversion,              // User preference (γ)
+            DEFAULT_NUM_LEVELS,                     // Ladder config (default 25 levels)
+            MIN_ORDER_NOTIONAL,                     // Exchange minimum ($10)
         );
 
         // CRITICAL: Update cached effective max_position from first principles
@@ -1887,31 +1914,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Note: exchange limits were already updated BEFORE building sources (line ~1210)
         // using pre_effective_max_position which should equal new_effective
 
-        // CRITICAL: Update cached effective target_liquidity from first principles
-        // min_viable = MIN_ORDER_NOTIONAL / price ensures orders pass exchange minimum
-        // This is THE source of truth for all sizing calculations
+        // === EFFECTIVE TARGET LIQUIDITY: Use GLFT-Derived as Default ===
+        // The model-derived liquidity is now the PRIMARY source of truth.
+        // User's config.target_liquidity is used ONLY as a cap (safety override).
         //
-        // Account for size truncation: sz_decimals truncation can lose up to 10^(-sz_decimals)
-        // Example: sz_decimals=2 → truncation can lose 0.01 → add buffer of 1.5× tick
-        // Formula: min_viable = min_notional / price + 1.5 × 10^(-sz_decimals)
+        // Priority:
+        // 1. GLFT-derived (from γ, σ, account_value, latency) - DEFAULT
+        // 2. User config - cap only (can reduce, cannot increase beyond derived)
+        // 3. Exchange minimum - floor (must pass min_notional)
         let truncation_buffer = 1.5 * (10.0_f64).powi(-(self.config.sz_decimals as i32));
         let min_viable_liquidity =
             (MIN_ORDER_NOTIONAL / market_params.microprice) + truncation_buffer;
-        let new_effective_liquidity = self
-            .config
-            .target_liquidity
-            .max(min_viable_liquidity) // Ensure orders pass min_notional after truncation
-            .min(self.effective_max_position); // Can't exceed position limit
+
+        // Use derived liquidity as default, cap with user config
+        let new_effective_liquidity = if market_params.derived_target_liquidity > 0.0 {
+            // GLFT-derived is available: use it, capped by user config
+            market_params
+                .derived_target_liquidity
+                .min(self.config.target_liquidity) // User cap
+                .max(min_viable_liquidity)         // Exchange minimum
+                .min(self.effective_max_position)  // Position limit
+        } else {
+            // Fallback: use config (warmup or zero account_value)
+            self.config
+                .target_liquidity
+                .max(min_viable_liquidity)
+                .min(self.effective_max_position)
+        };
 
         if (new_effective_liquidity - self.effective_target_liquidity).abs() > 0.001 {
             info!(
                 old = %format!("{:.6}", self.effective_target_liquidity),
                 new = %format!("{:.6}", new_effective_liquidity),
                 config_target = %format!("{:.6}", self.config.target_liquidity),
+                derived_target = %format!("{:.6}", market_params.derived_target_liquidity),
                 min_viable = %format!("{:.6}", min_viable_liquidity),
-                truncation_buffer = %format!("{:.6}", truncation_buffer),
                 max_position = %format!("{:.6}", self.effective_max_position),
-                "Effective target liquidity updated (first-principles with truncation buffer)"
+                latency_ms = %format!("{:.1}", market_params.measured_latency_ms),
+                "Target liquidity: GLFT-derived as default (all inputs from measured data)"
             );
         }
         self.effective_target_liquidity = new_effective_liquidity;

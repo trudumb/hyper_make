@@ -744,12 +744,19 @@ impl LadderStrategy {
             }
 
             // 4. Generate ladder to get depth levels and prices (using dynamic depths)
-            // Use effective level counts based on capacity constraints
+            // NOTE: Don't truncate here - let the entropy optimizer handle distribution
+            // The optimizer has built-in notional constraints that will filter sub-minimum levels
             let mut ladder = Ladder::generate(&ladder_config, &params);
-            
-            // Truncate ladder to effective level counts
-            ladder.bids.truncate(effective_bid_levels);
-            ladder.asks.truncate(effective_ask_levels);
+
+            // Log if capacity is tight (for debugging), but don't truncate
+            if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels {
+                tracing::debug!(
+                    configured = configured_levels,
+                    capacity_bid = effective_bid_levels,
+                    capacity_ask = effective_ask_levels,
+                    "Capacity suggests fewer levels, but entropy optimizer will handle distribution"
+                );
+            }
 
             // 5. Create separate optimizers for bids and asks with their respective limits
             // These are only used when use_entropy_distribution=false (legacy path)
@@ -981,11 +988,13 @@ impl LadderStrategy {
                 }
             }
 
-            // 9. Filter out zero-size levels
+            // 9. Filter out levels below minimum notional (exchange will reject them anyway)
+            // Use a slightly lower threshold (0.8x) to avoid edge cases near the boundary
+            let min_size_for_exchange = config.min_notional * 0.8 / market_params.microprice;
             let bids_before = ladder.bids.len();
             let asks_before = ladder.asks.len();
-            ladder.bids.retain(|l| l.size > EPSILON);
-            ladder.asks.retain(|l| l.size > EPSILON);
+            ladder.bids.retain(|l| l.size > min_size_for_exchange);
+            ladder.asks.retain(|l| l.size > min_size_for_exchange);
 
             // Diagnostic: warn if all levels were filtered out
             if bids_before > 0 && ladder.bids.is_empty() {

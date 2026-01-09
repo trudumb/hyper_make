@@ -1003,6 +1003,17 @@ impl ParameterAggregator {
             calibration_gamma_mult: sources.calibration_gamma_mult,
             calibration_progress: sources.calibration_progress,
             calibration_complete: sources.calibration_complete,
+
+            // === Model-Derived Sizing (GLFT First Principles) ===
+            // These are set from margin state and WS latency measurements
+            account_value: sources.margin_sizer.state().account_value,
+            measured_latency_ms: 0.0, // Will be set from WS manager in mod.rs
+            estimated_fill_rate: sources
+                .adaptive_spreads
+                .fill_rate_controller()
+                .observed_fill_rate()
+                .max(0.001), // Floor at 0.001/sec
+            derived_target_liquidity: 0.0, // Computed by compute_derived_target_liquidity()
         }
     }
 }

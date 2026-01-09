@@ -623,6 +623,13 @@ impl PrometheusMetrics {
             .store(reconnect_signal_count, Ordering::Relaxed);
     }
 
+    /// Get measured WebSocket ping latency in milliseconds.
+    /// Returns the EWMA-smoothed round-trip time from ping/pong measurements.
+    /// Used for latency-adjusted spread floor and position sizing.
+    pub fn ws_ping_latency_ms(&self) -> f64 {
+        self.inner.ws_ping_latency_ms.load()
+    }
+
     // === Data Quality Updates ===
 
     /// Record a data quality issue.

@@ -182,6 +182,11 @@ pub trait MarketMakerMetricsRecorder: Send + Sync {
     fn record_fill(&self, amount: f64, is_buy: bool);
     /// Called when position changes
     fn update_position(&self, position: f64);
+    /// Get measured WebSocket ping latency in milliseconds.
+    /// Returns 0.0 if not available or not measured yet.
+    fn ws_ping_latency_ms(&self) -> f64 {
+        0.0 // Default implementation for backwards compatibility
+    }
 }
 
 /// Configuration for the market maker.

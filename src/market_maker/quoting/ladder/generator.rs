@@ -1107,6 +1107,8 @@ mod tests {
             0.0,
             false,
             0.0,
+            0.0,   // funding_rate
+            false, // use_funding_skew
         );
 
         assert!(ladder.bids[0].price < 100.0); // Price shifted down
@@ -1144,6 +1146,8 @@ mod tests {
             0.0,
             false,
             0.0,
+            0.0,   // funding_rate
+            false, // use_funding_skew
         );
 
         assert!(ladder.bids[0].price > 99.0); // Price shifted up
@@ -1181,6 +1185,8 @@ mod tests {
             0.0,
             false,
             0.0,
+            0.0,   // funding_rate
+            false, // use_funding_skew
         );
 
         assert!((ladder.bids[0].price - 100.0).abs() < EPSILON);
@@ -1219,6 +1225,8 @@ mod tests {
             0.0,
             false,
             0.0,
+            0.0,   // funding_rate
+            false, // use_funding_skew
         );
 
         // Prices should be integers (no fractional part)

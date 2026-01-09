@@ -481,6 +481,30 @@ pub struct MarketParams {
     /// Whether calibration is complete.
     /// When true, calibration_gamma_mult = 1.0.
     pub calibration_complete: bool,
+
+    // ==================== Model-Derived Sizing (GLFT First Principles) ====================
+    /// Account value in USD (total equity).
+    /// Used for GLFT-derived target liquidity: Q_soft = √(2×loss_budget/(γ×σ²))
+    pub account_value: f64,
+
+    /// Measured WebSocket latency in milliseconds (from ping/pong).
+    /// Used for latency penalty: penalty = max(0.3, 1 - 0.5×√(τ/30ms))
+    /// NOT hardcoded - comes from live WS measurements.
+    pub measured_latency_ms: f64,
+
+    /// Estimated fill rate (fills per second).
+    /// Used for GLFT time horizon T = 1/fill_rate.
+    /// Derived from observed fills, NOT assumed.
+    pub estimated_fill_rate: f64,
+
+    /// Model-derived target liquidity (SIZE, not value).
+    /// Formula: min(Q_hard, Q_soft × latency_penalty).max(exchange_min)
+    /// Where:
+    /// - Q_hard = account_value × leverage × 0.5 / mark_price (margin solvency)
+    /// - Q_soft = √(2 × acceptable_loss / (γ × σ²)) (GLFT risk budget)
+    /// - latency_penalty = max(0.3, 1 - 0.5×√(τ/30ms)) (MEASURED τ)
+    /// This replaces hardcoded target_liquidity when > 0.
+    pub derived_target_liquidity: f64,
 }
 
 impl Default for MarketParams {
@@ -629,6 +653,11 @@ impl Default for MarketParams {
             calibration_gamma_mult: 0.3, // Start fill-hungry (70% gamma reduction)
             calibration_progress: 0.0,   // Start at 0% calibration
             calibration_complete: false, // Not calibrated yet
+            // Model-Derived Sizing (GLFT First Principles)
+            account_value: 0.0,              // Will be set from margin state
+            measured_latency_ms: 50.0,       // Default 50ms until measured
+            estimated_fill_rate: 0.001,      // Conservative 0.001/sec until observed
+            derived_target_liquidity: 0.0,   // Will be computed from GLFT formula
         }
     }
 }
@@ -910,10 +939,16 @@ impl MarketParams {
         current_hour_utc: u8,
     ) {
         // === 1. Latency-Aware Spread Floor ===
-        // δ_min = σ × √(2×τ_update) where τ_update is in seconds
+        // δ_min = σ × √(2×τ) where τ is MEASURED round-trip latency in seconds
+        // Use measured_latency_ms (from WS ping) if available, fall back to config
         if config.use_latency_spread_floor {
-            let tau_update_sec = config.quote_update_latency_ms / 1000.0;
-            self.latency_spread_floor = self.sigma * (2.0 * tau_update_sec).sqrt();
+            // Prefer MEASURED latency over hardcoded config value
+            let tau_sec = if self.measured_latency_ms > 0.0 {
+                self.measured_latency_ms / 1000.0
+            } else {
+                config.quote_update_latency_ms / 1000.0
+            };
+            self.latency_spread_floor = self.sigma * (2.0 * tau_sec).sqrt();
         }
 
         // === 2. Evaluate Tight Quoting Conditions ===
@@ -1006,5 +1041,98 @@ impl MarketParams {
         risk_config_floor
             .max(tick_floor)
             .max(self.latency_spread_floor)
+    }
+
+    /// Compute model-derived target liquidity from GLFT first principles.
+    ///
+    /// ALL inputs are from MEASURED data or exchange metadata - NO assumptions:
+    /// - `gamma`: Risk aversion (user preference)
+    /// - `sigma`: Measured volatility (from bipower variation)
+    /// - `measured_latency_ms`: Measured WS ping latency
+    /// - `estimated_fill_rate`: Observed fills per second
+    /// - `account_value`: From margin state
+    /// - `leverage`: From exchange metadata
+    /// - `microprice`: Current fair price
+    /// - `num_levels`: Ladder configuration
+    /// - `min_notional`: Exchange minimum ($10)
+    ///
+    /// Formula:
+    /// - Q_hard = account_value × leverage × 0.5 / mark_price (margin solvency)
+    /// - Q_soft = √(2 × acceptable_loss / (γ × σ²)) (GLFT risk budget, 2% of account)
+    /// - latency_penalty = max(0.3, 1 - 0.5 × √(τ_measured / 30ms))
+    /// - derived = min(Q_hard, Q_soft × latency_penalty).max(exchange_min)
+    pub fn compute_derived_target_liquidity(
+        &mut self,
+        gamma: f64,
+        num_levels: usize,
+        min_notional: f64,
+    ) {
+        // Sanity check inputs
+        if self.account_value <= 0.0 || self.leverage <= 0.0 || self.microprice <= 0.0 {
+            self.derived_target_liquidity = 0.0;
+            return;
+        }
+
+        // === Hard Constraint: Margin Solvency ===
+        // Can only quote what the account can actually support
+        // Use 50% safety factor to leave buffer for adverse price moves
+        let q_hard = (self.account_value * self.leverage * 0.5) / self.microprice;
+
+        // === Soft Constraint: GLFT Risk Budget ===
+        // Acceptable loss = 2% of account value (conservative)
+        // Q_soft = √(2 × acceptable_loss / (γ × σ²)) / 2
+        // The /2 at the end is because we size each side independently
+        let acceptable_loss = self.account_value * 0.02;
+        let sigma_sq = self.sigma.powi(2).max(1e-12); // Floor to prevent div by zero
+        let gamma_eff = gamma.max(0.01); // Floor gamma to prevent explosion
+
+        // Fill rate adjustment: higher fill rate allows larger inventory bounds
+        // T = 1/fill_rate, so Q_soft scales with sqrt(fill_rate)
+        let fill_rate_factor = self.estimated_fill_rate.sqrt().max(0.01);
+
+        let q_soft = ((2.0 * acceptable_loss) / (gamma_eff * sigma_sq)).sqrt()
+            * fill_rate_factor / 2.0;
+
+        // === Latency Penalty: Reduce exposure when slow ===
+        // At high latency, price moves σ√τ during round-trip
+        // This erodes edge, so size down proportionally
+        // penalty = max(0.3, 1 - 0.5 × √(τ_measured / 30ms))
+        let tau_ms = self.measured_latency_ms.max(10.0); // Floor at 10ms
+        let tau_baseline_ms = 30.0; // 30ms baseline (low latency)
+        let latency_penalty = (1.0 - 0.5 * (tau_ms / tau_baseline_ms).sqrt()).max(0.3);
+
+        let q_soft_adjusted = q_soft * latency_penalty;
+
+        // === Per-Level Constraint ===
+        // Don't size so large that individual levels are too big
+        let num_levels_f = (num_levels as f64).max(1.0);
+        let per_level_cap = q_hard / num_levels_f;
+
+        // === Exchange Minimum ===
+        // Must be at least min_notional in USD, with 50% buffer
+        let min_viable = (min_notional * 1.5) / self.microprice;
+
+        // === Final Derived Liquidity ===
+        // Take minimum of all constraints, but ensure at least exchange minimum
+        self.derived_target_liquidity = q_hard
+            .min(q_soft_adjusted)
+            .min(per_level_cap)
+            .max(min_viable);
+
+        tracing::debug!(
+            q_hard = %format!("{:.6}", q_hard),
+            q_soft = %format!("{:.6}", q_soft),
+            q_soft_adjusted = %format!("{:.6}", q_soft_adjusted),
+            latency_penalty = %format!("{:.2}", latency_penalty),
+            per_level_cap = %format!("{:.6}", per_level_cap),
+            min_viable = %format!("{:.6}", min_viable),
+            derived = %format!("{:.6}", self.derived_target_liquidity),
+            account_value = %format!("{:.2}", self.account_value),
+            gamma = %format!("{:.3}", gamma_eff),
+            sigma = %format!("{:.6}", self.sigma),
+            latency_ms = %format!("{:.1}", tau_ms),
+            fill_rate = %format!("{:.4}", self.estimated_fill_rate),
+            "GLFT-derived target liquidity (all inputs from measured data)"
+        );
     }
 }

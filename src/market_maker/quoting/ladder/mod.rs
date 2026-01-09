@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = LadderConfig::default();
-        assert_eq!(config.num_levels, 5);
+        assert_eq!(config.num_levels, 25); // Default 25 levels (max capacity)
         assert!((config.min_depth_bps - 2.0).abs() < 0.01);
         assert!((config.max_depth_bps - 200.0).abs() < 0.01);
         assert!(config.geometric_spacing);
@@ -275,6 +275,8 @@ mod tests {
             position_opposes_momentum: false,
             directional_variance_mult: 1.0,
             urgency_score: 0.0,
+            funding_rate: 0.0,
+            use_funding_skew: false,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -320,6 +322,8 @@ mod tests {
             position_opposes_momentum: false,
             directional_variance_mult: 1.0,
             urgency_score: 0.0,
+            funding_rate: 0.0,
+            use_funding_skew: false,
         };
 
         let params_long = LadderParams {
@@ -376,6 +380,8 @@ mod tests {
             position_opposes_momentum: false,
             directional_variance_mult: 1.0,
             urgency_score: 0.0,
+            funding_rate: 0.0,
+            use_funding_skew: false,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -425,6 +431,8 @@ mod tests {
             position_opposes_momentum: true,
             directional_variance_mult: 1.5,
             urgency_score: 2.0, // Above 0.5 threshold
+            funding_rate: 0.0,
+            use_funding_skew: false,
         };
 
         // Same params but WITHOUT drift adjustment
