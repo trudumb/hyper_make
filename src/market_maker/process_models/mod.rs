@@ -9,12 +9,12 @@
 
 mod funding;
 mod hawkes;
-mod hjb_control;
+mod hjb;
 mod liquidation;
 mod spread;
 
 pub use funding::*;
 pub use hawkes::*;
-pub use hjb_control::*;
+pub use hjb::*;
 pub use liquidation::*;
 pub use spread::*;

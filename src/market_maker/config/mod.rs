@@ -1,0 +1,28 @@
+//! Configuration types for the market maker.
+//!
+//! This module is organized into focused submodules:
+//!
+//! - `spread_profile`: Spread profile for different market types
+//! - `runtime`: Pre-computed asset runtime configuration
+//! - `core`: Core market maker config, quote config, monitoring
+//! - `risk`: Dynamic risk configuration
+//! - `stochastic`: Stochastic module integration settings
+//! - `impulse`: Statistical impulse control configuration
+//! - `multi_asset`: Multi-asset market making configuration
+
+mod core;
+mod impulse;
+mod multi_asset;
+mod risk;
+mod runtime;
+mod spread_profile;
+mod stochastic;
+
+// Re-export everything for backward compatibility
+pub use core::*;
+pub use impulse::*;
+pub use multi_asset::*;
+pub use risk::*;
+pub use runtime::*;
+pub use spread_profile::*;
+pub use stochastic::*;
