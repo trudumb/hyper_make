@@ -9,8 +9,104 @@
 //! - Exponential backoff with configurable thresholds
 //! - Automatic reset on successful order placement
 //! - Metrics for monitoring backoff state
+//! - Error classification for different rejection types
 
 use std::time::{Duration, Instant};
+
+// ============================================================================
+// Error Classification
+// ============================================================================
+
+/// Classification of order rejection error types.
+///
+/// Different error types require different handling strategies:
+/// - `PositionLimit`: Skip side entirely until position changes (do NOT retry)
+/// - `Margin`: Transient, use exponential backoff
+/// - `PriceError`: May retry with adjusted price
+/// - `Other`: Unknown error, use default backoff
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionErrorType {
+    /// Position limit exceeded (PerpMaxPosition, position exceeded, etc.)
+    /// Should NOT retry - skip side until position changes.
+    PositionLimit,
+    /// Margin or leverage related (PerpMargin, leverage limit, etc.)
+    /// Transient, use exponential backoff.
+    Margin,
+    /// Price-related error (BadAloPx - price outside spread)
+    /// May retry immediately with adjusted price.
+    PriceError,
+    /// Unknown error type - use default handling.
+    Other,
+}
+
+impl RejectionErrorType {
+    /// Classify an error message into a rejection type.
+    ///
+    /// # Arguments
+    /// - `error`: The error message from the exchange
+    ///
+    /// # Returns
+    /// The classified error type
+    pub fn classify(error: &str) -> Self {
+        let error_lower = error.to_lowercase();
+
+        // Position limit errors - these should skip the side, not backoff
+        if error_lower.contains("perpmaxposition")
+            || error_lower.contains("max position")
+            || error_lower.contains("position size")
+            || error_lower.contains("exceed")
+                && (error_lower.contains("position") || error_lower.contains("size"))
+        {
+            return RejectionErrorType::PositionLimit;
+        }
+
+        // Margin/leverage errors - transient, use backoff
+        if error_lower.contains("perpmargin")
+            || error_lower.contains("margin")
+            || error_lower.contains("leverage")
+            || error_lower.contains("insufficient")
+        {
+            return RejectionErrorType::Margin;
+        }
+
+        // Price errors - can retry with adjusted price
+        if error_lower.contains("badalopx")
+            || error_lower.contains("price")
+            || error_lower.contains("px")
+        {
+            return RejectionErrorType::PriceError;
+        }
+
+        RejectionErrorType::Other
+    }
+
+    /// Returns true if this error type should trigger position/side skipping.
+    pub fn should_skip_side(&self) -> bool {
+        matches!(self, RejectionErrorType::PositionLimit)
+    }
+
+    /// Returns true if this error type should use exponential backoff.
+    pub fn should_backoff(&self) -> bool {
+        matches!(
+            self,
+            RejectionErrorType::PositionLimit
+                | RejectionErrorType::Margin
+                | RejectionErrorType::Other
+        )
+    }
+
+    /// Returns true if this error type is transient and may resolve on its own.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            RejectionErrorType::Margin | RejectionErrorType::PriceError
+        )
+    }
+}
+
+// ============================================================================
+// Rejection Rate Limit Configuration
+// ============================================================================
 
 /// Configuration for rejection-aware rate limiting.
 #[derive(Debug, Clone)]
@@ -135,6 +231,91 @@ impl RejectionRateLimiter {
         } else {
             None
         }
+    }
+
+    /// Record a batch of order rejections as a single rejection event.
+    ///
+    /// When a bulk order has multiple rejections of the same type, this counts
+    /// as ONE rejection for backoff purposes, but the total count is preserved
+    /// for metrics accuracy.
+    ///
+    /// # Arguments
+    /// - `is_buy`: Whether the rejected orders were buys
+    /// - `error`: Error message from exchange (representative sample)
+    /// - `count`: Number of rejections in this batch
+    ///
+    /// # Returns
+    /// The new backoff duration (if any)
+    pub fn record_batch_rejection(
+        &mut self,
+        is_buy: bool,
+        error: &str,
+        count: u32,
+    ) -> Option<Duration> {
+        if count == 0 {
+            return None;
+        }
+
+        // Only track position-related rejections if configured
+        if self.config.position_errors_only
+            && !error.contains("position")
+            && !error.contains("exceed")
+            && !error.contains("leverage")
+        {
+            return None;
+        }
+
+        let state = if is_buy {
+            &mut self.bid_state
+        } else {
+            &mut self.ask_state
+        };
+
+        // Increment consecutive_rejections by 1 (batch = single event for backoff)
+        // but track the actual count in total_rejections for metrics
+        state.consecutive_rejections += 1;
+        state.total_rejections += count as u64;
+
+        // Calculate backoff if over threshold
+        if state.consecutive_rejections >= self.config.backoff_start_threshold {
+            let rejections_over =
+                state.consecutive_rejections - self.config.backoff_start_threshold;
+            let multiplier = self.config.backoff_multiplier.powi(rejections_over as i32);
+            let backoff_secs = (self.config.initial_backoff.as_secs_f64() * multiplier)
+                .min(self.config.max_backoff.as_secs_f64());
+            let backoff = Duration::from_secs_f64(backoff_secs);
+
+            state.backoff_until = Some(Instant::now() + backoff);
+
+            Some(backoff)
+        } else {
+            None
+        }
+    }
+
+    /// Record a batch of rejections with error classification.
+    ///
+    /// This is the preferred method for batch rejection handling as it provides
+    /// both backoff control and error type classification for smarter handling.
+    ///
+    /// # Arguments
+    /// - `is_buy`: Whether the rejected orders were buys
+    /// - `error`: Error message from exchange (representative sample)
+    /// - `count`: Number of rejections in this batch
+    ///
+    /// # Returns
+    /// A tuple of (backoff_duration, error_type, should_skip_side)
+    pub fn classify_and_record_batch(
+        &mut self,
+        is_buy: bool,
+        error: &str,
+        count: u32,
+    ) -> (Option<Duration>, RejectionErrorType, bool) {
+        let error_type = RejectionErrorType::classify(error);
+        let backoff = self.record_batch_rejection(is_buy, error, count);
+        let should_skip = error_type.should_skip_side();
+
+        (backoff, error_type, should_skip)
     }
 
     /// Record a successful order placement.
@@ -707,5 +888,148 @@ mod tests {
             .record_rejection(true, "insufficient margin")
             .is_none());
         assert_eq!(limiter.bid_state.consecutive_rejections, 0);
+    }
+
+    #[test]
+    fn test_batch_rejection_counts_as_single_event() {
+        let config = RejectionRateLimitConfig {
+            backoff_start_threshold: 3,
+            initial_backoff: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut limiter = RejectionRateLimiter::with_config(config);
+
+        // A batch of 25 rejections should only increment consecutive_rejections by 1
+        let backoff = limiter.record_batch_rejection(true, "position exceeded", 25);
+
+        // Should NOT trigger backoff (threshold is 3, we're only at 1)
+        assert!(backoff.is_none());
+        assert_eq!(limiter.bid_state.consecutive_rejections, 1);
+        // But total_rejections should reflect all 25
+        assert_eq!(limiter.bid_state.total_rejections, 25);
+        assert!(!limiter.should_skip(true));
+    }
+
+    #[test]
+    fn test_batch_rejection_triggers_backoff_at_threshold() {
+        let config = RejectionRateLimitConfig {
+            backoff_start_threshold: 2,
+            initial_backoff: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut limiter = RejectionRateLimiter::with_config(config);
+
+        // First batch of 10 rejections - counts as 1 rejection
+        let b1 = limiter.record_batch_rejection(true, "position exceeded", 10);
+        assert!(b1.is_none());
+        assert_eq!(limiter.bid_state.consecutive_rejections, 1);
+
+        // Second batch of 15 rejections - counts as 2nd rejection, triggers backoff
+        let b2 = limiter.record_batch_rejection(true, "position exceeded", 15);
+        assert_eq!(b2, Some(Duration::from_secs(5)));
+        assert_eq!(limiter.bid_state.consecutive_rejections, 2);
+        // Total rejections = 10 + 15 = 25
+        assert_eq!(limiter.bid_state.total_rejections, 25);
+        assert!(limiter.should_skip(true));
+    }
+
+    #[test]
+    fn test_batch_rejection_zero_count() {
+        let mut limiter = RejectionRateLimiter::new();
+
+        // Zero count should not change anything
+        let backoff = limiter.record_batch_rejection(true, "position exceeded", 0);
+        assert!(backoff.is_none());
+        assert_eq!(limiter.bid_state.consecutive_rejections, 0);
+        assert_eq!(limiter.bid_state.total_rejections, 0);
+    }
+
+    // ========================================================================
+    // Error Classification Tests
+    // ========================================================================
+
+    #[test]
+    fn test_error_classification_position_limit() {
+        // PerpMaxPosition error
+        let err_type = RejectionErrorType::classify("PerpMaxPosition: Order would exceed maximum");
+        assert_eq!(err_type, RejectionErrorType::PositionLimit);
+        assert!(err_type.should_skip_side());
+        assert!(err_type.should_backoff());
+
+        // Position exceeded
+        let err_type = RejectionErrorType::classify("position exceeded for current leverage");
+        assert_eq!(err_type, RejectionErrorType::PositionLimit);
+
+        // Max position
+        let err_type = RejectionErrorType::classify("Order would exceed max position size");
+        assert_eq!(err_type, RejectionErrorType::PositionLimit);
+    }
+
+    #[test]
+    fn test_error_classification_margin() {
+        // PerpMargin error
+        let err_type = RejectionErrorType::classify("PerpMargin: Insufficient margin");
+        assert_eq!(err_type, RejectionErrorType::Margin);
+        assert!(!err_type.should_skip_side());
+        assert!(err_type.should_backoff());
+        assert!(err_type.is_transient());
+
+        // Leverage error
+        let err_type = RejectionErrorType::classify("Max leverage at current position is 25x");
+        assert_eq!(err_type, RejectionErrorType::Margin);
+
+        // Insufficient funds
+        let err_type = RejectionErrorType::classify("Insufficient balance for order");
+        assert_eq!(err_type, RejectionErrorType::Margin);
+    }
+
+    #[test]
+    fn test_error_classification_price_error() {
+        // BadAloPx error
+        let err_type = RejectionErrorType::classify("BadAloPx: Price too aggressive");
+        assert_eq!(err_type, RejectionErrorType::PriceError);
+        assert!(!err_type.should_skip_side());
+        assert!(!err_type.should_backoff());
+        assert!(err_type.is_transient());
+
+        // Generic price error
+        let err_type = RejectionErrorType::classify("Invalid price specified");
+        assert_eq!(err_type, RejectionErrorType::PriceError);
+    }
+
+    #[test]
+    fn test_error_classification_other() {
+        // Unknown error
+        let err_type = RejectionErrorType::classify("Some unknown error occurred");
+        assert_eq!(err_type, RejectionErrorType::Other);
+        assert!(!err_type.should_skip_side());
+        assert!(err_type.should_backoff());
+        assert!(!err_type.is_transient());
+    }
+
+    #[test]
+    fn test_classify_and_record_batch() {
+        let config = RejectionRateLimitConfig {
+            backoff_start_threshold: 2,
+            initial_backoff: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut limiter = RejectionRateLimiter::with_config(config);
+
+        // First batch with position limit error
+        let (backoff, err_type, should_skip) =
+            limiter.classify_and_record_batch(true, "PerpMaxPosition: exceeded", 10);
+
+        assert!(backoff.is_none()); // Not at threshold yet
+        assert_eq!(err_type, RejectionErrorType::PositionLimit);
+        assert!(should_skip); // Should skip side for position limit
+
+        // Second batch
+        let (backoff, err_type, should_skip) =
+            limiter.classify_and_record_batch(true, "PerpMaxPosition: exceeded", 5);
+
+        assert_eq!(backoff, Some(Duration::from_secs(5))); // At threshold now
+        assert_eq!(err_type, RejectionErrorType::PositionLimit);
+        assert!(should_skip);
     }
 }

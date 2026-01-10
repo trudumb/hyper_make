@@ -1384,11 +1384,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let current_ws_oids = self.ws_state.open_order_ids();
 
         // Step 2: Identify orders to REMOVE (in ws_state but NOT in snapshot)
-        let stale_oids: Vec<u64> = current_ws_oids
+        // IMPORTANT: Apply grace period for fresh orders to avoid race condition
+        // between WS POST placement and openOrders snapshot delivery
+        const GRACE_PERIOD_SECS: u64 = 2;
+        let grace_period = std::time::Duration::from_secs(GRACE_PERIOD_SECS);
+
+        let (stale_oids, skipped_fresh): (Vec<u64>, Vec<u64>) = current_ws_oids
             .iter()
             .filter(|oid| !ws_open_oids.contains(oid))
-            .copied()
-            .collect();
+            .partition(|oid| {
+                // Only mark as stale if order is older than grace period
+                self.ws_state
+                    .get_order(**oid)
+                    .map(|o| o.placed_at.elapsed() > grace_period)
+                    .unwrap_or(true) // If order not found, treat as stale
+            });
+
+        // Log fresh orders that were skipped
+        if !skipped_fresh.is_empty() {
+            debug!(
+                count = skipped_fresh.len(),
+                grace_period_secs = GRACE_PERIOD_SECS,
+                "[OpenOrders] Skipping removal of fresh orders (age < grace period)"
+            );
+        }
 
         // Step 3: Identify orders to ADD (in snapshot but NOT in ws_state)
         let new_oids: Vec<_> = our_orders
@@ -2533,6 +2552,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Bulk order: 1 IP weight, n address requests
             self.infra.proactive_rate_tracker.record_call(1, num_orders);
 
+            // Track batch rejection metrics
+            // Problem: Previously, each order rejection individually incremented the counter,
+            // so a batch of 25 rejections caused exponential backoff to 120s immediately.
+            // Fix: Count rejections per batch and record once after the loop.
+            let mut rejection_count: u32 = 0;
+            let mut first_rejection_error: Option<String> = None;
+            let mut had_success = false;
+            let mut recovery_escalated = false;
+
             // Finalize pending orders with real OIDs (using CLOID for deterministic matching)
             for (i, result) in results.iter().enumerate() {
                 let spec = &order_specs[i];
@@ -2540,27 +2568,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Phase 5: Record success/rejection for rate limiting
                 if result.oid > 0 {
                     // Order placed successfully - reset rejection counter
-                    self.infra.rate_limiter.record_success(is_buy);
+                    had_success = true;
                     self.infra.recovery_manager.record_success();
                 } else if let Some(ref err) = result.error {
-                    // Order rejected - record for rate limiting and reconciliation
-                    if let Some(backoff) = self.infra.rate_limiter.record_rejection(is_buy, err) {
-                        warn!(
-                            side = %side_str(side),
-                            backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
-                            error = %err,
-                            "Rate limiter entering backoff due to rejection"
-                        );
+                    // Count rejections for batch processing (rate limiter)
+                    rejection_count += 1;
+                    if first_rejection_error.is_none() {
+                        first_rejection_error = Some(err.clone());
                     }
                     // Phase 4: Trigger reconciliation for position-related rejections
                     self.infra.reconciler.on_order_rejection(err);
                     // Phase 3: Record rejection for recovery state machine
                     // This may transition to IocRecovery if consecutive rejections exceed threshold
                     if self.infra.recovery_manager.record_rejection(is_buy, err) {
-                        warn!(
-                            side = %side_str(side),
-                            "Recovery manager escalating to IOC recovery mode"
-                        );
+                        recovery_escalated = true;
                     }
                     // Phase 7: Mark CLOID as failed in orphan tracker
                     if let Some(ref cloid) = spec.cloid {
@@ -2696,6 +2717,36 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         side == Side::Buy,
                     );
                 }
+            }
+
+            // After loop: Record batch rejection for rate limiting (once per batch, not per order)
+            // This prevents 25 rejections from immediately hitting 120s backoff.
+            if rejection_count > 0 {
+                if let Some(ref err) = first_rejection_error {
+                    if let Some(backoff) =
+                        self.infra
+                            .rate_limiter
+                            .record_batch_rejection(is_buy, err, rejection_count)
+                    {
+                        warn!(
+                            side = %side_str(side),
+                            backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+                            rejection_count = rejection_count,
+                            error = %err,
+                            "Rate limiter entering backoff due to batch rejection"
+                        );
+                    }
+                }
+                if recovery_escalated {
+                    warn!(
+                        side = %side_str(side),
+                        "Recovery manager escalating to IOC recovery mode"
+                    );
+                }
+            }
+            // Record success for rate limiter (resets counter) - only if we had any success
+            if had_success {
+                self.infra.rate_limiter.record_success(is_buy);
             }
         }
 
@@ -3763,32 +3814,31 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Record API call
         self.infra.proactive_rate_tracker.record_call(1, num_orders);
 
+        // Track batch rejection metrics (same fix as place_ladder_for_side)
+        let mut rejection_count: u32 = 0;
+        let mut first_rejection_error: Option<String> = None;
+        let mut had_success = false;
+        let mut recovery_escalated = false;
+
         // Finalize pending orders with proper state handling
         for (i, result) in results.iter().enumerate() {
             let spec = &order_specs[i];
 
             // Handle success vs rejection for rate limiting and recovery
             if result.oid > 0 {
-                self.infra.rate_limiter.record_success(is_buy);
+                had_success = true;
                 self.infra.recovery_manager.record_success();
             } else if let Some(ref err) = result.error {
-                // Record rejection for rate limiting
-                if let Some(backoff) = self.infra.rate_limiter.record_rejection(is_buy, err) {
-                    warn!(
-                        side = %if is_buy { "buy" } else { "sell" },
-                        backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
-                        error = %err,
-                        "Rate limiter entering backoff due to rejection"
-                    );
+                // Count rejections for batch processing (rate limiter)
+                rejection_count += 1;
+                if first_rejection_error.is_none() {
+                    first_rejection_error = Some(err.clone());
                 }
                 // Trigger reconciliation for position-related rejections
                 self.infra.reconciler.on_order_rejection(err);
                 // Record for recovery state machine
                 if self.infra.recovery_manager.record_rejection(is_buy, err) {
-                    warn!(
-                        side = %if is_buy { "buy" } else { "sell" },
-                        "Recovery manager escalating to IOC recovery mode"
-                    );
+                    recovery_escalated = true;
                 }
                 // Remove from pending on rejection
                 if let Some(ref cloid) = spec.cloid {
@@ -3909,6 +3959,35 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     is_buy,
                 );
             }
+        }
+
+        // After loop: Record batch rejection for rate limiting (once per batch, not per order)
+        if rejection_count > 0 {
+            if let Some(ref err) = first_rejection_error {
+                if let Some(backoff) =
+                    self.infra
+                        .rate_limiter
+                        .record_batch_rejection(is_buy, err, rejection_count)
+                {
+                    warn!(
+                        side = %if is_buy { "buy" } else { "sell" },
+                        backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+                        rejection_count = rejection_count,
+                        error = %err,
+                        "Rate limiter entering backoff due to batch rejection"
+                    );
+                }
+            }
+            if recovery_escalated {
+                warn!(
+                    side = %if is_buy { "buy" } else { "sell" },
+                    "Recovery manager escalating to IOC recovery mode"
+                );
+            }
+        }
+        // Record success for rate limiter (resets counter)
+        if had_success {
+            self.infra.rate_limiter.record_success(is_buy);
         }
 
         Ok(())

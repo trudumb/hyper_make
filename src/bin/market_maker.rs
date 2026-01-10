@@ -19,14 +19,49 @@ use tracing::{info, warn};
 
 use hyperliquid_rust_sdk::{
     init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CollateralInfo,
-    DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, FundingConfig,
-    GLFTStrategy, HawkesConfig, HyperliquidExecutor, ImpulseControlConfig, InfoClient,
-    InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy, LiquidationConfig,
-    LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker, MarketMakerConfig as MmConfig,
-    MarketMakerMetricsRecorder, PnLConfig, QueueConfig, QuotingStrategy, ReconcileConfig,
-    ReconciliationConfig, RecoveryConfig, RejectionRateLimitConfig, RiskConfig, SpreadConfig,
-    SpreadProfile, StochasticConfig, SymmetricStrategy,
+    DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, ExchangeResponseStatus,
+    FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, ImpulseControlConfig,
+    InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy,
+    LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker,
+    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
+    QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
+    RejectionRateLimitConfig, RiskConfig, SpreadConfig, SpreadProfile, StochasticConfig,
+    SymmetricStrategy,
 };
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Parse the actual allowed leverage from an exchange error message.
+///
+/// The exchange returns error messages like:
+/// - "Max leverage at current position size is 25x. To increase leverage, reduce position size."
+///
+/// Returns the parsed leverage value if found, None otherwise.
+fn parse_leverage_from_error(error_msg: &str) -> Option<u32> {
+    // Pattern: "...is Nx..." where N is the leverage
+    // Look for "is " followed by digits and "x"
+    if let Some(start) = error_msg.find("is ") {
+        let rest = &error_msg[start + 3..];
+        // Find the number followed by 'x'
+        let mut num_str = String::new();
+        for c in rest.chars() {
+            if c.is_ascii_digit() {
+                num_str.push(c);
+            } else if c == 'x' || c == 'X' {
+                break;
+            } else if !num_str.is_empty() {
+                // Non-digit, non-x after digits - stop
+                break;
+            }
+        }
+        if !num_str.is_empty() {
+            return num_str.parse().ok();
+        }
+    }
+    None
+}
 
 // ============================================================================
 // CLI Arguments
@@ -996,17 +1031,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         is_cross = runtime_config.is_cross,
         "Setting leverage on exchange"
     );
+
+    // Track effective leverage - may be reduced by exchange due to margin tiers
+    let mut effective_leverage = leverage;
+
     match exchange_client
         .update_leverage(leverage, &asset, runtime_config.is_cross, None)
         .await
     {
         Ok(response) => {
-            info!(leverage = leverage, response = ?response, "Leverage set successfully");
+            // Check if response contains a leverage limit error
+            // The exchange returns Ok(ExchangeResponseStatus::Err(msg)) when leverage is capped
+            if let ExchangeResponseStatus::Err(ref err_msg) = response {
+                // Parse "Max leverage at current position size is 25x" pattern
+                if let Some(actual) = parse_leverage_from_error(err_msg) {
+                    warn!(
+                        requested = leverage,
+                        actual = actual,
+                        "Exchange capped leverage due to position size - using actual"
+                    );
+                    effective_leverage = actual;
+                } else {
+                    warn!(
+                        requested = leverage,
+                        error = %err_msg,
+                        "Leverage request returned error - using requested"
+                    );
+                }
+            } else {
+                info!(leverage = leverage, "Leverage set successfully");
+            }
         }
         Err(e) => {
             warn!(leverage = leverage, error = %e, "Failed to set leverage, using existing");
         }
     }
+
+    // Use effective_leverage for all subsequent calculations
+    let leverage = effective_leverage;
 
     // Query initial position (use DEX-specific clearinghouse state for HIP-3)
     let user_address = wallet.address();
