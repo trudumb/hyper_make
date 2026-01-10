@@ -1,0 +1,115 @@
+{
+  "project": {
+    "name": "hyperliquid_rust_sdk",
+    "type": "Rust SDK + Market Making System",
+    "platform": "Hyperliquid DEX",
+    "generated": "2026-01-10"
+  },
+  "statistics": {
+    "total_files": 175,
+    "market_maker_files": 125,
+    "total_lines": 57000,
+    "tests_passed": 693,
+    "languages": ["rust"]
+  },
+  "entry_points": {
+    "main": "src/bin/market_maker.rs",
+    "library": "src/lib.rs",
+    "diagnostics": [
+      "src/bin/debug_ws.rs",
+      "src/bin/check_balance.rs",
+      "src/bin/check_alo.rs",
+      "src/bin/test_entropy.rs",
+      "src/bin/test_reconcile.rs"
+    ]
+  },
+  "modules": {
+    "strategy": {
+      "path": "src/market_maker/strategy/",
+      "purpose": "Quoting strategies",
+      "key_types": ["QuotingStrategy", "GLFTStrategy", "LadderStrategy", "InventoryAwareStrategy"],
+      "files": ["glft.rs", "ladder_strat.rs", "market_params.rs", "params.rs", "risk_config.rs"]
+    },
+    "estimator": {
+      "path": "src/market_maker/estimator/",
+      "purpose": "Parameter estimation",
+      "key_types": ["ParameterEstimator", "MarketEstimator", "EstimatorConfig"],
+      "files": ["parameter_estimator.rs", "volatility.rs", "kappa.rs", "microprice.rs", "momentum.rs"]
+    },
+    "risk": {
+      "path": "src/market_maker/risk/",
+      "purpose": "Risk management",
+      "key_types": ["KillSwitch", "RiskAggregator"],
+      "files": ["kill_switch.rs", "aggregator.rs", "monitors/"]
+    },
+    "quoting": {
+      "path": "src/market_maker/quoting/",
+      "purpose": "Quote generation",
+      "key_types": ["LadderGenerator", "EntropyOptimizer"],
+      "files": ["ladder/depth_generator.rs", "ladder/optimizer.rs", "ladder/entropy_optimizer.rs"]
+    },
+    "infra": {
+      "path": "src/market_maker/infra/",
+      "purpose": "Infrastructure",
+      "key_types": ["HyperliquidExecutor", "PrometheusMetrics", "MarginAwareSizer"],
+      "files": ["executor.rs", "metrics.rs", "margin.rs", "rate_limit.rs"]
+    },
+    "tracking": {
+      "path": "src/market_maker/tracking/",
+      "purpose": "State tracking",
+      "key_types": ["OrderManager", "PositionTracker", "QueuePositionTracker"],
+      "files": ["order_manager/", "position.rs", "pnl.rs", "queue/"]
+    },
+    "process_models": {
+      "path": "src/market_maker/process_models/",
+      "purpose": "Stochastic processes",
+      "key_types": ["HJBController", "HawkesOrderFlowEstimator", "LiquidationCascadeDetector"],
+      "files": ["hjb_control.rs", "hawkes.rs", "funding.rs", "liquidation.rs"]
+    }
+  },
+  "configuration": {
+    "files": {
+      "Cargo.toml": "Project dependencies",
+      "market_maker.toml": "Default MM config",
+      "rust-toolchain.toml": "Rust version"
+    },
+    "key_structs": [
+      "MarketMakerConfig",
+      "RiskConfig",
+      "LadderConfig",
+      "EstimatorConfig",
+      "KillSwitchConfig",
+      "SpreadProfile"
+    ]
+  },
+  "commands": {
+    "build": "cargo build",
+    "test": "cargo test",
+    "ci": "./ci.sh",
+    "run_testnet": "cargo run --bin market_maker -- --asset BTC",
+    "run_mainnet": "cargo run --bin market_maker -- --network mainnet --asset BTC",
+    "run_hip3": "cargo run --bin market_maker -- --asset BTC --dex hyna"
+  },
+  "key_dependencies": [
+    {"name": "alloy", "version": "1.0", "purpose": "Ethereum primitives"},
+    {"name": "tokio", "version": "1.0", "purpose": "Async runtime"},
+    {"name": "tokio-tungstenite", "version": "0.20", "purpose": "WebSocket"},
+    {"name": "reqwest", "version": "0.12", "purpose": "HTTP client"},
+    {"name": "tracing", "version": "0.1", "purpose": "Logging"},
+    {"name": "axum", "version": "0.7", "purpose": "HTTP server"},
+    {"name": "clap", "version": "4.4", "purpose": "CLI parsing"}
+  ],
+  "design_principles": [
+    "First-principles mathematics (GLFT stochastic control)",
+    "Data-driven adaptation (live parameter estimation)",
+    "Defense in depth (5 safety layers)",
+    "Modular architecture (pluggable components)"
+  ],
+  "largest_files": [
+    {"path": "src/market_maker/mod.rs", "lines": 5296},
+    {"path": "src/market_maker/infra/metrics.rs", "lines": 1775},
+    {"path": "src/market_maker/estimator/parameter_estimator.rs", "lines": 1636},
+    {"path": "src/market_maker/process_models/hjb_control.rs", "lines": 1398},
+    {"path": "src/market_maker/config.rs", "lines": 1234}
+  ]
+}

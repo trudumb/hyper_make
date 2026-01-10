@@ -96,7 +96,11 @@
       "Bash(while read line)",
       "Bash(do echo \"$line\")",
       "mcp__serena__insert_before_symbol",
-      "Bash(LOGFILE=logs/mm_testnet_BTC_2026-01-09_15-49-36.log echo '=== REJECTIONS ===' grep -c 'would exceed' $LOGFILE)"
+      "Bash(LOGFILE=logs/mm_testnet_BTC_2026-01-09_15-49-36.log echo '=== REJECTIONS ===' grep -c 'would exceed' $LOGFILE)",
+      "Bash(du:*)",
+      "mcp__serena__find_file",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
