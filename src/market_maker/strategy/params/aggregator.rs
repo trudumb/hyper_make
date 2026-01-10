@@ -3,7 +3,7 @@
 use crate::market_maker::adaptive::AdaptiveSpreadCalculator;
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
 use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
-use crate::market_maker::estimator::ParameterEstimator;
+use crate::market_maker::estimator::{ParameterEstimator, MarketEstimator};
 use crate::market_maker::infra::MarginAwareSizer;
 use crate::market_maker::process_models::{
     DriftAdjustedSkew, FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,
@@ -412,6 +412,35 @@ impl ParameterAggregator {
                 .observed_fill_rate()
                 .max(0.001), // Floor at 0.001/sec
             derived_target_liquidity: 0.0, // Computed by compute_derived_target_liquidity()
+
+            // === New Latent State Estimators (Phases 2-7) ===
+            // Particle Filter Volatility (Phase 2)
+            sigma_particle: est.sigma_particle_filter(),
+            regime_probs: est.regime_probabilities(),
+
+            // Informed Flow Model (Phase 3)
+            p_informed: est.p_informed(),
+            p_noise: est.p_noise(),
+            p_forced: est.p_forced(),
+            flow_decomp_confidence: est.flow_decomposition_confidence(),
+
+            // Fill Rate Model (Phase 4)
+            fill_rate_8bps: est.fill_rate_at_depth(8.0),
+            optimal_depth_50pct: est.optimal_depth_for_fill_rate(0.5),
+
+            // Adverse Selection Decomposition (Phase 5)
+            as_permanent_bps: est.as_permanent_bps(),
+            as_temporary_bps: est.as_temporary_bps(),
+            as_timing_bps: est.as_timing_bps(),
+            total_as_bps: est.total_as_bps(),
+
+            // Edge Surface (Phase 6)
+            current_edge_bps: est.current_edge_bps(),
+            should_quote_edge: est.should_quote_edge(),
+
+            // Joint Dynamics (Phase 7)
+            is_toxic_joint: est.is_toxic_joint(),
+            sigma_kappa_correlation: est.sigma_kappa_correlation(),
         }
     }
 }

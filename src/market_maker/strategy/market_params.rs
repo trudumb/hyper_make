@@ -507,6 +507,68 @@ pub struct MarketParams {
     ///
     /// This replaces hardcoded target_liquidity when > 0.
     pub derived_target_liquidity: f64,
+
+    // ==================== New Latent State Estimators (Phases 2-7) ====================
+
+    // --- Particle Filter Volatility (Phase 2) ---
+    /// Volatility from particle filter (bps per sqrt(second)).
+    /// More accurate than bipower variation, especially with regime switching.
+    pub sigma_particle: f64,
+
+    /// Regime probabilities [P(Low), P(Normal), P(High), P(Extreme)].
+    /// From particle filter ensemble.
+    pub regime_probs: [f64; 4],
+
+    // --- Informed Flow Model (Phase 3) ---
+    /// Probability current trade is from informed trader.
+    /// From online EM mixture model.
+    pub p_informed: f64,
+
+    /// Probability current trade is noise (uninformed).
+    pub p_noise: f64,
+
+    /// Probability current trade is forced (liquidation/rebalance).
+    pub p_forced: f64,
+
+    /// Confidence in flow decomposition.
+    pub flow_decomp_confidence: f64,
+
+    // --- Fill Rate Model (Phase 4) ---
+    /// Expected fill rate at standard depth (8 bps).
+    pub fill_rate_8bps: f64,
+
+    /// Optimal depth to achieve 50% fill rate.
+    pub optimal_depth_50pct: f64,
+
+    // --- Adverse Selection Decomposition (Phase 5) ---
+    /// Permanent adverse selection (information component) in bps.
+    pub as_permanent_bps: f64,
+
+    /// Temporary adverse selection (market impact) in bps.
+    pub as_temporary_bps: f64,
+
+    /// Timing adverse selection (inventory pressure) in bps.
+    pub as_timing_bps: f64,
+
+    /// Total adverse selection (sum of components) in bps.
+    pub total_as_bps: f64,
+
+    // --- Edge Surface (Phase 6) ---
+    /// Current expected edge in basis points.
+    /// Accounts for spread, AS, and fees.
+    pub current_edge_bps: f64,
+
+    /// Whether we should quote based on edge surface analysis.
+    /// True when expected edge > 0 with sufficient confidence.
+    pub should_quote_edge: bool,
+
+    // --- Joint Dynamics (Phase 7) ---
+    /// Whether in toxic state based on joint parameter correlations.
+    /// True when AS and informed flow are highly correlated with volatility.
+    pub is_toxic_joint: bool,
+
+    /// Sigma-kappa correlation (negative = widening spreads during vol).
+    pub sigma_kappa_correlation: f64,
 }
 
 impl Default for MarketParams {
@@ -660,6 +722,29 @@ impl Default for MarketParams {
             measured_latency_ms: 50.0,     // Default 50ms until measured
             estimated_fill_rate: 0.001,    // Conservative 0.001/sec until observed
             derived_target_liquidity: 0.0, // Will be computed from GLFT formula
+            // === New Latent State Estimators (Phases 2-7) ===
+            // Particle Filter Volatility (Phase 2)
+            sigma_particle: 0.0,          // Will be set from particle filter (bps/sqrt(s))
+            regime_probs: [0.1, 0.7, 0.15, 0.05], // Default: mostly Normal regime
+            // Informed Flow Model (Phase 3)
+            p_informed: 0.05,             // 5% informed baseline
+            p_noise: 0.90,                // 90% noise
+            p_forced: 0.05,               // 5% forced
+            flow_decomp_confidence: 0.0,  // Not confident until warmed up
+            // Fill Rate Model (Phase 4)
+            fill_rate_8bps: 0.5,          // 50% fill rate at 8bps (prior)
+            optimal_depth_50pct: 10.0,    // 10 bps for 50% fill rate (prior)
+            // Adverse Selection Decomposition (Phase 5)
+            as_permanent_bps: 0.0,        // No permanent AS until measured
+            as_temporary_bps: 0.0,        // No temporary AS until measured
+            as_timing_bps: 0.0,           // No timing AS until measured
+            total_as_bps: 0.0,            // Total starts at 0
+            // Edge Surface (Phase 6)
+            current_edge_bps: 0.0,        // No edge until measured
+            should_quote_edge: true,      // Default: safe to quote
+            // Joint Dynamics (Phase 7)
+            is_toxic_joint: false,        // Not toxic initially
+            sigma_kappa_correlation: -0.3, // Typical negative correlation
         }
     }
 }

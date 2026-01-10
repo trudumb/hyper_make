@@ -19,6 +19,16 @@ use super::volatility::{MultiScaleBipowerEstimator, StochasticVolParams, Volatil
 use super::volume::{VolumeBucketAccumulator, VolumeTickArrivalEstimator};
 use super::{EstimatorConfig, EstimatorV2Flags, MarketEstimator, VolatilityRegime};
 
+// New latent state estimators (Phases 2-7)
+use super::volatility_filter::{VolatilityFilter, VolFilterConfig};
+use super::informed_flow::{InformedFlowEstimator, InformedFlowConfig, TradeFeatures};
+use super::fill_rate_model::{FillRateModel, FillRateConfig, FillObservation, MarketState as FillRateMarketState};
+use super::as_decomposition::{ASDecomposition, ASDecompConfig, FillInfo as ASFillInfo};
+use crate::market_maker::latent::{
+    JointDynamics, JointDynamicsConfig, JointObservation,
+    EdgeSurface, EdgeSurfaceConfig, EdgeObservation, MarketCondition,
+};
+
 // ============================================================================
 // ParameterEstimator
 // ============================================================================
@@ -106,6 +116,22 @@ pub struct ParameterEstimator {
     /// Trend persistence tracker for detecting sustained trends vs bounces.
     /// Combines 30s and 5min momentum windows with underwater P&L tracking.
     trend_tracker: TrendPersistenceTracker,
+
+    // === New Latent State Estimators (Phases 2-7) ===
+    /// Particle filter for stochastic volatility with regime switching
+    volatility_filter: VolatilityFilter,
+    /// Online EM mixture model for trade flow decomposition (informed/noise/forced)
+    informed_flow: InformedFlowEstimator,
+    /// Bayesian fill rate regression model
+    fill_rate_model: FillRateModel,
+    /// Multi-horizon adverse selection decomposition
+    as_decomposition: ASDecomposition,
+    /// Cross-parameter correlation tracking and forecasting
+    joint_dynamics: JointDynamics,
+    /// Edge quantification by market condition (225-cell grid)
+    edge_surface: EdgeSurface,
+    /// Timestamp of last trade for inter-arrival calculation
+    last_trade_time_ms: u64,
 }
 
 impl ParameterEstimator {
@@ -235,6 +261,14 @@ impl ParameterEstimator {
             max_spread_ceiling_bps,
             // Multi-timeframe trend detection
             trend_tracker,
+            // New latent state estimators (Phases 2-7)
+            volatility_filter: VolatilityFilter::default_config(),
+            informed_flow: InformedFlowEstimator::default_config(),
+            fill_rate_model: FillRateModel::default_config(),
+            as_decomposition: ASDecomposition::default_config(),
+            joint_dynamics: JointDynamics::default_config(),
+            edge_surface: EdgeSurface::default_config(),
+            last_trade_time_ms: 0,
         }
     }
 
@@ -264,7 +298,35 @@ impl ParameterEstimator {
         // Track trade flow if we know aggressor side
         if let Some(is_buy) = is_buy_aggressor {
             self.flow.on_trade(timestamp_ms, size, is_buy);
+
+            // === New Latent State Estimators: Feed informed flow model ===
+            // Compute price impact in bps (trade price vs current mid)
+            let price_impact_bps = if self.current_mid > 0.0 {
+                ((price - self.current_mid) / self.current_mid) * 10_000.0
+            } else {
+                0.0
+            };
+
+            // Compute inter-arrival time
+            let inter_arrival_ms = if self.last_trade_time_ms > 0 {
+                timestamp_ms.saturating_sub(self.last_trade_time_ms)
+            } else {
+                100 // Default 100ms for first trade
+            };
+
+            let features = TradeFeatures {
+                size,
+                inter_arrival_ms,
+                price_impact_bps,
+                book_imbalance: self.book_structure.imbalance(),
+                is_buy,
+                timestamp_ms,
+            };
+            self.informed_flow.on_trade(&features);
         }
+
+        // Update last trade time for inter-arrival calculation
+        self.last_trade_time_ms = timestamp_ms;
 
         // Initialize current_mid from trade price if not yet set.
         // This prevents warmup deadlock where trades arrive before L2Book/AllMids.
@@ -326,6 +388,11 @@ impl ParameterEstimator {
                 let variance = self.multi_scale.sigma_total().powi(2);
                 self.stoch_vol
                     .on_variance(bucket.end_time_ms, variance, ret);
+
+                // === New Latent State Estimators: Feed particle filter ===
+                // VolatilityFilter uses returns and time delta (in seconds)
+                let bucket_dt = bucket.end_time_ms.saturating_sub(bucket.start_time_ms) as f64 / 1000.0;
+                self.volatility_filter.on_return(ret, bucket_dt.max(0.1));
             }
 
             // Update volatility regime with current sigma and jump ratio
@@ -358,6 +425,24 @@ impl ParameterEstimator {
             // Update parameter covariance tracker
             let kappa = self.kappa();
             self.param_covariance.update(kappa, sigma);
+
+            // === New Latent State Estimators: Feed joint dynamics ===
+            // JointDynamics tracks cross-parameter correlations and forecasts
+            let decomp = self.informed_flow.decomposition();
+            let joint_obs = JointObservation {
+                // Use particle filter sigma if warmed up, else fall back to multi_scale
+                sigma: if self.volatility_filter.is_warmed_up() {
+                    self.volatility_filter.sigma_bps_per_sqrt_s()
+                } else {
+                    self.multi_scale.sigma_clean() * 10_000.0 // Convert to bps
+                },
+                kappa,
+                p_informed: decomp.p_informed,
+                as_bps: self.as_decomposition.total_as_bps(),
+                flow_momentum: self.flow_imbalance(),
+                timestamp_ms: bucket.end_time_ms,
+            };
+            self.joint_dynamics.update(&joint_obs);
 
             debug!(
                 vwap = %format!("{:.4}", bucket.vwap),
@@ -446,6 +531,84 @@ impl ParameterEstimator {
                 self.current_mid,
             );
         }
+
+        // === New Latent State Estimators: Feed on fill ===
+
+        // Get current volatility and regime for all fill-based estimators
+        let sigma_bps = if self.volatility_filter.is_warmed_up() {
+            self.volatility_filter.sigma_bps_per_sqrt_s()
+        } else {
+            self.multi_scale.sigma_clean() * 10_000.0
+        };
+        // Convert regime enum to u8: Low=0, Normal=1, High=2, Extreme=3
+        let regime = match self.volatility_regime() {
+            super::volatility::VolatilityRegime::Low => 0u8,
+            super::volatility::VolatilityRegime::Normal => 1u8,
+            super::volatility::VolatilityRegime::High => 2u8,
+            super::volatility::VolatilityRegime::Extreme => 3u8,
+        };
+
+        // 1. Feed AS decomposition with fill info
+        let fill_info = ASFillInfo {
+            fill_id: timestamp_ms, // Use timestamp as unique ID
+            timestamp_ms,
+            fill_mid: self.current_mid,
+            size: fill_size,
+            is_buy,
+            sigma_bps: Some(sigma_bps),
+            regime: Some(regime),
+        };
+        self.as_decomposition.on_fill(&fill_info);
+
+        // 2. Feed fill rate model
+        // Calculate depth from placement price vs mid
+        let depth_bps = if self.current_mid > 0.0 {
+            ((placement_price - self.current_mid).abs() / self.current_mid) * 10_000.0
+        } else {
+            5.0 // Default to 5 bps if no mid
+        };
+
+        // Get hour from timestamp (UTC)
+        let hour_utc = ((timestamp_ms / 1000) % 86400 / 3600) as u8;
+
+        let fill_state = FillRateMarketState {
+            sigma_bps,
+            spread_bps: depth_bps * 2.0, // Approximate spread as 2x depth
+            book_imbalance: self.book_structure.imbalance(),
+            flow_imbalance: self.flow_imbalance(),
+            regime,
+            hour_utc,
+            is_bid: is_buy, // is_buy means our bid was filled
+        };
+
+        let fill_obs = FillObservation {
+            depth_bps,
+            filled: true, // This is always true in on_own_fill
+            duration_s: 60.0, // Default duration estimate (unknown actual duration)
+            state: fill_state,
+            size: fill_size,
+        };
+        self.fill_rate_model.observe(&fill_obs);
+
+        // 3. Feed edge surface
+        // Use AS decomposition's current estimate for realized AS
+        let realized_as = self.as_decomposition.total_as_bps();
+
+        let condition = MarketCondition::from_state(
+            sigma_bps,
+            regime,
+            hour_utc,
+            self.flow_imbalance(),
+        );
+
+        let edge_obs = EdgeObservation {
+            condition,
+            spread_bps: depth_bps * 2.0, // Approximate spread
+            filled: true,
+            realized_as_bps: realized_as,
+            timestamp_ms,
+        };
+        self.edge_surface.observe(&edge_obs);
     }
 
     /// Legacy on_trade without aggressor info (backward compatibility).
@@ -1364,6 +1527,67 @@ impl ParameterEstimator {
         // (redundant when std_kappa dominates, but ensures hier_kappa respects floor too)
         self.apply_kappa_floor(blended)
     }
+
+    // === New Latent State Estimator Helpers ===
+
+    /// Build current market state for fill rate model queries.
+    fn current_fill_rate_state(&self) -> FillRateMarketState {
+        // Get current hour from timestamp
+        let hour_utc = ((self.current_time_ms / 1000) % 86400 / 3600) as u8;
+
+        // Get sigma in bps
+        let sigma_bps = if self.volatility_filter.is_warmed_up() {
+            self.volatility_filter.sigma_bps_per_sqrt_s()
+        } else {
+            self.multi_scale.sigma_clean() * 10_000.0
+        };
+
+        // Get regime as u8
+        let regime = match self.volatility_regime() {
+            super::volatility::VolatilityRegime::Low => 0u8,
+            super::volatility::VolatilityRegime::Normal => 1u8,
+            super::volatility::VolatilityRegime::High => 2u8,
+            super::volatility::VolatilityRegime::Extreme => 3u8,
+        };
+
+        FillRateMarketState {
+            sigma_bps,
+            spread_bps: 8.0, // Default spread for queries
+            book_imbalance: self.book_structure.imbalance(),
+            flow_imbalance: self.flow_imbalance(),
+            regime,
+            hour_utc,
+            is_bid: true, // Default to bid side for queries
+        }
+    }
+
+    /// Build current market condition for edge surface queries.
+    fn current_market_condition(&self) -> MarketCondition {
+        // Get current hour from timestamp
+        let hour_utc = ((self.current_time_ms / 1000) % 86400 / 3600) as u8;
+
+        // Get sigma in bps
+        let sigma_bps = if self.volatility_filter.is_warmed_up() {
+            self.volatility_filter.sigma_bps_per_sqrt_s()
+        } else {
+            self.multi_scale.sigma_clean() * 10_000.0
+        };
+
+        // Get regime as u8
+        let regime = match self.volatility_regime() {
+            super::volatility::VolatilityRegime::Low => 0u8,
+            super::volatility::VolatilityRegime::Normal => 1u8,
+            super::volatility::VolatilityRegime::High => 2u8,
+            super::volatility::VolatilityRegime::Extreme => 3u8,
+        };
+
+        MarketCondition::from_state(
+            sigma_bps,
+            regime,
+            hour_utc,
+            self.flow_imbalance(),
+        )
+    }
 }
 
 // ============================================================================
@@ -1480,6 +1704,91 @@ impl MarketEstimator for ParameterEstimator {
     }
     fn sigma_confidence(&self) -> f64 {
         self.sigma_confidence()
+    }
+
+    // =========================================================================
+    // New Latent State Estimators (Phases 2-7)
+    // =========================================================================
+
+    // --- Particle Filter Volatility (Phase 2) ---
+    fn sigma_particle_filter(&self) -> f64 {
+        self.volatility_filter.sigma_bps_per_sqrt_s()
+    }
+
+    fn sigma_credible_interval(&self, level: f64) -> (f64, f64) {
+        let raw = self.volatility_filter.sigma_credible_interval(level);
+        // Convert to bps per sqrt(s)
+        (raw.0 * 10_000.0, raw.1 * 10_000.0)
+    }
+
+    fn regime_probabilities(&self) -> [f64; 4] {
+        self.volatility_filter.regime_probabilities()
+    }
+
+    // --- Informed Flow Model (Phase 3) ---
+    fn p_informed(&self) -> f64 {
+        self.informed_flow.decomposition().p_informed
+    }
+
+    fn p_noise(&self) -> f64 {
+        self.informed_flow.decomposition().p_noise
+    }
+
+    fn p_forced(&self) -> f64 {
+        self.informed_flow.decomposition().p_forced
+    }
+
+    fn flow_decomposition_confidence(&self) -> f64 {
+        self.informed_flow.decomposition().confidence
+    }
+
+    // --- Fill Rate Model (Phase 4) ---
+    fn fill_rate_at_depth(&self, depth_bps: f64) -> f64 {
+        // Create current market state for fill rate query
+        let state = self.current_fill_rate_state();
+        self.fill_rate_model.fill_rate(depth_bps, &state)
+    }
+
+    fn optimal_depth_for_fill_rate(&self, target_rate: f64) -> f64 {
+        let state = self.current_fill_rate_state();
+        self.fill_rate_model.optimal_depth(target_rate, &state)
+    }
+
+    // --- Adverse Selection Decomposition (Phase 5) ---
+    fn as_permanent_bps(&self) -> f64 {
+        self.as_decomposition.permanent_as_bps()
+    }
+
+    fn as_temporary_bps(&self) -> f64 {
+        self.as_decomposition.temporary_as_bps()
+    }
+
+    fn as_timing_bps(&self) -> f64 {
+        self.as_decomposition.timing_as_bps()
+    }
+
+    fn total_as_bps(&self) -> f64 {
+        self.as_decomposition.total_as_bps()
+    }
+
+    // --- Edge Surface (Phase 6) ---
+    fn current_edge_bps(&self) -> f64 {
+        let condition = self.current_market_condition();
+        self.edge_surface.edge_estimate(&condition).edge_bps
+    }
+
+    fn should_quote_edge(&self) -> bool {
+        let condition = self.current_market_condition();
+        self.edge_surface.should_quote(&condition)
+    }
+
+    // --- Joint Dynamics (Phase 7) ---
+    fn is_toxic_joint(&self) -> bool {
+        self.joint_dynamics.correlations().is_toxic()
+    }
+
+    fn sigma_kappa_correlation(&self) -> f64 {
+        self.joint_dynamics.correlations().sigma_kappa
     }
 }
 

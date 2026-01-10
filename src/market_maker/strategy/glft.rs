@@ -263,13 +263,33 @@ impl QuotingStrategy for GLFTStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        // === 0. CIRCUIT BREAKER: Cascade quote pulling ===
+        // === 0. CIRCUIT BREAKERS ===
         // Extreme liquidation cascade detected - pull all quotes immediately
         if market_params.should_pull_quotes {
             debug!(
                 tail_risk_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
                 cascade_size_factor = %format!("{:.2}", market_params.cascade_size_factor),
                 "CIRCUIT BREAKER: Liquidation cascade detected - pulling all quotes"
+            );
+            return (None, None);
+        }
+
+        // Edge surface says don't quote (expected edge <= 0 or low confidence)
+        if !market_params.should_quote_edge && market_params.flow_decomp_confidence > 0.5 {
+            debug!(
+                current_edge_bps = %format!("{:.2}", market_params.current_edge_bps),
+                flow_decomp_confidence = %format!("{:.2}", market_params.flow_decomp_confidence),
+                "CIRCUIT BREAKER: Edge surface indicates no edge - pulling quotes"
+            );
+            return (None, None);
+        }
+
+        // Joint dynamics detects toxic state (high AS + high informed correlated with volatility)
+        if market_params.is_toxic_joint && market_params.flow_decomp_confidence > 0.6 {
+            debug!(
+                p_informed = %format!("{:.3}", market_params.p_informed),
+                sigma_kappa_corr = %format!("{:.2}", market_params.sigma_kappa_correlation),
+                "CIRCUIT BREAKER: Joint dynamics detects toxic state - pulling quotes"
             );
             return (None, None);
         }
@@ -510,12 +530,23 @@ impl QuotingStrategy for GLFTStrategy {
         // The GLFT formula δ = (1/γ) × ln(1 + γ/κ) now handles all spread widening
         // in a mathematically principled way.
 
-        // === 3. USE LEVERAGE-ADJUSTED SIGMA FOR INVENTORY SKEW ===
+        // === 3. USE BEST AVAILABLE SIGMA FOR INVENTORY SKEW ===
+        // Priority: Particle filter sigma > sigma_leverage_adjusted
+        // Particle filter provides:
+        // - Regime-aware volatility estimation
+        // - Credible intervals for uncertainty quantification
         // sigma_leverage_adjusted incorporates:
         // - sigma_effective (blended clean/total based on jump regime)
         // - Leverage effect: wider during down moves when ρ < 0
-        // This provides asymmetric risk management in falling markets
-        let sigma_for_skew = market_params.sigma_leverage_adjusted;
+        let sigma_for_skew = if market_params.sigma_particle > 0.0
+            && market_params.flow_decomp_confidence > 0.3
+        {
+            // Use particle filter sigma (in bps/sqrt(s), convert to fractional)
+            market_params.sigma_particle / 10_000.0
+        } else {
+            // Fall back to leverage-adjusted sigma
+            market_params.sigma_leverage_adjusted
+        };
 
         // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
         let inventory_ratio = if effective_max_position > EPSILON {
@@ -552,14 +583,26 @@ impl QuotingStrategy for GLFTStrategy {
             )
         };
 
-        // === 3a. HAWKES FLOW SKEWING (Tier 2) ===
+        // === 3a. HAWKES FLOW SKEWING (Tier 2) with Informed Flow Adjustment ===
         // Use Hawkes-derived flow imbalance for additional directional adjustment
         // High activity + imbalance → stronger signal than simple flow imbalance
+        //
+        // When p_informed is high, reduce reliance on flow signals since they're
+        // likely from informed traders (adverse selection risk) rather than noise traders.
+        // flow_weight = 1 - p_informed (e.g., 80% noise → 80% weight)
+        let flow_weight = if market_params.flow_decomp_confidence > 0.3 {
+            (1.0 - market_params.p_informed).clamp(0.3, 1.0) // Min 30% weight
+        } else {
+            1.0 // Not confident in p_informed, use full flow signal
+        };
         let hawkes_skew = if market_params.hawkes_activity_percentile > 0.7 {
             // Significant activity - use Hawkes imbalance for flow prediction
             // hawkes_imbalance > 0 = more buy pressure → skew asks tighter (encourage selling)
-            // Scaling: 0.5 bps per 0.1 imbalance at high activity
-            market_params.hawkes_imbalance * 0.00005 * market_params.hawkes_activity_percentile
+            // Scaling: 0.5 bps per 0.1 imbalance at high activity, weighted by noise probability
+            market_params.hawkes_imbalance
+                * 0.00005
+                * market_params.hawkes_activity_percentile
+                * flow_weight
         } else {
             0.0 // Low activity - don't trust flow signal
         };

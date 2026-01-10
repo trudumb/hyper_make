@@ -45,6 +45,10 @@ mod soft_jump;
 pub(crate) mod tick_ewma;
 mod trend_persistence;
 mod volatility;
+pub mod volatility_filter;
+pub mod informed_flow;
+pub mod fill_rate_model;
+pub mod as_decomposition;
 mod volume;
 
 // V2 re-exports (will be used when integrated)
@@ -75,6 +79,10 @@ pub use momentum::MomentumModel;
 pub use parameter_estimator::ParameterEstimator;
 pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 pub use volatility::{StochasticVolParams, VolatilityRegime};
+pub use volatility_filter::{VolatilityFilter, VolFilterConfig, VolParticle, VolRegimeParams};
+pub use informed_flow::{InformedFlowEstimator, InformedFlowConfig, TradeFeatures, FlowDecomposition, ComponentParams};
+pub use fill_rate_model::{FillRateModel, FillRateConfig, FillObservation, MarketState as FillRateMarketState, FillRateStatistics};
+pub use as_decomposition::{ASDecomposition, ASDecompConfig, ASDecompResult, FillInfo as ASFillInfo};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability
@@ -191,6 +199,56 @@ pub trait MarketEstimator: Send + Sync {
     fn is_warmed_up(&self) -> bool;
     /// Confidence in sigma estimate [0, 1].
     fn sigma_confidence(&self) -> f64;
+
+    // =========================================================================
+    // New Latent State Estimators (Phases 2-7)
+    // =========================================================================
+
+    // === Particle Filter Volatility (Phase 2) ===
+    /// Volatility from particle filter (bps per sqrt(second)).
+    fn sigma_particle_filter(&self) -> f64;
+    /// Credible interval for sigma at given confidence level (e.g., 0.95).
+    fn sigma_credible_interval(&self, level: f64) -> (f64, f64);
+    /// Regime probabilities [P(Low), P(Normal), P(High), P(Extreme)].
+    fn regime_probabilities(&self) -> [f64; 4];
+
+    // === Informed Flow Model (Phase 3) ===
+    /// Probability current trade is from informed trader.
+    fn p_informed(&self) -> f64;
+    /// Probability current trade is noise.
+    fn p_noise(&self) -> f64;
+    /// Probability current trade is forced (liquidation/rebalance).
+    fn p_forced(&self) -> f64;
+    /// Confidence in flow decomposition.
+    fn flow_decomposition_confidence(&self) -> f64;
+
+    // === Fill Rate Model (Phase 4) ===
+    /// Expected fill rate at given depth (bps from mid).
+    fn fill_rate_at_depth(&self, depth_bps: f64) -> f64;
+    /// Optimal depth to achieve target fill rate.
+    fn optimal_depth_for_fill_rate(&self, target_rate: f64) -> f64;
+
+    // === Adverse Selection Decomposition (Phase 5) ===
+    /// Permanent adverse selection component (bps).
+    fn as_permanent_bps(&self) -> f64;
+    /// Temporary adverse selection component (bps).
+    fn as_temporary_bps(&self) -> f64;
+    /// Timing adverse selection component (bps).
+    fn as_timing_bps(&self) -> f64;
+    /// Total adverse selection (sum of all components).
+    fn total_as_bps(&self) -> f64;
+
+    // === Edge Surface (Phase 6) ===
+    /// Current expected edge in basis points.
+    fn current_edge_bps(&self) -> f64;
+    /// Whether we should quote given current market conditions.
+    fn should_quote_edge(&self) -> bool;
+
+    // === Joint Dynamics (Phase 7) ===
+    /// Whether in toxic state based on joint parameter dynamics.
+    fn is_toxic_joint(&self) -> bool;
+    /// Sigma-kappa correlation (negative = widening spreads during vol).
+    fn sigma_kappa_correlation(&self) -> f64;
 }
 
 // ============================================================================

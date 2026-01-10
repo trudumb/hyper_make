@@ -23,6 +23,8 @@ pub mod safety;
 mod strategy;
 pub mod tracking;
 
+pub mod latent;
+
 mod orchestrator;
 
 pub use adverse_selection::*;

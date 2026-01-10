@@ -52,6 +52,10 @@ rand_distr = "0.4"
 name = "market_maker"
 path = "src/bin/market_maker.rs"
 
+[[bin]]
+name = "parameter_estimator"
+path = "src/bin/parameter_estimator.rs"
+
 # Fast release builds (for dev iteration)
 [profile.release]
 incremental = true
