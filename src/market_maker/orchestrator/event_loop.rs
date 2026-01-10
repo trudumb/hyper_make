@@ -1,0 +1,646 @@
+//! Main event loop and startup synchronization for the market maker.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::mpsc::unbounded_channel;
+use tracing::{debug, error, info, warn};
+
+use crate::prelude::Result;
+use crate::{Message, Subscription};
+
+use super::super::{
+    CancelResult, ConnectionState, MarketMaker, OrderExecutor, QuotingStrategy, Side, TrackedOrder,
+};
+
+impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+    /// Sync open orders from exchange and initialize state.
+    pub async fn sync_open_orders(&mut self) -> Result<()> {
+        // === CRITICAL: Sync position from exchange first ===
+        // Exchange position is authoritative - detect any drift from local state
+        if let Err(e) = self.sync_position_from_exchange().await {
+            warn!("Failed to sync position from exchange: {e}");
+        }
+
+        // === CRITICAL: Cancel ALL existing orders before starting ===
+        // This prevents untracked fills from orders placed in previous sessions
+        if let Err(e) = self.cancel_all_orders_on_startup().await {
+            error!("Failed to cancel existing orders on startup: {e}");
+            // Continue anyway - orders will be tracked if we find them below
+        }
+
+        // === Refresh margin state on startup ===
+        if let Err(e) = self.refresh_margin_state().await {
+            warn!("Failed to refresh margin state on startup: {e}");
+        }
+
+        // === Refresh exchange position limits on startup ===
+        if let Err(e) = self.refresh_exchange_limits().await {
+            warn!("Failed to refresh exchange limits on startup: {e}");
+        } else {
+            info!(
+                "Exchange limits initialized: bid={:.6}, ask={:.6}",
+                self.infra.exchange_limits.effective_bid_limit(),
+                self.infra.exchange_limits.effective_ask_limit()
+            );
+        }
+
+        // Log impulse control status
+        info!(
+            impulse_control_enabled = %self.infra.impulse_control_enabled,
+            budget_tokens = %self.infra.execution_budget.available(),
+            improvement_threshold = %self.infra.impulse_filter.config().improvement_threshold,
+            queue_lock_threshold = %self.infra.impulse_filter.config().queue_lock_threshold,
+            "Impulse control status"
+        );
+
+        // Track any remaining orders (should be empty after cancel-all, but be safe)
+        // Use DEX-aware open_orders for HIP-3 support
+        let open_orders = self
+            .info_client
+            .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+            .await?;
+
+        for order in open_orders.iter().filter(|o| o.coin == *self.config.asset) {
+            let sz: f64 = order.sz.parse().unwrap_or(0.0);
+            let px: f64 = order.limit_px.parse().unwrap_or(0.0);
+            let side = if order.side == "B" {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+
+            warn!(
+                "[MarketMaker] Unexpected order still resting after cancel-all: {} oid={} sz={} px={}",
+                if side == Side::Buy { "BUY" } else { "SELL" },
+                order.oid,
+                sz,
+                px
+            );
+
+            self.orders
+                .add_order(TrackedOrder::new(order.oid, side, px, sz));
+        }
+
+        Ok(())
+    }
+
+    /// Sync position from exchange - the exchange is the authoritative source.
+    async fn sync_position_from_exchange(&mut self) -> Result<()> {
+        // Check if WebSocket data is fresh - skip REST if so
+        if let Some(last_ws_time) = self.last_web_data2_time {
+            let ws_age = last_ws_time.elapsed();
+            if ws_age < std::time::Duration::from_secs(30) {
+                debug!(
+                    ws_age_secs = ws_age.as_secs(),
+                    "[PositionSync] Skipping REST - WebSocket data is fresh"
+                );
+                return Ok(());
+            } else {
+                warn!(
+                    ws_age_secs = ws_age.as_secs(),
+                    "[PositionSync] WebSocket data is stale, falling back to REST"
+                );
+            }
+        }
+
+        let user_state = self
+            .info_client
+            .user_state_for_dex(self.user_address, self.config.dex.as_deref())
+            .await?;
+
+        // Find position for our asset
+        let exchange_position = user_state
+            .asset_positions
+            .iter()
+            .find(|p| p.position.coin == *self.config.asset)
+            .map(|p| p.position.szi.parse::<f64>().unwrap_or(0.0))
+            .unwrap_or(0.0);
+
+        let local_position = self.position.position();
+        let drift = (exchange_position - local_position).abs();
+
+        if drift > crate::EPSILON {
+            warn!(
+                "Position drift detected: local={:.6}, exchange={:.6}, drift={:.6}",
+                local_position, exchange_position, drift
+            );
+            // Update local position to match exchange (authoritative)
+            self.position.set_position(exchange_position);
+            info!("Position synced from exchange: {:.6}", exchange_position);
+        } else {
+            info!(
+                "Position verified: {:.6} (exchange matches local)",
+                exchange_position
+            );
+        }
+
+        // Initialize metrics with current position
+        // This ensures metrics show correct position from startup (not 0)
+        self.infra
+            .prometheus
+            .update_position(self.position.position(), self.effective_max_position);
+
+        // Check if existing position exceeds configured limit - will enter reduce-only mode
+        // Note: effective_max_position may be recalculated higher once price data arrives
+        // (margin-based calculation vs static config.max_position fallback)
+        let position_abs = self.position.position().abs();
+        if position_abs > self.effective_max_position {
+            warn!(
+                "Existing position {:.6} exceeds max {:.6} - will enter reduce-only mode after warmup",
+                position_abs, self.effective_max_position
+            );
+            info!(
+                "Reduce-only mode will only place orders that reduce position until within limits"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Cancel ALL orders for our asset on startup.
+    /// Uses retry loop to ensure all orders are cancelled.
+    async fn cancel_all_orders_on_startup(&mut self) -> Result<()> {
+        const MAX_RETRIES: usize = 5;
+        const RETRY_DELAY_MS: u64 = 500;
+
+        for attempt in 0..MAX_RETRIES {
+            // Use DEX-aware open_orders for HIP-3 support
+            let open_orders = self
+                .info_client
+                .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+                .await?;
+            let our_orders: Vec<_> = open_orders
+                .iter()
+                .filter(|o| o.coin == *self.config.asset)
+                .collect();
+
+            if our_orders.is_empty() {
+                if attempt > 0 {
+                    info!("All orders cancelled after {} attempts", attempt);
+                }
+                return Ok(());
+            }
+
+            info!(
+                "Cancelling {} existing orders on startup (attempt {})",
+                our_orders.len(),
+                attempt + 1
+            );
+
+            // RATE LIMIT OPTIMIZATION: Use bulk cancel instead of individual cancels
+            let oids: Vec<u64> = our_orders.iter().map(|o| o.oid).collect();
+            let results = self
+                .executor
+                .cancel_bulk_orders(&self.config.asset, oids.clone())
+                .await;
+
+            for (oid, result) in oids.iter().zip(results.iter()) {
+                match result {
+                    CancelResult::Cancelled => {
+                        debug!("Startup cancel: oid={} cancelled", oid);
+                    }
+                    CancelResult::AlreadyCancelled => {
+                        debug!("Startup cancel: oid={} already cancelled", oid);
+                    }
+                    CancelResult::AlreadyFilled => {
+                        warn!(
+                            "Startup cancel: oid={} was already filled - position may need sync",
+                            oid
+                        );
+                    }
+                    CancelResult::Failed => {
+                        warn!("Startup cancel: oid={} failed, will retry", oid);
+                    }
+                }
+            }
+
+            // Wait before checking again
+            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+
+        // After max retries, check what's left
+        // Use DEX-aware open_orders for HIP-3 support
+        let remaining = self
+            .info_client
+            .open_orders_for_dex(self.user_address, self.config.dex.as_deref())
+            .await?
+            .iter()
+            .filter(|o| o.coin == *self.config.asset)
+            .count();
+
+        if remaining > 0 {
+            error!(
+                "Failed to cancel all orders after {} attempts, {} remaining",
+                MAX_RETRIES, remaining
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Start the market maker event loop.
+    pub async fn start(&mut self) -> Result<()> {
+        // Channel uses Arc<Message> for zero-copy dispatch from WsManager
+        let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();
+
+        // Subscribe to UserFills for fill detection
+        self.info_client
+            .subscribe(
+                Subscription::UserFills {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to AllMids for price updates (DEX-aware for HIP-3)
+        self.info_client
+            .subscribe(
+                Subscription::AllMids {
+                    dex: self.config.dex.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to Trades for volatility and arrival intensity estimation (DEX-aware)
+        self.info_client
+            .subscribe(
+                Subscription::Trades {
+                    coin: self.config.asset.to_string(),
+                    dex: self.config.dex.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to L2Book for kappa (order book depth decay) estimation (DEX-aware)
+        self.info_client
+            .subscribe(
+                Subscription::L2Book {
+                    coin: self.config.asset.to_string(),
+                    dex: self.config.dex.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to OrderUpdates for order state tracking via WsOrderStateManager
+        self.info_client
+            .subscribe(
+                Subscription::OrderUpdates {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to OpenOrders for initial state sync and periodic snapshots
+        self.info_client
+            .subscribe(
+                Subscription::OpenOrders {
+                    user: self.user_address,
+                    dex: self.config.dex.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to ActiveAssetData for real-time exchange limit updates
+        self.info_client
+            .subscribe(
+                Subscription::ActiveAssetData {
+                    user: self.user_address,
+                    coin: self.config.asset.to_string(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to WebData2 for real-time margin/position updates (Phase 2)
+        self.info_client
+            .subscribe(
+                Subscription::WebData2 {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to UserNonFundingLedgerUpdates for spot balance deltas (Phase 3)
+        self.info_client
+            .subscribe(
+                Subscription::UserNonFundingLedgerUpdates {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        drop(sender); // Explicitly drop the sender since we're done with subscriptions
+
+        // Phase 3 Init: Populate spot balance cache via REST once
+        match self
+            .info_client
+            .user_token_balances(self.user_address)
+            .await
+        {
+            Ok(balances) => {
+                for balance in balances.balances {
+                    let total = balance.total.parse::<f64>().unwrap_or(0.0);
+                    self.spot_balance_cache.insert(balance.coin, total);
+                }
+                info!(
+                    "Initialized spot balance cache with {} assets",
+                    self.spot_balance_cache.len()
+                );
+            }
+            Err(e) => {
+                error!("Failed to fetch initial spot balances: {}. Spot margin tracking may be incorrect until next update.", e);
+            }
+        }
+
+        info!(
+            "Market maker started for {} with {} strategy",
+            self.config.asset,
+            self.strategy.name()
+        );
+        info!("Warming up parameter estimator...");
+
+        // === Start HJB session (stochastic module integration) ===
+        self.stochastic.hjb_controller.start_session();
+        debug!("HJB inventory controller session started");
+
+        // Safety sync interval (15 seconds) - catch orphan orders and state divergence more quickly
+        // Reduced from 60s to help catch orders that get out of sync with local tracking
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(15));
+        // Skip the immediate first tick
+        sync_interval.tick().await;
+
+        // === ROBUST SIGNAL HANDLING ===
+        // Problem: tokio::select! only checks signals at the START of each iteration.
+        // When message processing is slow (HTTP calls to exchange), Ctrl+C won't be
+        // handled until the current message handler completes.
+        //
+        // Solution: Use a shared atomic flag set by a dedicated signal handler task.
+        // The main loop checks this flag frequently (after each message + periodically).
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag_clone = shutdown_flag.clone();
+
+        // Spawn dedicated signal handler task
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Shutdown signal received (SIGINT/Ctrl+C)");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("Shutdown signal received (SIGTERM)");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Shutdown signal received (SIGINT/Ctrl+C)");
+            }
+
+            shutdown_flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        loop {
+            // === Shutdown Check (checked EVERY iteration) ===
+            if shutdown_flag.load(Ordering::SeqCst) {
+                info!("Shutdown flag detected, initiating graceful shutdown...");
+                break;
+            }
+
+            // === Kill Switch Check (before processing any message) ===
+            if self.safety.kill_switch.is_triggered() {
+                let reasons = self.safety.kill_switch.trigger_reasons();
+                error!(
+                    "KILL SWITCH TRIGGERED: {:?}",
+                    reasons.iter().map(|r| r.to_string()).collect::<Vec<_>>()
+                );
+                break;
+            }
+
+            // Process messages - the shutdown check happens at loop start
+            // and after each message is processed
+            tokio::select! {
+                // Message processing
+                message = receiver.recv() => {
+                    match message {
+                        Some(arc_msg) => {
+                            // Zero-copy unwrap: Arc::try_unwrap succeeds when we're the only owner
+                            // (which is typical since WsManager sends to each subscriber separately).
+                            // Falls back to clone only if Arc is still shared.
+                            let msg = Arc::try_unwrap(arc_msg)
+                                .unwrap_or_else(|arc| (*arc).clone());
+
+                            if let Err(e) = self.handle_message(msg).await {
+                                error!("Error handling message: {e}");
+                            }
+
+                            // Check kill switch after each message
+                            self.check_kill_switch();
+
+                            // Phase 4: Event-driven reconciliation check
+                            // The reconciler may have been triggered by order rejection,
+                            // unmatched fill, or large position change during message handling
+                            if let Some(trigger) = self.infra.reconciler.should_sync() {
+                                debug!(
+                                    trigger = ?trigger,
+                                    "Event-driven reconciliation triggered"
+                                );
+                                if let Err(e) = self.safety_sync().await {
+                                    warn!("Event-driven sync failed: {e}");
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("Message channel closed, stopping market maker");
+                            break;
+                        }
+                    }
+                }
+
+                // Periodic safety sync
+                _ = sync_interval.tick() => {
+                    if let Err(e) = self.safety_sync().await {
+                        warn!("Safety sync failed: {e}");
+                    }
+
+                    // === Update Prometheus metrics ===
+                    let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+
+                    // Update trend tracker with unrealized P&L for underwater detection
+                    self.estimator.update_trend_pnl(pnl_summary.unrealized_pnl);
+
+                    // HARMONIZED: Use effective_max_position for accurate utilization metrics
+                    self.infra.prometheus.update_position(
+                        self.position.position(),
+                        self.effective_max_position, // First-principles limit
+                    );
+                    self.infra.prometheus.update_pnl(
+                        pnl_summary.total_pnl,      // daily_pnl (total for now)
+                        pnl_summary.total_pnl,      // peak_pnl (simplified)
+                        pnl_summary.realized_pnl,
+                        pnl_summary.unrealized_pnl,
+                    );
+                    self.infra.prometheus.update_market(
+                        self.latest_mid,
+                        self.tier2.spread_tracker.current_spread_bps(),
+                        self.estimator.sigma_clean(),
+                        self.estimator.jump_ratio(),
+                        self.estimator.kappa(),
+                    );
+                    self.infra.prometheus.update_risk(
+                        self.safety.kill_switch.is_triggered(),
+                        self.tier1.liquidation_detector.cascade_severity(),
+                        self.tier1.adverse_selection.realized_as_bps(),
+                        self.tier1.liquidation_detector.tail_risk_multiplier(),
+                    );
+                    // V2 Bayesian estimator metrics
+                    self.infra.prometheus.update_v2_estimator(
+                        self.estimator.hierarchical_kappa_std(),
+                        self.estimator.hierarchical_kappa_ci_95().0,
+                        self.estimator.hierarchical_kappa_ci_95().1,
+                        self.estimator.soft_toxicity_score(),
+                        self.estimator.kappa_sigma_correlation(),
+                        self.estimator.hierarchical_as_factor(),
+                    );
+                    // Robust kappa diagnostic metrics
+                    self.infra.prometheus.update_robust_kappa(
+                        self.estimator.robust_kappa_ess(),
+                        self.estimator.kappa_outlier_count(),
+                        self.estimator.robust_kappa_nu(),
+                        self.estimator.robust_kappa_obs_count(),
+                    );
+                    let (bid_exp, ask_exp) = self.orders.pending_exposure();
+                    self.infra.prometheus.update_pending_exposure(
+                        bid_exp,
+                        ask_exp,
+                        self.position.position(),
+                    );
+
+                    // === Update connection health metrics ===
+                    let connected = self.infra.connection_health.state() == ConnectionState::Healthy;
+                    self.infra.prometheus.set_websocket_connected(connected);
+                    self.infra.prometheus.set_last_trade_age_ms(
+                        self.infra.connection_health.time_since_last_data().as_millis() as u64
+                    );
+                    // L2 book uses the same connection health tracker
+                    self.infra.prometheus.set_last_book_age_ms(
+                        self.infra.connection_health.time_since_last_data().as_millis() as u64
+                    );
+
+                    // Update supervisor statistics for Prometheus
+                    let supervisor_stats = self.infra.connection_supervisor.stats();
+                    self.infra.prometheus.update_supervisor_stats(
+                        supervisor_stats.consecutive_stale_count,
+                        supervisor_stats.reconnect_signal_count,
+                    );
+
+                    // Update calibration fill rate controller metrics
+                    self.infra.prometheus.update_calibration(
+                        self.stochastic.calibration_controller.gamma_multiplier(),
+                        self.stochastic.calibration_controller.calibration_progress(),
+                        self.stochastic.calibration_controller.fill_count(),
+                        self.stochastic.calibration_controller.is_calibrated(),
+                    );
+
+                    // Check if supervisor recommends reconnection and act on it
+                    if self.infra.connection_supervisor.is_reconnect_recommended() {
+                        let attempt = self.infra.connection_health.current_attempt() + 1;
+                        warn!(
+                            time_since_market_data_secs = supervisor_stats.time_since_market_data.as_secs_f64(),
+                            connection_state = %supervisor_stats.connection_state,
+                            reconnection_attempt = attempt,
+                            "Connection supervisor recommends reconnection - initiating"
+                        );
+
+                        // Mark that we're starting reconnection (increments attempt counter)
+                        self.infra.connection_supervisor.record_reconnection_start();
+
+                        // Force reconnect the WebSocket
+                        if let Err(e) = self.info_client.reconnect().await {
+                            warn!(
+                                error = %e,
+                                attempt = attempt,
+                                "Failed to initiate WebSocket reconnection"
+                            );
+                            // Track the failure - this will eventually set connection_failed=true
+                            // after max_consecutive_failures is reached
+                            if !self.infra.connection_supervisor.record_reconnection_failed() {
+                                error!(
+                                    "Reconnection permanently failed after max retries - kill switch will trigger"
+                                );
+                            }
+                        } else {
+                            info!(
+                                attempt = attempt,
+                                "WebSocket reconnection initiated - waiting for data to resume"
+                            );
+                            // Note: We do NOT call reconnection_success() here because the
+                            // reconnect is async. Success is detected when record_market_data()
+                            // is called and sees we were in Reconnecting state.
+                        }
+
+                        // Clear the recommendation (the supervisor will set it again if still stale)
+                        self.infra.connection_supervisor.clear_reconnect_recommendation();
+                    }
+
+                    // === Update P&L inventory snapshot for carry calculation ===
+                    if self.latest_mid > 0.0 {
+                        self.tier2.pnl_tracker.record_inventory_snapshot(self.latest_mid);
+                    }
+
+                    // Log Prometheus output (for scraping or debugging)
+                    debug!(
+                        prometheus_output = %self.infra.prometheus.to_prometheus_text(&self.config.asset, &self.config.collateral.symbol),
+                        "Prometheus metrics snapshot"
+                    );
+
+                    // Log kill switch status periodically
+                    let summary = self.safety.kill_switch.summary();
+                    debug!(
+                        daily_pnl = %format!("${:.2}", summary.daily_pnl),
+                        drawdown = %format!("{:.1}%", summary.drawdown_pct),
+                        position_value = %format!("${:.2}", summary.position_value),
+                        data_age = %format!("{:.1}s", summary.data_age_secs),
+                        cascade_severity = %format!("{:.2}", summary.cascade_severity),
+                        "Kill switch status"
+                    );
+                }
+            }
+        }
+
+        // Graceful shutdown with timeout to ensure completion even under load
+        // We give ourselves 5 seconds to cancel orders before forced exit
+        info!("Initiating graceful shutdown (5 second timeout)...");
+        match tokio::time::timeout(Duration::from_secs(5), self.shutdown()).await {
+            Ok(Ok(())) => {
+                info!("Graceful shutdown completed successfully");
+            }
+            Ok(Err(e)) => {
+                error!("Graceful shutdown encountered error: {e}");
+            }
+            Err(_) => {
+                error!(
+                    "Graceful shutdown timed out after 5 seconds - orders may remain on exchange"
+                );
+            }
+        }
+
+        info!("Market maker stopped.");
+        Ok(())
+    }
+}
