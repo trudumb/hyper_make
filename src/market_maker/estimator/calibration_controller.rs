@@ -76,10 +76,13 @@ impl Default for CalibrationControllerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            target_fill_rate_per_hour: 10.0, // 10 fills/hour = ~2/level for 5 levels
-            min_gamma_mult: 0.3,             // Max 70% gamma reduction
-            lookback_secs: 3600,             // 1 hour lookback
-            as_warmup_threshold: 20,         // Match AS estimator requirement
+            // MAINNET OPTIMIZED: Higher fill rate target for liquid markets
+            target_fill_rate_per_hour: 60.0, // Increased from 10 - liquid markets fill faster
+            // MAINNET OPTIMIZED: Don't sacrifice edge for fills - fills are abundant
+            min_gamma_mult: 0.6, // Increased from 0.3 - less aggressive tightening
+            // MAINNET OPTIMIZED: Shorter lookback - market regimes change faster
+            lookback_secs: 900,      // Reduced from 3600 - 15 minute window
+            as_warmup_threshold: 20, // Match AS estimator requirement
             kappa_confidence_threshold: 0.5,
         }
     }
@@ -153,12 +156,17 @@ impl CalibrationController {
             return;
         }
 
-        // Calculate actual fill rate (fills per hour)
-        let actual_rate = self.fill_timestamps.len() as f64;
+        // Calculate actual fill count in the lookback window
+        let actual_fills = self.fill_timestamps.len() as f64;
+
+        // Calculate expected fills in the lookback window
+        // (target_fill_rate_per_hour scaled to the window size)
+        let window_hours = self.lookback_secs as f64 / 3600.0;
+        let expected_fills_in_window = self.target_fill_rate_per_hour * window_hours;
 
         // Calculate fill-hungry multiplier
         // When ratio < 1: we need more fills, reduce gamma (tighter quotes)
-        let ratio = actual_rate / self.target_fill_rate_per_hour;
+        let ratio = actual_fills / expected_fills_in_window;
         let raw_mult = ratio.min(1.0);
         let clamped_mult = raw_mult.max(self.min_gamma_mult);
 
@@ -168,8 +176,9 @@ impl CalibrationController {
 
         if self.fill_hungry_gamma_mult < 0.99 {
             debug!(
-                actual_rate = %format!("{:.1}", actual_rate),
-                target_rate = %format!("{:.1}", self.target_fill_rate_per_hour),
+                actual_fills = %format!("{:.1}", actual_fills),
+                expected_fills = %format!("{:.1}", expected_fills_in_window),
+                fill_rate_ratio = %format!("{:.2}", ratio),
                 calibration_progress = %format!("{:.0}%", self.calibration_progress * 100.0),
                 fill_hungry_mult = %format!("{:.2}", self.fill_hungry_gamma_mult),
                 as_fills = self.as_fills_measured,
@@ -218,8 +227,8 @@ mod tests {
         let config = CalibrationControllerConfig::default();
         let controller = CalibrationController::new(config);
 
-        // Should start with min gamma (most aggressive)
-        assert!((controller.gamma_multiplier() - 0.3).abs() < 0.01);
+        // Should start with min gamma (most aggressive, now 0.6 for mainnet)
+        assert!((controller.gamma_multiplier() - 0.6).abs() < 0.01);
         assert!(!controller.is_calibrated());
         assert_eq!(controller.fill_count(), 0);
     }
@@ -242,15 +251,15 @@ mod tests {
         let config = CalibrationControllerConfig::default();
         let mut controller = CalibrationController::new(config);
 
-        // At 0% calibration, should be hungry (0.3)
-        assert!(controller.gamma_multiplier() < 0.4);
+        // At 0% calibration, should be at min gamma (0.6 for mainnet)
+        assert!(controller.gamma_multiplier() < 0.7);
 
         // At 50% calibration (10 AS fills, 0.25 kappa conf)
         controller.update_calibration_status(10, 0.25);
         let mid_mult = controller.gamma_multiplier();
 
-        // Should be between 0.3 and 1.0
-        assert!(mid_mult > 0.3);
+        // Should be between min (0.6) and 1.0
+        assert!(mid_mult > 0.6);
         assert!(mid_mult < 1.0);
 
         // At 100% calibration (20 AS fills, 0.5 kappa conf)
@@ -295,12 +304,13 @@ mod tests {
         let config = CalibrationControllerConfig::default();
         let mut controller = CalibrationController::new(config);
 
-        // Record more fills than target (15 fills when target is 10)
-        for _ in 0..15 {
+        // Record more fills than target (90 fills when target is 60/hour)
+        // With 900 second lookback, 90 fills = 360/hour, well above 60
+        for _ in 0..90 {
             controller.record_fill();
         }
 
-        // At 0% calibration progress, ratio = 15/10 = 1.5, clamped to 1.0
+        // At 0% calibration progress, ratio = 90/(60*900/3600) = 90/15 = 6.0, clamped to 1.0
         // So fill_hungry_mult should be 1.0 (no aggressive tightening needed)
         let mult = controller.gamma_multiplier();
         // With 0% calibration progress: blended = 1.0 + (1-1.0)*0 = 1.0
@@ -369,13 +379,14 @@ mod tests {
         let config = CalibrationControllerConfig::default();
         let mut controller = CalibrationController::new(config);
 
-        // Record exactly target fills (10)
-        for _ in 0..10 {
+        // Record exactly target fills for the lookback window
+        // target = 60/hour, lookback = 900s, so target in window = 60 * 900/3600 = 15
+        for _ in 0..15 {
             controller.record_fill();
         }
 
         // With target fill rate met and 0% calibration:
-        // ratio = 10/10 = 1.0, raw_mult = 1.0
+        // ratio = 15/15 = 1.0, raw_mult = 1.0
         // blended = 1.0 + (1-1.0) * 0 = 1.0
         let mult = controller.gamma_multiplier();
         assert!(

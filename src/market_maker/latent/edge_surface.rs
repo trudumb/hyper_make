@@ -95,7 +95,7 @@ impl Default for EdgeSurfaceConfig {
             min_edge_bps: 1.0,
             min_confidence: 0.6,
             max_cell_observations: 500,
-            prior_edge_bps: 2.0,     // Assume 2 bps baseline edge
+            prior_edge_bps: 2.0,        // Assume 2 bps baseline edge
             prior_uncertainty_bps: 5.0, // High uncertainty initially
             recalc_interval: 50,
         }
@@ -133,8 +133,8 @@ impl CellStats {
         Self {
             mean_edge: prior_edge,
             mean_edge_sq: prior_edge * prior_edge + prior_var,
-            mean_spread: 8.0, // Default 8 bps spread
-            mean_as: 2.0,     // Default 2 bps AS
+            mean_spread: 8.0,    // Default 8 bps spread
+            mean_as: 2.0,        // Default 2 bps AS
             mean_fill_rate: 0.1, // Default 10% fill rate
             n_obs: 0,
         }
@@ -312,7 +312,11 @@ impl EdgeSurface {
         } else {
             // Zero variance means perfectly consistent observations
             // If there are enough observations, this should give high confidence
-            if cell.n_obs >= 2 { 1.0 } else { 0.0 }
+            if cell.n_obs >= 2 {
+                1.0
+            } else {
+                0.0
+            }
         };
         let confidence = n_factor * 0.6 + var_factor * 0.4;
 
@@ -336,7 +340,12 @@ impl EdgeSurface {
     }
 
     /// Get expected edge for given spread and state
-    pub fn expected_edge(&self, spread_bps: f64, condition: &MarketCondition, fill_prob: f64) -> f64 {
+    pub fn expected_edge(
+        &self,
+        spread_bps: f64,
+        condition: &MarketCondition,
+        fill_prob: f64,
+    ) -> f64 {
         let estimate = self.edge_estimate(condition);
 
         // Edge = fill_prob × (spread/2 - AS - fees)
@@ -512,7 +521,7 @@ mod tests {
                 condition: condition.clone(),
                 spread_bps: 10.0,
                 filled: true,
-                realized_as_bps: 2.0,  // Edge = 10/2 - 2 - 1.5 = 1.5 bps
+                realized_as_bps: 2.0, // Edge = 10/2 - 2 - 1.5 = 1.5 bps
                 timestamp_ms: i * 1000,
             };
             surface.observe(&obs);
@@ -528,7 +537,7 @@ mod tests {
         let mut surface = create_surface();
 
         let good_condition = MarketCondition {
-            vol_bucket: 1,  // Low vol
+            vol_bucket: 1, // Low vol
             regime: 1,
             hour_bucket: 1,
             flow_bucket: 2,
@@ -540,7 +549,7 @@ mod tests {
                 condition: good_condition.clone(),
                 spread_bps: 12.0,
                 filled: true,
-                realized_as_bps: 1.0,  // Edge = 12/2 - 1 - 1.5 = 3.5 bps
+                realized_as_bps: 1.0, // Edge = 12/2 - 1 - 1.5 = 3.5 bps
                 timestamp_ms: i * 1000,
             };
             surface.observe(&obs);

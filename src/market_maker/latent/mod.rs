@@ -31,12 +31,15 @@
 //! analyze market conditions and estimate edge for market making.
 
 // Submodules
-pub mod joint_dynamics;
 pub mod edge_surface;
+pub mod joint_dynamics;
 
 // Re-exports
-pub use joint_dynamics::{JointDynamics, JointDynamicsConfig, JointObservation, LatentStateEstimate, StateCovariance, ParameterCorrelations};
-pub use edge_surface::{EdgeSurface, EdgeSurfaceConfig, EdgeObservation, SurfaceStatistics};
+pub use edge_surface::{EdgeObservation, EdgeSurface, EdgeSurfaceConfig, SurfaceStatistics};
+pub use joint_dynamics::{
+    JointDynamics, JointDynamicsConfig, JointObservation, LatentStateEstimate,
+    ParameterCorrelations, StateCovariance,
+};
 
 /// Latent market state representation
 #[derive(Debug, Clone, Default)]
@@ -67,10 +70,10 @@ impl LatentState {
     /// Create a new latent state with default values
     pub fn new() -> Self {
         Self {
-            sigma: 10.0,       // 10 bps/sqrt(s) typical
-            regime: 1,         // NORMAL
-            p_informed: 0.05,  // 5% baseline informed
-            p_forced: 0.02,    // 2% baseline forced
+            sigma: 10.0,      // 10 bps/sqrt(s) typical
+            regime: 1,        // NORMAL
+            p_informed: 0.05, // 5% baseline informed
+            p_forced: 0.02,   // 2% baseline forced
             flow_momentum: 0.0,
             book_pressure: 0.0,
             confidence: 0.0,
@@ -237,10 +240,10 @@ mod tests {
     #[test]
     fn test_market_condition_from_state() {
         let cond = MarketCondition::from_state(15.0, 1, 10, 0.0);
-        assert_eq!(cond.vol_bucket, 2);    // 10-20 bps
-        assert_eq!(cond.regime, 1);        // NORMAL
-        assert_eq!(cond.hour_bucket, 1);   // London
-        assert_eq!(cond.flow_bucket, 2);   // Neutral
+        assert_eq!(cond.vol_bucket, 2); // 10-20 bps
+        assert_eq!(cond.regime, 1); // NORMAL
+        assert_eq!(cond.hour_bucket, 1); // London
+        assert_eq!(cond.flow_bucket, 2); // Neutral
     }
 
     #[test]

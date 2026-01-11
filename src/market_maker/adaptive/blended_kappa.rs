@@ -300,10 +300,36 @@ impl BlendedKappaEstimator {
         self.book_kappa
     }
 
+    /// Check if book-based kappa estimate is reliable.
+    ///
+    /// Returns false if:
+    /// - κ_book > 3× prior (likely thin book artifact)
+    /// - Fewer than 10 L2 updates processed
+    pub fn book_kappa_reliable(&self) -> bool {
+        self.book_kappa < self.prior_mean * 3.0 && self.book_update_count >= 10
+    }
+
     /// Get the blended kappa estimate.
+    ///
+    /// Includes reliability check to prevent spread collapse on thin books.
+    /// When book kappa is unreliable (too high or insufficient samples),
+    /// falls back to prior. The final warmup factor is applied separately.
     pub fn kappa(&self) -> f64 {
         let w = self.blend_weight();
-        let blended = (1.0 - w) * self.book_kappa + w * self.own_kappa();
+
+        // Validate book kappa before using it
+        // High values (κ > 3× prior) on thin books can cause spreads to collapse
+        let book_reliable = self.book_kappa < self.prior_mean * 3.0 && self.book_update_count >= 10;
+
+        let effective_book_kappa = if book_reliable {
+            self.book_kappa
+        } else {
+            // Use prior when book is unreliable
+            // (warmup factor applied at the end, not here to avoid double-counting)
+            self.prior_mean
+        };
+
+        let blended = (1.0 - w) * effective_book_kappa + w * self.own_kappa();
 
         // Apply warmup conservatism if still early
         if self.own_fill_count < self.blend_min_fills {

@@ -129,12 +129,12 @@ impl ComponentParams {
     /// Create default informed trader parameters
     pub fn informed() -> Self {
         Self {
-            mu_size: 1.0,       // Larger than average
-            sigma_size: 0.8,    // Less variance (more consistent)
-            lambda_0: 0.05,     // Lower baseline
-            alpha: 0.5,         // High self-excitation (clustering)
-            beta: 2.0,          // Moderate decay
-            impact_per_unit: 3.0,  // High impact
+            mu_size: 1.0,         // Larger than average
+            sigma_size: 0.8,      // Less variance (more consistent)
+            lambda_0: 0.05,       // Lower baseline
+            alpha: 0.5,           // High self-excitation (clustering)
+            beta: 2.0,            // Moderate decay
+            impact_per_unit: 3.0, // High impact
             impact_variance: 2.0,
         }
     }
@@ -142,12 +142,12 @@ impl ComponentParams {
     /// Create default noise trader parameters
     pub fn noise() -> Self {
         Self {
-            mu_size: -0.5,      // Smaller than average
-            sigma_size: 1.2,    // Higher variance (random)
-            lambda_0: 0.2,      // Higher baseline (frequent)
-            alpha: 0.1,         // Low self-excitation (Poisson-like)
-            beta: 5.0,          // Fast decay
-            impact_per_unit: 0.5,  // Low impact
+            mu_size: -0.5,        // Smaller than average
+            sigma_size: 1.2,      // Higher variance (random)
+            lambda_0: 0.2,        // Higher baseline (frequent)
+            alpha: 0.1,           // Low self-excitation (Poisson-like)
+            beta: 5.0,            // Fast decay
+            impact_per_unit: 0.5, // Low impact
             impact_variance: 1.0,
         }
     }
@@ -155,12 +155,12 @@ impl ComponentParams {
     /// Create default forced trader parameters
     pub fn forced() -> Self {
         Self {
-            mu_size: 0.5,       // Medium-large
-            sigma_size: 0.5,    // Low variance (predictable size)
-            lambda_0: 0.02,     // Rare baseline
-            alpha: 0.8,         // Very high clustering (liquidation cascades)
-            beta: 1.0,          // Slow decay (sustained pressure)
-            impact_per_unit: 2.0,  // Medium-high impact
+            mu_size: 0.5,         // Medium-large
+            sigma_size: 0.5,      // Low variance (predictable size)
+            lambda_0: 0.02,       // Rare baseline
+            alpha: 0.8,           // Very high clustering (liquidation cascades)
+            beta: 1.0,            // Slow decay (sustained pressure)
+            impact_per_unit: 2.0, // Medium-high impact
             impact_variance: 3.0,
         }
     }
@@ -294,12 +294,12 @@ pub struct InformedFlowEstimator {
 #[derive(Debug, Clone, Default)]
 struct SufficientStats {
     // Per-component stats
-    n: [f64; 3],            // Weighted count
-    sum_log_size: [f64; 3], // Σ γ × log(size)
-    sum_log_size_sq: [f64; 3], // Σ γ × log(size)²
+    n: [f64; 3],                 // Weighted count
+    sum_log_size: [f64; 3],      // Σ γ × log(size)
+    sum_log_size_sq: [f64; 3],   // Σ γ × log(size)²
     sum_inter_arrival: [f64; 3], // Σ γ × inter_arrival
-    sum_impact: [f64; 3],   // Σ γ × impact
-    sum_impact_sq: [f64; 3], // Σ γ × impact²
+    sum_impact: [f64; 3],        // Σ γ × impact
+    sum_impact_sq: [f64; 3],     // Σ γ × impact²
 }
 
 impl InformedFlowEstimator {
@@ -382,15 +382,12 @@ impl InformedFlowEstimator {
         for (k, component) in self.components.iter().enumerate() {
             // Size likelihood (log-normal)
             let log_size = (features.size.max(0.01)).ln();
-            let size_ll = gaussian_log_pdf(
-                log_size,
-                component.mu_size,
-                component.sigma_size,
-            );
+            let size_ll = gaussian_log_pdf(log_size, component.mu_size, component.sigma_size);
 
             // Inter-arrival likelihood (exponential approximation)
             let arrival_rate = component.lambda_0
-                + component.alpha * (-(component.beta * features.inter_arrival_ms as f64 / 1000.0)).exp();
+                + component.alpha
+                    * (-(component.beta * features.inter_arrival_ms as f64 / 1000.0)).exp();
             let inter_arrival_s = features.inter_arrival_ms as f64 / 1000.0;
             let arrival_ll = arrival_rate.ln() - arrival_rate * inter_arrival_s;
 
@@ -407,7 +404,10 @@ impl InformedFlowEstimator {
         }
 
         // Softmax to get responsibilities
-        let max_ll = log_likelihoods.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_ll = log_likelihoods
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let mut responsibilities = [0.0f64; 3];
         let mut sum = 0.0;
 
@@ -435,9 +435,7 @@ impl InformedFlowEstimator {
         let log_size = (features.size.max(0.01)).ln();
         let inter_arrival_s = features.inter_arrival_ms as f64 / 1000.0;
 
-        for k in 0..3 {
-            let gamma = resp[k];
-
+        for (k, &gamma) in resp.iter().enumerate() {
             // Decay old stats and add new
             self.sufficient_stats.n[k] = lambda * self.sufficient_stats.n[k] + gamma;
             self.sufficient_stats.sum_log_size[k] =
@@ -448,9 +446,9 @@ impl InformedFlowEstimator {
                 lambda * self.sufficient_stats.sum_inter_arrival[k] + gamma * inter_arrival_s;
             self.sufficient_stats.sum_impact[k] =
                 lambda * self.sufficient_stats.sum_impact[k] + gamma * features.price_impact_bps;
-            self.sufficient_stats.sum_impact_sq[k] =
-                lambda * self.sufficient_stats.sum_impact_sq[k]
-                    + gamma * features.price_impact_bps * features.price_impact_bps;
+            self.sufficient_stats.sum_impact_sq[k] = lambda
+                * self.sufficient_stats.sum_impact_sq[k]
+                + gamma * features.price_impact_bps * features.price_impact_bps;
         }
     }
 
@@ -532,8 +530,8 @@ impl InformedFlowEstimator {
                 avg[k] += resp[k];
             }
         }
-        for k in 0..3 {
-            avg[k] /= n_recent as f64;
+        for item in &mut avg {
+            *item /= n_recent as f64;
         }
 
         // Compute confidence based on consistency
@@ -654,9 +652,9 @@ mod tests {
         // expected impact is ~15 bps (vs forced's 10 bps, noise's 2.5 bps)
         for i in 0..200 {
             let features = TradeFeatures {
-                size: 5.0,               // Large size
-                inter_arrival_ms: 100,   // Clustered (fast)
-                price_impact_bps: 15.0,  // High impact matching informed expectations
+                size: 5.0,              // Large size
+                inter_arrival_ms: 100,  // Clustered (fast)
+                price_impact_bps: 15.0, // High impact matching informed expectations
                 timestamp_ms: i * 100,
                 ..Default::default()
             };
@@ -678,9 +676,9 @@ mod tests {
         // Feed trades that look like noise: small, random, low impact
         for i in 0..200 {
             let features = TradeFeatures {
-                size: 0.3,               // Small size
-                inter_arrival_ms: 5000,  // Sparse (slow)
-                price_impact_bps: 0.5,   // Low impact
+                size: 0.3,              // Small size
+                inter_arrival_ms: 5000, // Sparse (slow)
+                price_impact_bps: 0.5,  // Low impact
                 timestamp_ms: i * 5000,
                 ..Default::default()
             };

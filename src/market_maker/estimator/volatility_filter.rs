@@ -527,7 +527,8 @@ impl VolatilityFilter {
     /// Confidence in sigma estimate (based on ESS and observation count)
     pub fn sigma_confidence(&self) -> f64 {
         let ess_ratio = self.effective_sample_size() / self.particles.len() as f64;
-        let obs_ratio = (self.observation_count as f64 / self.config.min_observations as f64).min(1.0);
+        let obs_ratio =
+            (self.observation_count as f64 / self.config.min_observations as f64).min(1.0);
         ess_ratio * obs_ratio
     }
 
@@ -705,7 +706,13 @@ mod tests {
         let mean = filter.sigma();
 
         // Mean should be within CI
-        assert!(lo <= mean && mean <= hi, "Mean {} not in CI [{}, {}]", mean, lo, hi);
+        assert!(
+            lo <= mean && mean <= hi,
+            "Mean {} not in CI [{}, {}]",
+            mean,
+            lo,
+            hi
+        );
 
         // CI should be reasonable (not infinite)
         assert!(lo > 0.0);

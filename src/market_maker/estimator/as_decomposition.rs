@@ -671,9 +671,9 @@ mod tests {
         est.on_fill(&fill);
 
         // Updates at each horizon
-        est.on_price_update(101.0, 1000);   // 1s: +100 bps
-        est.on_price_update(101.5, 5000);   // 5s: +150 bps
-        est.on_price_update(102.0, 30000);  // 30s: +200 bps
+        est.on_price_update(101.0, 1000); // 1s: +100 bps
+        est.on_price_update(101.5, 5000); // 5s: +150 bps
+        est.on_price_update(102.0, 30000); // 30s: +200 bps
         est.on_price_update(102.5, 300000); // 5min: +250 bps
 
         // Check all horizons measured
@@ -700,9 +700,9 @@ mod tests {
 
             // Immediate impact high, permanent lower (mean reversion)
             let t0 = i * 400_000;
-            est.on_price_update(103.0, t0 + 1000);   // 3% immediate
-            est.on_price_update(102.0, t0 + 5000);   // 2% at 5s
-            est.on_price_update(101.0, t0 + 30000);  // 1% at 30s
+            est.on_price_update(103.0, t0 + 1000); // 3% immediate
+            est.on_price_update(102.0, t0 + 5000); // 2% at 5s
+            est.on_price_update(101.0, t0 + 30000); // 1% at 30s
             est.on_price_update(100.5, t0 + 300000); // 0.5% permanent
         }
 

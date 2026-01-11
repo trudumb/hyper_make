@@ -196,23 +196,27 @@ impl RiskConfig {
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
-            gamma_base: 0.3,
+            // MAINNET OPTIMIZED: Lower gamma for liquid markets with deep books
+            gamma_base: 0.15, // Reduced from 0.3 - liquid markets need less risk aversion
             sigma_baseline: 0.0002, // 20bp per-second
             volatility_weight: 0.5,
-            max_volatility_multiplier: 3.0,
+            // MAINNET OPTIMIZED: Cap vol scaling for liquid markets
+            max_volatility_multiplier: 2.0, // Reduced from 3.0 - less extreme scaling
             toxicity_threshold: 1.5,
             toxicity_sensitivity: 0.3,
-            inventory_threshold: 0.3, // Lowered from 0.5 - start scaling earlier
+            // MAINNET OPTIMIZED: Higher inventory tolerance for liquid markets
+            inventory_threshold: 0.5, // Increased from 0.3 - easier to exit on liquid books
             inventory_sensitivity: 3.0, // Increased from 2.0 - stronger inventory effect on gamma
             gamma_min: 0.05,
             gamma_max: 5.0,
-            // FIRST PRINCIPLES: min_spread_floor = fees + AS + buffer + toxic_margin
-            // Trade history (Dec 2025):
+            // MAINNET OPTIMIZED: Tighter spread floor for liquid markets
+            // FIRST PRINCIPLES: min_spread_floor = fees + slippage + buffer
+            // Liquid market (mainnet BTC):
             //   - Fees: 1.5 bps
-            //   - Average AS: 0.5 bps (but 11.6 bps on large trades)
-            //   - Need 11.67 bps for break-even
-            // Setting to 8 bps = fees (1.5) + AS (0.5) + buffer (6) for base profitability
-            min_spread_floor: 0.0008, // 8 bps (raised from 5 bps)
+            //   - Expected slippage: 2.0 bps (tight books)
+            //   - Buffer: 1.5 bps
+            //   Total: 5 bps (reduced from 8 bps)
+            min_spread_floor: 0.0005, // 5 bps (reduced from 8 bps)
             max_holding_time: 120.0,  // 2 minutes
             flow_sensitivity: 0.5,    // exp(-0.5) ≈ 0.61 at perfect alignment
             maker_fee_rate: 0.00015,  // 1.5 bps Hyperliquid maker fee

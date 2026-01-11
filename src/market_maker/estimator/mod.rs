@@ -27,11 +27,14 @@
 //! - `tick_ewma`: Tick-based EWMA for volume-clock aligned estimation
 //! - `parameter_estimator`: Main orchestrator
 
+pub mod as_decomposition;
 mod book_kappa;
 mod calibration_controller;
 mod covariance;
 mod directional_risk;
+pub mod fill_rate_model;
 mod hierarchical_kappa;
+pub mod informed_flow;
 mod jump;
 mod kalman;
 mod kappa;
@@ -46,9 +49,6 @@ pub(crate) mod tick_ewma;
 mod trend_persistence;
 mod volatility;
 pub mod volatility_filter;
-pub mod informed_flow;
-pub mod fill_rate_model;
-pub mod as_decomposition;
 mod volume;
 
 // V2 re-exports (will be used when integrated)
@@ -68,9 +68,19 @@ pub(crate) use kappa_orchestrator::{KappaOrchestrator, KappaOrchestratorConfig};
 pub(crate) use robust_kappa::RobustKappaEstimator;
 
 // Re-export public types
+pub use as_decomposition::{
+    ASDecompConfig, ASDecompResult, ASDecomposition, FillInfo as ASFillInfo,
+};
 pub use calibration_controller::{CalibrationController, CalibrationControllerConfig};
 pub use directional_risk::{
     DirectionalRiskConfig, DirectionalRiskEstimator, DirectionalRiskOutput,
+};
+pub use fill_rate_model::{
+    FillObservation, FillRateConfig, FillRateModel, FillRateStatistics,
+    MarketState as FillRateMarketState,
+};
+pub use informed_flow::{
+    ComponentParams, FlowDecomposition, InformedFlowConfig, InformedFlowEstimator, TradeFeatures,
 };
 pub use jump::{JumpEstimator, JumpEstimatorConfig};
 pub use kalman::{KalmanPriceFilter, NoiseFilter};
@@ -79,10 +89,7 @@ pub use momentum::MomentumModel;
 pub use parameter_estimator::ParameterEstimator;
 pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 pub use volatility::{StochasticVolParams, VolatilityRegime};
-pub use volatility_filter::{VolatilityFilter, VolFilterConfig, VolParticle, VolRegimeParams};
-pub use informed_flow::{InformedFlowEstimator, InformedFlowConfig, TradeFeatures, FlowDecomposition, ComponentParams};
-pub use fill_rate_model::{FillRateModel, FillRateConfig, FillObservation, MarketState as FillRateMarketState, FillRateStatistics};
-pub use as_decomposition::{ASDecomposition, ASDecompConfig, ASDecompResult, FillInfo as ASFillInfo};
+pub use volatility_filter::{VolFilterConfig, VolParticle, VolRegimeParams, VolatilityFilter};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

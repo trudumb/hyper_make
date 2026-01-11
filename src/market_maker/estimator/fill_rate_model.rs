@@ -84,16 +84,18 @@ pub struct FillRateConfig {
 impl Default for FillRateConfig {
     fn default() -> Self {
         Self {
-            lambda_0_prior_mean: 0.1,        // 0.1 fills/second baseline
-            lambda_0_prior_strength: 10.0,   // Moderate confidence
-            delta_char_prior_mean: 10.0,     // 10 bps characteristic depth
-            delta_char_prior_strength: 5.0,  // Lower confidence
-            observation_half_life: 200,      // Adapt over ~200 observations
-            min_observations: 30,            // 30 fills/non-fills needed
-            buffer_size: 500,                // Keep recent observations
+            // MAINNET OPTIMIZED: Higher baseline for liquid markets
+            lambda_0_prior_mean: 0.8, // 0.8 fills/second (increased from 0.1)
+            lambda_0_prior_strength: 10.0, // Moderate confidence
+            delta_char_prior_mean: 10.0, // 10 bps characteristic depth
+            delta_char_prior_strength: 5.0, // Lower confidence
+            // MAINNET OPTIMIZED: Faster adaptation with abundant data
+            observation_half_life: 100, // Reduced from 200 - faster convergence
+            min_observations: 30,       // 30 fills/non-fills needed
+            buffer_size: 500,           // Keep recent observations
             coefficient_regularization: 0.1, // L2 regularization
-            max_depth_bps: 100.0,            // Cap depth at 100 bps
-            min_fill_rate: 0.001,            // Floor at 0.1% per second
+            max_depth_bps: 100.0,       // Cap depth at 100 bps
+            min_fill_rate: 0.001,       // Floor at 0.1% per second
         }
     }
 }
@@ -129,14 +131,14 @@ pub struct MarketState {
 
 impl MarketState {
     /// Extract feature vector for regression
-    fn to_features(&self) -> [f64; 6] {
+    fn to_features(self) -> [f64; 6] {
         [
-            self.sigma_bps.ln().max(-5.0).min(5.0),           // Log volatility
-            (self.spread_bps / 10.0).clamp(-2.0, 2.0),        // Normalized spread
-            self.book_imbalance,                               // Book pressure
-            self.flow_imbalance,                               // Trade flow
-            (self.regime as f64 - 1.5) / 1.5,                 // Regime (-1 to 1)
-            ((self.hour_utc as f64 - 12.0) / 12.0).cos(),     // Hour seasonality
+            self.sigma_bps.ln().clamp(-5.0, 5.0),         // Log volatility
+            (self.spread_bps / 10.0).clamp(-2.0, 2.0),    // Normalized spread
+            self.book_imbalance,                          // Book pressure
+            self.flow_imbalance,                          // Trade flow
+            (self.regime as f64 - 1.5) / 1.5,             // Regime (-1 to 1)
+            ((self.hour_utc as f64 - 12.0) / 12.0).cos(), // Hour seasonality
         ]
     }
 }
@@ -260,12 +262,7 @@ impl Default for FillRateCoefficients {
             values: [0.0; 6],
             variances: [1.0; 6],
             names: [
-                "log_vol",
-                "spread",
-                "book_imb",
-                "flow_imb",
-                "regime",
-                "hour_cos",
+                "log_vol", "spread", "book_imb", "flow_imb", "regime", "hour_cos",
             ],
         }
     }
@@ -283,12 +280,11 @@ impl FillRateCoefficients {
 
     /// Update coefficients with stochastic gradient descent
     fn sgd_update(&mut self, features: &[f64; 6], gradient: f64, learning_rate: f64, l2_reg: f64) {
-        for i in 0..6 {
-            let grad = gradient * features[i] + l2_reg * self.values[i];
+        for (i, &feat) in features.iter().enumerate() {
+            let grad = gradient * feat + l2_reg * self.values[i];
             self.values[i] -= learning_rate * grad;
             // Update variance estimate (approximate)
-            self.variances[i] =
-                0.99 * self.variances[i] + 0.01 * grad.powi(2).max(0.01);
+            self.variances[i] = 0.99 * self.variances[i] + 0.01 * grad.powi(2).max(0.01);
         }
     }
 }
@@ -356,8 +352,10 @@ impl FillRateModel {
     pub fn new(config: FillRateConfig) -> Self {
         let lambda_0 =
             BayesianEstimate::new(config.lambda_0_prior_mean, config.lambda_0_prior_strength);
-        let delta_char =
-            BayesianEstimate::new(config.delta_char_prior_mean, config.delta_char_prior_strength);
+        let delta_char = BayesianEstimate::new(
+            config.delta_char_prior_mean,
+            config.delta_char_prior_strength,
+        );
         let forgetting_factor = 0.5f64.powf(1.0 / config.observation_half_life as f64);
 
         Self {
@@ -447,7 +445,8 @@ impl FillRateModel {
             // δ_char relates to where fills vs non-fills separate
             if avg_depth_non > avg_depth_fills {
                 let estimated_delta_char = (avg_depth_non + avg_depth_fills) / 2.0;
-                self.delta_char.update(estimated_delta_char.clamp(1.0, 50.0), 0.1);
+                self.delta_char
+                    .update(estimated_delta_char.clamp(1.0, 50.0), 0.1);
             }
         }
 
@@ -484,8 +483,7 @@ impl FillRateModel {
         let depth_clamped = depth_bps.clamp(0.0, self.config.max_depth_bps);
         let depth_norm = depth_clamped / self.delta_char.mean;
 
-        let log_lambda =
-            self.lambda_0.mean.ln() - depth_norm + self.coefficients.dot(features);
+        let log_lambda = self.lambda_0.mean.ln() - depth_norm + self.coefficients.dot(features);
 
         log_lambda.exp().clamp(self.config.min_fill_rate, 10.0)
     }
@@ -501,12 +499,7 @@ impl FillRateModel {
     }
 
     /// Probability of fill within given duration
-    pub fn fill_probability(
-        &self,
-        depth_bps: f64,
-        state: &MarketState,
-        duration_s: f64,
-    ) -> f64 {
+    pub fn fill_probability(&self, depth_bps: f64, state: &MarketState, duration_s: f64) -> f64 {
         let lambda = self.fill_rate(depth_bps, state);
         (1.0 - (-lambda * duration_s).exp()).clamp(0.0, 1.0)
     }
@@ -642,8 +635,8 @@ mod tests {
         assert_eq!(model.observation_count(), 0);
         assert!(!model.is_warmed_up());
 
-        // Prior values should be set
-        assert!((model.lambda_0.mean - 0.1).abs() < 0.01);
+        // Prior values should be set (mainnet-optimized: lambda_0 = 0.8)
+        assert!((model.lambda_0.mean - 0.8).abs() < 0.01);
         assert!((model.delta_char.mean - 10.0).abs() < 0.1);
     }
 
@@ -656,8 +649,14 @@ mod tests {
         let rate_10 = model.fill_rate(10.0, &state);
         let rate_20 = model.fill_rate(20.0, &state);
 
-        assert!(rate_5 > rate_10, "Rate at 5 bps should exceed rate at 10 bps");
-        assert!(rate_10 > rate_20, "Rate at 10 bps should exceed rate at 20 bps");
+        assert!(
+            rate_5 > rate_10,
+            "Rate at 5 bps should exceed rate at 10 bps"
+        );
+        assert!(
+            rate_10 > rate_20,
+            "Rate at 10 bps should exceed rate at 20 bps"
+        );
     }
 
     #[test]
@@ -701,8 +700,14 @@ mod tests {
         }
 
         let stats = model.fill_statistics();
-        assert!(stats.empirical_fill_rate > 0.4, "Should have ~50% fill rate");
-        assert!(stats.mean_fill_time_s > 0.0, "Mean fill time should be positive");
+        assert!(
+            stats.empirical_fill_rate > 0.4,
+            "Should have ~50% fill rate"
+        );
+        assert!(
+            stats.mean_fill_time_s > 0.0,
+            "Mean fill time should be positive"
+        );
     }
 
     #[test]
@@ -711,8 +716,8 @@ mod tests {
         let state = MarketState::default();
 
         // Higher target rate should give smaller depth
-        let depth_high = model.optimal_depth(0.5, &state);  // Want fast fills
-        let depth_low = model.optimal_depth(0.05, &state);  // OK with slow fills
+        let depth_high = model.optimal_depth(0.5, &state); // Want fast fills
+        let depth_low = model.optimal_depth(0.05, &state); // OK with slow fills
 
         assert!(
             depth_high < depth_low,
@@ -785,7 +790,10 @@ mod tests {
 
         assert!(lo < estimate.mean, "Lower bound should be below mean");
         assert!(hi > estimate.mean, "Upper bound should be above mean");
-        assert!(lo > 0.0 || hi > 0.0, "At least one bound should be positive");
+        assert!(
+            lo > 0.0 || hi > 0.0,
+            "At least one bound should be positive"
+        );
     }
 
     #[test]

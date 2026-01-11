@@ -373,10 +373,24 @@ impl AdaptiveSpreadCalculator {
     ///
     /// This can be used to scale uncertainty margins during warmup.
     /// Higher = more confident in learned values.
+    ///
+    /// Thresholds adapt based on observed fill rate:
+    /// - Liquid markets (≥0.005 fills/sec): standard thresholds (20 floor, 10 kappa)
+    /// - Illiquid markets (<0.005 fills/sec): relaxed thresholds (10 floor, 5 kappa)
     pub fn warmup_progress(&self) -> f64 {
+        // Adapt thresholds based on observed market activity
+        let fill_rate = self.observed_fill_rate();
+        let (floor_target, kappa_target): (usize, usize) = if fill_rate < 0.005 {
+            (10, 5) // Low activity: relax thresholds
+        } else {
+            (20, 10) // Normal activity: standard thresholds
+        };
+
         // Components contribute to overall progress
-        let floor_progress = (self.floor.observation_count().min(20) as f64) / 20.0;
-        let kappa_progress = (self.kappa.own_fill_count().min(10) as f64) / 10.0;
+        let floor_progress =
+            (self.floor.observation_count().min(floor_target) as f64) / floor_target as f64;
+        let kappa_progress =
+            (self.kappa.own_fill_count().min(kappa_target) as f64) / kappa_target as f64;
         // Gamma uses standardizers which need ~20 observations
         let gamma_progress = if self.gamma.is_warmed_up() { 1.0 } else { 0.5 };
 

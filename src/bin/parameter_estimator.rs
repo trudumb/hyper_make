@@ -28,16 +28,13 @@ use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
 
 // Import estimator components (re-exported from market_maker)
 use hyperliquid_rust_sdk::market_maker::{
-    ASDecomposition, ASFillInfo,
-    FillRateModel, FillRateMarketState, FillObservation,
-    InformedFlowEstimator, TradeFeatures,
-    VolatilityFilter, VolFilterConfig,
+    ASDecomposition, ASFillInfo, FillObservation, FillRateMarketState, FillRateModel,
+    InformedFlowEstimator, TradeFeatures, VolFilterConfig, VolatilityFilter,
 };
 
 // Import latent state components
 use hyperliquid_rust_sdk::market_maker::latent::{
-    EdgeObservation, EdgeSurface, JointDynamics,
-    JointObservation, MarketCondition,
+    EdgeObservation, EdgeSurface, JointDynamics, JointObservation, MarketCondition,
 };
 
 // ============================================================================
@@ -619,7 +616,9 @@ impl LatentStateEstimator {
             fill_rate: FillRateReport {
                 lambda_0: self.fill_rate_model.lambda_0().mean,
                 delta_char_bps: self.fill_rate_model.delta_char().mean,
-                fill_rate_at_8bps: self.fill_rate_model.fill_rate(8.0, &FillRateMarketState::default()),
+                fill_rate_at_8bps: self
+                    .fill_rate_model
+                    .fill_rate(8.0, &FillRateMarketState::default()),
                 is_warmed_up: self.fill_rate_model.is_warmed_up(),
             },
             adverse_selection: ASReport {
@@ -662,7 +661,10 @@ impl LatentStateEstimator {
         println!("  Trades processed: {}", report.trades_processed);
         println!("  L2 books processed: {}", self.stats.books_processed);
         println!("  Mids processed: {}", self.stats.mids_processed);
-        println!("  Trade rate: {:.1} trades/min", self.stats.trades_per_minute());
+        println!(
+            "  Trade rate: {:.1} trades/min",
+            self.stats.trades_per_minute()
+        );
         println!("  Warmed up: {}", self.warmed_up);
         if let Some(mid) = self.stats.last_mid {
             println!("  Last mid: ${:.2}", mid);
@@ -767,10 +769,7 @@ impl LatentStateEstimator {
         println!("JOINT DYNAMICS:");
         if report.joint_dynamics.is_warmed_up {
             println!("  Regime: {}", report.joint_dynamics.regime);
-            println!(
-                "  ρ(σ, κ): {:.2}",
-                report.joint_dynamics.sigma_kappa_corr
-            );
+            println!("  ρ(σ, κ): {:.2}", report.joint_dynamics.sigma_kappa_corr);
             println!("  ρ(σ, AS): {:.2}", report.joint_dynamics.sigma_as_corr);
             println!(
                 "  ρ(κ, P_inf): {:.2}",
@@ -798,7 +797,10 @@ impl LatentStateEstimator {
             println!();
             println!("Current state:");
             println!("  Edge: {:.2} bps", report.edge.current_edge_bps);
-            println!("  Optimal spread: {:.2} bps", report.edge.optimal_spread_bps);
+            println!(
+                "  Optimal spread: {:.2} bps",
+                report.edge.optimal_spread_bps
+            );
             if report.edge.should_quote {
                 println!("  ✓ SHOULD QUOTE");
             } else {
@@ -931,7 +933,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create InfoClient for WebSocket
     info!("Connecting to {} WebSocket...", cli.network);
-    let mut info_client = InfoClient::new(None, Some(base_url.clone())).await?;
+    let mut info_client = InfoClient::new(None, Some(base_url)).await?;
 
     // Create message channel
     let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();

@@ -82,10 +82,10 @@ impl Default for JointDynamicsConfig {
             ewma_half_life: 100,
             min_observations: 30,
             max_observations: 500,
-            kappa_sigma: 0.1,      // Mean revert over ~10 observations
-            theta_sigma: 10.0,     // 10 bps/s long-run vol
-            kappa_kappa: 0.05,     // Slower mean reversion for kappa
-            theta_kappa: 100.0,    // 100 units long-run kappa
+            kappa_sigma: 0.1,   // Mean revert over ~10 observations
+            theta_sigma: 10.0,  // 10 bps/s long-run vol
+            kappa_kappa: 0.05,  // Slower mean reversion for kappa
+            theta_kappa: 100.0, // 100 units long-run kappa
             forecast_horizon_s: 60.0,
         }
     }
@@ -258,9 +258,33 @@ impl LatentStateEstimate {
     /// Detect regime from parameter values
     fn detect_regime(sigma: f64, p_informed: f64, as_bps: f64) -> u8 {
         // Simple regime detection based on thresholds
-        let vol_score = if sigma < 5.0 { 0 } else if sigma < 15.0 { 1 } else if sigma < 30.0 { 2 } else { 3 };
-        let informed_score = if p_informed < 0.1 { 0 } else if p_informed < 0.25 { 1 } else if p_informed < 0.5 { 2 } else { 3 };
-        let as_score = if as_bps < 1.0 { 0 } else if as_bps < 3.0 { 1 } else if as_bps < 6.0 { 2 } else { 3 };
+        let vol_score = if sigma < 5.0 {
+            0
+        } else if sigma < 15.0 {
+            1
+        } else if sigma < 30.0 {
+            2
+        } else {
+            3
+        };
+        let informed_score = if p_informed < 0.1 {
+            0
+        } else if p_informed < 0.25 {
+            1
+        } else if p_informed < 0.5 {
+            2
+        } else {
+            3
+        };
+        let as_score = if as_bps < 1.0 {
+            0
+        } else if as_bps < 3.0 {
+            1
+        } else if as_bps < 6.0 {
+            2
+        } else {
+            3
+        };
 
         // Take max of scores
         vol_score.max(informed_score).max(as_score)
@@ -377,13 +401,18 @@ impl JointDynamics {
 
             self.mean_sigma_sq = alpha * obs.sigma * obs.sigma + (1.0 - alpha) * self.mean_sigma_sq;
             self.mean_kappa_sq = alpha * obs.kappa * obs.kappa + (1.0 - alpha) * self.mean_kappa_sq;
-            self.mean_p_informed_sq = alpha * obs.p_informed * obs.p_informed + (1.0 - alpha) * self.mean_p_informed_sq;
+            self.mean_p_informed_sq =
+                alpha * obs.p_informed * obs.p_informed + (1.0 - alpha) * self.mean_p_informed_sq;
             self.mean_as_sq = alpha * obs.as_bps * obs.as_bps + (1.0 - alpha) * self.mean_as_sq;
 
-            self.mean_sigma_kappa = alpha * obs.sigma * obs.kappa + (1.0 - alpha) * self.mean_sigma_kappa;
-            self.mean_sigma_as = alpha * obs.sigma * obs.as_bps + (1.0 - alpha) * self.mean_sigma_as;
-            self.mean_kappa_pinformed = alpha * obs.kappa * obs.p_informed + (1.0 - alpha) * self.mean_kappa_pinformed;
-            self.mean_as_pinformed = alpha * obs.as_bps * obs.p_informed + (1.0 - alpha) * self.mean_as_pinformed;
+            self.mean_sigma_kappa =
+                alpha * obs.sigma * obs.kappa + (1.0 - alpha) * self.mean_sigma_kappa;
+            self.mean_sigma_as =
+                alpha * obs.sigma * obs.as_bps + (1.0 - alpha) * self.mean_sigma_as;
+            self.mean_kappa_pinformed =
+                alpha * obs.kappa * obs.p_informed + (1.0 - alpha) * self.mean_kappa_pinformed;
+            self.mean_as_pinformed =
+                alpha * obs.as_bps * obs.p_informed + (1.0 - alpha) * self.mean_as_pinformed;
         }
 
         self.last_timestamp_ms = obs.timestamp_ms;
@@ -427,7 +456,8 @@ impl JointDynamics {
         StateCovariance {
             var_sigma: (self.mean_sigma_sq - self.mean_sigma * self.mean_sigma).max(0.0),
             var_kappa: (self.mean_kappa_sq - self.mean_kappa * self.mean_kappa).max(0.0),
-            var_p_informed: (self.mean_p_informed_sq - self.mean_p_informed * self.mean_p_informed).max(0.0),
+            var_p_informed: (self.mean_p_informed_sq - self.mean_p_informed * self.mean_p_informed)
+                .max(0.0),
             var_as: (self.mean_as_sq - self.mean_as * self.mean_as).max(0.0),
             cov_sigma_kappa: self.mean_sigma_kappa - self.mean_sigma * self.mean_kappa,
             cov_sigma_as: self.mean_sigma_as - self.mean_sigma * self.mean_as,
@@ -471,10 +501,10 @@ impl JointDynamics {
         let decay_sigma = (-self.config.kappa_sigma * horizon_s).exp();
         let decay_kappa = (-self.config.kappa_kappa * horizon_s).exp();
 
-        let forecast_sigma = self.config.theta_sigma
-            + decay_sigma * (self.mean_sigma - self.config.theta_sigma);
-        let forecast_kappa = self.config.theta_kappa
-            + decay_kappa * (self.mean_kappa - self.config.theta_kappa);
+        let forecast_sigma =
+            self.config.theta_sigma + decay_sigma * (self.mean_sigma - self.config.theta_sigma);
+        let forecast_kappa =
+            self.config.theta_kappa + decay_kappa * (self.mean_kappa - self.config.theta_kappa);
 
         // P(informed) and AS are harder to forecast, use current values with decay
         let forecast_p_informed = self.mean_p_informed * 0.9_f64.powf(horizon_s / 60.0);
@@ -490,7 +520,11 @@ impl JointDynamics {
             p_informed: forecast_p_informed,
             as_bps: forecast_as,
             flow_momentum: self.mean_momentum * 0.5_f64.powf(horizon_s / 10.0),
-            regime: LatentStateEstimate::detect_regime(forecast_sigma, forecast_p_informed, forecast_as),
+            regime: LatentStateEstimate::detect_regime(
+                forecast_sigma,
+                forecast_p_informed,
+                forecast_as,
+            ),
             uncertainty: (base_uncertainty * horizon_factor).clamp(0.0, 1.0),
             timestamp_ms: self.last_timestamp_ms + (horizon_s * 1000.0) as u64,
         }
@@ -576,10 +610,18 @@ mod tests {
         assert!(cov.var_kappa > 0.0, "Variance should be positive");
 
         // Sigma-AS should be positively correlated
-        assert!(corr.sigma_as > 0.0, "Sigma-AS should be positive: {}", corr.sigma_as);
+        assert!(
+            corr.sigma_as > 0.0,
+            "Sigma-AS should be positive: {}",
+            corr.sigma_as
+        );
 
         // Sigma-kappa should be negatively correlated
-        assert!(corr.sigma_kappa < 0.0, "Sigma-kappa should be negative: {}", corr.sigma_kappa);
+        assert!(
+            corr.sigma_kappa < 0.0,
+            "Sigma-kappa should be negative: {}",
+            corr.sigma_kappa
+        );
     }
 
     #[test]
@@ -622,13 +664,22 @@ mod tests {
         let forecast = dynamics.forecast(60.0);
 
         // Sigma should mean-revert toward theta_sigma (10.0)
-        assert!(forecast.sigma < current.sigma, "Sigma should mean-revert down");
+        assert!(
+            forecast.sigma < current.sigma,
+            "Sigma should mean-revert down"
+        );
 
         // Kappa should mean-revert toward theta_kappa (100.0)
-        assert!(forecast.kappa > current.kappa, "Kappa should mean-revert up");
+        assert!(
+            forecast.kappa > current.kappa,
+            "Kappa should mean-revert up"
+        );
 
         // Uncertainty should increase with horizon
-        assert!(forecast.uncertainty >= current.uncertainty, "Uncertainty should increase");
+        assert!(
+            forecast.uncertainty >= current.uncertainty,
+            "Uncertainty should increase"
+        );
     }
 
     #[test]
@@ -676,9 +727,9 @@ mod tests {
     fn test_toxic_detection() {
         let toxic_corr = ParameterCorrelations {
             sigma_kappa: -0.5,
-            sigma_as: 0.6,       // High positive
+            sigma_as: 0.6, // High positive
             kappa_p_informed: 0.3,
-            as_p_informed: 0.7,  // High positive
+            as_p_informed: 0.7, // High positive
             confidence: 0.8,
         };
 

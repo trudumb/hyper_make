@@ -66,8 +66,10 @@ pub struct AdverseSelectionConfig {
 impl Default for AdverseSelectionConfig {
     fn default() -> Self {
         Self {
-            measurement_horizon_ms: 1000,
-            ewma_alpha: 0.05,
+            // MAINNET OPTIMIZED: Shorter horizon for liquid markets with faster mean reversion
+            measurement_horizon_ms: 500, // Reduced from 1000ms
+            // MAINNET OPTIMIZED: Faster adaptation to changing AS patterns
+            ewma_alpha: 0.12, // Increased from 0.05 - faster adaptation
             min_fills_warmup: 20,
             max_pending_fills: 1000,
             spread_adjustment_multiplier: 2.0,

@@ -20,13 +20,12 @@ use super::volume::{VolumeBucketAccumulator, VolumeTickArrivalEstimator};
 use super::{EstimatorConfig, EstimatorV2Flags, MarketEstimator, VolatilityRegime};
 
 // New latent state estimators (Phases 2-7)
-use super::volatility_filter::{VolatilityFilter, VolFilterConfig};
-use super::informed_flow::{InformedFlowEstimator, InformedFlowConfig, TradeFeatures};
-use super::fill_rate_model::{FillRateModel, FillRateConfig, FillObservation, MarketState as FillRateMarketState};
-use super::as_decomposition::{ASDecomposition, ASDecompConfig, FillInfo as ASFillInfo};
+use super::as_decomposition::{ASDecomposition, FillInfo as ASFillInfo};
+use super::fill_rate_model::{FillObservation, FillRateModel, MarketState as FillRateMarketState};
+use super::informed_flow::{InformedFlowEstimator, TradeFeatures};
+use super::volatility_filter::VolatilityFilter;
 use crate::market_maker::latent::{
-    JointDynamics, JointDynamicsConfig, JointObservation,
-    EdgeSurface, EdgeSurfaceConfig, EdgeObservation, MarketCondition,
+    EdgeObservation, EdgeSurface, JointDynamics, JointObservation, MarketCondition,
 };
 
 // ============================================================================
@@ -391,7 +390,8 @@ impl ParameterEstimator {
 
                 // === New Latent State Estimators: Feed particle filter ===
                 // VolatilityFilter uses returns and time delta (in seconds)
-                let bucket_dt = bucket.end_time_ms.saturating_sub(bucket.start_time_ms) as f64 / 1000.0;
+                let bucket_dt =
+                    bucket.end_time_ms.saturating_sub(bucket.start_time_ms) as f64 / 1000.0;
                 self.volatility_filter.on_return(ret, bucket_dt.max(0.1));
             }
 
@@ -583,7 +583,7 @@ impl ParameterEstimator {
 
         let fill_obs = FillObservation {
             depth_bps,
-            filled: true, // This is always true in on_own_fill
+            filled: true,     // This is always true in on_own_fill
             duration_s: 60.0, // Default duration estimate (unknown actual duration)
             state: fill_state,
             size: fill_size,
@@ -594,12 +594,8 @@ impl ParameterEstimator {
         // Use AS decomposition's current estimate for realized AS
         let realized_as = self.as_decomposition.total_as_bps();
 
-        let condition = MarketCondition::from_state(
-            sigma_bps,
-            regime,
-            hour_utc,
-            self.flow_imbalance(),
-        );
+        let condition =
+            MarketCondition::from_state(sigma_bps, regime, hour_utc, self.flow_imbalance());
 
         let edge_obs = EdgeObservation {
             condition,
@@ -1581,12 +1577,7 @@ impl ParameterEstimator {
             super::volatility::VolatilityRegime::Extreme => 3u8,
         };
 
-        MarketCondition::from_state(
-            sigma_bps,
-            regime,
-            hour_utc,
-            self.flow_imbalance(),
-        )
+        MarketCondition::from_state(sigma_bps, regime, hour_utc, self.flow_imbalance())
     }
 }
 

@@ -3,7 +3,7 @@
 use crate::market_maker::adaptive::AdaptiveSpreadCalculator;
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
 use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
-use crate::market_maker::estimator::{ParameterEstimator, MarketEstimator};
+use crate::market_maker::estimator::{MarketEstimator, ParameterEstimator};
 use crate::market_maker::infra::MarginAwareSizer;
 use crate::market_maker::process_models::{
     DriftAdjustedSkew, FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,

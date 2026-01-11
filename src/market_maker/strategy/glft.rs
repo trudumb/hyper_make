@@ -538,15 +538,14 @@ impl QuotingStrategy for GLFTStrategy {
         // sigma_leverage_adjusted incorporates:
         // - sigma_effective (blended clean/total based on jump regime)
         // - Leverage effect: wider during down moves when ρ < 0
-        let sigma_for_skew = if market_params.sigma_particle > 0.0
-            && market_params.flow_decomp_confidence > 0.3
-        {
-            // Use particle filter sigma (in bps/sqrt(s), convert to fractional)
-            market_params.sigma_particle / 10_000.0
-        } else {
-            // Fall back to leverage-adjusted sigma
-            market_params.sigma_leverage_adjusted
-        };
+        let sigma_for_skew =
+            if market_params.sigma_particle > 0.0 && market_params.flow_decomp_confidence > 0.3 {
+                // Use particle filter sigma (in bps/sqrt(s), convert to fractional)
+                market_params.sigma_particle / 10_000.0
+            } else {
+                // Fall back to leverage-adjusted sigma
+                market_params.sigma_leverage_adjusted
+            };
 
         // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
         let inventory_ratio = if effective_max_position > EPSILON {
