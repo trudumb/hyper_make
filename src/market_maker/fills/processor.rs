@@ -20,6 +20,7 @@ use super::dedup::FillDeduplicator;
 use super::{FillEvent, FillResult};
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
 use crate::market_maker::config::MetricsRecorder;
+use crate::market_maker::control::StochasticController;
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::PrometheusMetrics;
 use crate::market_maker::messages;
@@ -104,6 +105,14 @@ pub struct FillState<'a> {
     // Learning
     /// Closed-loop learning module
     pub learning: &'a mut crate::market_maker::learning::LearningModule,
+
+    // Layer 3: Stochastic Controller
+    /// POMDP-based sequential decision-making controller
+    pub stochastic_controller: &'a mut StochasticController,
+
+    // Fee configuration for edge calculation
+    /// Fee in basis points for edge calculation
+    pub fee_bps: f64,
 }
 
 /// Fill processor - coordinates fill handling across modules.
@@ -397,16 +406,51 @@ impl FillProcessor {
 
         // Learning: Update closed-loop learning module
         // Build minimal market params from estimator for learning update
+        let params = MarketParams::from_estimator(
+            state.estimator,
+            state.latest_mid,
+            state.position.position(),
+            state.max_position,
+        );
+
         if state.learning.is_enabled() {
-            let params = MarketParams::from_estimator(
-                state.estimator,
-                state.latest_mid,
-                state.position.position(),
-                state.max_position,
-            );
             state
                 .learning
                 .on_fill(fill, &params, state.position.position());
+        }
+
+        // Layer 3: Update stochastic controller beliefs
+        // This is the critical feedback loop that was missing!
+        if state.stochastic_controller.is_enabled() {
+            // Calculate drawdown from P&L (simplified - peak tracking would be better)
+            let pnl_summary = state.pnl_tracker.summary(state.latest_mid);
+            // Use 0.0 as fallback since we don't track peak_pnl here
+            // The actual drawdown is tracked in the risk monitors
+            let drawdown = 0.0;
+
+            // Get learning module output for controller
+            let learning_output = state.learning.output(
+                &params,
+                state.position.position(),
+                drawdown,
+            );
+
+            // Get realized adverse selection
+            let realized_as_bps = state.adverse_selection.realized_as_bps();
+
+            // Update controller beliefs and changepoint detection
+            state
+                .stochastic_controller
+                .on_fill(fill, &learning_output, realized_as_bps);
+
+            let cp_summary = state.stochastic_controller.changepoint_summary();
+            debug!(
+                realized_as_bps = %format!("{:.2}", realized_as_bps),
+                belief_edge = %format!("{:.2}", state.stochastic_controller.belief().expected_edge()),
+                n_fills = state.stochastic_controller.belief().n_fills,
+                changepoint_prob_5 = %format!("{:.3}", cp_summary.cp_prob_5),
+                "Layer 3: Updated beliefs from fill"
+            );
         }
 
         // Log fill summary
@@ -503,6 +547,7 @@ mod tests {
         prometheus: &'a mut PrometheusMetrics,
         metrics: &'a MetricsRecorder,
         learning: &'a mut crate::market_maker::learning::LearningModule,
+        stochastic_controller: &'a mut StochasticController,
     ) -> FillState<'a> {
         FillState {
             position,
@@ -519,6 +564,8 @@ mod tests {
             max_position: 10.0,
             calibrate_depth_as: true,
             learning,
+            stochastic_controller,
+            fee_bps: 1.5,
         }
     }
 
@@ -536,6 +583,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -548,6 +596,7 @@ mod tests {
             &mut prometheus,
             &metrics,
             &mut learning,
+            &mut stochastic_controller,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -572,6 +621,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -584,6 +634,7 @@ mod tests {
             &mut prometheus,
             &metrics,
             &mut learning,
+            &mut stochastic_controller,
         );
 
         let fill1 = make_fill(1, 100, 1.0, 50000.0, true);
@@ -662,6 +713,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -677,6 +729,7 @@ mod tests {
             &mut prometheus,
             &metrics,
             &mut learning,
+            &mut stochastic_controller,
         );
 
         // Now WebSocket fill arrives for OID 100
@@ -712,6 +765,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         // No pre-registration - this is a normal fill
 
@@ -726,6 +780,7 @@ mod tests {
             &mut prometheus,
             &metrics,
             &mut learning,
+            &mut stochastic_controller,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -758,6 +813,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -776,6 +832,7 @@ mod tests {
                 &mut prometheus,
                 &metrics,
                 &mut learning,
+                &mut stochastic_controller,
             );
             processor.process(&fill1, &mut state)
         };
@@ -798,6 +855,7 @@ mod tests {
                 &mut prometheus,
                 &metrics,
                 &mut learning,
+                &mut stochastic_controller,
             );
             processor.process(&fill2, &mut state)
         };
@@ -829,6 +887,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -848,6 +907,7 @@ mod tests {
                 &mut prometheus,
                 &metrics,
                 &mut learning,
+                &mut stochastic_controller,
             );
             processor.process(&fill1, &mut state)
         };
@@ -876,6 +936,7 @@ mod tests {
                 &mut prometheus,
                 &metrics,
                 &mut learning,
+                &mut stochastic_controller,
             );
             processor.process(&fill2, &mut state)
         };
@@ -905,6 +966,7 @@ mod tests {
                 &mut prometheus,
                 &metrics,
                 &mut learning,
+                &mut stochastic_controller,
             );
             processor.process(&fill3, &mut state)
         };

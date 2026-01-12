@@ -1319,6 +1319,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         // Spread profile for target spread ranges
         spread_profile: SpreadProfile::from_str(&cli.spread_profile),
+        // Trading fee in basis points (maker fee)
+        fee_bps: 1.5,
     };
 
     // Extract EMA config before mm_config is moved

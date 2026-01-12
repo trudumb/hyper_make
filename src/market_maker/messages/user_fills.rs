@@ -165,6 +165,7 @@ pub fn cleanup_orders(
 mod tests {
     use super::*;
     use crate::market_maker::config::MetricsRecorder;
+    use crate::market_maker::control::StochasticController;
     use crate::market_maker::{
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EstimatorConfig,
         ParameterEstimator, PnLConfig, PnLTracker, PositionTracker, PrometheusMetrics, QueueConfig,
@@ -194,6 +195,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -210,6 +212,8 @@ mod tests {
             max_position: 1.0,
             calibrate_depth_as: false,
             learning: &mut learning,
+            stochastic_controller: &mut stochastic_controller,
+            fee_bps: 1.5,
         };
 
         // Create fill for wrong asset
@@ -261,6 +265,7 @@ mod tests {
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -277,6 +282,8 @@ mod tests {
             max_position: 1.0,
             calibrate_depth_as: false,
             learning: &mut learning,
+            stochastic_controller: &mut stochastic_controller,
+            fee_bps: 1.5,
         };
 
         let user_fills = UserFills {

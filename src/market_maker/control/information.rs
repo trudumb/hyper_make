@@ -133,8 +133,8 @@ impl InformationValue {
 
     /// Predict uncertainty reduction from one more observation.
     fn predict_uncertainty_reduction(&self, current: f64) -> f64 {
-        // Use historical rate if available
-        if self.uncertainty_history.len() > 5 {
+        // Use historical rate if available (need at least 10 observations)
+        if self.uncertainty_history.len() >= 10 {
             let n = self.uncertainty_history.len();
             let recent: f64 = self.uncertainty_history[n - 5..].iter().sum::<f64>() / 5.0;
             let older: f64 = self.uncertainty_history[n - 10..n - 5].iter().sum::<f64>() / 5.0;

@@ -101,6 +101,11 @@ pub struct MarketMakerConfig {
     /// - Hip3: 15-25 bps (HIP-3 DEX)
     /// - Aggressive: 10-20 bps (experimental)
     pub spread_profile: SpreadProfile,
+
+    /// Trading fee in basis points.
+    /// Used for edge calculation: edge = spread_captured - AS - fee_bps.
+    /// Default: 1.5 bps (maker fee on Hyperliquid)
+    pub fee_bps: f64,
 }
 
 /// Configuration passed to strategy for quote calculation.

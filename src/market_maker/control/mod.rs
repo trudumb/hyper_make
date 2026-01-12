@@ -117,6 +117,13 @@ pub struct StochasticController {
 
     /// Consecutive wait cycles
     wait_cycles: u32,
+
+    /// Previous control state for TD learning
+    /// Stored when an action is taken, used when fill arrives
+    prev_state: Option<ControlState>,
+
+    /// Previous action taken (for TD learning)
+    prev_action_taken: Option<state::ActionTaken>,
 }
 
 impl Default for StochasticController {
@@ -137,6 +144,8 @@ impl StochasticController {
             cycle_count: 0,
             last_action: None,
             wait_cycles: 0,
+            prev_state: None,
+            prev_action_taken: None,
             config,
         }
     }
@@ -221,11 +230,49 @@ impl StochasticController {
             self.log_state(&control_state, &action, expected_value);
         }
 
+        // 8. Store state for TD learning on fill
+        // Convert action to ActionTaken for value function learning
+        let action_taken = match &action {
+            Action::Quote { ladder, .. } => {
+                // Extract spread from level 0 if available (first bid + first ask)
+                let spread_bps = ladder
+                    .bids
+                    .first()
+                    .zip(ladder.asks.first())
+                    .map(|(bid, ask)| bid.depth_bps + ask.depth_bps)
+                    .unwrap_or(8.0);
+                let size = ladder
+                    .bids
+                    .first()
+                    .map(|b| b.size)
+                    .unwrap_or(0.0)
+                    + ladder.asks.first().map(|a| a.size).unwrap_or(0.0);
+                state::ActionTaken::Quoted { spread_bps, size }
+            }
+            Action::DefensiveQuote { spread_multiplier, size_fraction, .. } => {
+                state::ActionTaken::Quoted {
+                    spread_bps: 8.0 * spread_multiplier, // Base spread * multiplier
+                    size: *size_fraction,
+                }
+            }
+            Action::DumpInventory { target_position, .. } => {
+                state::ActionTaken::DumpedInventory { amount: *target_position }
+            }
+            Action::BuildInventory { .. } => {
+                state::ActionTaken::Quoted { spread_bps: 8.0, size: 1.0 }
+            }
+            Action::NoQuote { .. } | Action::WaitToLearn { .. } => state::ActionTaken::NoQuote,
+        };
+        self.prev_state = Some(control_state);
+        self.prev_action_taken = Some(action_taken);
+
         self.last_action = Some(action.clone());
         action
     }
 
     /// Handle a fill event.
+    ///
+    /// Updates beliefs and performs TD(0) value function learning.
     pub fn on_fill(
         &mut self,
         fill: &FillEvent,
@@ -236,7 +283,7 @@ impl StochasticController {
             return;
         }
 
-        // Calculate realized edge
+        // Calculate realized edge (reward for TD learning)
         let spread_captured = fill.spread_capture();
         let fee_bps = 1.5; // Should come from config
         let realized_edge = spread_captured - realized_as_bps - fee_bps;
@@ -252,8 +299,49 @@ impl StochasticController {
         // Update changepoint detector with edge observation
         self.changepoint.update(realized_edge);
 
-        // Update controller value function
-        // (Simplified - in production would track full state transitions)
+        // TD(0) Value Function Learning
+        // If we have a previous state, create transition and update
+        if let (Some(prev_state), Some(action_taken)) =
+            (self.prev_state.take(), self.prev_action_taken.take())
+        {
+            // Build current control state (after fill)
+            let current_state = ControlState {
+                wealth: prev_state.wealth + realized_edge, // Updated wealth
+                position: prev_state.position + if fill.is_buy { fill.size } else { -fill.size },
+                time: prev_state.time, // Time is updated externally
+                margin_used: prev_state.margin_used,
+                drawdown: prev_state.drawdown,
+                time_to_funding: prev_state.time_to_funding,
+                predicted_funding: prev_state.predicted_funding, // Carry forward
+                vol_regime: prev_state.vol_regime.clone(), // Carry forward
+                // Convert Health enum to trust score [0, 1]
+                learning_trust: match learning_output.model_health.overall {
+                    Health::Good => 1.0,
+                    Health::Warning => 0.5,
+                    Health::Degraded => 0.1,
+                },
+                reduce_only: prev_state.reduce_only,
+                belief: self.belief.clone(),
+                model_health: learning_output.model_health.clone(),
+            };
+
+            // Create state transition for TD learning
+            let transition = state::StateTransition {
+                from: prev_state,
+                to: current_state,
+                action_taken,
+                reward: realized_edge, // Realized edge is our reward signal
+            };
+
+            // Update value function with TD(0)
+            self.controller.update_value_function(&transition);
+
+            debug!(
+                reward = %format!("{:.4}", realized_edge),
+                n_updates = self.controller.value_function_updates(),
+                "TD(0): Updated value function from fill"
+            );
+        }
 
         if result.significant {
             debug!(
@@ -392,6 +480,158 @@ impl StochasticController {
         self.wait_cycles = 0;
         self.last_action = None;
     }
+
+    /// Generate comprehensive system health report.
+    ///
+    /// Shows the full Layer 1→L2→L3 pipeline state for diagnostics.
+    pub fn system_health_report(&self, learning_output: &LearningModuleOutput) -> SystemHealthReport {
+        let cp_summary = self.changepoint.summary();
+
+        SystemHealthReport {
+            // Layer 2 (LearningModule) outputs
+            layer2_model_health: learning_output.model_health.clone(),
+            layer2_quote_decision: format!("{:?}", learning_output.myopic_decision),
+            layer2_edge_prediction: EdgePredictionReport {
+                mean: learning_output.edge_prediction.mean,
+                std: learning_output.edge_prediction.std,
+                confidence: learning_output.p_positive_edge, // Use P(edge > 0) as confidence
+            },
+
+            // Layer 3 (StochasticController) outputs
+            layer3_belief: BeliefReport {
+                expected_edge: self.belief.expected_edge(),
+                uncertainty: self.belief.total_edge_uncertainty,
+                confidence: self.belief.confidence(),
+                n_fills: self.belief.n_fills as u32,
+            },
+            layer3_changepoint: ChangepointReport {
+                prob_5: cp_summary.cp_prob_5,
+                prob_10: cp_summary.cp_prob_10,
+                run_length: cp_summary.most_likely_run as u32,
+            },
+            layer3_value_function: ValueFunctionReport {
+                n_updates: self.controller.value_function_updates(),
+            },
+            layer3_learning_trust: self.learning_trust,
+            layer3_cycle_count: self.cycle_count,
+            layer3_last_action: self.last_action.as_ref().map(|a| format!("{:?}", a)),
+
+            // Meta
+            overall_health: self.assess_overall_health(learning_output),
+        }
+    }
+
+    /// Assess overall system health.
+    fn assess_overall_health(&self, output: &LearningModuleOutput) -> OverallHealth {
+        let cp_prob = self.changepoint.changepoint_probability(5);
+
+        // Critical thresholds
+        if cp_prob > 0.8 {
+            return OverallHealth::Critical("Regime change detected".to_string());
+        }
+        if matches!(output.model_health.overall, Health::Degraded) {
+            return OverallHealth::Critical("Model health degraded".to_string());
+        }
+
+        // Warning thresholds
+        if cp_prob > 0.5 {
+            return OverallHealth::Warning("Elevated changepoint probability".to_string());
+        }
+        if matches!(output.model_health.overall, Health::Warning) {
+            return OverallHealth::Warning("Model health warning".to_string());
+        }
+        if self.learning_trust < 0.5 {
+            return OverallHealth::Warning("Low learning trust".to_string());
+        }
+
+        OverallHealth::Good
+    }
+
+    /// Log comprehensive health report.
+    pub fn log_health_report(&self, learning_output: &LearningModuleOutput) {
+        let report = self.system_health_report(learning_output);
+
+        info!(
+            target: "layer3::health",
+            // Layer 2 summary
+            l2_edge_mean = %format!("{:.2}bp", report.layer2_edge_prediction.mean),
+            l2_edge_std = %format!("{:.2}bp", report.layer2_edge_prediction.std),
+            l2_decision = %report.layer2_quote_decision,
+
+            // Layer 3 belief
+            l3_belief_edge = %format!("{:.2}bp", report.layer3_belief.expected_edge),
+            l3_belief_conf = %format!("{:.2}", report.layer3_belief.confidence),
+            l3_n_fills = report.layer3_belief.n_fills,
+
+            // Layer 3 meta-learning
+            l3_cp_prob = %format!("{:.3}", report.layer3_changepoint.prob_5),
+            l3_vf_updates = report.layer3_value_function.n_updates,
+            l3_trust = %format!("{:.2}", report.layer3_learning_trust),
+
+            // Overall
+            overall = ?report.overall_health,
+            "System health report"
+        );
+    }
+}
+
+/// Comprehensive system health report for Layer1→L2→L3 diagnostics.
+#[derive(Debug, Clone)]
+pub struct SystemHealthReport {
+    // Layer 2 outputs
+    pub layer2_model_health: crate::market_maker::learning::types::ModelHealth,
+    pub layer2_quote_decision: String,
+    pub layer2_edge_prediction: EdgePredictionReport,
+
+    // Layer 3 outputs
+    pub layer3_belief: BeliefReport,
+    pub layer3_changepoint: ChangepointReport,
+    pub layer3_value_function: ValueFunctionReport,
+    pub layer3_learning_trust: f64,
+    pub layer3_cycle_count: usize,
+    pub layer3_last_action: Option<String>,
+
+    // Overall assessment
+    pub overall_health: OverallHealth,
+}
+
+/// Edge prediction summary.
+#[derive(Debug, Clone)]
+pub struct EdgePredictionReport {
+    pub mean: f64,
+    pub std: f64,
+    pub confidence: f64,
+}
+
+/// Belief state summary.
+#[derive(Debug, Clone)]
+pub struct BeliefReport {
+    pub expected_edge: f64,
+    pub uncertainty: f64,
+    pub confidence: f64,
+    pub n_fills: u32,
+}
+
+/// Changepoint detector summary.
+#[derive(Debug, Clone)]
+pub struct ChangepointReport {
+    pub prob_5: f64,
+    pub prob_10: f64,
+    pub run_length: u32,
+}
+
+/// Value function summary.
+#[derive(Debug, Clone)]
+pub struct ValueFunctionReport {
+    pub n_updates: usize,
+}
+
+/// Overall system health status.
+#[derive(Debug, Clone)]
+pub enum OverallHealth {
+    Good,
+    Warning(String),
+    Critical(String),
 }
 
 /// Result of applying the stochastic controller.

@@ -460,6 +460,28 @@ impl OptimalController {
 
         self.value_fn.update_td(&transition);
     }
+
+    /// Update value function with a full state transition (for TD(0) learning).
+    ///
+    /// This is called when a fill is observed to update the value function
+    /// with the actual reward (realized edge).
+    pub fn update_value_function(&mut self, transition: &super::state::StateTransition) {
+        self.value_fn.update_td(transition);
+
+        // Also sync the expected value computer's value function
+        // (it maintains its own copy for Monte Carlo integration)
+        self.expected_value = ExpectedValueComputer::new(self.value_fn.clone());
+    }
+
+    /// Get number of value function updates performed.
+    pub fn value_function_updates(&self) -> usize {
+        self.value_fn.n_updates as usize
+    }
+
+    /// Get current value function weights for diagnostics.
+    pub fn value_function_weights(&self) -> &[f64] {
+        self.value_fn.weights()
+    }
 }
 
 #[cfg(test)]

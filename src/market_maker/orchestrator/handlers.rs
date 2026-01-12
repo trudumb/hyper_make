@@ -136,6 +136,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             max_position: self.effective_max_position, // First-principles limit
             calibrate_depth_as: self.stochastic.stochastic_config.calibrate_depth_as,
             learning: &mut self.learning,
+            stochastic_controller: &mut self.stochastic.controller,
+            fee_bps: self.config.fee_bps,
         };
 
         let result = messages::process_user_fills(
