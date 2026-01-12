@@ -6,6 +6,7 @@ use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::{ImpulseControlConfig, MetricsRecorder},
+    control::{StochasticController, StochasticControllerConfig},
     estimator::{CalibrationController, CalibrationControllerConfig},
     fills::FillProcessor,
     infra::{
@@ -321,6 +322,8 @@ pub struct StochasticComponents {
     pub adaptive_spreads: AdaptiveSpreadCalculator,
     /// Calibration-aware fill rate controller
     pub calibration_controller: CalibrationController,
+    /// Layer 3: Stochastic controller (POMDP-based sequential decisions)
+    pub controller: StochasticController,
 }
 
 impl StochasticComponents {
@@ -335,6 +338,7 @@ impl StochasticComponents {
             stochastic_config,
             dynamic_risk_config,
             AdaptiveBayesianConfig::default(),
+            StochasticControllerConfig::default(),
         )
     }
 
@@ -344,6 +348,7 @@ impl StochasticComponents {
         stochastic_config: StochasticConfig,
         dynamic_risk_config: DynamicRiskConfig,
         adaptive_config: AdaptiveBayesianConfig,
+        controller_config: StochasticControllerConfig,
     ) -> Self {
         // Create calibration controller from stochastic config
         let calibration_config = CalibrationControllerConfig {
@@ -359,6 +364,7 @@ impl StochasticComponents {
             dynamic_risk_config,
             adaptive_spreads: AdaptiveSpreadCalculator::new(adaptive_config),
             calibration_controller: CalibrationController::new(calibration_config),
+            controller: StochasticController::new(controller_config),
         }
     }
 }

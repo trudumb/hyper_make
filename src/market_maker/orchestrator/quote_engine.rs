@@ -471,6 +471,83 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Apply decision sizing to effective target liquidity
         let decision_adjusted_liquidity = self.effective_target_liquidity * decision_size_fraction;
 
+        // === LAYER 3: STOCHASTIC CONTROLLER ===
+        // When enabled, provides POMDP-based sequential decision-making on top of Layer 2
+        // Can override Layer 2 decisions based on:
+        // - Terminal conditions (session end, funding)
+        // - Information value (when to wait vs act)
+        // - Regime changes (changepoint detection)
+        // - Value function optimization
+        if self.stochastic.controller.is_enabled() {
+            // Build trading state for the controller
+            let risk_state = self.build_risk_state();
+            // Time to next funding (convert from Duration to hours)
+            let time_to_funding = self
+                .tier2
+                .funding
+                .time_to_next_funding()
+                .map(|d| d.as_secs_f64() / 3600.0)
+                .unwrap_or(8.0); // Default to 8 hours if unknown
+            let trading_state = crate::market_maker::control::TradingState {
+                wealth: self.tier2.pnl_tracker.summary(self.latest_mid).total_pnl,
+                position: self.position.position(),
+                margin_used: self.infra.margin_sizer.state().margin_used,
+                session_time: self.session_time_fraction(),
+                time_to_funding,
+                predicted_funding: self.tier2.funding.ewma_rate() * 10000.0, // Convert to bps
+                drawdown: risk_state.drawdown(),
+                reduce_only: risk_state.should_reduce_only(),
+            };
+
+            // Get Layer 2 output for the controller
+            let learning_output = self.learning.output(
+                &market_params,
+                self.position.position(),
+                trading_state.drawdown,
+            );
+
+            // Get optimal action from Layer 3
+            let action = self.stochastic.controller.act(&learning_output, &trading_state);
+
+            // Handle controller decision
+            use crate::market_maker::control::Action;
+            match action {
+                Action::NoQuote { reason } => {
+                    debug!(reason = ?reason, "Layer 3: not quoting");
+                    return Ok(());
+                }
+                Action::WaitToLearn { expected_info_gain, suggested_wait_cycles } => {
+                    debug!(
+                        info_gain = %format!("{:.4}", expected_info_gain),
+                        wait_cycles = suggested_wait_cycles,
+                        "Layer 3: waiting to learn"
+                    );
+                    return Ok(());
+                }
+                Action::DumpInventory { urgency, .. } => {
+                    debug!(urgency = %format!("{:.2}", urgency), "Layer 3: dump inventory mode");
+                    // Continue with normal quoting but the strategy will handle urgency
+                }
+                Action::BuildInventory { .. } => {
+                    debug!("Layer 3: build inventory mode");
+                    // Continue with normal quoting
+                }
+                Action::DefensiveQuote { spread_multiplier, size_fraction, reason } => {
+                    debug!(
+                        spread_mult = %format!("{:.2}", spread_multiplier),
+                        size_frac = %format!("{:.2}", size_fraction),
+                        reason = ?reason,
+                        "Layer 3: defensive quote"
+                    );
+                    // Apply defensive adjustments through the strategy
+                }
+                Action::Quote { expected_value, .. } => {
+                    debug!(expected_value = %format!("{:.4}", expected_value), "Layer 3: normal quote");
+                    // Continue with normal quoting
+                }
+            }
+        }
+
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
         let ladder = self.strategy.calculate_ladder(

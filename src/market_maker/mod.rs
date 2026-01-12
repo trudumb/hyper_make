@@ -23,6 +23,7 @@ pub mod safety;
 mod strategy;
 pub mod tracking;
 
+pub mod control;
 pub mod latent;
 pub mod learning;
 
@@ -145,6 +146,10 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     // === Closed-Loop Learning ===
     /// Learning module for model confidence tracking and ensemble predictions
     learning: learning::LearningModule,
+
+    // === Session Tracking ===
+    /// Session start time for controller terminal condition handling
+    session_start_time: std::time::Instant,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -263,6 +268,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             spot_balance_cache: std::collections::HashMap::new(),
             last_high_risk_state: false,
             learning: learning::LearningModule::default(),
+            session_start_time: std::time::Instant::now(),
         }
     }
 
@@ -368,6 +374,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.infra.connection_health.state()
                 == crate::market_maker::infra::ConnectionState::Failed,
         )
+    }
+
+    /// Get current session time as fraction [0, 1].
+    ///
+    /// Returns 0.0 at session start, 1.0 at session end.
+    /// Used by the stochastic controller for terminal condition handling.
+    pub fn session_time_fraction(&self) -> f64 {
+        // Use elapsed time since session start
+        let elapsed_secs = self.session_start_time.elapsed().as_secs_f64();
+
+        // Assume 24-hour session (can be configured later)
+        const SESSION_DURATION_SECS: f64 = 24.0 * 60.0 * 60.0;
+
+        (elapsed_secs / SESSION_DURATION_SECS).clamp(0.0, 1.0)
     }
 
     /// Check kill switch conditions and update state.

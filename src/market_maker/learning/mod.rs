@@ -409,6 +409,66 @@ impl LearningModule {
     pub fn ensemble(&self) -> &ModelEnsemble {
         &self.ensemble
     }
+
+    /// Generate output for Layer 3 (StochasticController).
+    ///
+    /// This bundles all Layer 2 outputs into a single structure for the controller.
+    pub fn output(
+        &self,
+        params: &MarketParams,
+        position: f64,
+        current_drawdown: f64,
+    ) -> crate::market_maker::control::LearningModuleOutput {
+        use crate::market_maker::control::{GaussianEstimate, LearningModuleOutput, ModelPrediction};
+
+        // Build market state
+        let state = self.build_market_state(params, position);
+
+        // Get ensemble prediction
+        let prediction = self.ensemble.predict_edge(&state);
+
+        // Get model health
+        let health = self.confidence_tracker.model_health();
+
+        // Get decision from engine
+        let decision = self
+            .decision_engine
+            .should_quote(&prediction, &health, current_drawdown);
+
+        // Convert model contributions
+        let model_predictions: Vec<ModelPrediction> = prediction
+            .model_contributions
+            .iter()
+            .map(|wp| ModelPrediction {
+                name: wp.model.clone(),
+                mean: wp.mean,
+                std: wp.std,
+                weight: wp.weight,
+                performance: 1.0, // Could track this in confidence tracker
+            })
+            .collect();
+
+        // Calculate p_positive_edge
+        let p_positive = if prediction.std > 1e-9 {
+            crate::market_maker::control::types::normal_cdf(prediction.mean / prediction.std)
+        } else {
+            if prediction.mean > 0.0 { 1.0 } else { 0.0 }
+        };
+
+        LearningModuleOutput {
+            edge_prediction: GaussianEstimate::new(prediction.mean, prediction.std),
+            model_predictions,
+            model_disagreement: prediction.disagreement,
+            model_health: health,
+            calibration: self.confidence_tracker.edge_calibration_score().clone(),
+            as_bias: self.confidence_tracker.as_bias(),
+            myopic_decision: decision,
+            p_positive_edge: p_positive,
+            position,
+            max_position: params.dynamic_max_position,
+            drawdown: current_drawdown,
+        }
+    }
 }
 
 #[cfg(test)]
