@@ -1,7 +1,7 @@
 //! Market parameters for quoting strategies.
 
 use crate::market_maker::adverse_selection::DepthDecayAS;
-use crate::market_maker::estimator::VolatilityRegime;
+use crate::market_maker::estimator::{MarketEstimator, VolatilityRegime};
 use crate::market_maker::process_models::SpreadRegime;
 
 use super::params;
@@ -1221,5 +1221,56 @@ impl MarketParams {
             fill_rate = %format!("{:.4}", self.estimated_fill_rate),
             "GLFT-derived target liquidity (all inputs from measured data)"
         );
+    }
+}
+
+impl MarketParams {
+    /// Build minimal MarketParams from just the estimator.
+    ///
+    /// This is useful for fill processing where we need basic market state
+    /// but don't have access to all the full parameter sources.
+    pub fn from_estimator(
+        estimator: &crate::market_maker::estimator::ParameterEstimator,
+        mid: f64,
+        _position: f64,
+        max_position: f64,
+    ) -> Self {
+        let mut params = Self {
+            // Volatility
+            sigma: estimator.sigma_clean(),
+            sigma_total: estimator.sigma_total(),
+            sigma_effective: estimator.sigma_effective(),
+            volatility_regime: estimator.volatility_regime(),
+
+            // Kappa
+            kappa: estimator.kappa(),
+            kappa_bid: estimator.kappa_bid(),
+            kappa_ask: estimator.kappa_ask(),
+
+            // Microprice
+            microprice: estimator.microprice().max(mid),
+            market_mid: mid,
+
+            // Flow
+            flow_imbalance: estimator.flow_imbalance(),
+            book_imbalance: estimator.book_imbalance(),
+            momentum_bps: estimator.momentum_bps(),
+
+            // Toxicity / Regime
+            toxicity_score: estimator.soft_toxicity_score(),
+            jump_ratio: estimator.jump_ratio(),
+            p_informed: estimator.p_informed(),
+            is_toxic_regime: estimator.is_toxic_regime(),
+
+            // Position
+            dynamic_max_position: max_position,
+
+            ..Default::default()
+        };
+
+        // Set position-related derivations
+        params.dynamic_limit_valid = true;
+
+        params
     }
 }

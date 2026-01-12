@@ -4,7 +4,7 @@
 #
 # Examples:
 #   ./scripts/test_mainnet.sh BTC 60       # 1 minute test
-#   ./scripts/test_mainnet.sh BTC 7200     # 2 hour test
+#   ./scripts/test_mainnet.sh BTC 14400    # 4 hour test
 #   ./scripts/test_mainnet.sh SOL 3600     # 1 hour test
 #
 # Notes:

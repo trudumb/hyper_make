@@ -24,6 +24,7 @@ mod strategy;
 pub mod tracking;
 
 pub mod latent;
+pub mod learning;
 
 mod orchestrator;
 
@@ -140,6 +141,10 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Tracks whether we're in high risk state to avoid log spam.
     /// Only logs transitions (normal → high risk, high risk → normal).
     last_high_risk_state: bool,
+
+    // === Closed-Loop Learning ===
+    /// Learning module for model confidence tracking and ensemble predictions
+    learning: learning::LearningModule,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -257,6 +262,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_web_data2_time: None,
             spot_balance_cache: std::collections::HashMap::new(),
             last_high_risk_state: false,
+            learning: learning::LearningModule::default(),
         }
     }
 

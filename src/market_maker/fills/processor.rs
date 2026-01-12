@@ -23,6 +23,7 @@ use crate::market_maker::config::MetricsRecorder;
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::PrometheusMetrics;
 use crate::market_maker::messages;
+use crate::market_maker::strategy::MarketParams;
 use crate::market_maker::tracking::{
     OrderManager, PnLTracker, PositionTracker, QueuePositionTracker, Side,
 };
@@ -99,6 +100,10 @@ pub struct FillState<'a> {
     pub max_position: f64,
     /// Whether depth AS calibration is enabled
     pub calibrate_depth_as: bool,
+
+    // Learning
+    /// Closed-loop learning module
+    pub learning: &'a mut crate::market_maker::learning::LearningModule,
 }
 
 /// Fill processor - coordinates fill handling across modules.
@@ -390,6 +395,20 @@ impl FillProcessor {
         // Infrastructure: Prometheus metrics
         state.prometheus.record_fill(fill.size, fill.is_buy);
 
+        // Learning: Update closed-loop learning module
+        // Build minimal market params from estimator for learning update
+        if state.learning.is_enabled() {
+            let params = MarketParams::from_estimator(
+                state.estimator,
+                state.latest_mid,
+                state.position.position(),
+                state.max_position,
+            );
+            state
+                .learning
+                .on_fill(fill, &params, state.position.position());
+        }
+
         // Log fill summary
         let pnl_summary = state.pnl_tracker.summary(state.latest_mid);
         info!(
@@ -483,6 +502,7 @@ mod tests {
         pnl_tracker: &'a mut PnLTracker,
         prometheus: &'a mut PrometheusMetrics,
         metrics: &'a MetricsRecorder,
+        learning: &'a mut crate::market_maker::learning::LearningModule,
     ) -> FillState<'a> {
         FillState {
             position,
@@ -498,6 +518,7 @@ mod tests {
             asset: "BTC",
             max_position: 10.0,
             calibrate_depth_as: true,
+            learning,
         }
     }
 
@@ -514,6 +535,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -525,6 +547,7 @@ mod tests {
             &mut pnl_tracker,
             &mut prometheus,
             &metrics,
+            &mut learning,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -548,6 +571,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -559,6 +583,7 @@ mod tests {
             &mut pnl_tracker,
             &mut prometheus,
             &metrics,
+            &mut learning,
         );
 
         let fill1 = make_fill(1, 100, 1.0, 50000.0, true);
@@ -636,6 +661,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -650,6 +676,7 @@ mod tests {
             &mut pnl_tracker,
             &mut prometheus,
             &metrics,
+            &mut learning,
         );
 
         // Now WebSocket fill arrives for OID 100
@@ -684,6 +711,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         // No pre-registration - this is a normal fill
 
@@ -697,6 +725,7 @@ mod tests {
             &mut pnl_tracker,
             &mut prometheus,
             &metrics,
+            &mut learning,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -728,6 +757,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -745,6 +775,7 @@ mod tests {
                 &mut pnl_tracker,
                 &mut prometheus,
                 &metrics,
+                &mut learning,
             );
             processor.process(&fill1, &mut state)
         };
@@ -766,6 +797,7 @@ mod tests {
                 &mut pnl_tracker,
                 &mut prometheus,
                 &metrics,
+                &mut learning,
             );
             processor.process(&fill2, &mut state)
         };
@@ -796,6 +828,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -814,6 +847,7 @@ mod tests {
                 &mut pnl_tracker,
                 &mut prometheus,
                 &metrics,
+                &mut learning,
             );
             processor.process(&fill1, &mut state)
         };
@@ -841,6 +875,7 @@ mod tests {
                 &mut pnl_tracker,
                 &mut prometheus,
                 &metrics,
+                &mut learning,
             );
             processor.process(&fill2, &mut state)
         };
@@ -869,6 +904,7 @@ mod tests {
                 &mut pnl_tracker,
                 &mut prometheus,
                 &metrics,
+                &mut learning,
             );
             processor.process(&fill3, &mut state)
         };

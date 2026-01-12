@@ -60,6 +60,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let result = messages::process_all_mids(&all_mids, &ctx, &mut state)?;
 
         if result.is_some() {
+            // Update learning module with current mid for prediction scoring
+            self.learning.update_mid(self.latest_mid);
             self.update_quotes().await
         } else {
             Ok(())
@@ -133,6 +135,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             asset: &self.config.asset,
             max_position: self.effective_max_position, // First-principles limit
             calibrate_depth_as: self.stochastic.stochastic_config.calibrate_depth_as,
+            learning: &mut self.learning,
         };
 
         let result = messages::process_user_fills(

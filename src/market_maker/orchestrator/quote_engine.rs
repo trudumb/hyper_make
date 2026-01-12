@@ -81,6 +81,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Mark that we're doing a requote
         self.infra.proactive_rate_tracker.mark_requote();
 
+        // === LEARNING MODULE: Periodic model health logging ===
+        if self.learning.is_enabled() && self.learning.should_log_health() {
+            let health = self.learning.model_health();
+            let pending = self.learning.pending_predictions_count();
+            info!(
+                overall = ?health.overall,
+                volatility = ?health.volatility,
+                adverse_selection = ?health.adverse_selection,
+                fill_rate = ?health.fill_rate,
+                edge = ?health.edge,
+                pending_predictions = pending,
+                "Learning module health"
+            );
+        }
+
         // Phase 3: Check recovery state and handle IOC recovery if needed
         if let Some(action) = self.check_and_handle_recovery().await? {
             if action.skip_normal_quoting {
@@ -399,13 +414,70 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.strategy
             .update_fill_model_params(market_params.sigma, market_params.kelly_time_horizon);
 
+        // === DECISION ENGINE FILTER ===
+        // When enabled, uses the learning module's decision engine to evaluate
+        // whether to quote and at what size based on:
+        // - P(edge > 0) confidence threshold
+        // - Model health status
+        // - Current drawdown
+        // - Model disagreement
+        let decision_size_fraction = if self.learning.use_decision_filter() {
+            // Get current drawdown from risk state
+            let risk_state = self.build_risk_state();
+            let current_drawdown = risk_state.drawdown();
+
+            // Evaluate decision
+            let decision = self.learning.evaluate_decision(
+                &market_params,
+                self.position.position(),
+                current_drawdown,
+            );
+
+            match decision {
+                crate::market_maker::learning::QuoteDecision::NoQuote { reason } => {
+                    info!(
+                        reason = %reason,
+                        drawdown = %format!("{:.2}%", current_drawdown * 100.0),
+                        "Decision engine: not quoting"
+                    );
+                    return Ok(()); // Skip this quote cycle
+                }
+                crate::market_maker::learning::QuoteDecision::ReducedSize { fraction, reason } => {
+                    info!(
+                        fraction = %format!("{:.0}%", fraction * 100.0),
+                        reason = %reason,
+                        "Decision engine: reduced size"
+                    );
+                    fraction
+                }
+                crate::market_maker::learning::QuoteDecision::Quote {
+                    size_fraction,
+                    confidence,
+                    expected_edge,
+                } => {
+                    debug!(
+                        size_fraction = %format!("{:.0}%", size_fraction * 100.0),
+                        confidence = %format!("{:.1}%", confidence * 100.0),
+                        expected_edge = %format!("{:.2}bp", expected_edge),
+                        "Decision engine: quoting"
+                    );
+                    size_fraction
+                }
+            }
+        } else {
+            1.0 // No filter, use full size
+        };
+
+        // Apply decision sizing to effective target liquidity
+        let decision_adjusted_liquidity = self.effective_target_liquidity * decision_size_fraction;
+
         // Try multi-level ladder quoting first
-        // HARMONIZED: Use effective_target_liquidity (first-principles derived)
+        // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
         let ladder = self.strategy.calculate_ladder(
             &quote_config,
             self.position.position(),
             self.effective_max_position,     // First-principles limit
-            self.effective_target_liquidity, // First-principles viable size
+            decision_adjusted_liquidity,     // Decision-adjusted viable size
             &market_params,
         );
 
@@ -490,12 +562,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         } else {
             // Fallback to single-quote mode for non-ladder strategies
-            // HARMONIZED: Use effective values (first-principles derived)
+            // HARMONIZED: Use decision-adjusted values (first-principles derived, decision-scaled)
             let (mut bid, mut ask) = self.strategy.calculate_quotes(
                 &quote_config,
                 self.position.position(),
                 self.effective_max_position,     // First-principles limit
-                self.effective_target_liquidity, // First-principles viable size
+                decision_adjusted_liquidity,     // Decision-adjusted viable size
                 &market_params,
             );
 

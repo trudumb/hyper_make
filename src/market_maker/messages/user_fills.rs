@@ -193,6 +193,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -208,6 +209,7 @@ mod tests {
             asset: "BTC",
             max_position: 1.0,
             calibrate_depth_as: false,
+            learning: &mut learning,
         };
 
         // Create fill for wrong asset
@@ -258,6 +260,7 @@ mod tests {
         let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
         let mut prometheus = PrometheusMetrics::new();
         let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -273,6 +276,7 @@ mod tests {
             asset: "BTC",
             max_position: 1.0,
             calibrate_depth_as: false,
+            learning: &mut learning,
         };
 
         let user_fills = UserFills {

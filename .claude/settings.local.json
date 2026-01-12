@@ -103,7 +103,8 @@
       "Bash(git commit:*)",
       "Bash(LOG=\"logs/mm_testnet_BTC_2026-01-10_14-46-04.log\" echo \"=== ERROR CATEGORIES ===\" grep \"ERROR\" \"$LOG\")",
       "Bash(LOG=\"logs/mm_testnet_BTC_2026-01-10_14-46-04.log\" echo \"=== SPREAD STATISTICS \\(optimal_spread_bps\\) ===\" grep \"optimal_spread_bps\" \"$LOG\")",
-      "Bash(LOG=\"logs/mm_testnet_BTC_2026-01-10_14-46-04.log\" echo \"=== WARMUP PROGRESS ===\" grep \"warmup_pct\" \"$LOG\")"
+      "Bash(LOG=\"logs/mm_testnet_BTC_2026-01-10_14-46-04.log\" echo \"=== WARMUP PROGRESS ===\" grep \"warmup_pct\" \"$LOG\")",
+      "mcp__serena__create_text_file"
     ]
   }
 }

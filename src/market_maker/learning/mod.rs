@@ -1,0 +1,433 @@
+//! Closed-loop learning system for market making.
+//!
+//! This module implements a 5-level architecture that transforms
+//! open-loop parameter estimation into closed-loop control where
+//! fills are labeled data that update model confidence.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Level 0: ParameterEstimator (exists) - σ, κ, microprice estimates
+//! Level 1: ModelConfidenceTracker     - track prediction vs realization
+//! Level 2: ModelEnsemble              - multiple edge models, weighted
+//! Level 3: DecisionEngine             - formal P(edge > 0) criterion
+//! Level 4: ExecutionOptimizer         - utility-maximizing ladder
+//! Level 5: CrossAssetSignals          - BTC lead-lag, funding divergence
+//! ```
+//!
+//! ## Core Insight
+//!
+//! Every fill is a prediction that gets scored:
+//! - At fill time: record `predicted_edge_bps` and `state`
+//! - After horizon (1s): measure `realized_as_bps` and `realized_edge_bps`
+//! - Update confidence tracker and ensemble weights
+//!
+//! This is online learning with labels from trading outcomes.
+
+pub mod confidence;
+pub mod decision;
+pub mod ensemble;
+pub mod execution;
+pub mod types;
+
+// Re-export key types
+pub use confidence::ModelConfidenceTracker;
+pub use decision::DecisionEngine;
+pub use ensemble::{EdgeModel, ModelEnsemble};
+pub use execution::ExecutionOptimizer;
+pub use types::*;
+
+use crate::market_maker::fills::FillEvent;
+use crate::market_maker::quoting::Ladder;
+use crate::market_maker::strategy::MarketParams;
+
+/// Configuration for the LearningModule.
+#[derive(Debug, Clone)]
+pub struct LearningConfig {
+    /// Whether learning is enabled
+    pub enabled: bool,
+    /// Prediction horizon in milliseconds (time to measure outcome)
+    pub prediction_horizon_ms: u64,
+    /// Minimum predictions before updating weights
+    pub min_predictions_for_update: usize,
+    /// Whether to use decision engine as quote filter
+    pub use_decision_filter: bool,
+    /// Log model health every N quote cycles
+    pub health_log_interval: usize,
+    /// Fee rate in basis points
+    pub fee_bps: f64,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prediction_horizon_ms: 1000, // 1 second
+            min_predictions_for_update: 20,
+            use_decision_filter: true, // Enabled by default - GLFT math is proven
+            health_log_interval: 100,
+            fee_bps: 1.5,
+        }
+    }
+}
+
+/// The learning module for closed-loop market making.
+///
+/// Integrates into MarketMaker without requiring Arc wrapping.
+/// Tracks predictions, updates model weights, and provides decision support.
+pub struct LearningModule {
+    /// Configuration
+    config: LearningConfig,
+
+    // === Level 1 ===
+    /// Model confidence tracker
+    confidence_tracker: ModelConfidenceTracker,
+
+    // === Level 2 ===
+    /// Model ensemble
+    ensemble: ModelEnsemble,
+
+    // === Level 3 ===
+    /// Decision engine
+    decision_engine: DecisionEngine,
+
+    // === Level 4 ===
+    /// Execution optimizer
+    execution_optimizer: ExecutionOptimizer,
+
+    // === Feedback loop ===
+    /// Pending predictions waiting for outcome
+    pending_predictions: Vec<PendingPrediction>,
+
+    /// Latest market mid for AS calculation
+    last_mid: f64,
+
+    /// Quote cycle counter for periodic logging
+    quote_cycle_count: usize,
+}
+
+impl Default for LearningModule {
+    fn default() -> Self {
+        Self::new(LearningConfig::default())
+    }
+}
+
+impl LearningModule {
+    /// Create a new learning module.
+    pub fn new(config: LearningConfig) -> Self {
+        Self {
+            config,
+            confidence_tracker: ModelConfidenceTracker::new(),
+            ensemble: ModelEnsemble::new(),
+            decision_engine: DecisionEngine::default(),
+            execution_optimizer: ExecutionOptimizer::default(),
+            pending_predictions: Vec::new(),
+            last_mid: 0.0,
+            quote_cycle_count: 0,
+        }
+    }
+
+    /// Check if learning is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Update the last known mid price.
+    pub fn update_mid(&mut self, mid: f64) {
+        self.last_mid = mid;
+    }
+
+    /// Handle a fill event - record prediction for later scoring.
+    ///
+    /// Called from FillProcessor with current market params and position.
+    pub fn on_fill(&mut self, fill: &FillEvent, params: &MarketParams, position: f64) {
+        if !self.config.enabled {
+            return;
+        }
+
+        // 1. Build market state at fill time
+        let state = self.build_market_state(params, position);
+
+        // 2. Get ensemble prediction for this state
+        let prediction = self.ensemble.predict_edge(&state);
+
+        // 3. Record pending prediction
+        let pending = PendingPrediction {
+            timestamp_ms: fill.timestamp_ms(),
+            fill: fill.clone(),
+            predicted_edge_bps: prediction.mean,
+            predicted_uncertainty: prediction.std,
+            state,
+            depth_bps: fill.depth_bps(),
+            predicted_fill_prob: 1.0, // Filled, so probability was validated
+        };
+        self.pending_predictions.push(pending);
+
+        // 4. Score any matured predictions
+        self.score_matured_predictions();
+    }
+
+    /// Score predictions that have reached their measurement horizon.
+    fn score_matured_predictions(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let horizon_ms = self.config.prediction_horizon_ms;
+
+        // Find matured predictions
+        let mut matured = Vec::new();
+        self.pending_predictions.retain(|pred| {
+            if now_ms.saturating_sub(pred.timestamp_ms) >= horizon_ms {
+                matured.push(pred.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        // Score each matured prediction
+        for pred in matured {
+            let outcome = self.measure_outcome(&pred);
+
+            // Update confidence tracker
+            self.confidence_tracker.record_edge_prediction(
+                pred.predicted_edge_bps,
+                pred.predicted_uncertainty,
+                outcome.realized_edge_bps,
+            );
+
+            // Update ensemble weights
+            self.ensemble.update_weights(&outcome);
+        }
+    }
+
+    /// Measure the outcome of a prediction.
+    fn measure_outcome(&self, pred: &PendingPrediction) -> TradingOutcome {
+        // Calculate realized adverse selection
+        // AS = price_move_against_fill / fill_price
+        let fill_price = pred.fill.price;
+        let current_mid = self.last_mid;
+
+        let price_move = if pred.fill.is_buy {
+            // For buys, AS is positive if price went down (we bought high)
+            (fill_price - current_mid) / fill_price * 10000.0
+        } else {
+            // For sells, AS is positive if price went up (we sold low)
+            (current_mid - fill_price) / fill_price * 10000.0
+        };
+
+        let realized_as_bps = price_move.max(0.0);
+
+        // Calculate realized edge
+        let spread_captured = pred.fill.spread_capture();
+        let realized_edge_bps = spread_captured - realized_as_bps - self.config.fee_bps;
+
+        TradingOutcome {
+            prediction: pred.clone(),
+            realized_as_bps,
+            realized_edge_bps,
+            price_at_horizon: current_mid,
+            horizon_elapsed_ms: self.config.prediction_horizon_ms,
+        }
+    }
+
+    /// Build market state from current parameters.
+    fn build_market_state(&self, params: &MarketParams, position: f64) -> MarketState {
+        MarketState {
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            microprice: params.microprice,
+            market_mid: params.market_mid,
+            sigma: params.sigma,
+            sigma_total: params.sigma_total,
+            sigma_effective: params.sigma_effective,
+            kappa: params.kappa,
+            kappa_bid: params.kappa_bid,
+            kappa_ask: params.kappa_ask,
+            book_imbalance: params.book_imbalance,
+            flow_imbalance: params.flow_imbalance,
+            momentum_bps: params.momentum_bps,
+            p_informed: params.p_informed,
+            toxicity_score: params.toxicity_score,
+            jump_ratio: params.jump_ratio,
+            volatility_regime: match params.volatility_regime {
+                crate::market_maker::estimator::VolatilityRegime::Low => VolatilityRegime::Low,
+                crate::market_maker::estimator::VolatilityRegime::Normal => {
+                    VolatilityRegime::Normal
+                }
+                crate::market_maker::estimator::VolatilityRegime::High => VolatilityRegime::High,
+                crate::market_maker::estimator::VolatilityRegime::Extreme => {
+                    VolatilityRegime::Extreme
+                }
+            },
+            predicted_as_bps: params.total_as_bps,
+            as_permanent_bps: params.as_permanent_bps,
+            as_temporary_bps: params.as_temporary_bps,
+            funding_rate: params.funding_rate,
+            predicted_funding_cost: params.predicted_funding_cost,
+            position,
+            max_position: params.dynamic_max_position,
+            cross_signal: None,
+        }
+    }
+
+    /// Main quote cycle - decide whether to quote and optimize ladder.
+    ///
+    /// Called with current market params and position.
+    pub fn quote_cycle(&mut self, params: &MarketParams, position: f64) -> Option<Ladder> {
+        // 1. Build current market state
+        let state = self.build_market_state(params, position);
+
+        // 2. Get ensemble prediction
+        let prediction = self.ensemble.predict_edge(&state);
+
+        // 3. Check model health
+        let health = self.confidence_tracker.model_health();
+
+        // 4. Get drawdown (placeholder - should come from P&L tracker)
+        let current_drawdown = 0.0;
+
+        // 5. Decision
+        let decision = self
+            .decision_engine
+            .should_quote(&prediction, &health, current_drawdown);
+
+        // 6. Log decision
+        tracing::debug!(
+            predicted_edge = %format!("{:.2}bp", prediction.mean),
+            uncertainty = %format!("{:.2}bp", prediction.std),
+            disagreement = %format!("{:.2}bp", prediction.disagreement),
+            model_health = ?health.overall,
+            decision = ?decision,
+            "Quote cycle decision"
+        );
+
+        // 7. Generate ladder if quoting
+        match decision {
+            QuoteDecision::Quote {
+                size_fraction,
+                expected_edge,
+                ..
+            } => {
+                let ladder = self.execution_optimizer.optimize_ladder(
+                    params,
+                    size_fraction,
+                    expected_edge,
+                );
+                Some(ladder)
+            }
+            QuoteDecision::ReducedSize { fraction, .. } => {
+                let ladder =
+                    self.execution_optimizer
+                        .optimize_ladder(params, fraction, prediction.mean);
+                Some(ladder)
+            }
+            QuoteDecision::NoQuote { reason } => {
+                tracing::info!(reason = %reason, "Not quoting");
+                None
+            }
+        }
+    }
+
+    /// Get the current model health.
+    pub fn model_health(&self) -> ModelHealth {
+        self.confidence_tracker.model_health()
+    }
+
+    /// Check if decision filter is enabled.
+    pub fn use_decision_filter(&self) -> bool {
+        self.config.enabled && self.config.use_decision_filter
+    }
+
+    /// Evaluate whether to quote based on decision engine.
+    ///
+    /// Returns the QuoteDecision which can be:
+    /// - Quote: Full size with confidence and expected edge
+    /// - ReducedSize: Partial size due to model disagreement
+    /// - NoQuote: Don't quote with reason
+    ///
+    /// The caller should apply the decision to their quote sizing.
+    pub fn evaluate_decision(
+        &self,
+        params: &MarketParams,
+        position: f64,
+        current_drawdown: f64,
+    ) -> QuoteDecision {
+        // Build current market state
+        let state = self.build_market_state(params, position);
+
+        // Get ensemble prediction
+        let prediction = self.ensemble.predict_edge(&state);
+
+        // Get model health
+        let health = self.confidence_tracker.model_health();
+
+        // Get decision from engine
+        let decision = self
+            .decision_engine
+            .should_quote(&prediction, &health, current_drawdown);
+
+        // Log the decision
+        tracing::debug!(
+            predicted_edge = %format!("{:.2}bp", prediction.mean),
+            uncertainty = %format!("{:.2}bp", prediction.std),
+            disagreement = %format!("{:.2}bp", prediction.disagreement),
+            model_health = ?health.overall,
+            drawdown = %format!("{:.2}%", current_drawdown * 100.0),
+            decision = ?decision,
+            "Decision engine evaluation"
+        );
+
+        decision
+    }
+
+    /// Track quote cycle and check if we should log model health.
+    /// Returns true if health should be logged this cycle.
+    pub fn should_log_health(&mut self) -> bool {
+        self.quote_cycle_count += 1;
+        if self.config.health_log_interval == 0 {
+            return false;
+        }
+        self.quote_cycle_count % self.config.health_log_interval == 0
+    }
+
+    /// Get the number of pending predictions.
+    pub fn pending_predictions_count(&self) -> usize {
+        self.pending_predictions.len()
+    }
+
+    /// Get confidence tracker for inspection.
+    pub fn confidence_tracker(&self) -> &ModelConfidenceTracker {
+        &self.confidence_tracker
+    }
+
+    /// Get ensemble for inspection.
+    pub fn ensemble(&self) -> &ModelEnsemble {
+        &self.ensemble
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_learning_config_default() {
+        let config = LearningConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.prediction_horizon_ms, 1000);
+        assert_eq!(config.min_predictions_for_update, 20);
+        assert_eq!(config.fee_bps, 1.5);
+    }
+
+    #[test]
+    fn test_learning_module_creation() {
+        let module = LearningModule::default();
+        assert!(module.is_enabled());
+        assert_eq!(module.pending_predictions_count(), 0);
+    }
+}
