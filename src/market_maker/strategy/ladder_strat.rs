@@ -248,6 +248,17 @@ impl LadderStrategy {
         // FIRST PRINCIPLES: This replaces the arbitrary adaptive_uncertainty_factor
         let warmup_scalar = cfg.warmup_multiplier(market_params.adaptive_warmup_progress);
 
+        // Kappa uncertainty scaling: express kappa estimation uncertainty through gamma
+        // FIRST PRINCIPLES: We now use market kappa (book/robust) during warmup instead of prior.
+        // However, market kappa has estimation error - express this through position sizing (gamma)
+        // not through overriding the kappa estimate itself.
+        // Range: 1.5x at 0% warmup (high uncertainty) → 1.0x at 100% warmup (converged)
+        let kappa_uncertainty_scalar = if market_params.adaptive_warmup_progress < 1.0 {
+            1.0 + (1.0 - market_params.adaptive_warmup_progress) * 0.5
+        } else {
+            1.0
+        };
+
         // Calibration fill-hungry scaling (reduce gamma to attract fills during warmup)
         // FIRST PRINCIPLES: calibration_gamma_mult ∈ [0.3, 1.0]
         // Lower values = tighter quotes = more fills for calibration
@@ -262,6 +273,7 @@ impl LadderStrategy {
             * time_scalar
             * book_depth_scalar
             * warmup_scalar
+            * kappa_uncertainty_scalar
             * calibration_scalar;
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }

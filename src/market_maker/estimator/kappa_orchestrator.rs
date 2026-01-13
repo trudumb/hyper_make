@@ -25,7 +25,7 @@
 use super::book_kappa::BookKappaEstimator;
 use super::kappa::BayesianKappaEstimator;
 use super::robust_kappa::RobustKappaEstimator;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Minimum weight for prior (always contributes some regularization)
 const PRIOR_MIN_WEIGHT: f64 = 0.05;
@@ -208,11 +208,44 @@ impl KappaOrchestrator {
         let min_own_fills = 5;
         let has_own_fills = self.own_kappa.observation_count() >= min_own_fills;
 
-        // During warmup: ONLY use prior - disable own, book, and robust
-        // This prevents book regression (which can give low κ on sparse books) from
-        // dragging down the estimate before we have fill data to anchor it
+        // Get market signals
+        let book_kappa = self.book_kappa.kappa();
+        let robust_kappa = self.robust_kappa.kappa();
+
+        // During warmup: Blend market kappa with prior instead of ignoring market data
+        // This is Bayesian-correct: use available information, express uncertainty through γ
         if !has_own_fills {
-            return self.config.prior_kappa;
+            // Trust market signal (book/robust) but hedge with prior
+            // Book kappa: from L2 depth decay regression (direct market structure)
+            // Robust kappa: from market trades with outlier resistance
+            let book_valid = book_kappa > 100.0 && self.config.use_book_kappa;
+            let robust_valid = robust_kappa > 100.0 && self.config.use_robust_kappa;
+
+            // Weight allocation during warmup:
+            // - Book: 40% (direct market structure signal)
+            // - Robust: 30% (market-wide fill behavior)
+            // - Prior: 30% minimum (regularization/safety)
+            let book_weight = if book_valid { 0.4 } else { 0.0 };
+            let robust_weight = if robust_valid { 0.3 } else { 0.0 };
+            let prior_weight = 1.0 - book_weight - robust_weight;
+
+            let blended = book_weight * book_kappa
+                + robust_weight * robust_kappa
+                + prior_weight * self.config.prior_kappa;
+
+            debug!(
+                warmup = true,
+                book_kappa = %format!("{:.0}", book_kappa),
+                book_weight = %format!("{:.0}%", book_weight * 100.0),
+                robust_kappa = %format!("{:.0}", robust_kappa),
+                robust_weight = %format!("{:.0}%", robust_weight * 100.0),
+                prior_kappa = self.config.prior_kappa,
+                prior_weight = %format!("{:.0}%", prior_weight * 100.0),
+                blended_kappa = %format!("{:.0}", blended),
+                "Warmup kappa: using market signal with prior blend"
+            );
+
+            return blended.clamp(50.0, 10000.0);
         }
 
         // Post-warmup: full confidence-weighted blending
@@ -256,20 +289,30 @@ impl KappaOrchestrator {
         (f64, f64),
         (f64, f64),
         (f64, f64), // (kappa, weight) for own, book, robust, prior
-        bool,       // is_warmup (all estimators disabled, only prior used)
+        bool,       // is_warmup (market signal used with prior blend)
     ) {
         // Mirror the warmup logic from kappa_effective exactly
         let min_own_fills = 5;
         let has_own_fills = self.own_kappa.observation_count() >= min_own_fills;
         let is_warmup = !has_own_fills;
 
-        // During warmup: all weights are 0 except prior (100%)
+        let book_kappa = self.book_kappa.kappa();
+        let robust_kappa = self.robust_kappa.kappa();
+
+        // During warmup: blend market signal with prior (not 100% prior anymore)
         if is_warmup {
+            let book_valid = book_kappa > 100.0 && self.config.use_book_kappa;
+            let robust_valid = robust_kappa > 100.0 && self.config.use_robust_kappa;
+
+            let book_weight = if book_valid { 0.4 } else { 0.0 };
+            let robust_weight = if robust_valid { 0.3 } else { 0.0 };
+            let prior_weight = 1.0 - book_weight - robust_weight;
+
             return (
-                (self.own_kappa.posterior_mean(), 0.0), // own disabled
-                (self.book_kappa.kappa(), 0.0),         // book disabled
-                (self.robust_kappa.kappa(), 0.0),       // robust disabled
-                (self.config.prior_kappa, 1.0),         // prior = 100%
+                (self.own_kappa.posterior_mean(), 0.0), // own disabled during warmup
+                (book_kappa, book_weight),              // book weighted if valid
+                (robust_kappa, robust_weight),          // robust weighted if valid
+                (self.config.prior_kappa, prior_weight), // prior gets remainder
                 true,                                   // is_warmup
             );
         }
