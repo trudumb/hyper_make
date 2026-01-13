@@ -153,6 +153,17 @@ impl ParameterAggregator {
             kappa_uncertainty: est.hierarchical_kappa_std(),
             kappa_95_lower: est.hierarchical_kappa_ci_95().0,
             kappa_95_upper: est.hierarchical_kappa_ci_95().1,
+            // Compute normalized CI width for uncertainty-based warmup scaling
+            // ci_width = (upper - lower) / mean, high uncertainty → wide CI → higher warmup gamma
+            kappa_ci_width: {
+                let (ci_lower, ci_upper) = est.hierarchical_kappa_ci_95();
+                let kappa_mean = est.kappa();
+                if ci_upper > ci_lower && kappa_mean > 0.0 {
+                    (ci_upper - ci_lower) / kappa_mean
+                } else {
+                    1.0 // Default high uncertainty
+                }
+            },
 
             // V3: Robust Kappa Orchestrator (outlier-resistant)
             kappa_robust: est.kappa_robust(),

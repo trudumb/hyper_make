@@ -553,6 +553,51 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let reconcile_config = &self.config.reconcile;
 
+        // === UNCONDITIONAL RATE LIMIT CHECK ===
+        // Refresh rate limit cache and throttle if headroom is low.
+        // This runs regardless of impulse_enabled to prevent hitting rate limits.
+        {
+            use crate::market_maker::core::CachedRateLimit;
+            use std::time::Duration;
+
+            // Refresh rate limit cache if stale (every 60 seconds)
+            let cache_max_age = Duration::from_secs(60);
+            let should_refresh = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .is_none_or(|c| c.is_stale(cache_max_age));
+
+            if should_refresh {
+                if let Ok(response) = self.info_client.user_rate_limit(self.user_address).await {
+                    self.infra.cached_rate_limit =
+                        Some(CachedRateLimit::from_response(&response));
+                    debug!(
+                        used = response.n_requests_used,
+                        cap = response.n_requests_cap,
+                        headroom_pct = %format!("{:.1}%", response.headroom_pct() * 100.0),
+                        "Rate limit status"
+                    );
+                }
+            }
+
+            // Throttle if headroom < 10% (more aggressive than impulse control's 5%)
+            // This gives buffer before we hit the hard 5% limit
+            // Uses proactive_rate_tracker's minimum interval check
+            if let Some(ref cache) = self.infra.cached_rate_limit {
+                let headroom = cache.headroom_pct();
+                if headroom < 0.10 && !self.infra.proactive_rate_tracker.can_modify() {
+                    // Rate limit is tight AND we're within the minimum modify interval
+                    // Skip this cycle to conserve rate limit budget
+                    debug!(
+                        headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                        "Rate limit headroom low (<10%) - throttling reconciliation"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         // Convert Quote to LadderLevel for reconciliation
         let bid_levels: Vec<LadderLevel> = bid_quotes
             .iter()

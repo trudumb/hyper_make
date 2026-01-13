@@ -84,6 +84,12 @@ pub struct MarketParams {
     /// κ_95_upper = posterior_alpha / posterior_beta quantile(0.975)
     pub kappa_95_upper: f64,
 
+    /// Kappa credible interval width (normalized by mean).
+    /// ci_width = (ci_95_upper - ci_95_lower) / kappa_mean
+    /// Used for uncertainty-based warmup gamma scaling.
+    /// Range: ~0.3 (converged) to ~1.0+ (high uncertainty)
+    pub kappa_ci_width: f64,
+
     /// Soft toxicity score [0, 1] from mixture model.
     /// Rolling average of P(jump) - smoother than binary is_toxic_regime.
     /// 0.0 = pure diffusion, 0.5+ = significant jump component
@@ -603,6 +609,7 @@ impl Default for MarketParams {
             kappa_uncertainty: 0.0,    // Will be computed from posterior
             kappa_95_lower: 100.0,     // Conservative lower bound
             kappa_95_upper: 100.0,     // Conservative upper bound
+            kappa_ci_width: 1.0,       // High uncertainty initially (CI width / mean)
             toxicity_score: 0.0,       // No toxicity initially
             param_correlation: 0.0,    // No correlation initially
             as_factor: 1.0,            // No AS adjustment initially
@@ -1262,8 +1269,8 @@ impl MarketParams {
             kappa_bid: estimator.kappa_bid(),
             kappa_ask: estimator.kappa_ask(),
 
-            // Microprice
-            microprice: estimator.microprice().max(mid),
+            // Microprice - use directly, EMA smoothing in microprice.rs handles outliers
+            microprice: estimator.microprice(),
             market_mid: mid,
 
             // Flow

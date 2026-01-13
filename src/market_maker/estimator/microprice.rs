@@ -611,12 +611,29 @@ impl MicropriceEstimator {
             let prev_bits = self.ema_microprice_bits.load(Ordering::Relaxed);
 
             if prev_bits == EMA_NONE {
-                // First observation - initialize EMA
+                // First observation - initialize EMA with mid (not raw_microprice)
+                // This prevents capturing early outliers during warmup
                 self.ema_microprice_bits
-                    .store(raw_microprice.to_bits(), Ordering::Relaxed);
+                    .store(mid.to_bits(), Ordering::Relaxed);
                 raw_microprice
             } else {
                 let prev = f64::from_bits(prev_bits);
+
+                // Safety check: if EMA diverged too far from mid, reset it
+                // This handles cases where market moved significantly while EMA was stale
+                let ema_divergence_bps = ((prev - mid) / mid).abs() * 10_000.0;
+                if ema_divergence_bps > 100.0 {
+                    // EMA is >100 bps from mid - reset to mid
+                    tracing::warn!(
+                        prev_ema = %format!("{:.2}", prev),
+                        mid = %format!("{:.2}", mid),
+                        divergence_bps = %format!("{:.1}", ema_divergence_bps),
+                        "Microprice EMA diverged too far from mid - resetting"
+                    );
+                    self.ema_microprice_bits
+                        .store(mid.to_bits(), Ordering::Relaxed);
+                    return raw_microprice;
+                }
 
                 // Calculate change in bps
                 let change_bps = ((raw_microprice - prev) / prev).abs() * 10_000.0;

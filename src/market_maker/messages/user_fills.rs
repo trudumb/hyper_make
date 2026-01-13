@@ -92,10 +92,11 @@ pub fn process_user_fills<'a>(
             );
         }
 
-        // Create fill event
-        let fill_event = FillEvent::new(
+        // Create fill event with CLOID for deterministic tracking
+        let fill_event = FillEvent::with_cloid(
             fill.tid,
             fill.oid,
+            fill.cloid.clone(),
             amount,
             fill_price,
             is_buy,
