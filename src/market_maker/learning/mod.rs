@@ -292,10 +292,10 @@ impl LearningModule {
         // 4. Get drawdown (placeholder - should come from P&L tracker)
         let current_drawdown = 0.0;
 
-        // 5. Decision
+        // 5. Decision (pass realized_vol for A-S reservation shift)
         let decision = self
             .decision_engine
-            .should_quote(&prediction, &health, current_drawdown);
+            .should_quote(&prediction, &health, current_drawdown, params.sigma);
 
         // 6. Log decision
         tracing::debug!(
@@ -367,10 +367,10 @@ impl LearningModule {
         // Get model health
         let health = self.confidence_tracker.model_health();
 
-        // Get decision from engine
+        // Get decision from engine (pass realized_vol for A-S reservation shift)
         let decision = self
             .decision_engine
-            .should_quote(&prediction, &health, current_drawdown);
+            .should_quote(&prediction, &health, current_drawdown, params.sigma);
 
         // Log the decision
         tracing::debug!(
@@ -454,10 +454,10 @@ impl LearningModule {
         // Get model health
         let health = self.confidence_tracker.model_health();
 
-        // Get decision from engine
+        // Get decision from engine (pass realized_vol for A-S reservation shift)
         let decision = self
             .decision_engine
-            .should_quote(&prediction, &health, current_drawdown);
+            .should_quote(&prediction, &health, current_drawdown, params.sigma);
 
         // Convert model contributions
         let model_predictions: Vec<ModelPrediction> = prediction

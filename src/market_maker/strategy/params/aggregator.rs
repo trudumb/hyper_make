@@ -441,6 +441,12 @@ impl ParameterAggregator {
             // Joint Dynamics (Phase 7)
             is_toxic_joint: est.is_toxic_joint(),
             sigma_kappa_correlation: est.sigma_kappa_correlation(),
+
+            // === L2 Decision Engine Outputs (A-S Framework) ===
+            // Set by QuoteEngine after decision_engine.should_quote() call
+            // Default to neutral values; actual values populated in quote_engine.rs
+            l2_reservation_shift: 0.0,  // No shift initially
+            l2_spread_multiplier: 1.0,  // No widening initially
         }
     }
 }

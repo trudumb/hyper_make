@@ -404,8 +404,15 @@ impl LadderStrategy {
         // Apply cascade size reduction
         let adjusted_size = target_liquidity * market_params.cascade_size_factor;
 
+        // === L2 RESERVATION SHIFT (Avellaneda-Stoikov Framework) ===
+        // Edge enters through the reservation price, not sizing.
+        // δ_μ = μ/(γσ²) shifts where we center quotes:
+        // - Positive edge → shift UP → aggressive asks, capturing positive drift
+        // - Negative edge → shift DOWN → aggressive bids, capturing negative drift
+        let adjusted_microprice = market_params.microprice + market_params.l2_reservation_shift;
+
         let params = LadderParams {
-            mid_price: market_params.microprice,
+            mid_price: adjusted_microprice,
             market_mid: market_params.market_mid, // Actual exchange mid for safety checks
             sigma: market_params.sigma,
             kappa, // Use AS-adjusted kappa
@@ -493,6 +500,24 @@ impl LadderStrategy {
             if *depth < effective_floor_bps {
                 *depth = effective_floor_bps;
             }
+        }
+
+        // === L2 SPREAD MULTIPLIER (Bayesian Uncertainty Premium) ===
+        // Unlike the deprecated arbitrary multipliers, this is principled:
+        // High σ_μ (noisy edge estimate) → widen spreads to protect against model error.
+        // Formula: spread_mult = 1.0 + uncertainty_scaling × (σ_μ / baseline_σ_μ)
+        // This is NOT bypassing GLFT - it's adding a Bayesian uncertainty premium on top.
+        if market_params.l2_spread_multiplier > 1.0 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth *= market_params.l2_spread_multiplier;
+            }
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth *= market_params.l2_spread_multiplier;
+            }
+            debug!(
+                l2_spread_mult = %format!("{:.2}x", market_params.l2_spread_multiplier),
+                "Applied L2 Bayesian uncertainty premium to spreads"
+            );
         }
 
         // === DEPRECATED: SPREAD MULTIPLIERS ===
@@ -1043,7 +1068,7 @@ impl LadderStrategy {
             // 10. CONCENTRATION FALLBACK: If all levels filtered out but total size
             // meets min_notional, create single concentrated order at tightest depth.
             // This prevents empty ladders when margin is tight but still above exchange minimum.
-            let min_size_for_order = config.min_notional / market_params.microprice;
+            let _min_size_for_order = config.min_notional / market_params.microprice; // Kept for reference
             let tightest_depth_bps = ladder_config.min_depth_bps;
 
             // Bid concentration fallback
@@ -1052,7 +1077,10 @@ impl LadderStrategy {
                 let total_bid_size = truncate_float(available_for_bids, config.sz_decimals, false);
                 let bid_notional = total_bid_size * market_params.microprice;
 
-                if total_bid_size > min_size_for_order && bid_notional >= config.min_notional {
+                // FIX: Removed redundant `total_bid_size > min_size_for_order` check.
+                // Both conditions are mathematically equivalent but floating-point precision
+                // can cause disagreement. The notional check is what the exchange cares about.
+                if bid_notional >= config.min_notional && total_bid_size > 1e-10 {
                     // Create concentrated order at tightest depth
                     let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
                     let bid_price = round_to_significant_and_decimal(
@@ -1094,7 +1122,8 @@ impl LadderStrategy {
                 let total_ask_size = truncate_float(available_for_asks, config.sz_decimals, false);
                 let ask_notional = total_ask_size * market_params.microprice;
 
-                if total_ask_size > min_size_for_order && ask_notional >= config.min_notional {
+                // FIX: Same as bid side - use only notional check to avoid precision issues
+                if ask_notional >= config.min_notional && total_ask_size > 1e-10 {
                     // Create concentrated order at tightest depth
                     let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
                     let ask_price = round_to_significant_and_decimal(

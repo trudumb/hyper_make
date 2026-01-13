@@ -456,13 +456,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     size_fraction,
                     confidence,
                     expected_edge,
+                    reservation_shift,
+                    spread_multiplier,
                 } => {
                     debug!(
                         size_fraction = %format!("{:.0}%", size_fraction * 100.0),
                         confidence = %format!("{:.1}%", confidence * 100.0),
                         expected_edge = %format!("{:.2}bp", expected_edge),
+                        reservation_shift = %format!("{:.6}", reservation_shift),
+                        spread_multiplier = %format!("{:.2}x", spread_multiplier),
                         "Decision engine: quoting"
                     );
+                    // Set L2 outputs on market_params for downstream strategy
+                    market_params.l2_reservation_shift = reservation_shift;
+                    market_params.l2_spread_multiplier = spread_multiplier;
                     size_fraction
                 }
             }

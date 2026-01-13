@@ -356,12 +356,20 @@ pub enum QuoteDecision {
     },
     /// Normal quote
     Quote {
-        /// Size fraction from Kelly (0-1)
+        /// Size fraction from inverse information asymmetry (0-1)
+        /// Higher when p ≈ 0.5 (uncertain), lower at extremes (informed flow)
         size_fraction: f64,
-        /// Confidence that edge > 0
+        /// Model confidence - HIGH when p ≈ 0.5 (spread capture dominates)
+        /// This is inverse of traditional "confidence" - we're confident when uncertain about direction
         confidence: f64,
-        /// Expected edge in bps
+        /// Expected edge in bps (drift estimate μ)
         expected_edge: f64,
+        /// Reservation price shift in price units (from A-S: μ/(γσ²))
+        /// Positive = shift quotes up (aggressive asks), Negative = shift down (aggressive bids)
+        reservation_shift: f64,
+        /// Spread multiplier from uncertainty premium (≥1.0)
+        /// Higher when edge estimate is noisy (Bayesian uncertainty premium)
+        spread_multiplier: f64,
     },
 }
 
@@ -419,6 +427,8 @@ mod tests {
             size_fraction: 0.5,
             confidence: 0.8,
             expected_edge: 2.0,
+            reservation_shift: 0.001,
+            spread_multiplier: 1.2,
         };
         assert!(quote.is_quote());
         assert_eq!(quote.size_fraction(), 0.5);

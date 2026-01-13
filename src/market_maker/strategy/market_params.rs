@@ -569,6 +569,18 @@ pub struct MarketParams {
 
     /// Sigma-kappa correlation (negative = widening spreads during vol).
     pub sigma_kappa_correlation: f64,
+
+    // ==================== L2 Decision Engine Outputs (A-S Framework) ====================
+    /// Reservation price shift from L2 decision engine (price units).
+    /// From A-S: δ_μ = μ / (γσ²) where μ is expected edge.
+    /// Positive = shift quotes UP (aggressive asks), Negative = shift DOWN (aggressive bids).
+    /// Add this to microprice when calculating bid/ask prices.
+    pub l2_reservation_shift: f64,
+
+    /// Spread multiplier from L2 uncertainty premium (≥1.0).
+    /// From Bayesian framework: widen spreads when edge estimate is noisy.
+    /// Multiply optimal spread by this factor.
+    pub l2_spread_multiplier: f64,
 }
 
 impl Default for MarketParams {
@@ -745,6 +757,9 @@ impl Default for MarketParams {
             // Joint Dynamics (Phase 7)
             is_toxic_joint: false,         // Not toxic initially
             sigma_kappa_correlation: -0.3, // Typical negative correlation
+            // L2 Decision Engine Outputs (A-S Framework)
+            l2_reservation_shift: 0.0,  // No shift initially (neutral)
+            l2_spread_multiplier: 1.0,  // No widening initially
         }
     }
 }
