@@ -2,7 +2,7 @@
 
 use tracing::{debug, info, warn};
 
-use crate::{truncate_float, EPSILON};
+use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
@@ -10,8 +10,8 @@ use crate::market_maker::estimator::VolatilityRegime;
 use crate::market_maker::quoting::{
     BayesianFillModel, ConstrainedLadderOptimizer, DepthSpacing, DynamicDepthConfig,
     DynamicDepthGenerator, EntropyConstrainedOptimizer, EntropyDistributionConfig,
-    EntropyOptimizerConfig, KellyStochasticParams, Ladder, LadderConfig, LadderParams,
-    LevelOptimizationParams, MarketRegime,
+    EntropyOptimizerConfig, KellyStochasticParams, Ladder, LadderConfig, LadderLevel,
+    LadderParams, LevelOptimizationParams, MarketRegime,
 };
 
 use super::{MarketParams, QuotingStrategy, RiskConfig};
@@ -1040,32 +1040,97 @@ impl LadderStrategy {
             ladder.bids.retain(|l| l.size > min_size_for_exchange);
             ladder.asks.retain(|l| l.size > min_size_for_exchange);
 
-            // Diagnostic: warn if all levels were filtered out
+            // 10. CONCENTRATION FALLBACK: If all levels filtered out but total size
+            // meets min_notional, create single concentrated order at tightest depth.
+            // This prevents empty ladders when margin is tight but still above exchange minimum.
+            let min_size_for_order = config.min_notional / market_params.microprice;
+            let tightest_depth_bps = ladder_config.min_depth_bps;
+
+            // Bid concentration fallback
             if bids_before > 0 && ladder.bids.is_empty() {
-                warn!(
-                    bids_before = bids_before,
-                    available_margin = %format!("{:.2}", available_margin),
-                    available_position = %format!("{:.6}", available_for_bids),
-                    min_notional = %format!("{:.2}", config.min_notional),
-                    min_level_size = %format!("{:.6}", ladder_config.min_level_size),
-                    mid_price = %format!("{:.2}", market_params.microprice),
-                    "All bid levels filtered out (sizes too small)"
-                );
-            }
-            if asks_before > 0 && ladder.asks.is_empty() {
-                warn!(
-                    asks_before = asks_before,
-                    available_margin = %format!("{:.2}", available_margin),
-                    available_position = %format!("{:.6}", available_for_asks),
-                    min_notional = %format!("{:.2}", config.min_notional),
-                    min_level_size = %format!("{:.6}", ladder_config.min_level_size),
-                    mid_price = %format!("{:.2}", market_params.microprice),
-                    "All ask levels filtered out (sizes too small)"
-                );
+                // Total available size for bids
+                let total_bid_size = truncate_float(available_for_bids, config.sz_decimals, false);
+                let bid_notional = total_bid_size * market_params.microprice;
+
+                if total_bid_size > min_size_for_order && bid_notional >= config.min_notional {
+                    // Create concentrated order at tightest depth
+                    let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
+                    let bid_price = round_to_significant_and_decimal(
+                        market_params.microprice - offset,
+                        5,
+                        config.decimals,
+                    );
+
+                    ladder.bids.push(LadderLevel {
+                        price: bid_price,
+                        size: total_bid_size,
+                        depth_bps: tightest_depth_bps,
+                    });
+
+                    info!(
+                        size = %format!("{:.6}", total_bid_size),
+                        price = %format!("{:.2}", bid_price),
+                        notional = %format!("{:.2}", bid_notional),
+                        depth_bps = %format!("{:.2}", tightest_depth_bps),
+                        levels_before = bids_before,
+                        "Bid concentration fallback: collapsed to single order at tightest depth"
+                    );
+                } else {
+                    warn!(
+                        bids_before = bids_before,
+                        available_margin = %format!("{:.2}", available_margin),
+                        available_position = %format!("{:.6}", available_for_bids),
+                        min_notional = %format!("{:.2}", config.min_notional),
+                        min_level_size = %format!("{:.6}", ladder_config.min_level_size),
+                        mid_price = %format!("{:.2}", market_params.microprice),
+                        "All bid levels filtered out (total size below min_notional)"
+                    );
+                }
             }
 
-            // DIAGNOSTIC: Detailed warning when ladder is completely empty
-            // Helps identify margin, min_notional, or capacity constraints
+            // Ask concentration fallback
+            if asks_before > 0 && ladder.asks.is_empty() {
+                // Total available size for asks
+                let total_ask_size = truncate_float(available_for_asks, config.sz_decimals, false);
+                let ask_notional = total_ask_size * market_params.microprice;
+
+                if total_ask_size > min_size_for_order && ask_notional >= config.min_notional {
+                    // Create concentrated order at tightest depth
+                    let offset = market_params.microprice * (tightest_depth_bps / 10000.0);
+                    let ask_price = round_to_significant_and_decimal(
+                        market_params.microprice + offset,
+                        5,
+                        config.decimals,
+                    );
+
+                    ladder.asks.push(LadderLevel {
+                        price: ask_price,
+                        size: total_ask_size,
+                        depth_bps: tightest_depth_bps,
+                    });
+
+                    info!(
+                        size = %format!("{:.6}", total_ask_size),
+                        price = %format!("{:.2}", ask_price),
+                        notional = %format!("{:.2}", ask_notional),
+                        depth_bps = %format!("{:.2}", tightest_depth_bps),
+                        levels_before = asks_before,
+                        "Ask concentration fallback: collapsed to single order at tightest depth"
+                    );
+                } else {
+                    warn!(
+                        asks_before = asks_before,
+                        available_margin = %format!("{:.2}", available_margin),
+                        available_position = %format!("{:.6}", available_for_asks),
+                        min_notional = %format!("{:.2}", config.min_notional),
+                        min_level_size = %format!("{:.6}", ladder_config.min_level_size),
+                        mid_price = %format!("{:.2}", market_params.microprice),
+                        "All ask levels filtered out (total size below min_notional)"
+                    );
+                }
+            }
+
+            // DIAGNOSTIC: Only warn if still empty after concentration fallback
             if ladder.bids.is_empty() && ladder.asks.is_empty() {
                 let dynamic_min_size = config.min_notional / market_params.microprice;
                 warn!(
@@ -1076,7 +1141,7 @@ impl LadderStrategy {
                     margin_available = %format!("{:.2}", available_margin),
                     bid_notional = %format!("{:.2}", available_for_bids * market_params.microprice),
                     ask_notional = %format!("{:.2}", available_for_asks * market_params.microprice),
-                    "Ladder completely empty: all levels below min_notional or margin constraint"
+                    "Ladder completely empty: available size below min_notional (no fallback possible)"
                 );
             }
 
