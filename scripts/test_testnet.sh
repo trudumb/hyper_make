@@ -6,7 +6,7 @@
 #   ./scripts/test_testnet.sh BTC 60       # 1 minute test
 #   ./scripts/test_testnet.sh BTC 300      # 5 minute test
 #   ./scripts/test_testnet.sh BTC 7200     # 2 hour test
-#   ./scripts/test_testnet.sh BTC 120 --diagnostics  # With L2/L3 diagnostics
+#   ./scripts/test_testnet.sh BTC 720 --diagnostics  # With L2/L3 diagnostics
 #
 # Diagnostic Mode (--diagnostics):
 #   Enables additional log targets for Layer 2/3 analysis:
