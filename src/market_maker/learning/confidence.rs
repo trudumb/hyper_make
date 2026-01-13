@@ -140,6 +140,15 @@ impl ModelConfidenceTracker {
         predicted_uncertainty: f64,
         realized_pnl_bps: f64,
     ) {
+        // Log for scatter plot analysis
+        tracing::info!(
+            target: "learning::scatter",
+            predicted_bps = %format!("{:.2}", predicted_edge_bps),
+            realized_bps = %format!("{:.2}", realized_pnl_bps),
+            uncertainty = %format!("{:.2}", predicted_uncertainty),
+            "[EdgeScatter] predicted vs realized edge"
+        );
+
         let pred = EdgePrediction {
             predicted_edge_bps,
             predicted_uncertainty,

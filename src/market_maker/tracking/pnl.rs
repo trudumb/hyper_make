@@ -156,6 +156,9 @@ pub struct PnLTracker {
     /// Cumulative realized P&L
     total_realized_pnl: f64,
 
+    /// Peak total P&L for drawdown calculation
+    peak_pnl: f64,
+
     /// Number of fills
     fill_count: usize,
 
@@ -187,6 +190,7 @@ impl PnLTracker {
             total_funding: 0.0,
             total_fees: 0.0,
             total_realized_pnl: 0.0,
+            peak_pnl: 0.0,
             fill_count: 0,
             start_time: Instant::now(),
             inventory_snapshots: VecDeque::with_capacity(1000),
@@ -609,9 +613,10 @@ impl PnLTracker {
         self.fill_count
     }
 
-    /// Get summary.
+    /// Get summary (read-only, uses current peak_pnl without updating).
     pub fn summary(&self, current_mid: f64) -> PnLSummary {
         let attr = self.attribution(current_mid);
+        let total_pnl = attr.total();
 
         PnLSummary {
             position: self.position,
@@ -623,7 +628,33 @@ impl PnLTracker {
             fees: attr.fees,
             realized_pnl: attr.realized_pnl,
             unrealized_pnl: attr.unrealized_pnl,
-            total_pnl: attr.total(),
+            total_pnl,
+            peak_pnl: self.peak_pnl,
+            uptime_secs: self.start_time.elapsed().as_secs_f64(),
+        }
+    }
+
+    /// Get summary and update peak P&L for accurate drawdown tracking.
+    /// Call this version after fills or when you want to record new highs.
+    pub fn summary_update_peak(&mut self, current_mid: f64) -> PnLSummary {
+        let attr = self.attribution(current_mid);
+        let total_pnl = attr.total();
+
+        // Update peak for drawdown tracking
+        self.peak_pnl = self.peak_pnl.max(total_pnl);
+
+        PnLSummary {
+            position: self.position,
+            avg_entry_price: self.avg_entry_price,
+            fill_count: self.fill_count,
+            spread_capture: attr.spread_capture,
+            adverse_selection: attr.adverse_selection,
+            funding: attr.funding,
+            fees: attr.fees,
+            realized_pnl: attr.realized_pnl,
+            unrealized_pnl: attr.unrealized_pnl,
+            total_pnl,
+            peak_pnl: self.peak_pnl,
             uptime_secs: self.start_time.elapsed().as_secs_f64(),
         }
     }
@@ -639,6 +670,7 @@ impl PnLTracker {
         self.total_funding = 0.0;
         self.total_fees = 0.0;
         self.total_realized_pnl = 0.0;
+        self.peak_pnl = 0.0;
         self.fill_count = 0;
         self.start_time = Instant::now();
         self.inventory_snapshots.clear();
@@ -678,7 +710,15 @@ pub struct PnLSummary {
     pub realized_pnl: f64,
     pub unrealized_pnl: f64,
     pub total_pnl: f64,
+    pub peak_pnl: f64,
     pub uptime_secs: f64,
+}
+
+impl PnLSummary {
+    /// Calculate current drawdown from peak.
+    pub fn drawdown(&self) -> f64 {
+        (self.peak_pnl - self.total_pnl).max(0.0)
+    }
 }
 
 // ============================================================================

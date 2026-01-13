@@ -221,8 +221,9 @@ impl LearningModule {
         let realized_as_bps = price_move.max(0.0);
 
         // Calculate realized edge
-        let spread_captured = pred.fill.spread_capture();
-        let realized_edge_bps = spread_captured - realized_as_bps - self.config.fee_bps;
+        // Note: depth_bps() returns basis points, spread_capture() returns dollars
+        let spread_captured_bps = pred.fill.depth_bps();
+        let realized_edge_bps = spread_captured_bps - realized_as_bps - self.config.fee_bps;
 
         TradingOutcome {
             prediction: pred.clone(),
@@ -387,12 +388,35 @@ impl LearningModule {
 
     /// Track quote cycle and check if we should log model health.
     /// Returns true if health should be logged this cycle.
+    /// Also scores any matured predictions periodically (not just on fills).
     pub fn should_log_health(&mut self) -> bool {
         self.quote_cycle_count += 1;
+
+        // Score matured predictions every cycle (not just on fills)
+        // This is critical for sparse fill environments
+        self.score_matured_predictions();
+
         if self.config.health_log_interval == 0 {
             return false;
         }
-        self.quote_cycle_count % self.config.health_log_interval == 0
+        self.quote_cycle_count.is_multiple_of(self.config.health_log_interval)
+    }
+
+    /// Log detailed calibration metrics for diagnostics.
+    /// Call this when should_log_health() returns true.
+    pub fn log_calibration_report(&self) {
+        let tracker = &self.confidence_tracker;
+        tracing::info!(
+            target: "layer2::calibration",
+            vol_rmse = %format!("{:.4}", tracker.vol_rmse()),
+            vol_bias = %format!("{:.4}", tracker.vol_bias()),
+            as_rmse = %format!("{:.2}", tracker.as_rmse()),
+            as_bias = %format!("{:.2}", tracker.as_bias()),
+            edge_rmse = %format!("{:.2}", tracker.edge_rmse()),
+            edge_bias = %format!("{:.2}", tracker.edge_bias()),
+            n_edge_obs = tracker.n_edge_observations(),
+            "[Calibration] Model confidence tracker metrics"
+        );
     }
 
     /// Get the number of pending predictions.

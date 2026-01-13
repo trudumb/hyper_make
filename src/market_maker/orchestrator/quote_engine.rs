@@ -94,6 +94,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 pending_predictions = pending,
                 "Learning module health"
             );
+            // Log detailed calibration metrics for diagnostics
+            self.learning.log_calibration_report();
         }
 
         // Phase 3: Check recovery state and handle IOC recovery if needed
@@ -508,6 +510,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Get optimal action from Layer 3
             let action = self.stochastic.controller.act(&learning_output, &trading_state);
+
+            // === L1→L2→L3→DECISION TRACE LOG ===
+            // This is the key diagnostic trace showing the full pipeline
+            info!(
+                target: "layer3::trace",
+                // Layer 1 (Estimator)
+                l1_sigma = %format!("{:.6}", market_params.sigma),
+                l1_kappa = %format!("{:.0}", market_params.kappa),
+                l1_micro = %format!("{:.2}", market_params.microprice),
+                l1_vol_regime = ?market_params.volatility_regime,
+                // Layer 2 (LearningModule)
+                l2_edge_mean = %format!("{:.2}", learning_output.edge_prediction.mean),
+                l2_edge_std = %format!("{:.2}", learning_output.edge_prediction.std),
+                l2_model_health = ?learning_output.model_health.overall,
+                l2_p_positive = %format!("{:.3}", learning_output.p_positive_edge),
+                l2_decision = %format!("{:?}", learning_output.myopic_decision).chars().take(40).collect::<String>(),
+                // Layer 3 (StochasticController)
+                l3_trust = %format!("{:.2}", self.stochastic.controller.learning_trust()),
+                l3_cp_prob = %format!("{:.3}", self.stochastic.controller.changepoint_summary().cp_prob_5),
+                l3_action = %format!("{:?}", action).chars().take(40).collect::<String>(),
+                // Final
+                position = %format!("{:.4}", self.position.position()),
+                "[Trace] L1->L2->L3 pipeline"
+            );
 
             // Handle controller decision
             use crate::market_maker::control::Action;

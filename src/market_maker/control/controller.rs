@@ -5,7 +5,6 @@
 //! where Q(s, a) = r(s, a) + γ E[V(s') | s, a]
 
 use super::actions::{Action, ActionConfig, DefensiveReason, NoQuoteReason};
-use super::interface::LearningModuleOutput;
 use super::state::ControlState;
 use super::value::{ActionOutcome, ExpectedValueComputer, ValueFunction};
 use crate::market_maker::learning::QuoteDecision;
@@ -339,11 +338,11 @@ impl OptimalController {
     }
 
     /// Conservative action when models disagree.
-    fn conservative_action(&self, myopic: &QuoteDecision, state: &ControlState) -> Action {
+    fn conservative_action(&self, myopic: &QuoteDecision, _state: &ControlState) -> Action {
         match myopic {
             QuoteDecision::Quote {
                 size_fraction,
-                expected_edge,
+                expected_edge: _,
                 ..
             } => {
                 // Reduce size and widen spreads
@@ -358,7 +357,7 @@ impl OptimalController {
                 size_fraction: fraction * 0.5,
                 reason: DefensiveReason::ModelDisagreement,
             },
-            QuoteDecision::NoQuote { reason } => Action::NoQuote {
+            QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::ModelDegraded,
             },
         }
@@ -413,7 +412,7 @@ impl OptimalController {
         } else {
             // Reduce size proportionally
             match myopic {
-                QuoteDecision::Quote { expected_edge, .. } => Action::DefensiveQuote {
+                QuoteDecision::Quote { expected_edge: _, .. } => Action::DefensiveQuote {
                     spread_multiplier: 1.0,
                     size_fraction: max_fraction,
                     reason: DefensiveReason::PositionLimitApproaching,
@@ -426,22 +425,22 @@ impl OptimalController {
     }
 
     /// Convert myopic decision to action.
-    fn myopic_to_action(&self, myopic: &QuoteDecision, state: &ControlState) -> Action {
+    fn myopic_to_action(&self, myopic: &QuoteDecision, _state: &ControlState) -> Action {
         match myopic {
             QuoteDecision::Quote {
-                size_fraction,
+                size_fraction: _,
                 expected_edge,
                 ..
             } => Action::Quote {
                 ladder: Ladder::default(),
                 expected_value: *expected_edge,
             },
-            QuoteDecision::ReducedSize { fraction, reason } => Action::DefensiveQuote {
+            QuoteDecision::ReducedSize { fraction, reason: _ } => Action::DefensiveQuote {
                 spread_multiplier: 1.0,
                 size_fraction: *fraction,
                 reason: DefensiveReason::ModelDisagreement,
             },
-            QuoteDecision::NoQuote { reason } => Action::NoQuote {
+            QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::NegativeEdge,
             },
         }
@@ -493,7 +492,7 @@ mod tests {
         let controller = OptimalController::default();
         let state = ControlState::default();
 
-        let (action, value) = controller.optimal_action(&state);
+        let (action, _value) = controller.optimal_action(&state);
         // Should return some action
         assert!(!matches!(action, Action::DumpInventory { .. }));
     }

@@ -29,11 +29,11 @@ impl Default for DecisionEngineConfig {
         Self {
             risk_aversion: 0.5,
             survival_threshold: 0.05, // 5% max drawdown
-            min_edge_confidence: 0.55, // 55% confidence edge > 0 (permissive for warmup)
+            min_edge_confidence: 0.45, // 45% confidence - very permissive to allow warmup quoting
             min_model_health: Health::Warning,
             kelly_fraction: 0.25, // Quarter Kelly
             max_size_fraction: 1.0,
-            min_edge_bps: 0.3, // Minimum 0.3bp expected edge (allow tighter spreads)
+            min_edge_bps: -1.0, // Allow negative edge predictions during warmup (model needs fills to calibrate)
         }
     }
 }

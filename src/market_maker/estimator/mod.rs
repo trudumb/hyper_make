@@ -384,7 +384,9 @@ impl Default for EstimatorConfig {
             min_trade_observations: 5,
 
             // Defaults
-            default_sigma: 0.0001,          // 0.01% per-second
+            // BTC mainnet typically runs 0.0002-0.0003 per-second volatility.
+            // Setting baseline too low (0.0001) causes normal conditions to trigger Extreme regime.
+            default_sigma: 0.00025,         // 0.025% per-second (typical BTC mainnet)
             default_kappa: 100.0,           // Moderate depth decay
             default_arrival_intensity: 0.5, // 0.5 ticks per second
 

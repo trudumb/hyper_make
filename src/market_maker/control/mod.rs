@@ -49,7 +49,7 @@ pub use state::{ControlState, StateConfig};
 pub use types::{DirichletPosterior, DiscreteDistribution, GammaPosterior, NormalGammaPosterior};
 
 use crate::market_maker::fills::FillEvent;
-use crate::market_maker::learning::{Health, ModelHealth, QuoteDecision};
+use crate::market_maker::learning::{Health, QuoteDecision};
 use crate::market_maker::quoting::Ladder;
 use tracing::{debug, info, warn};
 
@@ -410,18 +410,18 @@ impl StochasticController {
         match decision {
             QuoteDecision::Quote {
                 expected_edge,
-                size_fraction,
+                size_fraction: _,
                 ..
             } => Action::Quote {
                 ladder: Ladder::default(),
                 expected_value: *expected_edge,
             },
-            QuoteDecision::ReducedSize { fraction, reason } => Action::DefensiveQuote {
+            QuoteDecision::ReducedSize { fraction, reason: _ } => Action::DefensiveQuote {
                 spread_multiplier: 1.0,
                 size_fraction: *fraction,
                 reason: DefensiveReason::ModelDisagreement,
             },
-            QuoteDecision::NoQuote { reason } => Action::NoQuote {
+            QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::NegativeEdge,
             },
         }
@@ -429,7 +429,7 @@ impl StochasticController {
 
     /// Check if we should log this cycle.
     fn should_log(&self) -> bool {
-        self.config.log_interval > 0 && self.cycle_count % self.config.log_interval == 0
+        self.config.log_interval > 0 && self.cycle_count.is_multiple_of(self.config.log_interval)
     }
 
     /// Log current state.
@@ -448,6 +448,18 @@ impl StochasticController {
             expected_value = %format!("{:.4}", expected_value),
             action = ?action,
             "Stochastic controller state"
+        );
+
+        // Log detailed changepoint state for diagnostics
+        info!(
+            target: "layer3::changepoint",
+            p_now = %format!("{:.4}", cp_summary.cp_prob_1),
+            p_5 = %format!("{:.4}", cp_summary.cp_prob_5),
+            p_10 = %format!("{:.4}", cp_summary.cp_prob_10),
+            run_length = cp_summary.most_likely_run,
+            entropy = %format!("{:.4}", cp_summary.entropy),
+            detected = cp_summary.detected,
+            "[Changepoint] BOCD state"
         );
     }
 

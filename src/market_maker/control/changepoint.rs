@@ -159,7 +159,7 @@ impl ChangepointDetector {
 
         // Calculate predictive probabilities
         let mut pred_probs = Vec::with_capacity(n_run_lengths);
-        for (r, stats) in self.run_statistics.iter().enumerate() {
+        for stats in self.run_statistics.iter() {
             let p = stats.predictive_prob(observation, &self.prior);
             pred_probs.push(p);
         }

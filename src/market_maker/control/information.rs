@@ -226,15 +226,12 @@ pub struct InformationSummary {
 
 /// Action value comparator for timing decisions.
 #[derive(Debug, Clone)]
-pub struct ActionValueComparator {
-    /// Value function reference (simplified)
-    baseline_value: f64,
-}
+pub struct ActionValueComparator {}
 
 impl ActionValueComparator {
     /// Create a new comparator.
     pub fn new() -> Self {
-        Self { baseline_value: 0.0 }
+        Self {}
     }
 
     /// Compare immediate action value vs delayed action value.
@@ -313,7 +310,6 @@ pub struct TimingComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market_maker::control::actions::NoQuoteReason;
 
     #[test]
     fn test_information_value_default() {
@@ -335,7 +331,7 @@ mod tests {
         let mut state = ControlState::default();
         state.belief.total_edge_uncertainty = 5.0; // High uncertainty
 
-        let action = Action::Quote {
+        let _action = Action::Quote {
             ladder: Default::default(),
             expected_value: 0.1, // Small expected value
         };

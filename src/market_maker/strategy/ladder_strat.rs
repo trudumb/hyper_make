@@ -549,9 +549,9 @@ impl LadderStrategy {
 
             // === MARGIN RESERVE BUFFER ===
             // Only use a fraction of available margin for quoting to maintain safety buffer.
-            // 15% total utilization = 7.5% per side when flat.
-            // This prevents over-leveraging and leaves margin for adverse price moves.
-            const MAX_MARGIN_UTILIZATION: f64 = 0.15; // Use only 15% of available margin
+            // 50% total utilization = 25% per side when flat.
+            // GLFT model handles risk through gamma scaling, so we can use more margin.
+            const MAX_MARGIN_UTILIZATION: f64 = 0.50; // Use 50% of available margin
             let usable_margin = available_margin * MAX_MARGIN_UTILIZATION;
 
             // === TWO-SIDED MARGIN ALLOCATION (STOCHASTIC-WEIGHTED) ===

@@ -359,8 +359,8 @@ impl DirichletPosterior {
     }
 
     /// Probability that category i is the best (highest true probability).
-    /// Uses Monte Carlo sampling.
-    pub fn prob_best(&self, i: usize, n_samples: usize) -> f64 {
+    /// Uses closed-form approximation (n_samples parameter reserved for future Monte Carlo).
+    pub fn prob_best(&self, i: usize, _n_samples: usize) -> f64 {
         if i >= self.alpha.len() {
             return 0.0;
         }

@@ -419,14 +419,14 @@ impl FillProcessor {
                 .on_fill(fill, &params, state.position.position());
         }
 
+        // Update P&L peak tracking after fill
+        let pnl_summary = state.pnl_tracker.summary_update_peak(state.latest_mid);
+
         // Layer 3: Update stochastic controller beliefs
         // This is the critical feedback loop that was missing!
         if state.stochastic_controller.is_enabled() {
-            // Calculate drawdown from P&L (simplified - peak tracking would be better)
-            let pnl_summary = state.pnl_tracker.summary(state.latest_mid);
-            // Use 0.0 as fallback since we don't track peak_pnl here
-            // The actual drawdown is tracked in the risk monitors
-            let drawdown = 0.0;
+            // Use actual drawdown from P&L tracking
+            let drawdown = pnl_summary.drawdown();
 
             // Get learning module output for controller
             let learning_output = state.learning.output(
@@ -449,12 +449,12 @@ impl FillProcessor {
                 belief_edge = %format!("{:.2}", state.stochastic_controller.belief().expected_edge()),
                 n_fills = state.stochastic_controller.belief().n_fills,
                 changepoint_prob_5 = %format!("{:.3}", cp_summary.cp_prob_5),
+                drawdown = %format!("{:.2}", drawdown),
                 "Layer 3: Updated beliefs from fill"
             );
         }
 
         // Log fill summary
-        let pnl_summary = state.pnl_tracker.summary(state.latest_mid);
         info!(
             "[Fill] {} {} {} | oid={} tid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
             if fill.is_buy { "bought" } else { "sold" },
