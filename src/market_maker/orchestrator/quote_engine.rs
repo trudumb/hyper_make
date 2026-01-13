@@ -548,6 +548,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         wait_cycles = suggested_wait_cycles,
                         "Layer 3: waiting to learn"
                     );
+                    // Cancel all resting orders when waiting to learn
+                    // This prevents stale orders from sitting on the book while we gather information
+                    let bid_orders = self.orders.get_all_by_side(Side::Buy);
+                    let ask_orders = self.orders.get_all_by_side(Side::Sell);
+                    let resting_oids: Vec<u64> = bid_orders
+                        .iter()
+                        .chain(ask_orders.iter())
+                        .map(|o| o.oid)
+                        .collect();
+                    if !resting_oids.is_empty() {
+                        info!(
+                            count = resting_oids.len(),
+                            "WaitToLearn: cancelling resting orders to prevent stale quotes"
+                        );
+                        self.executor.cancel_bulk_orders(&self.config.asset, resting_oids).await;
+                    }
                     return Ok(());
                 }
                 Action::DumpInventory { urgency, .. } => {

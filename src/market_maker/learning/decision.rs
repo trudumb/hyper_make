@@ -120,15 +120,25 @@ impl DecisionEngine {
             };
         }
 
-        // 4. Check model disagreement
-        // If models strongly disagree, reduce size
-        if ensemble.disagreement > ensemble.mean.abs() {
+        // 4. Check model disagreement using epistemicity ratio (first-principles grounded)
+        //
+        // Variance decomposition: Total = E[Var(X|model)] + Var(E[X|model])
+        //                       std²  = weighted_var     + disagreement²
+        //
+        // Epistemicity ratio = disagreement / std
+        // This measures what fraction of total uncertainty comes from model disagreement.
+        // - Ratio near 0: models agree, uncertainty is within-model (aleatoric)
+        // - Ratio near 1: uncertainty dominated by model disagreement (epistemic)
+        //
+        // By construction, disagreement ≤ std always, so ratio ∈ [0, 1].
+        // When epistemicity > 50%, model disagreement dominates → reduce size.
+        let epistemicity_ratio = ensemble.disagreement / ensemble.std.max(0.001);
+        if epistemicity_ratio > 0.5 {
             return QuoteDecision::ReducedSize {
                 fraction: 0.5,
                 reason: format!(
-                    "High disagreement: {:.2}bp > mean {:.2}bp",
-                    ensemble.disagreement,
-                    ensemble.mean.abs()
+                    "High epistemic uncertainty: {:.0}% of std from model disagreement",
+                    epistemicity_ratio * 100.0
                 ),
             };
         }
@@ -239,7 +249,13 @@ mod tests {
 
     #[test]
     fn test_no_quote_low_confidence() {
-        let engine = DecisionEngine::default();
+        // Use stricter confidence threshold to test the low-confidence rejection path
+        // Default config is permissive (45%) to allow warmup quoting
+        let config = DecisionEngineConfig {
+            min_edge_confidence: 0.60, // Stricter than default 0.45
+            ..Default::default()
+        };
+        let engine = DecisionEngine::new(config);
         let health = ModelHealth::default();
 
         // z = 0.1 / 1.0 = 0.1, giving P(edge > 0) ≈ 54% < 60% threshold
@@ -254,9 +270,9 @@ mod tests {
 
         match decision {
             QuoteDecision::NoQuote { reason } => {
-                // Should fail either on low confidence or low edge
+                // Should fail on low confidence
                 assert!(
-                    reason.contains("Low confidence") || reason.contains("Edge"),
+                    reason.contains("Low confidence"),
                     "Unexpected reason: {}",
                     reason
                 );

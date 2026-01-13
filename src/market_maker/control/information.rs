@@ -36,6 +36,10 @@ pub struct InformationConfig {
     pub max_wait_cycles: u32,
     /// Threshold for deciding to wait
     pub wait_threshold: f64,
+    /// Minimum uncertainty to even consider waiting (bps)
+    /// If σ_edge < this, act immediately. Should approximate half-spread.
+    /// Derived from GLFT: δ = (1/γ) × ln(1 + γ/κ), typically 5-15 bps
+    pub min_uncertainty_to_wait: f64,
 }
 
 impl Default for InformationConfig {
@@ -46,6 +50,9 @@ impl Default for InformationConfig {
             learning_rate: 0.05, // 5% uncertainty reduction per observation
             max_wait_cycles: 10,
             wait_threshold: 0.5,
+            // Typical GLFT half-spread for crypto: ~8 bps
+            // If uncertainty < half-spread, we're confident enough to act
+            min_uncertainty_to_wait: 8.0,
         }
     }
 }
@@ -92,8 +99,9 @@ impl InformationValue {
             return false;
         }
 
-        // 3. Already low uncertainty
-        if state.edge_uncertainty() < 0.5 {
+        // 3. Uncertainty small relative to typical half-spread - act immediately
+        // First-principles: If σ_edge < δ (half-spread), uncertainty doesn't swamp edge
+        if state.edge_uncertainty() < self.config.min_uncertainty_to_wait {
             return false;
         }
 

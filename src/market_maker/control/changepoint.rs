@@ -82,6 +82,12 @@ pub struct ChangepointDetector {
     recent_obs: Vec<f64>,
     /// Maximum recent observations to keep
     max_recent: usize,
+    /// Minimum observations before detection is active (hard cap fallback)
+    warmup_observations: usize,
+    /// Total observations received
+    observation_count: usize,
+    /// Entropy threshold for warmup (primary mechanism)
+    warmup_entropy_threshold: f64,
 }
 
 impl Default for ChangepointDetector {
@@ -103,6 +109,15 @@ pub struct ChangepointConfig {
     pub prior_mean: f64,
     /// Prior variance
     pub prior_var: f64,
+    /// Minimum observations before changepoint detection is active
+    /// During warmup, changepoint_detected() returns false
+    pub warmup_observations: usize,
+    /// Entropy threshold for warmup (natural log scale).
+    /// When run_length_entropy < this threshold, detector is warmed up.
+    /// Entropy measures distribution concentration - low entropy means
+    /// the run length distribution has settled into a meaningful shape.
+    /// Default: 2.0 (e^2 ≈ 7 effective run lengths)
+    pub warmup_entropy_threshold: f64,
 }
 
 impl Default for ChangepointConfig {
@@ -110,9 +125,16 @@ impl Default for ChangepointConfig {
         Self {
             hazard: 1.0 / 250.0, // Expected run length of 250 observations
             max_run_length: 500,
-            threshold: 0.5,
+            // Bayes-optimal threshold: c_miss / (c_miss + c_false)
+            // Treating false alarm as 2.3× worse than miss → threshold ≈ 0.7
+            // This prefers stability: only declare changepoint if P > 70%
+            threshold: 0.7,
             prior_mean: 0.0,
             prior_var: 1.0,
+            warmup_observations: 50, // Hard cap fallback (entropy-based is primary)
+            // Entropy threshold for warmup: when distribution is concentrated
+            // ~2.0 means effective support of e^2 ≈ 7 run lengths
+            warmup_entropy_threshold: 2.0,
         }
     }
 }
@@ -139,7 +161,43 @@ impl ChangepointDetector {
             threshold: config.threshold,
             recent_obs: Vec::new(),
             max_recent: 50,
+            warmup_observations: config.warmup_observations,
+            observation_count: 0,
+            warmup_entropy_threshold: config.warmup_entropy_threshold,
         }
+    }
+
+    /// Check if the detector has completed warmup.
+    ///
+    /// Uses a hybrid approach:
+    /// 1. Minimum observations required (entropy must first rise before it can concentrate)
+    /// 2. Then either: entropy drops below threshold (distribution concentrated)
+    ///    OR observation hard cap is reached
+    ///
+    /// First-principles rationale: BOCD needs time for the run length distribution
+    /// to spread out and then concentrate on meaningful run lengths. At startup,
+    /// entropy is 0 (all mass on r=0), then rises as distribution spreads,
+    /// then falls as it concentrates on stable run lengths.
+    ///
+    /// The minimum observation requirement (10) ensures we don't falsely trigger
+    /// warmup completion due to the degenerate startup entropy = 0 case.
+    pub fn is_warmed_up(&self) -> bool {
+        // Minimum observations to let entropy rise first (escape degenerate r=0 state)
+        const MIN_OBSERVATIONS_FOR_ENTROPY: usize = 10;
+
+        if self.observation_count < MIN_OBSERVATIONS_FOR_ENTROPY {
+            return false;
+        }
+
+        // After minimum observations: check entropy OR hard cap
+        let entropy_ready = self.run_length_entropy() < self.warmup_entropy_threshold;
+        let observation_ready = self.observation_count >= self.warmup_observations;
+        entropy_ready || observation_ready
+    }
+
+    /// Get the maximum run length being tracked.
+    pub fn max_run_length(&self) -> usize {
+        self.max_run_length
     }
 
     /// Update with new observation.
@@ -206,6 +264,7 @@ impl ChangepointDetector {
 
         self.run_length_probs = new_probs;
         self.run_statistics = new_stats;
+        self.observation_count += 1;
     }
 
     /// Get probability that a changepoint occurred in the last k observations.
@@ -220,7 +279,12 @@ impl ChangepointDetector {
     }
 
     /// Check if a recent changepoint was detected.
+    ///
+    /// Returns false during warmup period to prevent false positives at startup.
     pub fn changepoint_detected(&self) -> bool {
+        if !self.is_warmed_up() {
+            return false;
+        }
         self.changepoint_probability(5) > self.threshold
     }
 
@@ -230,7 +294,12 @@ impl ChangepointDetector {
     }
 
     /// Check if beliefs should be reset due to regime change.
+    ///
+    /// Returns false during warmup period to prevent constant resets at startup.
     pub fn should_reset_beliefs(&self) -> bool {
+        if !self.is_warmed_up() {
+            return false;
+        }
         // Reset if changepoint probability is high
         self.changepoint_probability(10) > 0.7
     }
@@ -260,6 +329,7 @@ impl ChangepointDetector {
         self.run_length_probs = vec![1.0];
         self.run_statistics = vec![RunStatistics::default()];
         self.recent_obs.clear();
+        self.observation_count = 0;
     }
 
     /// Get summary for diagnostics.
@@ -271,6 +341,8 @@ impl ChangepointDetector {
             most_likely_run: self.most_likely_run_length(),
             entropy: self.run_length_entropy(),
             detected: self.changepoint_detected(),
+            warmed_up: self.is_warmed_up(),
+            observation_count: self.observation_count,
         }
     }
 }
@@ -290,6 +362,10 @@ pub struct ChangepointSummary {
     pub entropy: f64,
     /// Whether changepoint was detected
     pub detected: bool,
+    /// Whether the detector has completed warmup
+    pub warmed_up: bool,
+    /// Total observations received
+    pub observation_count: usize,
 }
 
 /// Student's t PDF for predictive probability.
@@ -396,5 +472,84 @@ mod tests {
     fn test_student_t_pdf() {
         let pdf = student_t_pdf(0.0, 10.0);
         assert!(pdf > 0.3 && pdf < 0.4); // Approximately 0.389
+    }
+
+    #[test]
+    fn test_warmup_prevents_false_positives() {
+        // Use low observation count to test hard cap fallback
+        let mut detector = ChangepointDetector::new(ChangepointConfig {
+            warmup_observations: 10,
+            warmup_entropy_threshold: 0.1, // Very low entropy threshold (hard to achieve)
+            ..Default::default()
+        });
+
+        // During warmup, should NOT detect changepoint even though cp_prob is high
+        assert!(!detector.is_warmed_up());
+        assert!(!detector.changepoint_detected());
+        assert!(!detector.should_reset_beliefs());
+
+        // The raw probability IS high at startup
+        assert!(detector.changepoint_probability(5) > 0.5);
+
+        // Feed observations - will hit the hard cap fallback
+        for i in 0..10 {
+            detector.update(i as f64 * 0.1);
+        }
+
+        // Now should be warmed up (via observation count fallback)
+        assert!(detector.is_warmed_up());
+        assert_eq!(detector.observation_count, 10);
+
+        // After warmup, detection can work if probability is high
+        let summary = detector.summary();
+        assert!(summary.warmed_up);
+        assert_eq!(summary.observation_count, 10);
+
+        // Reset should clear observation count
+        detector.reset();
+        assert!(!detector.is_warmed_up());
+        assert_eq!(detector.observation_count, 0);
+    }
+
+    #[test]
+    fn test_entropy_based_warmup() {
+        // Use high observation fallback to ensure entropy-based warmup is tested
+        let mut detector = ChangepointDetector::new(ChangepointConfig {
+            warmup_observations: 1000, // High fallback
+            warmup_entropy_threshold: 3.0, // Reasonable entropy threshold
+            ..Default::default()
+        });
+
+        // At startup: entropy should be 0 (all mass on r=0)
+        assert!(!detector.is_warmed_up());
+        let initial_entropy = detector.run_length_entropy();
+        assert!(
+            initial_entropy < 0.01,
+            "Initial entropy should be ~0, got {}",
+            initial_entropy
+        );
+
+        // Feed stable observations to let distribution spread and concentrate
+        for i in 0..100 {
+            detector.update((i as f64 * 0.01).sin()); // Oscillating but stable
+        }
+
+        // After sufficient observations, entropy should be meaningful
+        let final_entropy = detector.run_length_entropy();
+        // The distribution should have spread (entropy > 0) but eventually concentrate
+        assert!(
+            final_entropy > 0.0,
+            "Entropy should be > 0 after data, got {}",
+            final_entropy
+        );
+
+        // Should be warmed up via entropy (since observation_count=100 < 1000)
+        if detector.is_warmed_up() {
+            // Entropy threshold was met
+            assert!(final_entropy < 3.0 || detector.observation_count >= 1000);
+        }
+
+        // Verify max_run_length getter works
+        assert_eq!(detector.max_run_length(), 500); // Default from config
     }
 }

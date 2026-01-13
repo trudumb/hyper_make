@@ -204,7 +204,11 @@ impl StochasticController {
         );
 
         // 6. Information value check: should we wait?
-        if self.info_value.should_wait(&control_state, &action) {
+        // Skip WaitToLearn during L3 warmup - we need data first before making wait decisions
+        // Using myopic actions during warmup allows position building and calibration
+        let should_check_wait = self.changepoint.is_warmed_up();
+
+        if should_check_wait && self.info_value.should_wait(&control_state, &action) {
             self.wait_cycles += 1;
 
             if self.wait_cycles <= self.config.information.max_wait_cycles {
@@ -221,7 +225,7 @@ impl StochasticController {
                     suggested_wait_cycles: self.info_value.recommended_wait_cycles(&control_state),
                 };
             }
-        } else {
+        } else if should_check_wait {
             self.wait_cycles = 0;
         }
 
@@ -379,13 +383,42 @@ impl StochasticController {
     }
 
     /// Assess how much to trust the learning module.
+    ///
+    /// Uses entropy-based trust scaling for principled warmup behavior:
+    /// - During warmup: trust scales with inverse entropy (more concentrated = more trust)
+    /// - After warmup: trust based on changepoint probability
+    ///
+    /// First-principles: Trust should reflect how much we believe the learned
+    /// parameters are relevant to the current regime. Entropy measures how
+    /// confident BOCD is about the run length (regime age).
     fn assess_learning_trust(&self, output: &LearningModuleOutput) -> f64 {
-        // Changepoint detection
-        let changepoint_prob = self.changepoint.changepoint_probability(5);
-        if changepoint_prob > 0.5 {
-            // Recent changepoint - distrust learning module
-            return 0.5 * (1.0 - changepoint_prob);
-        }
+        // Use entropy for principled warmup scaling
+        let entropy = self.changepoint.run_length_entropy();
+        let max_entropy = (self.changepoint.max_run_length() as f64).ln();
+
+        // Normalized entropy ∈ [0, 1]
+        // 0 = maximally concentrated (high confidence in run length)
+        // 1 = maximally spread (no idea about run length)
+        let normalized_entropy = (entropy / max_entropy).clamp(0.0, 1.0);
+
+        let changepoint_factor = if !self.changepoint.is_warmed_up() {
+            // During warmup: scale from 0.5 to 1.0 as entropy decreases
+            // Low entropy = distribution concentrating = can trust more
+            // High entropy = still uncertain = use baseline trust
+            0.5 + 0.5 * (1.0 - normalized_entropy)
+        } else {
+            // Post-warmup: use changepoint probability for regime detection
+            let changepoint_prob = self.changepoint.changepoint_probability(5);
+            if changepoint_prob > 0.5 {
+                // Recent changepoint detected - distrust learning module
+                // Scale trust inversely with changepoint probability
+                // Floor of 0.1 prevents complete paralysis
+                (0.5 * (1.0 - changepoint_prob)).max(0.1)
+            } else {
+                // Stable regime - trust based on inverse probability
+                1.0 - changepoint_prob
+            }
+        };
 
         // Model health
         let health_trust = match output.model_health.overall {
@@ -401,8 +434,8 @@ impl StochasticController {
             1.0
         };
 
-        // Combine factors
-        health_trust * as_trust * (1.0 - changepoint_prob)
+        // Combine factors multiplicatively
+        health_trust * as_trust * changepoint_factor
     }
 
     /// Convert myopic decision to action.
