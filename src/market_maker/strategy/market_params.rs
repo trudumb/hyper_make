@@ -310,16 +310,12 @@ pub struct MarketParams {
     pub kalman_warmed_up: bool,
 
     // === Stochastic Module Integration (Constrained Optimizer) ===
-    /// Whether to use constrained ladder optimizer
-    pub use_constrained_optimizer: bool,
     /// Available margin for order placement (USD)
     pub margin_available: f64,
     /// Current leverage ratio
     pub leverage: f64,
 
     // === Stochastic Module Integration (Kelly-Stochastic Allocation) ===
-    /// Whether to use Kelly-Stochastic allocation (requires use_constrained_optimizer=true)
-    pub use_kelly_stochastic: bool,
     /// Informed trader probability at the touch (0.0-1.0)
     pub kelly_alpha_touch: f64,
     /// Characteristic depth for alpha decay in bps
@@ -400,11 +396,7 @@ pub struct MarketParams {
     /// > 1.0 = widen spreads proportionally
     pub stochastic_spread_multiplier: f64,
 
-    // ==================== Entropy-Based Distribution ====================
-    /// Whether to use entropy-based stochastic order distribution.
-    /// This completely replaces the concentration fallback with diversity-preserving allocation.
-    pub use_entropy_distribution: bool,
-
+    // ==================== Entropy-Based Distribution (always enabled) ====================
     /// Minimum entropy floor (bits). Distribution NEVER drops below this.
     /// H_min = 1.5 → at least exp(1.5) ≈ 4.5 effective levels always active.
     pub entropy_min_entropy: f64,
@@ -684,12 +676,10 @@ impl Default for MarketParams {
             kalman_spread_widening: 0.0, // Will be computed from Kalman filter
             kalman_warmed_up: false,     // Not warmed up initially
             // Constrained Optimizer (stochastic integration)
-            use_constrained_optimizer: true, // Enable for entropy-based allocation
-            margin_available: 0.0,           // Will be fetched from margin sizer
-            leverage: 1.0,                   // Default 1x leverage
+            margin_available: 0.0, // Will be fetched from margin sizer
+            leverage: 1.0,         // Default 1x leverage
             // Kelly-Stochastic Allocation (stochastic integration)
-            use_kelly_stochastic: false, // Default OFF for safety
-            kelly_alpha_touch: 0.15,     // 15% informed at touch
+            kelly_alpha_touch: 0.15, // 15% informed at touch
             kelly_alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
             kelly_fraction: 0.25,        // Quarter Kelly (conservative)
             kelly_time_horizon: 60.0,    // Default 60s (will be computed from config method)
@@ -712,9 +702,8 @@ impl Default for MarketParams {
             tight_quoting_allowed: false, // Conservative default
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
-            // Entropy-Based Distribution (FIRST PRINCIPLES)
-            use_entropy_distribution: true, // Entropy-based allocation (replaces concentration fallback)
-            entropy_min_entropy: 1.5,       // At least ~4.5 effective levels
+            // Entropy-Based Distribution (always enabled)
+            entropy_min_entropy: 1.5, // At least ~4.5 effective levels
             entropy_base_temperature: 1.0,  // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level
             entropy_thompson_samples: 5,    // Moderate stochasticity
@@ -970,7 +959,6 @@ impl MarketParams {
     /// Extract margin constraint parameters as a focused struct.
     pub fn margin_constraints(&self) -> params::MarginConstraintParams {
         params::MarginConstraintParams {
-            use_constrained_optimizer: self.use_constrained_optimizer,
             margin_available: self.margin_available,
             leverage: self.leverage,
         }
@@ -979,7 +967,6 @@ impl MarketParams {
     /// Extract Kelly-Stochastic parameters as a focused struct.
     pub fn kelly_stochastic(&self) -> params::KellyStochasticConfigParams {
         params::KellyStochasticConfigParams {
-            use_kelly_stochastic: self.use_kelly_stochastic,
             alpha_touch: self.kelly_alpha_touch,
             alpha_decay_bps: self.kelly_alpha_decay_bps,
             kelly_fraction: self.kelly_fraction,
@@ -1011,7 +998,6 @@ impl MarketParams {
     /// Extract entropy distribution parameters as a focused struct.
     pub fn entropy_distribution(&self) -> params::EntropyDistributionParams {
         params::EntropyDistributionParams {
-            use_entropy_distribution: self.use_entropy_distribution,
             min_entropy: self.entropy_min_entropy,
             base_temperature: self.entropy_base_temperature,
             min_allocation_floor: self.entropy_min_allocation_floor,

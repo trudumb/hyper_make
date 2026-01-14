@@ -1,3 +1,8 @@
+---
+name: Lead-Lag Estimator
+description: Exploit the fact that Binance BTC perpetual leads Hyperliquid for microprice adjustment and quote skew
+---
+
 # Cross-Exchange Lead-Lag Model Skill
 
 ## Purpose

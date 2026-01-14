@@ -6,12 +6,10 @@ use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig};
 use crate::market_maker::estimator::VolatilityRegime;
-#[allow(deprecated)] // ConstrainedLadderOptimizer is deprecated but kept for legacy path
 use crate::market_maker::quoting::{
-    BayesianFillModel, ConstrainedLadderOptimizer, DepthSpacing, DynamicDepthConfig,
-    DynamicDepthGenerator, EntropyConstrainedOptimizer, EntropyDistributionConfig,
-    EntropyOptimizerConfig, KellyStochasticParams, Ladder, LadderConfig, LadderLevel,
-    LadderParams, LevelOptimizationParams, MarketRegime,
+    BayesianFillModel, DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator,
+    EntropyConstrainedOptimizer, EntropyDistributionConfig, EntropyOptimizerConfig, Ladder,
+    LadderConfig, LadderLevel, LadderParams, LevelOptimizationParams, MarketRegime,
 };
 
 use super::{MarketParams, QuotingStrategy, RiskConfig};
@@ -569,16 +567,12 @@ impl LadderStrategy {
             "Ladder spread diagnostics (gamma includes book_depth + warmup scaling)"
         );
 
-        // === STOCHASTIC MODULE: Constrained Ladder Optimization ===
+        // === STOCHASTIC MODULE: Entropy-Based Ladder Optimization ===
         // Solves: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ  (expected profit)
         // s.t. Σ sᵢ × margin_per_unit ≤ margin_available (margin constraint)
         //      Σ sᵢ ≤ effective_max_position (position constraint - first principles)
         //      Σ sᵢ ≤ exchange_limit (exchange-enforced constraint)
-        tracing::debug!(
-            use_constrained_optimizer = market_params.use_constrained_optimizer,
-            "Checking constrained optimizer path"
-        );
-        if market_params.use_constrained_optimizer {
+        {
             // 1. Available margin comes from the exchange (already accounts for position margin)
             // NOTE: margin_available is already net of position margin, don't double-count!
             let leverage = market_params.leverage.max(1.0);
@@ -839,28 +833,6 @@ impl LadderStrategy {
                 );
             }
 
-            // 5. Create separate optimizers for bids and asks with their respective limits
-            // These are only used when use_entropy_distribution=false (legacy path)
-            // NOTE: Use inventory-weighted margin split (margin_for_bids/asks) not full available_margin
-            #[allow(deprecated)]
-            let optimizer_bids = ConstrainedLadderOptimizer::new(
-                margin_for_bids, // Inventory-weighted margin split
-                available_for_bids,
-                ladder_config.min_level_size,
-                config.min_notional,
-                market_params.microprice,
-                leverage,
-            );
-            #[allow(deprecated)]
-            let optimizer_asks = ConstrainedLadderOptimizer::new(
-                margin_for_asks, // Inventory-weighted margin split
-                available_for_asks,
-                ladder_config.min_level_size,
-                config.min_notional,
-                market_params.microprice,
-                leverage,
-            );
-
             // 5. Build LevelOptimizationParams for bids
             // Use Kelly time horizon for Bayesian fill probability (τ for P(fill|δ,τ))
             let tau_for_fill = market_params.kelly_time_horizon;
@@ -889,74 +861,43 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 6. Optimize bid sizes (entropy-based > Kelly-Stochastic > proportional MV)
+            // 6. Optimize bid sizes using entropy-based allocation
             if !bid_level_params.is_empty() {
-                let allocation = if market_params.use_entropy_distribution {
-                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
-                    // Uses information-theoretic entropy constraints to maintain diversity
-                    // and prevent collapse to 1-2 orders even under adverse conditions.
-                    let entropy_config = EntropyOptimizerConfig {
-                        distribution: EntropyDistributionConfig {
-                            min_entropy: market_params.entropy_min_entropy,
-                            base_temperature: market_params.entropy_base_temperature,
-                            min_allocation_floor: market_params.entropy_min_allocation_floor,
-                            thompson_samples: market_params.entropy_thompson_samples,
-                            ..Default::default()
-                        },
-                        min_notional: config.min_notional,
+                // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                // Uses information-theoretic entropy constraints to maintain diversity
+                // and prevent collapse to 1-2 orders even under adverse conditions.
+                let entropy_config = EntropyOptimizerConfig {
+                    distribution: EntropyDistributionConfig {
+                        min_entropy: market_params.entropy_min_entropy,
+                        base_temperature: market_params.entropy_base_temperature,
+                        min_allocation_floor: market_params.entropy_min_allocation_floor,
+                        thompson_samples: market_params.entropy_thompson_samples,
                         ..Default::default()
-                    };
-
-                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
-                        entropy_config,
-                        market_params.microprice,
-                        margin_for_bids, // Use inventory-weighted margin split (not full margin)
-                        available_for_bids,
-                        leverage,
-                    );
-
-                    let regime = Self::build_market_regime(market_params);
-                    let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
-
-                    info!(
-                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
-                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
-                        entropy_floor_active = entropy_alloc.entropy_floor_active,
-                        active_levels = entropy_alloc.active_levels,
-                        "Entropy optimizer applied to bids"
-                    );
-
-                    entropy_alloc.to_legacy()
-                } else if market_params.use_kelly_stochastic {
-                    // === KELLY-STOCHASTIC ALLOCATION (LEGACY) ===
-                    // Apply volatility regime adjustment to Kelly fraction
-                    // High vol → more conservative (lower Kelly)
-                    // Low vol → more aggressive (higher Kelly)
-                    let regime_multiplier =
-                        market_params.volatility_regime.kelly_fraction_multiplier();
-                    let dynamic_kelly =
-                        (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
-
-                    let kelly_params = KellyStochasticParams {
-                        sigma: market_params.sigma,
-                        time_horizon: market_params.kelly_time_horizon,
-                        alpha_touch: market_params.kelly_alpha_touch,
-                        alpha_decay_bps: market_params.kelly_alpha_decay_bps,
-                        kelly_fraction: dynamic_kelly,
-                    };
-
-                    debug!(
-                        kelly_fraction = %format!("{:.3}", dynamic_kelly),
-                        regime = ?market_params.volatility_regime,
-                        "Kelly-stochastic optimizer applied to bids (legacy)"
-                    );
-
-                    optimizer_bids.optimize_kelly_stochastic(&bid_level_params, &kelly_params)
-                } else {
-                    // === PROPORTIONAL MV ALLOCATION (LEGACY) ===
-                    debug!("Proportional MV optimizer applied to bids (legacy)");
-                    optimizer_bids.optimize(&bid_level_params)
+                    },
+                    min_notional: config.min_notional,
+                    ..Default::default()
                 };
+
+                let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                    entropy_config,
+                    market_params.microprice,
+                    margin_for_bids, // Use inventory-weighted margin split (not full margin)
+                    available_for_bids,
+                    leverage,
+                );
+
+                let regime = Self::build_market_regime(market_params);
+                let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
+
+                info!(
+                    entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                    effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                    entropy_floor_active = entropy_alloc.entropy_floor_active,
+                    active_levels = entropy_alloc.active_levels,
+                    "Entropy optimizer applied to bids"
+                );
+
+                let allocation = entropy_alloc.to_legacy();
 
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.bids.len() {
@@ -992,74 +933,43 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 8. Optimize ask sizes (entropy-based > Kelly-Stochastic > proportional MV)
+            // 8. Optimize ask sizes using entropy-based allocation
             if !ask_level_params.is_empty() {
-                let allocation = if market_params.use_entropy_distribution {
-                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
-                    // Uses information-theoretic entropy constraints to maintain diversity
-                    // and prevent collapse to 1-2 orders even under adverse conditions.
-                    let entropy_config = EntropyOptimizerConfig {
-                        distribution: EntropyDistributionConfig {
-                            min_entropy: market_params.entropy_min_entropy,
-                            base_temperature: market_params.entropy_base_temperature,
-                            min_allocation_floor: market_params.entropy_min_allocation_floor,
-                            thompson_samples: market_params.entropy_thompson_samples,
-                            ..Default::default()
-                        },
-                        min_notional: config.min_notional,
+                // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                // Uses information-theoretic entropy constraints to maintain diversity
+                // and prevent collapse to 1-2 orders even under adverse conditions.
+                let entropy_config = EntropyOptimizerConfig {
+                    distribution: EntropyDistributionConfig {
+                        min_entropy: market_params.entropy_min_entropy,
+                        base_temperature: market_params.entropy_base_temperature,
+                        min_allocation_floor: market_params.entropy_min_allocation_floor,
+                        thompson_samples: market_params.entropy_thompson_samples,
                         ..Default::default()
-                    };
-
-                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
-                        entropy_config,
-                        market_params.microprice,
-                        margin_for_asks, // Use inventory-weighted margin split (not full margin)
-                        available_for_asks,
-                        leverage,
-                    );
-
-                    let regime = Self::build_market_regime(market_params);
-                    let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
-
-                    info!(
-                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
-                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
-                        entropy_floor_active = entropy_alloc.entropy_floor_active,
-                        active_levels = entropy_alloc.active_levels,
-                        "Entropy optimizer applied to asks"
-                    );
-
-                    entropy_alloc.to_legacy()
-                } else if market_params.use_kelly_stochastic {
-                    // === KELLY-STOCHASTIC ALLOCATION (LEGACY) ===
-                    // Apply volatility regime adjustment to Kelly fraction
-                    // High vol → more conservative (lower Kelly)
-                    // Low vol → more aggressive (higher Kelly)
-                    let regime_multiplier =
-                        market_params.volatility_regime.kelly_fraction_multiplier();
-                    let dynamic_kelly =
-                        (market_params.kelly_fraction * regime_multiplier).clamp(0.05, 0.75);
-
-                    let kelly_params = KellyStochasticParams {
-                        sigma: market_params.sigma,
-                        time_horizon: market_params.kelly_time_horizon,
-                        alpha_touch: market_params.kelly_alpha_touch,
-                        alpha_decay_bps: market_params.kelly_alpha_decay_bps,
-                        kelly_fraction: dynamic_kelly,
-                    };
-
-                    debug!(
-                        kelly_fraction = %format!("{:.3}", dynamic_kelly),
-                        regime = ?market_params.volatility_regime,
-                        "Kelly-stochastic optimizer applied to asks (legacy)"
-                    );
-
-                    optimizer_asks.optimize_kelly_stochastic(&ask_level_params, &kelly_params)
-                } else {
-                    // === PROPORTIONAL MV ALLOCATION (LEGACY) ===
-                    debug!("Proportional MV optimizer applied to asks (legacy)");
-                    optimizer_asks.optimize(&ask_level_params)
+                    },
+                    min_notional: config.min_notional,
+                    ..Default::default()
                 };
+
+                let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                    entropy_config,
+                    market_params.microprice,
+                    margin_for_asks, // Use inventory-weighted margin split (not full margin)
+                    available_for_asks,
+                    leverage,
+                );
+
+                let regime = Self::build_market_regime(market_params);
+                let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
+
+                info!(
+                    entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                    effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                    entropy_floor_active = entropy_alloc.entropy_floor_active,
+                    active_levels = entropy_alloc.active_levels,
+                    "Entropy optimizer applied to asks"
+                );
+
+                let allocation = entropy_alloc.to_legacy();
 
                 for (i, &size) in allocation.sizes.iter().enumerate() {
                     if i < ladder.asks.len() {
@@ -1187,9 +1097,6 @@ impl LadderStrategy {
             }
 
             ladder
-        } else {
-            // Fallback path without constrained optimization (still uses dynamic depths)
-            Ladder::generate(&ladder_config, &params)
         }
     }
 }

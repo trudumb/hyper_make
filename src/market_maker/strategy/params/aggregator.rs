@@ -275,14 +275,12 @@ impl ParameterAggregator {
             kalman_warmed_up: est.kalman_warmed_up(),
 
             // === Stochastic Module: Constrained Optimizer ===
-            use_constrained_optimizer: sources.stochastic_config.use_constrained_optimizer,
             margin_available: sources.margin_sizer.state().available_margin,
             // NOTE: Use max_leverage (allowed leverage) not current_leverage (how levered we are)
             // This determines how much margin is needed per unit of position
             leverage: sources.margin_sizer.summary().max_leverage,
 
             // === Stochastic Module: Kelly-Stochastic Allocation ===
-            use_kelly_stochastic: sources.stochastic_config.use_kelly_stochastic,
             kelly_alpha_touch: sources.stochastic_config.kelly_alpha_touch,
             kelly_alpha_decay_bps: sources.stochastic_config.kelly_alpha_decay_bps,
             kelly_fraction: sources.stochastic_config.kelly_fraction,
@@ -400,9 +398,7 @@ impl ParameterAggregator {
             adaptive_warmup_progress: sources.adaptive_spreads.warmup_progress(),
             adaptive_uncertainty_factor: sources.adaptive_spreads.warmup_uncertainty_factor(),
 
-            // === Entropy-Based Distribution ===
-            // Default to off until enabled via stochastic config
-            use_entropy_distribution: sources.stochastic_config.use_entropy_distribution,
+            // === Entropy-Based Distribution (always enabled) ===
             entropy_min_entropy: sources.stochastic_config.entropy_min_entropy,
             entropy_base_temperature: sources.stochastic_config.entropy_base_temperature,
             entropy_min_allocation_floor: sources.stochastic_config.entropy_min_allocation_floor,

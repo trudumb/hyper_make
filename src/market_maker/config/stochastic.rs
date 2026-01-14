@@ -42,17 +42,6 @@ pub struct StochasticConfig {
     /// Adds uncertainty-based spread widening: half_spread += γ × σ_kalman × √T
     pub use_kalman_filter: bool,
 
-    /// Use ConstrainedLadderOptimizer for ladder sizing.
-    /// Optimizes: max Σ λ(δᵢ) × SC(δᵢ) × sᵢ s.t. margin/position constraints
-    /// When false: uses geometric decay allocation
-    pub use_constrained_optimizer: bool,
-
-    /// Use Kelly-Stochastic allocation instead of proportional MV allocation.
-    /// Only active when use_constrained_optimizer is true.
-    /// When true: uses first-passage fill probability and Kelly criterion
-    /// When false: uses proportional allocation by marginal value (λ × SC)
-    pub use_kelly_stochastic: bool,
-
     /// Feed fills to DepthDecayAS for calibration.
     /// Records fill depth and realized AS for exponential decay model fitting.
     /// Safe to enable - passive data collection only.
@@ -190,17 +179,12 @@ pub struct StochasticConfig {
     pub sigma_baseline: f64,
 
     // ==================== Entropy-Based Distribution ====================
-    /// Enable entropy-based stochastic order distribution.
-    /// Completely replaces the concentration fallback with a diversity-preserving system.
-    ///
-    /// Key features:
-    /// - Minimum entropy floor ensures at least N effective levels always active
-    /// - Softmax temperature controls distribution spread
-    /// - Thompson sampling adds controlled randomness
-    /// - Dirichlet smoothing prevents zero allocations
-    ///
-    /// Default: true (the new system is superior to concentration fallback)
-    pub use_entropy_distribution: bool,
+    // Entropy-based stochastic order distribution is always enabled.
+    // Key features:
+    // - Minimum entropy floor ensures at least N effective levels always active
+    // - Softmax temperature controls distribution spread
+    // - Thompson sampling adds controlled randomness
+    // - Dirichlet smoothing prevents zero allocations
 
     /// Minimum entropy floor (bits).
     /// H_min = 1.5 → at least exp(1.5) ≈ 4.5 effective levels always active.
@@ -269,11 +253,9 @@ pub struct StochasticConfig {
 impl Default for StochasticConfig {
     fn default() -> Self {
         Self {
-            // Feature flags - all ON by default
+            // Feature flags
             use_hjb_skew: true,
             use_kalman_filter: true,
-            use_constrained_optimizer: true,
-            use_kelly_stochastic: true, // Use Kelly-Stochastic by default
 
             // Calibration flags - ON by default (passive, safe)
             calibrate_depth_as: true,
@@ -324,9 +306,7 @@ impl Default for StochasticConfig {
             use_adaptive_spreads: true,
             sigma_baseline: 0.0002, // 20 bps per second (matches RiskConfig)
 
-            // Entropy-Based Distribution
-            // ENABLED by default - replaces concentration fallback with diversity-preserving system
-            use_entropy_distribution: true,
+            // Entropy-Based Distribution (always enabled)
             entropy_min_entropy: 1.5,      // At least ~4.5 effective levels
             entropy_base_temperature: 1.0, // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level
@@ -352,8 +332,6 @@ impl StochasticConfig {
         Self {
             use_hjb_skew: true,
             use_kalman_filter: true,
-            use_constrained_optimizer: true,
-            use_kelly_stochastic: true,
             calibrate_depth_as: true,
             use_calibrated_as: true,
             ..Default::default()
@@ -365,8 +343,6 @@ impl StochasticConfig {
         Self {
             use_hjb_skew: false,
             use_kalman_filter: false,
-            use_constrained_optimizer: false,
-            use_kelly_stochastic: false,
             calibrate_depth_as: true,
             use_calibrated_as: false,
             ..Default::default()
@@ -382,18 +358,6 @@ impl StochasticConfig {
     /// Builder: enable Kalman filter.
     pub fn with_kalman_filter(mut self) -> Self {
         self.use_kalman_filter = true;
-        self
-    }
-
-    /// Builder: enable constrained optimizer.
-    pub fn with_constrained_optimizer(mut self) -> Self {
-        self.use_constrained_optimizer = true;
-        self
-    }
-
-    /// Builder: enable Kelly-Stochastic allocation.
-    pub fn with_kelly_stochastic(mut self) -> Self {
-        self.use_kelly_stochastic = true;
         self
     }
 

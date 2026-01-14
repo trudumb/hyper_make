@@ -1,3 +1,8 @@
+---
+name: Adverse Selection Classifier
+description: Predict which incoming trades are informed before they hit you, enabling dynamic spread/kappa adjustment
+---
+
 # Adverse Selection Classifier Skill
 
 ## Purpose

@@ -1,3 +1,8 @@
+---
+name: Quote Engine Integration
+description: Wire together all model components into a coherent quote generation pipeline
+---
+
 # Quote Engine Integration Skill
 
 ## Purpose

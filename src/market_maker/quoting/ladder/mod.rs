@@ -47,11 +47,7 @@ pub use entropy_optimizer::{
     EntropyConstrainedAllocation, EntropyConstrainedOptimizer, EntropyOptimizerConfig,
 };
 pub use fill_probability::{BayesianFillModel, DepthBucket, FirstPassageFillModel};
-#[allow(deprecated)] // ConstrainedLadderOptimizer is deprecated but kept for legacy path
-pub use optimizer::{
-    BindingConstraint, ConstrainedAllocation, ConstrainedLadderOptimizer, KellyStochasticParams,
-    LevelOptimizationParams,
-};
+pub use optimizer::{BindingConstraint, ConstrainedAllocation, LevelOptimizationParams};
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;

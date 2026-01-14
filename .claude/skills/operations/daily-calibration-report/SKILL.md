@@ -1,3 +1,8 @@
+---
+name: Daily Calibration Report
+description: Automated daily health check of all model components for early warning of degradation and drift
+---
+
 # Daily Calibration Report Skill
 
 ## Purpose

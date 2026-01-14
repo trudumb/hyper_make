@@ -1,3 +1,8 @@
+---
+name: Measurement Infrastructure
+description: Build the prediction logging and outcome tracking system that all other model improvements depend on
+---
+
 # Measurement Infrastructure Skill
 
 ## Purpose

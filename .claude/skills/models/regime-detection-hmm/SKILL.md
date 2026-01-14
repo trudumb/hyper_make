@@ -1,3 +1,8 @@
+---
+name: Regime Detection HMM
+description: Bayesian belief tracking over market states using Hidden Markov Models for regime-dependent parameters
+---
+
 # Regime Detection (HMM) Skill
 
 ## Purpose

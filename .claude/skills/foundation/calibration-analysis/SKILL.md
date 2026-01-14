@@ -1,3 +1,8 @@
+---
+name: Calibration Analysis
+description: Systematic analysis of model predictions vs realized outcomes to identify model weaknesses
+---
+
 # Calibration Analysis Skill
 
 ## Purpose

@@ -3,12 +3,8 @@
 /// Kelly-Stochastic config parameters (for MarketParams extraction).
 ///
 /// This is a view type for extracting Kelly parameters from MarketParams.
-/// The actual optimization parameters are in `quoting::ladder::optimizer::KellyStochasticParams`.
 #[derive(Debug, Clone)]
 pub struct KellyStochasticConfigParams {
-    /// Whether to use Kelly-Stochastic allocation.
-    pub use_kelly_stochastic: bool,
-
     /// Informed trader probability at the touch (0.0-1.0).
     pub alpha_touch: f64,
 
@@ -27,7 +23,6 @@ pub struct KellyStochasticConfigParams {
 impl Default for KellyStochasticConfigParams {
     fn default() -> Self {
         Self {
-            use_kelly_stochastic: false,
             alpha_touch: 0.15,
             alpha_decay_bps: 10.0,
             kelly_fraction: 0.25,

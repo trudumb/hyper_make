@@ -1,3 +1,8 @@
+---
+name: Fill Intensity Hawkes
+description: Model fill intensity using Hawkes processes for state-dependent kappa estimation
+---
+
 # Fill Intensity Model (Hawkes Process) Skill
 
 ## Purpose

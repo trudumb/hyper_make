@@ -13,9 +13,6 @@
 /// - **Dirichlet smoothing**: Prior regularization prevents zero allocations
 #[derive(Debug, Clone)]
 pub struct EntropyDistributionParams {
-    /// Whether to use entropy-based stochastic order distribution.
-    pub use_entropy_distribution: bool,
-
     /// Minimum entropy floor (bits).
     /// H_min = 1.5 → at least exp(1.5) ≈ 4.5 effective levels always active.
     pub min_entropy: f64,
@@ -43,7 +40,6 @@ pub struct EntropyDistributionParams {
 impl Default for EntropyDistributionParams {
     fn default() -> Self {
         Self {
-            use_entropy_distribution: true, // First principles: entropy-based allocation
             min_entropy: 1.5,
             base_temperature: 1.0,
             min_allocation_floor: 0.02,
