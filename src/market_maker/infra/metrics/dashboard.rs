@@ -1,0 +1,535 @@
+//! Dashboard API data structures and aggregation.
+//!
+//! Provides JSON-serializable structures for the web dashboard,
+//! aggregating data from various system components.
+
+use crate::market_maker::tracking::{CalibrationMetrics, CalibrationTracker};
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+/// Live quote metrics for dashboard header.
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveQuotes {
+    /// Current mid price.
+    pub mid: f64,
+    /// Current spread in basis points.
+    pub spread_bps: f64,
+    /// Current inventory position.
+    pub inventory: f64,
+    /// Current regime classification.
+    pub regime: String,
+    /// Fill intensity (kappa) estimate.
+    pub kappa: f64,
+    /// Risk aversion parameter (gamma).
+    pub gamma: f64,
+    /// Probability of fill at current depth.
+    pub fill_prob: f64,
+    /// Probability of adverse selection.
+    pub adverse_prob: f64,
+}
+
+impl Default for LiveQuotes {
+    fn default() -> Self {
+        Self {
+            mid: 0.0,
+            spread_bps: 0.0,
+            inventory: 0.0,
+            regime: "Quiet".to_string(),
+            kappa: 0.0,
+            gamma: 0.0,
+            fill_prob: 0.0,
+            adverse_prob: 0.0,
+        }
+    }
+}
+
+/// P&L attribution breakdown.
+#[derive(Clone, Debug, Serialize)]
+pub struct PnLAttribution {
+    /// Revenue from capturing bid-ask spread.
+    pub spread_capture: f64,
+    /// Loss from adverse selection (informed flow).
+    pub adverse_selection: f64,
+    /// Gain/loss from inventory carry.
+    pub inventory_cost: f64,
+    /// Exchange fees paid.
+    pub fees: f64,
+    /// Total P&L.
+    pub total: f64,
+}
+
+impl Default for PnLAttribution {
+    fn default() -> Self {
+        Self {
+            spread_capture: 0.0,
+            adverse_selection: 0.0,
+            inventory_cost: 0.0,
+            fees: 0.0,
+            total: 0.0,
+        }
+    }
+}
+
+/// Regime probability distribution.
+#[derive(Clone, Debug, Serialize)]
+pub struct RegimeProbabilities {
+    pub quiet: f64,
+    pub trending: f64,
+    pub volatile: f64,
+    pub cascade: f64,
+}
+
+impl Default for RegimeProbabilities {
+    fn default() -> Self {
+        Self {
+            quiet: 1.0,
+            trending: 0.0,
+            volatile: 0.0,
+            cascade: 0.0,
+        }
+    }
+}
+
+/// Historical regime snapshot for time series.
+#[derive(Clone, Debug, Serialize)]
+pub struct RegimeSnapshot {
+    /// Time label (HH:MM format).
+    pub time: String,
+    /// Probability of Quiet regime.
+    #[serde(rename = "Quiet")]
+    pub quiet: f64,
+    /// Probability of Trending regime.
+    #[serde(rename = "Trending")]
+    pub trending: f64,
+    /// Probability of Volatile regime.
+    #[serde(rename = "Volatile")]
+    pub volatile: f64,
+    /// Probability of Cascade regime.
+    #[serde(rename = "Cascade")]
+    pub cascade: f64,
+}
+
+/// Current regime state with history.
+#[derive(Clone, Debug, Serialize)]
+pub struct RegimeState {
+    /// Current regime classification.
+    pub current: String,
+    /// Current regime probabilities.
+    pub probabilities: RegimeProbabilities,
+    /// Historical regime probabilities (60 minutes, 1-min intervals).
+    pub history: Vec<RegimeSnapshot>,
+}
+
+impl Default for RegimeState {
+    fn default() -> Self {
+        Self {
+            current: "Quiet".to_string(),
+            probabilities: RegimeProbabilities::default(),
+            history: Vec::new(),
+        }
+    }
+}
+
+/// Simplified fill record for dashboard.
+#[derive(Clone, Debug, Serialize)]
+pub struct FillRecord {
+    /// Time label (HH:MM format).
+    pub time: String,
+    /// P&L from this fill.
+    pub pnl: f64,
+    /// Cumulative P&L.
+    #[serde(rename = "cumPnl")]
+    pub cum_pnl: f64,
+    /// Fill side ("BID" or "ASK").
+    pub side: String,
+    /// Adverse selection measurement (bps).
+    #[serde(rename = "as")]
+    pub adverse_selection: String,
+}
+
+/// Signal information for audit display.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignalInfo {
+    /// Signal name.
+    pub signal: String,
+    /// Mutual information (bits).
+    pub mi: f64,
+    /// Correlation with outcome.
+    pub corr: f64,
+    /// Lag in milliseconds.
+    pub lag: i64,
+    /// Regime variance multiplier.
+    pub rv: f64,
+}
+
+/// Calibration state for dashboard.
+#[derive(Clone, Debug, Serialize)]
+pub struct CalibrationState {
+    pub fill: CalibrationMetrics,
+    pub adverse_selection: CalibrationMetrics,
+}
+
+impl Default for CalibrationState {
+    fn default() -> Self {
+        Self {
+            fill: CalibrationMetrics::default(),
+            adverse_selection: CalibrationMetrics::default(),
+        }
+    }
+}
+
+/// Complete dashboard state for API response.
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardState {
+    pub quotes: LiveQuotes,
+    pub pnl: PnLAttribution,
+    pub regime: RegimeState,
+    pub fills: Vec<FillRecord>,
+    pub calibration: CalibrationState,
+    pub signals: Vec<SignalInfo>,
+    pub timestamp_ms: i64,
+}
+
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self {
+            quotes: LiveQuotes::default(),
+            pnl: PnLAttribution::default(),
+            regime: RegimeState::default(),
+            fills: Vec::new(),
+            calibration: CalibrationState::default(),
+            signals: default_signals(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+/// Default signal list (static for now).
+pub fn default_signals() -> Vec<SignalInfo> {
+    vec![
+        SignalInfo {
+            signal: "binance_lead".to_string(),
+            mi: 0.089,
+            corr: 0.31,
+            lag: -150,
+            rv: 2.3,
+        },
+        SignalInfo {
+            signal: "trade_imb_1s".to_string(),
+            mi: 0.067,
+            corr: 0.24,
+            lag: 0,
+            rv: 1.2,
+        },
+        SignalInfo {
+            signal: "microprice_imb".to_string(),
+            mi: 0.045,
+            corr: 0.19,
+            lag: 0,
+            rv: 0.8,
+        },
+        SignalInfo {
+            signal: "funding_x_imb".to_string(),
+            mi: 0.041,
+            corr: 0.15,
+            lag: 0,
+            rv: 3.1,
+        },
+        SignalInfo {
+            signal: "oi_change_1m".to_string(),
+            mi: 0.023,
+            corr: 0.08,
+            lag: 0,
+            rv: 0.6,
+        },
+    ]
+}
+
+/// Classify regime from continuous signals.
+pub fn classify_regime(cascade_severity: f64, jump_ratio: f64, sigma: f64) -> String {
+    if cascade_severity > 0.5 || jump_ratio > 5.0 {
+        "Cascade".to_string()
+    } else if jump_ratio > 3.0 || cascade_severity > 0.2 {
+        "Volatile".to_string()
+    } else if sigma > 0.002 {
+        // High volatility = trending
+        "Trending".to_string()
+    } else {
+        "Quiet".to_string()
+    }
+}
+
+/// Compute soft regime probabilities using sigmoid-like functions.
+pub fn compute_regime_probabilities(cascade_severity: f64, jump_ratio: f64, sigma: f64) -> RegimeProbabilities {
+    // Use sigmoid functions for smooth transitions
+    let cascade_prob = sigmoid(cascade_severity, 0.3, 10.0) + sigmoid(jump_ratio, 4.0, 2.0);
+    let volatile_prob = sigmoid(jump_ratio, 2.5, 3.0) + sigmoid(cascade_severity, 0.15, 8.0);
+    let trending_prob = sigmoid(sigma, 0.0015, 2000.0);
+
+    // Normalize to sum to 1
+    let total = cascade_prob + volatile_prob + trending_prob + 1.0; // +1 for quiet baseline
+    let quiet_prob = 1.0 / total;
+
+    RegimeProbabilities {
+        quiet: quiet_prob,
+        trending: trending_prob / total,
+        volatile: volatile_prob / total,
+        cascade: cascade_prob / total,
+    }
+}
+
+/// Sigmoid function for smooth transitions.
+fn sigmoid(x: f64, center: f64, steepness: f64) -> f64 {
+    1.0 / (1.0 + (-steepness * (x - center)).exp())
+}
+
+/// Configuration for dashboard aggregator.
+#[derive(Clone, Debug)]
+pub struct DashboardConfig {
+    /// Maximum regime history entries (1 per minute).
+    pub max_regime_history: usize,
+    /// Maximum fill records to keep.
+    pub max_fills: usize,
+    /// Regime snapshot interval.
+    pub regime_snapshot_interval: Duration,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            max_regime_history: 60, // 1 hour at 1-minute intervals
+            max_fills: 100,
+            regime_snapshot_interval: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Aggregates data from system components for dashboard API.
+pub struct DashboardAggregator {
+    /// Configuration.
+    config: DashboardConfig,
+    /// Regime history (thread-safe).
+    regime_history: RwLock<VecDeque<RegimeSnapshot>>,
+    /// Fill history (thread-safe).
+    fill_history: RwLock<VecDeque<FillRecord>>,
+    /// Calibration tracker (shared reference).
+    calibration: Arc<RwLock<CalibrationTracker>>,
+    /// Last regime snapshot time.
+    last_regime_snapshot: RwLock<Instant>,
+    /// Cumulative P&L tracking.
+    cumulative_pnl: RwLock<f64>,
+}
+
+impl DashboardAggregator {
+    pub fn new(config: DashboardConfig, calibration: Arc<RwLock<CalibrationTracker>>) -> Self {
+        Self {
+            config,
+            regime_history: RwLock::new(VecDeque::new()),
+            fill_history: RwLock::new(VecDeque::new()),
+            calibration,
+            last_regime_snapshot: RwLock::new(Instant::now()),
+            cumulative_pnl: RwLock::new(0.0),
+        }
+    }
+
+    /// Record a regime snapshot if interval has elapsed.
+    pub fn maybe_record_regime(&self, probs: &RegimeProbabilities) {
+        let mut last_time = self.last_regime_snapshot.write().unwrap();
+        if last_time.elapsed() >= self.config.regime_snapshot_interval {
+            let snapshot = RegimeSnapshot {
+                time: chrono::Local::now().format("%H:%M").to_string(),
+                quiet: probs.quiet,
+                trending: probs.trending,
+                volatile: probs.volatile,
+                cascade: probs.cascade,
+            };
+
+            let mut history = self.regime_history.write().unwrap();
+            history.push_back(snapshot);
+            while history.len() > self.config.max_regime_history {
+                history.pop_front();
+            }
+
+            *last_time = Instant::now();
+        }
+    }
+
+    /// Record a fill event.
+    pub fn record_fill(&self, pnl: f64, is_buy: bool, as_bps: f64) {
+        let mut cum_pnl = self.cumulative_pnl.write().unwrap();
+        *cum_pnl += pnl;
+
+        let record = FillRecord {
+            time: chrono::Local::now().format("%H:%M").to_string(),
+            pnl,
+            cum_pnl: *cum_pnl,
+            side: if is_buy { "BID" } else { "ASK" }.to_string(),
+            adverse_selection: format!("{:.1}", as_bps),
+        };
+
+        let mut history = self.fill_history.write().unwrap();
+        history.push_back(record);
+        while history.len() > self.config.max_fills {
+            history.pop_front();
+        }
+    }
+
+    /// Generate dashboard snapshot from current state.
+    pub fn snapshot(
+        &self,
+        mid_price: f64,
+        spread_bps: f64,
+        position: f64,
+        kappa: f64,
+        gamma: f64,
+        cascade_severity: f64,
+        jump_ratio: f64,
+        sigma: f64,
+        fill_prob: f64,
+        adverse_prob: f64,
+        spread_capture: f64,
+        adverse_selection: f64,
+        inventory_cost: f64,
+        fees: f64,
+    ) -> DashboardState {
+        // Compute regime
+        let regime = classify_regime(cascade_severity, jump_ratio, sigma);
+        let probs = compute_regime_probabilities(cascade_severity, jump_ratio, sigma);
+
+        // Record regime snapshot if needed
+        self.maybe_record_regime(&probs);
+
+        // Get calibration metrics
+        let calibration_summary = {
+            let calib = self.calibration.read().unwrap();
+            calib.summary()
+        };
+
+        // Get regime history
+        let regime_history: Vec<RegimeSnapshot> = {
+            let history = self.regime_history.read().unwrap();
+            history.iter().cloned().collect()
+        };
+
+        // Get fill history
+        let fills: Vec<FillRecord> = {
+            let history = self.fill_history.read().unwrap();
+            history.iter().cloned().collect()
+        };
+
+        DashboardState {
+            quotes: LiveQuotes {
+                mid: mid_price,
+                spread_bps,
+                inventory: position,
+                regime: regime.clone(),
+                kappa,
+                gamma,
+                fill_prob,
+                adverse_prob,
+            },
+            pnl: PnLAttribution {
+                spread_capture,
+                adverse_selection,
+                inventory_cost,
+                fees,
+                total: spread_capture + adverse_selection + inventory_cost + fees,
+            },
+            regime: RegimeState {
+                current: regime,
+                probabilities: probs,
+                history: regime_history,
+            },
+            fills,
+            calibration: CalibrationState {
+                fill: calibration_summary.fill,
+                adverse_selection: calibration_summary.adverse_selection,
+            },
+            signals: default_signals(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Get the calibration tracker for recording predictions.
+    pub fn calibration(&self) -> Arc<RwLock<CalibrationTracker>> {
+        Arc::clone(&self.calibration)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_regime_classification() {
+        // Quiet
+        assert_eq!(classify_regime(0.0, 1.0, 0.001), "Quiet");
+
+        // Trending
+        assert_eq!(classify_regime(0.0, 1.0, 0.003), "Trending");
+
+        // Volatile
+        assert_eq!(classify_regime(0.3, 4.0, 0.001), "Volatile");
+
+        // Cascade
+        assert_eq!(classify_regime(0.6, 3.0, 0.001), "Cascade");
+        assert_eq!(classify_regime(0.3, 6.0, 0.001), "Cascade");
+    }
+
+    #[test]
+    fn test_regime_probabilities_sum_to_one() {
+        let probs = compute_regime_probabilities(0.2, 2.0, 0.001);
+        let sum = probs.quiet + probs.trending + probs.volatile + probs.cascade;
+        assert!((sum - 1.0).abs() < 0.01, "Sum: {}", sum);
+    }
+
+    #[test]
+    fn test_dashboard_state_serialization() {
+        let state = DashboardState::default();
+        let json = serde_json::to_string(&state).expect("Failed to serialize");
+        assert!(json.contains("quotes"));
+        assert!(json.contains("pnl"));
+        assert!(json.contains("regime"));
+    }
+
+    #[test]
+    fn test_dashboard_aggregator() {
+        let calibration = Arc::new(RwLock::new(CalibrationTracker::default()));
+        let aggregator = DashboardAggregator::new(DashboardConfig::default(), calibration);
+
+        // Record some fills
+        aggregator.record_fill(5.0, true, 2.5);
+        aggregator.record_fill(-3.0, false, 4.0);
+
+        // Generate snapshot
+        let state = aggregator.snapshot(
+            50000.0, 5.0, 0.1, 500.0, 0.2, 0.1, 1.5, 0.001, 0.2, 0.15, 100.0, -50.0, -10.0, -5.0,
+        );
+
+        assert_eq!(state.quotes.mid, 50000.0);
+        assert_eq!(state.fills.len(), 2);
+        assert_eq!(state.pnl.total, 35.0);
+    }
+
+    #[test]
+    fn test_fill_record() {
+        let calibration = Arc::new(RwLock::new(CalibrationTracker::default()));
+        let aggregator = DashboardAggregator::new(DashboardConfig::default(), calibration);
+
+        aggregator.record_fill(10.0, true, 2.0);
+        aggregator.record_fill(-5.0, false, 3.5);
+
+        let fills = aggregator.fill_history.read().unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].pnl, 10.0);
+        assert_eq!(fills[0].cum_pnl, 10.0);
+        assert_eq!(fills[1].pnl, -5.0);
+        assert_eq!(fills[1].cum_pnl, 5.0);
+    }
+}

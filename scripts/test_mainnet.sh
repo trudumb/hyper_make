@@ -1,11 +1,21 @@
 #!/bin/bash
 # Mainnet Validator Perps Market Maker Testing Script
-# Usage: ./scripts/test_mainnet.sh [ASSET] [DURATION_SECS]
+# Usage: ./scripts/test_mainnet.sh [ASSET] [DURATION_SECS] [--dashboard]
 #
 # Examples:
-#   ./scripts/test_mainnet.sh BTC 60       # 1 minute test
-#   ./scripts/test_mainnet.sh BTC 14400    # 4 hour test
-#   ./scripts/test_mainnet.sh SOL 3600     # 1 hour test
+#   ./scripts/test_mainnet.sh BTC 60             # 1 minute test
+#   ./scripts/test_mainnet.sh BTC 14400          # 4 hour test
+#   ./scripts/test_mainnet.sh SOL 3600           # 1 hour test
+#   ./scripts/test_mainnet.sh BTC 300 --dashboard # With live dashboard
+#
+# Options:
+#   --dashboard    Starts HTTP server for live dashboard at http://localhost:3000
+#
+# Dashboard:
+#   When --dashboard is enabled:
+#   - Metrics API runs at http://localhost:8080/api/dashboard
+#   - Dashboard HTML served at http://localhost:3000/mm-dashboard-fixed.html
+#   - Shows live quotes, P&L, regime, fills, and calibration data
 #
 # Notes:
 #   - Uses MAINNET (real funds at risk!)
@@ -18,6 +28,21 @@ set -e
 # Configuration
 ASSET="${1:-BTC}"
 DURATION="${2:-60}"
+DASHBOARD=false
+METRICS_PORT=8080
+
+for arg in "$@"; do
+    case $arg in
+        --dashboard)
+            DASHBOARD=true
+            ;;
+    esac
+done
+
+# Handle case where second arg is a flag
+if [[ "$2" == "--dashboard" ]]; then
+    DURATION=60  # Default duration if only flag passed
+fi
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 LOG_DIR="logs"
 LOG_FILE="${LOG_DIR}/mm_mainnet_${ASSET}_${TIMESTAMP}.log"
@@ -39,6 +64,10 @@ echo -e "Network:   ${RED}MAINNET${NC}"
 echo -e "Asset:     ${GREEN}${ASSET}${NC}"
 echo -e "Duration:  ${GREEN}${DURATION}s${NC}"
 echo -e "Log File:  ${GREEN}${LOG_FILE}${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "API:       ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
+fi
 echo -e "Started:   ${GREEN}$(date)${NC}"
 echo ""
 
@@ -68,21 +97,50 @@ if [ ! -f ".env" ]; then
 fi
 echo -e "${GREEN}Config OK${NC}"
 
+# Start dashboard HTTP server if requested
+DASHBOARD_PID=""
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[3/5] Starting dashboard server...${NC}"
+    python3 -m http.server 3000 &>/dev/null &
+    DASHBOARD_PID=$!
+    echo -e "${GREEN}Dashboard server started (PID: ${DASHBOARD_PID})${NC}"
+    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo ""
+fi
+
 # Run market maker with timeout
-echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[4/5] Running market maker for ${DURATION}s...${NC}"
+else
+    echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+fi
 echo -e "${YELLOW}       Press Ctrl+C to stop early (graceful shutdown)${NC}"
 echo ""
 
+# Build command with optional metrics port
+MM_ARGS="--network mainnet --asset ${ASSET} --log-file ${LOG_FILE}"
+if [ "$DASHBOARD" = true ]; then
+    MM_ARGS="${MM_ARGS} --metrics-port ${METRICS_PORT}"
+fi
+
 # Use timeout with --foreground to ensure signals are forwarded to the child
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-timeout --foreground "${DURATION}" ./target/debug/market_maker \
-    --network mainnet \
-    --asset "${ASSET}" \
-    --log-file "${LOG_FILE}" \
+timeout --foreground "${DURATION}" ./target/debug/market_maker ${MM_ARGS} \
     2>&1 | tee -a "${LOG_FILE}.console" || true
 
+# Stop dashboard server if started
+if [ -n "$DASHBOARD_PID" ]; then
+    echo ""
+    echo -e "${YELLOW}Stopping dashboard server...${NC}"
+    kill $DASHBOARD_PID 2>/dev/null || true
+fi
+
 echo ""
-echo -e "${YELLOW}[4/4] Test complete${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[5/5] Test complete${NC}"
+else
+    echo -e "${YELLOW}[4/4] Test complete${NC}"
+fi
 echo ""
 
 # Summary

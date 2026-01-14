@@ -7,8 +7,10 @@
 //! - **PnL**: Profit and loss attribution
 //! - **WsOrderState**: WebSocket-based order state management (new)
 //! - **AssetId**: Unique identifier for assets (multi-asset support)
+//! - **Calibration**: Prediction calibration tracking for model validation
 
 mod asset_id;
+pub mod calibration;
 mod order_manager;
 mod pnl;
 mod position;
@@ -16,6 +18,7 @@ mod queue;
 pub mod ws_order_state;
 
 pub use asset_id::AssetId;
+pub use calibration::{CalibrationConfig, CalibrationMetrics, CalibrationSummary, CalibrationTracker};
 pub use order_manager::*;
 pub use pnl::*;
 pub use position::*;

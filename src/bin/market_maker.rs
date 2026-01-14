@@ -8,7 +8,8 @@
 //! - Prometheus HTTP metrics endpoint
 
 use alloy::signers::local::PrivateKeySigner;
-use axum::{routing::get, Router};
+use axum::{routing::get, Json, Router};
+use tower_http::cors::{Any, CorsLayer};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -1610,15 +1611,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let quote_for_metrics = collateral_symbol.clone();
 
         tokio::spawn(async move {
-            let app = Router::new().route(
-                "/metrics",
-                get(move || {
-                    let prom = prometheus.clone();
-                    let asset = asset_for_metrics.clone();
-                    let quote = quote_for_metrics.clone();
-                    async move { prom.to_prometheus_text(&asset, &quote) }
-                }),
-            );
+            // Clone prometheus for dashboard endpoint
+            let prometheus_for_dashboard = prometheus.clone();
+
+            // CORS layer to allow dashboard at localhost:3000 to fetch from localhost:8080
+            let cors = CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any);
+
+            let app = Router::new()
+                .route(
+                    "/metrics",
+                    get(move || {
+                        let prom = prometheus.clone();
+                        let asset = asset_for_metrics.clone();
+                        let quote = quote_for_metrics.clone();
+                        async move { prom.to_prometheus_text(&asset, &quote) }
+                    }),
+                )
+                .route(
+                    "/api/dashboard",
+                    get(move || {
+                        let prom = prometheus_for_dashboard.clone();
+                        async move { Json(prom.to_dashboard_state()) }
+                    }),
+                )
+                .layer(cors);
 
             // Security: Bind to localhost only to prevent metrics exposure to network
             let addr = format!("127.0.0.1:{}", metrics_port);

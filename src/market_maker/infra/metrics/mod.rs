@@ -10,14 +10,19 @@
 //! - **Risk**: Kill switch status, cascade severity
 
 mod atomic;
+pub mod dashboard;
 mod fields;
 mod output;
 mod summary;
 mod updates;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use crate::market_maker::tracking::CalibrationTracker;
 use fields::MetricsInner;
+pub use dashboard::{
+    DashboardAggregator, DashboardConfig, DashboardState, LiveQuotes, PnLAttribution, RegimeState,
+};
 pub use summary::MetricsSummary;
 
 /// Prometheus-compatible metrics collector.
@@ -26,14 +31,35 @@ pub use summary::MetricsSummary;
 #[derive(Clone)]
 pub struct PrometheusMetrics {
     inner: Arc<MetricsInner>,
+    /// Dashboard aggregator for fill history and calibration.
+    dashboard: Arc<DashboardAggregator>,
 }
 
 impl PrometheusMetrics {
     /// Create a new metrics collector.
     pub fn new() -> Self {
+        let calibration = Arc::new(RwLock::new(CalibrationTracker::default()));
+        let dashboard = Arc::new(DashboardAggregator::new(
+            DashboardConfig::default(),
+            calibration,
+        ));
         Self {
             inner: Arc::new(MetricsInner::new()),
+            dashboard,
         }
+    }
+
+    /// Record a fill for dashboard display.
+    ///
+    /// This records the fill with P&L and adverse selection info for the
+    /// dashboard's fill history and calibration tracking.
+    pub fn record_fill_for_dashboard(&self, pnl: f64, is_buy: bool, as_bps: f64) {
+        self.dashboard.record_fill(pnl, is_buy, as_bps);
+    }
+
+    /// Get the dashboard aggregator for direct access.
+    pub fn dashboard(&self) -> &DashboardAggregator {
+        &self.dashboard
     }
 }
 

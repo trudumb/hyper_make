@@ -1,19 +1,23 @@
 #!/bin/bash
 # Testnet Market Maker Testing Script
-# Usage: ./scripts/test_testnet.sh [ASSET] [DURATION_SECS] [--diagnostics]
+# Usage: ./scripts/test_testnet.sh [ASSET] [DURATION_SECS] [--diagnostics] [--dashboard]
 #
 # Examples:
-#   ./scripts/test_testnet.sh BTC 60       # 1 minute test
-#   ./scripts/test_testnet.sh BTC 300      # 5 minute test
-#   ./scripts/test_testnet.sh BTC 7200     # 2 hour test
-#   ./scripts/test_testnet.sh BTC 720 --diagnostics  # With L2/L3 diagnostics
+#   ./scripts/test_testnet.sh BTC 60                  # 1 minute test
+#   ./scripts/test_testnet.sh BTC 300                 # 5 minute test
+#   ./scripts/test_testnet.sh BTC 7200                # 2 hour test
+#   ./scripts/test_testnet.sh BTC 720 --diagnostics   # With L2/L3 diagnostics
+#   ./scripts/test_testnet.sh BTC 300 --dashboard     # With live dashboard
 #
-# Diagnostic Mode (--diagnostics):
-#   Enables additional log targets for Layer 2/3 analysis:
-#   - layer2::calibration - ModelConfidenceTracker metrics
-#   - layer3::changepoint - BOCD changepoint detection state
-#   - layer3::trace       - Full L1->L2->L3 pipeline traces
-#   - learning::scatter   - Edge prediction vs realized data
+# Options:
+#   --diagnostics  Enables additional log targets for Layer 2/3 analysis
+#   --dashboard    Starts HTTP server for live dashboard at http://localhost:3000
+#
+# Dashboard:
+#   When --dashboard is enabled:
+#   - Metrics API runs at http://localhost:8080/api/dashboard
+#   - Dashboard HTML served at http://localhost:3000/mm-dashboard-fixed.html
+#   - Shows live quotes, P&L, regime, fills, and calibration data
 #
 # Notes:
 #   - Uses testnet (no real funds at risk)
@@ -27,11 +31,23 @@ set -e
 ASSET="${1:-BTC}"
 DURATION="${2:-60}"
 DIAGNOSTICS=false
-if [[ "$3" == "--diagnostics" ]] || [[ "$2" == "--diagnostics" ]]; then
-    DIAGNOSTICS=true
-    if [[ "$2" == "--diagnostics" ]]; then
-        DURATION=60  # Default duration if only --diagnostics passed
-    fi
+DASHBOARD=false
+METRICS_PORT=8080
+
+for arg in "$@"; do
+    case $arg in
+        --diagnostics)
+            DIAGNOSTICS=true
+            ;;
+        --dashboard)
+            DASHBOARD=true
+            ;;
+    esac
+done
+
+# Handle case where second arg is a flag
+if [[ "$2" == "--diagnostics" ]] || [[ "$2" == "--dashboard" ]]; then
+    DURATION=60  # Default duration if only flag passed
 fi
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 LOG_DIR="logs"
@@ -53,6 +69,10 @@ echo -e "Network:   ${MAGENTA}TESTNET${NC} (no real funds)"
 echo -e "Asset:     ${GREEN}${ASSET}${NC}"
 echo -e "Duration:  ${GREEN}${DURATION}s${NC}"
 echo -e "Log File:  ${GREEN}${LOG_FILE}${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "API:       ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
+fi
 echo -e "Started:   ${GREEN}$(date)${NC}"
 echo ""
 
@@ -78,8 +98,23 @@ if [ ! -f ".env" ]; then
 fi
 echo -e "${GREEN}Config OK${NC}"
 
+# Start dashboard HTTP server if requested
+DASHBOARD_PID=""
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[3/5] Starting dashboard server...${NC}"
+    python3 -m http.server 3000 &>/dev/null &
+    DASHBOARD_PID=$!
+    echo -e "${GREEN}Dashboard server started (PID: ${DASHBOARD_PID})${NC}"
+    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo ""
+fi
+
 # Run market maker with timeout
-echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[4/5] Running market maker for ${DURATION}s...${NC}"
+else
+    echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+fi
 echo -e "${YELLOW}       Press Ctrl+C to stop early (graceful shutdown)${NC}"
 echo ""
 
@@ -91,15 +126,29 @@ else
     export RUST_LOG="hyperliquid_rust_sdk::market_maker=debug"
 fi
 
+# Build command with optional metrics port
+MM_ARGS="--network testnet --asset ${ASSET} --log-file ${LOG_FILE}"
+if [ "$DASHBOARD" = true ]; then
+    MM_ARGS="${MM_ARGS} --metrics-port ${METRICS_PORT}"
+fi
+
 # Use timeout with --foreground to ensure signals are forwarded to the child
-timeout --foreground "${DURATION}" ./target/debug/market_maker \
-    --network testnet \
-    --asset "${ASSET}" \
-    --log-file "${LOG_FILE}" \
+timeout --foreground "${DURATION}" ./target/debug/market_maker ${MM_ARGS} \
     2>&1 | tee -a "${LOG_FILE}.console" || true
 
+# Stop dashboard server if started
+if [ -n "$DASHBOARD_PID" ]; then
+    echo ""
+    echo -e "${YELLOW}Stopping dashboard server...${NC}"
+    kill $DASHBOARD_PID 2>/dev/null || true
+fi
+
 echo ""
-echo -e "${YELLOW}[4/4] Test complete${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[5/5] Test complete${NC}"
+else
+    echo -e "${YELLOW}[4/4] Test complete${NC}"
+fi
 echo ""
 
 # Summary

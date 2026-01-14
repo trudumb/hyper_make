@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use super::dashboard::DashboardState;
 use super::summary::MetricsSummary;
 use super::PrometheusMetrics;
 
@@ -790,5 +791,55 @@ impl PrometheusMetrics {
             kelly_fraction: self.inner.kelly_fraction.load(),
             kelly_alpha_decay_bps: self.inner.kelly_alpha_decay_bps.load(),
         }
+    }
+
+    /// Get dashboard state for web UI.
+    ///
+    /// Creates a JSON-serializable dashboard state from current metrics.
+    /// This provides a snapshot suitable for the real-time dashboard.
+    /// Uses the dashboard aggregator to include fill history and calibration data.
+    pub fn to_dashboard_state(&self) -> DashboardState {
+        let mid_price = self.inner.mid_price.load();
+        let spread_bps = self.inner.spread_bps.load();
+        let position = self.inner.position.load();
+        let kappa = self.inner.kappa.load();
+        let sigma = self.inner.sigma.load();
+        let jump_ratio = self.inner.jump_ratio.load();
+        let cascade_severity = self.inner.cascade_severity.load();
+        let adverse_selection_bps = self.inner.adverse_selection_bps.load();
+        let daily_pnl = self.inner.daily_pnl.load();
+
+        // Estimate fill probability and adverse probability from available data
+        // For fill probability, use a simple heuristic based on spread
+        let fill_prob = (0.3 / (1.0 + spread_bps / 10.0)).clamp(0.05, 0.5);
+        // For adverse probability, use the AS estimator's output
+        let adverse_prob = (adverse_selection_bps / 10.0).clamp(0.0, 1.0);
+
+        // Current gamma (use kelly fraction as proxy, or default)
+        let gamma = self.inner.kelly_fraction.load().max(0.1);
+
+        // P&L component estimates
+        let spread_capture = daily_pnl.max(0.0);
+        let adverse_selection = (-adverse_selection_bps * position.abs() * mid_price / 10000.0).min(0.0);
+        let inventory_cost = 0.0; // Would need more tracking
+        let fees = 0.0; // Would need more tracking
+
+        // Use dashboard aggregator snapshot to get fills, calibration, and regime history
+        self.dashboard.snapshot(
+            mid_price,
+            spread_bps,
+            position,
+            kappa,
+            gamma,
+            cascade_severity,
+            jump_ratio,
+            sigma,
+            fill_prob * 100.0, // As percentage
+            adverse_prob * 100.0,
+            spread_capture,
+            adverse_selection,
+            inventory_cost,
+            fees,
+        )
     }
 }

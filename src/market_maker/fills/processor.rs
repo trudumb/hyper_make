@@ -455,6 +455,7 @@ impl FillProcessor {
         }
 
         // Log fill summary
+        let as_bps = state.adverse_selection.realized_as_bps();
         info!(
             "[Fill] {} {} {} | oid={} tid={} | position: {} | AS: {:.2}bps | P&L: ${:.2}",
             if fill.is_buy { "bought" } else { "sold" },
@@ -463,9 +464,14 @@ impl FillProcessor {
             fill.oid,
             fill.tid,
             state.position.position(),
-            state.adverse_selection.realized_as_bps(),
+            as_bps,
             pnl_summary.total_pnl
         );
+
+        // Record fill for dashboard display
+        state
+            .prometheus
+            .record_fill_for_dashboard(pnl_summary.total_pnl, fill.is_buy, as_bps);
 
         // Optional metrics recorder
         if let Some(m) = state.metrics {

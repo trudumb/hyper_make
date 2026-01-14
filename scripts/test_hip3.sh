@@ -1,12 +1,22 @@
 #!/bin/bash
 # HIP-3 DEX Testing Workflow Script
-# Usage: ./scripts/test_hip3.sh [ASSET] [DEX] [DURATION_SECS] [SPREAD_PROFILE]
+# Usage: ./scripts/test_hip3.sh [ASSET] [DEX] [DURATION_SECS] [SPREAD_PROFILE] [--dashboard]
 #
 # Examples:
 #   ./scripts/test_hip3.sh BTC hyna 60         # 1 minute test (default profile)
 #   ./scripts/test_hip3.sh HYPE hyna 3200 hip3  # 1 hour test with tight spreads
 #   ./scripts/test_hip3.sh HYPE hyna 14400 hip3   # 4 hour test with 15-25 bps target
 #   ./scripts/test_hip3.sh ETH flx 120         # 2 minute test on Felix
+#   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --dashboard  # With live dashboard
+#
+# Options:
+#   --dashboard    Starts HTTP server for live dashboard at http://localhost:3000
+#
+# Dashboard:
+#   When --dashboard is enabled:
+#   - Metrics API runs at http://localhost:8080/api/dashboard
+#   - Dashboard HTML served at http://localhost:3000/mm-dashboard-fixed.html
+#   - Shows live quotes, P&L, regime, fills, and calibration data
 #
 # Spread Profiles:
 #   default    - 40-50 bps spreads (standard)
@@ -20,6 +30,17 @@ ASSET="${1:-BTC}"
 DEX="${2:-hyna}"
 DURATION="${3:-60}"
 SPREAD_PROFILE="${4:-hip3}"  # Default to hip3 for HIP-3 DEX testing
+DASHBOARD=false
+METRICS_PORT=8080
+
+for arg in "$@"; do
+    case $arg in
+        --dashboard)
+            DASHBOARD=true
+            ;;
+    esac
+done
+
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 LOG_DIR="logs"
 LOG_FILE="${LOG_DIR}/mm_hip3_${DEX}_${ASSET}_${SPREAD_PROFILE}_${TIMESTAMP}.log"
@@ -41,6 +62,10 @@ echo -e "DEX:            ${GREEN}${DEX}${NC}"
 echo -e "Spread Profile: ${CYAN}${SPREAD_PROFILE}${NC}"
 echo -e "Duration:       ${GREEN}${DURATION}s${NC}"
 echo -e "Log File:       ${GREEN}${LOG_FILE}${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "Dashboard:      ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo -e "API:            ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
+fi
 echo -e "Started:        ${GREEN}$(date)${NC}"
 echo ""
 
@@ -83,26 +108,53 @@ if [ ! -f ".env" ]; then
 fi
 echo -e "${GREEN}Config OK${NC}"
 
+# Start dashboard HTTP server if requested
+DASHBOARD_PID=""
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[3/5] Starting dashboard server...${NC}"
+    python3 -m http.server 3000 &>/dev/null &
+    DASHBOARD_PID=$!
+    echo -e "${GREEN}Dashboard server started (PID: ${DASHBOARD_PID})${NC}"
+    echo -e "${GREEN}Open: http://localhost:3000/mm-dashboard-fixed.html${NC}"
+    echo ""
+fi
+
 # Run market maker with timeout
 # Note: We run the binary directly (not via cargo run) so Ctrl+C signals
 # are delivered correctly to the market_maker process
-echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[4/5] Running market maker for ${DURATION}s...${NC}"
+else
+    echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
+fi
 echo -e "${YELLOW}       Press Ctrl+C to stop early (graceful shutdown)${NC}"
 echo ""
+
+# Build command with optional metrics port
+MM_ARGS="--network mainnet --asset ${ASSET} --dex ${DEX} --spread-profile ${SPREAD_PROFILE} --log-file ${LOG_FILE}"
+if [ "$DASHBOARD" = true ]; then
+    MM_ARGS="${MM_ARGS} --metrics-port ${METRICS_PORT}"
+fi
 
 # Use timeout with --foreground to ensure signals are forwarded to the child
 # The binary is run directly for proper signal handling
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-timeout --foreground "${DURATION}" ./target/debug/market_maker \
-    --network mainnet \
-    --asset "${ASSET}" \
-    --dex "${DEX}" \
-    --spread-profile "${SPREAD_PROFILE}" \
-    --log-file "${LOG_FILE}" \
+timeout --foreground "${DURATION}" ./target/debug/market_maker ${MM_ARGS} \
     2>&1 | tee -a "${LOG_FILE}.console" || true
 
+# Stop dashboard server if started
+if [ -n "$DASHBOARD_PID" ]; then
+    echo ""
+    echo -e "${YELLOW}Stopping dashboard server...${NC}"
+    kill $DASHBOARD_PID 2>/dev/null || true
+fi
+
 echo ""
-echo -e "${YELLOW}[4/4] Test complete${NC}"
+if [ "$DASHBOARD" = true ]; then
+    echo -e "${YELLOW}[5/5] Test complete${NC}"
+else
+    echo -e "${YELLOW}[4/4] Test complete${NC}"
+fi
 echo ""
 
 # Summary
