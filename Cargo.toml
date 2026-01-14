@@ -57,6 +57,10 @@ path = "src/bin/market_maker.rs"
 name = "parameter_estimator"
 path = "src/bin/parameter_estimator.rs"
 
+[[bin]]
+name = "paper_trader"
+path = "src/bin/paper_trader.rs"
+
 # Fast release builds (for dev iteration)
 [profile.release]
 incremental = true

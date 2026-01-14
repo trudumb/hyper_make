@@ -13,9 +13,10 @@ use smallvec::SmallVec;
 
 use crate::market_maker::infra::capacity::FILL_TID_INLINE_CAPACITY;
 use crate::EPSILON;
+use serde::{Deserialize, Serialize};
 
 /// Side of an order (buy or sell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,

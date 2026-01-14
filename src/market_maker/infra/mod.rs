@@ -27,7 +27,7 @@ mod execution_budget;
 mod executor;
 mod logging;
 mod margin;
-mod metrics;
+pub mod metrics;
 mod orphan_tracker;
 mod rate_limit;
 mod reconciliation;

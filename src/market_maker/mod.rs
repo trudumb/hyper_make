@@ -26,6 +26,7 @@ pub mod tracking;
 pub mod control;
 pub mod latent;
 pub mod learning;
+pub mod simulation;
 
 mod orchestrator;
 
