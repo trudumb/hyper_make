@@ -18,7 +18,7 @@ alloy = { version = "1.0", default-features = false, features = [
   "signer-local",
 ] }
 async-trait = "0.1"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 chrono = "0.4.26"
 clap = { version = "4.4", features = ["derive", "env"] }
 dotenvy = "0.15"

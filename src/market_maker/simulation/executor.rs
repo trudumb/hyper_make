@@ -4,7 +4,10 @@
 //! without actually submitting them to the exchange. Used for paper trading
 //! and backtesting.
 
-use crate::market_maker::{CancelResult, ModifyResult, ModifySpec, OrderExecutor, OrderResult, OrderSpec};
+use crate::market_maker::{
+    tracking::ws_order_state::WsFillEvent, CancelResult, ModifyResult, ModifySpec, OrderExecutor,
+    OrderResult, OrderSpec,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -184,6 +187,66 @@ impl SimulationExecutor {
         } else {
             false
         }
+    }
+
+    /// Simulate a fill and return a WsFillEvent for injection into handlers.
+    ///
+    /// This is the primary method for paper trading integration. It:
+    /// 1. Updates the simulated order state
+    /// 2. Returns a WsFillEvent that can be passed to MarketMaker fill handlers
+    ///
+    /// Returns None if the order doesn't exist or isn't resting.
+    pub fn apply_fill(&self, oid: u64, fill_size: f64, fill_price: f64) -> Option<WsFillEvent> {
+        let mut orders = self.orders.write().unwrap();
+        let order = orders.get_mut(&oid)?;
+
+        if order.status != SimulatedOrderStatus::Resting {
+            return None;
+        }
+
+        let actual_fill = fill_size.min(order.size);
+        order.size -= actual_fill;
+
+        if order.size <= 0.0 {
+            order.status = SimulatedOrderStatus::Filled;
+        }
+
+        // Generate unique trade ID
+        let tid = self.next_order_id(); // Reuse OID generator for TID
+
+        // Log the fill
+        self.log_event(
+            OrderEvent::Fill,
+            Some(order.clone()),
+            format!(
+                "Filled {} @ {} (remaining: {}) tid={}",
+                actual_fill, fill_price, order.size, tid
+            ),
+        );
+
+        let mut stats = self.stats.write().unwrap();
+        stats.simulated_fills += 1;
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        Some(WsFillEvent {
+            oid,
+            tid,
+            size: actual_fill,
+            price: fill_price,
+            is_buy: order.is_buy,
+            coin: order.asset.clone(),
+            cloid: Some(order.cloid.clone()),
+            timestamp: now_ms,
+        })
+    }
+
+    /// Get an order by OID (for fill simulation logic)
+    pub fn get_order(&self, oid: u64) -> Option<SimulatedOrder> {
+        self.orders.read().unwrap().get(&oid).cloned()
     }
 
     /// Check if a post-only order would cross the spread

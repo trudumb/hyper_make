@@ -21,6 +21,7 @@
 mod arena;
 pub mod capacity;
 mod connection_supervisor;
+pub mod dashboard_ws;
 mod data_quality;
 mod exchange_limits;
 mod execution_budget;
@@ -37,6 +38,7 @@ mod ws_executor;
 
 pub use arena::*;
 pub use connection_supervisor::*;
+pub use dashboard_ws::*;
 pub use data_quality::*;
 pub use exchange_limits::*;
 pub use execution_budget::*;

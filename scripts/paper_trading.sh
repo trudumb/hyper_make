@@ -7,7 +7,7 @@
 #   ./scripts/paper_trading.sh BTC 300                 # 5 minute simulation
 #   ./scripts/paper_trading.sh BTC 3600 --report       # 1 hour with calibration report
 #   ./scripts/paper_trading.sh BTC 300 --verbose       # With verbose logging
-#   ./scripts/paper_trading.sh BTC 300 --dashboard     # With live dashboard
+#   ./scripts/paper_trading.sh BTC 3600 --dashboard     # With live dashboard
 #
 # Options:
 #   --report    Generate calibration report at end

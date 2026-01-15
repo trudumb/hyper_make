@@ -180,6 +180,65 @@ impl Default for CalibrationState {
     }
 }
 
+// ============================================================================
+// New Dashboard Visualization Structures
+// ============================================================================
+
+/// Single order book level for heat map.
+#[derive(Clone, Debug, Serialize)]
+pub struct BookLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
+/// Order book snapshot for 2D heat map visualization.
+#[derive(Clone, Debug, Serialize)]
+pub struct BookSnapshot {
+    pub time: String,
+    pub timestamp_ms: i64,
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+}
+
+/// Mid price point for live price chart.
+#[derive(Clone, Debug, Serialize)]
+pub struct PricePoint {
+    pub time: String,
+    pub timestamp_ms: i64,
+    pub price: f64,
+}
+
+/// Our quote snapshot for overlay visualization.
+#[derive(Clone, Debug, Serialize)]
+pub struct QuoteSnapshot {
+    pub time: String,
+    pub timestamp_ms: i64,
+    pub bid_prices: Vec<f64>,
+    pub ask_prices: Vec<f64>,
+    pub spread_bps: f64,
+}
+
+/// Quote fill statistics by level.
+#[derive(Clone, Debug, Serialize)]
+pub struct QuoteFillStats {
+    pub level: usize,
+    pub side: String,
+    pub fill_count: u32,
+    pub total_size: f64,
+}
+
+/// Spread distribution bucket.
+#[derive(Clone, Debug, Serialize)]
+pub struct SpreadBucket {
+    pub range_bps: String,
+    pub count: u32,
+    pub percentage: f64,
+}
+
+// ============================================================================
+// Dashboard State
+// ============================================================================
+
 /// Complete dashboard state for API response.
 #[derive(Clone, Debug, Serialize)]
 pub struct DashboardState {
@@ -190,6 +249,13 @@ pub struct DashboardState {
     pub calibration: CalibrationState,
     pub signals: Vec<SignalInfo>,
     pub timestamp_ms: i64,
+
+    // New visualization data
+    pub book_history: Vec<BookSnapshot>,
+    pub price_history: Vec<PricePoint>,
+    pub quote_history: Vec<QuoteSnapshot>,
+    pub quote_fill_stats: Vec<QuoteFillStats>,
+    pub spread_distribution: Vec<SpreadBucket>,
 }
 
 impl Default for DashboardState {
@@ -202,6 +268,12 @@ impl Default for DashboardState {
             calibration: CalibrationState::default(),
             signals: default_signals(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            // New visualization data - empty by default
+            book_history: Vec::new(),
+            price_history: Vec::new(),
+            quote_history: Vec::new(),
+            quote_fill_stats: Vec::new(),
+            spread_distribution: Vec::new(),
         }
     }
 }
@@ -449,6 +521,12 @@ impl DashboardAggregator {
             },
             signals: default_signals(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            // New visualization data (populated by caller if available)
+            book_history: Vec::new(),
+            price_history: Vec::new(),
+            quote_history: Vec::new(),
+            quote_fill_stats: Vec::new(),
+            spread_distribution: Vec::new(),
         }
     }
 

@@ -56,6 +56,86 @@
 
         // API Configuration
         const API_BASE = 'http://localhost:8080';  // Change to your market maker's metrics port
+        const WS_URL = 'ws://localhost:8080/ws/dashboard';  // WebSocket endpoint
+
+        // WebSocket Dashboard Client
+        class DashboardWebSocket {
+            constructor(url, onSnapshot, onUpdate, onFill, onConnected, onDisconnected) {
+                this.url = url;
+                this.onSnapshot = onSnapshot;
+                this.onUpdate = onUpdate;
+                this.onFill = onFill;
+                this.onConnected = onConnected;
+                this.onDisconnected = onDisconnected;
+                this.ws = null;
+                this.reconnectAttempts = 0;
+                this.maxReconnectDelay = 5000;
+                this.connected = false;
+            }
+
+            connect() {
+                try {
+                    this.ws = new WebSocket(this.url);
+
+                    this.ws.onopen = () => {
+                        console.log('[WS] Connected to dashboard');
+                        this.connected = true;
+                        this.reconnectAttempts = 0;
+                    };
+
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const msg = JSON.parse(event.data);
+                            switch (msg.type) {
+                                case 'snapshot':
+                                    this.onSnapshot(msg.state);
+                                    break;
+                                case 'update':
+                                    this.onUpdate(msg);
+                                    break;
+                                case 'fill':
+                                    this.onFill(msg.record);
+                                    break;
+                                case 'connected':
+                                    console.log('[WS] Client ID:', msg.client_id);
+                                    this.onConnected();
+                                    break;
+                            }
+                        } catch (e) {
+                            console.error('[WS] Failed to parse message:', e);
+                        }
+                    };
+
+                    this.ws.onclose = () => {
+                        console.log('[WS] Disconnected');
+                        this.connected = false;
+                        this.onDisconnected();
+                        this.scheduleReconnect();
+                    };
+
+                    this.ws.onerror = (error) => {
+                        console.error('[WS] Error:', error);
+                        this.connected = false;
+                    };
+                } catch (e) {
+                    console.error('[WS] Failed to connect:', e);
+                    this.scheduleReconnect();
+                }
+            }
+
+            scheduleReconnect() {
+                const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts), this.maxReconnectDelay);
+                this.reconnectAttempts++;
+                console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+                setTimeout(() => this.connect(), delay);
+            }
+
+            close() {
+                if (this.ws) {
+                    this.ws.close();
+                }
+            }
+        }
 
         // Default data for when API is unavailable
         const defaultQuotes = {
@@ -334,6 +414,164 @@
                 )
             );
 
+        // ============================================================================
+        // NEW VISUALIZATION COMPONENTS
+        // ============================================================================
+
+        // 2D Order Book Heat Map
+        const BookHeatMap = ({data, quoteData}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for order book data...');
+            }
+            // Transform book history into heat map points
+            const heatData = [];
+            const minPrice = Math.min(...data.flatMap(d => [...d.bids.map(b => b.price), ...d.asks.map(a => a.price)]));
+            const maxPrice = Math.max(...data.flatMap(d => [...d.bids.map(b => b.price), ...d.asks.map(a => a.price)]));
+            const maxSize = Math.max(...data.flatMap(d => [...d.bids.map(b => b.size), ...d.asks.map(a => a.size)]));
+
+            data.forEach((snapshot, timeIdx) => {
+                snapshot.bids.forEach(level => {
+                    heatData.push({
+                        time: snapshot.time,
+                        timeIdx,
+                        price: level.price,
+                        size: level.size,
+                        intensity: level.size / maxSize,
+                        side: 'bid'
+                    });
+                });
+                snapshot.asks.forEach(level => {
+                    heatData.push({
+                        time: snapshot.time,
+                        timeIdx,
+                        price: level.price,
+                        size: level.size,
+                        intensity: level.size / maxSize,
+                        side: 'ask'
+                    });
+                });
+            });
+
+            return e(ResponsiveContainer, {width: '100%', height: 300},
+                e(ComposedChart, {data: heatData, margin: {top: 10, right: 10, bottom: 30, left: 60}},
+                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
+                    e(XAxis, {dataKey: 'timeIdx', tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: (v) => data[v]?.time || ''}),
+                    e(YAxis, {dataKey: 'price', domain: [minPrice * 0.9999, maxPrice * 1.0001], tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: v => v ? v.toFixed(0) : ''}),
+                    e(Tooltip, {
+                        contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11},
+                        formatter: (value, name) => [value?.toFixed ? value.toFixed(4) : value, name]
+                    }),
+                    e(Scatter, {dataKey: 'price', fill: C.green},
+                        heatData.filter(d => d.side === 'bid').map((entry, i) =>
+                            e(Cell, {key: i, fill: `rgba(34, 197, 94, ${0.2 + entry.intensity * 0.8})`})
+                        )
+                    ),
+                    e(Scatter, {dataKey: 'price', data: heatData.filter(d => d.side === 'ask')},
+                        heatData.filter(d => d.side === 'ask').map((entry, i) =>
+                            e(Cell, {key: i, fill: `rgba(239, 68, 68, ${0.2 + entry.intensity * 0.8})`})
+                        )
+                    )
+                )
+            );
+        };
+
+        // Live Mid Price Chart with Quote Overlay
+        const PriceChart = ({priceData, quoteData}) => {
+            if (!priceData || priceData.length === 0) {
+                return e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for price data...');
+            }
+            // Merge price data with quote bands
+            const mergedData = priceData.map(p => {
+                const quote = quoteData?.find(q => q.time === p.time);
+                return {
+                    ...p,
+                    bestBid: quote?.bid_prices?.[0] || null,
+                    bestAsk: quote?.ask_prices?.[0] || null
+                };
+            });
+
+            return e(ResponsiveContainer, {width: '100%', height: 280},
+                e(ComposedChart, {data: mergedData, margin: {top: 10, right: 10, bottom: 30, left: 60}},
+                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
+                    e(XAxis, {dataKey: 'time', tick: {fill: C.textMuted, fontSize: 9}, interval: 'preserveStartEnd'}),
+                    e(YAxis, {domain: ['auto', 'auto'], tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: v => v ? v.toFixed(0) : ''}),
+                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
+                    e(Area, {type: 'monotone', dataKey: 'bestBid', stroke: 'transparent', fill: C.green, fillOpacity: 0.15}),
+                    e(Area, {type: 'monotone', dataKey: 'bestAsk', stroke: 'transparent', fill: C.red, fillOpacity: 0.15}),
+                    e(Line, {type: 'monotone', dataKey: 'price', stroke: C.accent, strokeWidth: 2, dot: false}),
+                    e(Line, {type: 'monotone', dataKey: 'bestBid', stroke: C.green, strokeWidth: 1, strokeDasharray: '3 3', dot: false}),
+                    e(Line, {type: 'monotone', dataKey: 'bestAsk', stroke: C.red, strokeWidth: 1, strokeDasharray: '3 3', dot: false})
+                )
+            );
+        };
+
+        // Spread Distribution Histogram
+        const SpreadHistogram = ({data}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for spread data...');
+            }
+            return e(ResponsiveContainer, {width: '100%', height: 200},
+                e(BarChart, {data, margin: {top: 10, right: 10, bottom: 30, left: 10}},
+                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
+                    e(XAxis, {dataKey: 'range_bps', tick: {fill: C.textMuted, fontSize: 10}, label: {value: 'Spread (bps)', position: 'bottom', fill: C.textMuted, fontSize: 10}}),
+                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v ? v.toFixed(0) : ''}),
+                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
+                    e(Bar, {dataKey: 'count', fill: C.purple, radius: [4, 4, 0, 0]})
+                )
+            );
+        };
+
+        // Quote Fill Rate by Level
+        const FillRateChart = ({data}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for fill data...');
+            }
+            // Group by level
+            const byLevel = {};
+            data.forEach(d => {
+                if (!byLevel[d.level]) byLevel[d.level] = {level: d.level, bid: 0, ask: 0};
+                if (d.side === 'BID') byLevel[d.level].bid = d.fill_count;
+                else byLevel[d.level].ask = d.fill_count;
+            });
+            const chartData = Object.values(byLevel).sort((a, b) => a.level - b.level);
+
+            return e(ResponsiveContainer, {width: '100%', height: 200},
+                e(BarChart, {data: chartData, layout: 'vertical', margin: {top: 10, right: 10, bottom: 10, left: 40}},
+                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
+                    e(XAxis, {type: 'number', tick: {fill: C.textMuted, fontSize: 10}}),
+                    e(YAxis, {type: 'category', dataKey: 'level', tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => `L${v}`}),
+                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
+                    e(Bar, {dataKey: 'bid', fill: C.green, name: 'Bid Fills'}),
+                    e(Bar, {dataKey: 'ask', fill: C.red, name: 'Ask Fills'})
+                )
+            );
+        };
+
+        // Current Book Depth (snapshot)
+        const DepthChart = ({data}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for book data...');
+            }
+            const latest = data[data.length - 1];
+            if (!latest) return null;
+
+            // Build cumulative depth
+            let bidCum = 0, askCum = 0;
+            const bidDepth = latest.bids.map(b => { bidCum += b.size; return {price: b.price, cumSize: bidCum, side: 'bid'}; });
+            const askDepth = latest.asks.map(a => { askCum += a.size; return {price: a.price, cumSize: askCum, side: 'ask'}; });
+            const depthData = [...bidDepth.reverse(), ...askDepth];
+
+            return e(ResponsiveContainer, {width: '100%', height: 200},
+                e(AreaChart, {data: depthData, margin: {top: 10, right: 10, bottom: 20, left: 60}},
+                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
+                    e(XAxis, {dataKey: 'price', tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: v => v ? v.toFixed(0) : ''}),
+                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v ? v.toFixed(2) : ''}),
+                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
+                    e(Area, {type: 'stepAfter', dataKey: 'cumSize', stroke: C.accent, fill: C.accent, fillOpacity: 0.3})
+                )
+            );
+        };
+
         // Main Dashboard
         const Dashboard = () => {
             const [tab, setTab] = useState('overview');
@@ -348,40 +586,132 @@
             const [leadLag, setLeadLag] = useState(genLeadLag());
             const [time, setTime] = useState(new Date().toLocaleTimeString());
 
-            // Fetch data from API every second
+            // New visualization state
+            const [bookHistory, setBookHistory] = useState([]);
+            const [priceHistory, setPriceHistory] = useState([]);
+            const [quoteHistory, setQuoteHistory] = useState([]);
+            const [spreadDist, setSpreadDist] = useState([]);
+            const [fillStats, setFillStats] = useState([]);
+
+            // Track accumulated fills from WebSocket
+            const [wsConnected, setWsConnected] = useState(false);
+
+            // Apply full state from snapshot
+            const applySnapshot = (data) => {
+                if (data) {
+                    setQuotes(transformQuotes(data));
+                    setPnl(transformPnL(data));
+                    setRegime(transformRegimeHistory(data));
+                    setFills(transformFills(data));
+                    setCalib(transformCalibration(data.calibration?.fill));
+                    setCalibMetrics({
+                        fill: {
+                            brier: data.calibration?.fill?.brier_score || 0,
+                            ir: data.calibration?.fill?.information_ratio || 0,
+                        },
+                        as: {
+                            brier: data.calibration?.adverse_selection?.brier_score || 0,
+                            ir: data.calibration?.adverse_selection?.information_ratio || 0,
+                        }
+                    });
+                    setSignals(transformSignals(data));
+                    // New visualization data
+                    if (data.book_history) setBookHistory(data.book_history);
+                    if (data.price_history) setPriceHistory(data.price_history);
+                    if (data.quote_history) setQuoteHistory(data.quote_history);
+                    if (data.spread_distribution) setSpreadDist(data.spread_distribution);
+                    if (data.quote_fill_stats) setFillStats(data.quote_fill_stats);
+                }
+                setTime(new Date().toLocaleTimeString());
+            };
+
+            // Apply incremental update
+            const applyUpdate = (update) => {
+                if (update.quotes) {
+                    setQuotes({
+                        mid: update.quotes.mid.toFixed(1),
+                        spreadBps: update.quotes.spread_bps.toFixed(1),
+                        inventory: update.quotes.inventory.toFixed(3),
+                        regime: update.quotes.regime,
+                        kappa: update.quotes.kappa.toFixed(0),
+                        gamma: update.quotes.gamma.toFixed(3),
+                        fillProb: update.quotes.fill_prob.toFixed(1),
+                        asProb: update.quotes.adverse_prob.toFixed(1),
+                    });
+                }
+                if (update.pnl) {
+                    setPnl({
+                        spreadCapture: update.pnl.spread_capture,
+                        adverseSelection: update.pnl.adverse_selection,
+                        inventoryCost: update.pnl.inventory_cost,
+                        fees: update.pnl.fees,
+                    });
+                }
+                if (update.regime) {
+                    // Could update regime state here
+                }
+                setTime(new Date().toLocaleTimeString());
+            };
+
+            // Add new fill to fills array
+            const addFill = (record) => {
+                setFills(prev => [...prev.slice(-99), {
+                    time: record.time,
+                    pnl: record.pnl,
+                    cumPnl: record.cum_pnl,
+                    side: record.side,
+                    as: record.adverse_selection
+                }]);
+            };
+
+            // Connect via WebSocket with HTTP fallback
             useEffect(() => {
-                const fetchData = async () => {
-                    const { data, connected: isConnected } = await fetchDashboard();
-                    setConnected(isConnected);
-                    setTime(new Date().toLocaleTimeString());
+                let wsClient = null;
+                let httpFallbackInterval = null;
 
-                    if (data) {
-                        setQuotes(transformQuotes(data));
-                        setPnl(transformPnL(data));
-                        setRegime(transformRegimeHistory(data));
-                        setFills(transformFills(data));
-                        setCalib(transformCalibration(data.calibration?.fill));
-                        setCalibMetrics({
-                            fill: {
-                                brier: data.calibration?.fill?.brier_score || 0,
-                                ir: data.calibration?.fill?.information_ratio || 0,
-                            },
-                            as: {
-                                brier: data.calibration?.adverse_selection?.brier_score || 0,
-                                ir: data.calibration?.adverse_selection?.information_ratio || 0,
-                            }
-                        });
-                        setSignals(transformSignals(data));
+                // Create WebSocket client
+                wsClient = new DashboardWebSocket(
+                    WS_URL,
+                    applySnapshot,  // onSnapshot
+                    applyUpdate,    // onUpdate
+                    addFill,        // onFill
+                    () => {         // onConnected
+                        setConnected(true);
+                        setWsConnected(true);
+                        // Clear HTTP fallback if running
+                        if (httpFallbackInterval) {
+                            clearInterval(httpFallbackInterval);
+                            httpFallbackInterval = null;
+                        }
+                    },
+                    () => {         // onDisconnected
+                        setConnected(false);
+                        setWsConnected(false);
+                        // Start HTTP fallback polling
+                        if (!httpFallbackInterval) {
+                            httpFallbackInterval = setInterval(async () => {
+                                const { data, connected: isConnected } = await fetchDashboard();
+                                if (isConnected && data) {
+                                    setConnected(true);
+                                    applySnapshot(data);
+                                }
+                            }, 1000);
+                        }
                     }
-                };
+                );
 
-                fetchData(); // Initial fetch
-                const interval = setInterval(fetchData, 1000);
-                return () => clearInterval(interval);
+                // Start WebSocket connection
+                wsClient.connect();
+
+                return () => {
+                    if (wsClient) wsClient.close();
+                    if (httpFallbackInterval) clearInterval(httpFallbackInterval);
+                };
             }, []);
 
             const tabs = [
                 {id: 'overview', label: 'Overview'},
+                {id: 'book', label: 'Order Book'},
                 {id: 'calibration', label: 'Calibration'},
                 {id: 'regime', label: 'Regime'},
                 {id: 'signals', label: 'Signals'},
@@ -399,7 +729,8 @@
                         e('div', {className: 'flex items-center gap-4'},
                             e('div', {className: 'flex items-center gap-2'},
                                 e('div', {className: 'w-2 h-2 rounded-full pulse-glow', style: {backgroundColor: connected ? C.green : C.red}}),
-                                e('span', {className: 'text-xs uppercase tracking-wider mono', style: {color: C.textMuted}}, connected ? 'Live' : 'Disconnected')
+                                e('span', {className: 'text-xs uppercase tracking-wider mono', style: {color: C.textMuted}},
+                                    connected ? (wsConnected ? 'WS Live' : 'HTTP') : 'Disconnected')
                             ),
                             e('span', {className: 'text-xs tabular-nums mono', style: {color: C.textMuted}}, time)
                         )
@@ -433,6 +764,56 @@
                         e(Card, {title: 'PnL Attribution', subtitle: 'Component breakdown', accent: C.purple}, e(WaterfallChart, {data: pnl})),
                         e(Card, {title: 'Regime Probabilities', subtitle: 'HMM belief state', accent: C.regimeTrending}, e(RegimeChart, {data: regime})),
                         e(Card, {title: 'Fill Calibration', subtitle: 'Predicted vs realized', accent: C.accent}, e(CalibrationChart, {data: calib}))
+                    ),
+
+                    tab === 'book' && e('div', {className: 'space-y-6'},
+                        // Top row: Price Chart (full width)
+                        e(Card, {title: 'Mid Price History', subtitle: '30-minute rolling window', accent: C.accent, className: 'lg:col-span-2'},
+                            e(PriceChart, {priceData: priceHistory, quoteData: quoteHistory})
+                        ),
+                        // Second row: Heat Map and Depth
+                        e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
+                            e(Card, {title: 'Order Book Heat Map', subtitle: 'Time × Price with size intensity', accent: C.purple},
+                                e(BookHeatMap, {data: bookHistory, quoteData: quoteHistory})
+                            ),
+                            e(Card, {title: 'Current Book Depth', subtitle: 'Bid/Ask liquidity profile', accent: C.accent},
+                                bookHistory.length > 0
+                                    ? e(DepthChart, {data: bookHistory[bookHistory.length - 1]})
+                                    : e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for book data...')
+                            )
+                        ),
+                        // Third row: Quote Distribution
+                        e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
+                            e(Card, {title: 'Spread Distribution', subtitle: 'Histogram of realized spreads', accent: C.orange},
+                                spreadDist.length > 0
+                                    ? e(SpreadHistogram, {data: spreadDist})
+                                    : e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Collecting spread data...')
+                            ),
+                            e(Card, {title: 'Fill Rate by Level', subtitle: 'Which quote levels get filled', accent: C.green},
+                                fillStats.length > 0
+                                    ? e(FillRateChart, {data: fillStats})
+                                    : e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Collecting fill data...')
+                            )
+                        ),
+                        // Stats summary
+                        e('div', {className: 'grid grid-cols-2 md:grid-cols-4 gap-4'},
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: `3px solid ${C.accent}`}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Price Points'),
+                                e('div', {className: 'text-2xl font-bold mono'}, priceHistory.length)
+                            ),
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: `3px solid ${C.purple}`}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Book Snapshots'),
+                                e('div', {className: 'text-2xl font-bold mono'}, bookHistory.length)
+                            ),
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: `3px solid ${C.orange}`}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Spread Samples'),
+                                e('div', {className: 'text-2xl font-bold mono'}, spreadDist.reduce((a, b) => a + b.count, 0))
+                            ),
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: `3px solid ${C.green}`}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Total Fills'),
+                                e('div', {className: 'text-2xl font-bold mono'}, fillStats.reduce((a, b) => a + b.fill_count, 0))
+                            )
+                        )
                     ),
 
                     tab === 'calibration' && e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},

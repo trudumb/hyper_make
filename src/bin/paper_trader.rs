@@ -31,21 +31,29 @@ use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+use hyperliquid_rust_sdk::market_maker::infra::{
+    DashboardThrottle, DashboardWsConfig, DashboardWsState, ws_handler,
+};
+
 use hyperliquid_rust_sdk::{
     BaseUrl, EstimatorConfig, InfoClient, Message, ParameterEstimator, Side, Subscription,
 };
 use tokio::sync::mpsc::unbounded_channel;
 
 use hyperliquid_rust_sdk::market_maker::infra::metrics::dashboard::{
-    CalibrationState, DashboardState, LiveQuotes, PnLAttribution, RegimeState,
-    classify_regime, compute_regime_probabilities,
+    BookLevel, BookSnapshot, CalibrationState, DashboardState, FillRecord, LiveQuotes,
+    PnLAttribution, PricePoint, QuoteFillStats, QuoteSnapshot, RegimeSnapshot, RegimeState,
+    SpreadBucket, classify_regime, compute_regime_probabilities,
 };
+use std::collections::{HashMap, VecDeque};
 use hyperliquid_rust_sdk::market_maker::simulation::{
     CalibrationAnalyzer, FillSimulator, FillSimulatorConfig, MarketStateSnapshot, ModelPredictions,
     OutcomeTracker, PredictionLogger, SimulatedFill, SimulationExecutor,
 };
 
-use hyperliquid_rust_sdk::{Ladder, LadderLevel, MarketParams, OrderExecutor};
+use hyperliquid_rust_sdk::{
+    Ladder, LadderConfig, LadderStrategy, MarketParams, OrderExecutor, QuoteConfig, RiskConfig,
+};
 
 // ============================================================================
 // CLI Arguments
@@ -106,13 +114,17 @@ struct Cli {
     /// Metrics HTTP port for dashboard API (default 8080)
     #[arg(long, default_value = "8080")]
     metrics_port: u16,
+
+    /// Quote refresh interval in milliseconds (default 500)
+    #[arg(long, default_value = "500")]
+    quote_interval_ms: u64,
 }
 
 // ============================================================================
-// Simulation State
+// Simulation State (using real LadderStrategy)
 // ============================================================================
 
-/// Complete simulation state
+/// Complete simulation state using production LadderStrategy
 struct SimulationState {
     /// Asset being simulated
     #[allow(dead_code)]
@@ -127,22 +139,56 @@ struct SimulationState {
     bid_levels: Vec<(f64, f64)>,
     ask_levels: Vec<(f64, f64)>,
 
-    /// Parameter estimator
+    /// Parameter estimator (same as production)
     estimator: ParameterEstimator,
+    /// Real ladder strategy (same as production)
+    strategy: LadderStrategy,
     /// Simulated inventory
     inventory: f64,
     /// Quote cycle counter
     cycle_count: u64,
 
     /// Configuration
-    gamma: f64,
-    target_spread_bps: f64,
-    ladder_levels: usize,
+    max_position: f64,
     target_liquidity: f64,
+    /// Price decimals (BTC=1, ETH=2, etc.)
+    decimals: u32,
+    /// Size decimals
+    sz_decimals: u32,
 }
 
 impl SimulationState {
-    fn new(asset: String, gamma: f64, target_spread_bps: f64, ladder_levels: usize, target_liquidity: f64) -> Self {
+    fn new(
+        asset: String,
+        gamma: f64,
+        target_spread_bps: f64,
+        ladder_levels: usize,
+        target_liquidity: f64
+    ) -> Self {
+        // Create production-style RiskConfig
+        let risk_config = RiskConfig {
+            gamma_base: gamma.clamp(0.01, 10.0),
+            min_spread_floor: target_spread_bps / 10_000.0 / 2.0, // Convert bps to fraction, half-spread
+            ..Default::default()
+        };
+
+        // Create LadderConfig with specified levels
+        let ladder_config = LadderConfig {
+            num_levels: ladder_levels,
+            ..Default::default()
+        };
+
+        // Create the real LadderStrategy
+        let strategy = LadderStrategy::with_config(risk_config, ladder_config);
+
+        // Determine decimals based on asset
+        let (decimals, sz_decimals) = match asset.as_str() {
+            "BTC" => (1, 4),  // $0.1 tick, 0.0001 BTC
+            "ETH" => (2, 3),  // $0.01 tick, 0.001 ETH
+            "SOL" => (3, 2),  // $0.001 tick, 0.01 SOL
+            _ => (2, 3),      // Default
+        };
+
         Self {
             asset,
             mid_price: 0.0,
@@ -151,12 +197,13 @@ impl SimulationState {
             bid_levels: Vec::new(),
             ask_levels: Vec::new(),
             estimator: ParameterEstimator::new(EstimatorConfig::default()),
+            strategy,
             inventory: 0.0,
             cycle_count: 0,
-            gamma,
-            target_spread_bps,
-            ladder_levels,
+            max_position: 1.0, // 1 BTC max position for simulation
             target_liquidity,
+            decimals,
+            sz_decimals,
         }
     }
 
@@ -189,7 +236,7 @@ impl SimulationState {
         self.estimator.on_trade(now_ms, price, size, Some(is_buy));
     }
 
-    /// Generate quotes for this cycle
+    /// Generate quotes using the REAL LadderStrategy (same as production)
     fn generate_quotes(&mut self) -> Option<Ladder> {
         if self.mid_price <= 0.0 {
             return None;
@@ -197,74 +244,80 @@ impl SimulationState {
 
         self.cycle_count += 1;
 
-        // Get estimated parameters
-        let sigma = self.estimator.sigma_clean().max(0.00001);
-        let kappa = self.estimator.kappa().max(100.0);
+        // Build QuoteConfig
+        let quote_config = QuoteConfig {
+            mid_price: self.mid_price,
+            decimals: self.decimals,
+            sz_decimals: self.sz_decimals,
+            min_notional: 10.0, // $10 minimum
+        };
 
-        // GLFT optimal half-spread: δ* = (1/γ) * ln(1 + γ/κ) + fee
-        let maker_fee = 0.00015; // 1.5 bps
-        let glft_half_spread = (1.0 / self.gamma) * (1.0 + self.gamma / kappa).ln() + maker_fee;
+        // Build MarketParams from estimator (same as production)
+        let market_params = self.build_market_params();
 
-        // Apply floor
-        let min_half_spread = self.target_spread_bps / 10000.0 / 2.0;
-        let half_spread = glft_half_spread.max(min_half_spread);
+        // Update strategy's fill model with current volatility
+        let sigma = market_params.sigma.max(0.00001);
+        let tau = 10.0; // Typical quote lifetime
+        self.strategy.update_fill_model_params(sigma, tau);
 
-        // Inventory skew: shift quotes when carrying inventory
-        let inventory_skew = self.gamma * sigma * sigma * self.inventory * 10.0;
+        // Use the REAL LadderStrategy to generate quotes
+        let ladder = self.strategy.generate_ladder(
+            &quote_config,
+            self.inventory,
+            self.max_position,
+            self.target_liquidity,
+            &market_params,
+        );
 
-        // Generate ladder levels
-        let mut bids = Vec::new();
-        let mut asks = Vec::new();
-
-        let level_spacing_bps = 3.0; // 3 bps between levels
-
-        for level in 0..self.ladder_levels {
-            let depth_offset = (level as f64 * level_spacing_bps) / 10000.0;
-
-            // Bid: below mid
-            let bid_depth = half_spread + depth_offset + inventory_skew.max(0.0);
-            let bid_price = self.mid_price * (1.0 - bid_depth);
-            let bid_size = self.target_liquidity * (0.8_f64.powi(level as i32)); // Decay size at further levels
-
-            bids.push(LadderLevel {
-                price: bid_price,
-                size: bid_size,
-                depth_bps: bid_depth * 10000.0,
-            });
-
-            // Ask: above mid
-            let ask_depth = half_spread + depth_offset - inventory_skew.min(0.0);
-            let ask_price = self.mid_price * (1.0 + ask_depth);
-            let ask_size = self.target_liquidity * (0.8_f64.powi(level as i32));
-
-            asks.push(LadderLevel {
-                price: ask_price,
-                size: ask_size,
-                depth_bps: ask_depth * 10000.0,
-            });
-        }
-
-        Some(Ladder { bids: bids.into(), asks: asks.into() })
+        Some(ladder)
     }
 
-    /// Build market params for prediction logging
+    /// Build market params from estimator (populates all fields needed by strategy)
     fn build_market_params(&self) -> MarketParams {
         let mut params = MarketParams::default();
 
+        // Core pricing
         params.microprice = self.mid_price;
         params.market_mid = self.mid_price;
-        params.sigma = self.estimator.sigma_clean();
+
+        // Volatility from estimator
+        params.sigma = self.estimator.sigma_clean().max(0.00001);
         params.sigma_total = self.estimator.sigma_total();
         params.sigma_effective = self.estimator.sigma_effective();
-        params.kappa = self.estimator.kappa();
-        params.kappa_robust = self.estimator.kappa();
+
+        // Kappa from estimator - use robust path
+        let kappa = self.estimator.kappa().max(100.0);
+        params.kappa = kappa;
+        params.kappa_robust = kappa;
+        params.kappa_bid = kappa;
+        params.kappa_ask = kappa;
+        params.use_kappa_robust = true; // Use robust path
+
+        // Jump/momentum
         params.jump_ratio = self.estimator.jump_ratio();
+        params.momentum_bps = self.estimator.momentum_bps();
+
+        // Book state
         params.book_imbalance = self.compute_book_imbalance();
         params.market_spread_bps = if self.best_ask > 0.0 && self.best_bid > 0.0 {
             (self.best_ask - self.best_bid) / self.mid_price * 10000.0
         } else {
-            0.0
+            10.0 // Default 10 bps if no book
         };
+
+        // Arrival intensity (for GLFT time horizon)
+        params.arrival_intensity = 0.5; // Conservative default
+
+        // Disable adaptive features (paper trading uses simple path)
+        params.use_adaptive_spreads = false;
+        params.use_hjb_skew = false;
+        params.use_kalman_filter = false;
+        params.use_dynamic_bounds = false;
+
+        // No cascade protection in paper trading
+        params.should_pull_quotes = false;
+        params.cascade_size_factor = 1.0;
+        params.tail_risk_multiplier = 1.0;
 
         params
     }
@@ -280,10 +333,28 @@ impl SimulationState {
         }
     }
 
-    /// Update inventory from simulated fill
+    /// Update inventory from simulated fill and record for Bayesian learning
     fn on_simulated_fill(&mut self, fill: &SimulatedFill) {
         let direction = if fill.side == Side::Buy { 1.0 } else { -1.0 };
         self.inventory += direction * fill.fill_size;
+
+        // Record fill for Bayesian learning in the strategy
+        // Compute depth in bps from mid
+        let depth_bps = if self.mid_price > 0.0 {
+            ((fill.fill_price - self.mid_price).abs() / self.mid_price) * 10_000.0
+        } else {
+            5.0 // Default 5 bps if no mid
+        };
+        self.strategy.record_fill_observation(depth_bps, true);
+    }
+
+    /// Record cancelled (non-filled) order for Bayesian learning
+    #[allow(dead_code)]
+    fn on_order_cancelled(&mut self, order_price: f64) {
+        if self.mid_price > 0.0 {
+            let depth_bps = ((order_price - self.mid_price).abs() / self.mid_price) * 10_000.0;
+            self.strategy.record_fill_observation(depth_bps, false);
+        }
     }
 }
 
@@ -532,8 +603,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dashboard setup
     let dashboard_state: Arc<RwLock<DashboardState>> = Arc::new(RwLock::new(DashboardState::default()));
 
+    // WebSocket dashboard state (None if dashboard disabled)
+    let dashboard_ws_state: Option<Arc<DashboardWsState>> = if cli.dashboard {
+        Some(Arc::new(DashboardWsState::new(DashboardWsConfig::default())))
+    } else {
+        None
+    };
+
+    // Throttle for WebSocket updates (100ms)
+    let mut ws_throttle = DashboardThrottle::new(100);
+
     if cli.dashboard {
         let dashboard_state_for_server = dashboard_state.clone();
+        let ws_state_for_server = dashboard_ws_state.clone().unwrap();
         let metrics_port = cli.metrics_port;
 
         tokio::spawn(async move {
@@ -544,22 +626,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .allow_headers(Any);
 
             let app = Router::new()
+                // HTTP endpoint (kept for debugging and fallback)
                 .route(
                     "/api/dashboard",
-                    get(move || {
+                    get({
                         let state = dashboard_state_for_server.clone();
-                        async move {
-                            let state_guard = state.read().unwrap();
-                            Json(state_guard.clone())
+                        move || {
+                            let state = state.clone();
+                            async move {
+                                let state_guard = state.read().unwrap();
+                                Json(state_guard.clone())
+                            }
                         }
                     }),
                 )
+                // WebSocket endpoint
+                .route("/ws/dashboard", get(ws_handler))
+                .with_state(ws_state_for_server)
                 .layer(cors);
 
             let addr = format!("127.0.0.1:{}", metrics_port);
             info!(
                 port = metrics_port,
-                "Dashboard API server starting at http://{}/api/dashboard", addr
+                "Dashboard server starting: HTTP at /api/dashboard, WS at /ws/dashboard"
             );
 
             if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
@@ -575,15 +664,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Dashboard enabled at http://localhost:3000/mm-dashboard-fixed.html"
         );
         info!(
-            "API endpoint at http://localhost:{}/api/dashboard",
-            cli.metrics_port
+            "HTTP: http://localhost:{}/api/dashboard  WS: ws://localhost:{}/ws/dashboard",
+            cli.metrics_port, cli.metrics_port
         );
     }
 
     info!("Simulation running for {} seconds...", cli.duration);
 
     let mut last_quote_time = Instant::now();
-    let quote_interval = Duration::from_millis(100); // Quote every 100ms
+    let quote_interval = Duration::from_millis(cli.quote_interval_ms);
+
+    // Dashboard accumulators - persist across loop iterations
+    let mut accumulated_fills: Vec<FillRecord> = Vec::new();
+    let mut regime_history: Vec<RegimeSnapshot> = Vec::new();
+    let mut last_regime_snapshot = Instant::now();
+    let mut cumulative_pnl: f64 = 0.0;
+
+    // New visualization buffers
+    let mut book_history: VecDeque<BookSnapshot> = VecDeque::with_capacity(360);  // 5 min at 1/sec
+    let mut price_history: VecDeque<PricePoint> = VecDeque::with_capacity(1800);  // 30 min at 1/sec
+    let mut quote_history: VecDeque<QuoteSnapshot> = VecDeque::with_capacity(360); // 30 min at 5/sec
+    let mut spread_counts: HashMap<String, u32> = HashMap::new();
+    let mut fill_stats: HashMap<(String, usize), (u32, f64)> = HashMap::new(); // (side, level) -> (count, size)
+    let mut last_price_snapshot = Instant::now();
+    let mut last_book_snapshot = Instant::now();
+    let mut last_quote_snapshot = Instant::now();
 
     while !shutdown.load(Ordering::SeqCst) && start_time.elapsed() < duration {
         tokio::select! {
@@ -592,9 +697,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MarketDataMessage::Mid(mid) => {
                         state.update_mid(mid);
                         executor.update_mid(mid);
+
+                        // Capture price history (every 1 second)
+                        if last_price_snapshot.elapsed() >= Duration::from_secs(1) {
+                            last_price_snapshot = Instant::now();
+                            let now = chrono::Utc::now();
+                            if price_history.len() >= 1800 {
+                                price_history.pop_front();
+                            }
+                            price_history.push_back(PricePoint {
+                                time: now.format("%H:%M:%S").to_string(),
+                                timestamp_ms: now.timestamp_millis(),
+                                price: mid,
+                            });
+                        }
                     }
                     MarketDataMessage::Book { bids, asks } => {
-                        state.update_book(bids, asks);
+                        state.update_book(bids.clone(), asks.clone());
+
+                        // Capture book history (every 1 second)
+                        if last_book_snapshot.elapsed() >= Duration::from_secs(1) {
+                            last_book_snapshot = Instant::now();
+                            let now = chrono::Utc::now();
+                            if book_history.len() >= 360 {
+                                book_history.pop_front();
+                            }
+                            book_history.push_back(BookSnapshot {
+                                time: now.format("%H:%M:%S").to_string(),
+                                timestamp_ms: now.timestamp_millis(),
+                                bids: bids.iter().take(10).map(|(p, s)| BookLevel { price: *p, size: *s }).collect(),
+                                asks: asks.iter().take(10).map(|(p, s)| BookLevel { price: *p, size: *s }).collect(),
+                            });
+                        }
                     }
                     MarketDataMessage::Trade { price, size, is_buy } => {
                         state.on_trade(price, size, is_buy);
@@ -615,6 +749,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "[SIM FILL] side={:?} price={:.2} size={:.4} inventory={:.4}",
                                 fill.side, fill.fill_price, fill.fill_size, state.inventory
                             );
+
+                            // Accumulate fills for dashboard
+                            let now = chrono::Utc::now();
+                            let fill_pnl = if fill.side == Side::Buy {
+                                (state.mid_price - fill.fill_price) * fill.fill_size
+                            } else {
+                                (fill.fill_price - state.mid_price) * fill.fill_size
+                            };
+                            cumulative_pnl += fill_pnl;
+
+                            let fill_record = FillRecord {
+                                time: now.format("%H:%M:%S").to_string(),
+                                pnl: fill_pnl,
+                                cum_pnl: cumulative_pnl,
+                                side: if fill.side == Side::Buy { "BID".to_string() } else { "ASK".to_string() },
+                                adverse_selection: "0.0".to_string(),
+                            };
+
+                            // Keep last 100 fills
+                            if accumulated_fills.len() >= 100 {
+                                accumulated_fills.remove(0);
+                            }
+                            accumulated_fills.push(fill_record.clone());
+
+                            // Push fill to WebSocket clients (immediate)
+                            if let Some(ref ws_state) = dashboard_ws_state {
+                                ws_state.push_fill(fill_record);
+                            }
                         }
                     }
                 }
@@ -626,6 +788,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if let Some(ladder) = state.generate_quotes() {
                         stats.quote_cycles += 1;
+
+                        // Queue-aware order management:
+                        // Only cancel/replace orders if price moved beyond threshold
+                        // This preserves queue position for realistic fill simulation
+                        let price_threshold_bps = 2.0; // Only refresh if price moved 2+ bps
+                        let active_orders = executor.get_active_orders();
+
+                        // Build set of desired prices from new ladder
+                        let desired_bid_prices: Vec<f64> = ladder.bids.iter().map(|l| l.price).collect();
+                        let desired_ask_prices: Vec<f64> = ladder.asks.iter().map(|l| l.price).collect();
+
+                        // Cancel orders that are too far from any desired price
+                        for order in &active_orders {
+                            let prices_to_check = if order.is_buy { &desired_bid_prices } else { &desired_ask_prices };
+
+                            // Find closest desired price
+                            let min_diff_bps = prices_to_check.iter()
+                                .map(|p| ((order.price - p).abs() / state.mid_price * 10_000.0))
+                                .fold(f64::MAX, f64::min);
+
+                            // Cancel if no desired price is within threshold
+                            if min_diff_bps > price_threshold_bps {
+                                executor.cancel_order(&cli.asset, order.oid).await;
+                                state.on_order_cancelled(order.price);
+                            }
+                        }
+
+                        // Get updated active orders after cancellations
+                        let active_orders = executor.get_active_orders();
+                        let active_bid_prices: Vec<f64> = active_orders.iter()
+                            .filter(|o| o.is_buy)
+                            .map(|o| o.price)
+                            .collect();
+                        let active_ask_prices: Vec<f64> = active_orders.iter()
+                            .filter(|o| !o.is_buy)
+                            .map(|o| o.price)
+                            .collect();
 
                         // Count quotes
                         stats.bid_quotes += ladder.bids.len() as u64;
@@ -643,6 +842,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if spread_bps > stats.max_spread_bps {
                                 stats.max_spread_bps = spread_bps;
                             }
+
+                            // Track spread distribution
+                            let bucket = if spread_bps < 5.0 { "0-5" }
+                                else if spread_bps < 10.0 { "5-10" }
+                                else if spread_bps < 15.0 { "10-15" }
+                                else if spread_bps < 20.0 { "15-20" }
+                                else if spread_bps < 30.0 { "20-30" }
+                                else { "30+" };
+                            *spread_counts.entry(bucket.to_string()).or_insert(0) += 1;
+
+                            // Capture quote history (every 5 seconds)
+                            if last_quote_snapshot.elapsed() >= Duration::from_secs(5) {
+                                last_quote_snapshot = Instant::now();
+                                let now = chrono::Utc::now();
+                                if quote_history.len() >= 360 {
+                                    quote_history.pop_front();
+                                }
+                                quote_history.push_back(QuoteSnapshot {
+                                    time: now.format("%H:%M:%S").to_string(),
+                                    timestamp_ms: now.timestamp_millis(),
+                                    bid_prices: ladder.bids.iter().map(|l| l.price).collect(),
+                                    ask_prices: ladder.asks.iter().map(|l| l.price).collect(),
+                                    spread_bps,
+                                });
+                            }
                         }
 
                         // Build market params and predictions
@@ -658,47 +882,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let predictions = ModelPredictions::from_ladder(
                             &ladder,
                             &params,
-                            state.target_spread_bps / 2.0,
-                            state.target_spread_bps / 2.0,
+                            cli.target_spread_bps / 2.0,
+                            cli.target_spread_bps / 2.0,
                             0.0,
                         );
 
                         // Log prediction
                         prediction_logger.log_prediction(market_snapshot, predictions);
 
-                        // Place simulated orders
+                        // Place simulated orders only at NEW price levels
+                        // (preserves queue position at existing levels)
                         for level in &ladder.bids {
-                            executor.place_order(
-                                &cli.asset,
-                                level.price,
-                                level.size,
-                                true,
-                                None,
-                                true,
-                            ).await;
+                            // Check if we already have an order near this price
+                            let has_order = active_bid_prices.iter()
+                                .any(|p| ((level.price - p).abs() / state.mid_price * 10_000.0) < price_threshold_bps);
+                            if !has_order {
+                                executor.place_order(
+                                    &cli.asset,
+                                    level.price,
+                                    level.size,
+                                    true,
+                                    None,
+                                    true,
+                                ).await;
+                            }
                         }
                         for level in &ladder.asks {
-                            executor.place_order(
-                                &cli.asset,
-                                level.price,
-                                level.size,
-                                false,
-                                None,
-                                true,
-                            ).await;
-                        }
-
-                        // Cancel old orders (simulate quote refresh)
-                        let active_orders = executor.get_active_orders();
-                        for order in active_orders {
-                            let age_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64
-                                - order.created_at_ns / 1_000_000;
-
-                            if age_ms > 200 {
-                                executor.cancel_order(&cli.asset, order.oid).await;
+                            let has_order = active_ask_prices.iter()
+                                .any(|p| ((level.price - p).abs() / state.mid_price * 10_000.0) < price_threshold_bps);
+                            if !has_order {
+                                executor.place_order(
+                                    &cli.asset,
+                                    level.price,
+                                    level.size,
+                                    false,
+                                    None,
+                                    true,
+                                ).await;
                             }
                         }
 
@@ -730,35 +950,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             let outcome_summary = outcome_tracker.get_summary();
 
-                            let mut dashboard = dashboard_state.write().unwrap();
-                            *dashboard = DashboardState {
-                                quotes: LiveQuotes {
-                                    mid: state.mid_price,
-                                    spread_bps,
-                                    inventory: state.inventory,
-                                    regime: regime.clone(),
-                                    kappa,
-                                    gamma: cli.gamma,
-                                    fill_prob: 0.2, // Estimated
-                                    adverse_prob: 0.1, // Estimated
-                                },
-                                pnl: PnLAttribution {
-                                    spread_capture: outcome_summary.spread_capture,
-                                    adverse_selection: outcome_summary.adverse_selection,
-                                    inventory_cost: outcome_summary.inventory_cost,
-                                    fees: outcome_summary.fee_cost,
-                                    total: outcome_summary.total_pnl,
-                                },
-                                regime: RegimeState {
-                                    current: regime,
-                                    probabilities: regime_probs,
-                                    history: Vec::new(), // Could add history tracking
-                                },
-                                fills: Vec::new(), // Could add fill history
-                                calibration: CalibrationState::default(),
-                                signals: Vec::new(),
-                                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                            // Build current quotes and PnL for updates
+                            let live_quotes = LiveQuotes {
+                                mid: state.mid_price,
+                                spread_bps,
+                                inventory: state.inventory,
+                                regime: regime.clone(),
+                                kappa,
+                                gamma: cli.gamma,
+                                fill_prob: 0.2, // Estimated
+                                adverse_prob: 0.1, // Estimated
                             };
+
+                            let pnl_attribution = PnLAttribution {
+                                spread_capture: outcome_summary.spread_capture,
+                                adverse_selection: outcome_summary.adverse_selection,
+                                inventory_cost: outcome_summary.inventory_cost,
+                                fees: outcome_summary.fee_cost,
+                                total: outcome_summary.total_pnl,
+                            };
+
+                            // Add regime snapshot every 5 seconds (keep last 60)
+                            if last_regime_snapshot.elapsed() >= Duration::from_secs(5) {
+                                last_regime_snapshot = Instant::now();
+                                let now = chrono::Utc::now();
+                                if regime_history.len() >= 60 {
+                                    regime_history.remove(0);
+                                }
+                                regime_history.push(RegimeSnapshot {
+                                    time: now.format("%H:%M:%S").to_string(),
+                                    quiet: regime_probs.quiet,
+                                    trending: regime_probs.trending,
+                                    volatile: regime_probs.volatile,
+                                    cascade: regime_probs.cascade,
+                                });
+                            }
+
+                            let regime_state = RegimeState {
+                                current: regime,
+                                probabilities: regime_probs,
+                                history: regime_history.clone(),
+                            };
+
+                            // Build spread distribution from counts
+                            let total_spread_samples: u32 = spread_counts.values().sum();
+                            let spread_distribution: Vec<SpreadBucket> = ["0-5", "5-10", "10-15", "15-20", "20-30", "30+"]
+                                .iter()
+                                .map(|range| {
+                                    let count = *spread_counts.get(*range).unwrap_or(&0);
+                                    SpreadBucket {
+                                        range_bps: range.to_string(),
+                                        count,
+                                        percentage: if total_spread_samples > 0 {
+                                            count as f64 / total_spread_samples as f64 * 100.0
+                                        } else { 0.0 },
+                                    }
+                                })
+                                .collect();
+
+                            // Build fill stats
+                            let quote_fill_stats: Vec<QuoteFillStats> = fill_stats
+                                .iter()
+                                .map(|((side, level), (count, size))| QuoteFillStats {
+                                    level: *level,
+                                    side: side.clone(),
+                                    fill_count: *count,
+                                    total_size: *size,
+                                })
+                                .collect();
+
+                            // Update HTTP dashboard state
+                            {
+                                let mut dashboard = dashboard_state.write().unwrap();
+                                *dashboard = DashboardState {
+                                    quotes: live_quotes.clone(),
+                                    pnl: pnl_attribution.clone(),
+                                    regime: regime_state.clone(),
+                                    fills: accumulated_fills.clone(),
+                                    calibration: CalibrationState::default(),
+                                    signals: Vec::new(),
+                                    timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                    book_history: book_history.iter().cloned().collect(),
+                                    price_history: price_history.iter().cloned().collect(),
+                                    quote_history: quote_history.iter().cloned().collect(),
+                                    quote_fill_stats: quote_fill_stats.clone(),
+                                    spread_distribution: spread_distribution.clone(),
+                                };
+                            }
+
+                            // Update WebSocket state for snapshots and push throttled updates
+                            if let Some(ref ws_state) = dashboard_ws_state {
+                                // Keep WebSocket state in sync for new client snapshots
+                                ws_state.update_state(DashboardState {
+                                    quotes: live_quotes.clone(),
+                                    pnl: pnl_attribution.clone(),
+                                    regime: regime_state.clone(),
+                                    fills: accumulated_fills.clone(),
+                                    calibration: CalibrationState::default(),
+                                    signals: Vec::new(),
+                                    timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                    book_history: book_history.iter().cloned().collect(),
+                                    price_history: price_history.iter().cloned().collect(),
+                                    quote_history: quote_history.iter().cloned().collect(),
+                                    quote_fill_stats,
+                                    spread_distribution,
+                                });
+
+                                // Push throttled incremental update
+                                if ws_throttle.should_push() {
+                                    ws_state.push_update(
+                                        Some(live_quotes),
+                                        Some(pnl_attribution),
+                                        Some(regime_state),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
