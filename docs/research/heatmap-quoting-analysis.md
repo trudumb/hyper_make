@@ -1844,3 +1844,642 @@ Based on expected edge per engineering effort:
 | 6 | Fill Intensity Model | Most complex, requires queue position inference |
 
 Each component should be validated against the measurement infrastructure before moving to the next. If a component doesn't improve calibration metrics, investigate why before building more complexity.
+
+---
+
+## Part 4: Path to Production-Quality Validation
+
+### Why Paper Trading is Useless for Market Making
+
+Paper trading works for directional strategies. It's fundamentally broken for market making:
+
+**Problem 1: Queue Position Fiction**
+
+Paper trading assumes: "If price touches my quote, I get filled."
+
+Reality: You're in a queue. If 100 ETH is resting at $1570.00 and you place 1 ETH at $1570.00, you're position 101. You only fill if 101+ ETH of market sells arrive. Paper trading gives you fills you'd never get.
+
+```
+Paper trading says:    Price touched 1570 → You filled
+Reality says:          Price touched 1570 → 100 ETH ahead of you filled
+                       Price bounced → You got nothing
+```
+
+**Problem 2: Adverse Selection is Anti-Correlated with Fills**
+
+The fills you DO get in real trading are the bad ones:
+- When you're first in queue, it's because everyone else pulled (they saw something)
+- When aggressive flow hits you, it's often informed
+
+Paper trading can't simulate this. It gives you the average fill, but you only get the toxic fills.
+
+**Problem 3: Your Quotes Affect the Market**
+
+If you're quoting 10 ETH at best bid, you ARE the best bid. Your presence changes:
+- Other MMs' behavior (they see your size)
+- Fill probability at that level (more liquidity = slower queue)
+- Information content of fills (if you get hit when you're the only bid, it's very informed)
+
+Paper trading treats your quotes as invisible observers.
+
+**Problem 4: Latency Matters**
+
+Real MM competes on microseconds for queue position. Paper trading has no latency model - you magically place quotes instantly at any price.
+
+**Bottom line:** Paper trading PnL is fiction. A profitable paper trading run tells you nothing. A losing paper trading run tells you nothing. It's noise.
+
+---
+
+### What CAN Be Validated Without Live Trading
+
+The good news: you can validate most of your alpha thesis using historical data and careful visualization. Here's what's actually measurable:
+
+#### 1. Prediction Calibration (No fills required)
+
+Your models make predictions. Outcomes happen regardless of whether you traded.
+
+| Prediction | Outcome Observable? | How to Validate |
+|------------|---------------------|-----------------|
+| P(price up in 1s) | Yes - price history exists | Calibration curve on historical predictions |
+| P(volatility spike) | Yes - realized vol is observable | Brier score on vol predictions |
+| P(regime = cascade) | Yes - you can label historical regimes | HMM calibration on labeled data |
+| P(adverse selection \| hypothetical fill) | Partially - see below | Counterfactual analysis |
+| Lead-lag estimate | Yes - both price series exist | R² on historical cross-exchange data |
+
+**Visualization: Calibration Dashboard**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CALIBRATION VALIDATION PANEL                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Fill Probability (1s horizon)         Regime Classification   │
+│  ┌────────────────────────┐            ┌────────────────────┐  │
+│  │    o                   │            │ Predicted vs Actual│  │
+│  │   o  o                 │            │                    │  │
+│  │  o    o  Perfect cal.  │            │ Quiet:    82% acc  │  │
+│  │ o      o    ↗          │            │ Trending: 71% acc  │  │
+│  │o        o              │            │ Volatile: 68% acc  │  │
+│  │          o  ← Our model│            │ Cascade:  89% acc  │  │
+│  └────────────────────────┘            └────────────────────┘  │
+│  Brier: 0.18  IR: 1.34                 Overall: 76% accuracy   │
+│                                                                 │
+│  Lead-Lag R² Over Time                 Prediction Confidence   │
+│  ┌────────────────────────┐            ┌────────────────────┐  │
+│  │ ████████████████████   │            │ High conf correct: │  │
+│  │         ▼ Signal decay │            │     78%            │  │
+│  │ ██████████             │            │ Low conf correct:  │  │
+│  │                        │            │     52%            │  │
+│  └────────────────────────┘            └────────────────────┘  │
+│  Current: R²=0.23  Peak: R²=0.41       Discrimination: Good    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**What this tells you:**
+- If calibration is bad on historical data, it will be bad live
+- If lead-lag R² is low, you have no cross-exchange edge
+- If regime accuracy is poor, your parameters will be wrong
+
+**No capital required. Pure data analysis.**
+
+#### 2. Counterfactual Fill Analysis
+
+You can't know if YOUR quote would have filled. But you can analyze what happened to quotes at similar prices.
+
+**Method: "Shadow Quoting"**
+
+1. Run your quote generation logic on historical data
+2. Generate the quotes you WOULD have placed at each timestamp
+3. Don't simulate fills - instead, analyze what happened to the market
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SHADOW QUOTE ANALYSIS                                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Your hypothetical bid: $1570.00                                │
+│  Market best bid:       $1570.00                                │
+│  Size at best bid:      47.3 ETH                                │
+│                                                                 │
+│  What happened in next 10 seconds:                              │
+│  ├─ Market sells hitting 1570: 23.4 ETH                         │
+│  ├─ Best bid moved to: 1569.50 (bid pulled)                     │
+│  ├─ Price 10s later: 1568.25 (dropped $1.75)                    │
+│  └─ If you were FIRST in queue: adverse selection = -$0.87/ETH  │
+│                                                                 │
+│  Analysis:                                                      │
+│  ├─ Would you have filled? Unknown (queue position unknown)     │
+│  ├─ If you filled, was it toxic? YES (-$0.87/ETH)               │
+│  └─ Classification: Wall pulled before fill, informed flow      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Visualization: Shadow Quote Overlay on Heatmap**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  HEATMAP + SHADOW QUOTES + OUTCOMES                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  $1575 │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│        │                    ▲ Your ask would be here            │
+│  $1572 │░░░░░░░░░░░░░░█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│        │             ↑ Wall                                     │
+│  $1570 │░░░░░░░░░░░░░░░░░●══════════════════════════════════░│
+│        │              ▲ Your bid │                              │
+│  $1568 │░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│        │                         │ Price dropped here           │
+│  $1565 │░░░░░░░░░░░░░░░░░░░░░░░░░▼░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│        ├─────────────────────────────────────────────────────── │
+│        │   -5s        -3s        -1s         +1s        +3s     │
+│                                                                 │
+│  Legend: ● Your quote  ═══ Quote duration  ▼ Price destination │
+│                                                                 │
+│  OUTCOME ANALYSIS:                                              │
+│  If filled at 1570.00, price went to 1565.00 = -$5.00/ETH loss │
+│  Your model predicted: P(adverse) = 0.23                        │
+│  Reality: Adverse (model was WRONG)                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**What this shows:**
+- Your quote relative to liquidity structure
+- What happened to price after your hypothetical entry
+- Whether your adverse selection prediction was correct
+- The "wall pulled before you" pattern that kills MMs
+
+#### 3. Conservative Fill Simulation
+
+If you must simulate fills, be pessimistic:
+
+```
+Conservative Fill Rules:
+1. Only fill if volume through your price > 2x your size
+2. Fill price is always worse than your quote (slippage)
+3. Assume you're LAST in queue at your level
+4. Only count fills where price CONTINUED through (not touched and bounced)
+```
+
+```rust
+fn conservative_would_fill(
+    our_quote: &Quote,
+    book_snapshots: &[BookSnapshot],
+    trades: &[Trade]
+) -> Option<ConservativeFill> {
+    let our_level = our_quote.price;
+    let our_size = our_quote.size;
+
+    // Sum volume that traded through our level
+    let volume_through: f64 = trades.iter()
+        .filter(|t| {
+            match our_quote.side {
+                Side::Bid => t.price <= our_level && t.side == Side::Sell,
+                Side::Ask => t.price >= our_level && t.side == Side::Buy,
+            }
+        })
+        .map(|t| t.size)
+        .sum();
+
+    // Estimate queue ahead of us (size at our level when we placed)
+    let queue_ahead = book_snapshots[0]
+        .get_size_at_level(our_quote.side, our_level);
+
+    // Conservative: assume we're last, need 2x buffer
+    let volume_needed = queue_ahead + our_size * 2.0;
+
+    if volume_through >= volume_needed {
+        // Check price CONTINUED through (not bounced)
+        let price_continued = check_price_continuation(our_level, book_snapshots);
+
+        if price_continued {
+            Some(ConservativeFill {
+                price: our_level - 0.01 * our_quote.side.sign(), // Assume slippage
+                size: our_size,
+                was_toxic: true,  // Assume worst case
+            })
+        } else {
+            None  // Bounced = we probably didn't fill
+        }
+    } else {
+        None
+    }
+}
+```
+
+**Key insight:** Conservative simulation should make you look BAD. If you're still profitable under conservative assumptions, you might actually be profitable.
+
+---
+
+### The Visualization-Driven Validation Protocol
+
+Here's the concrete process to go from "no confidence" to "ready for small live test":
+
+#### Stage 1: Data Collection (No risk)
+
+**Goal:** Collect enough historical data to analyze.
+
+**Duration:** 2 weeks of continuous data collection.
+
+**What to capture:**
+- L2 order book snapshots (100ms, both exchanges)
+- All trades (with aggressor flag if available)
+- Funding rate history
+- Open interest history
+- Your hypothetical quotes (run quote engine in shadow mode)
+
+**Visualization deliverable:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  DATA COLLECTION STATUS                                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Collection Period: 2026-01-01 to 2026-01-14 (14 days)         │
+│                                                                 │
+│  Data Completeness:                                             │
+│  ├─ HL book snapshots:     1,209,600 (99.8% coverage)          │
+│  ├─ Binance book snapshots: 1,205,400 (99.5% coverage)         │
+│  ├─ HL trades:             847,293                              │
+│  ├─ Shadow quotes:         2,419,200 (100%)                    │
+│  └─ Gaps > 1 second:       12 (acceptable)                      │
+│                                                                 │
+│  Data Quality Checks:                                           │
+│  ├─ Book crossed events:   0 (good)                             │
+│  ├─ Timestamp sync error:  < 50ms (acceptable)                  │
+│  └─ Missing fields:        0                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Stage 2: Feature Validation (No risk)
+
+**Goal:** Verify your signals actually contain information.
+
+**What to compute:**
+- Mutual information of each signal vs targets
+- Optimal lag for each signal
+- Regime-conditional signal strength
+- Signal decay over the collection period
+
+**Pass criteria:**
+```
+Feature Validation Checklist:
+[ ] At least 3 signals with MI > 0.05 bits for price direction
+[ ] At least 2 signals with MI > 0.10 bits for adverse selection
+[ ] Lead-lag R² > 0.15 (cross-exchange edge exists)
+[ ] No signal has decayed > 30% over 2 weeks (alpha not fully arbed)
+```
+
+**Visualization deliverable:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SIGNAL VALIDATION RESULTS                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Target: 1-second price direction                               │
+│                                                                 │
+│  Signal                   MI (bits)   Lag     Decay   Status   │
+│  ────────────────────────────────────────────────────────────  │
+│  binance_lead            0.089       -127ms   -8%     ✓ PASS   │
+│  trade_imbalance_1s      0.067       0ms      -3%     ✓ PASS   │
+│  microprice_imbalance    0.045       0ms      -1%     ✓ PASS   │
+│  funding_rate            0.012       0ms      +2%     ✗ WEAK   │
+│                                                                 │
+│  Target: Adverse selection on hypothetical fills                │
+│                                                                 │
+│  Signal                   MI (bits)   Lag     Decay   Status   │
+│  ────────────────────────────────────────────────────────────  │
+│  trade_arrival_rate      0.134       0ms      -5%     ✓ PASS   │
+│  oi_change_1m            0.098       0ms      -12%    ✓ PASS   │
+│  book_imbalance          0.054       0ms      -2%     ✓ PASS   │
+│                                                                 │
+│  OVERALL: 6/7 signals pass validation. Proceed to Stage 3.     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**If you fail Stage 2:** Your signals don't work. Fix your feature engineering or find new signals. Do NOT proceed.
+
+#### Stage 3: Model Calibration (No risk)
+
+**Goal:** Verify your predictions are well-calibrated on historical data.
+
+**What to compute:**
+- Calibration curves for each probability prediction
+- Brier score decomposition (reliability, resolution, uncertainty)
+- Information ratio for each model
+- Conditional calibration by regime
+
+**Pass criteria:**
+```
+Calibration Checklist:
+[ ] All probability predictions have reliability < 0.05
+[ ] All models have IR > 1.0 (adding value over base rate)
+[ ] Calibration holds across all regimes (no regime has IR < 0.8)
+[ ] Calibration holds across time (week 1 vs week 2 not significantly different)
+```
+
+**Visualization deliverable:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CALIBRATION VALIDATION RESULTS                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Model: Fill Probability (1s)                                   │
+│  ┌──────────────────────┐                                       │
+│  │ 1.0│       o o       │  Brier Score: 0.182                   │
+│  │    │     o     o     │  Reliability: 0.023  ✓                │
+│  │ 0.5│   o    ↗    o   │  Resolution:  0.089                   │
+│  │    │ o    Perfect    │  Uncertainty: 0.248                   │
+│  │ 0.0│o________________│  IR: 1.36  ✓                          │
+│  │    0.0    0.5    1.0 │                                       │
+│  └──────────────────────┘                                       │
+│                                                                 │
+│  Model: Adverse Selection Probability                           │
+│  ┌──────────────────────┐                                       │
+│  │ 1.0│     o           │  Brier Score: 0.231                   │
+│  │    │   o   o o       │  Reliability: 0.045  ✓                │
+│  │ 0.5│ o        o      │  Resolution:  0.071                   │
+│  │    │           o     │  Uncertainty: 0.257                   │
+│  │ 0.0│o________________│  IR: 1.10  ✓ (barely)                 │
+│  └──────────────────────┘                                       │
+│                                                                 │
+│  Regime Conditional IR:                                         │
+│  ├─ Quiet:    IR = 1.42  ✓                                      │
+│  ├─ Trending: IR = 1.21  ✓                                      │
+│  ├─ Volatile: IR = 0.98  ⚠ (borderline)                        │
+│  └─ Cascade:  IR = 1.67  ✓                                      │
+│                                                                 │
+│  OVERALL: Pass with warning. Volatile regime needs attention.  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**If you fail Stage 3:** Your models are miscalibrated. Either:
+- Recalibrate (Platt scaling, isotonic regression)
+- Add regime conditioning
+- Simplify the model (overfitting)
+
+Do NOT proceed until calibration passes.
+
+#### Stage 4: Conservative Backtest (No risk)
+
+**Goal:** Estimate worst-case PnL using conservative fill assumptions.
+
+**Method:**
+1. Apply conservative fill rules (2x volume through, assume last in queue)
+2. Compute PnL for hypothetical fills
+3. Add realistic fees, slippage
+4. Compute Sharpe, max drawdown, win rate
+
+**Pass criteria:**
+```
+Conservative Backtest Checklist:
+[ ] Sharpe > 0.5 (modest but positive)
+[ ] Max drawdown < 20% of peak
+[ ] Win rate > 45% (not losing most trades)
+[ ] No single day with loss > 5% of capital
+[ ] Profitable in at least 60% of days
+```
+
+**Key insight:** If conservative backtest is profitable, you have a real edge. If it's not profitable, you need more edge before going live.
+
+**Visualization deliverable:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CONSERVATIVE BACKTEST RESULTS                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Period: 2026-01-01 to 2026-01-14                              │
+│  Assumed capital: $10,000                                       │
+│  Fill assumption: Conservative (2x volume through, last queue) │
+│                                                                 │
+│  Cumulative PnL:                                                │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ $400│                                          ╭────     │  │
+│  │     │                               ╭─────────╯          │  │
+│  │ $200│              ╭───────────────╯                     │  │
+│  │     │   ╭─────────╯                                      │  │
+│  │   $0│───╯                                                │  │
+│  │     │                                                    │  │
+│  │-$200│                                                    │  │
+│  │     └────────────────────────────────────────────────────│  │
+│  │     Jan 1        Jan 5        Jan 9        Jan 13        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Summary Statistics:                                            │
+│  ├─ Total PnL:           +$342.50  (+3.4%)                     │
+│  ├─ Sharpe Ratio:        0.73  ✓                               │
+│  ├─ Max Drawdown:        -$187.20  (-1.9%)  ✓                  │
+│  ├─ Win Rate:            52.3%  ✓                              │
+│  ├─ Profitable Days:     9/14 (64%)  ✓                         │
+│  └─ Worst Day:           -$89.40  (-0.9%)  ✓                   │
+│                                                                 │
+│  PASS: Conservative backtest shows modest positive edge.       │
+│  Recommendation: Proceed to Stage 5 with small live test.      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**If you fail Stage 4:** Your edge isn't strong enough. Either:
+- Improve signal quality (back to Stage 2)
+- Improve calibration (back to Stage 3)
+- Accept that you don't have a viable strategy yet
+
+Do NOT proceed.
+
+#### Stage 5: Tiny Live Test (Small risk, < 1% of capital)
+
+**Goal:** Verify real-world behavior matches backtest.
+
+**Method:**
+1. Trade with minimum possible size (1 ETH or less)
+2. Capture all data (quotes placed, fills, outcomes)
+3. Run for minimum 1 week
+4. Compare to conservative backtest predictions
+
+**What you're looking for:**
+- Fill rate: Is it close to conservative estimate?
+- Adverse selection: Is it worse than predicted? (it will be)
+- Spread capture: Are you actually earning the spread?
+- Regime behavior: Does your system widen in volatility?
+
+**Pass criteria:**
+```
+Tiny Live Test Checklist:
+[ ] Fill rate within 50% of conservative estimate
+[ ] Adverse selection within 2x of predicted (real is always worse)
+[ ] At least broke even after fees
+[ ] No unexpected behavior (runaway inventory, stuck quotes, etc.)
+[ ] System survived at least one volatile period
+```
+
+**Visualization deliverable:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  LIVE TEST vs BACKTEST COMPARISON                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│                        Backtest      Live       Ratio          │
+│  ─────────────────────────────────────────────────────────────  │
+│  Fill rate (per hour)    2.3          1.4       0.61  ⚠        │
+│  Adverse selection bps   4.2          6.8       1.62  ⚠        │
+│  Spread capture bps      5.1          4.3       0.84  ✓        │
+│  Win rate               52%          48%        0.92  ✓        │
+│  PnL per fill           $0.23        $0.11      0.48  ⚠        │
+│                                                                 │
+│  DIAGNOSIS:                                                     │
+│  Fill rate 40% lower than expected - queue position is worse   │
+│  Adverse selection 60% higher - we're getting hit by informed  │
+│  Net effect: Half the expected PnL per fill                    │
+│                                                                 │
+│  Heatmap Analysis of Live Fills:                               │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Fill #1: Wall pulled just before fill ← TOXIC            │  │
+│  │ Fill #2: Normal market flow ← OK                         │  │
+│  │ Fill #3: Cascade onset, we were last liquidity ← TOXIC   │  │
+│  │ Fill #4: Cross-exchange arb ← TOXIC                      │  │
+│  │ Fill #5: Normal market flow ← OK                         │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  RECOMMENDATION: Investigate toxic fill patterns before        │
+│  increasing size. 3/5 fills were toxic - need better defense. │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**The key visualization here:** Looking at EACH fill on the heatmap to understand WHY it happened. Not aggregate statistics - individual fill forensics.
+
+#### Stage 6: Iterative Improvement (Small risk)
+
+**Goal:** Fix problems found in Stage 5, re-validate, repeat.
+
+**Process:**
+1. Identify specific failure modes from fill forensics
+2. Hypothesis: "We're getting filled when walls pull because X"
+3. Add feature/rule to detect this pattern
+4. Back to Stage 3 for calibration validation
+5. Back to Stage 4 for conservative backtest
+6. Back to Stage 5 for tiny live test
+7. Repeat until metrics stabilize
+
+**Visualization deliverable:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  IMPROVEMENT ITERATION LOG                                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Iteration 1 (2026-01-15):                                     │
+│  ├─ Problem: 60% of fills occur when wall just pulled          │
+│  ├─ Hypothesis: We're not detecting wall-pull fast enough      │
+│  ├─ Fix: Add "wall_age" feature, widen spread if wall < 500ms  │
+│  ├─ Backtest impact: +12% PnL improvement                      │
+│  └─ Live test: Pending                                          │
+│                                                                 │
+│  Iteration 2 (2026-01-18):                                     │
+│  ├─ Problem: Cascade detection triggers too late               │
+│  ├─ Hypothesis: OI drop threshold too high (2% → 1%)           │
+│  ├─ Fix: Lower threshold, add funding acceleration signal      │
+│  ├─ Backtest impact: -5% fills but +8% PnL (fewer toxic fills) │
+│  └─ Live test: Pending                                          │
+│                                                                 │
+│  Current Status: Iteration 2 in Stage 5 live test              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Concrete Visualization Tools Needed
+
+Based on this protocol, here are the specific visualizations required:
+
+#### Tool 1: Historical Heatmap + Shadow Quote Viewer
+
+**Purpose:** See where your quotes WOULD have been relative to historical book structure.
+
+**Features:**
+- Order book heatmap (price vs time, color = depth)
+- Your shadow quotes overlaid as colored lines
+- Market fills marked as dots
+- "Would you have filled?" indicator based on conservative rules
+- Price trajectory after each potential fill
+
+**Use case:** "Show me every time my shadow quote was at a level where a wall pulled."
+
+#### Tool 2: Fill Forensics Dashboard
+
+**Purpose:** Analyze each real or hypothetical fill in detail.
+
+**Features:**
+- Individual fill selection
+- Book state at fill time (who else was there?)
+- 10-second replay around fill
+- Binance state at fill time (cross-exchange context)
+- Model predictions at fill time vs actual outcome
+- Classification: noise/informed/liquidation/arbitrage
+
+**Use case:** "Why did fill #47 lose $2.30? Walk me through it."
+
+#### Tool 3: Calibration Monitoring Dashboard
+
+**Purpose:** Track whether your models are staying calibrated.
+
+**Features:**
+- Rolling calibration curves (last 24h, last 7d, all-time)
+- Brier decomposition over time
+- IR trend with decay detection
+- Regime-conditional breakdowns
+- Alerts when calibration degrades
+
+**Use case:** "My fill prediction IR dropped from 1.3 to 0.9 this week. When did it start?"
+
+#### Tool 4: Live vs Backtest Comparison
+
+**Purpose:** Understand how reality differs from simulation.
+
+**Features:**
+- Side-by-side metrics (fill rate, adverse selection, PnL)
+- Overlay of predicted vs actual outcomes
+- Specific divergence analysis (when does backtest fail?)
+- Queue position inference from real fills
+
+**Use case:** "My live fill rate is 40% of backtest. Show me where the fills are going instead."
+
+#### Tool 5: Regime Transition Analyzer
+
+**Purpose:** Understand regime behavior and parameter appropriateness.
+
+**Features:**
+- Regime probability time series
+- Spread/gamma parameters at each regime
+- PnL attribution by regime
+- Regime transition analysis (what triggers cascade?)
+
+**Use case:** "I'm losing money in volatile regime. Show me my spreads vs actual volatility."
+
+---
+
+### The Key Insight
+
+**You can't paper trade your way to confidence.**
+
+But you CAN:
+1. Validate predictions on historical data (no fills required)
+2. Analyze hypothetical fills conservatively
+3. Understand failure modes visually
+4. Test live with minimum capital
+5. Use fill forensics to diagnose problems
+6. Iterate until reality matches predictions
+
+The visualization infrastructure isn't just for monitoring - it's the primary tool for validating your edge exists before you risk capital.
+
+**The heatmap isn't decoration. It's how you see:**
+- Where your quotes sit relative to the ecosystem
+- What happens when liquidity disappears
+- Whether your fills are toxic or benign
+- Why your backtest diverges from reality
+
+Build the visualization first. Then use it to prove (or disprove) your edge.
