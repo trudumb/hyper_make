@@ -9,7 +9,12 @@
       "mcp__serena__read_file",
       "mcp__serena__initial_instructions",
       "mcp__serena__read_memory",
-      "mcp__serena__think_about_collected_information"
+      "mcp__serena__think_about_collected_information",
+      "mcp__serena__replace_symbol_body",
+      "mcp__serena__insert_after_symbol",
+      "Bash(cargo build:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs"
     ]
   }
 }

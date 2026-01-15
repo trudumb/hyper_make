@@ -224,3 +224,4 @@ Build components in this order (each depends on previous):
 4. **Units matter** - bps vs fraction, seconds vs milliseconds, 8h vs annualized
 5. **Regime matters** - single parameter values are almost always wrong
 6. **Defense wins** - when in doubt, widen spreads
+7. **Manual Execution Only**: The user wants to run all code manually. Do NOT execute binaries or scripts (e.g. `cargo run`, `./scripts/...`). Provide copy-pasteable blocks for the user to execute.
