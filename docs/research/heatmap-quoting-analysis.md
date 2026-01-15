@@ -791,3 +791,1056 @@ relative_visibility = our_size[level] / total_size[level]
 
 wall_distance = min(|our_quote - wall_price|) for walls > size_threshold
 ```
+
+---
+
+## Part 3: Complete Model Infrastructure
+
+Before improving any model, you need to know exactly how wrong your current models are and in what ways. This is the foundation everything else builds on.
+
+### 3.1 Measurement Infrastructure
+
+#### The Prediction Log Schema
+
+Every quote cycle, your system makes implicit predictions. These need to be recorded with enough granularity to diagnose failures.
+
+```rust
+struct PredictionRecord {
+    // Timing
+    timestamp_ns: u64,
+    quote_cycle_id: u64,
+
+    // Market state at prediction time
+    market_state: MarketStateSnapshot,
+
+    // Model outputs (what we predicted)
+    predictions: ModelPredictions,
+
+    // What actually happened (filled in async)
+    outcomes: Option<ObservedOutcomes>,
+}
+
+struct MarketStateSnapshot {
+    // L2 book state
+    bid_levels: Vec<(f64, f64)>,  // (price, size) for top N levels
+    ask_levels: Vec<(f64, f64)>,
+
+    // Derived quantities your models use
+    microprice: f64,
+    microprice_std: f64,  // uncertainty on microprice
+
+    // Kappa inputs
+    kappa_book: f64,
+    kappa_robust: f64,
+    kappa_own: f64,
+    kappa_final: f64,
+
+    // Volatility
+    sigma_bipower: f64,
+    sigma_realized_1m: f64,
+
+    // Gamma inputs
+    gamma_base: f64,
+    gamma_effective: f64,
+
+    // External state
+    funding_rate: f64,
+    time_to_funding_settlement_s: f64,
+    open_interest: f64,
+    open_interest_delta_1m: f64,
+
+    // Cross-exchange (if available)
+    binance_mid: Option<f64>,
+    binance_hl_spread: Option<f64>,
+
+    // Your position
+    inventory: f64,
+    inventory_age_s: f64,
+}
+
+struct ModelPredictions {
+    // For each quote level you're placing
+    levels: Vec<LevelPrediction>,
+
+    // Aggregate predictions
+    expected_fill_rate_1s: f64,
+    expected_fill_rate_10s: f64,
+    expected_adverse_selection_bps: f64,
+    regime_probabilities: HashMap<Regime, f64>,
+}
+
+struct LevelPrediction {
+    side: Side,
+    price: f64,
+    size: f64,
+    depth_from_mid_bps: f64,
+
+    // Fill probability predictions at different horizons
+    p_fill_100ms: f64,
+    p_fill_1s: f64,
+    p_fill_10s: f64,
+
+    // Conditional predictions
+    p_adverse_given_fill: f64,  // P(price moves against us | we get filled)
+    expected_pnl_given_fill: f64,
+
+    // Queue position estimate
+    estimated_queue_position: f64,
+    estimated_queue_total: f64,
+}
+
+struct ObservedOutcomes {
+    // Fill outcomes
+    fills: Vec<FillOutcome>,
+
+    // Price evolution
+    price_1s_later: f64,
+    price_10s_later: f64,
+    price_60s_later: f64,
+
+    // Did we get adversely selected?
+    adverse_selection_realized_bps: f64,
+}
+
+struct FillOutcome {
+    level_index: usize,
+    fill_timestamp_ns: u64,
+    fill_price: f64,
+    fill_size: f64,
+
+    // Post-fill price evolution
+    mark_price_at_fill: f64,
+    mark_price_100ms_later: f64,
+    mark_price_1s_later: f64,
+    mark_price_10s_later: f64,
+}
+```
+
+#### Calibration Analysis Pipeline
+
+**Step 1: Probability Calibration Curves**
+
+For each prediction type (fill probability at different horizons), bin predictions and compare to realized frequencies:
+
+```
+Algorithm: BuildCalibrationCurve
+Input: predictions[], outcomes[], num_bins=20
+
+1. Sort (prediction, outcome) pairs by prediction value
+2. Divide into num_bins equal-sized buckets
+3. For each bucket:
+   - mean_predicted = average of predictions in bucket
+   - realized_frequency = fraction where outcome=True
+   - count = number of samples in bucket
+4. Return [(mean_predicted, realized_frequency, count), ...]
+```
+
+**Interpretation:**
+- Perfect calibration: points lie on y=x diagonal
+- Overconfident: curve below diagonal (you predict 70%, reality is 50%)
+- Underconfident: curve above diagonal
+
+**Step 2: Brier Score Decomposition**
+
+The Brier score is the mean squared error of probability predictions:
+
+```
+BS = (1/N) Σ (pᵢ - oᵢ)²
+```
+
+Where pᵢ is predicted probability and oᵢ ∈ {0,1} is outcome.
+
+Decompose into three components:
+
+```
+BS = Reliability - Resolution + Uncertainty
+
+Reliability = (1/N) Σₖ nₖ(p̄ₖ - ōₖ)²
+  - Measures calibration quality
+  - Lower is better
+  - If your 70% predictions hit 70%, this is 0
+
+Resolution = (1/N) Σₖ nₖ(ōₖ - ō)²
+  - Measures discrimination ability
+  - Higher is better
+  - Are your high predictions different from low predictions?
+
+Uncertainty = ō(1 - ō)
+  - Base rate variance
+  - Not controllable, just the inherent difficulty
+```
+
+**Step 3: Information Ratio**
+
+For each model output, compute how much information it provides:
+
+```
+Information Ratio = Resolution / Uncertainty
+
+IR > 1.0: Model predictions carry useful information
+IR ≈ 1.0: Model is roughly as good as predicting base rate
+IR < 1.0: Model is adding noise
+```
+
+Track IR over time. If IR degrades, your model is becoming stale.
+
+**Step 4: Conditional Calibration Analysis**
+
+Overall calibration can hide regime-dependent failures. Slice your calibration analysis by:
+
+```
+Conditioning Variables:
+├── Volatility regime (σ quartiles)
+├── Funding rate regime (positive/negative/extreme)
+├── Time of day (funding settlement windows)
+├── Inventory state (long/flat/short)
+├── Recent fill rate (active/quiet)
+├── Book imbalance (bid-heavy/balanced/ask-heavy)
+└── Cross-exchange state (HL leading/lagging/synced)
+```
+
+#### Outcome Attribution Pipeline
+
+When you lose money, you need to know why:
+
+```rust
+struct CycleAttribution {
+    cycle_id: u64,
+    gross_pnl: f64,
+
+    // Decomposition
+    spread_capture: f64,      // Revenue from bid-ask spread
+    adverse_selection: f64,   // Loss from fills before adverse moves
+    inventory_cost: f64,      // Cost of holding inventory
+    fee_cost: f64,            // Exchange fees
+
+    // Model accuracy
+    fill_prediction_error: f64,
+    adverse_selection_prediction_error: f64,
+    volatility_prediction_error: f64,
+}
+```
+
+**Daily Attribution Report:**
+
+```
+=== PnL Attribution: 2026-01-13 ===
+
+Gross PnL:              -$127.45
+├── Spread Capture:     +$284.30  (working correctly)
+├── Adverse Selection:  -$312.80  (THIS IS THE PROBLEM)
+├── Inventory Cost:     -$45.20   (acceptable)
+└── Fees:               -$53.75   (fixed cost)
+
+Model Accuracy:
+├── Fill Prediction:    Brier=0.18, IR=1.34  (good)
+├── Adverse Selection:  Brier=0.31, IR=0.89  (NEEDS WORK)
+└── Volatility:         RMSE=0.000012        (acceptable)
+
+Regime Breakdown:
+├── Quiet (68% of time):    +$89.20
+├── Active (28% of time):   -$45.60
+└── Extreme (4% of time):   -$171.05  (INVESTIGATE)
+```
+
+This tells you exactly where to focus: adverse selection prediction during extreme regimes.
+
+---
+
+### 3.2 Information Source Audit
+
+Before building models, systematically measure what signals contain predictive information.
+
+#### Mutual Information Estimation
+
+For each candidate signal X and target variable Y, estimate mutual information:
+
+```
+I(X; Y) = H(Y) - H(Y|X)
+```
+
+Where H is entropy. This measures how many bits of information X provides about Y.
+
+**Continuous Variables: k-NN Estimator (Kraskov et al.)**
+
+```rust
+fn estimate_mutual_information(
+    x: &[f64],  // Signal values
+    y: &[f64],  // Target values
+    k: usize    // Number of neighbors (typically 3-10)
+) -> f64 {
+    let n = x.len();
+
+    // Build k-d trees for joint and marginals
+    // Find k-th nearest neighbor distance in joint space
+    // Count points within eps in marginals
+    // MI ≈ digamma(k) + digamma(n) - digamma(n_x) - digamma(n_y)
+
+    // ... implementation details
+}
+```
+
+#### Signal Catalog
+
+```rust
+struct SignalCatalog {
+    // Book-derived
+    microprice_imbalance: f64,      // (bid_size - ask_size) / (bid_size + ask_size)
+    book_pressure: f64,             // Integrated depth asymmetry
+    spread_bps: f64,
+    depth_at_1bps: f64,
+    depth_at_5bps: f64,
+
+    // Trade-derived
+    trade_imbalance_1s: f64,        // Net signed volume last 1s
+    trade_imbalance_10s: f64,
+    trade_arrival_rate: f64,        // Trades per second
+    avg_trade_size: f64,
+    large_trade_indicator: bool,    // Trade > 2σ from mean
+
+    // Hyperliquid-specific
+    funding_rate: f64,
+    funding_rate_change_1h: f64,
+    time_to_funding_settlement: f64,
+    open_interest: f64,
+    open_interest_change_1m: f64,
+    open_interest_change_10m: f64,
+
+    // Cross-exchange
+    binance_hl_spread: f64,
+    binance_lead_indicator: f64,    // Recent price change on Binance
+    binance_volume_ratio: f64,      // Binance volume / HL volume
+
+    // Derived/Composite
+    funding_x_imbalance: f64,       // funding_rate * trade_imbalance
+    oi_momentum: f64,               // OI change acceleration
+}
+```
+
+#### Signal Audit Report Format
+
+```
+=== Signal Audit Report: 2026-01-13 ===
+
+Target: PriceDirection1s
+
+Signal                      MI (bits)  Corr    Opt Lag   Regime Var
+─────────────────────────────────────────────────────────────────────
+binance_lead_indicator      0.089      0.31    -150ms    High (2.3x in volatile)
+trade_imbalance_1s          0.067      0.24    0ms       Medium
+microprice_imbalance        0.045      0.19    0ms       Low
+funding_x_imbalance         0.041      0.15    0ms       High (3.1x near settlement)
+open_interest_change_1m     0.023      0.08    0ms       Low
+
+Target: AdverseSelectionOnNextFill
+
+Signal                      MI (bits)  Corr    Opt Lag   Regime Var
+─────────────────────────────────────────────────────────────────────
+trade_arrival_rate          0.134      0.42    0ms       High (4.2x in cascade)
+large_trade_indicator       0.098      0.38    -50ms     Medium
+binance_hl_spread           0.076      0.29    -100ms    High
+
+ACTIONABLE INSIGHTS:
+1. binance_lead_indicator is your highest-value unused signal for direction
+2. trade_arrival_rate strongly predicts adverse selection - use for dynamic kappa
+3. funding_x_imbalance has 3x higher MI near settlement - regime-condition this
+```
+
+---
+
+### 3.3 Proprietary Fill Intensity Model (Hawkes Process)
+
+Standard Hawkes process for trade arrivals:
+
+```
+λ(t) = μ + ∫₀ᵗ α·e^(-β(t-s)) dN(s)
+```
+
+Where:
+- μ = baseline intensity
+- α = excitation from each event
+- β = decay rate
+- N(s) = counting process (number of trades by time s)
+
+#### Exchange-Specific Extensions
+
+**Extension 1: State-Dependent Baseline**
+
+```
+μ(t) = μ₀ · exp(w_F · F(t) + w_OI · ΔOI(t) + w_τ · τ(t))
+```
+
+Where:
+- F(t) = funding rate
+- ΔOI(t) = OI change rate
+- τ(t) = time to funding settlement (cyclical feature)
+
+**Extension 2: Trade-Type-Dependent Excitation**
+
+```rust
+fn compute_excitation(trade: &Trade, our_side: Side) -> f64 {
+    let base_alpha = 0.3;
+
+    // Size effect: larger trades excite more
+    let size_mult = (trade.size / MEDIAN_TRADE_SIZE).sqrt().min(3.0);
+
+    // Side effect: trades on our side are more relevant for our fills
+    let side_mult = if trade.side == our_side { 1.5 } else { 0.8 };
+
+    // Aggressor effect: market orders excite more than limit fills
+    let aggressor_mult = if trade.is_aggressor { 1.2 } else { 1.0 };
+
+    base_alpha * size_mult * side_mult * aggressor_mult
+}
+```
+
+**Extension 3: Queue-Position-Dependent Kernel**
+
+```rust
+fn adaptive_kernel(
+    time_since_trade: f64,
+    queue_change_since_trade: f64,
+    beta: f64
+) -> f64 {
+    // Standard temporal decay
+    let temporal = (-beta * time_since_trade).exp();
+
+    // Queue consumption effect
+    let queue_mult = 1.0 + 0.5 * (queue_change_since_trade / TYPICAL_QUEUE_SIZE).min(1.0);
+
+    temporal * queue_mult
+}
+```
+
+#### Full Model Specification
+
+```rust
+struct HyperliquidFillIntensityModel {
+    // Baseline parameters
+    mu_0: f64,
+    w_funding: f64,
+    w_oi_change: f64,
+    w_time_to_settlement: f64,
+
+    // Excitation parameters
+    alpha_base: f64,
+    alpha_size_power: f64,
+    alpha_same_side_mult: f64,
+    alpha_aggressor_mult: f64,
+
+    // Decay parameters
+    beta_time: f64,
+    beta_queue_sensitivity: f64,
+
+    // Regime-switching
+    regime_multipliers: HashMap<Regime, f64>,
+}
+
+impl HyperliquidFillIntensityModel {
+    fn intensity_at(
+        &self,
+        t: f64,
+        recent_trades: &[Trade],
+        queue_position: f64,
+        market_state: &MarketState
+    ) -> f64 {
+        // State-dependent baseline
+        let funding_effect = self.w_funding * market_state.funding_rate;
+        let oi_effect = self.w_oi_change * market_state.oi_change_rate;
+        let settlement_effect = self.w_time_to_settlement
+            * (market_state.time_to_settlement / 8.0 * TAU).sin();
+
+        let mu_t = self.mu_0 * (funding_effect + oi_effect + settlement_effect).exp();
+
+        // Excitation from recent trades
+        let excitation = self.compute_excitation_sum(t, recent_trades, queue_position);
+
+        // Regime adjustment
+        let regime_mult = self.regime_multipliers
+            .get(&market_state.regime)
+            .copied()
+            .unwrap_or(1.0);
+
+        (mu_t + excitation) * regime_mult
+    }
+}
+```
+
+#### Converting Intensity to Kappa
+
+```rust
+fn intensity_to_kappa(
+    fill_intensity_model: &HyperliquidFillIntensityModel,
+    market_state: &MarketState,
+    reference_depth_bps: f64
+) -> f64 {
+    // Kappa represents: additional fills per unit of spread tightening
+    // κ = ∂(fill_rate)/∂(depth)
+
+    let eps = 0.1;  // 0.1 bps perturbation
+
+    let fill_rate_at_depth = fill_intensity_model.expected_fills_in_window(
+        0.0, 1.0, reference_depth_bps, market_state
+    );
+
+    let fill_rate_tighter = fill_intensity_model.expected_fills_in_window(
+        0.0, 1.0, reference_depth_bps - eps, market_state
+    );
+
+    let kappa = (fill_rate_tighter - fill_rate_at_depth) / (eps / 10000.0);
+
+    kappa.max(100.0)  // Floor to prevent division issues in GLFT
+}
+```
+
+---
+
+### 3.4 Adverse Selection Decomposition
+
+#### Mixture Model for Trade Classification
+
+Every trade comes from one of several latent types:
+
+```
+Types: {noise, informed, liquidation, arbitrage}
+
+P(type | observable_features) = softmax(W · φ(features))
+```
+
+**Feature Engineering:**
+
+```rust
+struct TradeFeatures {
+    // Size features
+    size_zscore: f64,
+    size_quantile: f64,
+
+    // Timing features
+    time_since_last_trade_ms: f64,
+    trades_in_last_1s: u32,
+    trades_in_last_10s: u32,
+
+    // Aggression features
+    is_aggressor: bool,
+    crossed_spread_bps: f64,
+
+    // Directional features
+    signed_volume_imbalance_1s: f64,
+    signed_volume_imbalance_10s: f64,
+
+    // Funding interaction
+    funding_rate: f64,
+    trade_aligns_with_funding: bool,
+
+    // Cross-exchange
+    binance_price_change_100ms: f64,
+    binance_hl_spread_at_trade: f64,
+
+    // Book state
+    book_imbalance_at_trade: f64,
+    depth_consumed_pct: f64,
+
+    // Hyperliquid-specific
+    oi_change_1m_before: f64,
+    near_liquidation_price: bool,
+}
+```
+
+**Labeling Strategy (for training):**
+
+```rust
+enum TradeLabel {
+    Informed,      // Price moved >X bps in trade direction within 10s
+    Noise,         // Price stayed flat or reversed
+    Liquidation,   // Part of a liquidation cascade (detect via OI drop)
+    Arbitrage,     // Cross-exchange spread closed immediately after
+}
+
+fn label_trade(trade: &Trade, future_prices: &[f64], context: &MarketContext) -> TradeLabel {
+    // Check for liquidation cascade
+    if context.oi_dropped_significantly && context.funding_extreme {
+        return TradeLabel::Liquidation;
+    }
+
+    // Check for arbitrage
+    if context.cross_exchange_spread_closed_within_500ms {
+        return TradeLabel::Arbitrage;
+    }
+
+    // Informed vs noise based on ex-post price move
+    let price_10s_later = future_prices[100];
+    let signed_move = compute_signed_move(trade, price_10s_later);
+
+    if signed_move > 5.0 {  // Moved >5 bps in trade direction
+        TradeLabel::Informed
+    } else {
+        TradeLabel::Noise
+    }
+}
+```
+
+#### Real-Time Integration
+
+```rust
+struct AdverseSelectionAdjuster {
+    classifier: TradeClassifier,
+    informed_intensity: ExponentialMovingAverage,
+    kappa_discount_per_informed_pct: f64,
+    spread_premium_per_informed_pct: f64,
+}
+
+impl AdverseSelectionAdjuster {
+    fn on_trade(&mut self, trade: &Trade, features: &TradeFeatures) {
+        let informed_prob = self.classifier.informed_probability(features);
+        self.informed_intensity.update(informed_prob);
+    }
+
+    fn get_kappa_adjustment(&self) -> f64 {
+        let informed_pct = self.informed_intensity.value() * 100.0;
+        let adjustment = 1.0 - informed_pct * self.kappa_discount_per_informed_pct;
+        adjustment.max(0.3)  // Don't reduce kappa by more than 70%
+    }
+
+    fn get_spread_adjustment_bps(&self) -> f64 {
+        let informed_pct = self.informed_intensity.value() * 100.0;
+        informed_pct * self.spread_premium_per_informed_pct
+    }
+}
+```
+
+#### Liquidation Detection Subsystem
+
+```rust
+struct LiquidationDetector {
+    oi_history: RingBuffer<(u64, f64)>,
+    funding_history: RingBuffer<(u64, f64)>,
+    cascade_threshold_oi_drop_pct: f64,
+    liquidation_probability: f64,
+}
+
+impl LiquidationDetector {
+    fn update(&mut self, current_oi: f64, current_funding: f64, timestamp: u64) {
+        self.oi_history.push((timestamp, current_oi));
+        self.funding_history.push((timestamp, current_funding));
+
+        let oi_1m_ago = self.oi_history.get_at_time(timestamp - 60_000);
+        let oi_change_pct = (current_oi - oi_1m_ago) / oi_1m_ago * 100.0;
+        let funding_percentile = self.funding_history.percentile_rank(current_funding);
+
+        self.liquidation_probability = self.compute_liquidation_probability(
+            oi_change_pct,
+            funding_percentile,
+            current_funding
+        );
+    }
+
+    fn is_cascade_active(&self) -> bool {
+        self.liquidation_probability > 0.5
+    }
+}
+```
+
+---
+
+### 3.5 Regime Detection System (HMM)
+
+#### Hidden Markov Model Specification
+
+**States:**
+
+```rust
+enum MarketRegime {
+    Quiet,          // Low volatility, balanced flow, normal fill rates
+    Trending,       // Directional momentum, elevated adverse selection
+    Volatile,       // High volatility, wide spreads, uncertain direction
+    Cascade,        // Liquidation cascade, extreme toxicity
+}
+```
+
+**Emission Model:**
+
+```rust
+struct RegimeEmissionModel {
+    volatility_mean: f64,
+    volatility_std: f64,
+    trade_intensity_mean: f64,
+    trade_intensity_std: f64,
+    imbalance_mean: f64,
+    imbalance_std: f64,
+    adverse_selection_mean: f64,
+    adverse_selection_std: f64,
+}
+
+struct HMMParams {
+    transition_probs: [[f64; 4]; 4],
+    emissions: [RegimeEmissionModel; 4],
+    initial_probs: [f64; 4],
+}
+```
+
+**Initialization:**
+
+```rust
+fn initialize_hmm_params() -> HMMParams {
+    HMMParams {
+        transition_probs: [
+            // From Quiet: mostly stays quiet
+            [0.95, 0.03, 0.019, 0.001],
+            // From Trending: can stay or revert
+            [0.10, 0.85, 0.04, 0.01],
+            // From Volatile: can calm down or escalate
+            [0.15, 0.10, 0.70, 0.05],
+            // From Cascade: usually short, reverts to volatile
+            [0.05, 0.05, 0.60, 0.30],
+        ],
+        // ... emission parameters
+    }
+}
+```
+
+#### Online Filtering (Forward Algorithm)
+
+```rust
+struct OnlineHMMFilter {
+    params: HMMParams,
+    belief: [f64; 4],  // P(regime | observations so far)
+    observation_buffer: RingBuffer<ObservationVector>,
+}
+
+struct ObservationVector {
+    volatility: f64,
+    trade_intensity: f64,
+    imbalance: f64,
+    adverse_selection: f64,
+}
+
+impl OnlineHMMFilter {
+    fn update(&mut self, obs: &ObservationVector) {
+        // Prediction step: apply transition matrix
+        let mut predicted = [0.0; 4];
+        for j in 0..4 {
+            for i in 0..4 {
+                predicted[j] += self.params.transition_probs[i][j] * self.belief[i];
+            }
+        }
+
+        // Update step: multiply by observation likelihood
+        let mut updated = [0.0; 4];
+        let mut normalizer = 0.0;
+
+        for i in 0..4 {
+            let likelihood = self.observation_likelihood(obs, i);
+            updated[i] = predicted[i] * likelihood;
+            normalizer += updated[i];
+        }
+
+        // Normalize
+        for i in 0..4 {
+            self.belief[i] = updated[i] / normalizer;
+        }
+    }
+
+    fn most_likely_regime(&self) -> MarketRegime {
+        let max_idx = self.belief.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap().0;
+
+        match max_idx {
+            0 => MarketRegime::Quiet,
+            1 => MarketRegime::Trending,
+            2 => MarketRegime::Volatile,
+            3 => MarketRegime::Cascade,
+            _ => unreachable!(),
+        }
+    }
+}
+```
+
+#### Regime-Dependent Parameters
+
+```rust
+struct RegimeSpecificParams {
+    gamma: f64,
+    kappa_multiplier: f64,
+    spread_floor_bps: f64,
+    max_inventory: f64,
+}
+
+fn get_regime_params(regime: MarketRegime) -> RegimeSpecificParams {
+    match regime {
+        MarketRegime::Quiet => RegimeSpecificParams {
+            gamma: 0.3,
+            kappa_multiplier: 1.0,
+            spread_floor_bps: 5.0,
+            max_inventory: 1.0,
+        },
+        MarketRegime::Trending => RegimeSpecificParams {
+            gamma: 0.5,
+            kappa_multiplier: 0.7,
+            spread_floor_bps: 10.0,
+            max_inventory: 0.5,
+        },
+        MarketRegime::Volatile => RegimeSpecificParams {
+            gamma: 0.8,
+            kappa_multiplier: 1.5,
+            spread_floor_bps: 15.0,
+            max_inventory: 0.3,
+        },
+        MarketRegime::Cascade => RegimeSpecificParams {
+            gamma: 2.0,
+            kappa_multiplier: 5.0,
+            spread_floor_bps: 50.0,
+            max_inventory: 0.1,
+        },
+    }
+}
+
+fn blend_params_by_belief(hmm_filter: &OnlineHMMFilter) -> RegimeSpecificParams {
+    let probs = hmm_filter.regime_probabilities();
+
+    let mut blended = RegimeSpecificParams::default();
+
+    for (regime, prob) in probs {
+        let params = get_regime_params(regime);
+        blended.gamma += prob * params.gamma;
+        blended.kappa_multiplier += prob * params.kappa_multiplier;
+        blended.spread_floor_bps += prob * params.spread_floor_bps;
+        blended.max_inventory += prob * params.max_inventory;
+    }
+
+    blended
+}
+```
+
+---
+
+### 3.6 Cross-Exchange Lead-Lag Model
+
+This is potentially the highest-value proprietary signal.
+
+#### Lead-Lag Estimation
+
+**Observation:** Binance BTC perp leads Hyperliquid BTC perp by 50-500ms depending on conditions.
+
+```rust
+struct LeadLagEstimator {
+    binance_changes: RingBuffer<(u64, f64)>,
+    hl_changes: RingBuffer<(u64, f64)>,
+
+    lag_estimate_ms: f64,
+    lag_estimate_std: f64,
+    beta_estimate: f64,  // HL_change ≈ β × Binance_change(t - lag)
+    beta_estimate_std: f64,
+
+    r_squared: f64,
+    sample_count: usize,
+}
+
+impl LeadLagEstimator {
+    fn estimate_lag(&mut self) {
+        // Grid search over candidate lags
+        let candidate_lags_ms: Vec<f64> = (-100..=500).step_by(10)
+            .map(|x| x as f64).collect();
+
+        let mut best_lag = 0.0;
+        let mut best_r2 = -1.0;
+        let mut best_beta = 0.0;
+
+        for &lag_ms in &candidate_lags_ms {
+            let (beta, r2) = self.compute_regression_at_lag(lag_ms);
+            if r2 > best_r2 {
+                best_r2 = r2;
+                best_lag = lag_ms;
+                best_beta = beta;
+            }
+        }
+
+        // Update estimates with smoothing
+        let alpha = 0.1;
+        self.lag_estimate_ms = alpha * best_lag + (1.0 - alpha) * self.lag_estimate_ms;
+        self.beta_estimate = alpha * best_beta + (1.0 - alpha) * self.beta_estimate;
+        self.r_squared = alpha * best_r2 + (1.0 - alpha) * self.r_squared;
+    }
+}
+```
+
+#### Regime-Conditioned Lead-Lag
+
+The lead-lag relationship changes with volatility:
+
+```rust
+struct RegimeConditionedLeadLag {
+    estimators: HashMap<VolatilityRegime, LeadLagEstimator>,
+    current_regime: VolatilityRegime,
+}
+
+impl RegimeConditionedLeadLag {
+    fn predict_hl_move(&self, recent_binance_change: f64, time_since_change_ms: f64) -> f64 {
+        let (lag_ms, beta) = self.get_current_estimate();
+
+        if time_since_change_ms < lag_ms {
+            let completion_fraction = time_since_change_ms / lag_ms;
+            let remaining_move = beta * recent_binance_change * (1.0 - completion_fraction);
+            remaining_move
+        } else {
+            0.0
+        }
+    }
+}
+```
+
+#### Integration into Quote Generation
+
+```rust
+fn compute_adjusted_microprice(
+    local_microprice: f64,
+    lead_lag_model: &RegimeConditionedLeadLag,
+    recent_binance_move: f64,
+    time_since_binance_move_ms: f64
+) -> f64 {
+    let predicted_hl_move = lead_lag_model.predict_hl_move(
+        recent_binance_move,
+        time_since_binance_move_ms
+    );
+
+    local_microprice * (1.0 + predicted_hl_move)
+}
+
+fn compute_directional_skew(
+    lead_lag_model: &RegimeConditionedLeadLag,
+    recent_binance_move: f64,
+    time_since_binance_move_ms: f64,
+    base_skew: f64
+) -> f64 {
+    let (lag_ms, _beta) = lead_lag_model.get_current_estimate();
+
+    if time_since_binance_move_ms < lag_ms {
+        let expected_direction = recent_binance_move.signum();
+        let confidence = lead_lag_model.current_r_squared();
+
+        // Add skew in direction of expected move
+        base_skew + expected_direction * confidence * 2.0  // 2 bps at full confidence
+    } else {
+        base_skew
+    }
+}
+```
+
+---
+
+### 3.7 Integration Architecture
+
+```rust
+struct EnhancedQuoteEngine {
+    // Existing components
+    kappa_orchestrator: KappaOrchestrator,
+    volatility_estimator: BipowerVariation,
+    microprice_estimator: MicropriceEstimator,
+
+    // New components
+    prediction_logger: PredictionLogger,
+    fill_intensity_model: HyperliquidFillIntensityModel,
+    trade_classifier: TradeClassifier,
+    adverse_selection_adjuster: AdverseSelectionAdjuster,
+    hmm_filter: OnlineHMMFilter,
+    liquidation_detector: LiquidationDetector,
+    lead_lag_model: RegimeConditionedLeadLag,
+
+    // Calibration tracking
+    calibration_metrics: CalibrationMetrics,
+}
+
+impl EnhancedQuoteEngine {
+    fn generate_quotes(&mut self, market_data: &MarketData) -> QuoteSet {
+        // 1. Update all models with new data
+        self.update_models(market_data);
+
+        // 2. Log predictions for calibration
+        let predictions = self.generate_predictions(market_data);
+        self.prediction_logger.log(&predictions, market_data);
+
+        // 3. Get regime-blended parameters
+        let regime_params = blend_params_by_belief(&self.hmm_filter);
+
+        // 4. Check for liquidation cascade
+        if self.liquidation_detector.is_cascade_active() {
+            return self.generate_defensive_quotes(market_data);
+        }
+
+        // 5. Compute adjusted microprice using lead-lag
+        let adjusted_microprice = compute_adjusted_microprice(
+            self.microprice_estimator.get_microprice(),
+            &self.lead_lag_model,
+            market_data.recent_binance_move,
+            market_data.time_since_binance_move_ms
+        );
+
+        // 6. Compute fill-intensity-based kappa
+        let intensity_kappa = intensity_to_kappa(
+            &self.fill_intensity_model,
+            &market_data.market_state,
+            10.0
+        );
+
+        // 7. Apply adverse selection adjustment
+        let adjusted_kappa = intensity_kappa
+            * self.adverse_selection_adjuster.get_kappa_adjustment()
+            * regime_params.kappa_multiplier;
+
+        // 8. Compute GLFT optimal spread
+        let gamma = regime_params.gamma;
+        let glft_half_spread = (1.0 / gamma) * (1.0 + gamma / adjusted_kappa).ln()
+            + MAKER_FEE;
+
+        // 9. Apply floor and uncertainty premium
+        let spread_floor = regime_params.spread_floor_bps / 10000.0;
+        let uncertainty_mult = self.compute_uncertainty_multiplier();
+        let final_half_spread = glft_half_spread.max(spread_floor) * uncertainty_mult;
+
+        // 10. Compute inventory skew
+        let inventory_skew = self.compute_inventory_skew(market_data);
+
+        // 11. Add lead-lag directional skew
+        let directional_skew = compute_directional_skew(
+            &self.lead_lag_model,
+            market_data.recent_binance_move,
+            market_data.time_since_binance_move_ms,
+            0.0
+        ) / 10000.0;
+
+        // 12. Generate final quotes
+        let bid_depth = final_half_spread + inventory_skew - directional_skew;
+        let ask_depth = final_half_spread - inventory_skew + directional_skew;
+
+        QuoteSet {
+            bid_price: adjusted_microprice * (1.0 - bid_depth),
+            ask_price: adjusted_microprice * (1.0 + ask_depth),
+            bid_size: self.compute_bid_size(regime_params.max_inventory),
+            ask_size: self.compute_ask_size(regime_params.max_inventory),
+
+            regime: self.hmm_filter.most_likely_regime(),
+            kappa_used: adjusted_kappa,
+            gamma_used: gamma,
+            spread_bps: (bid_depth + ask_depth) * 10000.0,
+        }
+    }
+}
+```
+
+---
+
+### 3.8 Implementation Priority
+
+Based on expected edge per engineering effort:
+
+| Phase | Focus | Rationale |
+|-------|-------|-----------|
+| 1 | Measurement Infrastructure | Foundational - everything else depends on measuring properly |
+| 2 | Signal Audit | Identify highest-value unused signals before building |
+| 3 | Lead-Lag Model | Highest expected edge for moderate complexity |
+| 4 | Regime Detection | Replace warmup multiplier with proper Bayesian belief |
+| 5 | Adverse Selection Classifier | Requires labeled data from earlier phases |
+| 6 | Fill Intensity Model | Most complex, requires queue position inference |
+
+Each component should be validated against the measurement infrastructure before moving to the next. If a component doesn't improve calibration metrics, investigate why before building more complexity.
