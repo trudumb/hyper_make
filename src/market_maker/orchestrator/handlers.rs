@@ -62,6 +62,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if result.is_some() {
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
+
+            // Record price for dashboard time series visualization
+            self.infra.prometheus.record_price_for_dashboard(self.latest_mid);
+
             self.update_quotes().await
         } else {
             Ok(())
@@ -314,6 +318,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.stochastic
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
+
+                // Record book snapshot for dashboard time series visualization
+                self.infra
+                    .prometheus
+                    .record_book_for_dashboard(&bids, &asks);
             }
         }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # HIP-3 DEX Testing Workflow Script
-# Usage: ./scripts/test_hip3.sh [ASSET] [DEX] [DURATION_SECS] [SPREAD_PROFILE] [--dashboard]
+# Usage: ./scripts/test_hip3.sh [ASSET] [DEX] [DURATION_SECS] [SPREAD_PROFILE] [--dashboard] [--capture]
 #
 # Examples:
 #   ./scripts/test_hip3.sh BTC hyna 60         # 1 minute test (default profile)
@@ -8,15 +8,23 @@
 #   ./scripts/test_hip3.sh HYPE hyna 14400 hip3   # 4 hour test with 15-25 bps target
 #   ./scripts/test_hip3.sh ETH flx 120         # 2 minute test on Felix
 #   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --dashboard  # With live dashboard
+#   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --capture    # With dashboard + screenshot capture
 #
 # Options:
 #   --dashboard    Starts HTTP server for live dashboard at http://localhost:3000
+#   --capture      Enables dashboard screenshots for Claude vision (implies --dashboard)
 #
 # Dashboard:
 #   When --dashboard is enabled:
 #   - Metrics API runs at http://localhost:8080/api/dashboard
 #   - Dashboard HTML served at http://localhost:3000/mm-dashboard-fixed.html
 #   - Shows live quotes, P&L, regime, fills, and calibration data
+#
+# Screenshot Capture:
+#   When --capture is enabled:
+#   - Screenshots saved to tools/dashboard-capture/screenshots/YYYY-MM-DD/
+#   - Captures all 6 tabs every 5 seconds (optimized for Claude vision)
+#   - Requires: cd tools/dashboard-capture && npm install (first time only)
 #
 # Spread Profiles:
 #   default    - 40-50 bps spreads (standard)
@@ -31,12 +39,17 @@ DEX="${2:-hyna}"
 DURATION="${3:-60}"
 SPREAD_PROFILE="${4:-hip3}"  # Default to hip3 for HIP-3 DEX testing
 DASHBOARD=false
+CAPTURE=false
 METRICS_PORT=8080
 
 for arg in "$@"; do
     case $arg in
         --dashboard)
             DASHBOARD=true
+            ;;
+        --capture)
+            CAPTURE=true
+            DASHBOARD=true  # --capture implies --dashboard
             ;;
     esac
 done
@@ -65,6 +78,9 @@ echo -e "Log File:       ${GREEN}${LOG_FILE}${NC}"
 if [ "$DASHBOARD" = true ]; then
     echo -e "Dashboard:      ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
     echo -e "API:            ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
+fi
+if [ "$CAPTURE" = true ]; then
+    echo -e "Capture:        ${GREEN}tools/dashboard-capture/screenshots/${NC}"
 fi
 echo -e "Started:        ${GREEN}$(date)${NC}"
 echo ""
@@ -110,8 +126,13 @@ echo -e "${GREEN}Config OK${NC}"
 
 # Start dashboard HTTP server if requested
 DASHBOARD_PID=""
+CAPTURE_PID=""
 if [ "$DASHBOARD" = true ]; then
-    echo -e "${YELLOW}[3/5] Starting dashboard server...${NC}"
+    if [ "$CAPTURE" = true ]; then
+        echo -e "${YELLOW}[3/6] Starting dashboard server...${NC}"
+    else
+        echo -e "${YELLOW}[3/5] Starting dashboard server...${NC}"
+    fi
     python3 -m http.server 3000 &>/dev/null &
     DASHBOARD_PID=$!
     echo -e "${GREEN}Dashboard server started (PID: ${DASHBOARD_PID})${NC}"
@@ -119,10 +140,34 @@ if [ "$DASHBOARD" = true ]; then
     echo ""
 fi
 
+# Start screenshot capture if requested
+if [ "$CAPTURE" = true ]; then
+    echo -e "${YELLOW}[4/6] Starting screenshot capture...${NC}"
+    CAPTURE_DIR="tools/dashboard-capture"
+
+    # Check if node_modules exists
+    if [ ! -d "${CAPTURE_DIR}/node_modules" ]; then
+        echo -e "${YELLOW}Installing capture tool dependencies...${NC}"
+        (cd "${CAPTURE_DIR}" && npm install --silent)
+    fi
+
+    # Start capture tool in background
+    (cd "${CAPTURE_DIR}" && node src/index.js) &
+    CAPTURE_PID=$!
+
+    # Wait a moment for browser to launch
+    sleep 3
+    echo -e "${GREEN}Screenshot capture started (PID: ${CAPTURE_PID})${NC}"
+    echo -e "${GREEN}Screenshots: ${CAPTURE_DIR}/screenshots/${NC}"
+    echo ""
+fi
+
 # Run market maker with timeout
 # Note: We run the binary directly (not via cargo run) so Ctrl+C signals
 # are delivered correctly to the market_maker process
-if [ "$DASHBOARD" = true ]; then
+if [ "$CAPTURE" = true ]; then
+    echo -e "${YELLOW}[5/6] Running market maker for ${DURATION}s...${NC}"
+elif [ "$DASHBOARD" = true ]; then
     echo -e "${YELLOW}[4/5] Running market maker for ${DURATION}s...${NC}"
 else
     echo -e "${YELLOW}[3/4] Running market maker for ${DURATION}s...${NC}"
@@ -142,6 +187,14 @@ RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
 timeout --foreground "${DURATION}" ./target/debug/market_maker ${MM_ARGS} \
     2>&1 | tee -a "${LOG_FILE}.console" || true
 
+# Stop capture tool if started
+if [ -n "$CAPTURE_PID" ]; then
+    echo ""
+    echo -e "${YELLOW}Stopping screenshot capture...${NC}"
+    kill $CAPTURE_PID 2>/dev/null || true
+    sleep 1
+fi
+
 # Stop dashboard server if started
 if [ -n "$DASHBOARD_PID" ]; then
     echo ""
@@ -150,7 +203,9 @@ if [ -n "$DASHBOARD_PID" ]; then
 fi
 
 echo ""
-if [ "$DASHBOARD" = true ]; then
+if [ "$CAPTURE" = true ]; then
+    echo -e "${YELLOW}[6/6] Test complete${NC}"
+elif [ "$DASHBOARD" = true ]; then
     echo -e "${YELLOW}[5/5] Test complete${NC}"
 else
     echo -e "${YELLOW}[4/4] Test complete${NC}"
@@ -164,6 +219,11 @@ echo -e "${BLUE}========================================${NC}"
 echo -e "Log File:       ${GREEN}${LOG_FILE}${NC}"
 echo -e "Console Log:    ${GREEN}${LOG_FILE}.console${NC}"
 echo -e "Spread Profile: ${CYAN}${SPREAD_PROFILE}${NC}"
+if [ "$CAPTURE" = true ]; then
+    SCREENSHOT_DIR="tools/dashboard-capture/screenshots/$(date +%Y-%m-%d)"
+    SCREENSHOT_COUNT=$(find "${SCREENSHOT_DIR}" -name "*.png" 2>/dev/null | wc -l || echo 0)
+    echo -e "Screenshots:    ${GREEN}${SCREENSHOT_DIR}/${NC} (${SCREENSHOT_COUNT} files)"
+fi
 echo -e "Ended:          ${GREEN}$(date)${NC}"
 echo ""
 
@@ -186,5 +246,10 @@ echo ""
 echo -e "${BLUE}Next Steps:${NC}"
 echo -e "  1. Review log:  ${GREEN}less ${LOG_FILE}${NC}"
 echo -e "  2. Analyze:     Ask Claude to run ${GREEN}sc:analyze${NC} on the log"
-echo -e "  3. Checkpoint:  Claude will create Serena session memory"
+if [ "$CAPTURE" = true ]; then
+    echo -e "  3. Vision:      Feed screenshots to Claude for visual analysis"
+    echo -e "  4. Checkpoint:  Claude will create Serena session memory"
+else
+    echo -e "  3. Checkpoint:  Claude will create Serena session memory"
+fi
 echo ""

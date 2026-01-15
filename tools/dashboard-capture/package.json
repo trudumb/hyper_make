@@ -1,0 +1,17 @@
+{
+  "name": "dashboard-capture",
+  "version": "1.0.0",
+  "description": "Automated dashboard screenshot capture for Claude vision analysis",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:visible": "HEADLESS=false node src/index.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

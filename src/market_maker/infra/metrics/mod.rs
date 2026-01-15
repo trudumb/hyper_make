@@ -57,6 +57,22 @@ impl PrometheusMetrics {
         self.dashboard.record_fill(pnl, is_buy, as_bps);
     }
 
+    /// Record a price snapshot for dashboard time series.
+    ///
+    /// Records the mid price at regular intervals for the dashboard's
+    /// price history chart.
+    pub fn record_price_for_dashboard(&self, mid: f64) {
+        self.dashboard.record_price(mid);
+    }
+
+    /// Record a book snapshot for dashboard time series.
+    ///
+    /// Records the order book depth at regular intervals for the dashboard's
+    /// book history and heat map visualization.
+    pub fn record_book_for_dashboard(&self, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
+        self.dashboard.record_book(bids, asks);
+    }
+
     /// Get the dashboard aggregator for direct access.
     pub fn dashboard(&self) -> &DashboardAggregator {
         &self.dashboard

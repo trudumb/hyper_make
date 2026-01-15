@@ -7,13 +7,21 @@
 #   ./scripts/paper_trading.sh BTC 300                 # 5 minute simulation
 #   ./scripts/paper_trading.sh BTC 3600 --report       # 1 hour with calibration report
 #   ./scripts/paper_trading.sh BTC 300 --verbose       # With verbose logging
-#   ./scripts/paper_trading.sh BTC 3600 --dashboard     # With live dashboard
+#   ./scripts/paper_trading.sh BTC 3600 --dashboard    # With live dashboard
+#   ./scripts/paper_trading.sh BTC 300 --capture       # With dashboard + screenshot capture
 #
 # Options:
 #   --report    Generate calibration report at end
 #   --verbose   Enable verbose logging
 #   --testnet   Use testnet instead of mainnet data
 #   --dashboard Enable live dashboard at http://localhost:3000
+#   --capture   Enable dashboard screenshots for Claude vision (implies --dashboard)
+#
+# Screenshot Capture:
+#   When --capture is enabled:
+#   - Screenshots saved to tools/dashboard-capture/screenshots/YYYY-MM-DD/
+#   - Captures all 6 tabs every 5 seconds (optimized for Claude vision)
+#   - Requires: cd tools/dashboard-capture && npm install (first time only)
 #
 # Description:
 #   This script runs the paper trading simulator which:
@@ -38,6 +46,7 @@ REPORT=false
 VERBOSE=false
 NETWORK="mainnet"
 DASHBOARD=false
+CAPTURE=false
 METRICS_PORT=8080
 
 for arg in "$@"; do
@@ -54,11 +63,15 @@ for arg in "$@"; do
         --dashboard)
             DASHBOARD=true
             ;;
+        --capture)
+            CAPTURE=true
+            DASHBOARD=true  # --capture implies --dashboard
+            ;;
     esac
 done
 
 # Handle case where second arg is a flag
-if [[ "$2" == "--report" ]] || [[ "$2" == "--verbose" ]] || [[ "$2" == "--testnet" ]] || [[ "$2" == "--dashboard" ]]; then
+if [[ "$2" == "--report" ]] || [[ "$2" == "--verbose" ]] || [[ "$2" == "--testnet" ]] || [[ "$2" == "--dashboard" ]] || [[ "$2" == "--capture" ]]; then
     DURATION=60  # Default duration if only flag passed
 fi
 
@@ -88,6 +101,9 @@ echo -e "Output:    ${GREEN}${OUTPUT_DIR}${NC}"
 if [ "$DASHBOARD" = true ]; then
     echo -e "Dashboard: ${GREEN}http://localhost:3000/mm-dashboard-fixed.html${NC}"
     echo -e "API:       ${GREEN}http://localhost:${METRICS_PORT}/api/dashboard${NC}"
+fi
+if [ "$CAPTURE" = true ]; then
+    echo -e "Capture:   ${GREEN}tools/dashboard-capture/screenshots/${NC}"
 fi
 echo -e "Started:   ${GREEN}$(date)${NC}"
 echo ""
@@ -140,6 +156,7 @@ fi
 
 # Start dashboard HTTP server if requested
 DASHBOARD_PID=""
+CAPTURE_PID=""
 if [ "$DASHBOARD" = true ]; then
     echo -e "${YELLOW}Starting dashboard server...${NC}"
     python3 -m http.server 3000 &>/dev/null &
@@ -149,8 +166,38 @@ if [ "$DASHBOARD" = true ]; then
     echo ""
 fi
 
+# Start screenshot capture if requested
+if [ "$CAPTURE" = true ]; then
+    echo -e "${YELLOW}Starting screenshot capture...${NC}"
+    CAPTURE_DIR="tools/dashboard-capture"
+
+    # Check if node_modules exists
+    if [ ! -d "${CAPTURE_DIR}/node_modules" ]; then
+        echo -e "${YELLOW}Installing capture tool dependencies...${NC}"
+        (cd "${CAPTURE_DIR}" && npm install --silent)
+    fi
+
+    # Start capture tool in background
+    (cd "${CAPTURE_DIR}" && node src/index.js) &
+    CAPTURE_PID=$!
+
+    # Wait a moment for browser to launch
+    sleep 3
+    echo -e "${GREEN}Screenshot capture started (PID: ${CAPTURE_PID})${NC}"
+    echo -e "${GREEN}Screenshots: ${CAPTURE_DIR}/screenshots/${NC}"
+    echo ""
+fi
+
 # Run paper trader with tee to capture output
 ./target/debug/paper_trader ${PT_ARGS} 2>&1 | tee "${LOG_FILE}" || true
+
+# Stop capture tool if started
+if [ -n "$CAPTURE_PID" ]; then
+    echo ""
+    echo -e "${YELLOW}Stopping screenshot capture...${NC}"
+    kill $CAPTURE_PID 2>/dev/null || true
+    sleep 1
+fi
 
 # Stop dashboard server if started
 if [ -n "$DASHBOARD_PID" ]; then
@@ -169,6 +216,11 @@ echo -e "${CYAN}  Simulation Summary${NC}"
 echo -e "${CYAN}========================================${NC}"
 echo -e "Output Dir:  ${GREEN}${OUTPUT_DIR}${NC}"
 echo -e "Log File:    ${GREEN}${LOG_FILE}${NC}"
+if [ "$CAPTURE" = true ]; then
+    SCREENSHOT_DIR="tools/dashboard-capture/screenshots/$(date +%Y-%m-%d)"
+    SCREENSHOT_COUNT=$(find "${SCREENSHOT_DIR}" -name "*.png" 2>/dev/null | wc -l || echo 0)
+    echo -e "Screenshots: ${GREEN}${SCREENSHOT_DIR}/${NC} (${SCREENSHOT_COUNT} files)"
+fi
 echo -e "Ended:       ${GREEN}$(date)${NC}"
 echo ""
 
@@ -199,6 +251,12 @@ echo ""
 echo -e "${BLUE}Next Steps:${NC}"
 echo -e "  1. Review log:      ${GREEN}less ${LOG_FILE}${NC}"
 echo -e "  2. Analyze fills:   ${GREEN}grep '\[SIM\] Fill' ${LOG_FILE}${NC}"
-echo -e "  3. Calibration:     Run ${GREEN}./scripts/paper_trading.sh ${ASSET} 3600 --report${NC} for full analysis"
-echo -e "  4. Live trading:    Run ${GREEN}./scripts/test_testnet.sh${NC} (testnet) or ${GREEN}./scripts/test_mainnet.sh${NC}"
+if [ "$CAPTURE" = true ]; then
+    echo -e "  3. Vision:          Feed screenshots to Claude for visual analysis"
+    echo -e "  4. Calibration:     Run ${GREEN}./scripts/paper_trading.sh ${ASSET} 3600 --report${NC} for full analysis"
+    echo -e "  5. Live trading:    Run ${GREEN}./scripts/test_testnet.sh${NC} (testnet) or ${GREEN}./scripts/test_mainnet.sh${NC}"
+else
+    echo -e "  3. Calibration:     Run ${GREEN}./scripts/paper_trading.sh ${ASSET} 3600 --report${NC} for full analysis"
+    echo -e "  4. Live trading:    Run ${GREEN}./scripts/test_testnet.sh${NC} (testnet) or ${GREEN}./scripts/test_mainnet.sh${NC}"
+fi
 echo ""

@@ -370,6 +370,14 @@ pub struct DashboardConfig {
     pub max_fills: usize,
     /// Regime snapshot interval.
     pub regime_snapshot_interval: Duration,
+    /// Maximum price history entries (30 min at 1/sec).
+    pub max_price_history: usize,
+    /// Maximum book history entries (6 min at 1/sec).
+    pub max_book_history: usize,
+    /// Price snapshot interval.
+    pub price_snapshot_interval: Duration,
+    /// Book snapshot interval.
+    pub book_snapshot_interval: Duration,
 }
 
 impl Default for DashboardConfig {
@@ -378,6 +386,10 @@ impl Default for DashboardConfig {
             max_regime_history: 60, // 1 hour at 1-minute intervals
             max_fills: 100,
             regime_snapshot_interval: Duration::from_secs(60),
+            max_price_history: 1800, // 30 min at 1/sec
+            max_book_history: 360,   // 6 min at 1/sec
+            price_snapshot_interval: Duration::from_secs(1),
+            book_snapshot_interval: Duration::from_secs(1),
         }
     }
 }
@@ -396,6 +408,14 @@ pub struct DashboardAggregator {
     last_regime_snapshot: RwLock<Instant>,
     /// Cumulative P&L tracking.
     cumulative_pnl: RwLock<f64>,
+    /// Price history (thread-safe).
+    price_history: RwLock<VecDeque<PricePoint>>,
+    /// Book history (thread-safe).
+    book_history: RwLock<VecDeque<BookSnapshot>>,
+    /// Last price snapshot time.
+    last_price_snapshot: RwLock<Instant>,
+    /// Last book snapshot time.
+    last_book_snapshot: RwLock<Instant>,
 }
 
 impl DashboardAggregator {
@@ -407,6 +427,10 @@ impl DashboardAggregator {
             calibration,
             last_regime_snapshot: RwLock::new(Instant::now()),
             cumulative_pnl: RwLock::new(0.0),
+            price_history: RwLock::new(VecDeque::new()),
+            book_history: RwLock::new(VecDeque::new()),
+            last_price_snapshot: RwLock::new(Instant::now()),
+            last_book_snapshot: RwLock::new(Instant::now()),
         }
     }
 
@@ -454,6 +478,57 @@ impl DashboardAggregator {
         }
     }
 
+    /// Record a price snapshot if interval has elapsed.
+    pub fn record_price(&self, mid: f64) {
+        let mut last_time = self.last_price_snapshot.write().unwrap();
+        if last_time.elapsed() >= self.config.price_snapshot_interval {
+            let now = chrono::Utc::now();
+            let snapshot = PricePoint {
+                time: now.format("%H:%M:%S").to_string(),
+                timestamp_ms: now.timestamp_millis(),
+                price: mid,
+            };
+
+            let mut history = self.price_history.write().unwrap();
+            history.push_back(snapshot);
+            while history.len() > self.config.max_price_history {
+                history.pop_front();
+            }
+
+            *last_time = Instant::now();
+        }
+    }
+
+    /// Record a book snapshot if interval has elapsed.
+    pub fn record_book(&self, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
+        let mut last_time = self.last_book_snapshot.write().unwrap();
+        if last_time.elapsed() >= self.config.book_snapshot_interval {
+            let now = chrono::Utc::now();
+            let snapshot = BookSnapshot {
+                time: now.format("%H:%M:%S").to_string(),
+                timestamp_ms: now.timestamp_millis(),
+                bids: bids
+                    .iter()
+                    .take(10)
+                    .map(|(p, s)| BookLevel { price: *p, size: *s })
+                    .collect(),
+                asks: asks
+                    .iter()
+                    .take(10)
+                    .map(|(p, s)| BookLevel { price: *p, size: *s })
+                    .collect(),
+            };
+
+            let mut history = self.book_history.write().unwrap();
+            history.push_back(snapshot);
+            while history.len() > self.config.max_book_history {
+                history.pop_front();
+            }
+
+            *last_time = Instant::now();
+        }
+    }
+
     /// Generate dashboard snapshot from current state.
     pub fn snapshot(
         &self,
@@ -497,6 +572,18 @@ impl DashboardAggregator {
             history.iter().cloned().collect()
         };
 
+        // Get price history
+        let price_history: Vec<PricePoint> = {
+            let history = self.price_history.read().unwrap();
+            history.iter().cloned().collect()
+        };
+
+        // Get book history
+        let book_history: Vec<BookSnapshot> = {
+            let history = self.book_history.read().unwrap();
+            history.iter().cloned().collect()
+        };
+
         DashboardState {
             quotes: LiveQuotes {
                 mid: mid_price,
@@ -527,10 +614,10 @@ impl DashboardAggregator {
             },
             signals: default_signals(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            // New visualization data (populated by caller if available)
-            book_history: Vec::new(),
-            price_history: Vec::new(),
-            quote_history: Vec::new(),
+            // Time series visualization data
+            book_history,
+            price_history,
+            quote_history: Vec::new(), // TODO: implement quote history tracking
             quote_fill_stats: Vec::new(),
             spread_distribution: Vec::new(),
         }

@@ -764,6 +764,7 @@
             }
             return data.regime.history.map(h => ({
                 time: h.time,
+                timestamp_ms: h.timestamp_ms,
                 Quiet: h.Quiet,
                 Trending: h.Trending,
                 Volatile: h.Volatile,
@@ -777,6 +778,7 @@
             }
             return data.fills.map(f => ({
                 time: f.time,
+                timestamp_ms: f.timestamp_ms,
                 pnl: f.pnl,
                 cumPnl: f.cumPnl,
                 side: f.side,

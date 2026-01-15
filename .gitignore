@@ -5,3 +5,7 @@ Cargo.lock
 market_maker.toml
 *.log
 logs/
+
+# Dashboard capture tool
+tools/dashboard-capture/screenshots/
+tools/dashboard-capture/node_modules/
