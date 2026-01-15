@@ -97,6 +97,8 @@ impl Default for RegimeProbabilities {
 pub struct RegimeSnapshot {
     /// Time label (HH:MM format).
     pub time: String,
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: i64,
     /// Probability of Quiet regime.
     #[serde(rename = "Quiet")]
     pub quiet: f64,
@@ -137,6 +139,8 @@ impl Default for RegimeState {
 pub struct FillRecord {
     /// Time label (HH:MM format).
     pub time: String,
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: i64,
     /// P&L from this fill.
     pub pnl: f64,
     /// Cumulative P&L.
@@ -412,6 +416,7 @@ impl DashboardAggregator {
         if last_time.elapsed() >= self.config.regime_snapshot_interval {
             let snapshot = RegimeSnapshot {
                 time: chrono::Local::now().format("%H:%M").to_string(),
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
                 quiet: probs.quiet,
                 trending: probs.trending,
                 volatile: probs.volatile,
@@ -435,6 +440,7 @@ impl DashboardAggregator {
 
         let record = FillRecord {
             time: chrono::Local::now().format("%H:%M").to_string(),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
             pnl,
             cum_pnl: *cum_pnl,
             side: if is_buy { "BID" } else { "ASK" }.to_string(),

@@ -10,8 +10,10 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
-    <script src="https://unpkg.com/recharts@2.1.16/umd/Recharts.js"></script>
+    <!-- Canvas-based charting libraries (replacing Recharts) -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.28/dist/uPlot.iife.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.28/dist/uPlot.min.css">
     <style>
         * { scrollbar-width: thin; scrollbar-color: #3a3a4a #12121a; }
         *::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -21,18 +23,570 @@
         .pulse-glow { animation: pulse-glow 2s ease-in-out infinite; }
         body { font-family: 'Space Grotesk', sans-serif; }
         .mono { font-family: 'JetBrains Mono', monospace; }
+        /* uPlot dark theme overrides */
+        .uplot { font-family: 'JetBrains Mono', monospace; }
+        .uplot .u-legend { display: none; }
+        .u-wrap { background: transparent !important; }
     </style>
 </head>
 <body style="background-color: #0a0a0f; margin: 0;">
     <div id="root"></div>
     <script>
         const e = React.createElement;
-        const { useState, useEffect } = React;
-        const { 
-            ResponsiveContainer, AreaChart, Area, BarChart, Bar, 
-            XAxis, YAxis, CartesianGrid, Tooltip, Cell, ReferenceLine,
-            ComposedChart, Line, Scatter
-        } = Recharts;
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // ============================================================================
+        // CHART THEME CONFIGURATIONS
+        // ============================================================================
+
+        // uPlot dark theme base options
+        const uPlotDarkTheme = {
+            axes: [
+                { stroke: '#71717a', grid: { stroke: '#2a2a3a', width: 1 }, ticks: { stroke: '#2a2a3a' } },
+                { stroke: '#71717a', grid: { stroke: '#2a2a3a', width: 1 }, ticks: { stroke: '#2a2a3a' } }
+            ],
+            cursor: { show: true, x: true, y: true, drag: { x: false, y: false } }
+        };
+
+        // lightweight-charts dark theme
+        const lwcDarkTheme = {
+            layout: {
+                background: { type: 'solid', color: '#12121a' },
+                textColor: '#71717a',
+                fontFamily: 'JetBrains Mono, monospace',
+                fontSize: 10
+            },
+            grid: {
+                vertLines: { color: '#2a2a3a' },
+                horzLines: { color: '#2a2a3a' }
+            },
+            crosshair: { mode: 1 },
+            timeScale: { borderColor: '#2a2a3a', timeVisible: true },
+            rightPriceScale: { borderColor: '#2a2a3a' }
+        };
+
+        // ============================================================================
+        // CHART SYNCHRONIZATION MANAGER
+        // ============================================================================
+
+        class ChartSyncManager {
+            constructor(windowDurationMs = 30 * 60 * 1000) {
+                this.windowDurationMs = windowDurationMs;
+                this.charts = new Map();  // chartId -> { type, instance, adapter }
+                this.timeRange = { from: null, to: null };
+                this.cursorTimestamp = null;
+                this.listeners = new Set();
+                this.isProgrammaticUpdate = false;
+            }
+
+            // Register a chart with its adapter
+            register(chartId, type, instance, adapter) {
+                this.charts.set(chartId, { type, instance, adapter });
+            }
+
+            unregister(chartId) {
+                this.charts.delete(chartId);
+            }
+
+            // Set the visible time range (called by any chart)
+            setTimeRange(from, to, sourceChartId = null) {
+                if (this.isProgrammaticUpdate) return;
+
+                this.timeRange = { from, to };
+                this.isProgrammaticUpdate = true;
+
+                this.charts.forEach((chart, chartId) => {
+                    if (chartId !== sourceChartId && chart.adapter?.setTimeRange) {
+                        chart.adapter.setTimeRange(from, to);
+                    }
+                });
+
+                this.isProgrammaticUpdate = false;
+                this.notifyListeners('timeRange', { from, to });
+            }
+
+            // Set cursor position (called by any chart on crosshair move)
+            setCursor(timestamp, sourceChartId = null) {
+                if (this.isProgrammaticUpdate) return;
+
+                this.cursorTimestamp = timestamp;
+                this.isProgrammaticUpdate = true;
+
+                this.charts.forEach((chart, chartId) => {
+                    if (chartId !== sourceChartId && chart.adapter?.setCursor) {
+                        chart.adapter.setCursor(timestamp);
+                    }
+                });
+
+                this.isProgrammaticUpdate = false;
+                this.notifyListeners('cursor', { timestamp });
+            }
+
+            // Clear cursor (mouse left chart area)
+            clearCursor(sourceChartId = null) {
+                this.cursorTimestamp = null;
+                this.charts.forEach((chart, chartId) => {
+                    if (chartId !== sourceChartId && chart.adapter?.clearCursor) {
+                        chart.adapter.clearCursor();
+                    }
+                });
+            }
+
+            // Convert timestamp to data index for a given dataset (binary search)
+            timestampToIndex(timestamp, data, timestampField = 'timestamp_ms') {
+                if (!data || data.length === 0 || !timestamp) return null;
+
+                let left = 0, right = data.length - 1;
+                while (left < right) {
+                    const mid = Math.floor((left + right) / 2);
+                    const ts = data[mid][timestampField] || data[mid].timestamp_ms;
+                    if (ts < timestamp) left = mid + 1;
+                    else right = mid;
+                }
+                return left;
+            }
+
+            // Convert index to timestamp for a given dataset
+            indexToTimestamp(index, data, timestampField = 'timestamp_ms') {
+                if (!data || index < 0 || index >= data.length) return null;
+                return data[index][timestampField] || data[index].timestamp_ms;
+            }
+
+            // Calculate 30-minute rolling window boundaries
+            getDefaultTimeRange() {
+                const now = Date.now();
+                return {
+                    from: now - this.windowDurationMs,
+                    to: now
+                };
+            }
+
+            addListener(callback) {
+                this.listeners.add(callback);
+            }
+
+            removeListener(callback) {
+                this.listeners.delete(callback);
+            }
+
+            notifyListeners(event, data) {
+                this.listeners.forEach(cb => cb(event, data));
+            }
+        }
+
+        // ============================================================================
+        // CANVAS CHART WRAPPER COMPONENTS
+        // ============================================================================
+
+        // Generic uPlot wrapper component
+        const UPlotChart = ({ data, options, width, height }) => {
+            const containerRef = useRef(null);
+            const chartRef = useRef(null);
+
+            useEffect(() => {
+                if (!containerRef.current || !data || data.length === 0 || !data[0]?.length) return;
+
+                // Destroy existing chart
+                if (chartRef.current) {
+                    chartRef.current.destroy();
+                    chartRef.current = null;
+                }
+
+                // Merge options with theme
+                const opts = {
+                    ...uPlotDarkTheme,
+                    ...options,
+                    width: width || containerRef.current.offsetWidth || 400,
+                    height: height || 200,
+                    axes: options.axes || uPlotDarkTheme.axes
+                };
+
+                try {
+                    chartRef.current = new uPlot(opts, data, containerRef.current);
+                } catch (err) {
+                    console.error('uPlot error:', err);
+                }
+
+                return () => {
+                    if (chartRef.current) {
+                        chartRef.current.destroy();
+                        chartRef.current = null;
+                    }
+                };
+            }, [data, options, width, height]);
+
+            return e('div', { ref: containerRef, style: { width: '100%', height: height || 200 } });
+        };
+
+        // lightweight-charts wrapper for price chart
+        const LWCPriceChart = ({ priceData, quoteData, width, height, syncManager }) => {
+            const containerRef = useRef(null);
+            const chartRef = useRef(null);
+            const seriesRef = useRef({});
+            const adapterRef = useRef(null);
+
+            useEffect(() => {
+                if (!containerRef.current) return;
+
+                // Create chart with zoom/pan enabled
+                const chart = LightweightCharts.createChart(containerRef.current, {
+                    ...lwcDarkTheme,
+                    width: width || containerRef.current.offsetWidth || 400,
+                    height: height || 350,
+                    handleScroll: true,
+                    handleScale: true
+                });
+                chartRef.current = chart;
+
+                // Add price line series
+                const priceSeries = chart.addLineSeries({
+                    color: '#22d3ee',
+                    lineWidth: 2,
+                    priceLineVisible: false,
+                    lastValueVisible: true
+                });
+                seriesRef.current.price = priceSeries;
+
+                // Add bid line (dashed green)
+                const bidSeries = chart.addLineSeries({
+                    color: '#22c55e',
+                    lineWidth: 1,
+                    lineStyle: 2, // Dashed
+                    priceLineVisible: false,
+                    lastValueVisible: false
+                });
+                seriesRef.current.bid = bidSeries;
+
+                // Add ask line (dashed red)
+                const askSeries = chart.addLineSeries({
+                    color: '#ef4444',
+                    lineWidth: 1,
+                    lineStyle: 2,
+                    priceLineVisible: false,
+                    lastValueVisible: false
+                });
+                seriesRef.current.ask = askSeries;
+
+                // Register with sync manager
+                if (syncManager) {
+                    const adapter = {
+                        setTimeRange: (fromMs, toMs) => {
+                            if (chart) {
+                                chart.timeScale().setVisibleRange({
+                                    from: Math.floor(fromMs / 1000),
+                                    to: Math.floor(toMs / 1000)
+                                });
+                            }
+                        },
+                        setCursor: (timestampMs) => {
+                            // LWC doesn't have programmatic cursor positioning
+                        },
+                        clearCursor: () => {}
+                    };
+                    adapterRef.current = adapter;
+                    syncManager.register('priceChart', 'lwc', chart, adapter);
+
+                    // Subscribe to time range changes
+                    chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
+                        if (range && !syncManager.isProgrammaticUpdate) {
+                            syncManager.setTimeRange(range.from * 1000, range.to * 1000, 'priceChart');
+                        }
+                    });
+
+                    // Subscribe to crosshair movements
+                    chart.subscribeCrosshairMove((param) => {
+                        if (param.time && !syncManager.isProgrammaticUpdate) {
+                            syncManager.setCursor(param.time * 1000, 'priceChart');
+                        } else if (!param.time) {
+                            syncManager.clearCursor('priceChart');
+                        }
+                    });
+                }
+
+                return () => {
+                    if (syncManager) {
+                        syncManager.unregister('priceChart');
+                    }
+                    chart.remove();
+                    chartRef.current = null;
+                    seriesRef.current = {};
+                    adapterRef.current = null;
+                };
+            }, [width, height, syncManager]);
+
+            // Update data
+            useEffect(() => {
+                if (!seriesRef.current.price || !priceData?.length) return;
+
+                // Transform and set price data
+                const pricePoints = priceData.map(p => ({
+                    time: Math.floor(p.timestamp_ms / 1000),
+                    value: p.price
+                })).sort((a, b) => a.time - b.time);
+
+                // Remove duplicates
+                const uniquePrice = pricePoints.filter((p, i, arr) =>
+                    i === 0 || p.time !== arr[i-1].time
+                );
+                if (uniquePrice.length > 0) {
+                    seriesRef.current.price.setData(uniquePrice);
+                }
+
+                // Build quote overlay data
+                if (quoteData?.length && seriesRef.current.bid && seriesRef.current.ask) {
+                    const quoteMap = new Map();
+                    quoteData.forEach(q => {
+                        quoteMap.set(Math.floor(q.timestamp_ms / 1000), q);
+                    });
+
+                    const bidPoints = [];
+                    const askPoints = [];
+                    uniquePrice.forEach(p => {
+                        const q = quoteMap.get(p.time);
+                        if (q?.bid_prices?.[0]) {
+                            bidPoints.push({ time: p.time, value: q.bid_prices[0] });
+                        }
+                        if (q?.ask_prices?.[0]) {
+                            askPoints.push({ time: p.time, value: q.ask_prices[0] });
+                        }
+                    });
+
+                    if (bidPoints.length > 0) seriesRef.current.bid.setData(bidPoints);
+                    if (askPoints.length > 0) seriesRef.current.ask.setData(askPoints);
+                }
+
+                // Fit content
+                if (chartRef.current) {
+                    chartRef.current.timeScale().fitContent();
+                }
+            }, [priceData, quoteData]);
+
+            return e('div', { ref: containerRef, style: { width: '100%', height: height || 350 } });
+        };
+
+        // Custom Canvas 2D heatmap for order book with timestamp-based positioning
+        const BookHeatMapCanvas = ({ data, width, height, syncManager }) => {
+            const canvasRef = useRef(null);
+            const overlayRef = useRef(null);
+            const dataRef = useRef(data);
+            const marginsRef = useRef({ top: 10, right: 10, bottom: 25, left: 50 });
+            const dimensionsRef = useRef({ w: 0, h: 0, plotW: 0, plotH: 0 });
+
+            // Update data ref
+            useEffect(() => { dataRef.current = data; }, [data]);
+
+            // Helper: convert timestamp to X position
+            const timestampToX = useCallback((ts, plotW, margin) => {
+                const d = dataRef.current;
+                if (!d || d.length < 2) return null;
+                const t0 = d[0].timestamp_ms;
+                const tN = d[d.length - 1].timestamp_ms;
+                const timeRange = tN - t0;
+                if (timeRange <= 0) return null;
+                return margin.left + ((ts - t0) / timeRange) * plotW;
+            }, []);
+
+            // Helper: convert X position to timestamp
+            const xToTimestamp = useCallback((x, plotW, margin) => {
+                const d = dataRef.current;
+                if (!d || d.length < 2) return null;
+                const t0 = d[0].timestamp_ms;
+                const tN = d[d.length - 1].timestamp_ms;
+                const ratio = (x - margin.left) / plotW;
+                return t0 + ratio * (tN - t0);
+            }, []);
+
+            // Draw cursor line on overlay
+            const drawCursor = useCallback((x) => {
+                const overlay = overlayRef.current;
+                if (!overlay) return;
+                const ctx = overlay.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const { w, h, plotH } = dimensionsRef.current;
+                const margin = marginsRef.current;
+
+                ctx.clearRect(0, 0, w * dpr, h * dpr);
+                if (x !== null && x >= margin.left && x <= w - margin.right) {
+                    ctx.save();
+                    ctx.scale(dpr, dpr);
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([4, 4]);
+                    ctx.beginPath();
+                    ctx.moveTo(x, margin.top);
+                    ctx.lineTo(x, margin.top + plotH);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }, []);
+
+            // Main drawing effect
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                const overlay = overlayRef.current;
+                if (!canvas || !overlay || !data?.length) return;
+
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const w = width || canvas.parentElement?.offsetWidth || 400;
+                const h = height || 350;
+
+                // Set up both canvases
+                [canvas, overlay].forEach(c => {
+                    c.width = w * dpr;
+                    c.height = h * dpr;
+                    c.style.width = w + 'px';
+                    c.style.height = h + 'px';
+                });
+                ctx.scale(dpr, dpr);
+
+                // Calculate bounds
+                const allPrices = data.flatMap(d => [...d.bids.map(b => b.price), ...d.asks.map(a => a.price)]);
+                if (allPrices.length === 0) return;
+
+                const minPrice = Math.min(...allPrices);
+                const maxPrice = Math.max(...allPrices);
+                const priceRange = maxPrice - minPrice || 1;
+
+                const maxSize = Math.max(...data.flatMap(d =>
+                    [...d.bids.map(b => b.size), ...d.asks.map(a => a.size)]
+                )) || 1;
+
+                // Margins and dimensions
+                const margin = marginsRef.current;
+                const plotW = w - margin.left - margin.right;
+                const plotH = h - margin.top - margin.bottom;
+                dimensionsRef.current = { w, h, plotW, plotH };
+
+                // Time range for timestamp-based positioning
+                const t0 = data[0].timestamp_ms;
+                const tN = data[data.length - 1].timestamp_ms;
+                const timeRange = tN - t0 || 1;
+                const cellW = Math.max(1, plotW / data.length);
+
+                // Clear
+                ctx.fillStyle = '#12121a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Draw cells using TIMESTAMP-BASED positioning
+                data.forEach((snapshot) => {
+                    const x = margin.left + ((snapshot.timestamp_ms - t0) / timeRange) * plotW;
+
+                    // Bids (green)
+                    snapshot.bids.forEach(level => {
+                        const y = margin.top + ((maxPrice - level.price) / priceRange) * plotH;
+                        const intensity = Math.min(1, level.size / maxSize);
+                        ctx.fillStyle = `rgba(34, 197, 94, ${0.15 + intensity * 0.85})`;
+                        ctx.fillRect(x, y - 1.5, cellW + 0.5, 3);
+                    });
+
+                    // Asks (red)
+                    snapshot.asks.forEach(level => {
+                        const y = margin.top + ((maxPrice - level.price) / priceRange) * plotH;
+                        const intensity = Math.min(1, level.size / maxSize);
+                        ctx.fillStyle = `rgba(239, 68, 68, ${0.15 + intensity * 0.85})`;
+                        ctx.fillRect(x, y - 1.5, cellW + 0.5, 3);
+                    });
+                });
+
+                // Y axis labels (prices)
+                ctx.fillStyle = '#71717a';
+                ctx.font = '9px JetBrains Mono';
+                ctx.textAlign = 'right';
+                const priceSteps = 5;
+                for (let i = 0; i <= priceSteps; i++) {
+                    const price = maxPrice - (i / priceSteps) * priceRange;
+                    const y = margin.top + (i / priceSteps) * plotH;
+                    ctx.fillText(price.toFixed(0), margin.left - 5, y + 3);
+                }
+
+                // X axis labels (time) - also timestamp-based
+                ctx.textAlign = 'center';
+                const timeSteps = Math.min(6, data.length);
+                for (let i = 0; i < timeSteps; i++) {
+                    const ts = t0 + (i / (timeSteps - 1)) * timeRange;
+                    const x = margin.left + (i / (timeSteps - 1)) * plotW;
+                    // Find closest data point for label
+                    const closest = data.reduce((prev, curr) =>
+                        Math.abs(curr.timestamp_ms - ts) < Math.abs(prev.timestamp_ms - ts) ? curr : prev
+                    );
+                    ctx.fillText(closest?.time || '', x, h - 5);
+                }
+
+            }, [data, width, height]);
+
+            // Register with sync manager
+            useEffect(() => {
+                if (!syncManager) return;
+
+                const adapter = {
+                    setTimeRange: (fromMs, toMs) => {
+                        // Canvas charts could filter data here for zoom
+                    },
+                    setCursor: (timestampMs) => {
+                        const { plotW } = dimensionsRef.current;
+                        const margin = marginsRef.current;
+                        const x = timestampToX(timestampMs, plotW, margin);
+                        drawCursor(x);
+                    },
+                    clearCursor: () => {
+                        drawCursor(null);
+                    }
+                };
+                syncManager.register('bookHeatmap', 'canvas', canvasRef.current, adapter);
+
+                return () => {
+                    syncManager.unregister('bookHeatmap');
+                };
+            }, [syncManager, timestampToX, drawCursor]);
+
+            // Mouse event handlers
+            const handleMouseMove = useCallback((e) => {
+                if (!syncManager) return;
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const { plotW } = dimensionsRef.current;
+                const margin = marginsRef.current;
+
+                if (x >= margin.left && x <= margin.left + plotW) {
+                    const ts = xToTimestamp(x, plotW, margin);
+                    if (ts) {
+                        syncManager.setCursor(ts, 'bookHeatmap');
+                        drawCursor(x);
+                    }
+                }
+            }, [syncManager, xToTimestamp, drawCursor]);
+
+            const handleMouseLeave = useCallback(() => {
+                if (syncManager) {
+                    syncManager.clearCursor('bookHeatmap');
+                }
+                drawCursor(null);
+            }, [syncManager, drawCursor]);
+
+            return e('div', { style: { position: 'relative', width: '100%', height: height || 300 } },
+                e('canvas', {
+                    ref: canvasRef,
+                    style: { width: '100%', height: '100%', display: 'block' },
+                    onMouseMove: handleMouseMove,
+                    onMouseLeave: handleMouseLeave
+                }),
+                e('canvas', {
+                    ref: overlayRef,
+                    style: {
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        height: '100%',
+                        pointerEvents: 'none'
+                    }
+                })
+            );
+        };
 
         // Colors
         const C = {
@@ -302,92 +856,254 @@
                 }
             }, label);
 
-        // Charts
-        const RegimeChart = ({data}) => {
+        // ============================================================================
+        // CHART COMPONENTS (Canvas-based via uPlot)
+        // ============================================================================
+
+        // Regime probabilities stacked area chart
+        const RegimeChart = ({data, syncManager}) => {
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for regime data...');
             }
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(AreaChart, {data, margin: {top: 10, right: 10, bottom: 20, left: 10}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'time', tick: {fill: C.textMuted, fontSize: 9}, interval: 'preserveStartEnd'}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v != null ? (v*100).toFixed(0)+'%' : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(Area, {type: 'monotone', dataKey: 'Quiet', stackId: '1', stroke: C.regimeQuiet, fill: C.regimeQuiet, fillOpacity: 0.6}),
-                    e(Area, {type: 'monotone', dataKey: 'Trending', stackId: '1', stroke: C.regimeTrending, fill: C.regimeTrending, fillOpacity: 0.6}),
-                    e(Area, {type: 'monotone', dataKey: 'Volatile', stackId: '1', stroke: C.regimeVolatile, fill: C.regimeVolatile, fillOpacity: 0.6}),
-                    e(Area, {type: 'monotone', dataKey: 'Cascade', stackId: '1', stroke: C.regimeCascade, fill: C.regimeCascade, fillOpacity: 0.6})
-                )
-            );
+
+            // Transform to uPlot columnar format with stacking
+            // Use timestamp_ms for x-axis (converted to seconds for uPlot time mode)
+            const timestamps = data.map(d => d.timestamp_ms ? d.timestamp_ms / 1000 : 0);
+            const quiet = data.map(d => d.Quiet || 0);
+            const trending = data.map(d => (d.Quiet || 0) + (d.Trending || 0));
+            const volatile = data.map(d => (d.Quiet || 0) + (d.Trending || 0) + (d.Volatile || 0));
+            const cascade = data.map(d => (d.Quiet || 0) + (d.Trending || 0) + (d.Volatile || 0) + (d.Cascade || 0));
+
+            const uData = [timestamps, quiet, trending, volatile, cascade];
+
+            const opts = {
+                scales: { x: { time: true }, y: { range: [0, 1] } },
+                axes: [
+                    { ...uPlotDarkTheme.axes[0] },
+                    { ...uPlotDarkTheme.axes[1], values: (u, vals) => vals.map(v => (v * 100).toFixed(0) + '%') }
+                ],
+                series: [
+                    {},
+                    { label: 'Quiet', stroke: C.regimeQuiet, fill: C.regimeQuiet + '99', width: 1 },
+                    { label: 'Trending', stroke: C.regimeTrending, fill: C.regimeTrending + '99', width: 1 },
+                    { label: 'Volatile', stroke: C.regimeVolatile, fill: C.regimeVolatile + '99', width: 1 },
+                    { label: 'Cascade', stroke: C.regimeCascade, fill: C.regimeCascade + '99', width: 1 }
+                ]
+            };
+
+            return e(UPlotChart, { data: uData, options: opts, height: 200 });
         };
 
-        const PnLChart = ({data}) => {
+        // Cumulative PnL area chart
+        const PnLChart = ({data, syncManager}) => {
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for fill data...');
             }
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(AreaChart, {data, margin: {top: 10, right: 10, bottom: 20, left: 10}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'time', tick: {fill: C.textMuted, fontSize: 9}, interval: 'preserveStartEnd'}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v != null ? '$'+v.toFixed(0) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(ReferenceLine, {y: 0, stroke: C.textDim, strokeDasharray: '3 3'}),
-                    e(Area, {type: 'monotone', dataKey: 'cumPnl', stroke: C.accent, fill: C.accent, fillOpacity: 0.2})
-                )
-            );
+
+            // Use timestamp_ms for x-axis (converted to seconds for uPlot time mode)
+            const timestamps = data.map(d => d.timestamp_ms ? d.timestamp_ms / 1000 : 0);
+            const pnlValues = data.map(d => d.cumPnl || 0);
+
+            const uData = [timestamps, pnlValues];
+
+            const opts = {
+                scales: { x: { time: true } },
+                axes: [
+                    { ...uPlotDarkTheme.axes[0] },
+                    { ...uPlotDarkTheme.axes[1], values: (u, vals) => vals.map(v => '$' + (v || 0).toFixed(0)) }
+                ],
+                series: [
+                    {},
+                    { label: 'Cumulative PnL', stroke: C.accent, fill: C.accent + '33', width: 2 }
+                ]
+            };
+
+            return e(UPlotChart, { data: uData, options: opts, height: 200 });
         };
 
+        // PnL waterfall bar chart (Canvas)
         const WaterfallChart = ({data}) => {
-            const items = [
-                {name: 'Spread', value: data?.spreadCapture || 0, fill: C.green},
-                {name: 'Adverse', value: data?.adverseSelection || 0, fill: C.red},
-                {name: 'Inventory', value: data?.inventoryCost || 0, fill: C.orange},
-                {name: 'Fees', value: data?.fees || 0, fill: C.purple},
-            ];
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(BarChart, {data: items, margin: {top: 10, right: 10, bottom: 20, left: 10}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'name', tick: {fill: C.textMuted, fontSize: 9}}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v != null ? '$'+v.toFixed(0) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(ReferenceLine, {y: 0, stroke: C.textDim}),
-                    e(Bar, {dataKey: 'value', radius: [4, 4, 0, 0]},
-                        items.map((item, i) => e(Cell, {key: i, fill: item.fill}))
-                    )
-                )
-            );
+            const canvasRef = useRef(null);
+
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const w = canvas.parentElement?.offsetWidth || 400;
+                const h = 200;
+
+                canvas.width = w * dpr;
+                canvas.height = h * dpr;
+                canvas.style.width = w + 'px';
+                canvas.style.height = h + 'px';
+                ctx.scale(dpr, dpr);
+
+                const items = [
+                    { name: 'Spread', value: data?.spreadCapture || 0, color: C.green },
+                    { name: 'Adverse', value: data?.adverseSelection || 0, color: C.red },
+                    { name: 'Inventory', value: data?.inventoryCost || 0, color: C.orange },
+                    { name: 'Fees', value: data?.fees || 0, color: C.purple }
+                ];
+
+                const margin = { top: 20, right: 20, bottom: 30, left: 50 };
+                const plotW = w - margin.left - margin.right;
+                const plotH = h - margin.top - margin.bottom;
+                const barW = plotW / items.length * 0.6;
+                const gap = plotW / items.length;
+
+                // Find range
+                const maxVal = Math.max(...items.map(i => Math.abs(i.value)), 1);
+
+                // Clear
+                ctx.fillStyle = '#12121a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Draw zero line
+                const zeroY = margin.top + plotH / 2;
+                ctx.strokeStyle = C.textDim;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                ctx.moveTo(margin.left, zeroY);
+                ctx.lineTo(w - margin.right, zeroY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Draw bars
+                items.forEach((item, i) => {
+                    const x = margin.left + i * gap + (gap - barW) / 2;
+                    const barH = (item.value / maxVal) * (plotH / 2);
+                    const y = item.value >= 0 ? zeroY - barH : zeroY;
+
+                    ctx.fillStyle = item.color;
+                    ctx.beginPath();
+                    ctx.roundRect(x, y, barW, Math.abs(barH), [4, 4, 0, 0]);
+                    ctx.fill();
+
+                    // Label
+                    ctx.fillStyle = C.textMuted;
+                    ctx.font = '9px JetBrains Mono';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(item.name, x + barW / 2, h - 8);
+
+                    // Value
+                    ctx.fillStyle = C.text;
+                    ctx.fillText('$' + item.value.toFixed(0), x + barW / 2, item.value >= 0 ? y - 5 : y + Math.abs(barH) + 12);
+                });
+
+                // Y axis labels
+                ctx.fillStyle = C.textMuted;
+                ctx.textAlign = 'right';
+                ctx.fillText('$' + maxVal.toFixed(0), margin.left - 5, margin.top + 10);
+                ctx.fillText('$0', margin.left - 5, zeroY + 3);
+                ctx.fillText('-$' + maxVal.toFixed(0), margin.left - 5, h - margin.bottom - 5);
+
+            }, [data]);
+
+            return e('canvas', { ref: canvasRef, style: { width: '100%', height: 200, display: 'block' } });
         };
 
+        // Lead-lag area chart
         const LeadLagChart = ({data}) => {
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for data...');
             }
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(AreaChart, {data, margin: {top: 10, right: 10, bottom: 20, left: 10}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'lag', tick: {fill: C.textMuted, fontSize: 10}}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v != null ? v.toFixed(2) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(ReferenceLine, {x: 0, stroke: C.textDim, strokeDasharray: '3 3'}),
-                    e(Area, {type: 'monotone', dataKey: 'r2', stroke: C.purple, fill: C.purple, fillOpacity: 0.3})
-                )
-            );
+
+            const lags = data.map(d => d.lag);
+            const r2Values = data.map(d => d.r2 || 0);
+            const uData = [lags, r2Values];
+
+            const opts = {
+                scales: { x: { time: false } },
+                axes: [
+                    { ...uPlotDarkTheme.axes[0], values: (u, vals) => vals.map(v => v + 'ms') },
+                    { ...uPlotDarkTheme.axes[1], values: (u, vals) => vals.map(v => (v || 0).toFixed(2)) }
+                ],
+                series: [
+                    {},
+                    { label: 'R²', stroke: C.purple, fill: C.purple + '4D', width: 2 }
+                ]
+            };
+
+            return e(UPlotChart, { data: uData, options: opts, height: 200 });
         };
 
+        // Calibration scatter + line chart (Canvas)
         const CalibrationChart = ({data}) => {
+            const canvasRef = useRef(null);
+
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                if (!canvas || !data?.length) return;
+
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const w = canvas.parentElement?.offsetWidth || 400;
+                const h = 250;
+
+                canvas.width = w * dpr;
+                canvas.height = h * dpr;
+                canvas.style.width = w + 'px';
+                canvas.style.height = h + 'px';
+                ctx.scale(dpr, dpr);
+
+                const margin = { top: 20, right: 20, bottom: 30, left: 40 };
+                const plotW = w - margin.left - margin.right;
+                const plotH = h - margin.top - margin.bottom;
+
+                // Clear
+                ctx.fillStyle = '#12121a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Draw grid
+                ctx.strokeStyle = C.border;
+                ctx.lineWidth = 1;
+                for (let i = 0; i <= 5; i++) {
+                    const y = margin.top + (i / 5) * plotH;
+                    ctx.beginPath();
+                    ctx.moveTo(margin.left, y);
+                    ctx.lineTo(w - margin.right, y);
+                    ctx.stroke();
+                }
+
+                // Draw perfect calibration line (dashed diagonal)
+                ctx.strokeStyle = C.textDim;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(margin.left, h - margin.bottom);
+                ctx.lineTo(w - margin.right, margin.top);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Draw scatter points
+                ctx.fillStyle = C.accent;
+                data.forEach(d => {
+                    const x = margin.left + (d.predicted || 0) * plotW;
+                    const y = margin.top + (1 - (d.realized || 0)) * plotH;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+
+                // Axis labels
+                ctx.fillStyle = C.textMuted;
+                ctx.font = '9px JetBrains Mono';
+                ctx.textAlign = 'center';
+                ctx.fillText('Predicted', w / 2, h - 5);
+                ctx.save();
+                ctx.translate(10, h / 2);
+                ctx.rotate(-Math.PI / 2);
+                ctx.fillText('Realized', 0, 0);
+                ctx.restore();
+
+            }, [data]);
+
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for calibration data...');
             }
-            return e(ResponsiveContainer, {width: '100%', height: 250},
-                e(ComposedChart, {data, margin: {top: 10, right: 10, bottom: 20, left: 10}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'predicted', tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v != null ? v.toFixed(1) : ''}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v != null ? v.toFixed(1) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(Line, {type: 'monotone', dataKey: 'perfect', stroke: C.textDim, strokeDasharray: '5 5', dot: false}),
-                    e(Scatter, {dataKey: 'realized', fill: C.accent})
-                )
-            );
+
+            return e('canvas', { ref: canvasRef, style: { width: '100%', height: 250, display: 'block' } });
         };
 
         const SignalTable = ({data}) =>
@@ -415,161 +1131,271 @@
             );
 
         // ============================================================================
-        // NEW VISUALIZATION COMPONENTS
+        // NEW VISUALIZATION COMPONENTS (Canvas-based)
         // ============================================================================
 
-        // 2D Order Book Heat Map
-        const BookHeatMap = ({data, quoteData}) => {
+        // 2D Order Book Heat Map - uses Canvas for performance
+        const BookHeatMap = ({data, quoteData, syncManager}) => {
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for order book data...');
             }
-            // Transform book history into heat map points
-            const heatData = [];
-            const minPrice = Math.min(...data.flatMap(d => [...d.bids.map(b => b.price), ...d.asks.map(a => a.price)]));
-            const maxPrice = Math.max(...data.flatMap(d => [...d.bids.map(b => b.price), ...d.asks.map(a => a.price)]));
-            const maxSize = Math.max(...data.flatMap(d => [...d.bids.map(b => b.size), ...d.asks.map(a => a.size)]));
-
-            data.forEach((snapshot, timeIdx) => {
-                snapshot.bids.forEach(level => {
-                    heatData.push({
-                        time: snapshot.time,
-                        timeIdx,
-                        price: level.price,
-                        size: level.size,
-                        intensity: level.size / maxSize,
-                        side: 'bid'
-                    });
-                });
-                snapshot.asks.forEach(level => {
-                    heatData.push({
-                        time: snapshot.time,
-                        timeIdx,
-                        price: level.price,
-                        size: level.size,
-                        intensity: level.size / maxSize,
-                        side: 'ask'
-                    });
-                });
-            });
-
-            return e(ResponsiveContainer, {width: '100%', height: 300},
-                e(ComposedChart, {data: heatData, margin: {top: 10, right: 10, bottom: 30, left: 60}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'timeIdx', tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: (v) => data[v]?.time || ''}),
-                    e(YAxis, {dataKey: 'price', domain: [minPrice * 0.9999, maxPrice * 1.0001], tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: v => v ? v.toFixed(0) : ''}),
-                    e(Tooltip, {
-                        contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11},
-                        formatter: (value, name) => [value?.toFixed ? value.toFixed(4) : value, name]
-                    }),
-                    e(Scatter, {dataKey: 'price', fill: C.green},
-                        heatData.filter(d => d.side === 'bid').map((entry, i) =>
-                            e(Cell, {key: i, fill: `rgba(34, 197, 94, ${0.2 + entry.intensity * 0.8})`})
-                        )
-                    ),
-                    e(Scatter, {dataKey: 'price', data: heatData.filter(d => d.side === 'ask')},
-                        heatData.filter(d => d.side === 'ask').map((entry, i) =>
-                            e(Cell, {key: i, fill: `rgba(239, 68, 68, ${0.2 + entry.intensity * 0.8})`})
-                        )
-                    )
-                )
-            );
+            return e(BookHeatMapCanvas, { data, height: 350, syncManager });
         };
 
-        // Live Mid Price Chart with Quote Overlay
-        const PriceChart = ({priceData, quoteData}) => {
+        // Live Mid Price Chart with Quote Overlay - uses lightweight-charts
+        const PriceChart = ({priceData, quoteData, syncManager}) => {
             if (!priceData || priceData.length === 0) {
                 return e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for price data...');
             }
-            // Merge price data with quote bands
-            const mergedData = priceData.map(p => {
-                const quote = quoteData?.find(q => q.time === p.time);
-                return {
-                    ...p,
-                    bestBid: quote?.bid_prices?.[0] || null,
-                    bestAsk: quote?.ask_prices?.[0] || null
-                };
-            });
-
-            return e(ResponsiveContainer, {width: '100%', height: 280},
-                e(ComposedChart, {data: mergedData, margin: {top: 10, right: 10, bottom: 30, left: 60}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'time', tick: {fill: C.textMuted, fontSize: 9}, interval: 'preserveStartEnd'}),
-                    e(YAxis, {domain: ['auto', 'auto'], tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: v => v ? v.toFixed(0) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(Area, {type: 'monotone', dataKey: 'bestBid', stroke: 'transparent', fill: C.green, fillOpacity: 0.15}),
-                    e(Area, {type: 'monotone', dataKey: 'bestAsk', stroke: 'transparent', fill: C.red, fillOpacity: 0.15}),
-                    e(Line, {type: 'monotone', dataKey: 'price', stroke: C.accent, strokeWidth: 2, dot: false}),
-                    e(Line, {type: 'monotone', dataKey: 'bestBid', stroke: C.green, strokeWidth: 1, strokeDasharray: '3 3', dot: false}),
-                    e(Line, {type: 'monotone', dataKey: 'bestAsk', stroke: C.red, strokeWidth: 1, strokeDasharray: '3 3', dot: false})
-                )
-            );
+            return e(LWCPriceChart, { priceData, quoteData, height: 350, syncManager });
         };
 
-        // Spread Distribution Histogram
+        // Spread Distribution Histogram (Canvas)
         const SpreadHistogram = ({data}) => {
+            const canvasRef = useRef(null);
+
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                if (!canvas || !data?.length) return;
+
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const w = canvas.parentElement?.offsetWidth || 400;
+                const h = 200;
+
+                canvas.width = w * dpr;
+                canvas.height = h * dpr;
+                canvas.style.width = w + 'px';
+                canvas.style.height = h + 'px';
+                ctx.scale(dpr, dpr);
+
+                const margin = { top: 20, right: 20, bottom: 35, left: 40 };
+                const plotW = w - margin.left - margin.right;
+                const plotH = h - margin.top - margin.bottom;
+                const barW = plotW / data.length * 0.7;
+                const gap = plotW / data.length;
+
+                const maxCount = Math.max(...data.map(d => d.count || 0), 1);
+
+                // Clear
+                ctx.fillStyle = '#12121a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Draw bars
+                data.forEach((item, i) => {
+                    const x = margin.left + i * gap + (gap - barW) / 2;
+                    const barH = ((item.count || 0) / maxCount) * plotH;
+                    const y = margin.top + plotH - barH;
+
+                    ctx.fillStyle = C.purple;
+                    ctx.beginPath();
+                    ctx.roundRect(x, y, barW, barH, [4, 4, 0, 0]);
+                    ctx.fill();
+
+                    // X label
+                    ctx.fillStyle = C.textMuted;
+                    ctx.font = '9px JetBrains Mono';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(item.range_bps || '', x + barW / 2, h - 8);
+                });
+
+                // Y axis
+                ctx.fillStyle = C.textMuted;
+                ctx.textAlign = 'right';
+                ctx.fillText(maxCount.toFixed(0), margin.left - 5, margin.top + 10);
+                ctx.fillText('0', margin.left - 5, h - margin.bottom);
+
+                // X axis label
+                ctx.textAlign = 'center';
+                ctx.fillText('Spread (bps)', w / 2, h - 20);
+
+            }, [data]);
+
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for spread data...');
             }
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(BarChart, {data, margin: {top: 10, right: 10, bottom: 30, left: 10}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'range_bps', tick: {fill: C.textMuted, fontSize: 10}, label: {value: 'Spread (bps)', position: 'bottom', fill: C.textMuted, fontSize: 10}}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v ? v.toFixed(0) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(Bar, {dataKey: 'count', fill: C.purple, radius: [4, 4, 0, 0]})
-                )
-            );
+
+            return e('canvas', { ref: canvasRef, style: { width: '100%', height: 200, display: 'block' } });
         };
 
-        // Quote Fill Rate by Level
+        // Quote Fill Rate by Level (Canvas horizontal bar)
         const FillRateChart = ({data}) => {
+            const canvasRef = useRef(null);
+
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                if (!canvas || !data?.length) return;
+
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const w = canvas.parentElement?.offsetWidth || 400;
+                const h = 200;
+
+                canvas.width = w * dpr;
+                canvas.height = h * dpr;
+                canvas.style.width = w + 'px';
+                canvas.style.height = h + 'px';
+                ctx.scale(dpr, dpr);
+
+                // Group by level
+                const byLevel = {};
+                data.forEach(d => {
+                    if (!byLevel[d.level]) byLevel[d.level] = { level: d.level, bid: 0, ask: 0 };
+                    if (d.side === 'BID') byLevel[d.level].bid = d.fill_count;
+                    else byLevel[d.level].ask = d.fill_count;
+                });
+                const chartData = Object.values(byLevel).sort((a, b) => a.level - b.level);
+                if (chartData.length === 0) return;
+
+                const margin = { top: 20, right: 20, bottom: 20, left: 35 };
+                const plotW = w - margin.left - margin.right;
+                const plotH = h - margin.top - margin.bottom;
+                const barH = plotH / chartData.length * 0.35;
+                const rowH = plotH / chartData.length;
+
+                const maxVal = Math.max(...chartData.flatMap(d => [d.bid, d.ask]), 1);
+
+                // Clear
+                ctx.fillStyle = '#12121a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Draw bars
+                chartData.forEach((item, i) => {
+                    const y = margin.top + i * rowH;
+
+                    // Bid bar (green)
+                    const bidW = (item.bid / maxVal) * plotW;
+                    ctx.fillStyle = C.green;
+                    ctx.fillRect(margin.left, y + rowH * 0.15, bidW, barH);
+
+                    // Ask bar (red)
+                    const askW = (item.ask / maxVal) * plotW;
+                    ctx.fillStyle = C.red;
+                    ctx.fillRect(margin.left, y + rowH * 0.5, askW, barH);
+
+                    // Y label
+                    ctx.fillStyle = C.textMuted;
+                    ctx.font = '9px JetBrains Mono';
+                    ctx.textAlign = 'right';
+                    ctx.fillText('L' + item.level, margin.left - 5, y + rowH * 0.5);
+                });
+
+            }, [data]);
+
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for fill data...');
             }
-            // Group by level
-            const byLevel = {};
-            data.forEach(d => {
-                if (!byLevel[d.level]) byLevel[d.level] = {level: d.level, bid: 0, ask: 0};
-                if (d.side === 'BID') byLevel[d.level].bid = d.fill_count;
-                else byLevel[d.level].ask = d.fill_count;
-            });
-            const chartData = Object.values(byLevel).sort((a, b) => a.level - b.level);
 
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(BarChart, {data: chartData, layout: 'vertical', margin: {top: 10, right: 10, bottom: 10, left: 40}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {type: 'number', tick: {fill: C.textMuted, fontSize: 10}}),
-                    e(YAxis, {type: 'category', dataKey: 'level', tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => `L${v}`}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(Bar, {dataKey: 'bid', fill: C.green, name: 'Bid Fills'}),
-                    e(Bar, {dataKey: 'ask', fill: C.red, name: 'Ask Fills'})
-                )
-            );
+            return e('canvas', { ref: canvasRef, style: { width: '100%', height: 200, display: 'block' } });
         };
 
-        // Current Book Depth (snapshot)
+        // Current Book Depth (snapshot) - Canvas-based
         const DepthChart = ({data}) => {
+            const canvasRef = useRef(null);
+
+            useEffect(() => {
+                if (!canvasRef.current || !data || data.length === 0) return;
+                const latest = data[data.length - 1];
+                if (!latest) return;
+
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = rect.width * dpr;
+                canvas.height = rect.height * dpr;
+                ctx.scale(dpr, dpr);
+                const W = rect.width, H = rect.height;
+
+                // Build cumulative depth
+                let bidCum = 0, askCum = 0;
+                const bidDepth = latest.bids.map(b => { bidCum += b.size; return {price: b.price, cumSize: bidCum}; }).reverse();
+                const askDepth = latest.asks.map(a => { askCum += a.size; return {price: a.price, cumSize: askCum}; });
+
+                // Find ranges
+                const allPrices = [...bidDepth.map(d => d.price), ...askDepth.map(d => d.price)];
+                const allSizes = [...bidDepth.map(d => d.cumSize), ...askDepth.map(d => d.cumSize)];
+                const minPrice = Math.min(...allPrices);
+                const maxPrice = Math.max(...allPrices);
+                const maxSize = Math.max(...allSizes);
+                const priceRange = maxPrice - minPrice || 1;
+
+                const margin = { top: 10, right: 10, bottom: 25, left: 50 };
+                const plotW = W - margin.left - margin.right;
+                const plotH = H - margin.top - margin.bottom;
+
+                const priceToX = p => margin.left + ((p - minPrice) / priceRange) * plotW;
+                const sizeToY = s => margin.top + plotH - (s / maxSize) * plotH;
+
+                // Clear
+                ctx.fillStyle = C.bgCard;
+                ctx.fillRect(0, 0, W, H);
+
+                // Grid
+                ctx.strokeStyle = C.border;
+                ctx.lineWidth = 1;
+                for (let i = 0; i <= 4; i++) {
+                    const y = margin.top + (plotH / 4) * i;
+                    ctx.beginPath(); ctx.moveTo(margin.left, y); ctx.lineTo(W - margin.right, y); ctx.stroke();
+                }
+
+                // Draw bid depth (green, filled step)
+                if (bidDepth.length > 0) {
+                    ctx.fillStyle = 'rgba(34, 197, 94, 0.3)';
+                    ctx.strokeStyle = C.profit;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(priceToX(bidDepth[0].price), sizeToY(0));
+                    bidDepth.forEach((d, i) => {
+                        ctx.lineTo(priceToX(d.price), sizeToY(d.cumSize));
+                        if (i < bidDepth.length - 1) ctx.lineTo(priceToX(bidDepth[i + 1].price), sizeToY(d.cumSize));
+                    });
+                    ctx.lineTo(priceToX(bidDepth[bidDepth.length - 1].price), sizeToY(0));
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+                }
+
+                // Draw ask depth (red, filled step)
+                if (askDepth.length > 0) {
+                    ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
+                    ctx.strokeStyle = C.loss;
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(priceToX(askDepth[0].price), sizeToY(0));
+                    askDepth.forEach((d, i) => {
+                        ctx.lineTo(priceToX(d.price), sizeToY(d.cumSize));
+                        if (i < askDepth.length - 1) ctx.lineTo(priceToX(askDepth[i + 1].price), sizeToY(d.cumSize));
+                    });
+                    ctx.lineTo(priceToX(askDepth[askDepth.length - 1].price), sizeToY(0));
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+                }
+
+                // Y axis labels
+                ctx.fillStyle = C.textMuted;
+                ctx.font = '10px monospace';
+                ctx.textAlign = 'right';
+                for (let i = 0; i <= 4; i++) {
+                    const size = (maxSize / 4) * (4 - i);
+                    ctx.fillText(size.toFixed(2), margin.left - 5, margin.top + (plotH / 4) * i + 4);
+                }
+
+                // X axis labels
+                ctx.textAlign = 'center';
+                for (let i = 0; i <= 4; i++) {
+                    const price = minPrice + (priceRange / 4) * i;
+                    ctx.fillText(price.toFixed(0), margin.left + (plotW / 4) * i, H - 5);
+                }
+
+            }, [data]);
+
             if (!data || data.length === 0) {
                 return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for book data...');
             }
-            const latest = data[data.length - 1];
-            if (!latest) return null;
 
-            // Build cumulative depth
-            let bidCum = 0, askCum = 0;
-            const bidDepth = latest.bids.map(b => { bidCum += b.size; return {price: b.price, cumSize: bidCum, side: 'bid'}; });
-            const askDepth = latest.asks.map(a => { askCum += a.size; return {price: a.price, cumSize: askCum, side: 'ask'}; });
-            const depthData = [...bidDepth.reverse(), ...askDepth];
-
-            return e(ResponsiveContainer, {width: '100%', height: 200},
-                e(AreaChart, {data: depthData, margin: {top: 10, right: 10, bottom: 20, left: 60}},
-                    e(CartesianGrid, {strokeDasharray: '3 3', stroke: C.border}),
-                    e(XAxis, {dataKey: 'price', tick: {fill: C.textMuted, fontSize: 9}, tickFormatter: v => v ? v.toFixed(0) : ''}),
-                    e(YAxis, {tick: {fill: C.textMuted, fontSize: 10}, tickFormatter: v => v ? v.toFixed(2) : ''}),
-                    e(Tooltip, {contentStyle: {backgroundColor: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 11}}),
-                    e(Area, {type: 'stepAfter', dataKey: 'cumSize', stroke: C.accent, fill: C.accent, fillOpacity: 0.3})
-                )
-            );
+            return e('canvas', { ref: canvasRef, style: { width: '100%', height: 200, display: 'block' } });
         };
 
         // Main Dashboard
@@ -595,6 +1421,13 @@
 
             // Track accumulated fills from WebSocket
             const [wsConnected, setWsConnected] = useState(false);
+
+            // Create chart sync manager for synchronized time scales
+            const syncManagerRef = useRef(null);
+            if (!syncManagerRef.current) {
+                syncManagerRef.current = new ChartSyncManager();
+            }
+            const syncManager = syncManagerRef.current;
 
             // Apply full state from snapshot
             const applySnapshot = (data) => {
@@ -760,27 +1593,27 @@
                 // Content
                 e('div', {className: 'mt-6'},
                     tab === 'overview' && e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
-                        e(Card, {title: 'Cumulative PnL', subtitle: 'Last hour', accent: C.green}, e(PnLChart, {data: fills})),
+                        e(Card, {title: 'Cumulative PnL', subtitle: 'Last hour', accent: C.green}, e(PnLChart, {data: fills, syncManager})),
                         e(Card, {title: 'PnL Attribution', subtitle: 'Component breakdown', accent: C.purple}, e(WaterfallChart, {data: pnl})),
-                        e(Card, {title: 'Regime Probabilities', subtitle: 'HMM belief state', accent: C.regimeTrending}, e(RegimeChart, {data: regime})),
+                        e(Card, {title: 'Regime Probabilities', subtitle: 'HMM belief state', accent: C.regimeTrending}, e(RegimeChart, {data: regime, syncManager})),
                         e(Card, {title: 'Fill Calibration', subtitle: 'Predicted vs realized', accent: C.accent}, e(CalibrationChart, {data: calib}))
                     ),
 
                     tab === 'book' && e('div', {className: 'space-y-6'},
-                        // Top row: Price Chart (full width)
-                        e(Card, {title: 'Mid Price History', subtitle: '30-minute rolling window', accent: C.accent, className: 'lg:col-span-2'},
-                            e(PriceChart, {priceData: priceHistory, quoteData: quoteHistory})
-                        ),
-                        // Second row: Heat Map and Depth
+                        // Top row: Price Chart AND Order Book Heat Map SIDE-BY-SIDE (same size)
                         e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
-                            e(Card, {title: 'Order Book Heat Map', subtitle: 'Time × Price with size intensity', accent: C.purple},
-                                e(BookHeatMap, {data: bookHistory, quoteData: quoteHistory})
+                            e(Card, {title: 'Mid Price History', subtitle: '30-minute rolling window', accent: C.accent},
+                                e(PriceChart, {priceData: priceHistory, quoteData: quoteHistory, syncManager})
                             ),
-                            e(Card, {title: 'Current Book Depth', subtitle: 'Bid/Ask liquidity profile', accent: C.accent},
-                                bookHistory.length > 0
-                                    ? e(DepthChart, {data: bookHistory[bookHistory.length - 1]})
-                                    : e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for book data...')
+                            e(Card, {title: 'Order Book Heat Map', subtitle: 'Time × Price with size intensity', accent: C.purple},
+                                e(BookHeatMap, {data: bookHistory, quoteData: quoteHistory, syncManager})
                             )
+                        ),
+                        // Second row: Depth Chart (full width)
+                        e(Card, {title: 'Current Book Depth', subtitle: 'Bid/Ask liquidity profile', accent: C.accent},
+                            bookHistory.length > 0
+                                ? e(DepthChart, {data: bookHistory[bookHistory.length - 1]})
+                                : e('div', {className: 'h-64 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for book data...')
                         ),
                         // Third row: Quote Distribution
                         e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
@@ -851,7 +1684,7 @@
 
                     tab === 'regime' && e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
                         e(Card, {title: 'Regime History', subtitle: 'HMM belief evolution', accent: C.regimeTrending, className: 'lg:col-span-2'},
-                            e(RegimeChart, {data: regime}),
+                            e(RegimeChart, {data: regime, syncManager}),
                             e('div', {className: 'flex gap-4 mt-4 flex-wrap'},
                                 ['Quiet', 'Trending', 'Volatile', 'Cascade'].map(r =>
                                     e('div', {key: r, className: 'flex items-center gap-2'},
@@ -930,7 +1763,7 @@
                                 )
                             )
                         ),
-                        e(Card, {title: 'Cumulative', accent: C.accent}, e(PnLChart, {data: fills})),
+                        e(Card, {title: 'Cumulative', accent: C.accent}, e(PnLChart, {data: fills, syncManager})),
                         e(Card, {title: 'By Regime', accent: C.purple},
                             e('div', {className: 'space-y-4'},
                                 [{r: 'Quiet', pnl: 89.20, pct: 68}, {r: 'Trending', pnl: -45.60, pct: 28}, {r: 'Volatile', pnl: -12.30, pct: 3.5}, {r: 'Cascade', pnl: -158.75, pct: 0.5}].map(x =>

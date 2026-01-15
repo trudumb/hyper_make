@@ -690,9 +690,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_book_snapshot = Instant::now();
     let mut last_quote_snapshot = Instant::now();
 
+    // Watchdog: track when we last received market data
+    let mut last_data_received = Instant::now();
+    let stale_data_threshold = Duration::from_secs(30);
+    let mut stale_warning_logged = false;
+
     while !shutdown.load(Ordering::SeqCst) && start_time.elapsed() < duration {
         tokio::select! {
             Some(msg) = rx.recv() => {
+                // Reset watchdog on any message
+                last_data_received = Instant::now();
+                if stale_warning_logged {
+                    info!("Market data stream recovered");
+                    stale_warning_logged = false;
+                }
+
                 match msg {
                     MarketDataMessage::Mid(mid) => {
                         state.update_mid(mid);
@@ -761,6 +773,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             let fill_record = FillRecord {
                                 time: now.format("%H:%M:%S").to_string(),
+                                timestamp_ms: chrono::Utc::now().timestamp_millis(),
                                 pnl: fill_pnl,
                                 cum_pnl: cumulative_pnl,
                                 side: if fill.side == Side::Buy { "BID".to_string() } else { "ASK".to_string() },
@@ -782,6 +795,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                // Watchdog: check for stale market data
+                if last_data_received.elapsed() > stale_data_threshold && !stale_warning_logged {
+                    warn!(
+                        "No market data received for {:?}. WebSocket subscriptions may have disconnected.",
+                        last_data_received.elapsed()
+                    );
+                    stale_warning_logged = true;
+                }
+
                 // Generate quotes on interval
                 if last_quote_time.elapsed() >= quote_interval {
                     last_quote_time = Instant::now();
@@ -979,6 +1001,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 regime_history.push(RegimeSnapshot {
                                     time: now.format("%H:%M:%S").to_string(),
+                                    timestamp_ms: now.timestamp_millis(),
                                     quiet: regime_probs.quiet,
                                     trending: regime_probs.trending,
                                     volatile: regime_probs.volatile,
@@ -1135,6 +1158,43 @@ async fn subscribe_all_mids(
     asset: &str,
     tx: mpsc::Sender<MarketDataMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let asset = asset.to_string();
+    let mut retry_count = 0;
+    let max_retries = 100; // Keep trying for a long time
+    let mut backoff_ms = 1000u64;
+    let max_backoff_ms = 30000u64;
+
+    loop {
+        match subscribe_all_mids_inner(base_url, &asset, tx.clone()).await {
+            Ok(()) => {
+                // Clean exit (channel closed) - likely shutdown
+                info!("AllMids subscription ended gracefully");
+                break;
+            }
+            Err(e) => {
+                retry_count += 1;
+                if retry_count > max_retries {
+                    error!("AllMids subscription failed after {} retries: {}", max_retries, e);
+                    return Err(e);
+                }
+                warn!(
+                    "AllMids subscription error (attempt {}/{}): {}. Reconnecting in {}ms...",
+                    retry_count, max_retries, e, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+            }
+        }
+    }
+    Ok(())
+}
+
+
+async fn subscribe_all_mids_inner(
+    base_url: BaseUrl,
+    asset: &str,
+    tx: mpsc::Sender<MarketDataMessage>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut info_client = InfoClient::new(None, Some(base_url)).await?;
 
     let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();
@@ -1147,16 +1207,56 @@ async fn subscribe_all_mids(
         if let Message::AllMids(all_mids) = &*arc_msg {
             if let Some(mid_str) = all_mids.data.mids.get(&asset) {
                 if let Ok(mid) = mid_str.parse::<f64>() {
-                    tx.send(MarketDataMessage::Mid(mid)).await.ok();
+                    // If send fails, the main loop has shut down
+                    if tx.send(MarketDataMessage::Mid(mid)).await.is_err() {
+                        return Ok(()); // Clean exit
+                    }
                 }
             }
         }
     }
 
-    Ok(())
+    // Channel closed - return error to trigger reconnect
+    Err("AllMids channel closed unexpectedly".into())
 }
 
 async fn subscribe_l2_book(
+    base_url: BaseUrl,
+    asset: &str,
+    tx: mpsc::Sender<MarketDataMessage>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let asset = asset.to_string();
+    let mut retry_count = 0;
+    let max_retries = 100;
+    let mut backoff_ms = 1000u64;
+    let max_backoff_ms = 30000u64;
+
+    loop {
+        match subscribe_l2_book_inner(base_url, &asset, tx.clone()).await {
+            Ok(()) => {
+                info!("L2Book subscription ended gracefully");
+                break;
+            }
+            Err(e) => {
+                retry_count += 1;
+                if retry_count > max_retries {
+                    error!("L2Book subscription failed after {} retries: {}", max_retries, e);
+                    return Err(e);
+                }
+                warn!(
+                    "L2Book subscription error (attempt {}/{}): {}. Reconnecting in {}ms...",
+                    retry_count, max_retries, e, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+            }
+        }
+    }
+    Ok(())
+}
+
+
+async fn subscribe_l2_book_inner(
     base_url: BaseUrl,
     asset: &str,
     tx: mpsc::Sender<MarketDataMessage>,
@@ -1203,14 +1303,52 @@ async fn subscribe_l2_book(
                 Vec::new()
             };
 
-            tx.send(MarketDataMessage::Book { bids, asks }).await.ok();
+            if tx.send(MarketDataMessage::Book { bids, asks }).await.is_err() {
+                return Ok(()); // Clean exit
+            }
         }
     }
 
-    Ok(())
+    Err("L2Book channel closed unexpectedly".into())
 }
 
 async fn subscribe_trades(
+    base_url: BaseUrl,
+    asset: &str,
+    tx: mpsc::Sender<MarketDataMessage>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let asset = asset.to_string();
+    let mut retry_count = 0;
+    let max_retries = 100;
+    let mut backoff_ms = 1000u64;
+    let max_backoff_ms = 30000u64;
+
+    loop {
+        match subscribe_trades_inner(base_url, &asset, tx.clone()).await {
+            Ok(()) => {
+                info!("Trades subscription ended gracefully");
+                break;
+            }
+            Err(e) => {
+                retry_count += 1;
+                if retry_count > max_retries {
+                    error!("Trades subscription failed after {} retries: {}", max_retries, e);
+                    return Err(e);
+                }
+                warn!(
+                    "Trades subscription error (attempt {}/{}): {}. Reconnecting in {}ms...",
+                    retry_count, max_retries, e, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+            }
+        }
+    }
+    Ok(())
+}
+
+
+async fn subscribe_trades_inner(
     base_url: BaseUrl,
     asset: &str,
     tx: mpsc::Sender<MarketDataMessage>,
@@ -1238,17 +1376,19 @@ async fn subscribe_trades(
                 }
                 if let (Ok(px), Ok(sz)) = (trade.px.parse::<f64>(), trade.sz.parse::<f64>()) {
                     let is_buy = trade.side == "B";
-                    tx.send(MarketDataMessage::Trade {
+                    if tx.send(MarketDataMessage::Trade {
                         price: px,
                         size: sz,
                         is_buy,
                     })
                     .await
-                    .ok();
+                    .is_err() {
+                        return Ok(()); // Clean exit
+                    }
                 }
             }
         }
     }
 
-    Ok(())
+    Err("Trades channel closed unexpectedly".into())
 }
