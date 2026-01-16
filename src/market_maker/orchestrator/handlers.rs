@@ -59,12 +59,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let result = messages::process_all_mids(&all_mids, &ctx, &mut state)?;
 
+        // Record price for dashboard unconditionally when we have a valid mid
+        // This ensures dashboard shows price data even during warmup
+        if self.latest_mid > 0.0 {
+            self.infra.prometheus.record_price_for_dashboard(self.latest_mid);
+        }
+
         if result.is_some() {
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
-
-            // Record price for dashboard time series visualization
-            self.infra.prometheus.record_price_for_dashboard(self.latest_mid);
 
             self.update_quotes().await
         } else {
@@ -311,18 +314,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let result = messages::process_l2_book(&l2_book, &ctx, &mut state)?;
 
-        // Feed L2 data to adaptive spread calculator's blended kappa estimator
-        // This enables book-based kappa estimation to work alongside own-fill kappa
-        if result.is_valid && self.latest_mid > 0.0 {
-            if let Some((bids, asks)) = Self::parse_l2_for_adaptive(&l2_book.data.levels) {
+        // Parse L2 data for dashboard and adaptive spreads
+        // Recording is unconditional for dashboard; adaptive spreads only when valid
+        if let Some((bids, asks)) = Self::parse_l2_for_adaptive(&l2_book.data.levels) {
+            // Record book snapshot for dashboard unconditionally
+            // This ensures dashboard shows data even during warmup
+            self.infra
+                .prometheus
+                .record_book_for_dashboard(&bids, &asks);
+
+            // Feed L2 data to adaptive spread calculator only when result is valid
+            // This enables book-based kappa estimation to work alongside own-fill kappa
+            if result.is_valid && self.latest_mid > 0.0 {
                 self.stochastic
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
-
-                // Record book snapshot for dashboard time series visualization
-                self.infra
-                    .prometheus
-                    .record_book_for_dashboard(&bids, &asks);
             }
         }
 

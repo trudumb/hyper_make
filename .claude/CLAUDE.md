@@ -225,3 +225,23 @@ Build components in this order (each depends on previous):
 5. **Regime matters** - single parameter values are almost always wrong
 6. **Defense wins** - when in doubt, widen spreads
 7. **Manual Execution Only**: The user wants to run all code manually. Do NOT execute binaries or scripts (e.g. `cargo run`, `./scripts/...`). Provide copy-pasteable blocks for the user to execute.
+
+---
+
+## Project Plans
+
+**Always save implementation plans to `.claude/plans/` inside the project directory.**
+
+```
+.claude/
+└── plans/
+    └── <descriptive-name>.md
+```
+
+When entering plan mode or creating implementation plans:
+1. Create the plan file at `.claude/plans/<descriptive-name>.md`
+2. Use kebab-case naming (e.g., `feature-engineering-improvements.md`)
+3. Include: objectives, phases, files to modify, verification steps
+4. Reference plan files in Serena session memories for continuity
+
+This keeps plans version-controlled with the project and accessible across sessions.

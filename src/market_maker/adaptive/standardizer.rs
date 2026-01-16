@@ -134,12 +134,22 @@ impl SignalStandardizer {
 /// Collection of signal standardizers for all gamma signals.
 #[derive(Debug, Clone)]
 pub(super) struct SignalStandardizers {
+    // Base signals
     pub vol_ratio: SignalStandardizer,
     pub jump_ratio: SignalStandardizer,
     pub inventory: SignalStandardizer,
     pub hawkes: SignalStandardizer,
     pub spread_regime: SignalStandardizer,
     pub cascade: SignalStandardizer,
+
+    // Interaction terms (products of base signals)
+    pub vol_x_momentum: SignalStandardizer,
+    pub regime_x_inventory: SignalStandardizer,
+    pub jump_x_flow: SignalStandardizer,
+
+    // Additional base signals needed for interactions
+    pub momentum_abs: SignalStandardizer,
+    pub flow_abs: SignalStandardizer,
 }
 
 impl Default for SignalStandardizers {
@@ -164,6 +174,19 @@ impl Default for SignalStandardizers {
 
             // Cascade severity: 0.0 - 1.0
             cascade: SignalStandardizer::for_bounded_signal(),
+
+            // === Interaction terms ===
+            // These are products of standardized signals, so they're ~N(0,1) products
+            // For z1 ~ N(0,1) and z2 ~ N(0,1), E[z1*z2] = 0, Var[z1*z2] ≈ 1
+            vol_x_momentum: SignalStandardizer::new(0.0, 1.0, 5),
+            regime_x_inventory: SignalStandardizer::new(0.0, 1.0, 5),
+            jump_x_flow: SignalStandardizer::new(0.0, 1.0, 5),
+
+            // Additional base signals for interactions
+            // Momentum absolute value: 0.0 - 20 bps typically
+            momentum_abs: SignalStandardizer::new(5.0, 5.0, 5),
+            // Flow imbalance absolute: 0.0 - 1.0
+            flow_abs: SignalStandardizer::for_bounded_signal(),
         }
     }
 }
@@ -178,7 +201,50 @@ impl SignalStandardizers {
             super::config::GammaSignal::HawkesIntensity => self.hawkes.standardize(raw),
             super::config::GammaSignal::SpreadRegime => self.spread_regime.standardize(raw),
             super::config::GammaSignal::CascadeSeverity => self.cascade.standardize(raw),
+            // Interaction terms - raw is already the product
+            super::config::GammaSignal::VolatilityXMomentum => {
+                self.vol_x_momentum.standardize(raw)
+            }
+            super::config::GammaSignal::RegimeXInventory => {
+                self.regime_x_inventory.standardize(raw)
+            }
+            super::config::GammaSignal::JumpXFlow => self.jump_x_flow.standardize(raw),
         }
+    }
+
+    /// Standardize a signal without updating (peek).
+    pub(super) fn standardize_peek(
+        &self,
+        signal: &super::config::GammaSignal,
+        raw: f64,
+    ) -> f64 {
+        match signal {
+            super::config::GammaSignal::VolatilityRatio => self.vol_ratio.standardize_peek(raw),
+            super::config::GammaSignal::JumpRatio => self.jump_ratio.standardize_peek(raw),
+            super::config::GammaSignal::InventoryUtilization => {
+                self.inventory.standardize_peek(raw)
+            }
+            super::config::GammaSignal::HawkesIntensity => self.hawkes.standardize_peek(raw),
+            super::config::GammaSignal::SpreadRegime => self.spread_regime.standardize_peek(raw),
+            super::config::GammaSignal::CascadeSeverity => self.cascade.standardize_peek(raw),
+            super::config::GammaSignal::VolatilityXMomentum => {
+                self.vol_x_momentum.standardize_peek(raw)
+            }
+            super::config::GammaSignal::RegimeXInventory => {
+                self.regime_x_inventory.standardize_peek(raw)
+            }
+            super::config::GammaSignal::JumpXFlow => self.jump_x_flow.standardize_peek(raw),
+        }
+    }
+
+    /// Standardize momentum_abs (helper for interaction terms).
+    pub(super) fn standardize_momentum_abs(&mut self, raw: f64) -> f64 {
+        self.momentum_abs.standardize(raw)
+    }
+
+    /// Standardize flow_abs (helper for interaction terms).
+    pub(super) fn standardize_flow_abs(&mut self, raw: f64) -> f64 {
+        self.flow_abs.standardize(raw)
     }
 
     /// Check if all standardizers are warmed up.

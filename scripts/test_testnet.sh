@@ -8,7 +8,7 @@
 #   ./scripts/test_testnet.sh BTC 7200                # 2 hour test
 #   ./scripts/test_testnet.sh BTC 720 --diagnostics   # With L2/L3 diagnostics
 #   ./scripts/test_testnet.sh BTC 300 --dashboard     # With live dashboard
-#   ./scripts/test_testnet.sh BTC 300 --capture       # With dashboard + screenshot capture
+#   ./scripts/test_testnet.sh BTC 3600 --capture       # With dashboard + screenshot capture
 #
 # Options:
 #   --diagnostics  Enables additional log targets for Layer 2/3 analysis

@@ -29,7 +29,7 @@ impl Default for CalibrationConfig {
         Self {
             max_observations: 1000,
             num_bins: 20,
-            min_observations: 50,
+            min_observations: 10, // Reduced from 50 for faster dashboard feedback
         }
     }
 }

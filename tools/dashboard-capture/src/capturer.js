@@ -12,6 +12,8 @@ export class DashboardCapturer {
     this.page = null;
     this.isRunning = false;
     this.cycleCount = 0;
+    // Session ID from start time (matches MM log naming convention)
+    this.sessionId = formatTime(new Date());
   }
 
   /**
@@ -139,8 +141,8 @@ export class DashboardCapturer {
     const dateDir = formatDate(timestamp);
     const timePrefix = formatTime(timestamp);
 
-    // Ensure date directory exists
-    const outputPath = path.join(this.config.outputDir, dateDir);
+    // Ensure date/session directory exists
+    const outputPath = path.join(this.config.outputDir, dateDir, this.sessionId);
     await ensureOutputDir(outputPath);
 
     log('info', `Starting capture cycle at ${timePrefix}...`);

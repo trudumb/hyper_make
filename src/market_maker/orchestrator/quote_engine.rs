@@ -9,6 +9,9 @@ use super::super::{
     quoting, MarketMaker, OrderExecutor, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
     QuotingStrategy, Side,
 };
+use crate::market_maker::infra::metrics::dashboard::{
+    SignalSnapshot, QuoteDecisionRecord, KappaDiagnostics, ChangepointDiagnostics,
+};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
@@ -411,6 +414,94 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             "Quote inputs with microprice"
         );
 
+        // === SIGNAL SNAPSHOT FOR DASHBOARD VISUALIZATION ===
+        // Record current signal state for the dashboard's SIGNALS tab
+        // This captures all the alpha signals used to make quote decisions
+        {
+            let now = chrono::Utc::now();
+            
+            // Get regime probabilities from stochastic controller if enabled
+            let (regime_quiet, regime_trending, regime_volatile, regime_cascade) = 
+                if self.stochastic.controller.is_enabled() {
+                    let belief = self.stochastic.controller.belief();
+                    (belief.regime_probs[0], belief.regime_probs[1], belief.regime_probs[2], 
+                     (1.0 - market_params.cascade_size_factor).max(0.0))
+                } else {
+                    // Fallback: use market params to estimate regime
+                    let cascade = (1.0 - market_params.cascade_size_factor).max(0.0);
+                    let volatile = if market_params.jump_ratio > 2.0 { 0.3 } else { 0.0 };
+                    let trending = if market_params.sigma > 0.002 { 0.2 } else { 0.0 };
+                    let quiet = (1.0 - cascade - volatile - trending).max(0.0);
+                    (quiet, trending, volatile, cascade)
+                };
+            
+            // Get changepoint info from stochastic controller
+            let (cp_prob_5, cp_detected) = if self.stochastic.controller.is_enabled() {
+                let cp = self.stochastic.controller.changepoint_summary();
+                (cp.cp_prob_5, cp.detected)
+            } else {
+                (0.0, false)
+            };
+            
+            let signal_snapshot = SignalSnapshot {
+                timestamp_ms: now.timestamp_millis(),
+                time: now.format("%H:%M:%S").to_string(),
+                // Kappa (fill intensity)
+                kappa: market_params.kappa,
+                kappa_confidence: self.estimator.kappa_confidence(),
+                kappa_ci_lower: market_params.kappa * 0.7, // Approximate CI
+                kappa_ci_upper: market_params.kappa * 1.3,
+                // Microprice
+                microprice: market_params.microprice,
+                beta_book: market_params.beta_book,
+                beta_flow: market_params.beta_flow,
+                // Momentum
+                momentum_bps: self.estimator.momentum_bps(),
+                flow_imbalance: market_params.book_imbalance,
+                falling_knife: if drift_adjusted_skew.is_opposed { drift_adjusted_skew.urgency_score } else { 0.0 },
+                // Volatility
+                sigma: market_params.sigma,
+                jump_ratio: market_params.jump_ratio,
+                // Regime
+                regime_quiet,
+                regime_trending,
+                regime_volatile,
+                regime_cascade,
+                // Changepoint
+                cp_prob_5,
+                cp_detected,
+            };
+            self.infra.prometheus.dashboard().record_signal_snapshot(signal_snapshot);
+            
+            // Update kappa diagnostics
+            let kappa_diag = KappaDiagnostics {
+                posterior_mean: market_params.kappa,
+                posterior_std: market_params.kappa * (1.0 - self.estimator.kappa_confidence()),
+                confidence: self.estimator.kappa_confidence(),
+                ci_95_lower: market_params.kappa * 0.7,
+                ci_95_upper: market_params.kappa * 1.3,
+                cv: 0.15, // Default coefficient of variation
+                is_heavy_tailed: false,
+                observation_count: self.tier1.adverse_selection.fills_measured() as usize,
+                mean_distance_bps: 0.0, // TODO: get from estimator
+            };
+            self.infra.prometheus.dashboard().update_kappa_diagnostics(kappa_diag);
+            
+            // Update changepoint diagnostics if controller enabled
+            if self.stochastic.controller.is_enabled() {
+                let cp = self.stochastic.controller.changepoint_summary();
+                let cp_diag = ChangepointDiagnostics {
+                    cp_prob_1: cp.cp_prob_1,
+                    cp_prob_5: cp.cp_prob_5,
+                    cp_prob_10: cp.cp_prob_10,
+                    run_length: cp.most_likely_run as u32,
+                    entropy: cp.entropy,
+                    detected: cp.detected,
+                };
+                self.infra.prometheus.dashboard().update_changepoint_diagnostics(cp_diag);
+            }
+        }
+
         // Update fill model params for Bayesian fill probability
         // Uses Kelly time horizon (τ) which is computed in ParameterAggregator
         self.strategy
@@ -657,6 +748,54 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 best_ask = ?ask_quotes.first().map(|q| (q.price, q.size)),
                 "Calculated ladder quotes"
             );
+
+            // === RECORD QUOTE DECISION FOR DASHBOARD ===
+            // Capture why this specific spread was chosen
+            if let (Some(best_bid), Some(best_ask)) = (bid_quotes.first(), ask_quotes.first()) {
+                let now = chrono::Utc::now();
+                let mid = self.latest_mid;
+                let bid_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
+                let ask_spread_bps = ((best_ask.price - mid) / mid) * 10000.0;
+                
+                // Determine regime string from cascade_size_factor
+                let cascade_level = 1.0 - market_params.cascade_size_factor;
+                let regime = if cascade_level > 0.5 {
+                    "Cascade"
+                } else if market_params.jump_ratio > 3.0 {
+                    "Volatile"
+                } else if market_params.sigma > 0.002 {
+                    "Trending"
+                } else {
+                    "Quiet"
+                }.to_string();
+                
+                // Determine defensive reason if any
+                let defensive_reason = if market_params.is_toxic_regime {
+                    Some("Toxic regime detected".to_string())
+                } else if reduce_only_result.was_filtered {
+                    Some("Reduce-only mode".to_string())
+                } else if decision_size_fraction < 1.0 {
+                    Some(format!("Decision filter: {:.0}% size", decision_size_fraction * 100.0))
+                } else {
+                    None
+                };
+                
+                let decision = QuoteDecisionRecord {
+                    timestamp_ms: now.timestamp_millis(),
+                    time: now.format("%H:%M:%S").to_string(),
+                    bid_spread_bps,
+                    ask_spread_bps,
+                    input_kappa: market_params.kappa,
+                    input_gamma: self.config.risk_aversion * market_params.hjb_gamma_multiplier,
+                    input_sigma: market_params.sigma,
+                    input_inventory: self.position.position(),
+                    regime,
+                    momentum_adjustment: drift_adjusted_skew.drift_urgency * 10000.0,
+                    inventory_skew: market_params.hjb_optimal_skew,
+                    defensive_reason,
+                };
+                self.infra.prometheus.dashboard().record_quote_decision(decision);
+            }
 
             // DIAGNOSTIC: Warn when ladder is completely empty after processing
             // This helps diagnose min_notional and capacity issues at INFO level

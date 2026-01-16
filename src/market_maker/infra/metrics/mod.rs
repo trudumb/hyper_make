@@ -77,6 +77,36 @@ impl PrometheusMetrics {
     pub fn dashboard(&self) -> &DashboardAggregator {
         &self.dashboard
     }
+
+    /// Record fill probability calibration data.
+    ///
+    /// Tracks predicted fill probability vs actual outcome for calibration analysis.
+    /// This enables the dashboard to show prediction quality metrics.
+    pub fn record_fill_calibration(&self, predicted_prob: f64, did_fill: bool, regime: &str) {
+        let calib_arc = self.dashboard.calibration();
+        let mut calib = calib_arc.write().unwrap();
+        calib.record_fill(predicted_prob, did_fill, regime);
+    }
+
+    /// Record adverse selection calibration data.
+    ///
+    /// Tracks predicted adverse selection probability vs actual outcome.
+    /// This enables the dashboard to show AS prediction quality metrics.
+    pub fn record_as_calibration(&self, predicted_alpha: f64, was_adverse: bool, regime: &str) {
+        let calib_arc = self.dashboard.calibration();
+        let mut calib = calib_arc.write().unwrap();
+        calib.record_adverse_selection(predicted_alpha, was_adverse, regime);
+    }
+
+    /// Record P&L attribution from a fill.
+    ///
+    /// Accumulates the components of P&L for dashboard display:
+    /// - spread: Revenue from capturing bid-ask spread
+    /// - adverse: Loss from adverse selection (negative value expected)
+    /// - fees: Exchange fees paid (negative value expected)
+    pub fn record_pnl_attribution(&self, spread: f64, adverse: f64, fees: f64) {
+        self.dashboard.record_pnl_attribution(spread, adverse, 0.0, fees);
+    }
 }
 
 impl Default for PrometheusMetrics {

@@ -217,22 +217,7 @@ impl ShrinkageGamma {
                     .unwrap_or(0.0);
 
                 // Use peek (don't update) for this read
-                match signal {
-                    GammaSignal::VolatilityRatio => {
-                        self.standardizers.vol_ratio.standardize_peek(raw)
-                    }
-                    GammaSignal::JumpRatio => self.standardizers.jump_ratio.standardize_peek(raw),
-                    GammaSignal::InventoryUtilization => {
-                        self.standardizers.inventory.standardize_peek(raw)
-                    }
-                    GammaSignal::HawkesIntensity => self.standardizers.hawkes.standardize_peek(raw),
-                    GammaSignal::SpreadRegime => {
-                        self.standardizers.spread_regime.standardize_peek(raw)
-                    }
-                    GammaSignal::CascadeSeverity => {
-                        self.standardizers.cascade.standardize_peek(raw)
-                    }
-                }
+                self.standardizers.standardize_peek(signal, raw)
             })
             .collect()
     }
@@ -391,6 +376,57 @@ mod tests {
             gamma <= 2.0,
             "Log-additive should prevent explosion: {}",
             gamma
+        );
+    }
+
+    #[test]
+    fn test_interaction_terms() {
+        // Create shrinkage gamma with interaction terms
+        let mut sg = ShrinkageGamma::new(
+            0.3, // gamma_base
+            vec![
+                GammaSignal::VolatilityRatio,
+                GammaSignal::VolatilityXMomentum,
+                GammaSignal::RegimeXInventory,
+                GammaSignal::JumpXFlow,
+            ],
+            0.1,  // tau_initial
+            0.01, // learning_rate
+            0.05, // gamma_min
+            2.0,  // gamma_max
+        );
+
+        // Set weights to test interaction effects
+        // Base signal + 3 interaction signals = 4 weights
+        sg.weights = vec![0.2, 0.3, 0.3, 0.3];
+
+        // Simulate high volatility + high momentum (dangerous cascade scenario)
+        // Interaction term vol_x_momentum should increase gamma
+        let signals_dangerous = vec![
+            (GammaSignal::VolatilityRatio, 2.0),      // High vol
+            (GammaSignal::VolatilityXMomentum, 2.0),  // High vol×momentum product
+            (GammaSignal::RegimeXInventory, 0.0),     // Neutral
+            (GammaSignal::JumpXFlow, 0.0),            // Neutral
+        ];
+
+        let gamma_dangerous = sg.effective_gamma(&signals_dangerous);
+
+        // Simulate normal conditions
+        let signals_normal = vec![
+            (GammaSignal::VolatilityRatio, 1.0),      // Normal vol
+            (GammaSignal::VolatilityXMomentum, 0.0),  // Low interaction
+            (GammaSignal::RegimeXInventory, 0.0),     // Neutral
+            (GammaSignal::JumpXFlow, 0.0),            // Neutral
+        ];
+
+        let gamma_normal = sg.effective_gamma(&signals_normal);
+
+        // Gamma should be higher in dangerous conditions due to interaction term
+        assert!(
+            gamma_dangerous > gamma_normal,
+            "Gamma should be higher in dangerous conditions: {} vs {}",
+            gamma_dangerous,
+            gamma_normal
         );
     }
 }

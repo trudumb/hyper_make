@@ -103,6 +103,7 @@ pub struct AdaptiveBayesianConfig {
 /// Signals that can influence gamma adjustment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GammaSignal {
+    // === Base Signals ===
     /// Volatility ratio (σ / σ_baseline)
     VolatilityRatio,
     /// Jump ratio (RV / BV)
@@ -115,6 +116,17 @@ pub enum GammaSignal {
     SpreadRegime,
     /// Cascade severity
     CascadeSeverity,
+
+    // === Interaction Terms (Phase 2 Feature Engineering) ===
+    /// Volatility × |Momentum|: Wider spreads when volatile AND trending
+    /// High vol alone is fine; high vol + momentum = dangerous cascade risk
+    VolatilityXMomentum,
+    /// Regime score × Inventory utilization: More risk-averse when exposed during regime shifts
+    /// Large inventory alone is manageable; large inventory + regime shift = liquidation risk
+    RegimeXInventory,
+    /// Jump ratio × |Flow imbalance|: Detect toxic flow during jump events
+    /// Jumps alone are noise; jumps + directional flow = informed trader
+    JumpXFlow,
 }
 
 impl GammaSignal {
@@ -127,6 +139,35 @@ impl GammaSignal {
             GammaSignal::HawkesIntensity => "hawkes",
             GammaSignal::SpreadRegime => "spread_regime",
             GammaSignal::CascadeSeverity => "cascade",
+            // Interaction terms
+            GammaSignal::VolatilityXMomentum => "vol_x_momentum",
+            GammaSignal::RegimeXInventory => "regime_x_inventory",
+            GammaSignal::JumpXFlow => "jump_x_flow",
+        }
+    }
+
+    /// Check if this signal is an interaction term.
+    pub fn is_interaction(&self) -> bool {
+        matches!(
+            self,
+            GammaSignal::VolatilityXMomentum
+                | GammaSignal::RegimeXInventory
+                | GammaSignal::JumpXFlow
+        )
+    }
+
+    /// Get the component signals for an interaction term.
+    /// Returns None for base signals.
+    pub fn components(&self) -> Option<(GammaSignal, &'static str)> {
+        match self {
+            GammaSignal::VolatilityXMomentum => {
+                Some((GammaSignal::VolatilityRatio, "momentum_abs"))
+            }
+            GammaSignal::RegimeXInventory => {
+                Some((GammaSignal::SpreadRegime, "inventory"))
+            }
+            GammaSignal::JumpXFlow => Some((GammaSignal::JumpRatio, "flow_abs")),
+            _ => None,
         }
     }
 }
@@ -152,10 +193,15 @@ impl Default for AdaptiveBayesianConfig {
             gamma_min: 0.05,
             gamma_max: 2.0,
             gamma_signals: vec![
+                // Base signals
                 GammaSignal::VolatilityRatio,
                 GammaSignal::JumpRatio,
                 GammaSignal::InventoryUtilization,
                 GammaSignal::HawkesIntensity,
+                // Interaction terms (Phase 2 Feature Engineering)
+                GammaSignal::VolatilityXMomentum,
+                GammaSignal::RegimeXInventory,
+                GammaSignal::JumpXFlow,
             ],
 
             // Blended Kappa - liquid market priors

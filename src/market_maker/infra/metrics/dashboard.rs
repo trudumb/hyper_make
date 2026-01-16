@@ -240,6 +240,219 @@ pub struct SpreadBucket {
 }
 
 // ============================================================================
+// Signal & Decision Visualization Structures
+// ============================================================================
+
+/// Snapshot of all signal values at a point in time.
+/// Used to visualize signal evolution and understand decision inputs.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignalSnapshot {
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: i64,
+    /// Time label (HH:MM:SS format).
+    pub time: String,
+
+    // Kappa (fill intensity) estimates
+    /// Posterior mean of kappa.
+    pub kappa: f64,
+    /// Confidence in kappa estimate [0, 1].
+    pub kappa_confidence: f64,
+    /// 95% credible interval lower bound.
+    pub kappa_ci_lower: f64,
+    /// 95% credible interval upper bound.
+    pub kappa_ci_upper: f64,
+
+    // Microprice signals
+    /// Fair price incorporating book/flow imbalance.
+    pub microprice: f64,
+    /// Book imbalance weight.
+    pub beta_book: f64,
+    /// Flow imbalance weight.
+    pub beta_flow: f64,
+
+    // Momentum signals
+    /// Momentum in basis points (signed).
+    pub momentum_bps: f64,
+    /// Buy/sell aggressor imbalance [-1, 1].
+    pub flow_imbalance: f64,
+    /// Falling knife score [0, 3].
+    pub falling_knife: f64,
+
+    // Volatility signals
+    /// Clean volatility (bipower variation).
+    pub sigma: f64,
+    /// Jump ratio (RV/BV) for toxic flow detection.
+    pub jump_ratio: f64,
+
+    // Regime probabilities
+    /// Probability of Quiet regime.
+    pub regime_quiet: f64,
+    /// Probability of Trending regime.
+    pub regime_trending: f64,
+    /// Probability of Volatile regime.
+    pub regime_volatile: f64,
+    /// Probability of Cascade regime.
+    pub regime_cascade: f64,
+
+    // Changepoint detection
+    /// Probability of changepoint in last 5 observations.
+    pub cp_prob_5: f64,
+    /// Whether changepoint was detected.
+    pub cp_detected: bool,
+}
+
+impl Default for SignalSnapshot {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            time: String::new(),
+            kappa: 0.0,
+            kappa_confidence: 0.0,
+            kappa_ci_lower: 0.0,
+            kappa_ci_upper: 0.0,
+            microprice: 0.0,
+            beta_book: 0.0,
+            beta_flow: 0.0,
+            momentum_bps: 0.0,
+            flow_imbalance: 0.0,
+            falling_knife: 0.0,
+            sigma: 0.0,
+            jump_ratio: 0.0,
+            regime_quiet: 1.0,
+            regime_trending: 0.0,
+            regime_volatile: 0.0,
+            regime_cascade: 0.0,
+            cp_prob_5: 0.0,
+            cp_detected: false,
+        }
+    }
+}
+
+/// Record of a quote decision with context.
+/// Used to understand WHY a specific spread was chosen.
+#[derive(Clone, Debug, Serialize)]
+pub struct QuoteDecisionRecord {
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: i64,
+    /// Time label (HH:MM:SS format).
+    pub time: String,
+
+    // What spread was set
+    /// Bid spread in basis points.
+    pub bid_spread_bps: f64,
+    /// Ask spread in basis points.
+    pub ask_spread_bps: f64,
+
+    // Key inputs to the decision
+    /// Kappa (fill intensity) used.
+    pub input_kappa: f64,
+    /// Gamma (risk aversion) used.
+    pub input_gamma: f64,
+    /// Sigma (volatility) used.
+    pub input_sigma: f64,
+    /// Inventory position.
+    pub input_inventory: f64,
+
+    // Decision factors
+    /// Current regime classification.
+    pub regime: String,
+    /// Momentum-based spread adjustment (multiplier).
+    pub momentum_adjustment: f64,
+    /// Inventory skew applied (bps).
+    pub inventory_skew: f64,
+    /// Reason for defensive quoting (if any).
+    pub defensive_reason: Option<String>,
+}
+
+impl Default for QuoteDecisionRecord {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            time: String::new(),
+            bid_spread_bps: 0.0,
+            ask_spread_bps: 0.0,
+            input_kappa: 0.0,
+            input_gamma: 0.0,
+            input_sigma: 0.0,
+            input_inventory: 0.0,
+            regime: "Unknown".to_string(),
+            momentum_adjustment: 1.0,
+            inventory_skew: 0.0,
+            defensive_reason: None,
+        }
+    }
+}
+
+/// Current kappa diagnostics for detailed view.
+#[derive(Clone, Debug, Serialize)]
+pub struct KappaDiagnostics {
+    /// Posterior mean.
+    pub posterior_mean: f64,
+    /// Posterior standard deviation.
+    pub posterior_std: f64,
+    /// Confidence [0, 1].
+    pub confidence: f64,
+    /// 95% CI lower bound.
+    pub ci_95_lower: f64,
+    /// 95% CI upper bound.
+    pub ci_95_upper: f64,
+    /// Coefficient of variation.
+    pub cv: f64,
+    /// Whether heavy-tailed distribution detected.
+    pub is_heavy_tailed: bool,
+    /// Number of observations.
+    pub observation_count: usize,
+    /// Mean fill distance in bps.
+    pub mean_distance_bps: f64,
+}
+
+impl Default for KappaDiagnostics {
+    fn default() -> Self {
+        Self {
+            posterior_mean: 0.0,
+            posterior_std: 0.0,
+            confidence: 0.0,
+            ci_95_lower: 0.0,
+            ci_95_upper: 0.0,
+            cv: 0.0,
+            is_heavy_tailed: false,
+            observation_count: 0,
+            mean_distance_bps: 0.0,
+        }
+    }
+}
+
+/// Current changepoint/regime diagnostics.
+#[derive(Clone, Debug, Serialize)]
+pub struct ChangepointDiagnostics {
+    /// P(changepoint 1 obs ago).
+    pub cp_prob_1: f64,
+    /// P(changepoint 5 obs ago).
+    pub cp_prob_5: f64,
+    /// P(changepoint 10 obs ago).
+    pub cp_prob_10: f64,
+    /// Most likely run length (age of current regime).
+    pub run_length: u32,
+    /// Entropy (uncertainty over run length).
+    pub entropy: f64,
+    /// Threshold detection status.
+    pub detected: bool,
+}
+
+impl Default for ChangepointDiagnostics {
+    fn default() -> Self {
+        Self {
+            cp_prob_1: 0.0,
+            cp_prob_5: 0.0,
+            cp_prob_10: 0.0,
+            run_length: 0,
+            entropy: 0.0,
+            detected: false,
+        }
+    }
+}
+
+// ============================================================================
 // Dashboard State
 // ============================================================================
 
@@ -254,12 +467,22 @@ pub struct DashboardState {
     pub signals: Vec<SignalInfo>,
     pub timestamp_ms: i64,
 
-    // New visualization data
+    // Visualization data
     pub book_history: Vec<BookSnapshot>,
     pub price_history: Vec<PricePoint>,
     pub quote_history: Vec<QuoteSnapshot>,
     pub quote_fill_stats: Vec<QuoteFillStats>,
     pub spread_distribution: Vec<SpreadBucket>,
+
+    // Signal & decision visualization (NEW)
+    /// Time series of signal values for pattern visualization.
+    pub signal_history: Vec<SignalSnapshot>,
+    /// Recent quote decisions with context for debugging.
+    pub decision_history: Vec<QuoteDecisionRecord>,
+    /// Current kappa estimation diagnostics.
+    pub kappa_diagnostics: KappaDiagnostics,
+    /// Current changepoint detection state.
+    pub changepoint_diagnostics: ChangepointDiagnostics,
 }
 
 impl Default for DashboardState {
@@ -272,12 +495,17 @@ impl Default for DashboardState {
             calibration: CalibrationState::default(),
             signals: default_signals(),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            // New visualization data - empty by default
+            // Visualization data
             book_history: Vec::new(),
             price_history: Vec::new(),
             quote_history: Vec::new(),
             quote_fill_stats: Vec::new(),
             spread_distribution: Vec::new(),
+            // Signal & decision visualization
+            signal_history: Vec::new(),
+            decision_history: Vec::new(),
+            kappa_diagnostics: KappaDiagnostics::default(),
+            changepoint_diagnostics: ChangepointDiagnostics::default(),
         }
     }
 }
@@ -378,6 +606,12 @@ pub struct DashboardConfig {
     pub price_snapshot_interval: Duration,
     /// Book snapshot interval.
     pub book_snapshot_interval: Duration,
+    /// Maximum signal history entries (5 min at 1/sec).
+    pub max_signal_history: usize,
+    /// Maximum decision history entries.
+    pub max_decision_history: usize,
+    /// Signal snapshot interval.
+    pub signal_snapshot_interval: Duration,
 }
 
 impl Default for DashboardConfig {
@@ -385,11 +619,14 @@ impl Default for DashboardConfig {
         Self {
             max_regime_history: 60, // 1 hour at 1-minute intervals
             max_fills: 100,
-            regime_snapshot_interval: Duration::from_secs(60),
+            regime_snapshot_interval: Duration::from_secs(5), // More responsive for dashboard
             max_price_history: 1800, // 30 min at 1/sec
             max_book_history: 360,   // 6 min at 1/sec
             price_snapshot_interval: Duration::from_secs(1),
             book_snapshot_interval: Duration::from_secs(1),
+            max_signal_history: 300,    // 5 min at 1/sec
+            max_decision_history: 100,  // Last 100 quote decisions
+            signal_snapshot_interval: Duration::from_secs(1),
         }
     }
 }
@@ -416,6 +653,24 @@ pub struct DashboardAggregator {
     last_price_snapshot: RwLock<Instant>,
     /// Last book snapshot time.
     last_book_snapshot: RwLock<Instant>,
+    /// Accumulated spread capture P&L.
+    total_spread_capture: RwLock<f64>,
+    /// Accumulated adverse selection losses.
+    total_adverse_selection: RwLock<f64>,
+    /// Accumulated inventory cost.
+    total_inventory_cost: RwLock<f64>,
+    /// Accumulated fees.
+    total_fees: RwLock<f64>,
+    /// Signal snapshot history (thread-safe).
+    signal_history: RwLock<VecDeque<SignalSnapshot>>,
+    /// Quote decision history (thread-safe).
+    decision_history: RwLock<VecDeque<QuoteDecisionRecord>>,
+    /// Last signal snapshot time.
+    last_signal_snapshot: RwLock<Instant>,
+    /// Latest kappa diagnostics.
+    kappa_diagnostics: RwLock<KappaDiagnostics>,
+    /// Latest changepoint diagnostics.
+    changepoint_diagnostics: RwLock<ChangepointDiagnostics>,
 }
 
 impl DashboardAggregator {
@@ -425,12 +680,22 @@ impl DashboardAggregator {
             regime_history: RwLock::new(VecDeque::new()),
             fill_history: RwLock::new(VecDeque::new()),
             calibration,
-            last_regime_snapshot: RwLock::new(Instant::now()),
+            // Initialize to 60s in the past to trigger immediate first snapshot
+            last_regime_snapshot: RwLock::new(Instant::now() - Duration::from_secs(60)),
             cumulative_pnl: RwLock::new(0.0),
             price_history: RwLock::new(VecDeque::new()),
             book_history: RwLock::new(VecDeque::new()),
             last_price_snapshot: RwLock::new(Instant::now()),
             last_book_snapshot: RwLock::new(Instant::now()),
+            total_spread_capture: RwLock::new(0.0),
+            total_adverse_selection: RwLock::new(0.0),
+            total_inventory_cost: RwLock::new(0.0),
+            total_fees: RwLock::new(0.0),
+            signal_history: RwLock::new(VecDeque::new()),
+            decision_history: RwLock::new(VecDeque::new()),
+            last_signal_snapshot: RwLock::new(Instant::now()),
+            kappa_diagnostics: RwLock::new(KappaDiagnostics::default()),
+            changepoint_diagnostics: RwLock::new(ChangepointDiagnostics::default()),
         }
     }
 
@@ -529,6 +794,72 @@ impl DashboardAggregator {
         }
     }
 
+    /// Record P&L attribution from a fill.
+    ///
+    /// Accumulates the components of P&L for dashboard display:
+    /// - spread: Revenue from capturing bid-ask spread
+    /// - adverse: Loss from adverse selection (negative value)
+    /// - inv_cost: Cost from inventory carry (negative value)
+    /// - fees: Exchange fees paid (negative value)
+    pub fn record_pnl_attribution(&self, spread: f64, adverse: f64, inv_cost: f64, fees: f64) {
+        *self.total_spread_capture.write().unwrap() += spread;
+        *self.total_adverse_selection.write().unwrap() += adverse;
+        *self.total_inventory_cost.write().unwrap() += inv_cost;
+        *self.total_fees.write().unwrap() += fees;
+    }
+
+    /// Get accumulated spread capture.
+    pub fn total_spread_capture(&self) -> f64 {
+        *self.total_spread_capture.read().unwrap()
+    }
+
+    /// Get accumulated adverse selection losses.
+    pub fn total_adverse_selection(&self) -> f64 {
+        *self.total_adverse_selection.read().unwrap()
+    }
+
+    /// Get accumulated inventory cost.
+    pub fn total_inventory_cost(&self) -> f64 {
+        *self.total_inventory_cost.read().unwrap()
+    }
+
+    /// Get accumulated fees.
+    pub fn total_fees(&self) -> f64 {
+        *self.total_fees.read().unwrap()
+    }
+
+    /// Record a signal snapshot if interval has elapsed.
+    pub fn record_signal_snapshot(&self, snapshot: SignalSnapshot) {
+        let mut last_time = self.last_signal_snapshot.write().unwrap();
+        if last_time.elapsed() >= self.config.signal_snapshot_interval {
+            let mut history = self.signal_history.write().unwrap();
+            history.push_back(snapshot);
+            while history.len() > self.config.max_signal_history {
+                history.pop_front();
+            }
+            *last_time = Instant::now();
+        }
+    }
+
+    /// Record a quote decision (always recorded, no interval).
+    pub fn record_quote_decision(&self, decision: QuoteDecisionRecord) {
+        let mut history = self.decision_history.write().unwrap();
+        history.push_back(decision);
+        while history.len() > self.config.max_decision_history {
+            history.pop_front();
+        }
+    }
+
+    /// Update kappa diagnostics.
+    pub fn update_kappa_diagnostics(&self, diagnostics: KappaDiagnostics) {
+        *self.kappa_diagnostics.write().unwrap() = diagnostics;
+    }
+
+    /// Update changepoint diagnostics.
+    pub fn update_changepoint_diagnostics(&self, diagnostics: ChangepointDiagnostics) {
+        *self.changepoint_diagnostics.write().unwrap() = diagnostics;
+    }
+
     /// Generate dashboard snapshot from current state.
     pub fn snapshot(
         &self,
@@ -584,6 +915,22 @@ impl DashboardAggregator {
             history.iter().cloned().collect()
         };
 
+        // Get signal history
+        let signal_history: Vec<SignalSnapshot> = {
+            let history = self.signal_history.read().unwrap();
+            history.iter().cloned().collect()
+        };
+
+        // Get decision history
+        let decision_history: Vec<QuoteDecisionRecord> = {
+            let history = self.decision_history.read().unwrap();
+            history.iter().cloned().collect()
+        };
+
+        // Get current diagnostics
+        let kappa_diagnostics = self.kappa_diagnostics.read().unwrap().clone();
+        let changepoint_diagnostics = self.changepoint_diagnostics.read().unwrap().clone();
+
         DashboardState {
             quotes: LiveQuotes {
                 mid: mid_price,
@@ -620,6 +967,11 @@ impl DashboardAggregator {
             quote_history: Vec::new(), // TODO: implement quote history tracking
             quote_fill_stats: Vec::new(),
             spread_distribution: Vec::new(),
+            // Signal & decision visualization
+            signal_history,
+            decision_history,
+            kappa_diagnostics,
+            changepoint_diagnostics,
         }
     }
 

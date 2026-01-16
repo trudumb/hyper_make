@@ -42,7 +42,9 @@ mod kappa_orchestrator;
 mod microprice;
 mod mock;
 mod momentum;
+pub mod mutual_info;
 mod parameter_estimator;
+pub mod temporal;
 mod robust_kappa;
 mod soft_jump;
 pub(crate) mod tick_ewma;
@@ -90,6 +92,18 @@ pub use parameter_estimator::ParameterEstimator;
 pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 pub use volatility::{StochasticVolParams, VolatilityRegime};
 pub use volatility_filter::{VolFilterConfig, VolParticle, VolRegimeParams, VolatilityFilter};
+
+// Mutual information for feature quality assessment
+pub use mutual_info::{
+    MutualInfoEstimator, SignalAuditManager, SignalQualityTracker, SignalRankEntry, SignalType,
+    TargetType,
+};
+
+// Temporal feature engineering
+pub use temporal::{
+    FundingFeatures, MomentumScale, MultiScaleMomentum, TemporalFeatures,
+    TemporalMomentumFeatures, TimeOfDayFeatures,
+};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

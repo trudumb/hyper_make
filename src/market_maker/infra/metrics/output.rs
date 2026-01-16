@@ -818,11 +818,12 @@ impl PrometheusMetrics {
         // Current gamma (use kelly fraction as proxy, or default)
         let gamma = self.inner.kelly_fraction.load().max(0.1);
 
-        // P&L component estimates
-        let spread_capture = daily_pnl.max(0.0);
-        let adverse_selection = (-adverse_selection_bps * position.abs() * mid_price / 10000.0).min(0.0);
-        let inventory_cost = 0.0; // Would need more tracking
-        let fees = 0.0; // Would need more tracking
+        // P&L attribution from accumulated fill data
+        // These are tracked per-fill in FillProcessor and accumulated in DashboardAggregator
+        let spread_capture = self.dashboard.total_spread_capture();
+        let adverse_selection = self.dashboard.total_adverse_selection();
+        let inventory_cost = self.dashboard.total_inventory_cost();
+        let fees = self.dashboard.total_fees();
 
         // Use dashboard aggregator snapshot to get fills, calibration, and regime history
         self.dashboard.snapshot(

@@ -473,6 +473,34 @@ impl FillProcessor {
             .prometheus
             .record_fill_for_dashboard(pnl_summary.total_pnl, fill.is_buy, as_bps);
 
+        // Record P&L attribution for dashboard breakdown
+        // Note: adverse_selection and fees are typically negative values
+        state.prometheus.record_pnl_attribution(
+            pnl_summary.spread_capture,
+            -pnl_summary.adverse_selection, // Convert to negative (it's tracked as positive loss)
+            -pnl_summary.fees,              // Convert to negative (fees are costs)
+        );
+
+        // Record calibration data for dashboard prediction quality tracking
+        // Note: We record that a fill happened (did_fill=true)
+        // Using current kappa to estimate fill probability: p = kappa / (kappa + 1000)
+        // This is a rough heuristic - proper calibration would track prediction at order time
+        let kappa = state.estimator.kappa();
+        let fill_prob_estimate = kappa / (kappa + 1000.0);
+        let regime = format!("{:?}", state.estimator.volatility_regime());
+        state
+            .prometheus
+            .record_fill_calibration(fill_prob_estimate, true, &regime);
+
+        // Record AS calibration: consider "adverse" if AS exceeds 2 bps threshold
+        let as_threshold_bps = 2.0;
+        let was_adverse = as_bps > as_threshold_bps;
+        // Use toxic regime flag as AS probability proxy
+        let as_prob_estimate = if state.estimator.is_toxic_regime() { 0.5 } else { 0.1 };
+        state
+            .prometheus
+            .record_as_calibration(as_prob_estimate, was_adverse, &regime);
+
         // Optional metrics recorder
         if let Some(m) = state.metrics {
             m.record_fill(fill.size, fill.is_buy);

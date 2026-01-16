@@ -1031,6 +1031,171 @@
             return e(UPlotChart, { data: uData, options: opts, height: 200 });
         };
 
+        // Signal Time Series Chart (NEW) - shows kappa, momentum, flow imbalance over time
+        const SignalTimeSeriesChart = ({data, field, label, color}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-32 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for signal data...');
+            }
+
+            const times = data.map(d => d.timestamp_ms / 1000);
+            const values = data.map(d => d[field] || 0);
+            const uData = [times, values];
+
+            const opts = {
+                scales: { x: { time: true } },
+                axes: [
+                    { ...uPlotDarkTheme.axes[0], values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleTimeString()) },
+                    { ...uPlotDarkTheme.axes[1], values: (u, vals) => vals.map(v => v.toFixed(2)) }
+                ],
+                series: [
+                    {},
+                    { label: label, stroke: color, fill: color + '33', width: 2 }
+                ]
+            };
+
+            return e(UPlotChart, { data: uData, options: opts, height: 120 });
+        };
+
+        // Multi-signal chart showing kappa with confidence bands
+        const KappaChart = ({data}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-40 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for kappa data...');
+            }
+
+            const times = data.map(d => d.timestamp_ms / 1000);
+            const kappa = data.map(d => d.kappa || 0);
+            const ciLower = data.map(d => d.kappa_ci_lower || d.kappa * 0.7);
+            const ciUpper = data.map(d => d.kappa_ci_upper || d.kappa * 1.3);
+            const uData = [times, kappa, ciLower, ciUpper];
+
+            const opts = {
+                scales: { x: { time: true } },
+                axes: [
+                    { ...uPlotDarkTheme.axes[0], values: (u, vals) => vals.map(v => new Date(v * 1000).toLocaleTimeString().slice(0, 5)) },
+                    { ...uPlotDarkTheme.axes[1], values: (u, vals) => vals.map(v => v.toFixed(0)) }
+                ],
+                series: [
+                    {},
+                    { label: 'κ', stroke: C.accent, width: 2 },
+                    { label: '95% CI Low', stroke: C.accent + '66', width: 1, dash: [4, 4] },
+                    { label: '95% CI High', stroke: C.accent + '66', width: 1, dash: [4, 4] }
+                ]
+            };
+
+            return e(UPlotChart, { data: uData, options: opts, height: 160 });
+        };
+
+        // Quote Decision Log Table
+        const DecisionLogTable = ({data}) => {
+            if (!data || data.length === 0) {
+                return e('div', {className: 'h-32 flex items-center justify-center', style: {color: C.textMuted}}, 'No decisions yet...');
+            }
+
+            // Show last 15 decisions, newest first
+            const recent = [...data].reverse().slice(0, 15);
+
+            return e('div', {className: 'overflow-x-auto'},
+                e('table', {className: 'w-full text-xs'},
+                    e('thead', null,
+                        e('tr', {style: {borderBottom: '1px solid ' + C.border}},
+                            e('th', {className: 'text-left py-2 px-1', style: {color: C.textMuted}}, 'Time'),
+                            e('th', {className: 'text-right py-2 px-1', style: {color: C.textMuted}}, 'Bid'),
+                            e('th', {className: 'text-right py-2 px-1', style: {color: C.textMuted}}, 'Ask'),
+                            e('th', {className: 'text-right py-2 px-1', style: {color: C.textMuted}}, 'κ'),
+                            e('th', {className: 'text-right py-2 px-1', style: {color: C.textMuted}}, 'γ'),
+                            e('th', {className: 'text-right py-2 px-1', style: {color: C.textMuted}}, 'σ'),
+                            e('th', {className: 'text-center py-2 px-1', style: {color: C.textMuted}}, 'Regime'),
+                            e('th', {className: 'text-left py-2 px-1', style: {color: C.textMuted}}, 'Reason')
+                        )
+                    ),
+                    e('tbody', null,
+                        recent.map((d, i) =>
+                            e('tr', {key: i, style: {borderBottom: '1px solid ' + C.border + '44'}},
+                                e('td', {className: 'py-1.5 px-1 mono', style: {color: C.textMuted}}, d.time),
+                                e('td', {className: 'text-right py-1.5 px-1 mono', style: {color: C.green}}, d.bid_spread_bps.toFixed(1)),
+                                e('td', {className: 'text-right py-1.5 px-1 mono', style: {color: C.red}}, d.ask_spread_bps.toFixed(1)),
+                                e('td', {className: 'text-right py-1.5 px-1 mono', style: {color: C.accent}}, d.input_kappa.toFixed(0)),
+                                e('td', {className: 'text-right py-1.5 px-1 mono', style: {color: C.text}}, d.input_gamma.toFixed(2)),
+                                e('td', {className: 'text-right py-1.5 px-1 mono', style: {color: C.text}}, (d.input_sigma * 10000).toFixed(1)),
+                                e('td', {className: 'text-center py-1.5 px-1'},
+                                    e('span', {
+                                        className: 'px-1.5 py-0.5 rounded text-xs',
+                                        style: {
+                                            backgroundColor: d.regime === 'Cascade' ? C.red + '33' :
+                                                           d.regime === 'Volatile' ? C.orange + '33' :
+                                                           d.regime === 'Trending' ? C.blue + '33' : C.green + '33',
+                                            color: d.regime === 'Cascade' ? C.red :
+                                                  d.regime === 'Volatile' ? C.orange :
+                                                  d.regime === 'Trending' ? C.blue : C.green
+                                        }
+                                    }, d.regime)
+                                ),
+                                e('td', {className: 'py-1.5 px-1 text-xs', style: {color: d.defensive_reason ? C.orange : C.textMuted}},
+                                    d.defensive_reason || '—')
+                            )
+                        )
+                    )
+                )
+            );
+        };
+
+        // Kappa Diagnostics Panel
+        const KappaDiagPanel = ({diag}) => {
+            return e('div', {className: 'space-y-3'},
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Posterior Mean'),
+                    e('span', {className: 'mono text-sm', style: {color: C.accent}}, diag.posterior_mean.toFixed(0))
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Std Dev'),
+                    e('span', {className: 'mono text-sm', style: {color: C.text}}, '±' + diag.posterior_std.toFixed(0))
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Confidence'),
+                    e('span', {className: 'mono text-sm', style: {color: diag.confidence > 0.7 ? C.green : C.orange}},
+                        (diag.confidence * 100).toFixed(0) + '%')
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, '95% CI'),
+                    e('span', {className: 'mono text-sm', style: {color: C.text}},
+                        '[' + diag.ci_95_lower.toFixed(0) + ', ' + diag.ci_95_upper.toFixed(0) + ']')
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Observations'),
+                    e('span', {className: 'mono text-sm', style: {color: C.text}}, diag.observation_count)
+                )
+            );
+        };
+
+        // Changepoint Diagnostics Panel
+        const ChangepointDiagPanel = ({diag}) => {
+            return e('div', {className: 'space-y-3'},
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'CP Prob (5)'),
+                    e('span', {className: 'mono text-sm', style: {color: diag.cp_prob_5 > 0.3 ? C.orange : C.green}},
+                        (diag.cp_prob_5 * 100).toFixed(1) + '%')
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Run Length'),
+                    e('span', {className: 'mono text-sm', style: {color: C.text}}, diag.run_length + ' obs')
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Entropy'),
+                    e('span', {className: 'mono text-sm', style: {color: C.text}}, diag.entropy.toFixed(2) + ' bits')
+                ),
+                e('div', {className: 'flex justify-between'},
+                    e('span', {className: 'text-xs', style: {color: C.textMuted}}, 'Detected'),
+                    e('span', {
+                        className: 'px-2 py-0.5 rounded text-xs',
+                        style: {
+                            backgroundColor: diag.detected ? C.red + '33' : C.green + '33',
+                            color: diag.detected ? C.red : C.green
+                        }
+                    }, diag.detected ? 'YES' : 'NO')
+                )
+            );
+        };
+
         // Calibration scatter + line chart (Canvas)
         const CalibrationChart = ({data}) => {
             const canvasRef = useRef(null);
@@ -1421,6 +1586,18 @@
             const [spreadDist, setSpreadDist] = useState([]);
             const [fillStats, setFillStats] = useState([]);
 
+            // Signal & Decision visualization state (NEW)
+            const [signalHistory, setSignalHistory] = useState([]);
+            const [decisionHistory, setDecisionHistory] = useState([]);
+            const [kappaDiag, setKappaDiag] = useState({
+                posterior_mean: 0, posterior_std: 0, confidence: 0,
+                ci_95_lower: 0, ci_95_upper: 0, observation_count: 0
+            });
+            const [changepointDiag, setChangepointDiag] = useState({
+                cp_prob_1: 0, cp_prob_5: 0, cp_prob_10: 0,
+                run_length: 0, entropy: 0, detected: false
+            });
+
             // Track accumulated fills from WebSocket
             const [wsConnected, setWsConnected] = useState(false);
 
@@ -1456,6 +1633,11 @@
                     if (data.quote_history) setQuoteHistory(data.quote_history);
                     if (data.spread_distribution) setSpreadDist(data.spread_distribution);
                     if (data.quote_fill_stats) setFillStats(data.quote_fill_stats);
+                    // Signal & Decision visualization data (NEW)
+                    if (data.signal_history) setSignalHistory(data.signal_history);
+                    if (data.decision_history) setDecisionHistory(data.decision_history);
+                    if (data.kappa_diagnostics) setKappaDiag(data.kappa_diagnostics);
+                    if (data.changepoint_diagnostics) setChangepointDiag(data.changepoint_diagnostics);
                 }
                 setTime(new Date().toLocaleTimeString());
             };
@@ -1721,37 +1903,44 @@
                     ),
 
                     tab === 'signals' && e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
-                        e(Card, {title: 'Signal Audit', subtitle: 'Mutual information analysis', accent: C.accent, className: 'lg:col-span-2'},
-                            signals.length > 0 ? e(SignalTable, {data: signals}) : e('div', {className: 'h-24 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for data...'),
-                            signals.length > 0 && e('div', {className: 'mt-4 p-3 rounded border', style: {backgroundColor: C.bg, borderColor: C.border}},
-                                e('span', {className: 'text-xs', style: {color: C.textMuted}},
-                                    e('strong', {style: {color: C.accent}}, 'Key: '),
-                                    signals[0]?.signal + ' (' + signals[0]?.mi.toFixed(3) + ' bits, ' + signals[0]?.lag + 'ms lag)'
-                                )
-                            )
+                        // Kappa Time Series (full width)
+                        e(Card, {title: 'Kappa (Fill Intensity)', subtitle: 'With 95% confidence interval', accent: C.accent, className: 'lg:col-span-2'},
+                            e(KappaChart, {data: signalHistory})
                         ),
-                        e(Card, {title: 'Cross-Exchange Lead-Lag', subtitle: 'Binance → Hyperliquid', accent: C.purple},
-                            e(LeadLagChart, {data: leadLag}),
-                            e('div', {className: 'grid grid-cols-3 gap-4 mt-4'},
-                                e(Metric, {label: 'Opt Lag', value: '150', unit: 'ms'}),
-                                e(Metric, {label: 'Peak R²', value: '0.32'}),
-                                e(Metric, {label: 'Beta', value: '0.87'})
-                            )
+                        
+                        // Quote Decision Log (full width)
+                        e(Card, {title: 'Quote Decision Log', subtitle: 'Why spreads were set', accent: C.blue, className: 'lg:col-span-2'},
+                            e(DecisionLogTable, {data: decisionHistory})
                         ),
-                        e(Card, {title: 'MI by Signal', accent: C.green},
-                            signals.length > 0 ? e('div', {className: 'space-y-3'},
-                                signals.map((s, i) =>
-                                    e('div', {key: i},
-                                        e('div', {className: 'flex justify-between mb-1'},
-                                            e('span', {className: 'text-xs', style: {color: C.text}}, s.signal),
-                                            e('span', {className: 'text-xs tabular-nums mono', style: {color: C.accent}}, s.mi.toFixed(3))
-                                        ),
-                                        e('div', {className: 'h-1.5 rounded-full overflow-hidden', style: {backgroundColor: C.border}},
-                                            e('div', {className: 'h-full rounded-full', style: {width: (s.mi / 0.1 * 100) + '%', backgroundColor: C.accent}})
-                                        )
-                                    )
-                                )
-                            ) : e('div', {className: 'h-24 flex items-center justify-center', style: {color: C.textMuted}}, 'Waiting for data...')
+                        
+                        // Kappa Diagnostics
+                        e(Card, {title: 'Kappa Diagnostics', subtitle: 'Bayesian posterior', accent: C.accent},
+                            e(KappaDiagPanel, {diag: kappaDiag})
+                        ),
+                        
+                        // Changepoint Diagnostics
+                        e(Card, {title: 'Changepoint Detection', subtitle: 'Regime transition', accent: C.orange},
+                            e(ChangepointDiagPanel, {diag: changepointDiag})
+                        ),
+                        
+                        // Momentum Signal
+                        e(Card, {title: 'Momentum (bps)', subtitle: 'Signed price momentum', accent: C.purple},
+                            e(SignalTimeSeriesChart, {data: signalHistory, field: 'momentum_bps', label: 'Momentum', color: C.purple})
+                        ),
+                        
+                        // Flow Imbalance
+                        e(Card, {title: 'Flow Imbalance', subtitle: 'Order flow direction', accent: C.blue},
+                            e(SignalTimeSeriesChart, {data: signalHistory, field: 'flow_imbalance', label: 'Imbalance', color: C.blue})
+                        ),
+                        
+                        // Volatility
+                        e(Card, {title: 'Volatility (σ)', subtitle: 'Clean bipower variation', accent: C.green},
+                            e(SignalTimeSeriesChart, {data: signalHistory, field: 'sigma', label: 'σ', color: C.green})
+                        ),
+                        
+                        // Jump Ratio
+                        e(Card, {title: 'Jump Ratio', subtitle: 'RV/BV toxicity indicator', accent: C.red},
+                            e(SignalTimeSeriesChart, {data: signalHistory, field: 'jump_ratio', label: 'Jump', color: C.red})
                         )
                     ),
 
