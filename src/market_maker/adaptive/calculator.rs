@@ -71,18 +71,41 @@ pub struct MarketSignals {
     pub spread_regime: f64,
     /// Cascade severity (0 to 1)
     pub cascade_severity: f64,
+
+    // Interaction term components (Phase 2 Feature Engineering)
+    /// Absolute momentum (|momentum_bps|) for VolatilityXMomentum interaction
+    pub momentum_abs: f64,
+    /// Absolute flow imbalance (|flow|) for JumpXFlow interaction
+    pub flow_abs: f64,
 }
 
 impl MarketSignals {
     /// Convert to signal-value pairs for ShrinkageGamma.
+    ///
+    /// Includes both base signals and interaction terms for non-linear gamma adjustment.
     pub fn to_pairs(&self) -> Vec<(GammaSignal, f64)> {
         vec![
+            // Base signals
             (GammaSignal::VolatilityRatio, self.vol_ratio),
             (GammaSignal::JumpRatio, self.jump_ratio),
             (GammaSignal::InventoryUtilization, self.inventory_util),
             (GammaSignal::HawkesIntensity, self.hawkes_percentile),
             (GammaSignal::SpreadRegime, self.spread_regime),
             (GammaSignal::CascadeSeverity, self.cascade_severity),
+            // Interaction terms (Phase 2 Feature Engineering)
+            // These capture non-linear effects that base signals miss:
+            // - High vol + momentum = especially dangerous (trending volatility)
+            // - Bad regime + inventory = especially dangerous (exposed in cascade)
+            // - Jump + directional flow = toxic flow detection
+            (
+                GammaSignal::VolatilityXMomentum,
+                self.vol_ratio * self.momentum_abs,
+            ),
+            (
+                GammaSignal::RegimeXInventory,
+                self.spread_regime * self.inventory_util,
+            ),
+            (GammaSignal::JumpXFlow, self.jump_ratio * self.flow_abs),
         ]
     }
 }
@@ -657,6 +680,8 @@ mod tests {
             hawkes_percentile: 0.5,
             spread_regime: 0.0,
             cascade_severity: 0.0,
+            momentum_abs: 0.5,
+            flow_abs: 0.3,
         }
     }
 

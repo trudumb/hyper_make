@@ -214,6 +214,381 @@ impl MultiParameterCovariance {
     }
 }
 
+// ============================================================================
+// Feature Correlation Matrix (Phase 4: Feature Engineering)
+// ============================================================================
+
+/// Feature names for correlation tracking.
+pub(crate) const FEATURE_NAMES: [&str; 10] = [
+    "kappa",
+    "sigma",
+    "momentum",
+    "flow_imbalance",
+    "book_imbalance",
+    "jump_ratio",
+    "hawkes_intensity",
+    "spread_regime",
+    "funding_rate",
+    "volatility_ratio",
+];
+
+/// Full feature correlation matrix tracker.
+///
+/// Tracks NxN correlation matrix using online EWMA updates.
+/// Use cases:
+/// - Detect redundant signals (correlation > 0.8)
+/// - Weight decorrelated signals higher
+/// - Alert when regime causes correlation breakdown
+#[derive(Debug, Clone)]
+pub(crate) struct FeatureCorrelationTracker {
+    /// Feature count
+    n: usize,
+    /// Feature names
+    feature_names: Vec<String>,
+    /// EWMA means for each feature
+    means: Vec<f64>,
+    /// EWMA of squared features (for variance)
+    mean_squares: Vec<f64>,
+    /// EWMA of products (flattened upper triangle, for covariance)
+    /// Index: i * n + j for i < j
+    mean_products: Vec<f64>,
+    /// EWMA decay factor
+    alpha: f64,
+    /// Observation count
+    observation_count: usize,
+    /// Minimum observations before valid
+    min_observations: usize,
+}
+
+impl FeatureCorrelationTracker {
+    /// Create a new tracker for N features.
+    pub(crate) fn new(feature_names: &[&str], alpha: f64) -> Self {
+        let n = feature_names.len();
+        let n_products = n * (n - 1) / 2; // Upper triangle count
+
+        Self {
+            n,
+            feature_names: feature_names.iter().map(|s| s.to_string()).collect(),
+            means: vec![0.0; n],
+            mean_squares: vec![0.0; n],
+            mean_products: vec![0.0; n_products],
+            alpha,
+            observation_count: 0,
+            min_observations: 30,
+        }
+    }
+
+    /// Create with default features and half-life.
+    pub(crate) fn default_features(half_life_ticks: f64) -> Self {
+        let alpha = 1.0 - 2.0_f64.powf(-1.0 / half_life_ticks);
+        Self::new(&FEATURE_NAMES, alpha)
+    }
+
+    /// Get index into mean_products for pair (i, j) where i < j.
+    fn product_index(&self, i: usize, j: usize) -> usize {
+        let (i, j) = if i < j { (i, j) } else { (j, i) };
+        // Upper triangle: sum of (n-1) + (n-2) + ... + (n-i) elements before row i
+        // Then add (j - i - 1) for position within row
+        i * self.n - (i * (i + 1)) / 2 + j - i - 1
+    }
+
+    /// Update with a new feature vector.
+    ///
+    /// # Arguments
+    /// * `features` - Feature values in same order as feature_names
+    pub(crate) fn update(&mut self, features: &[f64]) {
+        if features.len() != self.n {
+            return;
+        }
+
+        // Validate all features are finite
+        if !features.iter().all(|f| f.is_finite()) {
+            return;
+        }
+
+        if self.observation_count == 0 {
+            // Initialize with first observation
+            for i in 0..self.n {
+                self.means[i] = features[i];
+                self.mean_squares[i] = features[i] * features[i];
+            }
+            for i in 0..self.n {
+                for j in (i + 1)..self.n {
+                    let idx = self.product_index(i, j);
+                    self.mean_products[idx] = features[i] * features[j];
+                }
+            }
+        } else {
+            // EWMA update
+            let one_minus_alpha = 1.0 - self.alpha;
+            for i in 0..self.n {
+                self.means[i] = self.alpha * features[i] + one_minus_alpha * self.means[i];
+                self.mean_squares[i] =
+                    self.alpha * features[i] * features[i] + one_minus_alpha * self.mean_squares[i];
+            }
+            for i in 0..self.n {
+                for j in (i + 1)..self.n {
+                    let idx = self.product_index(i, j);
+                    self.mean_products[idx] = self.alpha * features[i] * features[j]
+                        + one_minus_alpha * self.mean_products[idx];
+                }
+            }
+        }
+        self.observation_count += 1;
+    }
+
+    /// Get variance of feature i.
+    pub(crate) fn variance(&self, i: usize) -> f64 {
+        if i >= self.n {
+            return 0.0;
+        }
+        (self.mean_squares[i] - self.means[i].powi(2)).max(0.0)
+    }
+
+    /// Get covariance between features i and j.
+    pub(crate) fn covariance(&self, i: usize, j: usize) -> f64 {
+        if i >= self.n || j >= self.n {
+            return 0.0;
+        }
+        if i == j {
+            return self.variance(i);
+        }
+
+        let idx = self.product_index(i, j);
+        self.mean_products[idx] - self.means[i] * self.means[j]
+    }
+
+    /// Get correlation between features i and j.
+    pub(crate) fn correlation(&self, i: usize, j: usize) -> f64 {
+        if i == j {
+            return 1.0;
+        }
+
+        let var_i = self.variance(i);
+        let var_j = self.variance(j);
+        let denom = (var_i * var_j).sqrt();
+
+        if denom < 1e-12 {
+            return 0.0;
+        }
+
+        (self.covariance(i, j) / denom).clamp(-1.0, 1.0)
+    }
+
+    /// Get full NxN correlation matrix.
+    pub(crate) fn correlation_matrix(&self) -> Vec<Vec<f64>> {
+        let mut matrix = vec![vec![0.0; self.n]; self.n];
+        for i in 0..self.n {
+            for j in 0..self.n {
+                matrix[i][j] = self.correlation(i, j);
+            }
+        }
+        matrix
+    }
+
+    /// Compute condition number of correlation matrix.
+    ///
+    /// High condition number (> 30) indicates multicollinearity.
+    /// Uses power iteration to estimate largest/smallest eigenvalues.
+    pub(crate) fn condition_number(&self) -> f64 {
+        if self.observation_count < self.min_observations {
+            return 1.0;
+        }
+
+        let matrix = self.correlation_matrix();
+
+        // Power iteration for largest eigenvalue
+        let lambda_max = self.power_iteration(&matrix, 50);
+
+        // For condition number, we need smallest eigenvalue too
+        // Use inverse power iteration (solve Ax = b iteratively)
+        let lambda_min = self.inverse_power_iteration(&matrix, 50);
+
+        if lambda_min.abs() < 1e-10 {
+            return f64::INFINITY; // Singular matrix
+        }
+
+        lambda_max.abs() / lambda_min.abs()
+    }
+
+    /// Power iteration to find largest eigenvalue.
+    fn power_iteration(&self, matrix: &[Vec<f64>], iterations: usize) -> f64 {
+        let n = matrix.len();
+        let mut v: Vec<f64> = (0..n).map(|i| 1.0 / (i + 1) as f64).collect();
+
+        for _ in 0..iterations {
+            // Matrix-vector multiply
+            let mut w = vec![0.0; n];
+            for i in 0..n {
+                for j in 0..n {
+                    w[i] += matrix[i][j] * v[j];
+                }
+            }
+
+            // Normalize
+            let norm: f64 = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm < 1e-10 {
+                return 0.0;
+            }
+            v = w.iter().map(|x| x / norm).collect();
+        }
+
+        // Rayleigh quotient for eigenvalue estimate
+        let mut numer = 0.0;
+        let mut denom = 0.0;
+        for i in 0..n {
+            let mut av_i = 0.0;
+            for j in 0..n {
+                av_i += matrix[i][j] * v[j];
+            }
+            numer += v[i] * av_i;
+            denom += v[i] * v[i];
+        }
+
+        numer / denom.max(1e-10)
+    }
+
+    /// Inverse power iteration to find smallest eigenvalue.
+    fn inverse_power_iteration(&self, matrix: &[Vec<f64>], iterations: usize) -> f64 {
+        let n = matrix.len();
+
+        // Shift matrix slightly to avoid singularity
+        let mut shifted = matrix.to_vec();
+        for i in 0..n {
+            shifted[i][i] += 0.01;
+        }
+
+        let mut v: Vec<f64> = (0..n).map(|i| 1.0 / (i + 1) as f64).collect();
+
+        for _ in 0..iterations {
+            // Solve (A + 0.01*I) * w = v using Gauss-Seidel (simple iterative solver)
+            let mut w = v.clone();
+            for _ in 0..10 {
+                for i in 0..n {
+                    let mut sum = v[i];
+                    for j in 0..n {
+                        if j != i {
+                            sum -= shifted[i][j] * w[j];
+                        }
+                    }
+                    w[i] = sum / shifted[i][i].max(1e-10);
+                }
+            }
+
+            // Normalize
+            let norm: f64 = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm < 1e-10 {
+                return 0.0;
+            }
+            v = w.iter().map(|x| x / norm).collect();
+        }
+
+        // Inverse of Rayleigh quotient gives smallest eigenvalue of original matrix
+        let mut numer = 0.0;
+        let mut denom = 0.0;
+        for i in 0..n {
+            let mut av_i = 0.0;
+            for j in 0..n {
+                av_i += matrix[i][j] * v[j];
+            }
+            numer += v[i] * av_i;
+            denom += v[i] * v[i];
+        }
+
+        numer / denom.max(1e-10)
+    }
+
+    /// Compute variance inflation factors.
+    ///
+    /// VIF > 5 indicates potential multicollinearity.
+    /// VIF > 10 is severe multicollinearity.
+    pub(crate) fn variance_inflation_factors(&self) -> Vec<f64> {
+        let mut vifs = vec![1.0; self.n];
+
+        if self.observation_count < self.min_observations {
+            return vifs;
+        }
+
+        for i in 0..self.n {
+            // VIF_i = 1 / (1 - R²_i)
+            // where R²_i is the R² from regressing feature i on all others
+            // Approximate with max correlation squared
+            let mut max_corr_sq: f64 = 0.0;
+            for j in 0..self.n {
+                if i != j {
+                    let corr = self.correlation(i, j);
+                    max_corr_sq = max_corr_sq.max(corr * corr);
+                }
+            }
+
+            // VIF approximation using max correlation
+            if max_corr_sq < 0.999 {
+                vifs[i] = 1.0 / (1.0 - max_corr_sq);
+            } else {
+                vifs[i] = f64::INFINITY;
+            }
+        }
+
+        vifs
+    }
+
+    /// Find highly correlated feature pairs.
+    ///
+    /// Returns pairs with |correlation| > threshold.
+    pub(crate) fn highly_correlated_pairs(&self, threshold: f64) -> Vec<(usize, usize, f64)> {
+        let mut pairs = Vec::new();
+
+        if self.observation_count < self.min_observations {
+            return pairs;
+        }
+
+        for i in 0..self.n {
+            for j in (i + 1)..self.n {
+                let corr = self.correlation(i, j);
+                if corr.abs() > threshold {
+                    pairs.push((i, j, corr));
+                }
+            }
+        }
+
+        // Sort by absolute correlation (highest first)
+        pairs.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
+        pairs
+    }
+
+    /// Get feature name by index.
+    pub(crate) fn feature_name(&self, i: usize) -> &str {
+        if i < self.feature_names.len() {
+            &self.feature_names[i]
+        } else {
+            "unknown"
+        }
+    }
+
+    /// Get index by feature name.
+    pub(crate) fn feature_index(&self, name: &str) -> Option<usize> {
+        self.feature_names.iter().position(|n| n == name)
+    }
+
+    /// Check if enough observations.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.observation_count >= self.min_observations
+    }
+
+    /// Get observation count.
+    pub(crate) fn observation_count(&self) -> usize {
+        self.observation_count
+    }
+
+    /// Reset tracker.
+    pub(crate) fn reset(&mut self) {
+        self.means.fill(0.0);
+        self.mean_squares.fill(0.0);
+        self.mean_products.fill(0.0);
+        self.observation_count = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +680,114 @@ mod tests {
             cov.variance_sigma() < 1e-12,
             "Constant data should have near-zero variance"
         );
+    }
+
+    #[test]
+    fn test_feature_correlation_tracker() {
+        let features = ["a", "b", "c"];
+        let mut tracker = FeatureCorrelationTracker::new(&features, 0.1);
+
+        // Feed correlated data: a and b positively correlated, c independent
+        for i in 0..100 {
+            let a = i as f64;
+            let b = a * 0.9 + 5.0; // Highly correlated with a
+            let c = (i as f64 * 0.3).sin() * 10.0; // Independent
+            tracker.update(&[a, b, c]);
+        }
+
+        assert!(tracker.is_valid());
+
+        // a-b correlation should be high
+        let corr_ab = tracker.correlation(0, 1);
+        assert!(
+            corr_ab > 0.9,
+            "a-b should be highly correlated: {}",
+            corr_ab
+        );
+
+        // a-c correlation should be low
+        let corr_ac = tracker.correlation(0, 2);
+        assert!(
+            corr_ac.abs() < 0.5,
+            "a-c should be weakly correlated: {}",
+            corr_ac
+        );
+
+        // Diagonal should be 1
+        assert!((tracker.correlation(0, 0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_correlation_matrix() {
+        let features = ["x", "y"];
+        let mut tracker = FeatureCorrelationTracker::new(&features, 0.1);
+
+        // Perfect positive correlation
+        for i in 0..50 {
+            let x = i as f64;
+            let y = x * 2.0;
+            tracker.update(&[x, y]);
+        }
+
+        let matrix = tracker.correlation_matrix();
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(matrix[0].len(), 2);
+
+        // Diagonal should be 1
+        assert!((matrix[0][0] - 1.0).abs() < 1e-6);
+        assert!((matrix[1][1] - 1.0).abs() < 1e-6);
+
+        // Off-diagonal should be ~1 (perfect correlation)
+        assert!(matrix[0][1] > 0.99);
+        assert!(matrix[1][0] > 0.99);
+    }
+
+    #[test]
+    fn test_highly_correlated_pairs() {
+        let features = ["a", "b", "c", "d"];
+        let mut tracker = FeatureCorrelationTracker::new(&features, 0.1);
+
+        // a-b highly correlated, c-d highly correlated, others independent
+        for i in 0..100 {
+            let a = i as f64;
+            let b = a + 1.0; // Same trend as a
+            let c = (i as f64 * 0.5).sin() * 10.0;
+            let d = c + 0.5; // Same trend as c
+            tracker.update(&[a, b, c, d]);
+        }
+
+        let pairs = tracker.highly_correlated_pairs(0.9);
+        assert!(
+            !pairs.is_empty(),
+            "Should find highly correlated pairs"
+        );
+
+        // a-b (0,1) should be in the list
+        let has_ab = pairs.iter().any(|(i, j, _)| (*i == 0 && *j == 1));
+        assert!(has_ab, "Should find a-b pair");
+    }
+
+    #[test]
+    fn test_vif() {
+        let features = ["x", "y", "z"];
+        let mut tracker = FeatureCorrelationTracker::new(&features, 0.1);
+
+        // x and y highly correlated, z independent
+        for i in 0..100 {
+            let x = i as f64;
+            let y = x * 1.1 + 2.0;
+            let z = (i as f64 * 0.2).cos() * 5.0;
+            tracker.update(&[x, y, z]);
+        }
+
+        let vifs = tracker.variance_inflation_factors();
+        assert_eq!(vifs.len(), 3);
+
+        // x and y should have high VIF (multicollinear)
+        assert!(vifs[0] > 5.0, "x should have high VIF: {}", vifs[0]);
+        assert!(vifs[1] > 5.0, "y should have high VIF: {}", vifs[1]);
+
+        // z should have low VIF (independent)
+        assert!(vifs[2] < 5.0, "z should have low VIF: {}", vifs[2]);
     }
 }

@@ -15,6 +15,7 @@ mod order_manager;
 mod pnl;
 mod position;
 mod queue;
+pub mod signal_decay;
 pub mod ws_order_state;
 
 pub use asset_id::AssetId;

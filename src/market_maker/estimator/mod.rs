@@ -39,6 +39,7 @@ mod jump;
 mod kalman;
 mod kappa;
 mod kappa_orchestrator;
+pub mod lag_analysis;
 mod microprice;
 mod mock;
 mod momentum;

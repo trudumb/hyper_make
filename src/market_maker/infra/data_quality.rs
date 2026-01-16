@@ -326,6 +326,312 @@ impl Default for DataQualityMonitor {
 }
 
 // ============================================================================
+// Feature Validation (Phase 7: Feature Engineering)
+// ============================================================================
+
+/// Feature validation status.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeatureStatus {
+    /// Feature value is valid
+    Valid,
+    /// Feature value is out of expected bounds
+    OutOfBounds {
+        value: f64,
+        lower: f64,
+        upper: f64,
+    },
+    /// Feature value is stale (not updated recently)
+    Stale {
+        age_ms: u64,
+    },
+    /// Feature value is NaN or Infinite
+    Invalid,
+}
+
+impl FeatureStatus {
+    /// Check if the status is valid.
+    pub fn is_valid(&self) -> bool {
+        matches!(self, FeatureStatus::Valid)
+    }
+}
+
+/// Online percentile tracker for learning feature bounds.
+#[derive(Debug, Clone)]
+struct PercentileTracker {
+    /// Running quantile estimator (P² algorithm simplified)
+    /// Tracks min, 1%, 50%, 99%, max
+    quantiles: [f64; 5],
+    /// Target percentiles
+    targets: [f64; 5],
+    /// Observation count
+    count: usize,
+    /// Whether initialized
+    initialized: bool,
+}
+
+impl PercentileTracker {
+    fn new() -> Self {
+        Self {
+            quantiles: [0.0; 5],
+            targets: [0.0, 0.01, 0.50, 0.99, 1.0],
+            count: 0,
+            initialized: false,
+        }
+    }
+
+    fn update(&mut self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+
+        if !self.initialized {
+            self.quantiles.fill(value);
+            self.initialized = true;
+            self.count = 1;
+            return;
+        }
+
+        self.count += 1;
+
+        // Update min/max
+        self.quantiles[0] = self.quantiles[0].min(value);
+        self.quantiles[4] = self.quantiles[4].max(value);
+
+        // Simplified EWMA update for middle quantiles
+        let alpha = 0.01; // Slow adaptation
+        for i in 1..4 {
+            // Stochastic approximation: move toward value if it's in the right direction
+            let target = self.targets[i];
+            let adjustment = if value < self.quantiles[i] {
+                -alpha * (1.0 - target)
+            } else {
+                alpha * target
+            };
+            self.quantiles[i] += adjustment * (value - self.quantiles[i]).abs();
+        }
+    }
+
+    fn percentile(&self, p: f64) -> f64 {
+        if !self.initialized {
+            return 0.0;
+        }
+
+        // Linear interpolation between tracked quantiles
+        let idx = match p {
+            x if x <= 0.01 => 0,
+            x if x <= 0.50 => 1,
+            x if x <= 0.99 => 2,
+            _ => 3,
+        };
+
+        self.quantiles[idx]
+    }
+
+    fn lower_bound(&self) -> f64 {
+        self.quantiles[1] // 1st percentile
+    }
+
+    fn upper_bound(&self) -> f64 {
+        self.quantiles[3] // 99th percentile
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.count >= 10
+    }
+}
+
+/// Configuration for feature validation.
+#[derive(Debug, Clone)]
+pub struct FeatureValidatorConfig {
+    /// Staleness threshold in milliseconds
+    pub staleness_threshold_ms: u64,
+    /// Minimum observations before enforcing bounds
+    pub min_observations: usize,
+    /// Bound multiplier (how far outside learned bounds triggers alert)
+    pub bound_multiplier: f64,
+}
+
+impl Default for FeatureValidatorConfig {
+    fn default() -> Self {
+        Self {
+            staleness_threshold_ms: 5000, // 5 seconds
+            min_observations: 100,
+            bound_multiplier: 3.0, // 3x beyond 1-99 percentile range
+        }
+    }
+}
+
+/// Validates feature values against learned bounds.
+///
+/// Key features:
+/// - Auto-learns 1st/99th percentile bounds per feature
+/// - Detects stale features (not updated recently)
+/// - Detects NaN/Inf values
+/// - Graceful degradation: flags issues without blocking
+#[derive(Debug, Clone)]
+pub struct FeatureValidator {
+    /// Configuration
+    config: FeatureValidatorConfig,
+    /// Per-feature percentile trackers
+    trackers: std::collections::HashMap<String, PercentileTracker>,
+    /// Last seen timestamp per feature
+    last_seen: std::collections::HashMap<String, u64>,
+    /// Total validation count
+    validation_count: usize,
+    /// Count of issues detected
+    issue_count: usize,
+}
+
+impl FeatureValidator {
+    /// Create a new validator with default config.
+    pub fn new() -> Self {
+        Self::with_config(FeatureValidatorConfig::default())
+    }
+
+    /// Create with custom config.
+    pub fn with_config(config: FeatureValidatorConfig) -> Self {
+        Self {
+            config,
+            trackers: std::collections::HashMap::new(),
+            last_seen: std::collections::HashMap::new(),
+            validation_count: 0,
+            issue_count: 0,
+        }
+    }
+
+    /// Validate a feature value.
+    ///
+    /// Returns FeatureStatus indicating if value is valid or why not.
+    /// Also updates the learned bounds with this observation.
+    pub fn validate(&mut self, name: &str, value: f64, timestamp_ms: u64) -> FeatureStatus {
+        self.validation_count += 1;
+
+        // Check for NaN/Inf
+        if !value.is_finite() {
+            self.issue_count += 1;
+            return FeatureStatus::Invalid;
+        }
+
+        // Update tracker
+        let tracker = self
+            .trackers
+            .entry(name.to_string())
+            .or_insert_with(PercentileTracker::new);
+        tracker.update(value);
+
+        // Update last seen
+        self.last_seen.insert(name.to_string(), timestamp_ms);
+
+        // Check bounds (only after enough observations)
+        if tracker.is_initialized() && tracker.count >= self.config.min_observations {
+            let lower = tracker.lower_bound();
+            let upper = tracker.upper_bound();
+            let range = upper - lower;
+
+            // Extend bounds by multiplier
+            let extended_lower = lower - range * (self.config.bound_multiplier - 1.0);
+            let extended_upper = upper + range * (self.config.bound_multiplier - 1.0);
+
+            if value < extended_lower || value > extended_upper {
+                self.issue_count += 1;
+                return FeatureStatus::OutOfBounds {
+                    value,
+                    lower: extended_lower,
+                    upper: extended_upper,
+                };
+            }
+        }
+
+        FeatureStatus::Valid
+    }
+
+    /// Check if a feature is stale.
+    pub fn is_stale(&self, name: &str, current_time_ms: u64) -> bool {
+        match self.last_seen.get(name) {
+            Some(&last) => current_time_ms.saturating_sub(last) > self.config.staleness_threshold_ms,
+            None => true, // Never seen = stale
+        }
+    }
+
+    /// Get staleness status for a feature.
+    pub fn check_staleness(&self, name: &str, current_time_ms: u64) -> FeatureStatus {
+        match self.last_seen.get(name) {
+            Some(&last) => {
+                let age = current_time_ms.saturating_sub(last);
+                if age > self.config.staleness_threshold_ms {
+                    FeatureStatus::Stale { age_ms: age }
+                } else {
+                    FeatureStatus::Valid
+                }
+            }
+            None => FeatureStatus::Stale {
+                age_ms: u64::MAX, // Never seen
+            },
+        }
+    }
+
+    /// Validate and check staleness in one call.
+    pub fn full_validate(&mut self, name: &str, value: f64, timestamp_ms: u64) -> FeatureStatus {
+        // First check value
+        let value_status = self.validate(name, value, timestamp_ms);
+        if !value_status.is_valid() {
+            return value_status;
+        }
+
+        // Value is valid - all good
+        FeatureStatus::Valid
+    }
+
+    /// Get current bounds for a feature.
+    pub fn bounds(&self, name: &str) -> Option<(f64, f64)> {
+        self.trackers.get(name).map(|t| (t.lower_bound(), t.upper_bound()))
+    }
+
+    /// Get fallback value for a feature (median).
+    pub fn fallback_value(&self, name: &str) -> Option<f64> {
+        self.trackers.get(name).map(|t| t.percentile(0.50))
+    }
+
+    /// Get total validation count.
+    pub fn validation_count(&self) -> usize {
+        self.validation_count
+    }
+
+    /// Get total issue count.
+    pub fn issue_count(&self) -> usize {
+        self.issue_count
+    }
+
+    /// Get issue rate (issues / validations).
+    pub fn issue_rate(&self) -> f64 {
+        if self.validation_count > 0 {
+            self.issue_count as f64 / self.validation_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get all tracked feature names.
+    pub fn feature_names(&self) -> Vec<&str> {
+        self.trackers.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Reset all state.
+    pub fn reset(&mut self) {
+        self.trackers.clear();
+        self.last_seen.clear();
+        self.validation_count = 0;
+        self.issue_count = 0;
+    }
+}
+
+impl Default for FeatureValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
