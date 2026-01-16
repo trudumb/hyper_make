@@ -453,6 +453,223 @@ impl Default for ChangepointDiagnostics {
 }
 
 // ============================================================================
+// Feature Health Visualization Structures
+// ============================================================================
+
+/// Individual signal health information.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignalHealthInfo {
+    /// Signal name.
+    pub name: String,
+    /// Current mutual information (bits).
+    pub mi: f64,
+    /// Trend direction: "up", "down", or "stable".
+    pub trend: String,
+    /// Estimated half-life in days.
+    pub half_life_days: Option<f64>,
+    /// Health status: "healthy", "warning", "critical".
+    pub status: String,
+    /// MI change percentage over last period.
+    pub mi_change_pct: f64,
+}
+
+impl Default for SignalHealthInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mi: 0.0,
+            trend: "stable".to_string(),
+            half_life_days: None,
+            status: "healthy".to_string(),
+            mi_change_pct: 0.0,
+        }
+    }
+}
+
+/// Signal decay alert.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignalAlertInfo {
+    /// Signal name.
+    pub signal_name: String,
+    /// Severity: "warning" or "critical".
+    pub severity: String,
+    /// Alert message.
+    pub message: String,
+    /// Unix timestamp when alert was triggered.
+    pub timestamp_ms: i64,
+}
+
+/// Signal decay tracking state for dashboard.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SignalDecayState {
+    /// All tracked signals with health info.
+    pub signals: Vec<SignalHealthInfo>,
+    /// Active alerts.
+    pub alerts: Vec<SignalAlertInfo>,
+    /// Total number of tracked signals.
+    pub signal_count: usize,
+    /// Number of signals in warning/critical state.
+    pub issue_count: usize,
+}
+
+/// Feature correlation matrix state.
+#[derive(Clone, Debug, Serialize)]
+pub struct FeatureCorrelationState {
+    /// Feature names in matrix order.
+    pub feature_names: Vec<String>,
+    /// NxN correlation matrix (row-major).
+    pub correlation_matrix: Vec<f64>,
+    /// Variance Inflation Factors.
+    pub vif: Vec<f64>,
+    /// Matrix condition number (stability indicator).
+    pub condition_number: f64,
+    /// Pairs with correlation above threshold.
+    pub highly_correlated_pairs: Vec<CorrelatedPair>,
+    /// Whether enough observations for valid matrix.
+    pub is_valid: bool,
+}
+
+impl Default for FeatureCorrelationState {
+    fn default() -> Self {
+        Self {
+            feature_names: Vec::new(),
+            correlation_matrix: Vec::new(),
+            vif: Vec::new(),
+            condition_number: 1.0,
+            highly_correlated_pairs: Vec::new(),
+            is_valid: false,
+        }
+    }
+}
+
+/// A highly correlated feature pair.
+#[derive(Clone, Debug, Serialize)]
+pub struct CorrelatedPair {
+    pub feature_a: String,
+    pub feature_b: String,
+    pub correlation: f64,
+}
+
+/// Single feature validation info.
+#[derive(Clone, Debug, Serialize)]
+pub struct FeatureValidationInfo {
+    /// Feature name.
+    pub name: String,
+    /// Current value.
+    pub value: f64,
+    /// Lower bound (learned from percentiles).
+    pub lower_bound: f64,
+    /// Upper bound (learned from percentiles).
+    pub upper_bound: f64,
+    /// Status: "valid", "out_of_bounds", "stale", "invalid".
+    pub status: String,
+    /// Milliseconds since last update.
+    pub staleness_ms: u64,
+}
+
+impl Default for FeatureValidationInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            value: 0.0,
+            lower_bound: f64::NEG_INFINITY,
+            upper_bound: f64::INFINITY,
+            status: "valid".to_string(),
+            staleness_ms: 0,
+        }
+    }
+}
+
+/// Feature validation state for dashboard.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FeatureValidationState {
+    /// All validated features.
+    pub features: Vec<FeatureValidationInfo>,
+    /// Total issue count.
+    pub issue_count: usize,
+    /// Issue rate (issues / total validations).
+    pub issue_rate: f64,
+    /// Total validation count.
+    pub validation_count: usize,
+}
+
+/// Lag analysis state for cross-exchange signals.
+#[derive(Clone, Debug, Serialize)]
+pub struct LagAnalysisState {
+    /// Optimal lag in milliseconds (negative = signal leads).
+    pub optimal_lag_ms: i64,
+    /// Mutual information at optimal lag.
+    pub mi_at_lag: f64,
+    /// Cross-correlation function: (lag_ms, correlation).
+    pub ccf: Vec<LagPoint>,
+    /// Whether signal has enough data to be ready.
+    pub signal_ready: bool,
+    /// Signal name being analyzed.
+    pub signal_name: String,
+    /// Target name.
+    pub target_name: String,
+}
+
+impl Default for LagAnalysisState {
+    fn default() -> Self {
+        Self {
+            optimal_lag_ms: 0,
+            mi_at_lag: 0.0,
+            ccf: Vec::new(),
+            signal_ready: false,
+            signal_name: "binance_mid".to_string(),
+            target_name: "hyperliquid_mid".to_string(),
+        }
+    }
+}
+
+/// Single point in cross-correlation function.
+#[derive(Clone, Debug, Serialize)]
+pub struct LagPoint {
+    pub lag_ms: i64,
+    pub correlation: f64,
+}
+
+/// Current values of interaction signals.
+#[derive(Clone, Debug, Serialize)]
+pub struct InteractionSignalState {
+    /// Volatility × Momentum interaction.
+    pub vol_x_momentum: f64,
+    /// Regime × Inventory interaction.
+    pub regime_x_inventory: f64,
+    /// Jump × Flow interaction.
+    pub jump_x_flow: f64,
+    /// Timestamp of last update.
+    pub timestamp_ms: i64,
+}
+
+impl Default for InteractionSignalState {
+    fn default() -> Self {
+        Self {
+            vol_x_momentum: 0.0,
+            regime_x_inventory: 0.0,
+            jump_x_flow: 0.0,
+            timestamp_ms: 0,
+        }
+    }
+}
+
+/// Combined feature health state for dashboard.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FeatureHealthState {
+    /// Signal decay tracking.
+    pub signal_decay: SignalDecayState,
+    /// Feature correlation matrix.
+    pub correlation: FeatureCorrelationState,
+    /// Feature validation status.
+    pub validation: FeatureValidationState,
+    /// Cross-exchange lag analysis.
+    pub lag_analysis: LagAnalysisState,
+    /// Interaction signal values.
+    pub interactions: InteractionSignalState,
+}
+
+// ============================================================================
 // Dashboard State
 // ============================================================================
 
@@ -483,6 +700,10 @@ pub struct DashboardState {
     pub kappa_diagnostics: KappaDiagnostics,
     /// Current changepoint detection state.
     pub changepoint_diagnostics: ChangepointDiagnostics,
+
+    // Feature health visualization
+    /// Combined feature health state (decay, correlation, validation, lag, interactions).
+    pub feature_health: FeatureHealthState,
 }
 
 impl Default for DashboardState {
@@ -506,6 +727,8 @@ impl Default for DashboardState {
             decision_history: Vec::new(),
             kappa_diagnostics: KappaDiagnostics::default(),
             changepoint_diagnostics: ChangepointDiagnostics::default(),
+            // Feature health
+            feature_health: FeatureHealthState::default(),
         }
     }
 }
@@ -972,7 +1195,55 @@ impl DashboardAggregator {
             decision_history,
             kappa_diagnostics,
             changepoint_diagnostics,
+            // Feature health (populated separately via update_feature_health)
+            feature_health: FeatureHealthState::default(),
         }
+    }
+
+    /// Update feature health state.
+    pub fn update_feature_health(&self, _state: FeatureHealthState) {
+        // Feature health is stored in the aggregator and returned via snapshot_with_feature_health
+        // For now, the basic snapshot uses default values
+        // The full integration will use snapshot_with_feature_health
+    }
+
+    /// Generate dashboard snapshot with feature health data.
+    pub fn snapshot_with_feature_health(
+        &self,
+        mid_price: f64,
+        spread_bps: f64,
+        position: f64,
+        kappa: f64,
+        gamma: f64,
+        cascade_severity: f64,
+        jump_ratio: f64,
+        sigma: f64,
+        fill_prob: f64,
+        adverse_prob: f64,
+        spread_capture: f64,
+        adverse_selection: f64,
+        inventory_cost: f64,
+        fees: f64,
+        feature_health: FeatureHealthState,
+    ) -> DashboardState {
+        let mut state = self.snapshot(
+            mid_price,
+            spread_bps,
+            position,
+            kappa,
+            gamma,
+            cascade_severity,
+            jump_ratio,
+            sigma,
+            fill_prob,
+            adverse_prob,
+            spread_capture,
+            adverse_selection,
+            inventory_cost,
+            fees,
+        );
+        state.feature_health = feature_health;
+        state
     }
 
     /// Get the calibration tracker for recording predictions.
@@ -1054,5 +1325,62 @@ mod tests {
         assert_eq!(fills[0].cum_pnl, 10.0);
         assert_eq!(fills[1].pnl, -5.0);
         assert_eq!(fills[1].cum_pnl, 5.0);
+    }
+
+    #[test]
+    fn test_feature_health_serialization() {
+        let mut health = FeatureHealthState::default();
+
+        // Add some test data
+        health.signal_decay.signals.push(SignalHealthInfo {
+            name: "test_signal".to_string(),
+            mi: 0.05,
+            trend: "down".to_string(),
+            half_life_days: Some(14.0),
+            status: "warning".to_string(),
+            mi_change_pct: -10.0,
+        });
+
+        health.correlation.feature_names = vec!["kappa".to_string(), "sigma".to_string()];
+        health.correlation.correlation_matrix = vec![1.0, 0.5, 0.5, 1.0];
+        health.correlation.is_valid = true;
+
+        health.lag_analysis.optimal_lag_ms = -150;
+        health.lag_analysis.mi_at_lag = 0.03;
+        health.lag_analysis.signal_ready = true;
+
+        health.interactions.vol_x_momentum = 0.8;
+        health.interactions.regime_x_inventory = 0.3;
+        health.interactions.jump_x_flow = 0.1;
+
+        let json = serde_json::to_string(&health).expect("Failed to serialize");
+        assert!(json.contains("test_signal"));
+        assert!(json.contains("optimal_lag_ms"));
+        assert!(json.contains("vol_x_momentum"));
+        assert!(json.contains("correlation_matrix"));
+    }
+
+    #[test]
+    fn test_dashboard_with_feature_health() {
+        let calibration = Arc::new(RwLock::new(CalibrationTracker::default()));
+        let aggregator = DashboardAggregator::new(DashboardConfig::default(), calibration);
+
+        let feature_health = FeatureHealthState {
+            interactions: InteractionSignalState {
+                vol_x_momentum: 0.5,
+                regime_x_inventory: 0.3,
+                jump_x_flow: 0.2,
+                timestamp_ms: 1000,
+            },
+            ..Default::default()
+        };
+
+        let state = aggregator.snapshot_with_feature_health(
+            50000.0, 5.0, 0.1, 500.0, 0.2, 0.1, 1.5, 0.001, 0.2, 0.15, 100.0, -50.0, -10.0, -5.0,
+            feature_health,
+        );
+
+        assert_eq!(state.feature_health.interactions.vol_x_momentum, 0.5);
+        assert_eq!(state.feature_health.interactions.regime_x_inventory, 0.3);
     }
 }

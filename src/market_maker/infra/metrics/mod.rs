@@ -22,6 +22,10 @@ use crate::market_maker::tracking::CalibrationTracker;
 use fields::MetricsInner;
 pub use dashboard::{
     DashboardAggregator, DashboardConfig, DashboardState, LiveQuotes, PnLAttribution, RegimeState,
+    // Feature health visualization types
+    CorrelatedPair, FeatureCorrelationState, FeatureHealthState, FeatureValidationInfo,
+    FeatureValidationState, InteractionSignalState, LagAnalysisState, LagPoint, SignalAlertInfo,
+    SignalDecayState, SignalHealthInfo,
 };
 pub use summary::MetricsSummary;
 

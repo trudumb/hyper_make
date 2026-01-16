@@ -106,6 +106,9 @@ pub use temporal::{
     TemporalMomentumFeatures, TimeOfDayFeatures,
 };
 
+// Lag analysis for cross-exchange signals
+pub use lag_analysis::{LagAnalyzer, LagAnalyzerConfig, LagDecayTracker};
+
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability
 // ============================================================================

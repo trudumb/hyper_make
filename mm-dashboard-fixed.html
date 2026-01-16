@@ -1565,6 +1565,166 @@
             return e('canvas', { ref: canvasRef, style: { width: '100%', height: 200, display: 'block' } });
         };
 
+        // ============================================================================
+        // FEATURE HEALTH COMPONENTS
+        // ============================================================================
+
+        // Signal Health Bar Chart
+        const SignalHealthChart = ({ signals }) => {
+            if (!signals || signals.length === 0) {
+                return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'No signal data available');
+            }
+
+            const maxMi = Math.max(...signals.map(s => s.mi), 0.05);
+
+            return e('div', {className: 'space-y-3'},
+                signals.map((signal, i) => {
+                    const statusColor = signal.status === 'healthy' ? C.green : signal.status === 'warning' ? C.yellow : C.red;
+                    const trendIcon = signal.trend === 'up' ? '↑' : signal.trend === 'down' ? '↓' : '→';
+                    const barWidth = (signal.mi / maxMi) * 100;
+
+                    return e('div', {key: i, className: 'flex items-center gap-3'},
+                        e('div', {className: 'w-28 text-xs mono truncate', style: {color: C.text}}, signal.name),
+                        e('div', {className: 'flex-1 h-4 rounded overflow-hidden', style: {backgroundColor: C.border}},
+                            e('div', {className: 'h-full rounded', style: {width: barWidth + '%', backgroundColor: statusColor + '80'}})
+                        ),
+                        e('span', {className: 'w-16 text-xs mono text-right', style: {color: C.text}}, signal.mi.toFixed(3) + ' bits'),
+                        e('span', {className: 'w-8 text-center', style: {color: signal.trend === 'up' ? C.green : signal.trend === 'down' ? C.red : C.textMuted}}, trendIcon),
+                        e('span', {className: 'w-12 text-xs mono text-right', style: {color: C.textMuted}},
+                            signal.half_life_days ? signal.half_life_days.toFixed(0) + 'd' : '--'
+                        )
+                    );
+                })
+            );
+        };
+
+        // Correlation Heatmap (Canvas-based)
+        const CorrelationHeatmap = ({ data }) => {
+            const canvasRef = useRef(null);
+
+            useEffect(() => {
+                if (!data || !data.is_valid || !data.feature_names.length) return;
+
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                const W = canvas.width = canvas.offsetWidth;
+                const H = canvas.height = 200;
+
+                ctx.fillStyle = C.bgCard;
+                ctx.fillRect(0, 0, W, H);
+
+                const n = data.feature_names.length;
+                const cellSize = Math.min((W - 80) / n, (H - 40) / n);
+                const startX = 70;
+                const startY = 10;
+
+                // Color scale: blue (-1) -> white (0) -> red (+1)
+                const getColor = (corr) => {
+                    if (corr >= 0) {
+                        const intensity = Math.min(Math.abs(corr), 1);
+                        return `rgb(${Math.round(255)}, ${Math.round(255 - intensity * 150)}, ${Math.round(255 - intensity * 200)})`;
+                    } else {
+                        const intensity = Math.min(Math.abs(corr), 1);
+                        return `rgb(${Math.round(255 - intensity * 200)}, ${Math.round(255 - intensity * 150)}, ${Math.round(255)})`;
+                    }
+                };
+
+                // Draw cells
+                for (let i = 0; i < n; i++) {
+                    for (let j = 0; j < n; j++) {
+                        const corr = data.correlation_matrix[i * n + j] || 0;
+                        ctx.fillStyle = getColor(corr);
+                        ctx.fillRect(startX + j * cellSize, startY + i * cellSize, cellSize - 1, cellSize - 1);
+
+                        // Draw value text for larger cells
+                        if (cellSize > 25) {
+                            ctx.fillStyle = Math.abs(corr) > 0.5 ? '#000' : C.textMuted;
+                            ctx.font = '9px JetBrains Mono';
+                            ctx.textAlign = 'center';
+                            ctx.fillText(corr.toFixed(1), startX + j * cellSize + cellSize/2, startY + i * cellSize + cellSize/2 + 3);
+                        }
+                    }
+                }
+
+                // Draw labels
+                ctx.fillStyle = C.textMuted;
+                ctx.font = '9px JetBrains Mono';
+                ctx.textAlign = 'right';
+                for (let i = 0; i < n; i++) {
+                    ctx.fillText(data.feature_names[i].slice(0, 8), startX - 5, startY + i * cellSize + cellSize/2 + 3);
+                }
+
+            }, [data]);
+
+            if (!data || !data.is_valid) {
+                return e('div', {className: 'h-48 flex items-center justify-center', style: {color: C.textMuted}}, 'Collecting correlation data...');
+            }
+
+            return e('canvas', { ref: canvasRef, style: { width: '100%', height: 200, display: 'block' } });
+        };
+
+        // Lag Analysis Display
+        const LagAnalysisDisplay = ({ data }) => {
+            if (!data || !data.signal_ready) {
+                return e('div', {className: 'h-32 flex items-center justify-center', style: {color: C.textMuted}}, 'Collecting lag data...');
+            }
+
+            return e('div', {className: 'space-y-4'},
+                e('div', {className: 'grid grid-cols-3 gap-4'},
+                    e('div', {className: 'p-3 rounded text-center', style: {backgroundColor: C.bg}},
+                        e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Optimal Lag'),
+                        e('div', {className: 'text-xl font-bold mono', style: {color: data.optimal_lag_ms < 0 ? C.green : C.yellow}},
+                            data.optimal_lag_ms + 'ms'
+                        ),
+                        e('div', {className: 'text-xs', style: {color: C.textMuted}},
+                            data.optimal_lag_ms < 0 ? 'Signal leads' : 'Signal lags'
+                        )
+                    ),
+                    e('div', {className: 'p-3 rounded text-center', style: {backgroundColor: C.bg}},
+                        e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'MI at Lag'),
+                        e('div', {className: 'text-xl font-bold mono'}, data.mi_at_lag.toFixed(3) + ' bits')
+                    ),
+                    e('div', {className: 'p-3 rounded text-center', style: {backgroundColor: C.bg}},
+                        e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Status'),
+                        e('div', {className: 'text-xl font-bold', style: {color: data.signal_ready ? C.green : C.yellow}},
+                            data.signal_ready ? '✓ Ready' : '○ Warming'
+                        )
+                    )
+                ),
+                e('div', {className: 'text-xs', style: {color: C.textMuted}},
+                    data.signal_name + ' → ' + data.target_name
+                )
+            );
+        };
+
+        // Interaction Signals Display
+        const InteractionSignals = ({ data }) => {
+            const signals = [
+                { name: 'Vol × Momentum', value: data?.vol_x_momentum || 0, desc: 'High volatility + strong momentum' },
+                { name: 'Regime × Inventory', value: data?.regime_x_inventory || 0, desc: 'Regime-adjusted inventory pressure' },
+                { name: 'Jump × Flow', value: data?.jump_x_flow || 0, desc: 'Jump detection + flow imbalance' }
+            ];
+
+            return e('div', {className: 'space-y-4'},
+                signals.map((s, i) =>
+                    e('div', {key: i, className: 'flex items-center gap-4'},
+                        e('div', {className: 'w-36'},
+                            e('div', {className: 'text-xs font-medium', style: {color: C.text}}, s.name),
+                            e('div', {className: 'text-xs', style: {color: C.textDim}}, s.desc)
+                        ),
+                        e('div', {className: 'flex-1 h-2 rounded overflow-hidden', style: {backgroundColor: C.border}},
+                            e('div', {className: 'h-full rounded', style: {
+                                width: Math.min(Math.abs(s.value) * 100, 100) + '%',
+                                backgroundColor: s.value > 0.5 ? C.red : s.value > 0.2 ? C.yellow : C.green
+                            }})
+                        ),
+                        e('span', {className: 'w-12 text-right text-xs mono'}, s.value.toFixed(2))
+                    )
+                )
+            );
+        };
+
         // Main Dashboard
         const Dashboard = () => {
             const [tab, setTab] = useState('overview');
@@ -1596,6 +1756,15 @@
             const [changepointDiag, setChangepointDiag] = useState({
                 cp_prob_1: 0, cp_prob_5: 0, cp_prob_10: 0,
                 run_length: 0, entropy: 0, detected: false
+            });
+
+            // Feature Health visualization state
+            const [featureHealth, setFeatureHealth] = useState({
+                signal_decay: { signals: [], alerts: [], signal_count: 0, issue_count: 0 },
+                correlation: { feature_names: [], correlation_matrix: [], vif: [], condition_number: 1, is_valid: false },
+                validation: { features: [], issue_count: 0, issue_rate: 0 },
+                lag_analysis: { optimal_lag_ms: 0, mi_at_lag: 0, signal_ready: false },
+                interactions: { vol_x_momentum: 0, regime_x_inventory: 0, jump_x_flow: 0 }
             });
 
             // Track accumulated fills from WebSocket
@@ -1638,6 +1807,8 @@
                     if (data.decision_history) setDecisionHistory(data.decision_history);
                     if (data.kappa_diagnostics) setKappaDiag(data.kappa_diagnostics);
                     if (data.changepoint_diagnostics) setChangepointDiag(data.changepoint_diagnostics);
+                    // Feature health data
+                    if (data.feature_health) setFeatureHealth(data.feature_health);
                 }
                 setTime(new Date().toLocaleTimeString());
             };
@@ -1732,6 +1903,7 @@
                 {id: 'calibration', label: 'Calibration'},
                 {id: 'regime', label: 'Regime'},
                 {id: 'signals', label: 'Signals'},
+                {id: 'features', label: 'Features'},
                 {id: 'pnl', label: 'PnL'}
             ];
 
@@ -1941,6 +2113,74 @@
                         // Jump Ratio
                         e(Card, {title: 'Jump Ratio', subtitle: 'RV/BV toxicity indicator', accent: C.red},
                             e(SignalTimeSeriesChart, {data: signalHistory, field: 'jump_ratio', label: 'Jump', color: C.red})
+                        )
+                    ),
+
+                    tab === 'features' && e('div', {className: 'space-y-6'},
+                        // Signal Health Panel (full width)
+                        e(Card, {title: 'Signal Health', subtitle: 'MI trends and half-lives', accent: C.accent, className: 'lg:col-span-2'},
+                            e('div', {className: 'mb-2 flex gap-4 text-xs', style: {color: C.textMuted}},
+                                e('span', null, 'Signal'),
+                                e('span', {className: 'flex-1'}, 'Mutual Information'),
+                                e('span', {className: 'w-16 text-right'}, 'MI'),
+                                e('span', {className: 'w-8 text-center'}, 'Trend'),
+                                e('span', {className: 'w-12 text-right'}, 'Half-life')
+                            ),
+                            e(SignalHealthChart, {signals: featureHealth.signal_decay?.signals || []})
+                        ),
+
+                        // Alerts (if any)
+                        featureHealth.signal_decay?.alerts?.length > 0 &&
+                            e(Card, {title: 'Active Alerts', accent: C.red},
+                                e('div', {className: 'space-y-2'},
+                                    featureHealth.signal_decay.alerts.map((alert, i) =>
+                                        e('div', {key: i, className: 'p-3 rounded flex items-center gap-3', style: {backgroundColor: alert.severity === 'critical' ? C.red + '20' : C.yellow + '20'}},
+                                            e('span', {style: {color: alert.severity === 'critical' ? C.red : C.yellow}}, alert.severity === 'critical' ? '🔴' : '⚠'),
+                                            e('span', {className: 'font-medium', style: {color: C.text}}, alert.signal_name),
+                                            e('span', {className: 'flex-1 text-sm', style: {color: C.textMuted}}, alert.message)
+                                        )
+                                    )
+                                )
+                            ),
+
+                        // Two-column layout for correlation and lag analysis
+                        e('div', {className: 'grid grid-cols-1 lg:grid-cols-2 gap-6'},
+                            // Correlation Heatmap
+                            e(Card, {title: 'Feature Correlations', subtitle: 'Condition #: ' + (featureHealth.correlation?.condition_number?.toFixed(1) || '-'), accent: C.purple},
+                                e(CorrelationHeatmap, {data: featureHealth.correlation})
+                            ),
+
+                            // Lag Analysis
+                            e(Card, {title: 'Cross-Exchange Lag', subtitle: 'Lead-lag detection', accent: C.blue},
+                                e(LagAnalysisDisplay, {data: featureHealth.lag_analysis})
+                            )
+                        ),
+
+                        // Interaction Signals
+                        e(Card, {title: 'Interaction Signals', subtitle: 'Non-linear feature combinations', accent: C.orange},
+                            e(InteractionSignals, {data: featureHealth.interactions})
+                        ),
+
+                        // Summary stats
+                        e('div', {className: 'grid grid-cols-2 md:grid-cols-4 gap-4'},
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: '3px solid ' + C.accent}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Tracked Signals'),
+                                e('div', {className: 'text-2xl font-bold mono'}, featureHealth.signal_decay?.signal_count || 0)
+                            ),
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: '3px solid ' + (featureHealth.signal_decay?.issue_count > 0 ? C.yellow : C.green)}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Issues'),
+                                e('div', {className: 'text-2xl font-bold mono', style: {color: featureHealth.signal_decay?.issue_count > 0 ? C.yellow : C.green}}, featureHealth.signal_decay?.issue_count || 0)
+                            ),
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: '3px solid ' + C.purple}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Features Tracked'},
+                                e('div', {className: 'text-2xl font-bold mono'}, featureHealth.correlation?.feature_names?.length || 0)
+                            ),
+                            e('div', {className: 'p-4 rounded', style: {backgroundColor: C.bgCard, borderLeft: '3px solid ' + (featureHealth.lag_analysis?.signal_ready ? C.green : C.yellow)}},
+                                e('div', {className: 'text-xs uppercase mb-1 mono', style: {color: C.textMuted}}, 'Lag Signal'},
+                                e('div', {className: 'text-2xl font-bold', style: {color: featureHealth.lag_analysis?.signal_ready ? C.green : C.yellow}},
+                                    featureHealth.lag_analysis?.signal_ready ? '✓ Ready' : 'Warming'
+                                )
+                            )
                         )
                     ),
 

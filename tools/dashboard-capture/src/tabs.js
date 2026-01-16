@@ -40,6 +40,12 @@ export const TABS = {
     waitSelector: 'table',
   },
 
+  features: {
+    id: 'features',
+    label: 'Features',
+    waitSelector: 'canvas',
+  },
+
   pnl: {
     id: 'pnl',
     label: 'PnL',

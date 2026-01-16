@@ -24,4 +24,5 @@ pub use order_manager::*;
 pub use pnl::*;
 pub use position::*;
 pub use queue::*;
+pub use signal_decay::{AlertSeverity, SignalAlert, SignalDecayConfig, SignalDecayReport, SignalDecayTracker};
 pub use ws_order_state::{WsOrderSpec, WsOrderStateConfig, WsOrderStateManager};

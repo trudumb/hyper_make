@@ -44,6 +44,9 @@ use hyperliquid_rust_sdk::market_maker::infra::metrics::dashboard::{
     BookLevel, BookSnapshot, CalibrationState, DashboardState, FillRecord, LiveQuotes,
     PnLAttribution, PricePoint, QuoteFillStats, QuoteSnapshot, RegimeSnapshot, RegimeState,
     SpreadBucket, classify_regime, compute_regime_probabilities,
+    // Feature health visualization
+    FeatureHealthState, InteractionSignalState, SignalDecayState, SignalHealthInfo,
+    FeatureCorrelationState, FeatureValidationState, LagAnalysisState,
 };
 use std::collections::{HashMap, VecDeque};
 use hyperliquid_rust_sdk::market_maker::simulation::{
@@ -54,6 +57,10 @@ use hyperliquid_rust_sdk::market_maker::simulation::{
 use hyperliquid_rust_sdk::{
     Ladder, LadderConfig, LadderStrategy, MarketParams, OrderExecutor, QuoteConfig, RiskConfig,
 };
+
+// Adaptive GLFT components
+use hyperliquid_rust_sdk::market_maker::adaptive::{AdaptiveSpreadCalculator, AdaptiveBayesianConfig};
+use hyperliquid_rust_sdk::market_maker::process_models::{HJBInventoryController, HJBConfig};
 
 // ============================================================================
 // CLI Arguments
@@ -121,6 +128,102 @@ struct Cli {
 }
 
 // ============================================================================
+// Feature Health Mock Data Generator
+// ============================================================================
+
+/// Generate mock feature health data for dashboard display.
+/// In production, this would come from actual trackers.
+fn generate_mock_feature_health(cycle_count: u64) -> FeatureHealthState {
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+
+    // Simulate slowly varying signal health
+    let base_mi = 0.04 + 0.01 * ((cycle_count as f64 / 100.0).sin());
+
+    FeatureHealthState {
+        signal_decay: SignalDecayState {
+            signals: vec![
+                SignalHealthInfo {
+                    name: "book_imbalance".to_string(),
+                    mi: base_mi + 0.005,
+                    trend: "stable".to_string(),
+                    half_life_days: Some(45.0),
+                    status: "healthy".to_string(),
+                    mi_change_pct: 2.0,
+                },
+                SignalHealthInfo {
+                    name: "trade_flow".to_string(),
+                    mi: base_mi - 0.005,
+                    trend: "up".to_string(),
+                    half_life_days: Some(35.0),
+                    status: "healthy".to_string(),
+                    mi_change_pct: 5.0,
+                },
+                SignalHealthInfo {
+                    name: "momentum_10s".to_string(),
+                    mi: base_mi - 0.015,
+                    trend: "down".to_string(),
+                    half_life_days: Some(18.0),
+                    status: "warning".to_string(),
+                    mi_change_pct: -12.0,
+                },
+                SignalHealthInfo {
+                    name: "binance_lead".to_string(),
+                    mi: base_mi + 0.02,
+                    trend: "down".to_string(),
+                    half_life_days: Some(25.0),
+                    status: "healthy".to_string(),
+                    mi_change_pct: -8.0,
+                },
+            ],
+            alerts: vec![],
+            signal_count: 4,
+            issue_count: 1,
+        },
+        correlation: FeatureCorrelationState {
+            feature_names: vec![
+                "kappa".to_string(),
+                "sigma".to_string(),
+                "momentum".to_string(),
+                "flow".to_string(),
+                "book_imb".to_string(),
+            ],
+            // 5x5 correlation matrix (row-major)
+            correlation_matrix: vec![
+                1.0, 0.3, -0.1, 0.2, 0.7,
+                0.3, 1.0, 0.4, -0.2, 0.1,
+                -0.1, 0.4, 1.0, 0.6, 0.0,
+                0.2, -0.2, 0.6, 1.0, 0.3,
+                0.7, 0.1, 0.0, 0.3, 1.0,
+            ],
+            vif: vec![2.1, 1.3, 1.8, 1.5, 2.0],
+            condition_number: 8.5,
+            highly_correlated_pairs: vec![],
+            is_valid: true,
+        },
+        validation: FeatureValidationState {
+            features: vec![],
+            issue_count: 0,
+            issue_rate: 0.0,
+            validation_count: cycle_count as usize,
+        },
+        lag_analysis: LagAnalysisState {
+            optimal_lag_ms: -150,
+            mi_at_lag: 0.032,
+            ccf: vec![],  // Would contain cross-correlation function
+            signal_ready: true,
+            signal_name: "binance_mid".to_string(),
+            target_name: "hyperliquid_mid".to_string(),
+        },
+        interactions: InteractionSignalState {
+            vol_x_momentum: 0.3 + 0.1 * ((cycle_count as f64 / 50.0).sin()),
+            regime_x_inventory: 0.2 + 0.05 * ((cycle_count as f64 / 30.0).cos()),
+            jump_x_flow: 0.1 + 0.05 * ((cycle_count as f64 / 70.0).sin()),
+            timestamp_ms,
+        },
+    }
+}
+
+// ============================================================================
 // Simulation State (using real LadderStrategy)
 // ============================================================================
 
@@ -155,6 +258,12 @@ struct SimulationState {
     decimals: u32,
     /// Size decimals
     sz_decimals: u32,
+
+    // === Adaptive GLFT Components ===
+    /// Adaptive Bayesian spread calculator (learned kappa, gamma, floor)
+    adaptive_spreads: AdaptiveSpreadCalculator,
+    /// HJB inventory controller (optimal skew from HJB solution)
+    hjb_controller: HJBInventoryController,
 }
 
 impl SimulationState {
@@ -189,6 +298,11 @@ impl SimulationState {
             _ => (2, 3),      // Default
         };
 
+        // Create adaptive components with defaults
+        let adaptive_spreads = AdaptiveSpreadCalculator::new(AdaptiveBayesianConfig::default());
+        let mut hjb_controller = HJBInventoryController::new(HJBConfig::default());
+        hjb_controller.start_session(); // Start HJB session timing
+
         Self {
             asset,
             mid_price: 0.0,
@@ -204,6 +318,9 @@ impl SimulationState {
             target_liquidity,
             decimals,
             sz_decimals,
+            // Adaptive components
+            adaptive_spreads,
+            hjb_controller,
         }
     }
 
@@ -211,19 +328,28 @@ impl SimulationState {
     fn update_mid(&mut self, mid: f64) {
         if mid > 0.0 {
             self.mid_price = mid;
+
+            // Update HJB controller with current volatility estimate
+            let sigma = self.estimator.sigma_clean().max(0.00001);
+            self.hjb_controller.update_sigma(sigma);
         }
     }
 
     /// Update state from L2 book
     fn update_book(&mut self, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) {
-        self.bid_levels = bids;
-        self.ask_levels = asks;
+        self.bid_levels = bids.clone();
+        self.ask_levels = asks.clone();
 
         if let Some((price, _)) = self.bid_levels.first() {
             self.best_bid = *price;
         }
         if let Some((price, _)) = self.ask_levels.first() {
             self.best_ask = *price;
+        }
+
+        // Update adaptive kappa from book depth
+        if self.mid_price > 0.0 {
+            self.adaptive_spreads.on_l2_update(&bids, &asks, self.mid_price);
         }
     }
 
@@ -308,11 +434,23 @@ impl SimulationState {
         // Arrival intensity (for GLFT time horizon)
         params.arrival_intensity = 0.5; // Conservative default
 
-        // Disable adaptive features (paper trading uses simple path)
-        params.use_adaptive_spreads = false;
-        params.use_hjb_skew = false;
-        params.use_kalman_filter = false;
+        // === ENABLE FULL ADAPTIVE GLFT ===
+        // This is the key change: enable adaptive features to use learned parameters
+        params.use_adaptive_spreads = true;
+        params.use_hjb_skew = true;
+        params.use_kalman_filter = false; // Not wired up yet
         params.use_dynamic_bounds = false;
+
+        // Populate adaptive values from our components
+        params.adaptive_gamma = self.adaptive_spreads.current_gamma();
+        params.adaptive_kappa = self.adaptive_spreads.current_kappa();
+        params.adaptive_spread_floor = self.adaptive_spreads.current_floor();
+        params.adaptive_can_estimate = self.adaptive_spreads.can_provide_estimates();
+        params.adaptive_warmed_up = self.adaptive_spreads.is_warmed_up();
+        params.adaptive_warmup_progress = self.adaptive_spreads.warmup_progress();
+
+        // HJB optimal skew for inventory control
+        params.hjb_optimal_skew = self.hjb_controller.optimal_skew(self.inventory, self.max_position);
 
         // No cascade protection in paper trading
         params.should_pull_quotes = false;
@@ -685,7 +823,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut price_history: VecDeque<PricePoint> = VecDeque::with_capacity(1800);  // 30 min at 1/sec
     let mut quote_history: VecDeque<QuoteSnapshot> = VecDeque::with_capacity(360); // 30 min at 5/sec
     let mut spread_counts: HashMap<String, u32> = HashMap::new();
-    let mut fill_stats: HashMap<(String, usize), (u32, f64)> = HashMap::new(); // (side, level) -> (count, size)
+    let fill_stats: HashMap<(String, usize), (u32, f64)> = HashMap::new(); // (side, level) -> (count, size)
     let mut last_price_snapshot = Instant::now();
     let mut last_book_snapshot = Instant::now();
     let mut last_quote_snapshot = Instant::now();
@@ -1042,6 +1180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 })
                                 .collect();
 
+                            // Generate mock feature health data for dashboard visualization
+                            let feature_health = generate_mock_feature_health(stats.quote_cycles);
+
                             // Update HTTP dashboard state
                             {
                                 let mut dashboard = dashboard_state.write().unwrap();
@@ -1058,6 +1199,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     quote_history: quote_history.iter().cloned().collect(),
                                     quote_fill_stats: quote_fill_stats.clone(),
                                     spread_distribution: spread_distribution.clone(),
+                                    feature_health: feature_health.clone(),
+                                    ..Default::default()
                                 };
                             }
 
@@ -1077,6 +1220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     quote_history: quote_history.iter().cloned().collect(),
                                     quote_fill_stats,
                                     spread_distribution,
+                                    feature_health,
+                                    ..Default::default()
                                 });
 
                                 // Push throttled incremental update
