@@ -362,6 +362,496 @@ pub struct HawkesSummary {
 }
 
 // ============================================================================
+// GMM Calibration for Hawkes Process
+// ============================================================================
+
+/// Result of GMM calibration for Hawkes process parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct HawkesGmmResult {
+    /// Estimated baseline intensity (λ₀ or μ)
+    pub lambda_0: f64,
+    /// Estimated self-excitation parameter (α)
+    pub alpha: f64,
+    /// Estimated decay rate (β)
+    pub beta: f64,
+    /// Branching ratio α/β (must be < 1 for stationarity)
+    pub branching_ratio: f64,
+    /// Sample mean of counts
+    pub sample_mean: f64,
+    /// Sample variance of counts
+    pub sample_variance: f64,
+    /// Number of windows used for estimation
+    pub n_windows: usize,
+    /// Estimation quality: ratio of theoretical to empirical variance
+    pub fit_quality: f64,
+}
+
+impl HawkesGmmResult {
+    /// Check if the estimated process is stationary (branching ratio < 1).
+    pub fn is_stationary(&self) -> bool {
+        self.branching_ratio < 1.0
+    }
+
+    /// Check if the fit is reasonable (quality close to 1.0).
+    pub fn is_well_fit(&self) -> bool {
+        self.fit_quality > 0.5 && self.fit_quality < 2.0
+    }
+
+    /// Get the long-run expected intensity.
+    /// E[λ] = λ₀ / (1 - α/β)
+    pub fn long_run_intensity(&self) -> f64 {
+        if self.branching_ratio >= 1.0 {
+            return f64::INFINITY;
+        }
+        self.lambda_0 / (1.0 - self.branching_ratio)
+    }
+}
+
+/// GMM calibrator for Hawkes process parameters.
+///
+/// Uses closed-form moment conditions to estimate parameters from fill history:
+/// - E[N(T)] = λ₀ × T / (1 - α/β)
+/// - Var[N(T)] = E[N(T)] × (1 + 2α/(β - α))
+///
+/// This is much faster than MLE and works well for real-time calibration.
+#[derive(Debug, Clone)]
+pub struct HawkesGmmCalibrator {
+    /// Window size in seconds for counting
+    window_size_secs: f64,
+    /// Trade counts per window
+    window_counts: Vec<usize>,
+    /// Minimum windows needed for estimation
+    min_windows: usize,
+    /// Prior estimate of beta for initialization
+    beta_prior: f64,
+}
+
+impl HawkesGmmCalibrator {
+    /// Create a new GMM calibrator.
+    ///
+    /// # Arguments
+    /// - `window_size_secs`: Size of counting windows (e.g., 10 seconds)
+    /// - `min_windows`: Minimum windows needed before estimation (e.g., 30)
+    /// - `beta_prior`: Prior estimate of decay rate for regularization
+    pub fn new(window_size_secs: f64, min_windows: usize, beta_prior: f64) -> Self {
+        Self {
+            window_size_secs,
+            window_counts: Vec::with_capacity(min_windows * 2),
+            min_windows,
+            beta_prior,
+        }
+    }
+
+    /// Create with default settings (10s windows, 30 minimum, beta=0.1).
+    pub fn default_calibrator() -> Self {
+        Self::new(10.0, 30, 0.1)
+    }
+
+    /// Add a window count observation.
+    pub fn add_window_count(&mut self, count: usize) {
+        self.window_counts.push(count);
+
+        // Keep only recent history (rolling window of 1000 observations)
+        if self.window_counts.len() > 1000 {
+            self.window_counts.remove(0);
+        }
+    }
+
+    /// Add multiple fill timestamps and compute window counts.
+    ///
+    /// # Arguments
+    /// - `timestamps_secs`: Fill timestamps in seconds (relative to some epoch)
+    pub fn add_fill_history(&mut self, timestamps_secs: &[f64]) {
+        if timestamps_secs.is_empty() {
+            return;
+        }
+
+        let min_t = timestamps_secs
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        let max_t = timestamps_secs
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let duration = max_t - min_t;
+        if duration < self.window_size_secs {
+            // Not enough data for even one window
+            self.window_counts.push(timestamps_secs.len());
+            return;
+        }
+
+        let n_windows = (duration / self.window_size_secs).floor() as usize;
+
+        for i in 0..n_windows {
+            let window_start = min_t + (i as f64) * self.window_size_secs;
+            let window_end = window_start + self.window_size_secs;
+
+            let count = timestamps_secs
+                .iter()
+                .filter(|&&t| t >= window_start && t < window_end)
+                .count();
+
+            self.window_counts.push(count);
+        }
+    }
+
+    /// Check if we have enough data for calibration.
+    pub fn has_sufficient_data(&self) -> bool {
+        self.window_counts.len() >= self.min_windows
+    }
+
+    /// Get the number of windows collected.
+    pub fn n_windows(&self) -> usize {
+        self.window_counts.len()
+    }
+
+    /// Compute sample mean of window counts.
+    fn sample_mean(&self) -> f64 {
+        if self.window_counts.is_empty() {
+            return 0.0;
+        }
+        let sum: usize = self.window_counts.iter().sum();
+        sum as f64 / self.window_counts.len() as f64
+    }
+
+    /// Compute sample variance of window counts.
+    fn sample_variance(&self) -> f64 {
+        if self.window_counts.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.sample_mean();
+        let sum_sq: f64 = self
+            .window_counts
+            .iter()
+            .map(|&c| {
+                let diff = c as f64 - mean;
+                diff * diff
+            })
+            .sum();
+        sum_sq / (self.window_counts.len() - 1) as f64
+    }
+
+    /// Calibrate Hawkes parameters using GMM.
+    ///
+    /// Uses moment conditions:
+    /// - E[N(T)] = λ₀ × T / (1 - α/β)
+    /// - Var[N(T)] = E[N(T)] × (1 + 2α/(β - α))
+    ///
+    /// Returns None if insufficient data or estimation fails.
+    pub fn calibrate(&self) -> Option<HawkesGmmResult> {
+        if !self.has_sufficient_data() {
+            return None;
+        }
+
+        let mean = self.sample_mean();
+        let variance = self.sample_variance();
+        let t = self.window_size_secs;
+
+        // Sanity checks
+        if mean < 0.001 || variance < 0.001 {
+            // Not enough activity
+            return Some(HawkesGmmResult {
+                lambda_0: mean / t,
+                alpha: 0.0,
+                beta: self.beta_prior,
+                branching_ratio: 0.0,
+                sample_mean: mean,
+                sample_variance: variance,
+                n_windows: self.window_counts.len(),
+                fit_quality: 1.0,
+            });
+        }
+
+        // From the moment equations:
+        // Let m = E[N(T)], v = Var[N(T)]
+        // m = λ₀ × T / (1 - α/β)    ... (1)
+        // v = m × (1 + 2α/(β - α))  ... (2)
+        //
+        // Let r = α/β (branching ratio), then:
+        // m = λ₀ × T / (1 - r)
+        // v/m = 1 + 2r/(1 - r) = 1 + 2r/(1-r) = (1 - r + 2r)/(1-r) = (1 + r)/(1 - r)
+        //
+        // So: v/m = (1 + r)/(1 - r)
+        // Solving: v/m × (1 - r) = 1 + r
+        //          v/m - v/m × r = 1 + r
+        //          v/m - 1 = r + v/m × r = r(1 + v/m)
+        //          r = (v/m - 1) / (1 + v/m) = (v - m) / (v + m)
+
+        let variance_to_mean = variance / mean;
+
+        // Estimate branching ratio
+        let r = if variance_to_mean > 1.0 {
+            // Overdispersed (typical for Hawkes)
+            ((variance - mean) / (variance + mean)).clamp(0.0, 0.95)
+        } else {
+            // Underdispersed - no self-excitation
+            0.0
+        };
+
+        // Estimate λ₀ from mean: λ₀ = m × (1 - r) / T
+        let lambda_0 = (mean * (1.0 - r) / t).max(0.001);
+
+        // Use prior beta and solve for alpha: α = r × β
+        let beta = self.beta_prior;
+        let alpha = r * beta;
+
+        // Compute theoretical variance for fit quality
+        let theoretical_var = if r < 1.0 {
+            mean * (1.0 + r) / (1.0 - r)
+        } else {
+            f64::INFINITY
+        };
+        let fit_quality = if theoretical_var > 0.0 && theoretical_var.is_finite() {
+            variance / theoretical_var
+        } else {
+            0.0
+        };
+
+        Some(HawkesGmmResult {
+            lambda_0,
+            alpha,
+            beta,
+            branching_ratio: r,
+            sample_mean: mean,
+            sample_variance: variance,
+            n_windows: self.window_counts.len(),
+            fit_quality,
+        })
+    }
+
+    /// Calibrate with variable beta estimation.
+    ///
+    /// Uses additional moment condition to estimate beta from
+    /// autocorrelation of window counts.
+    pub fn calibrate_with_beta(&self) -> Option<HawkesGmmResult> {
+        if self.window_counts.len() < self.min_windows * 2 {
+            // Need more data for autocorrelation
+            return self.calibrate();
+        }
+
+        // Compute lag-1 autocorrelation
+        let mean = self.sample_mean();
+        let variance = self.sample_variance();
+
+        if variance < 0.001 {
+            return self.calibrate();
+        }
+
+        let mut autocovar = 0.0;
+        for i in 0..(self.window_counts.len() - 1) {
+            let x = self.window_counts[i] as f64 - mean;
+            let y = self.window_counts[i + 1] as f64 - mean;
+            autocovar += x * y;
+        }
+        autocovar /= (self.window_counts.len() - 1) as f64;
+
+        let autocorr = autocovar / variance;
+
+        // For Hawkes: autocorr ≈ exp(-β × T) for adjacent windows
+        // So: β ≈ -ln(autocorr) / T
+        let estimated_beta = if autocorr > 0.01 && autocorr < 0.99 {
+            (-autocorr.ln() / self.window_size_secs).clamp(0.01, 10.0)
+        } else {
+            self.beta_prior
+        };
+
+        // Now calibrate with estimated beta
+        let mean_val = self.sample_mean();
+        let variance_val = self.sample_variance();
+        let t = self.window_size_secs;
+
+        let variance_to_mean = variance_val / mean_val;
+        let r = if variance_to_mean > 1.0 {
+            ((variance_val - mean_val) / (variance_val + mean_val)).clamp(0.0, 0.95)
+        } else {
+            0.0
+        };
+
+        let lambda_0 = (mean_val * (1.0 - r) / t).max(0.001);
+        let alpha = r * estimated_beta;
+
+        let theoretical_var = if r < 1.0 {
+            mean_val * (1.0 + r) / (1.0 - r)
+        } else {
+            f64::INFINITY
+        };
+        let fit_quality = if theoretical_var > 0.0 && theoretical_var.is_finite() {
+            variance_val / theoretical_var
+        } else {
+            0.0
+        };
+
+        Some(HawkesGmmResult {
+            lambda_0,
+            alpha,
+            beta: estimated_beta,
+            branching_ratio: r,
+            sample_mean: mean_val,
+            sample_variance: variance_val,
+            n_windows: self.window_counts.len(),
+            fit_quality,
+        })
+    }
+
+    /// Reset the calibrator.
+    pub fn reset(&mut self) {
+        self.window_counts.clear();
+    }
+}
+
+/// Fast online Hawkes calibrator that updates incrementally.
+///
+/// Maintains running statistics for O(1) parameter updates.
+#[derive(Debug, Clone)]
+pub struct OnlineHawkesCalibrator {
+    /// Window size in seconds
+    window_size_secs: f64,
+    /// EWMA decay for statistics
+    ewma_alpha: f64,
+    /// Running mean of counts
+    ewma_mean: f64,
+    /// Running variance (Welford's algorithm adapted for EWMA)
+    ewma_variance: f64,
+    /// Running autocorrelation
+    ewma_autocorr: f64,
+    /// Last window count
+    last_count: Option<usize>,
+    /// Total windows seen
+    n_windows: usize,
+    /// Prior for beta
+    beta_prior: f64,
+}
+
+impl OnlineHawkesCalibrator {
+    /// Create a new online calibrator.
+    ///
+    /// # Arguments
+    /// - `window_size_secs`: Size of counting windows
+    /// - `half_life_windows`: Half-life in number of windows for EWMA
+    /// - `beta_prior`: Prior estimate of decay rate
+    pub fn new(window_size_secs: f64, half_life_windows: f64, beta_prior: f64) -> Self {
+        let ewma_alpha = 1.0 - (-2.0_f64.ln() / half_life_windows).exp();
+        Self {
+            window_size_secs,
+            ewma_alpha,
+            ewma_mean: 0.0,
+            ewma_variance: 1.0,
+            ewma_autocorr: 0.0,
+            last_count: None,
+            n_windows: 0,
+            beta_prior,
+        }
+    }
+
+    /// Update with a new window count.
+    pub fn update(&mut self, count: usize) {
+        let x = count as f64;
+        self.n_windows += 1;
+
+        if self.n_windows == 1 {
+            self.ewma_mean = x;
+            self.ewma_variance = 1.0; // Initialize with small variance
+            self.last_count = Some(count);
+            return;
+        }
+
+        // Update mean
+        let old_mean = self.ewma_mean;
+        self.ewma_mean = self.ewma_alpha * x + (1.0 - self.ewma_alpha) * self.ewma_mean;
+
+        // Update variance (simplified EWMA variance)
+        let diff = x - old_mean;
+        let var_obs = diff * diff;
+        self.ewma_variance =
+            self.ewma_alpha * var_obs + (1.0 - self.ewma_alpha) * self.ewma_variance;
+
+        // Update autocorrelation
+        if let Some(last) = self.last_count {
+            let last_diff = last as f64 - old_mean;
+            let autocorr_obs = diff * last_diff / (self.ewma_variance + 0.001);
+            self.ewma_autocorr =
+                self.ewma_alpha * autocorr_obs + (1.0 - self.ewma_alpha) * self.ewma_autocorr;
+        }
+
+        self.last_count = Some(count);
+    }
+
+    /// Get current parameter estimates.
+    pub fn estimate(&self) -> Option<HawkesGmmResult> {
+        if self.n_windows < 10 {
+            return None;
+        }
+
+        let mean = self.ewma_mean;
+        let variance = self.ewma_variance;
+        let t = self.window_size_secs;
+
+        if mean < 0.001 {
+            return Some(HawkesGmmResult {
+                lambda_0: 0.001,
+                alpha: 0.0,
+                beta: self.beta_prior,
+                branching_ratio: 0.0,
+                sample_mean: mean,
+                sample_variance: variance,
+                n_windows: self.n_windows,
+                fit_quality: 1.0,
+            });
+        }
+
+        // Estimate branching ratio from variance/mean
+        let r = if variance > mean {
+            ((variance - mean) / (variance + mean)).clamp(0.0, 0.95)
+        } else {
+            0.0
+        };
+
+        // Estimate beta from autocorrelation
+        let beta = if self.ewma_autocorr > 0.01 && self.ewma_autocorr < 0.99 {
+            (-self.ewma_autocorr.ln() / t).clamp(0.01, 10.0)
+        } else {
+            self.beta_prior
+        };
+
+        let lambda_0 = (mean * (1.0 - r) / t).max(0.001);
+        let alpha = r * beta;
+
+        let theoretical_var = if r < 1.0 {
+            mean * (1.0 + r) / (1.0 - r)
+        } else {
+            variance
+        };
+        let fit_quality = if theoretical_var > 0.0 {
+            variance / theoretical_var
+        } else {
+            0.0
+        };
+
+        Some(HawkesGmmResult {
+            lambda_0,
+            alpha,
+            beta,
+            branching_ratio: r,
+            sample_mean: mean,
+            sample_variance: variance,
+            n_windows: self.n_windows,
+            fit_quality,
+        })
+    }
+
+    /// Reset the calibrator.
+    pub fn reset(&mut self) {
+        self.ewma_mean = 0.0;
+        self.ewma_variance = 1.0;
+        self.ewma_autocorr = 0.0;
+        self.last_count = None;
+        self.n_windows = 0;
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -523,5 +1013,304 @@ mod tests {
         assert!(!estimator.is_warmed_up());
         assert_eq!(estimator.trade_count, 0);
         assert!(estimator.events.is_empty());
+    }
+
+    // ========================================================================
+    // GMM Calibration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_gmm_calibrator_new() {
+        let calibrator = HawkesGmmCalibrator::new(10.0, 30, 0.1);
+        assert_eq!(calibrator.n_windows(), 0);
+        assert!(!calibrator.has_sufficient_data());
+    }
+
+    #[test]
+    fn test_gmm_calibrator_default() {
+        let calibrator = HawkesGmmCalibrator::default_calibrator();
+        assert_eq!(calibrator.window_size_secs, 10.0);
+        assert_eq!(calibrator.min_windows, 30);
+    }
+
+    #[test]
+    fn test_gmm_add_window_count() {
+        let mut calibrator = HawkesGmmCalibrator::new(10.0, 5, 0.1);
+
+        for i in 0..5 {
+            calibrator.add_window_count(i + 1);
+        }
+
+        assert_eq!(calibrator.n_windows(), 5);
+        assert!(calibrator.has_sufficient_data());
+    }
+
+    #[test]
+    fn test_gmm_sample_statistics() {
+        let mut calibrator = HawkesGmmCalibrator::new(10.0, 5, 0.1);
+
+        // Add known counts: 2, 4, 6, 8, 10 -> mean = 6, variance = 10
+        for &count in &[2, 4, 6, 8, 10] {
+            calibrator.add_window_count(count);
+        }
+
+        let mean = calibrator.sample_mean();
+        assert!((mean - 6.0).abs() < 0.01, "Mean should be 6, got {}", mean);
+
+        let variance = calibrator.sample_variance();
+        // Sample variance of [2,4,6,8,10] = 10
+        assert!(
+            (variance - 10.0).abs() < 0.01,
+            "Variance should be 10, got {}",
+            variance
+        );
+    }
+
+    #[test]
+    fn test_gmm_calibrate_poisson_like() {
+        // If variance ≈ mean, branching ratio should be ≈ 0 (Poisson, no self-excitation)
+        let mut calibrator = HawkesGmmCalibrator::new(1.0, 10, 0.1);
+
+        // Add counts where variance ≈ mean (Poisson-like)
+        // Poisson(5) has mean=5, var=5
+        for &count in &[4, 6, 5, 3, 7, 5, 4, 6, 5, 5] {
+            calibrator.add_window_count(count);
+        }
+
+        let result = calibrator.calibrate().unwrap();
+
+        // For Poisson-like data, branching ratio should be near 0
+        assert!(
+            result.branching_ratio < 0.3,
+            "Branching ratio {} should be small for Poisson-like data",
+            result.branching_ratio
+        );
+        assert!(result.is_stationary());
+    }
+
+    #[test]
+    fn test_gmm_calibrate_overdispersed() {
+        // If variance >> mean, branching ratio should be significant (self-excitation)
+        let mut calibrator = HawkesGmmCalibrator::new(1.0, 10, 0.1);
+
+        // Add overdispersed counts (variance > mean)
+        // Mean ≈ 5, but high variability
+        for &count in &[1, 10, 2, 9, 1, 10, 2, 8, 1, 11] {
+            calibrator.add_window_count(count);
+        }
+
+        let result = calibrator.calibrate().unwrap();
+
+        // For overdispersed data, branching ratio should be positive
+        assert!(
+            result.branching_ratio > 0.1,
+            "Branching ratio {} should be significant for overdispersed data",
+            result.branching_ratio
+        );
+        assert!(result.is_stationary());
+    }
+
+    #[test]
+    fn test_gmm_result_long_run_intensity() {
+        let result = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.2,
+            beta: 0.4,
+            branching_ratio: 0.5, // alpha/beta = 0.2/0.4 = 0.5
+            sample_mean: 10.0,
+            sample_variance: 30.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+
+        // Long-run intensity = λ₀ / (1 - r) = 0.5 / 0.5 = 1.0
+        let long_run = result.long_run_intensity();
+        assert!(
+            (long_run - 1.0).abs() < 0.01,
+            "Long-run intensity should be 1.0, got {}",
+            long_run
+        );
+    }
+
+    #[test]
+    fn test_gmm_result_stationarity() {
+        let stationary = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.08,
+            beta: 0.1,
+            branching_ratio: 0.8,
+            sample_mean: 10.0,
+            sample_variance: 30.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        assert!(stationary.is_stationary());
+
+        let non_stationary = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.15,
+            beta: 0.1,
+            branching_ratio: 1.5,
+            sample_mean: 10.0,
+            sample_variance: 30.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        assert!(!non_stationary.is_stationary());
+    }
+
+    #[test]
+    fn test_gmm_add_fill_history() {
+        let mut calibrator = HawkesGmmCalibrator::new(1.0, 5, 0.1);
+
+        // Add fills over 5 seconds
+        let timestamps: Vec<f64> = vec![0.1, 0.5, 1.2, 1.8, 2.5, 3.1, 3.9, 4.2, 4.8];
+        calibrator.add_fill_history(&timestamps);
+
+        // Should have created ~4-5 windows
+        assert!(calibrator.n_windows() >= 4);
+    }
+
+    #[test]
+    fn test_gmm_calibrate_with_beta() {
+        let mut calibrator = HawkesGmmCalibrator::new(1.0, 20, 0.1);
+
+        // Add enough data for autocorrelation estimation
+        for i in 0..100 {
+            // Clustered counts with some autocorrelation
+            let base = 5 + (i % 10);
+            calibrator.add_window_count(base);
+        }
+
+        let result = calibrator.calibrate_with_beta();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(r.beta > 0.0);
+        assert!(r.is_stationary());
+    }
+
+    #[test]
+    fn test_gmm_calibrator_reset() {
+        let mut calibrator = HawkesGmmCalibrator::default_calibrator();
+
+        for i in 0..50 {
+            calibrator.add_window_count(i);
+        }
+        assert!(calibrator.has_sufficient_data());
+
+        calibrator.reset();
+        assert!(!calibrator.has_sufficient_data());
+        assert_eq!(calibrator.n_windows(), 0);
+    }
+
+    #[test]
+    fn test_online_calibrator_new() {
+        let calibrator = OnlineHawkesCalibrator::new(10.0, 20.0, 0.1);
+        assert_eq!(calibrator.n_windows, 0);
+        assert!(calibrator.estimate().is_none());
+    }
+
+    #[test]
+    fn test_online_calibrator_update() {
+        let mut calibrator = OnlineHawkesCalibrator::new(1.0, 10.0, 0.1);
+
+        for i in 0..20 {
+            calibrator.update(5 + (i % 3));
+        }
+
+        let result = calibrator.estimate();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(r.lambda_0 > 0.0);
+        assert!(r.is_stationary());
+    }
+
+    #[test]
+    fn test_online_calibrator_reset() {
+        let mut calibrator = OnlineHawkesCalibrator::new(1.0, 10.0, 0.1);
+
+        for i in 0..20 {
+            calibrator.update(i);
+        }
+        assert!(calibrator.estimate().is_some());
+
+        calibrator.reset();
+        assert!(calibrator.estimate().is_none());
+    }
+
+    #[test]
+    fn test_gmm_moment_equations() {
+        // Verify the moment equations are implemented correctly:
+        // E[N(T)] = λ₀ × T / (1 - α/β)
+        // Var[N(T)] = E[N(T)] × (1 + 2α/(β - α))
+        //
+        // Equivalently with r = α/β:
+        // Var/Mean = (1 + r)/(1 - r)
+        // So r = (Var - Mean)/(Var + Mean)
+
+        let mean: f64 = 10.0;
+        let variance: f64 = 30.0;
+
+        // Expected r = (30 - 10)/(30 + 10) = 20/40 = 0.5
+        let expected_r: f64 = (variance - mean) / (variance + mean);
+        assert!(
+            (expected_r - 0.5).abs() < 0.01,
+            "Expected r=0.5, got {}",
+            expected_r
+        );
+
+        // Verify: Var/Mean = (1 + 0.5)/(1 - 0.5) = 1.5/0.5 = 3.0
+        let var_to_mean: f64 = variance / mean;
+        let theoretical: f64 = (1.0 + expected_r) / (1.0 - expected_r);
+        assert!(
+            (var_to_mean - theoretical).abs() < 0.01,
+            "Var/Mean={} should equal theoretical={}",
+            var_to_mean,
+            theoretical
+        );
+    }
+
+    #[test]
+    fn test_gmm_result_well_fit() {
+        let good_fit = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.05,
+            beta: 0.1,
+            branching_ratio: 0.5,
+            sample_mean: 10.0,
+            sample_variance: 30.0,
+            n_windows: 100,
+            fit_quality: 0.95, // Close to 1.0
+        };
+        assert!(good_fit.is_well_fit());
+
+        let bad_fit = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.05,
+            beta: 0.1,
+            branching_ratio: 0.5,
+            sample_mean: 10.0,
+            sample_variance: 30.0,
+            n_windows: 100,
+            fit_quality: 0.1, // Far from 1.0
+        };
+        assert!(!bad_fit.is_well_fit());
+    }
+
+    #[test]
+    fn test_gmm_low_activity() {
+        // Test behavior with very low activity (should still work)
+        let mut calibrator = HawkesGmmCalibrator::new(10.0, 10, 0.1);
+
+        for _ in 0..20 {
+            calibrator.add_window_count(0); // All zeros
+        }
+
+        let result = calibrator.calibrate();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        // Should return minimal lambda_0 and no excitation
+        assert!(r.lambda_0 >= 0.0);
+        assert!(r.alpha >= 0.0);
     }
 }

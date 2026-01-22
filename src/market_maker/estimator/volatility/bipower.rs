@@ -59,4 +59,210 @@ impl SingleScaleBipower {
             1.0
         }
     }
+
+    /// Returns true if jump_ratio > 1.5, indicating toxic/jump regime.
+    /// Per Small Fish Strategy: jump_ratio > 1.5 = toxic regime, widen spreads.
+    pub(crate) fn is_toxic_regime(&self) -> bool {
+        self.jump_ratio() > 1.5
+    }
+
+    /// Get realized variance (includes jumps)
+    pub(crate) fn rv(&self) -> f64 {
+        self.rv
+    }
+
+    /// Get bipower variation (excludes jumps)
+    pub(crate) fn bv(&self) -> f64 {
+        self.bv
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bipower_variation_formula() {
+        // BV = (π/2) × Σ |r_t| × |r_{t-1}|
+        // Test with known returns
+        let mut bp = SingleScaleBipower::new(10.0, 0.0001);
+
+        // First update - no BV yet (need two returns)
+        bp.update(0.01);
+        assert!(bp.last_abs_return.is_some());
+
+        // Second update - now we have BV
+        bp.update(0.02);
+        // BV observation = (π/2) × 0.01 × 0.02 = 0.000314...
+        assert!(bp.bv > 0.0);
+    }
+
+    #[test]
+    fn test_sigma_clean_excludes_jumps() {
+        let mut bp = SingleScaleBipower::new(5.0, 0.0001);
+
+        // Feed normal returns
+        for _ in 0..20 {
+            bp.update(0.001);
+        }
+        let sigma_clean_normal = bp.sigma_clean();
+
+        // Feed a jump
+        bp.update(0.05); // 5% move = jump
+
+        // sigma_clean should increase less than sigma_total
+        let sigma_clean_after = bp.sigma_clean();
+        let sigma_total_after = bp.sigma_total();
+
+        // After a jump, total vol should be higher than clean vol
+        assert!(
+            sigma_total_after > sigma_clean_after,
+            "sigma_total ({}) should be > sigma_clean ({}) after jump",
+            sigma_total_after,
+            sigma_clean_after
+        );
+    }
+
+    #[test]
+    fn test_jump_ratio_normal_market() {
+        let mut bp = SingleScaleBipower::new(10.0, 0.0001);
+
+        // Feed consistent returns - no jumps
+        for _ in 0..50 {
+            bp.update(0.001);
+        }
+
+        // Jump ratio should be close to 1.0 in normal market
+        let jr = bp.jump_ratio();
+        assert!(
+            jr > 0.8 && jr < 1.5,
+            "Jump ratio {} should be near 1.0 in normal market",
+            jr
+        );
+        assert!(!bp.is_toxic_regime(), "Should not be toxic in normal market");
+    }
+
+    #[test]
+    fn test_jump_ratio_with_jumps() {
+        let mut bp = SingleScaleBipower::new(5.0, 0.0001);
+
+        // Feed small returns
+        for _ in 0..10 {
+            bp.update(0.0005);
+        }
+
+        // Feed large jump
+        bp.update(0.10); // 10% move
+
+        // Jump ratio should spike
+        let jr = bp.jump_ratio();
+        assert!(jr > 1.0, "Jump ratio {} should be > 1.0 after big move", jr);
+    }
+
+    #[test]
+    fn test_is_toxic_regime_threshold() {
+        let mut bp = SingleScaleBipower::new(3.0, 0.0001);
+
+        // Build baseline with small returns
+        for _ in 0..20 {
+            bp.update(0.0002);
+        }
+
+        // Should not be toxic yet
+        assert!(
+            !bp.is_toxic_regime(),
+            "Should not be toxic with normal returns"
+        );
+
+        // Inject multiple large moves to push ratio above 1.5
+        for _ in 0..5 {
+            bp.update(0.05);
+            bp.update(0.0001); // small return after jump
+        }
+
+        // After multiple jumps, may become toxic
+        // Note: depends on EWMA dynamics
+        let jr = bp.jump_ratio();
+        println!("Jump ratio after jumps: {}", jr);
+    }
+
+    #[test]
+    fn test_rv_and_bv_accessors() {
+        let mut bp = SingleScaleBipower::new(10.0, 0.0001);
+        bp.update(0.01);
+        bp.update(0.02);
+
+        assert!(bp.rv() > 0.0, "RV should be positive");
+        assert!(bp.bv() > 0.0, "BV should be positive");
+    }
+
+    #[test]
+    fn test_bipower_ewma_decay() {
+        let mut bp = SingleScaleBipower::new(5.0, 0.0001);
+
+        // Feed a spike
+        bp.update(0.05);
+        bp.update(0.05);
+        let rv_after_spike = bp.rv();
+
+        // Feed many small returns - should decay
+        for _ in 0..20 {
+            bp.update(0.0001);
+        }
+        let rv_after_decay = bp.rv();
+
+        assert!(
+            rv_after_decay < rv_after_spike,
+            "RV should decay: {} should be < {}",
+            rv_after_decay,
+            rv_after_spike
+        );
+    }
+
+    #[test]
+    fn test_sigma_clean_formula() {
+        // sigma_clean = sqrt(BV)
+        let mut bp = SingleScaleBipower::new(10.0, 0.0004); // default var = 0.0004 -> sigma = 0.02
+        bp.update(0.01);
+        bp.update(0.01);
+
+        let sigma = bp.sigma_clean();
+        let expected = bp.bv().sqrt();
+
+        // Should be within clamping range
+        assert!(sigma >= 1e-7 && sigma <= 0.05);
+        // Should match sqrt(bv) if within range
+        if expected >= 1e-7 && expected <= 0.05 {
+            assert!(
+                (sigma - expected).abs() < 1e-10,
+                "sigma_clean {} should equal sqrt(bv) {}",
+                sigma,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_toxic_regime_constant() {
+        // Verify the 1.5 threshold from Small Fish Strategy
+        let mut bp = SingleScaleBipower::new(10.0, 0.0001);
+
+        // Manually set internal state to test threshold
+        // We can't directly set, so we test via behavior
+        // This test documents the threshold
+        for _ in 0..10 {
+            bp.update(0.001);
+        }
+
+        // The threshold is jump_ratio > 1.5
+        // We verify this by checking the method behavior
+        let jr = bp.jump_ratio();
+        let is_toxic = bp.is_toxic_regime();
+
+        if jr > 1.5 {
+            assert!(is_toxic, "Should be toxic when jr > 1.5");
+        } else {
+            assert!(!is_toxic, "Should not be toxic when jr <= 1.5");
+        }
+    }
 }

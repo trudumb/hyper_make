@@ -19,7 +19,13 @@ pub mod signal_decay;
 pub mod ws_order_state;
 
 pub use asset_id::AssetId;
-pub use calibration::{CalibrationConfig, CalibrationMetrics, CalibrationSummary, CalibrationTracker};
+pub use calibration::{
+    CalibrationConfig, CalibrationMetrics, CalibrationSummary, CalibrationTracker,
+    // Small Fish Strategy prediction logging infrastructure
+    LinkedPredictionOutcome, OutcomeLog, PredictionLog, PredictionOutcomeStore, PredictionType,
+    // Small Fish Strategy signal quality tracking
+    SignalQualityTracker,
+};
 pub use order_manager::*;
 pub use pnl::*;
 pub use position::*;
