@@ -1117,7 +1117,7 @@ mod tests {
         // Strong positive returns with low variance
         let returns: Vec<f64> = (0..100).map(|_| 0.02).collect(); // 2% returns
 
-        let result = validator.t_test(&returns);
+        let _result = validator.t_test(&returns);
 
         // With constant positive returns, should be highly significant
         // Note: zero variance case is handled specially

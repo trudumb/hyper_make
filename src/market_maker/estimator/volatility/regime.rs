@@ -3,6 +3,9 @@
 //! Four-state regime with asymmetric hysteresis to prevent rapid switching.
 //! Self-calibrating: learns baseline and thresholds from observed market data.
 
+// HMM-based regime blending infrastructure - reserved for future integration
+#![allow(dead_code)]
+
 use tracing::{debug, info};
 
 /// Volatility regime classification.
@@ -108,6 +111,7 @@ impl VolatilityRegime {
 ///
 /// Key insight: Single parameter values are almost always wrong. Use the belief state
 /// to blend parameters based on regime probabilities.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RegimeBeliefState {
     /// Probability of Low (calm) regime
@@ -132,6 +136,7 @@ impl Default for RegimeBeliefState {
     }
 }
 
+#[allow(dead_code)]
 impl RegimeBeliefState {
     /// Create belief state from hard regime (all probability on one state).
     pub(crate) fn from_regime(regime: VolatilityRegime) -> Self {

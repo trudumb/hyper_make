@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_stats_tracking() {
-        let mut filter = default_filter();
+        let filter = default_filter();
         assert_eq!(filter.stats().evaluated_count, 0);
 
         // After evaluation, stats should be updated

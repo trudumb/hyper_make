@@ -23,8 +23,8 @@ pub use calibration::{
     CalibrationConfig, CalibrationMetrics, CalibrationSummary, CalibrationTracker,
     // Small Fish Strategy prediction logging infrastructure
     LinkedPredictionOutcome, OutcomeLog, PredictionLog, PredictionOutcomeStore, PredictionType,
-    // Small Fish Strategy signal quality tracking
-    SignalQualityTracker,
+    // Small Fish Strategy signal MI (Mutual Information) tracking
+    SignalMiTracker,
 };
 pub use order_manager::*;
 pub use pnl::*;

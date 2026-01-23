@@ -309,7 +309,7 @@ pub struct AggressiveFillSimulator {
     /// Reference to executor
     executor: Arc<SimulationExecutor>,
     /// Track cumulative volume at each price level
-    level_volume: std::collections::HashMap<u64, f64>,
+    _level_volume: std::collections::HashMap<u64, f64>,
     /// Total fills
     total_fills: u64,
 }
@@ -319,7 +319,7 @@ impl AggressiveFillSimulator {
     pub fn new(executor: Arc<SimulationExecutor>) -> Self {
         Self {
             executor,
-            level_volume: std::collections::HashMap::new(),
+            _level_volume: std::collections::HashMap::new(),
             total_fills: 0,
         }
     }

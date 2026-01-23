@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_hierarchical_warmup() {
-        let mut est = HierarchicalKappa::default_liquid();
+        let est = HierarchicalKappa::default_liquid();
 
         // Before any fills, posterior mean = prior mean = market kappa
         assert!(
@@ -451,7 +451,7 @@ mod tests {
 
         // Posterior should converge toward 1000 (= 1/0.001)
         // Since we're feeding consistent 10bp distances
-        let expected_kappa = 100.0; // 1 / 0.01 = 100
+        let _expected_kappa = 100.0; // 1 / 0.01 = 100
         let observed = est.posterior_mean();
 
         // With 100 observations, should be close to true value

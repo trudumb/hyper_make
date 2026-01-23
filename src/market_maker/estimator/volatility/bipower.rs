@@ -62,16 +62,19 @@ impl SingleScaleBipower {
 
     /// Returns true if jump_ratio > 1.5, indicating toxic/jump regime.
     /// Per Small Fish Strategy: jump_ratio > 1.5 = toxic regime, widen spreads.
+    #[allow(dead_code)]
     pub(crate) fn is_toxic_regime(&self) -> bool {
         self.jump_ratio() > 1.5
     }
 
     /// Get realized variance (includes jumps)
+    #[allow(dead_code)]
     pub(crate) fn rv(&self) -> f64 {
         self.rv
     }
 
     /// Get bipower variation (excludes jumps)
+    #[allow(dead_code)]
     pub(crate) fn bv(&self) -> f64 {
         self.bv
     }
@@ -105,7 +108,7 @@ mod tests {
         for _ in 0..20 {
             bp.update(0.001);
         }
-        let sigma_clean_normal = bp.sigma_clean();
+        let _sigma_clean_normal = bp.sigma_clean();
 
         // Feed a jump
         bp.update(0.05); // 5% move = jump

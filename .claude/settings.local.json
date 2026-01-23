@@ -24,7 +24,11 @@
       "Skill(ralph-loop:ralph-loop)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(gh auth status:*)"
+      "Bash(gh auth status:*)",
+      "Bash(grep:*)",
+      "Bash(chmod:*)",
+      "Bash(ls:*)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }

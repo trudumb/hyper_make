@@ -1,7 +1,7 @@
 # Market Maker Standard Operating Procedures (SOP)
 
-**Version:** 2.1
-**Last Updated:** 2026-01-04
+**Version:** 2.2
+**Last Updated:** 2026-01-22
 **Document Type:** Standard Operating Procedure
 
 This document provides comprehensive operational guidance for the Hyperliquid market maker, including setup, daily operations, monitoring, troubleshooting, and emergency procedures.
@@ -24,6 +24,7 @@ This document provides comprehensive operational guidance for the Hyperliquid ma
 12. [Architecture Reference](#12-architecture-reference)
 13. [Module Reference](#13-module-reference)
 14. [Quick Reference Card](#14-quick-reference-card)
+15. [Validation & Analysis Workflow](#15-validation--analysis-workflow)
 
 ---
 
@@ -1248,9 +1249,188 @@ tail -f mm.log | grep -E "WARN|ERROR"                # Warnings/errors
 
 ---
 
+## 15. Validation & Analysis Workflow
+
+This section describes the systematic workflow for validating market making strategies following the Small Fish methodology: **measurement before modeling**, **calibration is ground truth**, and **complexity only when proven necessary**.
+
+### 15.1 Workflow Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SMALL FISH VALIDATION WORKFLOW                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Phase 1: PAPER TRADING          Phase 2: ANALYSIS           Phase 3: DECISION
+  ─────────────────────          ────────────────────         ─────────────────
+  ┌─────────────────┐            ┌─────────────────┐          ┌─────────────────┐
+  │ Run simulation  │────────────│ Quick analysis  │──────────│ Sufficient      │
+  │ (60-3600s)      │            │ (shell script)  │          │ samples?        │
+  └─────────────────┘            └─────────────────┘          └─────────────────┘
+         │                              │                            │
+         │                              │                            │
+         ▼                              ▼                        YES │ NO
+  ┌─────────────────┐            ┌─────────────────┐               ▼
+  │ Collect:        │            │ Check:          │          ┌─────────────────┐
+  │ - predictions   │            │ - Fill count    │          │ Run longer      │
+  │ - fills         │            │ - Errors        │          │ (need 200+)     │
+  │ - PnL           │            │ - Warnings      │          └─────────────────┘
+  └─────────────────┘            └─────────────────┘
+                                        │
+                                        ▼
+                                 ┌─────────────────┐
+                                 │ Calibration     │
+                                 │ report (Python) │
+                                 └─────────────────┘
+                                        │
+                                        ▼
+                                 ┌─────────────────┐
+                                 │ Check IR > 1.0  │───── NO ──▶ Simplify model
+                                 └─────────────────┘
+                                        │
+                                       YES
+                                        ▼
+                                 ┌─────────────────┐
+                                 │ Check calibr.   │───── NO ──▶ Retune params
+                                 │ error < 0.1     │
+                                 └─────────────────┘
+                                        │
+                                       YES
+                                        ▼
+                                 ┌─────────────────┐
+                                 │ Paper trade OK  │───────────▶ Live (testnet)
+                                 └─────────────────┘
+```
+
+### 15.2 Paper Trading Commands
+
+**Quick Test (1 minute):**
+```bash
+./scripts/paper_trading.sh BTC 60
+```
+
+**Standard Session (5 minutes):**
+```bash
+./scripts/paper_trading.sh BTC 300
+```
+
+**Full Calibration Session (1 hour with report):**
+```bash
+./scripts/paper_trading.sh BTC 3600 --report
+```
+
+**With Dashboard (visual monitoring):**
+```bash
+./scripts/paper_trading.sh BTC 300 --dashboard
+```
+
+**With Screenshot Capture (Claude vision analysis):**
+```bash
+./scripts/paper_trading.sh BTC 300 --capture
+```
+
+### 15.3 Analysis Scripts
+
+**Quick Analysis (shell):**
+```bash
+./scripts/analysis/analyze_session.sh logs/paper_trading_BTC_2026-01-22_15-30-00
+```
+
+Output includes:
+- Basic statistics (lines, errors, warnings)
+- Session timing
+- Fill analysis (buy/sell ratio, fill rate)
+- Parameter estimation samples
+- Risk events (reduce-only, kill switch, cascades)
+
+**Calibration Report (Python):**
+```bash
+python3 scripts/analysis/calibration_report.py logs/paper_trading_BTC_2026-01-22_15-30-00
+```
+
+Generates:
+- `calibration_report.json` - Machine-readable metrics
+- `calibration_report.md` - Human-readable report
+
+### 15.4 Key Validation Metrics
+
+| Metric | Target | Meaning |
+|--------|--------|---------|
+| Sample count | ≥200 | Statistical significance |
+| Information Ratio | >1.0 | Model adds value over base rate |
+| Calibration error | <0.1 | Predictions match reality |
+| Brier score | <0.25 | Better than random guessing |
+| Win rate | >50% | Profitable fill ratio |
+
+**Information Ratio Interpretation:**
+
+| IR | Meaning | Action |
+|----|---------|--------|
+| <0.8 | Model harmful | Remove model, use simple baseline |
+| 0.8-1.0 | Model adds noise | Simplify or retune |
+| 1.0-1.5 | Model useful | Keep, monitor for decay |
+| >1.5 | Model valuable | Protect from overfitting |
+
+### 15.5 Validation Checklist
+
+Before moving from paper trading to live:
+
+- [ ] **Sample size**: 200+ independent fills
+- [ ] **Fill prediction IR**: >1.0
+- [ ] **Calibration error**: <0.1
+- [ ] **No kill switch triggers**: 0 during session
+- [ ] **Positive PnL**: After fees and adverse selection
+- [ ] **Stable parameters**: σ, κ not drifting wildly
+- [ ] **Regime coverage**: Tested in calm AND volatile periods
+
+### 15.6 Iterative Improvement Workflow
+
+Following the Small Fish principle: **only add complexity when simple demonstrably fails**.
+
+```bash
+# Phase 1: Establish baseline (simple EWMA)
+./scripts/paper_trading.sh BTC 3600 --report
+# → Check IR, if <1.0, investigate
+
+# Phase 2: Identify weakness
+python3 scripts/analysis/calibration_report.py <session_dir>
+# → Read calibration_report.md for issues
+
+# Phase 3: Add ONE component (e.g., Hawkes)
+# → Modify config, re-run
+
+# Phase 4: Compare to baseline
+# → Only keep if statistically significant improvement (p < 0.05)
+```
+
+### 15.7 Common Issues and Solutions
+
+| Issue | Symptom | Solution |
+|-------|---------|----------|
+| Low fill rate | <5% fills per cycle | Tighten spreads (lower γ) |
+| High adverse selection | AS cost > spread capture | Improve regime detection |
+| Parameter drift | σ, κ unstable | Longer warmup window |
+| Calibration error high | Predictions don't match outcomes | Check feature inputs |
+| IR < 1.0 | Model adds noise | Simplify to EWMA baseline |
+
+### 15.8 Session File Reference
+
+After running `./scripts/paper_trading.sh BTC 300`:
+
+```
+logs/paper_trading_BTC_2026-01-22_15-30-00/
+├── paper_trader.log          # Full simulation log
+├── predictions.jsonl         # Prediction records (if --report)
+├── fills.jsonl               # Simulated fills (if --report)
+├── calibration_report.json   # Machine-readable analysis
+└── calibration_report.md     # Human-readable report
+```
+
+---
+
 ## Further Reading
 
 - [CLAUDE.md](./CLAUDE.md) - Detailed architecture and implementation notes
+- [SMALL_FISH_STRATEGY.md](./SMALL_FISH_STRATEGY.md) - Small Fish validation methodology
 - [Hyperliquid Docs](https://hyperliquid.gitbook.io/) - Exchange API reference
 - [GLFT Paper](https://arxiv.org/abs/1105.3115) - Optimal market making theory
 

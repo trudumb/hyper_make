@@ -564,11 +564,12 @@ mod tests {
         let levels = make_levels();
         let regime = MarketRegime::default();
 
-        let mut defensive = create_defensive_optimizer(90000.0, 10000.0, 0.1, 20.0);
-        let mut aggressive = create_aggressive_optimizer(90000.0, 10000.0, 0.1, 20.0);
+        // Create initial optimizers (then replace with seeded versions for reproducibility)
+        let _ = create_defensive_optimizer(90000.0, 10000.0, 0.1, 20.0);
+        let _ = create_aggressive_optimizer(90000.0, 10000.0, 0.1, 20.0);
 
         // Use seeds for reproducibility
-        defensive = EntropyConstrainedOptimizer::with_seed(
+        let mut defensive = EntropyConstrainedOptimizer::with_seed(
             EntropyOptimizerConfig {
                 distribution: EntropyDistributionConfig {
                     min_entropy: 2.0,
@@ -584,7 +585,7 @@ mod tests {
             42,
         );
 
-        aggressive = EntropyConstrainedOptimizer::with_seed(
+        let mut aggressive = EntropyConstrainedOptimizer::with_seed(
             EntropyOptimizerConfig {
                 distribution: EntropyDistributionConfig {
                     min_entropy: 1.0,

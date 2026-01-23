@@ -385,7 +385,7 @@ impl PredictionOutcomeStore {
 /// Edge decays over time as markets adapt. This tracker helps detect
 /// when a signal needs recalibration or should be removed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SignalQualityTracker {
+pub struct SignalMiTracker {
     /// Name of the signal being tracked.
     pub signal_name: String,
 
@@ -416,13 +416,13 @@ pub struct SignalQualityTracker {
     mi_timestamps: VecDeque<u64>,
 }
 
-impl Default for SignalQualityTracker {
+impl Default for SignalMiTracker {
     fn default() -> Self {
         Self::new("unnamed")
     }
 }
 
-impl SignalQualityTracker {
+impl SignalMiTracker {
     /// Create a new tracker for a signal.
     pub fn new(signal_name: &str) -> Self {
         Self {
@@ -994,7 +994,8 @@ pub struct CalibrationTracker {
     pub fill: PredictionTracker,
     /// Adverse selection calibration.
     pub adverse_selection: PredictionTracker,
-    /// Configuration.
+    /// Configuration (reserved for future use).
+    #[allow(dead_code)]
     config: CalibrationConfig,
 }
 
@@ -1809,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_creation() {
-        let tracker = SignalQualityTracker::new("test_signal");
+        let tracker = SignalMiTracker::new("test_signal");
 
         assert_eq!(tracker.signal_name, "test_signal");
         assert_eq!(tracker.mutual_information, 0.0);
@@ -1820,7 +1821,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_default() {
-        let tracker = SignalQualityTracker::default();
+        let tracker = SignalMiTracker::default();
 
         assert_eq!(tracker.signal_name, "unnamed");
         assert_eq!(tracker.mutual_information, 0.0);
@@ -1828,7 +1829,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_is_stale() {
-        let mut tracker = SignalQualityTracker::new("test");
+        let mut tracker = SignalMiTracker::new("test");
 
         // Not stale by default (infinite half-life)
         assert!(!tracker.is_stale());
@@ -1847,7 +1848,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_is_useful() {
-        let mut tracker = SignalQualityTracker::new("test");
+        let mut tracker = SignalMiTracker::new("test");
 
         // Not useful by default (MI = 0)
         assert!(!tracker.is_useful());
@@ -1869,7 +1870,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_should_keep() {
-        let mut tracker = SignalQualityTracker::new("test");
+        let mut tracker = SignalMiTracker::new("test");
 
         // Default: not useful (MI=0), not stale (half_life=inf)
         // Should NOT keep because not useful
@@ -1891,7 +1892,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_record_mi() {
-        let mut tracker = SignalQualityTracker::new("test");
+        let mut tracker = SignalMiTracker::new("test");
 
         // Record some MI values
         tracker.record_mi(0.1);
@@ -1913,7 +1914,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_max_history() {
-        let mut tracker = SignalQualityTracker::with_history_size("test", 5);
+        let mut tracker = SignalMiTracker::with_history_size("test", 5);
 
         // Add more than max_history
         for i in 0..10 {
@@ -1926,7 +1927,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_stable_signal() {
-        let mut tracker = SignalQualityTracker::new("stable");
+        let mut tracker = SignalMiTracker::new("stable");
 
         // Record stable MI values (no decay)
         for _ in 0..10 {
@@ -1946,7 +1947,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_decaying_signal() {
-        let mut tracker = SignalQualityTracker::new("decaying");
+        let mut tracker = SignalMiTracker::new("decaying");
 
         // Record decaying MI values
         let values = [0.10, 0.09, 0.08, 0.07, 0.06, 0.05];
@@ -1967,7 +1968,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_project_mi() {
-        let mut tracker = SignalQualityTracker::new("test");
+        let mut tracker = SignalMiTracker::new("test");
 
         // Set up a decaying signal
         tracker.mutual_information = 0.1;
@@ -1991,7 +1992,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_diagnostic_summary() {
-        let mut tracker = SignalQualityTracker::new("my_signal");
+        let mut tracker = SignalMiTracker::new("my_signal");
         tracker.mutual_information = 0.05;
         tracker.mi_trend = -0.001;
         tracker.half_life_days = 14.0;
@@ -2006,7 +2007,7 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker_recent_mi_values() {
-        let mut tracker = SignalQualityTracker::new("test");
+        let mut tracker = SignalMiTracker::new("test");
 
         for i in 0..5 {
             tracker.record_mi((i + 1) as f64 * 0.01);

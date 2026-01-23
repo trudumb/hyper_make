@@ -595,33 +595,25 @@ mod tests {
 
     #[test]
     fn test_fill_probability_estimation() {
+        // Use a reasonable kappa for testing (not the high default)
+        // kappa=10 means λ(0) = 10 fills/second at the touch
+        let mut params = MarketParams::default();
+        params.kappa_robust = 10.0; // Reasonable kappa for test
+        params.use_kappa_robust = true;
+
         // At depth 0, probability should be high
-        let p_0 = estimate_fill_probability(
-            0.0,
-            &MarketParams::default(),
-            1.0,
-        );
-        assert!(p_0 > 0.5, "Fill prob at touch should be high");
+        let p_0 = estimate_fill_probability(0.0, &params, 1.0);
+        assert!(p_0 > 0.5, "Fill prob at touch should be high, got {}", p_0);
 
         // At depth 50 bps, probability should be low
-        let p_50 = estimate_fill_probability(
-            50.0,
-            &MarketParams::default(),
-            1.0,
-        );
-        assert!(p_50 < 0.1, "Fill prob at 50 bps should be low");
+        // λ(50) = 10 × exp(-50/10) = 10 × exp(-5) = 0.067
+        // P(fill in 1s) = 1 - exp(-0.067) = 0.065
+        let p_50 = estimate_fill_probability(50.0, &params, 1.0);
+        assert!(p_50 < 0.1, "Fill prob at 50 bps should be low, got {}", p_50);
 
         // Longer horizon = higher probability
-        let p_1s = estimate_fill_probability(
-            10.0,
-            &MarketParams::default(),
-            1.0,
-        );
-        let p_10s = estimate_fill_probability(
-            10.0,
-            &MarketParams::default(),
-            10.0,
-        );
+        let p_1s = estimate_fill_probability(10.0, &params, 1.0);
+        let p_10s = estimate_fill_probability(10.0, &params, 10.0);
         assert!(p_10s > p_1s, "Longer horizon should have higher fill prob");
     }
 

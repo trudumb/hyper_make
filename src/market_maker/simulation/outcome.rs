@@ -101,7 +101,8 @@ pub struct OutcomeTracker {
     completed_attributions: VecDeque<CycleAttribution>,
     /// Maximum pending fills
     max_pending: usize,
-    /// Maximum completed attributions to keep
+    /// Maximum completed attributions to keep (reserved for future trimming)
+    #[allow(dead_code)]
     max_completed: usize,
 
     /// Running totals

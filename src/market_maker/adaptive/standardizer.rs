@@ -147,8 +147,10 @@ pub(super) struct SignalStandardizers {
     pub regime_x_inventory: SignalStandardizer,
     pub jump_x_flow: SignalStandardizer,
 
-    // Additional base signals needed for interactions
+    // Additional base signals needed for interactions (reserved for future use)
+    #[allow(dead_code)]
     pub momentum_abs: SignalStandardizer,
+    #[allow(dead_code)]
     pub flow_abs: SignalStandardizer,
 }
 
@@ -238,11 +240,13 @@ impl SignalStandardizers {
     }
 
     /// Standardize momentum_abs (helper for interaction terms).
+    #[allow(dead_code)]
     pub(super) fn standardize_momentum_abs(&mut self, raw: f64) -> f64 {
         self.momentum_abs.standardize(raw)
     }
 
     /// Standardize flow_abs (helper for interaction terms).
+    #[allow(dead_code)]
     pub(super) fn standardize_flow_abs(&mut self, raw: f64) -> f64 {
         self.flow_abs.standardize(raw)
     }

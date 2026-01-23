@@ -331,14 +331,14 @@ mod tests {
         let mut floor = default_floor();
 
         // First establish a baseline with the prior
-        let initial = floor.learned_spread_floor();
+        let _initial = floor.learned_spread_floor();
 
         // Simulate very high-AS fills (20 bps - much higher than prior 3 bps)
         for _ in 0..100 {
             floor.update(0.002); // 20 bps AS
         }
 
-        let after = floor.learned_spread_floor();
+        let _after = floor.learned_spread_floor();
 
         // The posterior mean should move toward observed values
         assert!(

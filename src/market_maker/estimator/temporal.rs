@@ -223,7 +223,8 @@ pub struct MultiScaleMomentum {
 pub struct MomentumScale {
     /// Half-life in seconds
     half_life_secs: f64,
-    /// EWMA decay factor
+    /// EWMA decay factor (reserved for adaptive decay)
+    #[allow(dead_code)]
     alpha: f64,
     /// Current EWMA of returns (basis points)
     ewma_return: f64,

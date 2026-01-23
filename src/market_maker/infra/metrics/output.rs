@@ -807,7 +807,7 @@ impl PrometheusMetrics {
         let jump_ratio = self.inner.jump_ratio.load();
         let cascade_severity = self.inner.cascade_severity.load();
         let adverse_selection_bps = self.inner.adverse_selection_bps.load();
-        let daily_pnl = self.inner.daily_pnl.load();
+        let _daily_pnl = self.inner.daily_pnl.load();
 
         // Estimate fill probability and adverse probability from available data
         // For fill probability, use a simple heuristic based on spread

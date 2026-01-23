@@ -247,16 +247,40 @@ if [ -f "${OUTPUT_DIR}/predictions.jsonl" ]; then
     echo -e "  ${GREEN}${OUTPUT_DIR}/predictions.jsonl${NC} - Prediction records (for calibration)"
 fi
 
+# Run calibration analysis if --report flag was set
+if [ "$REPORT" = true ]; then
+    echo ""
+    echo -e "${YELLOW}Generating calibration report...${NC}"
+
+    # Run shell analysis script
+    if [ -f "scripts/analysis/analyze_session.sh" ]; then
+        echo ""
+        ./scripts/analysis/analyze_session.sh "${OUTPUT_DIR}"
+    fi
+
+    # Run Python calibration report if available
+    if command -v python3 &> /dev/null && [ -f "scripts/analysis/calibration_report.py" ]; then
+        echo ""
+        python3 scripts/analysis/calibration_report.py "${OUTPUT_DIR}"
+
+        if [ -f "${OUTPUT_DIR}/calibration_report.md" ]; then
+            echo ""
+            echo -e "${GREEN}Calibration report generated: ${OUTPUT_DIR}/calibration_report.md${NC}"
+        fi
+    fi
+fi
+
 echo ""
 echo -e "${BLUE}Next Steps:${NC}"
 echo -e "  1. Review log:      ${GREEN}less ${LOG_FILE}${NC}"
 echo -e "  2. Analyze fills:   ${GREEN}grep '\[SIM\] Fill' ${LOG_FILE}${NC}"
+echo -e "  3. Quick analysis:  ${GREEN}./scripts/analysis/analyze_session.sh ${OUTPUT_DIR}${NC}"
 if [ "$CAPTURE" = true ]; then
-    echo -e "  3. Vision:          Feed screenshots to Claude for visual analysis"
+    echo -e "  4. Vision:          Feed screenshots to Claude for visual analysis"
+    echo -e "  5. Calibration:     Run ${GREEN}./scripts/paper_trading.sh ${ASSET} 3600 --report${NC} for full analysis"
+    echo -e "  6. Live trading:    Run ${GREEN}./scripts/test_testnet.sh${NC} (testnet) or ${GREEN}./scripts/test_mainnet.sh${NC}"
+else
     echo -e "  4. Calibration:     Run ${GREEN}./scripts/paper_trading.sh ${ASSET} 3600 --report${NC} for full analysis"
     echo -e "  5. Live trading:    Run ${GREEN}./scripts/test_testnet.sh${NC} (testnet) or ${GREEN}./scripts/test_mainnet.sh${NC}"
-else
-    echo -e "  3. Calibration:     Run ${GREEN}./scripts/paper_trading.sh ${ASSET} 3600 --report${NC} for full analysis"
-    echo -e "  4. Live trading:    Run ${GREEN}./scripts/test_testnet.sh${NC} (testnet) or ${GREEN}./scripts/test_mainnet.sh${NC}"
 fi
 echo ""
