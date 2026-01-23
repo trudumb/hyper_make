@@ -26,6 +26,11 @@ impl PositionTracker {
         self.position
     }
 
+    /// Get the net position (alias for position for API compatibility).
+    pub fn net_position(&self) -> f64 {
+        self.position
+    }
+
     /// Set the position directly (used for initialization/sync).
     pub fn set_position(&mut self, position: f64) {
         self.position = position;

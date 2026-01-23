@@ -34,7 +34,9 @@ pub mod changepoint;
 pub mod controller;
 pub mod information;
 pub mod interface;
+pub mod simulation;
 pub mod state;
+pub mod traits;
 pub mod types;
 pub mod value;
 
@@ -46,6 +48,14 @@ pub use controller::{ControllerConfig, OptimalController};
 pub use information::{InformationConfig, InformationValue};
 pub use interface::{GaussianEstimate, LearningModuleOutput, ModelPrediction, TradingState};
 pub use state::{ControlState, StateConfig};
+pub use simulation::{
+    CascadeScenario, HistoricalReplay, MarketScenario, MeanRevertingScenario, MonteCarloResult,
+    SimulationConfig, SimulationEngine, SimulationResult, TrendingScenario,
+};
+pub use traits::{
+    BeliefProvider, ControlOutput, ControlReason, ControlSolver, ControlStateProvider,
+    MarketMicrostructure, ObservableState, StateSnapshot, ValueFunctionSolver,
+};
 pub use types::{DirichletPosterior, DiscreteDistribution, GammaPosterior, NormalGammaPosterior};
 
 use crate::market_maker::fills::FillEvent;

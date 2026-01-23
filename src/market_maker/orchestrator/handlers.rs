@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::prelude::Result;
 use crate::Message;
@@ -97,6 +97,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
 
         let _result = messages::process_trades(&trades, &ctx, &mut state)?;
+
+        // === Phase 2/3 Component Updates ===
+        // TODO: Once regime_hmm is added to StochasticComponents, update here:
+        // Update regime HMM with trade observation
+        // let obs = HmmObservation {
+        //     volatility: self.estimator.sigma(),
+        //     spread_bps: self.tier2.spread_tracker.current_spread_bps().unwrap_or(5.0),
+        //     flow_imbalance: self.tier2.hawkes.flow_imbalance(),
+        // };
+        // self.stochastic.regime_hmm.forward_update(&obs);
+        //
+        // For now, log the observation data for debugging
+        trace!(
+            sigma = %format!("{:.6}", self.estimator.sigma()),
+            flow_imbalance = %format!("{:.3}", self.tier2.hawkes.flow_imbalance()),
+            "Trade observation processed (regime HMM not yet wired)"
+        );
+
         Ok(())
     }
 
@@ -275,6 +293,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
+        // === Phase 2/3 Component Updates ===
+        // TODO: Once fill_tracker, drawdown_tracker, and alerter are added to tiers:
+        //
+        // Update execution tracking
+        // for fill in &user_fills.data.fills {
+        //     if fill.coin != *self.config.asset { continue; }
+        //     let record = FillRecord::new(
+        //         fill.time,
+        //         Side::from_is_buy(fill.side == "B"),
+        //         fill.px.parse().unwrap_or(0.0),
+        //         fill.sz.parse().unwrap_or(0.0),
+        //         0, // queue_position - needs integration with queue_tracker
+        //         0.0, // latency_ms - needs order placement timestamp
+        //     );
+        //     self.infra.fill_tracker.record_fill(record);
+        // }
+        //
+        // Update drawdown tracker with new equity
+        // let current_equity = self.infra.margin_sizer.account_value();
+        // self.safety.drawdown_tracker.update_equity(current_equity);
+        //
+        // Check for fill rate alerts
+        // let fill_metrics = self.infra.fill_tracker.metrics();
+        // if let Some(alert) = self.infra.alerter.check_fill_rate(
+        //     fill_metrics.fill_rate,
+        //     self.stochastic.calibration_controller.target_fill_rate(),
+        //     std::time::SystemTime::now()
+        //         .duration_since(std::time::UNIX_EPOCH)
+        //         .unwrap()
+        //         .as_millis() as u64,
+        // ) {
+        //     self.infra.alerter.add_alert(alert);
+        // }
+        trace!(
+            total_volume_usd = %format!("{:.2}", result.total_volume_usd),
+            "Fill processed (Phase 2/3 components not yet wired)"
+        );
+
         // Margin refresh on fills
         const MARGIN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
         if self.infra.last_margin_refresh.elapsed() > MARGIN_REFRESH_INTERVAL {
@@ -330,6 +386,38 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
             }
+
+            // === Phase 2/3 Component Updates ===
+            // TODO: Once circuit_breaker and dashboard are added to tiers:
+            //
+            // Calculate current spread for circuit breaker
+            // let spread_bps = if !bids.is_empty() && !asks.is_empty() {
+            //     let best_bid = bids.first().map(|(p, _)| *p).unwrap_or(0.0);
+            //     let best_ask = asks.first().map(|(p, _)| *p).unwrap_or(0.0);
+            //     if best_bid > 0.0 {
+            //         ((best_ask - best_bid) / best_bid) * 10_000.0
+            //     } else {
+            //         0.0
+            //     }
+            // } else {
+            //     0.0
+            // };
+            //
+            // Update circuit breaker with spread
+            // if let Some(cb_type) = self.tier1.circuit_breaker.check_spread(spread_bps) {
+            //     warn!(breaker = %cb_type, spread_bps = %format!("{:.1}", spread_bps),
+            //           "Circuit breaker triggered by spread blowout");
+            // }
+            //
+            // Update monitoring dashboard
+            // let regime = self.stochastic.regime_hmm.current_regime();
+            // let confidence = self.stochastic.regime_hmm.max_belief();
+            // self.infra.dashboard.update_market(regime, confidence, spread_bps, self.latest_mid);
+            trace!(
+                best_bid = ?bids.first().map(|(p, _)| *p),
+                best_ask = ?asks.first().map(|(p, _)| *p),
+                "L2 book processed (Phase 2/3 components not yet wired)"
+            );
         }
 
         Ok(())
@@ -759,5 +847,56 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
         Ok(())
+    }
+
+    /// Called periodically (e.g., every 1s) to update component states.
+    ///
+    /// This method performs periodic maintenance tasks that don't need to happen
+    /// on every market data tick but should run regularly.
+    ///
+    /// # Phase 2/3 Integration
+    ///
+    /// TODO: Once ensemble, model_calibration, and alerter are added to tiers:
+    /// - Recompute ensemble weights based on recent model performance
+    /// - Update model calibration metrics
+    /// - Check for degraded models and trigger alerts
+    pub fn periodic_component_update(&mut self) {
+        // === Phase 2/3 Component Updates ===
+        //
+        // TODO: Uncomment and wire once components are added to StochasticComponents/InfraComponents:
+        //
+        // // Recompute ensemble weights based on recent performance
+        // self.stochastic.ensemble.compute_weights();
+        //
+        // // Update model calibration tracking
+        // let now = std::time::SystemTime::now()
+        //     .duration_since(std::time::UNIX_EPOCH)
+        //     .unwrap()
+        //     .as_millis() as u64;
+        // self.stochastic.model_calibration.update_all(now);
+        //
+        // // Check for degraded models and create alerts
+        // if self.stochastic.model_calibration.is_any_degraded() {
+        //     let degraded_models = self.stochastic.model_calibration.degraded_models();
+        //     for model_name in degraded_models {
+        //         let ir = self.stochastic.model_calibration.get_ir(&model_name).unwrap_or(0.0);
+        //         if let Some(alert) = self.infra.alerter.check_calibration(ir, &model_name, now) {
+        //             warn!(
+        //                 model = %model_name,
+        //                 ir = %format!("{:.2}", ir),
+        //                 "Model calibration degraded"
+        //             );
+        //             self.infra.alerter.add_alert(alert);
+        //         }
+        //     }
+        // }
+
+        // Log current state for debugging
+        trace!(
+            sigma = %format!("{:.6}", self.estimator.sigma()),
+            kappa = %format!("{:.3}", self.estimator.kappa()),
+            position = %format!("{:.4}", self.position.position()),
+            "Periodic component update (Phase 2/3 components not yet wired)"
+        );
     }
 }

@@ -965,7 +965,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Find closest desired price
                             let min_diff_bps = prices_to_check.iter()
-                                .map(|p| ((order.price - p).abs() / state.mid_price * 10_000.0))
+                                .map(|p| (order.price - p).abs() / state.mid_price * 10_000.0)
                                 .fold(f64::MAX, f64::min);
 
                             // Cancel if no desired price is within threshold

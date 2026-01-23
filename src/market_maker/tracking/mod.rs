@@ -8,9 +8,11 @@
 //! - **WsOrderState**: WebSocket-based order state management (new)
 //! - **AssetId**: Unique identifier for assets (multi-asset support)
 //! - **Calibration**: Prediction calibration tracking for model validation
+//! - **CalibrationWiring**: Wrappers connecting calibration to existing models
 
 mod asset_id;
 pub mod calibration;
+pub mod calibration_wiring;
 mod order_manager;
 mod pnl;
 mod position;
@@ -25,6 +27,14 @@ pub use calibration::{
     LinkedPredictionOutcome, OutcomeLog, PredictionLog, PredictionOutcomeStore, PredictionType,
     // Small Fish Strategy signal MI (Mutual Information) tracking
     SignalMiTracker,
+};
+pub use calibration_wiring::{
+    // Calibrated model wrappers
+    CalibratedFillModel, CalibratedFillModelConfig,
+    CalibratedAdverseSelection, CalibratedAdverseSelectionConfig,
+    CalibratedLagAnalyzer, CalibratedLagAnalyzerConfig,
+    // Orchestrator
+    ModelCalibrationOrchestrator, ModelCalibrationSummary,
 };
 pub use order_manager::*;
 pub use pnl::*;

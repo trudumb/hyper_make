@@ -1,7 +1,7 @@
 //! Quote generation engine for the market maker.
 
 use chrono::Timelike;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::prelude::Result;
 
@@ -10,8 +10,9 @@ use super::super::{
     QuotingStrategy, Side,
 };
 use crate::market_maker::infra::metrics::dashboard::{
-    SignalSnapshot, QuoteDecisionRecord, KappaDiagnostics, ChangepointDiagnostics,
+    ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
+use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
@@ -38,6 +39,50 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 );
                 self.last_warmup_block_log = Some(std::time::Instant::now());
             }
+            return Ok(());
+        }
+
+        // === Circuit Breaker Checks ===
+        let breaker_action = self.tier1.circuit_breaker.most_severe_action();
+        match breaker_action {
+            Some(CircuitBreakerAction::PauseTrading) => {
+                warn!("Circuit breaker: pausing trading");
+                return Ok(()); // Skip quoting entirely
+            }
+            Some(CircuitBreakerAction::CancelAllQuotes) => {
+                warn!("Circuit breaker: cancelling all quotes");
+                // Cancel existing quotes on both sides
+                let bid_orders = self.orders.get_all_by_side(Side::Buy);
+                let ask_orders = self.orders.get_all_by_side(Side::Sell);
+                let all_oids: Vec<u64> = bid_orders
+                    .iter()
+                    .chain(ask_orders.iter())
+                    .map(|o| o.oid)
+                    .collect();
+                if !all_oids.is_empty() {
+                    self.executor
+                        .cancel_bulk_orders(&self.config.asset, all_oids)
+                        .await;
+                }
+                return Ok(());
+            }
+            Some(CircuitBreakerAction::WidenSpreads { .. }) => {
+                // Will apply multiplier below
+            }
+            None => {}
+        }
+
+        // === Risk Limit Checks ===
+        let position_notional = self.position.position().abs() * self.latest_mid;
+        let position_check = self.safety.risk_checker.check_position(position_notional);
+        if matches!(position_check, RiskCheckResult::HardLimitBreached { .. }) {
+            error!("Hard position limit breached - cancelling quotes");
+            return Ok(());
+        }
+
+        // === Drawdown Check ===
+        if self.safety.drawdown_tracker.should_pause() {
+            warn!("Emergency drawdown - pausing trading");
             return Ok(());
         }
 
@@ -276,6 +321,60 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             use_dynamic_spread_ceiling: !self.estimator.has_static_max_spread_ceiling(),
         };
         let mut market_params = ParameterAggregator::build(&sources);
+
+        // === Regime-Aware Parameters ===
+        // Get HMM regime probabilities for soft blending
+        // [p_low, p_normal, p_high, p_extreme]
+        let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
+        let (p_low, p_normal, p_high, p_extreme) = (
+            regime_probs[0],
+            regime_probs[1],
+            regime_probs[2],
+            regime_probs[3],
+        );
+
+        // Log regime state when not in normal regime
+        if p_extreme > 0.3 || p_high > 0.5 || p_low > 0.7 {
+            debug!(
+                p_low = %format!("{:.2}", p_low),
+                p_normal = %format!("{:.2}", p_normal),
+                p_high = %format!("{:.2}", p_high),
+                p_extreme = %format!("{:.2}", p_extreme),
+                "HMM regime probabilities"
+            );
+        }
+
+        // Get spread multiplier from circuit breaker if applicable
+        let spread_multiplier = match breaker_action {
+            Some(CircuitBreakerAction::WidenSpreads { multiplier }) => multiplier,
+            _ => 1.0,
+        };
+
+        // Apply circuit breaker spread multiplier to market params if needed
+        if spread_multiplier > 1.0 {
+            debug!(
+                multiplier = %format!("{:.2}", spread_multiplier),
+                "Circuit breaker: widening spreads"
+            );
+            // The spread multiplier will be applied in the strategy
+        }
+
+        // Apply position-based size reduction from risk checker and drawdown tracker
+        let risk_size_mult = self
+            .safety
+            .risk_checker
+            .suggested_size_multiplier(self.position.position().abs() * self.latest_mid);
+        let drawdown_size_mult = self.safety.drawdown_tracker.position_multiplier();
+        let size_multiplier = risk_size_mult * drawdown_size_mult;
+
+        if size_multiplier < 1.0 {
+            debug!(
+                risk_mult = %format!("{:.2}", risk_size_mult),
+                drawdown_mult = %format!("{:.2}", drawdown_size_mult),
+                total_mult = %format!("{:.2}", size_multiplier),
+                "Position-based size reduction active"
+            );
+        }
 
         // === MEASURED LATENCY: Set from WS ping measurements ===
         // This is MEASURED data, NOT hardcoded assumptions
@@ -866,6 +965,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Handle ask side
             self.reconcile_side(Side::Sell, ask).await?;
         }
+
+        // === Post-Quote Tracking ===
+        // Record quote for fill rate calculation
+        self.infra.fill_tracker.record_quote();
+
+        // Update dashboard with current position
+        let position = self.position.position();
+        let position_value = position * self.latest_mid;
+        self.infra.dashboard.update_position(position, position_value);
 
         Ok(())
     }

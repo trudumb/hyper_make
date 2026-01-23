@@ -763,7 +763,7 @@ mod tests {
         );
 
         // a-b (0,1) should be in the list
-        let has_ab = pairs.iter().any(|(i, j, _)| (*i == 0 && *j == 1));
+        let has_ab = pairs.iter().any(|(i, j, _)| *i == 0 && *j == 1);
         assert!(has_ab, "Should find a-b pair");
     }
 

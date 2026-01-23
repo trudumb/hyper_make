@@ -297,6 +297,128 @@ impl Default for StateConfig {
     }
 }
 
+// === Trait implementations for trait-based architecture ===
+
+use super::traits::{BeliefProvider, ControlStateProvider, MarketMicrostructure, ObservableState};
+
+impl ObservableState for ControlState {
+    fn position(&self) -> f64 {
+        self.position
+    }
+
+    fn wealth(&self) -> f64 {
+        self.wealth
+    }
+
+    fn margin_used(&self) -> f64 {
+        self.margin_used
+    }
+
+    fn time(&self) -> f64 {
+        self.time
+    }
+
+    fn time_to_funding(&self) -> f64 {
+        self.time_to_funding
+    }
+
+    fn predicted_funding(&self) -> f64 {
+        self.predicted_funding
+    }
+
+    fn drawdown(&self) -> f64 {
+        self.drawdown
+    }
+
+    fn reduce_only(&self) -> bool {
+        self.reduce_only
+    }
+
+    fn learning_trust(&self) -> f64 {
+        self.learning_trust
+    }
+}
+
+impl BeliefProvider for ControlState {
+    fn expected_fill_rate(&self) -> f64 {
+        self.belief.expected_fill_rate()
+    }
+
+    fn fill_rate_uncertainty(&self) -> f64 {
+        self.belief.fill_rate_uncertainty()
+    }
+
+    fn expected_as(&self) -> f64 {
+        self.belief.expected_as()
+    }
+
+    fn as_uncertainty(&self) -> f64 {
+        self.belief.as_uncertainty()
+    }
+
+    fn expected_edge(&self) -> f64 {
+        self.belief.expected_edge()
+    }
+
+    fn edge_uncertainty(&self) -> f64 {
+        self.belief.total_edge_uncertainty
+    }
+
+    fn p_positive_edge(&self) -> f64 {
+        self.belief.p_positive_edge()
+    }
+
+    fn confidence(&self) -> f64 {
+        self.belief.confidence()
+    }
+
+    fn epistemic_uncertainty(&self) -> f64 {
+        self.belief.epistemic_uncertainty
+    }
+
+    fn n_fills(&self) -> u64 {
+        self.belief.n_fills
+    }
+
+    fn regime_probs(&self) -> [f64; 3] {
+        self.vol_regime.probs
+    }
+
+    fn current_regime(&self) -> usize {
+        self.vol_regime.argmax()
+    }
+
+    fn regime_entropy(&self) -> f64 {
+        self.vol_regime.entropy()
+    }
+}
+
+impl MarketMicrostructure for ControlState {
+    fn is_model_degraded(&self) -> bool {
+        self.model_health.is_degraded()
+    }
+
+    fn can_quote(&self) -> bool {
+        !self.reduce_only && !self.model_health.is_degraded()
+    }
+
+    fn risk_score(&self) -> f64 {
+        let drawdown_risk = self.drawdown;
+        let position_risk = self.position.abs() / 10.0;
+        let model_risk = if self.model_health.is_degraded() {
+            1.0
+        } else {
+            0.0
+        };
+        let trust_risk = 1.0 - self.learning_trust;
+
+        (0.4 * drawdown_risk + 0.3 * position_risk + 0.2 * model_risk + 0.1 * trust_risk)
+            .clamp(0.0, 1.0)
+    }
+}
+
+impl ControlStateProvider for ControlState {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

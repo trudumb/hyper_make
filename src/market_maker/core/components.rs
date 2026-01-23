@@ -7,7 +7,8 @@ use crate::market_maker::{
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{StochasticController, StochasticControllerConfig},
-    estimator::{CalibrationController, CalibrationControllerConfig},
+    estimator::{CalibrationController, CalibrationControllerConfig, RegimeHMM},
+    execution::{FillTracker, OrderLifecycleTracker},
     fills::FillProcessor,
     infra::{
         ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
@@ -16,13 +17,21 @@ use crate::market_maker::{
         ProactiveRateLimitTracker, PrometheusMetrics, ReconciliationConfig, RecoveryConfig,
         RecoveryManager, RejectionRateLimitConfig, RejectionRateLimiter, SupervisorConfig,
     },
+    learning::AdaptiveEnsemble,
+    monitoring::{AlertConfig, Alerter, DashboardState},
     process_models::{
         FundingConfig, FundingRateEstimator, HJBConfig, HJBInventoryController, HawkesConfig,
         HawkesOrderFlowEstimator, LiquidationCascadeDetector, LiquidationConfig, SpreadConfig,
         SpreadProcessEstimator,
     },
-    risk::{KillSwitch, KillSwitchConfig, RiskAggregator},
-    tracking::{ImpulseFilter, PnLConfig, PnLTracker, QueueConfig, QueuePositionTracker},
+    risk::{
+        CircuitBreakerConfig, CircuitBreakerMonitor, DrawdownConfig, DrawdownTracker, KillSwitch,
+        KillSwitchConfig, RiskAggregator, RiskChecker, RiskLimits,
+    },
+    tracking::{
+        ImpulseFilter, ModelCalibrationOrchestrator, PnLConfig, PnLTracker, QueueConfig,
+        QueuePositionTracker,
+    },
     DynamicRiskConfig, StochasticConfig,
 };
 
@@ -32,6 +41,7 @@ use crate::market_maker::{
 /// - Adverse selection measurement
 /// - Queue position tracking
 /// - Liquidation cascade detection
+/// - Circuit breaker monitoring
 pub struct Tier1Components {
     /// Adverse selection estimator
     pub adverse_selection: AdverseSelectionEstimator,
@@ -41,6 +51,8 @@ pub struct Tier1Components {
     pub queue_tracker: QueuePositionTracker,
     /// Liquidation cascade detector
     pub liquidation_detector: LiquidationCascadeDetector,
+    /// Circuit breaker for market condition monitoring
+    pub circuit_breaker: CircuitBreakerMonitor,
 }
 
 impl Tier1Components {
@@ -50,11 +62,27 @@ impl Tier1Components {
         queue_config: QueueConfig,
         liquidation_config: LiquidationConfig,
     ) -> Self {
+        Self::with_circuit_breaker(
+            as_config,
+            queue_config,
+            liquidation_config,
+            CircuitBreakerConfig::default(),
+        )
+    }
+
+    /// Create Tier 1 components with custom circuit breaker config.
+    pub fn with_circuit_breaker(
+        as_config: AdverseSelectionConfig,
+        queue_config: QueueConfig,
+        liquidation_config: LiquidationConfig,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Self {
         Self {
             adverse_selection: AdverseSelectionEstimator::new(as_config),
             depth_decay_as: DepthDecayAS::default(),
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
+            circuit_breaker: CircuitBreakerMonitor::new(circuit_breaker_config),
         }
     }
 }
@@ -102,15 +130,37 @@ pub struct SafetyComponents {
     pub risk_aggregator: RiskAggregator,
     /// Fill processor
     pub fill_processor: FillProcessor,
+    /// Position and order limit checker
+    pub risk_checker: RiskChecker,
+    /// Equity drawdown tracker
+    pub drawdown_tracker: DrawdownTracker,
 }
 
 impl SafetyComponents {
     /// Create safety components from config.
     pub fn new(kill_switch_config: KillSwitchConfig, risk_aggregator: RiskAggregator) -> Self {
+        Self::with_risk_limits(
+            kill_switch_config,
+            risk_aggregator,
+            RiskLimits::default(),
+            DrawdownConfig::default(),
+        )
+    }
+
+    /// Create safety components with custom risk limits and drawdown config.
+    pub fn with_risk_limits(
+        kill_switch_config: KillSwitchConfig,
+        risk_aggregator: RiskAggregator,
+        risk_limits: RiskLimits,
+        drawdown_config: DrawdownConfig,
+    ) -> Self {
         Self {
             kill_switch: KillSwitch::new(kill_switch_config),
             risk_aggregator,
             fill_processor: FillProcessor::new(),
+            risk_checker: RiskChecker::new(risk_limits),
+            // Initial equity of 10,000 is a placeholder; updated on first margin refresh
+            drawdown_tracker: DrawdownTracker::new(drawdown_config, 10_000.0),
         }
     }
 }
@@ -155,6 +205,14 @@ pub struct InfraComponents {
     pub impulse_control_enabled: bool,
     /// Cached exchange rate limit (from userRateLimit API)
     pub cached_rate_limit: Option<CachedRateLimit>,
+    /// Monitoring alerts
+    pub alerter: Alerter,
+    /// Dashboard state for display
+    pub dashboard: DashboardState,
+    /// Execution quality tracker
+    pub fill_tracker: FillTracker,
+    /// Order lifecycle tracker
+    pub order_lifecycle: OrderLifecycleTracker,
 }
 
 /// Cached exchange rate limit with timestamp.
@@ -305,6 +363,11 @@ impl InfraComponents {
             impulse_filter: ImpulseFilter::new(impulse_config.filter.clone()),
             impulse_control_enabled: impulse_config.enabled,
             cached_rate_limit: None,
+            // Phase 2/3 monitoring components with defaults
+            alerter: Alerter::new(AlertConfig::default(), 1000),
+            dashboard: DashboardState::default(),
+            fill_tracker: FillTracker::new(1000),
+            order_lifecycle: OrderLifecycleTracker::new(1000),
         }
     }
 }
@@ -324,6 +387,12 @@ pub struct StochasticComponents {
     pub calibration_controller: CalibrationController,
     /// Layer 3: Stochastic controller (POMDP-based sequential decisions)
     pub controller: StochasticController,
+    /// HMM-based regime detection for soft regime probabilities
+    pub regime_hmm: RegimeHMM,
+    /// Model calibration orchestrator
+    pub model_calibration: ModelCalibrationOrchestrator,
+    /// Adaptive model ensemble
+    pub ensemble: AdaptiveEnsemble,
 }
 
 impl StochasticComponents {
@@ -365,6 +434,9 @@ impl StochasticComponents {
             adaptive_spreads: AdaptiveSpreadCalculator::new(adaptive_config),
             calibration_controller: CalibrationController::new(calibration_config),
             controller: StochasticController::new(controller_config),
+            regime_hmm: RegimeHMM::new(),
+            model_calibration: ModelCalibrationOrchestrator::default(),
+            ensemble: AdaptiveEnsemble::default(),
         }
     }
 }
@@ -384,6 +456,19 @@ mod tests {
     }
 
     #[test]
+    fn test_tier1_with_circuit_breaker() {
+        let config = CircuitBreakerConfig::default();
+        let tier1 = Tier1Components::with_circuit_breaker(
+            AdverseSelectionConfig::default(),
+            QueueConfig::default(),
+            LiquidationConfig::default(),
+            config,
+        );
+        // Circuit breaker should have no triggered breakers initially
+        assert!(tier1.circuit_breaker.triggered_breakers().is_empty());
+    }
+
+    #[test]
     fn test_tier2_construction() {
         let tier2 = Tier2Components::new(
             HawkesConfig::default(),
@@ -392,5 +477,47 @@ mod tests {
             PnLConfig::default(),
         );
         assert!((tier2.pnl_tracker.summary(50000.0).total_pnl).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_safety_components_construction() {
+        let safety = SafetyComponents::new(
+            KillSwitchConfig::default(),
+            RiskAggregator::new(),
+        );
+        // Kill switch should not be triggered initially
+        assert!(!safety.kill_switch.is_triggered());
+        // Risk checker should be created with defaults
+        assert!(!safety.risk_checker.check_order_size(0.5).is_breach());
+    }
+
+    #[test]
+    fn test_safety_components_with_risk_limits() {
+        use crate::market_maker::risk::RiskCheckResult;
+        let limits = RiskLimits::default().with_max_order_size(0.1);
+        let safety = SafetyComponents::with_risk_limits(
+            KillSwitchConfig::default(),
+            RiskAggregator::new(),
+            limits,
+            DrawdownConfig::default(),
+        );
+        // Risk checker should enforce the custom limit
+        assert_eq!(safety.risk_checker.check_order_size(0.05), RiskCheckResult::Ok);
+        assert!(safety.risk_checker.check_order_size(0.2).is_hard_breach());
+    }
+
+    #[test]
+    fn test_stochastic_components_construction() {
+        let stochastic = StochasticComponents::new(
+            HJBConfig::default(),
+            StochasticConfig::default(),
+            DynamicRiskConfig::default(),
+        );
+        // Regime HMM should start with Normal as most likely
+        let belief = stochastic.regime_hmm.regime_probabilities();
+        assert!(belief[1] > 0.5); // Normal regime index is 1
+        // Ensemble should start empty
+        let summary = stochastic.ensemble.summary();
+        assert_eq!(summary.total_models, 0);
     }
 }

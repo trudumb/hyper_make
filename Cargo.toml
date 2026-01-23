@@ -45,6 +45,9 @@ portable-atomic = { version = "1.6", features = ["float"] }
 smallvec = "1.11"
 bumpalo = { version = "3.16", features = ["collections"] }
 
+# Compile-time assertions for thread safety
+static_assertions = "1.1"
+
 # Random number generation for stochastic allocation
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
@@ -60,6 +63,14 @@ path = "src/bin/parameter_estimator.rs"
 [[bin]]
 name = "paper_trader"
 path = "src/bin/paper_trader.rs"
+
+[[bin]]
+name = "health_dashboard"
+path = "src/bin/health_dashboard.rs"
+
+[[bin]]
+name = "calibration_report"
+path = "src/bin/calibration_report.rs"
 
 # Fast release builds (for dev iteration)
 [profile.release]

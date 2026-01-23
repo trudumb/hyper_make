@@ -483,6 +483,85 @@ impl OptimalController {
     }
 }
 
+// === Trait implementations for trait-based architecture ===
+
+use super::traits::{
+    ControlOutput, ControlSolver, ControlStateProvider, ValueFunctionSolver,
+};
+use crate::market_maker::strategy::MarketParams;
+
+impl ControlSolver for OptimalController {
+    fn solve(
+        &self,
+        state: &dyn ControlStateProvider,
+        _market_params: &MarketParams,
+    ) -> ControlOutput {
+        // Convert trait object to ControlState for compatibility with existing logic
+        // This creates a temporary ControlState from the provider
+        let control_state = self.state_from_provider(state);
+        let (action, expected_value) = self.optimal_action(&control_state);
+
+        let confidence = state.overall_confidence();
+
+        ControlOutput {
+            action,
+            expected_value,
+            confidence,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "OptimalController"
+    }
+}
+
+impl ValueFunctionSolver for OptimalController {
+    fn q_value(&self, state: &dyn ControlStateProvider, action: &Action) -> f64 {
+        let control_state = self.state_from_provider(state);
+        self.q_value(&control_state, action)
+    }
+
+    fn n_updates(&self) -> usize {
+        self.value_function_updates()
+    }
+}
+
+impl OptimalController {
+    /// Create a ControlState from a ControlStateProvider.
+    ///
+    /// This is a helper for the trait-based interface to work with
+    /// the existing concrete-type methods.
+    fn state_from_provider(&self, provider: &dyn ControlStateProvider) -> ControlState {
+        use super::belief::BeliefState;
+        use super::types::DiscreteDistribution;
+        use crate::market_maker::learning::ModelHealth;
+
+        ControlState {
+            wealth: provider.wealth(),
+            position: provider.position(),
+            margin_used: provider.margin_used(),
+            time: provider.time(),
+            belief: BeliefState::default(), // We use trait methods instead
+            vol_regime: {
+                let probs = provider.regime_probs();
+                DiscreteDistribution { probs }
+            },
+            time_to_funding: provider.time_to_funding(),
+            predicted_funding: provider.predicted_funding(),
+            learning_trust: provider.learning_trust(),
+            model_health: if provider.is_model_degraded() {
+                let mut health = ModelHealth::default();
+                health.overall = crate::market_maker::learning::Health::Degraded;
+                health
+            } else {
+                ModelHealth::default()
+            },
+            reduce_only: provider.reduce_only(),
+            drawdown: provider.drawdown(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

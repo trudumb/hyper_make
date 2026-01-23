@@ -8,10 +8,12 @@
 
 pub mod adaptive;
 mod adverse_selection;
+pub mod calibration;
 mod config;
 pub mod core;
 mod estimator;
 pub mod events;
+pub mod execution;
 pub mod fills;
 pub mod infra;
 pub mod messages;
@@ -24,15 +26,37 @@ mod strategy;
 pub mod tracking;
 
 pub mod control;
+pub mod edge;
 pub mod latent;
 pub mod learning;
+pub mod monitoring;
 pub mod simulation;
 
 mod orchestrator;
 
+#[cfg(test)]
+mod tests;
+
 pub use adverse_selection::*;
+pub use calibration::{
+    BrierScoreTracker, ConditionalCalibration, InformationRatioTracker, PredictionLog,
+    PredictionRecord, PredictionType,
+};
 pub use config::*;
+pub use edge::{
+    ABMetrics, ABTest, ABTestConfig, ABTestManager, ABVariant, EdgeSignalKind, HealthStatus,
+    SignalHealth, SignalHealthMonitor, SignalHealthSummary,
+};
+pub use monitoring::{
+    Alert, AlertConfig, AlertHandler, AlertSeverity, AlertType, Alerter,
+    DashboardState as MonitoringDashboardState, LoggingAlertHandler, PositionSide,
+};
 pub use estimator::*;
+pub use execution::{
+    CancelAnalysis, FillMetrics, FillRecord, FillStatistics, FillTracker, OrderEvent,
+    OrderLifecycle, OrderLifecycleTracker, OrderState as ExecutionOrderState,
+    Side as ExecutionSide,
+};
 pub use infra::*;
 pub use process_models::*;
 pub use quoting::*;

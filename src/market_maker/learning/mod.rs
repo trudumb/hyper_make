@@ -10,6 +10,7 @@
 //! Level 0: ParameterEstimator (exists) - σ, κ, microprice estimates
 //! Level 1: ModelConfidenceTracker     - track prediction vs realization
 //! Level 2: ModelEnsemble              - multiple edge models, weighted
+//! Level 2.5: AdaptiveEnsemble         - dynamic IR-based model weighting
 //! Level 3: DecisionEngine             - formal P(edge > 0) criterion
 //! Level 4: ExecutionOptimizer         - utility-maximizing ladder
 //! Level 5: CrossAssetSignals          - BTC lead-lag, funding divergence
@@ -24,6 +25,7 @@
 //!
 //! This is online learning with labels from trading outcomes.
 
+pub mod adaptive_ensemble;
 pub mod confidence;
 pub mod decision;
 pub mod ensemble;
@@ -31,6 +33,7 @@ pub mod execution;
 pub mod types;
 
 // Re-export key types
+pub use adaptive_ensemble::{AdaptiveEnsemble, EnsembleSummary, ModelPerformance};
 pub use confidence::ModelConfidenceTracker;
 pub use decision::DecisionEngine;
 pub use ensemble::{EdgeModel, ModelEnsemble};

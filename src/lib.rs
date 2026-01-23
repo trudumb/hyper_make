@@ -148,6 +148,17 @@ pub use market_maker::{
     VolatilityRegime,
     // WebSocket POST Configuration
     WsPostConfig,
+    // Execution Quality Tracking
+    CancelAnalysis,
+    FillMetrics,
+    FillRecord,
+    FillStatistics,
+    FillTracker,
+    OrderEvent,
+    OrderLifecycle,
+    OrderLifecycleTracker,
+    ExecutionOrderState,
+    ExecutionSide,
 };
 pub use meta::{
     AssetContext, AssetMeta, CollateralInfo, Meta, MetaAndAssetCtxs, PerpDex, PerpDexLimits,

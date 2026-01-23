@@ -45,6 +45,7 @@ mod mock;
 mod momentum;
 pub mod mutual_info;
 mod parameter_estimator;
+pub mod regime_hmm;
 pub mod temporal;
 mod robust_kappa;
 mod soft_jump;
@@ -108,6 +109,9 @@ pub use temporal::{
 
 // Lag analysis for cross-exchange signals
 pub use lag_analysis::{LagAnalyzer, LagAnalyzerConfig, LagDecayTracker};
+
+// HMM-based regime detection
+pub use regime_hmm::{EmissionParams, Observation as HmmObservation, RegimeHMM, NUM_REGIMES};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability
