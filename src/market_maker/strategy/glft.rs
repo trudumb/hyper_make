@@ -235,6 +235,78 @@ impl GLFTStrategy {
         glft_spread + self.risk_config.maker_fee_rate
     }
 
+    /// Proactive directional skew based on momentum predictions.
+    ///
+    /// **Key Insight:** This is the OPPOSITE of inventory skew:
+    /// - Inventory skew: When you HAVE position, skew to REDUCE it
+    /// - Proactive skew: When you DON'T have position, skew to BUILD with momentum
+    ///
+    /// # How it works
+    /// When momentum is strong and confident, skew quotes to BUILD position:
+    /// - Positive momentum → want to be long → tighten bids, widen asks → negative skew
+    /// - Negative momentum → want to be short → tighten asks, widen bids → positive skew
+    ///
+    /// # When applied
+    /// - Only when inventory is small (proactive mode)
+    /// - Only when momentum confidence > threshold (clear signal)
+    /// - Only when momentum strength > threshold (not noise)
+    ///
+    /// # Regime awareness
+    /// - Trending: Trust momentum more (1.5x)
+    /// - Mean-reverting: Don't chase (0.3x)
+    /// - Volatile: Cautious (0.5x)
+    /// - Quiet: Normal (1.0x)
+    /// Compute proactive directional skew based on momentum predictions.
+    ///
+    /// This is the OPPOSITE of inventory skew - we WANT to get filled WITH momentum
+    /// to BUILD position in a profitable direction.
+    ///
+    /// Returns skew in fractional terms (divide by 10000 to get bps).
+    fn proactive_directional_skew(&self, market_params: &MarketParams) -> f64 {
+        // Check if proactive skew is enabled
+        if !market_params.enable_proactive_skew {
+            return 0.0;
+        }
+
+        let momentum_bps = market_params.momentum_bps;
+        let p_continuation = market_params.p_momentum_continue;
+
+        // Normalize momentum strength to [0, 1]
+        // 20 bps is considered "strong" momentum
+        let momentum_strength = (momentum_bps.abs() / 20.0).min(1.0);
+
+        // Check thresholds
+        if p_continuation < market_params.proactive_min_momentum_confidence {
+            return 0.0; // Not confident enough
+        }
+        if momentum_bps.abs() < market_params.proactive_min_momentum_bps {
+            return 0.0; // Too weak
+        }
+
+        // Direction: OPPOSITE of momentum to BUILD position WITH momentum
+        // Positive momentum → we want to get filled on bids → negative skew (tighter bids)
+        let direction = -momentum_bps.signum();
+
+        // Regime multiplier
+        use crate::market_maker::VolatilityRegime;
+        let regime_mult = match market_params.volatility_regime {
+            VolatilityRegime::Low => 1.2,     // Low vol, trust momentum
+            VolatilityRegime::Normal => 1.0,  // Normal behavior
+            VolatilityRegime::High => 0.5,    // Cautious in high vol
+            VolatilityRegime::Extreme => 0.2, // Very cautious in extreme vol
+        };
+
+        // Calculate proactive skew in bps
+        let proactive_skew_bps = direction
+            * momentum_strength
+            * p_continuation
+            * regime_mult
+            * market_params.proactive_skew_sensitivity;
+
+        // Convert to fractional (divide by 10000)
+        proactive_skew_bps / 10000.0
+    }
+
     /// Flow-adjusted inventory skew with exponential regularization.
     ///
     /// The flow_alignment ∈ [-1, 1] measures how aligned position is with flow:
@@ -768,8 +840,38 @@ impl QuotingStrategy for GLFTStrategy {
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
         // - momentum amplification: variance-derived multiplier when opposed
-        let skew =
+
+        // === 6.0: PROACTIVE DIRECTIONAL SKEW (Small Fish Strategy) ===
+        // When inventory is LOW, add proactive skew to BUILD position with momentum
+        // When inventory is HIGH, inventory skew dominates to REDUCE position
+        // The blend is additive: inventory_skew + proactive contribution
+        let proactive_skew = self.proactive_directional_skew(market_params);
+
+        // Inventory-reactive skew (existing behavior)
+        let inventory_skew =
             (base_skew + drift_urgency + hawkes_skew + funding_skew) * momentum_skew_multiplier;
+
+        // Blend: inventory skew always applies, proactive skew fades as inventory grows
+        // inventory_weight: 0 at zero inventory → 1 at max position
+        let inventory_weight = (position.abs() / effective_max_position).min(1.0);
+
+        // Proactive skew is additive when inventory is low, fades to zero at max inventory
+        // This ensures inventory skew always applies (preserves existing behavior)
+        // while adding proactive component when we have room to build position
+        let skew = inventory_skew + proactive_skew * (1.0 - inventory_weight);
+
+        if proactive_skew.abs() > 1e-8 {
+            tracing::info!(
+                proactive_skew_bps = %format!("{:.2}", proactive_skew * 10000.0),
+                inventory_skew_bps = %format!("{:.2}", inventory_skew * 10000.0),
+                inventory_weight = %format!("{:.2}", inventory_weight),
+                proactive_contribution_bps = %format!("{:.2}", proactive_skew * (1.0 - inventory_weight) * 10000.0),
+                blended_skew_bps = %format!("{:.2}", skew * 10000.0),
+                momentum_bps = %format!("{:.2}", market_params.momentum_bps),
+                p_continue = %format!("{:.2}", market_params.p_momentum_continue),
+                "Proactive skew active (Small Fish)"
+            );
+        }
 
         // Calculate flow modifier for logging (same as in inventory_skew_with_flow)
         let flow_alignment = inventory_ratio.signum() * market_params.flow_imbalance;

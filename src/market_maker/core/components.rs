@@ -6,7 +6,7 @@ use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::{ImpulseControlConfig, MetricsRecorder},
-    control::{StochasticController, StochasticControllerConfig},
+    control::{QuoteGate, StochasticController, StochasticControllerConfig},
     estimator::{CalibrationController, CalibrationControllerConfig, RegimeHMM},
     execution::{FillTracker, OrderLifecycleTracker},
     fills::FillProcessor,
@@ -393,6 +393,17 @@ pub struct StochasticComponents {
     pub model_calibration: ModelCalibrationOrchestrator,
     /// Adaptive model ensemble
     pub ensemble: AdaptiveEnsemble,
+
+    // === Proactive Position Management (Phase 1-4) ===
+    /// Time-based position ramp: limits max position based on session time
+    pub position_ramp: super::super::SessionPositionRamp,
+    /// Performance-gated capacity: adjusts max position based on P&L
+    pub performance_gating: super::super::PerformanceGatedCapacity,
+
+    // === Quote Gate (Directional Edge Gating) ===
+    /// Quote gate: decides WHETHER to quote based on directional edge.
+    /// Prevents whipsaw losses from random fills when no edge exists.
+    pub quote_gate: QuoteGate,
 }
 
 impl StochasticComponents {
@@ -427,6 +438,38 @@ impl StochasticComponents {
             ..CalibrationControllerConfig::default()
         };
 
+        // Create position ramp from stochastic config
+        use super::super::{RampCurve, SessionPositionRamp, PerformanceGatedCapacity};
+        let ramp_curve = match stochastic_config.ramp_curve.as_str() {
+            "linear" => RampCurve::Linear,
+            "log" => RampCurve::Log,
+            _ => RampCurve::Sqrt, // Default to sqrt
+        };
+        let mut position_ramp = SessionPositionRamp::new(
+            stochastic_config.ramp_duration_secs,
+            stochastic_config.ramp_initial_fraction,
+            ramp_curve,
+        );
+        // Start session immediately on construction
+        if stochastic_config.enable_position_ramp {
+            position_ramp.start_session();
+        }
+
+        // Create performance gating (will be configured with max_position later)
+        let performance_gating = if stochastic_config.enable_performance_gating {
+            PerformanceGatedCapacity::new(
+                0.0, // Will be updated with actual max_position
+                0.0, // Will be updated with mid price
+                stochastic_config.performance_loss_reduction_mult,
+                stochastic_config.performance_min_capacity_fraction,
+            )
+        } else {
+            PerformanceGatedCapacity::disabled(0.0)
+        };
+
+        // Create quote gate from stochastic config
+        let quote_gate = QuoteGate::new(stochastic_config.quote_gate_config());
+
         Self {
             hjb_controller: HJBInventoryController::new(hjb_config),
             stochastic_config,
@@ -437,6 +480,9 @@ impl StochasticComponents {
             regime_hmm: RegimeHMM::new(),
             model_calibration: ModelCalibrationOrchestrator::default(),
             ensemble: AdaptiveEnsemble::default(),
+            position_ramp,
+            performance_gating,
+            quote_gate,
         }
     }
 }

@@ -9,6 +9,7 @@ use super::super::{
     quoting, MarketMaker, OrderExecutor, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
     QuotingStrategy, Side,
 };
+use crate::market_maker::control::{QuoteGateDecision, QuoteGateInput};
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
@@ -322,6 +323,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
+        // FIX: Wire p_momentum_continue from actual momentum model
+        // (p_continuation was computed earlier from self.estimator.momentum_continuation_probability())
+        // This was hardcoded to 0.5 in aggregator.rs, causing Quote Gate to never open
+        market_params.p_momentum_continue = p_continuation;
+
         // === Regime-Aware Parameters ===
         // Get HMM regime probabilities for soft blending
         // [p_low, p_normal, p_high, p_extreme]
@@ -424,6 +430,87 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
         self.effective_max_position = new_effective;
+
+        // =======================================================================
+        // PROACTIVE POSITION MANAGEMENT (Phases 1-4)
+        // =======================================================================
+        // This transforms quoting from passive (react to fills) to proactive
+        // (assess → size appropriately → quote deliberately).
+
+        // Phase 1: Time-Based Position Ramp
+        // Limits max position based on session time elapsed
+        let ramp_fraction = if self.stochastic.stochastic_config.enable_position_ramp {
+            self.stochastic.position_ramp.current_fraction()
+        } else {
+            1.0 // Disabled: full capacity immediately
+        };
+        let ramped_max_position = new_effective * ramp_fraction;
+
+        // Phase 4: Performance-Gated Capacity
+        // Adjusts max position based on realized P&L (earn the right to size up)
+        let performance_fraction = if self.stochastic.stochastic_config.enable_performance_gating {
+            // Update performance gating with current state
+            self.stochastic.performance_gating.update_reference_price(self.latest_mid);
+            self.stochastic.performance_gating.update_base_max_position(ramped_max_position);
+
+            // Get realized P&L from tracker
+            let realized_pnl = self.tier2.pnl_tracker.summary(self.latest_mid).realized_pnl;
+            self.stochastic.performance_gating.capacity_fraction(realized_pnl)
+        } else {
+            1.0 // Disabled: full capacity
+        };
+        let performance_adjusted_max = ramped_max_position * performance_fraction;
+
+        // Phase 2: Confidence-Gated Sizing
+        // Scale quote size by model confidence
+        let confidence_size_mult = if self.stochastic.stochastic_config.enable_confidence_sizing {
+            // Build aggregate confidence from component confidences
+            let (vol_ticks, min_vol_ticks, trade_obs, min_trades) = self.estimator.warmup_progress();
+            let warmup_progress = if min_vol_ticks > 0 && min_trades > 0 {
+                let vol_progress = (vol_ticks as f64 / min_vol_ticks as f64).min(1.0);
+                let trade_progress = (trade_obs as f64 / min_trades as f64).min(1.0);
+                (vol_progress + trade_progress) / 2.0
+            } else {
+                1.0
+            };
+
+            let kappa_confidence = self.estimator.kappa_confidence();
+            let vol_confidence = if market_params.sigma > 0.0 { 0.8 } else { 0.3 }; // Vol estimate confidence
+            let as_confidence = if self.tier1.adverse_selection.is_warmed_up() { 0.7 } else { 0.3 };
+            let momentum_confidence = p_continuation; // Use momentum continuation probability
+
+            let aggregate_confidence = crate::market_maker::learning::AggregateConfidence::new(
+                momentum_confidence,
+                vol_confidence,
+                kappa_confidence,
+                as_confidence,
+                self.tier1.adverse_selection.fills_measured(),
+                warmup_progress < 0.99,
+            );
+            aggregate_confidence.size_multiplier()
+        } else {
+            1.0 // Disabled: full size
+        };
+
+        // Apply all proactive adjustments
+        let proactive_max_position = performance_adjusted_max;
+        let proactive_size_mult = confidence_size_mult;
+
+        // Log proactive adjustments when significant
+        if ramp_fraction < 0.99 || performance_fraction < 0.99 || confidence_size_mult < 0.99 {
+            debug!(
+                ramp_fraction = %format!("{:.2}", ramp_fraction),
+                ramp_elapsed_min = %format!("{:.1}", self.stochastic.position_ramp.elapsed_secs() / 60.0),
+                performance_fraction = %format!("{:.2}", performance_fraction),
+                confidence_mult = %format!("{:.2}", confidence_size_mult),
+                base_max = %format!("{:.4}", new_effective),
+                proactive_max = %format!("{:.4}", proactive_max_position),
+                "Proactive position management active"
+            );
+        }
+
+        // Update effective max position with proactive adjustments
+        self.effective_max_position = proactive_max_position;
 
         // Note: exchange limits were already updated BEFORE building sources (line ~1210)
         // using pre_effective_max_position which should equal new_effective
@@ -692,8 +779,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             1.0 // No filter, use full size
         };
 
-        // Apply decision sizing to effective target liquidity
-        let decision_adjusted_liquidity = self.effective_target_liquidity * decision_size_fraction;
+        // Apply decision sizing AND proactive confidence to effective target liquidity
+        let decision_adjusted_liquidity = self.effective_target_liquidity
+            * decision_size_fraction
+            * proactive_size_mult;
 
         // === LAYER 3: STOCHASTIC CONTROLLER ===
         // When enabled, provides POMDP-based sequential decision-making on top of Layer 2
@@ -824,6 +913,67 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
 
+        // === QUOTE GATE: Decide WHETHER to quote based on directional edge ===
+        // This prevents whipsaw losses from random fills when we have no directional edge.
+        // The gate uses flow_imbalance, momentum confidence, and position to decide.
+        let quote_gate_input = QuoteGateInput {
+            flow_imbalance: market_params.flow_imbalance,
+            momentum_confidence: market_params.p_momentum_continue,
+            momentum_bps: market_params.momentum_bps,
+            position: self.position.position(),
+            max_position: self.effective_max_position,
+            is_warmup: !self.estimator.is_warmed_up(),
+            cascade_size_factor: market_params.cascade_size_factor,
+        };
+        let quote_gate_decision = self.stochastic.quote_gate.decide(&quote_gate_input);
+
+        // Handle quote gate decision
+        match &quote_gate_decision {
+            QuoteGateDecision::NoQuote { reason } => {
+                info!(
+                    reason = %reason,
+                    flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
+                    position = %format!("{:.4}", self.position.position()),
+                    "Quote gate: NO QUOTE - waiting for signal"
+                );
+                // Cancel any resting orders when not quoting
+                let bid_orders = self.orders.get_all_by_side(Side::Buy);
+                let ask_orders = self.orders.get_all_by_side(Side::Sell);
+                let resting_oids: Vec<u64> = bid_orders
+                    .iter()
+                    .chain(ask_orders.iter())
+                    .map(|o| o.oid)
+                    .collect();
+                if !resting_oids.is_empty() {
+                    info!(
+                        count = resting_oids.len(),
+                        "Quote gate: cancelling resting orders"
+                    );
+                    self.executor
+                        .cancel_bulk_orders(&self.config.asset, resting_oids)
+                        .await;
+                }
+                return Ok(());
+            }
+            QuoteGateDecision::QuoteOnlyBids { urgency } => {
+                debug!(
+                    urgency = %format!("{:.2}", urgency),
+                    "Quote gate: ONLY BIDS (reducing short or bullish edge)"
+                );
+                // Will clear asks after ladder generation
+            }
+            QuoteGateDecision::QuoteOnlyAsks { urgency } => {
+                debug!(
+                    urgency = %format!("{:.2}", urgency),
+                    "Quote gate: ONLY ASKS (reducing long or bearish edge)"
+                );
+                // Will clear bids after ladder generation
+            }
+            QuoteGateDecision::QuoteBoth => {
+                // Normal path - quote both sides with skew
+            }
+        }
+
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
         let ladder = self.strategy.calculate_ladder(
@@ -846,6 +996,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .iter()
                 .map(|l| Quote::new(l.price, l.size))
                 .collect();
+
+            // === QUOTE GATE: Apply one-sided filtering if needed ===
+            match &quote_gate_decision {
+                QuoteGateDecision::QuoteOnlyBids { urgency: _ } => {
+                    // Only quote bids (buying) - clear asks
+                    if !ask_quotes.is_empty() {
+                        info!(
+                            cleared_asks = ask_quotes.len(),
+                            "Quote gate: clearing ASK side (only quoting bids)"
+                        );
+                        ask_quotes.clear();
+                    }
+                }
+                QuoteGateDecision::QuoteOnlyAsks { urgency: _ } => {
+                    // Only quote asks (selling) - clear bids
+                    if !bid_quotes.is_empty() {
+                        info!(
+                            cleared_bids = bid_quotes.len(),
+                            "Quote gate: clearing BID side (only quoting asks)"
+                        );
+                        bid_quotes.clear();
+                    }
+                }
+                QuoteGateDecision::QuoteBoth | QuoteGateDecision::NoQuote { .. } => {
+                    // QuoteBoth: normal, no filtering
+                    // NoQuote: should have returned early, but defensive
+                }
+            }
 
             // Reduce-only mode: when over max position, position value, OR margin utilization
             // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
@@ -978,6 +1156,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 decision_adjusted_liquidity, // Decision-adjusted viable size
                 &market_params,
             );
+
+            // === QUOTE GATE: Apply one-sided filtering if needed (single-quote mode) ===
+            match &quote_gate_decision {
+                QuoteGateDecision::QuoteOnlyBids { .. } => {
+                    // Only quote bids (buying) - clear ask
+                    if ask.is_some() {
+                        debug!("Quote gate: clearing ASK quote (single-quote mode)");
+                        ask = None;
+                    }
+                }
+                QuoteGateDecision::QuoteOnlyAsks { .. } => {
+                    // Only quote asks (selling) - clear bid
+                    if bid.is_some() {
+                        debug!("Quote gate: clearing BID quote (single-quote mode)");
+                        bid = None;
+                    }
+                }
+                QuoteGateDecision::QuoteBoth | QuoteGateDecision::NoQuote { .. } => {
+                    // QuoteBoth: normal, no filtering
+                    // NoQuote: should have returned early, but defensive
+                }
+            }
 
             // Reduce-only mode: when over max position, position value, OR margin utilization
             // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)

@@ -1,8 +1,161 @@
 //! Pre-computed asset runtime configuration for zero-overhead hot paths.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::meta::AssetMeta;
+
+// =============================================================================
+// Session Position Ramp
+// =============================================================================
+
+/// Ramp curve for position capacity growth over time.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum RampCurve {
+    /// Linear: fraction = t / T
+    Linear,
+    /// Square root: fraction = sqrt(t / T) - reaches 70% at half time
+    #[default]
+    Sqrt,
+    /// Logarithmic: fraction = ln(1 + t) / ln(1 + T) - very gradual
+    Log,
+}
+
+impl RampCurve {
+    /// Calculate the fraction at time t for total duration T.
+    pub fn fraction_at(&self, t_secs: f64, total_secs: f64) -> f64 {
+        if total_secs <= 0.0 || t_secs >= total_secs {
+            return 1.0;
+        }
+        if t_secs <= 0.0 {
+            return 0.0;
+        }
+
+        let ratio = t_secs / total_secs;
+        match self {
+            RampCurve::Linear => ratio,
+            RampCurve::Sqrt => ratio.sqrt(),
+            RampCurve::Log => {
+                // ln(1 + t) / ln(1 + T)
+                (1.0 + t_secs).ln() / (1.0 + total_secs).ln()
+            }
+        }
+    }
+}
+
+/// Time-based position ramp that limits max position based on session time.
+///
+/// Prevents the system from immediately taking full position at session start.
+/// Instead, position capacity grows gradually, allowing time to:
+/// - Calibrate model parameters
+/// - Observe market conditions
+/// - Build confidence before full exposure
+///
+/// # Example
+/// With 30-minute ramp using sqrt curve:
+/// | Time | Ramp Fraction | If max=10 BTC |
+/// |------|---------------|---------------|
+/// | 0 min | 10% | 1.0 BTC |
+/// | 2 min | 36% | 3.6 BTC |
+/// | 5 min | 51% | 5.1 BTC |
+/// | 15 min | 81% | 8.1 BTC |
+/// | 30 min | 100% | 10.0 BTC |
+#[derive(Debug, Clone)]
+pub struct SessionPositionRamp {
+    /// Time to reach full position capacity (seconds).
+    /// Default: 1800 (30 minutes)
+    pub ramp_duration_secs: f64,
+
+    /// Starting fraction of max position (0.0 - 1.0).
+    /// Default: 0.1 (10%)
+    pub initial_fraction: f64,
+
+    /// Ramp curve shape.
+    /// Default: Sqrt (fast start, slow finish)
+    pub ramp_curve: RampCurve,
+
+    /// Session start time (set when session begins).
+    session_start: Option<Instant>,
+}
+
+impl Default for SessionPositionRamp {
+    fn default() -> Self {
+        Self {
+            ramp_duration_secs: 1800.0, // 30 minutes
+            initial_fraction: 0.1,      // Start at 10%
+            ramp_curve: RampCurve::Sqrt,
+            session_start: None,
+        }
+    }
+}
+
+impl SessionPositionRamp {
+    /// Create a new position ramp with custom parameters.
+    pub fn new(ramp_duration_secs: f64, initial_fraction: f64, ramp_curve: RampCurve) -> Self {
+        Self {
+            ramp_duration_secs: ramp_duration_secs.max(0.0),
+            initial_fraction: initial_fraction.clamp(0.0, 1.0),
+            ramp_curve,
+            session_start: None,
+        }
+    }
+
+    /// Start the session (call once at session begin).
+    pub fn start_session(&mut self) {
+        self.session_start = Some(Instant::now());
+    }
+
+    /// Check if session has started.
+    pub fn is_session_started(&self) -> bool {
+        self.session_start.is_some()
+    }
+
+    /// Get the current ramp fraction [initial_fraction, 1.0].
+    ///
+    /// Returns 1.0 if session hasn't started (fail-open behavior).
+    pub fn current_fraction(&self) -> f64 {
+        let Some(start) = self.session_start else {
+            return 1.0; // Fail-open: full capacity if not initialized
+        };
+
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        self.fraction_at(elapsed_secs)
+    }
+
+    /// Get ramp fraction at a specific elapsed time.
+    pub fn fraction_at(&self, elapsed_secs: f64) -> f64 {
+        if self.ramp_duration_secs <= 0.0 {
+            return 1.0;
+        }
+
+        // Calculate base fraction from curve
+        let curve_fraction = self
+            .ramp_curve
+            .fraction_at(elapsed_secs, self.ramp_duration_secs);
+
+        // Scale from initial_fraction to 1.0
+        // fraction = initial + (1 - initial) * curve_fraction
+        self.initial_fraction + (1.0 - self.initial_fraction) * curve_fraction
+    }
+
+    /// Get elapsed session time in seconds.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.session_start
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Check if ramp is complete (at full capacity).
+    pub fn is_complete(&self) -> bool {
+        self.current_fraction() >= 0.999
+    }
+
+    /// Apply ramp to a max position value.
+    #[inline]
+    pub fn apply(&self, max_position: f64) -> f64 {
+        max_position * self.current_fraction()
+    }
+}
 
 /// Pre-computed asset configuration for zero-overhead hot paths.
 ///
@@ -123,6 +276,90 @@ impl Default for AssetRuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =============================================================================
+    // SessionPositionRamp Tests
+    // =============================================================================
+
+    #[test]
+    fn test_ramp_curve_linear() {
+        let curve = RampCurve::Linear;
+        assert!((curve.fraction_at(0.0, 100.0) - 0.0).abs() < 0.01);
+        assert!((curve.fraction_at(50.0, 100.0) - 0.5).abs() < 0.01);
+        assert!((curve.fraction_at(100.0, 100.0) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ramp_curve_sqrt() {
+        let curve = RampCurve::Sqrt;
+        assert!((curve.fraction_at(0.0, 100.0) - 0.0).abs() < 0.01);
+        // sqrt(0.5) ≈ 0.707
+        assert!((curve.fraction_at(50.0, 100.0) - 0.707).abs() < 0.01);
+        assert!((curve.fraction_at(100.0, 100.0) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ramp_curve_log() {
+        let curve = RampCurve::Log;
+        assert!((curve.fraction_at(0.0, 100.0) - 0.0).abs() < 0.01);
+        // Log curve: ln(1+t)/ln(1+T) - actually faster than linear early on
+        // At t=50, T=100: ln(51)/ln(101) ≈ 0.85
+        assert!(curve.fraction_at(50.0, 100.0) > 0.8);
+        assert!((curve.fraction_at(100.0, 100.0) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_session_position_ramp_default() {
+        let ramp = SessionPositionRamp::default();
+        assert_eq!(ramp.ramp_duration_secs, 1800.0);
+        assert_eq!(ramp.initial_fraction, 0.1);
+        assert!(!ramp.is_session_started());
+        // Without session start, returns 1.0 (fail-open)
+        assert_eq!(ramp.current_fraction(), 1.0);
+    }
+
+    #[test]
+    fn test_session_position_ramp_fraction_at() {
+        let ramp = SessionPositionRamp {
+            ramp_duration_secs: 1800.0, // 30 minutes
+            initial_fraction: 0.1,
+            ramp_curve: RampCurve::Sqrt,
+            session_start: None,
+        };
+
+        // At t=0: should be initial_fraction (10%)
+        assert!((ramp.fraction_at(0.0) - 0.1).abs() < 0.01);
+
+        // At t=2min (120s): sqrt(120/1800) ≈ 0.258, scaled = 0.1 + 0.9*0.258 ≈ 0.33
+        let frac_2min = ramp.fraction_at(120.0);
+        assert!(frac_2min > 0.3 && frac_2min < 0.4, "At 2min: {}", frac_2min);
+
+        // At t=30min: should be ~1.0
+        assert!((ramp.fraction_at(1800.0) - 1.0).abs() < 0.01);
+
+        // Beyond ramp duration: should be 1.0
+        assert!((ramp.fraction_at(3600.0) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_session_position_ramp_apply() {
+        let mut ramp = SessionPositionRamp::new(1800.0, 0.1, RampCurve::Linear);
+
+        // Before session start, apply returns full amount (fail-open)
+        assert_eq!(ramp.apply(10.0), 10.0);
+
+        // After session start
+        ramp.start_session();
+
+        // Immediately after start: ~10% of 10 = 1.0
+        // (with some tolerance for the tiny elapsed time)
+        let applied = ramp.apply(10.0);
+        assert!(applied >= 0.99 && applied <= 1.5, "Immediate: {}", applied);
+    }
+
+    // =============================================================================
+    // AssetRuntimeConfig Tests
+    // =============================================================================
 
     fn make_hip3_asset_meta() -> AssetMeta {
         AssetMeta {

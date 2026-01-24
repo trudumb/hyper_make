@@ -454,6 +454,15 @@ impl ParameterAggregator {
             // Default to neutral values; actual values populated in quote_engine.rs
             l2_reservation_shift: 0.0, // No shift initially
             l2_spread_multiplier: 1.0, // No widening initially
+
+            // === Proactive Position Management (Small Fish Strategy) ===
+            // These are populated from stochastic config for GLFT access
+            enable_proactive_skew: sources.stochastic_config.enable_proactive_skew,
+            proactive_skew_sensitivity: sources.stochastic_config.proactive_skew_sensitivity,
+            proactive_min_momentum_confidence: sources
+                .stochastic_config
+                .proactive_min_momentum_confidence,
+            proactive_min_momentum_bps: sources.stochastic_config.proactive_min_momentum_bps,
         }
     }
 }

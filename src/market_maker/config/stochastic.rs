@@ -247,6 +247,116 @@ pub struct StochasticConfig {
     ///
     /// Default: 2.0
     pub microprice_ema_min_change_bps: f64,
+
+    // ==================== Proactive Position Management ====================
+    // Phase 1: Time-Based Position Ramp
+    /// Enable time-based position ramping.
+    /// When true, max position starts at initial_fraction and ramps up over time.
+    /// Default: true
+    pub enable_position_ramp: bool,
+
+    /// Time to reach full position capacity (seconds).
+    /// Default: 1800 (30 minutes)
+    pub ramp_duration_secs: f64,
+
+    /// Starting fraction of max position (0.0 - 1.0).
+    /// Default: 0.10 (10%)
+    pub ramp_initial_fraction: f64,
+
+    /// Ramp curve type: "linear", "sqrt", "log".
+    /// sqrt is recommended: fast start, slow finish.
+    /// Default: "sqrt"
+    pub ramp_curve: String,
+
+    // Phase 2: Confidence-Gated Sizing
+    /// Enable confidence-gated sizing.
+    /// When true, quote size scales with model confidence.
+    /// Default: true
+    pub enable_confidence_sizing: bool,
+
+    /// Minimum size fraction when confidence is zero.
+    /// 0.3 = always quote at least 30% size.
+    /// Default: 0.3
+    pub confidence_min_size_fraction: f64,
+
+    // Phase 3: Proactive Directional Skew
+    /// Enable proactive directional skew based on momentum predictions.
+    /// When true, skews quotes to BUILD position with momentum (before getting filled).
+    /// Default: true
+    pub enable_proactive_skew: bool,
+
+    /// Sensitivity for proactive skew (bps per unit momentum×confidence).
+    /// Higher = more aggressive position building with momentum.
+    /// Default: 2.0
+    pub proactive_skew_sensitivity: f64,
+
+    /// Minimum momentum confidence to apply proactive skew.
+    /// Below this, no proactive skew is applied.
+    /// Default: 0.6
+    pub proactive_min_momentum_confidence: f64,
+
+    /// Minimum momentum strength (bps) to apply proactive skew.
+    /// Filters out noise from weak momentum signals.
+    /// Default: 5.0
+    pub proactive_min_momentum_bps: f64,
+
+    // Phase 4: Performance-Gated Capacity
+    /// Enable performance-based capacity gating.
+    /// When true, max position scales based on realized P&L.
+    /// Default: true
+    pub enable_performance_gating: bool,
+
+    /// Loss reduction multiplier for performance gating.
+    /// 2.0 = capacity_reduction = 2 × loss_ratio.
+    /// Default: 2.0
+    pub performance_loss_reduction_mult: f64,
+
+    /// Minimum capacity fraction (floor) for performance gating.
+    /// 0.3 = never go below 30% of max position.
+    /// Default: 0.3
+    pub performance_min_capacity_fraction: f64,
+
+    // ==================== Quote Gate (Directional Edge Gating) ====================
+    /// Enable Quote Gate for directional edge-based quoting decisions.
+    /// When enabled, the system will NOT quote when there's no directional edge.
+    /// This prevents whipsaw losses from random fills.
+    ///
+    /// Default: true
+    pub enable_quote_gate: bool,
+
+    /// Minimum |flow_imbalance| to have directional edge.
+    /// Below this threshold, we consider ourselves "edgeless" and may not quote.
+    ///
+    /// Default: 0.25
+    pub quote_gate_min_edge_signal: f64,
+
+    /// Minimum momentum confidence to trust the edge signal.
+    /// Even with strong flow_imbalance, low confidence means uncertain.
+    ///
+    /// Default: 0.55
+    pub quote_gate_min_edge_confidence: f64,
+
+    /// Minimum position (as fraction of max) to trigger one-sided quoting.
+    /// Below this, position is considered "flat".
+    ///
+    /// Default: 0.05 (5%)
+    pub quote_gate_position_threshold: f64,
+
+    /// Maximum position (as fraction of max) before ONLY reducing.
+    /// Above this, we become very defensive and only quote to reduce position.
+    ///
+    /// Default: 0.7 (70%)
+    pub quote_gate_max_position_before_reduce_only: f64,
+
+    /// Enable cascade protection in Quote Gate (pull all quotes during cascade).
+    ///
+    /// Default: true
+    pub quote_gate_cascade_protection: bool,
+
+    /// Cascade threshold (cascade_size_factor below this = cascade).
+    ///
+    /// Default: 0.3 (70% cascade severity)
+    pub quote_gate_cascade_threshold: f64,
 }
 
 impl Default for StochasticConfig {
@@ -321,6 +431,38 @@ impl Default for StochasticConfig {
             // ENABLED by default - reduces quote volatility from microprice noise
             microprice_ema_alpha: 0.2,          // 5-update half-life
             microprice_ema_min_change_bps: 2.0, // 2 bps noise filter
+
+            // Proactive Position Management
+            // Phase 1: Time-Based Position Ramp
+            enable_position_ramp: true,
+            ramp_duration_secs: 1800.0,      // 30 minutes
+            ramp_initial_fraction: 0.10,     // Start at 10%
+            ramp_curve: "sqrt".to_string(),  // Fast start, slow finish
+
+            // Phase 2: Confidence-Gated Sizing
+            enable_confidence_sizing: true,
+            confidence_min_size_fraction: 0.3, // Always at least 30%
+
+            // Phase 3: Proactive Directional Skew
+            enable_proactive_skew: true,
+            proactive_skew_sensitivity: 2.0,         // bps per unit momentum×confidence
+            proactive_min_momentum_confidence: 0.6,  // 60% confidence threshold
+            proactive_min_momentum_bps: 5.0,         // 5 bps minimum momentum
+
+            // Phase 4: Performance-Gated Capacity
+            enable_performance_gating: true,
+            performance_loss_reduction_mult: 2.0,     // 2x loss ratio
+            performance_min_capacity_fraction: 0.3,  // Never below 30%
+
+            // Quote Gate (Directional Edge Gating)
+            // ENABLED by default - prevents whipsaw losses from random fills
+            enable_quote_gate: true,
+            quote_gate_min_edge_signal: 0.25,               // |flow_imbalance| threshold
+            quote_gate_min_edge_confidence: 0.55,           // momentum confidence threshold
+            quote_gate_position_threshold: 0.05,            // 5% of max = "flat"
+            quote_gate_max_position_before_reduce_only: 0.7, // 70% of max = reduce only
+            quote_gate_cascade_protection: true,
+            quote_gate_cascade_threshold: 0.3,              // 70% cascade severity
         }
     }
 }
@@ -412,5 +554,18 @@ impl StochasticConfig {
     pub fn with_kelly_tau_fixed(mut self, tau: f64) -> Self {
         self.kelly_tau_fixed = tau;
         self
+    }
+
+    /// Create a QuoteGateConfig from this StochasticConfig.
+    pub fn quote_gate_config(&self) -> crate::market_maker::control::QuoteGateConfig {
+        crate::market_maker::control::QuoteGateConfig {
+            enabled: self.enable_quote_gate,
+            min_edge_signal: self.quote_gate_min_edge_signal,
+            min_edge_confidence: self.quote_gate_min_edge_confidence,
+            position_threshold: self.quote_gate_position_threshold,
+            max_position_before_reduce_only: self.quote_gate_max_position_before_reduce_only,
+            cascade_protection: self.quote_gate_cascade_protection,
+            cascade_threshold: self.quote_gate_cascade_threshold,
+        }
     }
 }

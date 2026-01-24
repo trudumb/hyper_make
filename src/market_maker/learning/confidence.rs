@@ -5,6 +5,158 @@
 
 use super::types::{CalibrationScore, Health, ModelHealth, RingBuffer};
 
+// =============================================================================
+// Aggregate Confidence for Proactive Position Management
+// =============================================================================
+
+/// Aggregate confidence score combining all model components.
+///
+/// Used for confidence-gated sizing: when uncertain, quote smaller sizes.
+/// This transforms the system from passive (react to fills) to proactive
+/// (assess confidence → size appropriately → quote deliberately).
+///
+/// # Sizing Policy
+/// - confidence ≥ 0.8 → full size (high confidence)
+/// - confidence ∈ [0.5, 0.8) → scaled size
+/// - confidence < 0.5 → minimum size (30%)
+///
+/// Key insight: During warmup, models have high uncertainty → smaller quotes.
+/// As calibration improves, confidence grows → larger quotes. This naturally
+/// implements "earn the right to size up" without explicit rules.
+#[derive(Debug, Clone, Default)]
+pub struct AggregateConfidence {
+    /// Overall confidence score [0.0, 1.0].
+    /// Geometric mean of component confidences for multiplicative combination.
+    pub score: f64,
+
+    /// Momentum/direction prediction confidence.
+    /// High when momentum signal is clear and consistent.
+    pub momentum_confidence: f64,
+
+    /// Volatility estimate confidence.
+    /// High when vol estimates are stable and well-calibrated.
+    pub volatility_confidence: f64,
+
+    /// Fill rate (kappa) estimation confidence.
+    /// High when we have enough fill observations.
+    pub kappa_confidence: f64,
+
+    /// Adverse selection prediction confidence.
+    /// High when AS model is calibrated with sufficient fills.
+    pub as_confidence: f64,
+
+    /// Number of observations used to compute confidence.
+    pub n_observations: usize,
+
+    /// Whether models are in warmup phase.
+    pub is_warmup: bool,
+}
+
+impl AggregateConfidence {
+    /// Create a new aggregate confidence from component confidences.
+    pub fn new(
+        momentum_confidence: f64,
+        volatility_confidence: f64,
+        kappa_confidence: f64,
+        as_confidence: f64,
+        n_observations: usize,
+        is_warmup: bool,
+    ) -> Self {
+        // Clamp all inputs to [0, 1]
+        let mom = momentum_confidence.clamp(0.0, 1.0);
+        let vol = volatility_confidence.clamp(0.0, 1.0);
+        let kappa = kappa_confidence.clamp(0.0, 1.0);
+        let as_conf = as_confidence.clamp(0.0, 1.0);
+
+        // Geometric mean for overall score (multiplicative combination)
+        // This means ALL components must be confident for high overall score
+        let product = mom * vol * kappa * as_conf;
+        let score = if product > 0.0 {
+            product.powf(0.25) // 4th root = geometric mean of 4 values
+        } else {
+            0.0
+        };
+
+        Self {
+            score,
+            momentum_confidence: mom,
+            volatility_confidence: vol,
+            kappa_confidence: kappa,
+            as_confidence: as_conf,
+            n_observations,
+            is_warmup,
+        }
+    }
+
+    /// Create a warmup confidence with conservative values.
+    pub fn warmup(warmup_progress: f64) -> Self {
+        // During warmup, confidence scales with progress
+        let progress = warmup_progress.clamp(0.0, 1.0);
+
+        // Start very conservative, ramp up
+        let base_confidence = 0.3 + 0.5 * progress; // [0.3, 0.8]
+
+        Self {
+            score: base_confidence,
+            momentum_confidence: base_confidence,
+            volatility_confidence: base_confidence,
+            kappa_confidence: progress, // Kappa needs most warmup
+            as_confidence: base_confidence,
+            n_observations: 0,
+            is_warmup: true,
+        }
+    }
+
+    /// Size multiplier based on confidence [0.3, 1.0].
+    ///
+    /// Never go below 30% size to maintain market presence.
+    /// Maps confidence [0, 1] → size [0.3, 1.0].
+    ///
+    /// Formula: size_mult = 0.3 + 0.7 × confidence
+    pub fn size_multiplier(&self) -> f64 {
+        let floor = 0.3; // Minimum 30% size always
+        let range = 0.7; // Can scale up by 70%
+
+        floor + range * self.score
+    }
+
+    /// Alternative size multiplier with steeper curve.
+    ///
+    /// Uses quadratic scaling: more aggressive reduction at low confidence.
+    /// size_mult = 0.3 + 0.7 × confidence²
+    pub fn size_multiplier_steep(&self) -> f64 {
+        let floor = 0.3;
+        let range = 0.7;
+
+        floor + range * self.score.powi(2)
+    }
+
+    /// Get the weakest component confidence.
+    pub fn weakest_component(&self) -> (&'static str, f64) {
+        let components = [
+            ("momentum", self.momentum_confidence),
+            ("volatility", self.volatility_confidence),
+            ("kappa", self.kappa_confidence),
+            ("as", self.as_confidence),
+        ];
+
+        components
+            .into_iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap()
+    }
+
+    /// Check if confidence is sufficient for full-size quoting.
+    pub fn is_high_confidence(&self) -> bool {
+        self.score >= 0.8
+    }
+
+    /// Check if in low-confidence mode (reduced sizing).
+    pub fn is_low_confidence(&self) -> bool {
+        self.score < 0.5
+    }
+}
+
 /// Volatility prediction record.
 #[derive(Debug, Clone)]
 pub struct VolPrediction {
@@ -371,6 +523,79 @@ impl ModelConfidenceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =============================================================================
+    // AggregateConfidence Tests
+    // =============================================================================
+
+    #[test]
+    fn test_aggregate_confidence_full() {
+        let conf = AggregateConfidence::new(1.0, 1.0, 1.0, 1.0, 100, false);
+        assert!((conf.score - 1.0).abs() < 0.01);
+        assert!((conf.size_multiplier() - 1.0).abs() < 0.01);
+        assert!(conf.is_high_confidence());
+        assert!(!conf.is_low_confidence());
+    }
+
+    #[test]
+    fn test_aggregate_confidence_low() {
+        let conf = AggregateConfidence::new(0.3, 0.3, 0.3, 0.3, 10, true);
+        assert!(conf.score < 0.5);
+        assert!(conf.is_low_confidence());
+        // Size multiplier should be close to floor (0.3)
+        let size_mult = conf.size_multiplier();
+        assert!(size_mult >= 0.3 && size_mult < 0.6);
+    }
+
+    #[test]
+    fn test_aggregate_confidence_mixed() {
+        // One weak component should drag down overall
+        let conf = AggregateConfidence::new(0.9, 0.9, 0.2, 0.9, 50, false);
+        // Geometric mean: (0.9 * 0.9 * 0.2 * 0.9)^0.25 ≈ 0.59
+        assert!(conf.score < 0.7);
+
+        let (name, value) = conf.weakest_component();
+        assert_eq!(name, "kappa");
+        assert!((value - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_aggregate_confidence_warmup() {
+        // At 0% warmup progress
+        let conf_0 = AggregateConfidence::warmup(0.0);
+        assert!(conf_0.is_warmup);
+        assert!((conf_0.score - 0.3).abs() < 0.1);
+
+        // At 50% warmup progress
+        let conf_50 = AggregateConfidence::warmup(0.5);
+        assert!(conf_50.score > conf_0.score);
+
+        // At 100% warmup progress
+        let conf_100 = AggregateConfidence::warmup(1.0);
+        assert!((conf_100.score - 0.8).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_size_multiplier_range() {
+        // Score = 0 → size = 0.3 (floor)
+        let conf_low = AggregateConfidence::new(0.0, 0.0, 0.0, 0.0, 0, true);
+        assert!((conf_low.size_multiplier() - 0.3).abs() < 0.01);
+
+        // Score = 1 → size = 1.0 (ceiling)
+        let conf_high = AggregateConfidence::new(1.0, 1.0, 1.0, 1.0, 100, false);
+        assert!((conf_high.size_multiplier() - 1.0).abs() < 0.01);
+
+        // Score = 0.5 → size = 0.65 (midpoint)
+        let conf_mid = AggregateConfidence {
+            score: 0.5,
+            ..Default::default()
+        };
+        assert!((conf_mid.size_multiplier() - 0.65).abs() < 0.01);
+    }
+
+    // =============================================================================
+    // ModelConfidenceTracker Tests
+    // =============================================================================
 
     #[test]
     fn test_empty_tracker() {

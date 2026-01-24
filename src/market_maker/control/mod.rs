@@ -34,6 +34,7 @@ pub mod changepoint;
 pub mod controller;
 pub mod information;
 pub mod interface;
+pub mod quote_gate;
 pub mod simulation;
 pub mod state;
 pub mod traits;
@@ -44,6 +45,10 @@ pub mod value;
 pub use actions::{Action, ActionConfig, DefensiveReason, NoQuoteReason};
 pub use belief::BeliefState;
 pub use changepoint::{ChangepointConfig, ChangepointDetector};
+pub use quote_gate::{
+    NoQuoteReason as QuoteGateNoQuoteReason, QuoteDecision as QuoteGateDecision, QuoteGate,
+    QuoteGateConfig, QuoteGateInput,
+};
 pub use controller::{ControllerConfig, OptimalController};
 pub use information::{InformationConfig, InformationValue};
 pub use interface::{GaussianEstimate, LearningModuleOutput, ModelPrediction, TradingState};

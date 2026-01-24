@@ -579,6 +579,23 @@ pub struct MarketParams {
     /// From Bayesian framework: widen spreads when edge estimate is noisy.
     /// Multiply optimal spread by this factor.
     pub l2_spread_multiplier: f64,
+
+    // ==================== Proactive Position Management (Small Fish) ====================
+    /// Whether proactive directional skew is enabled.
+    /// When enabled, skews quotes to BUILD position with momentum (opposite of inventory skew).
+    pub enable_proactive_skew: bool,
+
+    /// Sensitivity for proactive skew (bps per unit momentum×confidence).
+    /// Higher = more aggressive position building with momentum.
+    pub proactive_skew_sensitivity: f64,
+
+    /// Minimum momentum confidence to apply proactive skew.
+    /// Below this threshold, proactive skew is 0.
+    pub proactive_min_momentum_confidence: f64,
+
+    /// Minimum momentum magnitude (bps) to apply proactive skew.
+    /// Below this threshold, proactive skew is 0.
+    pub proactive_min_momentum_bps: f64,
 }
 
 impl Default for MarketParams {
@@ -756,6 +773,11 @@ impl Default for MarketParams {
             // L2 Decision Engine Outputs (A-S Framework)
             l2_reservation_shift: 0.0, // No shift initially (neutral)
             l2_spread_multiplier: 1.0, // No widening initially
+            // Proactive Position Management (Small Fish)
+            enable_proactive_skew: false,            // Off by default, opt-in
+            proactive_skew_sensitivity: 2.0,         // 2 bps per unit momentum×confidence
+            proactive_min_momentum_confidence: 0.6,  // Need 60% confidence
+            proactive_min_momentum_bps: 5.0,         // Need 5 bps minimum momentum
         }
     }
 }
@@ -1123,6 +1145,14 @@ impl MarketParams {
         //
         // Setting to 1.0 (no-op) - the field is kept for API compatibility.
         self.stochastic_spread_multiplier = 1.0;
+
+        // === 4. Proactive Position Management (Small Fish Strategy) ===
+        // Copy proactive skew config values from StochasticConfig to MarketParams
+        // so GLFT strategy has access to them without needing the full config.
+        self.enable_proactive_skew = config.enable_proactive_skew;
+        self.proactive_skew_sensitivity = config.proactive_skew_sensitivity;
+        self.proactive_min_momentum_confidence = config.proactive_min_momentum_confidence;
+        self.proactive_min_momentum_bps = config.proactive_min_momentum_bps;
     }
 
     /// Get the effective minimum spread floor in fractional terms.

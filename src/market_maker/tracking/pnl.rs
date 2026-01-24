@@ -721,6 +721,161 @@ impl PnLSummary {
     }
 }
 
+// =============================================================================
+// Performance-Gated Capacity
+// =============================================================================
+
+/// Performance-based position capacity gating.
+///
+/// Implements "earn the right to size up" by adjusting max position based on
+/// realized P&L. When losing money, capacity is reduced to limit further losses.
+/// When profitable, full capacity is allowed.
+///
+/// # Philosophy
+/// - Making money → earned trust → full capacity
+/// - Losing money → reduced trust → reduced capacity
+/// - This creates a natural feedback loop that prevents blowing up
+///
+/// # Configuration
+/// - `loss_reduction_multiplier`: How aggressively to reduce (2.0 = 2x loss ratio)
+/// - `min_capacity_fraction`: Floor on capacity (0.3 = never below 30%)
+#[derive(Debug, Clone)]
+pub struct PerformanceGatedCapacity {
+    /// Base max position from configuration (units, e.g., BTC).
+    base_max_position: f64,
+
+    /// Reference price for notional calculations.
+    /// Updated periodically with current mid price.
+    reference_price: f64,
+
+    /// Loss reduction multiplier.
+    /// 2.0 means capacity_reduction = 2 × loss_ratio.
+    /// Higher = more aggressive reduction when losing.
+    loss_reduction_mult: f64,
+
+    /// Minimum capacity fraction (floor).
+    /// 0.3 means never go below 30% of base_max_position.
+    min_capacity_fraction: f64,
+
+    /// Whether performance gating is enabled.
+    enabled: bool,
+}
+
+impl Default for PerformanceGatedCapacity {
+    fn default() -> Self {
+        Self {
+            base_max_position: 0.0,
+            reference_price: 0.0,
+            loss_reduction_mult: 2.0,
+            min_capacity_fraction: 0.3,
+            enabled: true,
+        }
+    }
+}
+
+impl PerformanceGatedCapacity {
+    /// Create a new performance-gated capacity tracker.
+    pub fn new(
+        base_max_position: f64,
+        reference_price: f64,
+        loss_reduction_mult: f64,
+        min_capacity_fraction: f64,
+    ) -> Self {
+        Self {
+            base_max_position: base_max_position.max(0.0),
+            reference_price: reference_price.max(0.0),
+            loss_reduction_mult: loss_reduction_mult.max(0.0),
+            min_capacity_fraction: min_capacity_fraction.clamp(0.1, 1.0),
+            enabled: true,
+        }
+    }
+
+    /// Create disabled (pass-through) gating.
+    pub fn disabled(base_max_position: f64) -> Self {
+        Self {
+            base_max_position,
+            enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// Update reference price (call periodically).
+    pub fn update_reference_price(&mut self, price: f64) {
+        if price > 0.0 {
+            self.reference_price = price;
+        }
+    }
+
+    /// Update base max position (if config changes).
+    pub fn update_base_max_position(&mut self, max_position: f64) {
+        self.base_max_position = max_position.max(0.0);
+    }
+
+    /// Calculate allowed max position based on current P&L.
+    ///
+    /// # Arguments
+    /// * `realized_pnl` - Session realized P&L (USD)
+    ///
+    /// # Returns
+    /// Allowed max position (units)
+    pub fn allowed_max_position(&self, realized_pnl: f64) -> f64 {
+        if !self.enabled || self.base_max_position <= 0.0 {
+            return self.base_max_position;
+        }
+
+        // Calculate base position notional for reference
+        let base_notional = self.base_max_position * self.reference_price.max(1.0);
+
+        // P&L ratio relative to base notional
+        // Positive = making money, Negative = losing money
+        let pnl_ratio = realized_pnl / base_notional.max(1.0);
+
+        let capacity_fraction = if pnl_ratio >= 0.0 {
+            // Making money → full capacity
+            1.0
+        } else {
+            // Losing money → reduce capacity proportionally
+            // reduction = loss_ratio × multiplier, clamped to [0, 1 - min_fraction]
+            let loss_ratio = pnl_ratio.abs();
+            let reduction = (loss_ratio * self.loss_reduction_mult).min(1.0 - self.min_capacity_fraction);
+            1.0 - reduction
+        };
+
+        // Apply capacity fraction with floor
+        self.base_max_position * capacity_fraction.max(self.min_capacity_fraction)
+    }
+
+    /// Get the current capacity fraction [min_capacity_fraction, 1.0].
+    pub fn capacity_fraction(&self, realized_pnl: f64) -> f64 {
+        if !self.enabled || self.base_max_position <= 0.0 {
+            return 1.0;
+        }
+
+        let allowed = self.allowed_max_position(realized_pnl);
+        (allowed / self.base_max_position).clamp(self.min_capacity_fraction, 1.0)
+    }
+
+    /// Check if currently at reduced capacity.
+    pub fn is_reduced(&self, realized_pnl: f64) -> bool {
+        self.enabled && self.capacity_fraction(realized_pnl) < 0.99
+    }
+
+    /// Get the base max position.
+    pub fn base_max_position(&self) -> f64 {
+        self.base_max_position
+    }
+
+    /// Check if enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Enable/disable gating.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -842,5 +997,81 @@ mod tests {
         let summary = tracker.summary(50100.0);
         assert_eq!(summary.fill_count, 1);
         assert!(summary.total_pnl > 0.0);
+    }
+
+    // =============================================================================
+    // PerformanceGatedCapacity Tests
+    // =============================================================================
+
+    #[test]
+    fn test_performance_gated_capacity_profitable() {
+        let capacity = PerformanceGatedCapacity::new(
+            10.0,     // 10 BTC max
+            50000.0,  // $50k reference price
+            2.0,      // 2x loss multiplier
+            0.3,      // 30% minimum
+        );
+
+        // Making money → full capacity
+        let allowed = capacity.allowed_max_position(5000.0); // +$5k profit
+        assert!((allowed - 10.0).abs() < 0.01);
+        assert!(!capacity.is_reduced(5000.0));
+    }
+
+    #[test]
+    fn test_performance_gated_capacity_losing() {
+        let capacity = PerformanceGatedCapacity::new(
+            10.0,     // 10 BTC max
+            50000.0,  // $50k reference price ($500k notional)
+            2.0,      // 2x loss multiplier
+            0.3,      // 30% minimum
+        );
+
+        // Losing 5% of notional ($25k) → reduction = 5% × 2 = 10%
+        let allowed = capacity.allowed_max_position(-25000.0);
+        assert!((allowed - 9.0).abs() < 0.1, "Expected ~9.0, got {}", allowed);
+        assert!(capacity.is_reduced(-25000.0));
+
+        // Losing 50% of notional ($250k) → reduction capped at 70% (min 30%)
+        let allowed_max_loss = capacity.allowed_max_position(-250000.0);
+        assert!((allowed_max_loss - 3.0).abs() < 0.1, "Expected ~3.0, got {}", allowed_max_loss);
+    }
+
+    #[test]
+    fn test_performance_gated_capacity_floor() {
+        let capacity = PerformanceGatedCapacity::new(
+            10.0,
+            50000.0,
+            2.0,
+            0.3, // 30% floor
+        );
+
+        // Even with massive loss, should never go below 30%
+        let allowed = capacity.allowed_max_position(-1_000_000.0);
+        assert!(allowed >= 3.0, "Should be at least 30% = 3.0, got {}", allowed);
+    }
+
+    #[test]
+    fn test_performance_gated_capacity_disabled() {
+        let capacity = PerformanceGatedCapacity::disabled(10.0);
+
+        // When disabled, always returns base
+        assert_eq!(capacity.allowed_max_position(-100000.0), 10.0);
+        assert!(!capacity.is_reduced(-100000.0));
+    }
+
+    #[test]
+    fn test_performance_gated_capacity_fraction() {
+        let capacity = PerformanceGatedCapacity::new(10.0, 50000.0, 2.0, 0.3);
+
+        // Profitable → 100%
+        assert!((capacity.capacity_fraction(1000.0) - 1.0).abs() < 0.01);
+
+        // Break-even → 100%
+        assert!((capacity.capacity_fraction(0.0) - 1.0).abs() < 0.01);
+
+        // Losing → reduced
+        assert!(capacity.capacity_fraction(-50000.0) < 1.0);
+        assert!(capacity.capacity_fraction(-50000.0) >= 0.3);
     }
 }
