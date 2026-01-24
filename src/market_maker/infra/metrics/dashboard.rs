@@ -789,7 +789,11 @@ pub fn classify_regime(cascade_severity: f64, jump_ratio: f64, sigma: f64) -> St
 }
 
 /// Compute soft regime probabilities using sigmoid-like functions.
-pub fn compute_regime_probabilities(cascade_severity: f64, jump_ratio: f64, sigma: f64) -> RegimeProbabilities {
+pub fn compute_regime_probabilities(
+    cascade_severity: f64,
+    jump_ratio: f64,
+    sigma: f64,
+) -> RegimeProbabilities {
     // Use sigmoid functions for smooth transitions
     let cascade_prob = sigmoid(cascade_severity, 0.3, 10.0) + sigmoid(jump_ratio, 4.0, 2.0);
     let volatile_prob = sigmoid(jump_ratio, 2.5, 3.0) + sigmoid(cascade_severity, 0.15, 8.0);
@@ -843,12 +847,12 @@ impl Default for DashboardConfig {
             max_regime_history: 60, // 1 hour at 1-minute intervals
             max_fills: 100,
             regime_snapshot_interval: Duration::from_secs(5), // More responsive for dashboard
-            max_price_history: 1800, // 30 min at 1/sec
-            max_book_history: 360,   // 6 min at 1/sec
+            max_price_history: 1800,                          // 30 min at 1/sec
+            max_book_history: 360,                            // 6 min at 1/sec
             price_snapshot_interval: Duration::from_secs(1),
             book_snapshot_interval: Duration::from_secs(1),
-            max_signal_history: 300,    // 5 min at 1/sec
-            max_decision_history: 100,  // Last 100 quote decisions
+            max_signal_history: 300,   // 5 min at 1/sec
+            max_decision_history: 100, // Last 100 quote decisions
             signal_snapshot_interval: Duration::from_secs(1),
         }
     }
@@ -998,12 +1002,18 @@ impl DashboardAggregator {
                 bids: bids
                     .iter()
                     .take(10)
-                    .map(|(p, s)| BookLevel { price: *p, size: *s })
+                    .map(|(p, s)| BookLevel {
+                        price: *p,
+                        size: *s,
+                    })
                     .collect(),
                 asks: asks
                     .iter()
                     .take(10)
-                    .map(|(p, s)| BookLevel { price: *p, size: *s })
+                    .map(|(p, s)| BookLevel {
+                        price: *p,
+                        size: *s,
+                    })
                     .collect(),
             };
 
@@ -1376,7 +1386,20 @@ mod tests {
         };
 
         let state = aggregator.snapshot_with_feature_health(
-            50000.0, 5.0, 0.1, 500.0, 0.2, 0.1, 1.5, 0.001, 0.2, 0.15, 100.0, -50.0, -10.0, -5.0,
+            50000.0,
+            5.0,
+            0.1,
+            500.0,
+            0.2,
+            0.1,
+            1.5,
+            0.001,
+            0.2,
+            0.15,
+            100.0,
+            -50.0,
+            -10.0,
+            -5.0,
             feature_health,
         );
 

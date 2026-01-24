@@ -12,15 +12,14 @@
 #[cfg(test)]
 mod tests {
     // Use public re-exports from the parent modules
-    use crate::market_maker::risk::{
-        CircuitBreakerConfig, CircuitBreakerMonitor, CircuitBreakerType,
-        DrawdownConfig, DrawdownLevel, DrawdownTracker,
-        RiskCheckResult, RiskChecker, RiskLimits,
-    };
-    use crate::market_maker::monitoring::{AlertConfig, AlertSeverity, AlertType, Alerter};
+    use crate::market_maker::edge::{EdgeSignalKind, SignalHealthMonitor};
     use crate::market_maker::estimator::{HmmObservation, RegimeHMM};
     use crate::market_maker::learning::AdaptiveEnsemble;
-    use crate::market_maker::edge::{EdgeSignalKind, SignalHealthMonitor};
+    use crate::market_maker::monitoring::{AlertConfig, AlertSeverity, AlertType, Alerter};
+    use crate::market_maker::risk::{
+        CircuitBreakerConfig, CircuitBreakerMonitor, CircuitBreakerType, DrawdownConfig,
+        DrawdownLevel, DrawdownTracker, RiskCheckResult, RiskChecker, RiskLimits,
+    };
 
     // =========================================================================
     // Circuit Breaker Tests
@@ -281,8 +280,7 @@ mod tests {
 
     #[test]
     fn test_drawdown_position_multiplier() {
-        let config = DrawdownConfig::default()
-            .with_position_reduction(0.5, 0.25);
+        let config = DrawdownConfig::default().with_position_reduction(0.5, 0.25);
         let mut tracker = DrawdownTracker::new(config, 10_000.0);
 
         // Normal - full size
@@ -349,10 +347,7 @@ mod tests {
         let limits = RiskLimits::default().with_max_order_size(1.0);
         let checker = RiskChecker::new(limits);
 
-        assert!(matches!(
-            checker.check_order_size(0.5),
-            RiskCheckResult::Ok
-        ));
+        assert!(matches!(checker.check_order_size(0.5), RiskCheckResult::Ok));
         assert!(checker.check_order_size(1.5).is_hard_breach());
     }
 
@@ -458,11 +453,7 @@ mod tests {
         let mut monitor = SignalHealthMonitor::new(0.5, 0.75);
 
         // Register signals
-        monitor.register_signal(
-            EdgeSignalKind::LeadLag,
-            "Lead-Lag Signal".to_string(),
-            0.8,
-        );
+        monitor.register_signal(EdgeSignalKind::LeadLag, "Lead-Lag Signal".to_string(), 0.8);
         monitor.register_signal(
             EdgeSignalKind::FillProbability,
             "Fill Probability".to_string(),
@@ -604,7 +595,9 @@ mod tests {
 
         // 5. Check stress responses
         assert!(
-            circuit_breaker.check_oi_cascade(base_time + 30_000).is_some(),
+            circuit_breaker
+                .check_oi_cascade(base_time + 30_000)
+                .is_some(),
             "Should detect OI cascade"
         );
 

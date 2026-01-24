@@ -757,10 +757,7 @@ mod tests {
         }
 
         let pairs = tracker.highly_correlated_pairs(0.9);
-        assert!(
-            !pairs.is_empty(),
-            "Should find highly correlated pairs"
-        );
+        assert!(!pairs.is_empty(), "Should find highly correlated pairs");
 
         // a-b (0,1) should be in the list
         let has_ab = pairs.iter().any(|(i, j, _)| *i == 0 && *j == 1);

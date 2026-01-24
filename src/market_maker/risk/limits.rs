@@ -36,12 +36,12 @@ pub struct RiskLimits {
 impl Default for RiskLimits {
     fn default() -> Self {
         Self {
-            max_position_notional: 10_000.0,   // $10k hard limit
-            soft_position_threshold: 7_000.0,  // $7k soft limit (70%)
-            max_drawdown_pct: 0.02,            // 2% daily drawdown
-            max_concentration_pct: 0.01,       // 1% of open interest
-            max_order_size: 1.0,               // 1 contract default
-            min_spread_bps: 5.0,               // 5 bps minimum spread
+            max_position_notional: 10_000.0,  // $10k hard limit
+            soft_position_threshold: 7_000.0, // $7k soft limit (70%)
+            max_drawdown_pct: 0.02,           // 2% daily drawdown
+            max_concentration_pct: 0.01,      // 1% of open interest
+            max_order_size: 1.0,              // 1 contract default
+            min_spread_bps: 5.0,              // 5 bps minimum spread
         }
     }
 }
@@ -105,16 +105,10 @@ pub enum RiskCheckResult {
     Ok,
 
     /// Soft limit breached - reduce exposure but don't cancel.
-    SoftLimitBreached {
-        current: f64,
-        limit: f64,
-    },
+    SoftLimitBreached { current: f64, limit: f64 },
 
     /// Hard limit breached - cancel all quotes immediately.
-    HardLimitBreached {
-        current: f64,
-        limit: f64,
-    },
+    HardLimitBreached { current: f64, limit: f64 },
 }
 
 impl RiskCheckResult {
@@ -380,13 +374,12 @@ mod tests {
         assert!(checker.check_concentration(85.0, 10_000.0).is_soft_breach());
 
         // 1.5% of OI - hard breach
-        assert!(checker.check_concentration(150.0, 10_000.0).is_hard_breach());
+        assert!(checker
+            .check_concentration(150.0, 10_000.0)
+            .is_hard_breach());
 
         // Zero OI - defensive OK
-        assert_eq!(
-            checker.check_concentration(100.0, 0.0),
-            RiskCheckResult::Ok
-        );
+        assert_eq!(checker.check_concentration(100.0, 0.0), RiskCheckResult::Ok);
     }
 
     #[test]

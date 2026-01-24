@@ -402,9 +402,9 @@ mod tests {
         for _ in 0..50 {
             tracker.record_as_prediction(ASPrediction {
                 fill_price: 100.0,
-                predicted_as_bps: 1.0,     // We predict 1bp
+                predicted_as_bps: 1.0, // We predict 1bp
                 measurement_horizon_ms: 1000,
-                realized_as_bps: 2.0,      // But it's actually 2bp
+                realized_as_bps: 2.0, // But it's actually 2bp
             });
         }
 

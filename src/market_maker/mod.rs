@@ -47,10 +47,6 @@ pub use edge::{
     ABMetrics, ABTest, ABTestConfig, ABTestManager, ABVariant, EdgeSignalKind, HealthStatus,
     SignalHealth, SignalHealthMonitor, SignalHealthSummary,
 };
-pub use monitoring::{
-    Alert, AlertConfig, AlertHandler, AlertSeverity, AlertType, Alerter,
-    DashboardState as MonitoringDashboardState, LoggingAlertHandler, PositionSide,
-};
 pub use estimator::*;
 pub use execution::{
     CancelAnalysis, FillMetrics, FillRecord, FillStatistics, FillTracker, OrderEvent,
@@ -58,6 +54,10 @@ pub use execution::{
     Side as ExecutionSide,
 };
 pub use infra::*;
+pub use monitoring::{
+    Alert, AlertConfig, AlertHandler, AlertSeverity, AlertType, Alerter,
+    DashboardState as MonitoringDashboardState, LoggingAlertHandler, PositionSide,
+};
 pub use process_models::*;
 pub use quoting::*;
 pub use risk::*;

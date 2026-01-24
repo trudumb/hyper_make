@@ -22,23 +22,36 @@ pub mod ws_order_state;
 
 pub use asset_id::AssetId;
 pub use calibration::{
-    CalibrationConfig, CalibrationMetrics, CalibrationSummary, CalibrationTracker,
+    CalibrationConfig,
+    CalibrationMetrics,
+    CalibrationSummary,
+    CalibrationTracker,
     // Small Fish Strategy prediction logging infrastructure
-    LinkedPredictionOutcome, OutcomeLog, PredictionLog, PredictionOutcomeStore, PredictionType,
+    LinkedPredictionOutcome,
+    OutcomeLog,
+    PredictionLog,
+    PredictionOutcomeStore,
+    PredictionType,
     // Small Fish Strategy signal MI (Mutual Information) tracking
     SignalMiTracker,
 };
 pub use calibration_wiring::{
+    CalibratedAdverseSelection,
+    CalibratedAdverseSelectionConfig,
     // Calibrated model wrappers
-    CalibratedFillModel, CalibratedFillModelConfig,
-    CalibratedAdverseSelection, CalibratedAdverseSelectionConfig,
-    CalibratedLagAnalyzer, CalibratedLagAnalyzerConfig,
+    CalibratedFillModel,
+    CalibratedFillModelConfig,
+    CalibratedLagAnalyzer,
+    CalibratedLagAnalyzerConfig,
     // Orchestrator
-    ModelCalibrationOrchestrator, ModelCalibrationSummary,
+    ModelCalibrationOrchestrator,
+    ModelCalibrationSummary,
 };
 pub use order_manager::*;
 pub use pnl::*;
 pub use position::*;
 pub use queue::*;
-pub use signal_decay::{AlertSeverity, SignalAlert, SignalDecayConfig, SignalDecayReport, SignalDecayTracker};
+pub use signal_decay::{
+    AlertSeverity, SignalAlert, SignalDecayConfig, SignalDecayReport, SignalDecayTracker,
+};
 pub use ws_order_state::{WsOrderSpec, WsOrderStateConfig, WsOrderStateManager};

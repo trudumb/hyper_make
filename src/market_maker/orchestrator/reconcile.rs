@@ -17,7 +17,7 @@ use super::super::{
 use super::{partition_ladder_actions, side_str};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
-const MIN_ORDER_NOTIONAL: f64 = 10.0;
+pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Reconcile a single order per side (legacy single-order mode).
@@ -505,11 +505,31 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Sort current orders by price (bids: descending, asks: ascending)
-        let mut sorted_current: Vec<_> = current.iter().collect();
+        // Filter out any orders with NaN prices (defensive - should never happen)
+        let mut sorted_current: Vec<_> = current
+            .iter()
+            .filter(|order| {
+                if order.price.is_nan() {
+                    tracing::error!(oid = ?order.oid, "Order has NaN price, excluding from reconciliation");
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         if side == Side::Buy {
-            sorted_current.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+            // Use unwrap_or(Equal) to handle potential NaN comparisons safely
+            sorted_current.sort_by(|a, b| {
+                b.price
+                    .partial_cmp(&a.price)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         } else {
-            sorted_current.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
+            sorted_current.sort_by(|a, b| {
+                a.price
+                    .partial_cmp(&b.price)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         // Check each level for meaningful price/size changes
@@ -570,8 +590,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             if should_refresh {
                 if let Ok(response) = self.info_client.user_rate_limit(self.user_address).await {
-                    self.infra.cached_rate_limit =
-                        Some(CachedRateLimit::from_response(&response));
+                    self.infra.cached_rate_limit = Some(CachedRateLimit::from_response(&response));
                     debug!(
                         used = response.n_requests_used,
                         cap = response.n_requests_cap,

@@ -292,11 +292,7 @@ impl ExpectedValueComputer {
     /// Compute expected future value: E[V(s') | s, a].
     ///
     /// Uses Monte Carlo integration over belief distribution.
-    pub fn expected_future_value(
-        &self,
-        state: &ControlState,
-        action: &ActionOutcome,
-    ) -> f64 {
+    pub fn expected_future_value(&self, state: &ControlState, action: &ActionOutcome) -> f64 {
         let mut total = 0.0;
 
         // Sample possible outcomes
@@ -323,11 +319,17 @@ impl ExpectedValueComputer {
 
         // Position changes from fills
         match action {
-            ActionOutcome::Quoted { fill_prob, fill_size, fill_side } => {
+            ActionOutcome::Quoted {
+                fill_prob,
+                fill_size,
+                fill_side,
+            } => {
                 // Deterministic approximation using fill probability
                 let expected_fill = fill_prob * fill_size;
                 let sign = if *fill_side { 1.0 } else { -1.0 };
-                next.position += expected_fill * sign * (1.0 + 0.1 * (sample_idx as f64 / self.n_samples as f64 - 0.5));
+                next.position += expected_fill
+                    * sign
+                    * (1.0 + 0.1 * (sample_idx as f64 / self.n_samples as f64 - 0.5));
             }
             ActionOutcome::NoAction => {}
             ActionOutcome::DumpedInventory { amount } => {
@@ -349,7 +351,11 @@ impl ExpectedValueComputer {
     /// Sample P&L outcome.
     fn sample_pnl(&self, state: &ControlState, action: &ActionOutcome, _sample_idx: usize) -> f64 {
         match action {
-            ActionOutcome::Quoted { fill_prob, fill_size, .. } => {
+            ActionOutcome::Quoted {
+                fill_prob,
+                fill_size,
+                ..
+            } => {
                 // Expected spread capture minus AS
                 let spread_capture = 4.0; // bps, placeholder
                 let as_cost = state.belief.expected_as();

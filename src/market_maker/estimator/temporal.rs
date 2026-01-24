@@ -559,7 +559,10 @@ mod tests {
         // Price up 1% = 100 bps
         scale.update(101.0, 1000);
         let momentum_after_up = scale.momentum_bps();
-        assert!(momentum_after_up > 0.0, "Momentum should be positive after price increase");
+        assert!(
+            momentum_after_up > 0.0,
+            "Momentum should be positive after price increase"
+        );
 
         // Price down 2% from previous (101 -> 98.98 is about -2%)
         scale.update(98.98, 2000);

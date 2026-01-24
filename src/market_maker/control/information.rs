@@ -45,9 +45,9 @@ pub struct InformationConfig {
 impl Default for InformationConfig {
     fn default() -> Self {
         Self {
-            wait_cost_per_period: 0.01, // 0.01 bps opportunity cost per cycle
+            wait_cost_per_period: 0.01,     // 0.01 bps opportunity cost per cycle
             min_uncertainty_reduction: 0.1, // 10% reduction needed
-            learning_rate: 0.05, // 5% uncertainty reduction per observation
+            learning_rate: 0.05,            // 5% uncertainty reduction per observation
             max_wait_cycles: 10,
             wait_threshold: 0.5,
             // Typical GLFT half-spread for crypto: ~8 bps
@@ -180,7 +180,8 @@ impl InformationValue {
         let current_uncertainty = state.edge_uncertainty();
 
         // Calculate how many cycles to reach target uncertainty
-        let target_uncertainty = current_uncertainty * (1.0 - self.config.min_uncertainty_reduction);
+        let target_uncertainty =
+            current_uncertainty * (1.0 - self.config.min_uncertainty_reduction);
         let learning_rate = self.config.learning_rate;
 
         if learning_rate <= 0.0 {
@@ -189,8 +190,7 @@ impl InformationValue {
 
         // Solve: current * (1-learning_rate)^n = target
         // n = log(target/current) / log(1-learning_rate)
-        let n =
-            (target_uncertainty / current_uncertainty).ln() / (1.0 - learning_rate).ln();
+        let n = (target_uncertainty / current_uncertainty).ln() / (1.0 - learning_rate).ln();
 
         (n.ceil() as u32).min(self.config.max_wait_cycles).max(1)
     }
@@ -276,7 +276,9 @@ impl ActionValueComparator {
                 state.expected_edge() * size_fraction * 0.5
             }
             Action::NoQuote { .. } => -0.01,
-            Action::WaitToLearn { expected_info_gain, .. } => *expected_info_gain * 0.5,
+            Action::WaitToLearn {
+                expected_info_gain, ..
+            } => *expected_info_gain * 0.5,
             _ => 0.0,
         }
     }

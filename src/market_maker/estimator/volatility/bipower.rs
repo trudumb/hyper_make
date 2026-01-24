@@ -142,7 +142,10 @@ mod tests {
             "Jump ratio {} should be near 1.0 in normal market",
             jr
         );
-        assert!(!bp.is_toxic_regime(), "Should not be toxic in normal market");
+        assert!(
+            !bp.is_toxic_regime(),
+            "Should not be toxic in normal market"
+        );
     }
 
     #[test]

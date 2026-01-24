@@ -335,15 +335,9 @@ pub enum FeatureStatus {
     /// Feature value is valid
     Valid,
     /// Feature value is out of expected bounds
-    OutOfBounds {
-        value: f64,
-        lower: f64,
-        upper: f64,
-    },
+    OutOfBounds { value: f64, lower: f64, upper: f64 },
     /// Feature value is stale (not updated recently)
-    Stale {
-        age_ms: u64,
-    },
+    Stale { age_ms: u64 },
     /// Feature value is NaN or Infinite
     Invalid,
 }
@@ -548,7 +542,9 @@ impl FeatureValidator {
     /// Check if a feature is stale.
     pub fn is_stale(&self, name: &str, current_time_ms: u64) -> bool {
         match self.last_seen.get(name) {
-            Some(&last) => current_time_ms.saturating_sub(last) > self.config.staleness_threshold_ms,
+            Some(&last) => {
+                current_time_ms.saturating_sub(last) > self.config.staleness_threshold_ms
+            }
             None => true, // Never seen = stale
         }
     }
@@ -584,7 +580,9 @@ impl FeatureValidator {
 
     /// Get current bounds for a feature.
     pub fn bounds(&self, name: &str) -> Option<(f64, f64)> {
-        self.trackers.get(name).map(|t| (t.lower_bound(), t.upper_bound()))
+        self.trackers
+            .get(name)
+            .map(|t| (t.lower_bound(), t.upper_bound()))
     }
 
     /// Get fallback value for a feature (median).

@@ -163,9 +163,7 @@ impl GammaSignal {
             GammaSignal::VolatilityXMomentum => {
                 Some((GammaSignal::VolatilityRatio, "momentum_abs"))
             }
-            GammaSignal::RegimeXInventory => {
-                Some((GammaSignal::SpreadRegime, "inventory"))
-            }
+            GammaSignal::RegimeXInventory => Some((GammaSignal::SpreadRegime, "inventory")),
             GammaSignal::JumpXFlow => Some((GammaSignal::JumpRatio, "flow_abs")),
             _ => None,
         }

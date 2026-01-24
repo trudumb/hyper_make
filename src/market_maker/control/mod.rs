@@ -47,11 +47,11 @@ pub use changepoint::{ChangepointConfig, ChangepointDetector};
 pub use controller::{ControllerConfig, OptimalController};
 pub use information::{InformationConfig, InformationValue};
 pub use interface::{GaussianEstimate, LearningModuleOutput, ModelPrediction, TradingState};
-pub use state::{ControlState, StateConfig};
 pub use simulation::{
     CascadeScenario, HistoricalReplay, MarketScenario, MeanRevertingScenario, MonteCarloResult,
     SimulationConfig, SimulationEngine, SimulationResult, TrendingScenario,
 };
+pub use state::{ControlState, StateConfig};
 pub use traits::{
     BeliefProvider, ControlOutput, ControlReason, ControlSolver, ControlStateProvider,
     MarketMicrostructure, ObservableState, StateSnapshot, ValueFunctionSolver,
@@ -255,26 +255,29 @@ impl StochasticController {
                     .zip(ladder.asks.first())
                     .map(|(bid, ask)| bid.depth_bps + ask.depth_bps)
                     .unwrap_or(8.0);
-                let size = ladder
-                    .bids
-                    .first()
-                    .map(|b| b.size)
-                    .unwrap_or(0.0)
+                let size = ladder.bids.first().map(|b| b.size).unwrap_or(0.0)
                     + ladder.asks.first().map(|a| a.size).unwrap_or(0.0);
                 state::ActionTaken::Quoted { spread_bps, size }
             }
-            Action::DefensiveQuote { spread_multiplier, size_fraction, .. } => {
+            Action::DefensiveQuote {
+                spread_multiplier,
+                size_fraction,
+                ..
+            } => {
                 state::ActionTaken::Quoted {
                     spread_bps: 8.0 * spread_multiplier, // Base spread * multiplier
                     size: *size_fraction,
                 }
             }
-            Action::DumpInventory { target_position, .. } => {
-                state::ActionTaken::DumpedInventory { amount: *target_position }
-            }
-            Action::BuildInventory { .. } => {
-                state::ActionTaken::Quoted { spread_bps: 8.0, size: 1.0 }
-            }
+            Action::DumpInventory {
+                target_position, ..
+            } => state::ActionTaken::DumpedInventory {
+                amount: *target_position,
+            },
+            Action::BuildInventory { .. } => state::ActionTaken::Quoted {
+                spread_bps: 8.0,
+                size: 1.0,
+            },
             Action::NoQuote { .. } | Action::WaitToLearn { .. } => state::ActionTaken::NoQuote,
         };
         self.prev_state = Some(control_state);
@@ -306,9 +309,9 @@ impl StochasticController {
         let time_elapsed = 0.001; // 1ms placeholder
 
         // Update belief state
-        let result = self
-            .belief
-            .update_with_diagnostics(realized_as_bps, realized_edge, time_elapsed);
+        let result =
+            self.belief
+                .update_with_diagnostics(realized_as_bps, realized_edge, time_elapsed);
 
         // Update changepoint detector with edge observation
         self.changepoint.update(realized_edge);
@@ -327,7 +330,7 @@ impl StochasticController {
                 drawdown: prev_state.drawdown,
                 time_to_funding: prev_state.time_to_funding,
                 predicted_funding: prev_state.predicted_funding, // Carry forward
-                vol_regime: prev_state.vol_regime.clone(), // Carry forward
+                vol_regime: prev_state.vol_regime.clone(),       // Carry forward
                 // Convert Health enum to trust score [0, 1]
                 learning_trust: match learning_output.model_health.overall {
                     Health::Good => 1.0,
@@ -459,7 +462,10 @@ impl StochasticController {
                 ladder: Ladder::default(),
                 expected_value: *expected_edge,
             },
-            QuoteDecision::ReducedSize { fraction, reason: _ } => Action::DefensiveQuote {
+            QuoteDecision::ReducedSize {
+                fraction,
+                reason: _,
+            } => Action::DefensiveQuote {
                 spread_multiplier: 1.0,
                 size_fraction: *fraction,
                 reason: DefensiveReason::ModelDisagreement,
@@ -539,7 +545,10 @@ impl StochasticController {
     /// Generate comprehensive system health report.
     ///
     /// Shows the full Layer 1→L2→L3 pipeline state for diagnostics.
-    pub fn system_health_report(&self, learning_output: &LearningModuleOutput) -> SystemHealthReport {
+    pub fn system_health_report(
+        &self,
+        learning_output: &LearningModuleOutput,
+    ) -> SystemHealthReport {
         let cp_summary = self.changepoint.summary();
 
         SystemHealthReport {

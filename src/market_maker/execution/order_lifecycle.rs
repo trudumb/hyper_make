@@ -99,12 +99,7 @@ pub struct OrderEvent {
 
 impl OrderEvent {
     /// Create a new order event.
-    pub fn new(
-        timestamp: u64,
-        state: OrderState,
-        filled_size: f64,
-        remaining_size: f64,
-    ) -> Self {
+    pub fn new(timestamp: u64, state: OrderState, filled_size: f64, remaining_size: f64) -> Self {
         Self {
             timestamp,
             state,
@@ -253,7 +248,10 @@ impl OrderLifecycle {
 
     /// Get the last event timestamp.
     pub fn last_event_time(&self) -> u64 {
-        self.events.last().map(|e| e.timestamp).unwrap_or(self.created_at)
+        self.events
+            .last()
+            .map(|e| e.timestamp)
+            .unwrap_or(self.created_at)
     }
 
     /// Get the order age (time since creation, based on last event).
@@ -457,12 +455,12 @@ impl OrderLifecycleTracker {
         let cancel_before_any_fill = cancelled.iter().filter(|o| o.total_filled == 0.0).count();
         let cancel_after_partial = cancelled.iter().filter(|o| o.total_filled > 0.0).count();
 
-        let total_time_to_cancel: u64 = cancelled
+        let total_time_to_cancel: u64 = cancelled.iter().filter_map(|o| o.time_to_terminal()).sum();
+
+        let orders_with_time = cancelled
             .iter()
             .filter_map(|o| o.time_to_terminal())
-            .sum();
-
-        let orders_with_time = cancelled.iter().filter_map(|o| o.time_to_terminal()).count();
+            .count();
         let avg_time_to_cancel_ms = if orders_with_time > 0 {
             total_time_to_cancel as f64 / orders_with_time as f64
         } else {
@@ -684,7 +682,12 @@ mod tests {
             1000,
         );
 
-        lifecycle.add_event(OrderEvent::new(1100, OrderState::PartiallyFilled, 0.005, 0.005));
+        lifecycle.add_event(OrderEvent::new(
+            1100,
+            OrderState::PartiallyFilled,
+            0.005,
+            0.005,
+        ));
 
         assert_eq!(lifecycle.current_state, OrderState::PartiallyFilled);
         assert!((lifecycle.total_filled - 0.005).abs() < f64::EPSILON);
@@ -723,7 +726,12 @@ mod tests {
 
         assert!((lifecycle.fill_ratio() - 0.0).abs() < f64::EPSILON);
 
-        lifecycle.add_event(OrderEvent::new(1100, OrderState::PartiallyFilled, 0.005, 0.005));
+        lifecycle.add_event(OrderEvent::new(
+            1100,
+            OrderState::PartiallyFilled,
+            0.005,
+            0.005,
+        ));
         assert!((lifecycle.fill_ratio() - 0.5).abs() < f64::EPSILON);
 
         lifecycle.add_event(OrderEvent::new(1200, OrderState::Filled, 0.01, 0.0));
@@ -780,7 +788,12 @@ mod tests {
             1000,
         );
 
-        lifecycle.add_event(OrderEvent::new(1100, OrderState::PartiallyFilled, 0.005, 0.005));
+        lifecycle.add_event(OrderEvent::new(
+            1100,
+            OrderState::PartiallyFilled,
+            0.005,
+            0.005,
+        ));
         lifecycle.add_event(OrderEvent::new(1200, OrderState::Cancelled, 0.005, 0.005));
 
         assert!(!lifecycle.was_cancelled_before_fill());
@@ -803,7 +816,12 @@ mod tests {
         assert!(lifecycle.time_to_first_fill().is_none());
 
         // First fill at 1100
-        lifecycle.add_event(OrderEvent::new(1100, OrderState::PartiallyFilled, 0.005, 0.005));
+        lifecycle.add_event(OrderEvent::new(
+            1100,
+            OrderState::PartiallyFilled,
+            0.005,
+            0.005,
+        ));
         assert_eq!(lifecycle.time_to_first_fill(), Some(100));
 
         // Second fill at 1200 shouldn't change time to first fill
@@ -879,10 +897,7 @@ mod tests {
     fn test_order_lifecycle_tracker_update_nonexistent() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        assert!(!tracker.update_order(
-            999,
-            OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0)
-        ));
+        assert!(!tracker.update_order(999, OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0)));
     }
 
     #[test]

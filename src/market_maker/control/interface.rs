@@ -108,14 +108,20 @@ pub struct GaussianEstimate {
 
 impl Default for GaussianEstimate {
     fn default() -> Self {
-        Self { mean: 0.0, std: 1.0 }
+        Self {
+            mean: 0.0,
+            std: 1.0,
+        }
     }
 }
 
 impl GaussianEstimate {
     /// Create a new Gaussian estimate.
     pub fn new(mean: f64, std: f64) -> Self {
-        Self { mean, std: std.max(1e-9) }
+        Self {
+            mean,
+            std: std.max(1e-9),
+        }
     }
 
     /// Symmetric confidence interval.

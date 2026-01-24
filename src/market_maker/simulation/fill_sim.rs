@@ -64,8 +64,8 @@ impl Default for FillSimulatorConfig {
     fn default() -> Self {
         Self {
             touch_fill_probability: 0.3, // 30% chance when touched
-            queue_position_factor: 0.5,   // Assume middle of queue
-            max_order_age_s: 300.0,       // 5 minutes
+            queue_position_factor: 0.5,  // Assume middle of queue
+            max_order_age_s: 300.0,      // 5 minutes
             min_triggering_trade_size: 0.0,
         }
     }
@@ -111,7 +111,10 @@ impl FillSimulator {
             // Check if this trade could fill the order
             if let Some(fill) = self.check_fill(&order, trade) {
                 // Execute the fill in the executor
-                if self.executor.simulate_fill(fill.oid, fill.fill_size, fill.fill_price) {
+                if self
+                    .executor
+                    .simulate_fill(fill.oid, fill.fill_size, fill.fill_price)
+                {
                     info!(
                         oid = fill.oid,
                         side = ?fill.side,
@@ -186,7 +189,9 @@ impl FillSimulator {
         }
 
         // Determine fill size (can't fill more than order size or trade size)
-        let fill_size = order.size.min(trade.size * self.config.queue_position_factor);
+        let fill_size = order
+            .size
+            .min(trade.size * self.config.queue_position_factor);
 
         if fill_size <= 0.0 {
             return None;
@@ -286,8 +291,8 @@ pub struct FillSimulatorStats {
 
 /// Probabilistic fill decision using simple random sampling
 fn should_fill_probabilistic(probability: f64) -> bool {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     // Use hash of timestamp for pseudo-random without extra dependencies
     let now = SystemTime::now()
@@ -346,7 +351,10 @@ impl AggressiveFillSimulator {
                 for order in buy_orders {
                     if trade.price <= order.price && remaining_size > 0.0 {
                         let fill_size = order.size.min(remaining_size);
-                        if self.executor.simulate_fill(order.oid, fill_size, order.price) {
+                        if self
+                            .executor
+                            .simulate_fill(order.oid, fill_size, order.price)
+                        {
                             let now_ns = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
@@ -372,7 +380,10 @@ impl AggressiveFillSimulator {
                 for order in sell_orders {
                     if trade.price >= order.price && remaining_size > 0.0 {
                         let fill_size = order.size.min(remaining_size);
-                        if self.executor.simulate_fill(order.oid, fill_size, order.price) {
+                        if self
+                            .executor
+                            .simulate_fill(order.oid, fill_size, order.price)
+                        {
                             let now_ns = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
@@ -449,7 +460,9 @@ mod tests {
         // Create a buy order at 100
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             executor.update_mid(101.0);
-            executor.place_order("BTC", 100.0, 1.0, true, None, true).await;
+            executor
+                .place_order("BTC", 100.0, 1.0, true, None, true)
+                .await;
         });
 
         // Trade at 99 should potentially fill

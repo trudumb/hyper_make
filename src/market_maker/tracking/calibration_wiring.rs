@@ -174,12 +174,9 @@ impl CalibratedFillModel {
 
         if let Some(linked) = self.prediction_store.record_outcome(outcome) {
             // Also update the detailed tracker
-            let regime = linked
-                .prediction
-                .regime
-                .as_deref()
-                .unwrap_or("Unknown");
-            self.tracker.record(linked.prediction.predicted_value, filled, regime);
+            let regime = linked.prediction.regime.as_deref().unwrap_or("Unknown");
+            self.tracker
+                .record(linked.prediction.predicted_value, filled, regime);
 
             // Update the underlying model with this observation
             if let Some(depth) = linked.prediction.features.get("depth_bps") {
@@ -337,9 +334,18 @@ impl CalibratedAdverseSelection {
         let alpha = self.estimator.predicted_alpha();
 
         let mut features = HashMap::new();
-        features.insert("realized_as_bps".to_string(), self.estimator.realized_as_bps());
-        features.insert("fills_measured".to_string(), self.estimator.fills_measured() as f64);
-        features.insert("spread_adj_bps".to_string(), self.estimator.spread_adjustment_bps());
+        features.insert(
+            "realized_as_bps".to_string(),
+            self.estimator.realized_as_bps(),
+        );
+        features.insert(
+            "fills_measured".to_string(),
+            self.estimator.fills_measured() as f64,
+        );
+        features.insert(
+            "spread_adj_bps".to_string(),
+            self.estimator.spread_adjustment_bps(),
+        );
 
         let prediction = PredictionLog::new(
             PredictionType::AdverseSelection,
@@ -357,9 +363,18 @@ impl CalibratedAdverseSelection {
         let alpha = self.estimator.predicted_alpha();
 
         let mut features = HashMap::new();
-        features.insert("realized_as_bps".to_string(), self.estimator.realized_as_bps());
-        features.insert("fills_measured".to_string(), self.estimator.fills_measured() as f64);
-        features.insert("spread_adj_bps".to_string(), self.estimator.spread_adjustment_bps());
+        features.insert(
+            "realized_as_bps".to_string(),
+            self.estimator.realized_as_bps(),
+        );
+        features.insert(
+            "fills_measured".to_string(),
+            self.estimator.fills_measured() as f64,
+        );
+        features.insert(
+            "spread_adj_bps".to_string(),
+            self.estimator.spread_adjustment_bps(),
+        );
 
         let prediction = PredictionLog::new(
             PredictionType::AdverseSelection,
@@ -390,12 +405,9 @@ impl CalibratedAdverseSelection {
         );
 
         if let Some(linked) = self.prediction_store.record_outcome(outcome) {
-            let regime = linked
-                .prediction
-                .regime
-                .as_deref()
-                .unwrap_or("Unknown");
-            self.tracker.record(linked.prediction.predicted_value, was_adverse, regime);
+            let regime = linked.prediction.regime.as_deref().unwrap_or("Unknown");
+            self.tracker
+                .record(linked.prediction.predicted_value, was_adverse, regime);
         }
     }
 
@@ -581,7 +593,8 @@ impl CalibratedLagAnalyzer {
         );
 
         if let Some(linked) = self.prediction_store.record_outcome(outcome) {
-            self.tracker.record(linked.prediction.predicted_value, signal_led, "Unknown");
+            self.tracker
+                .record(linked.prediction.predicted_value, signal_led, "Unknown");
         }
     }
 
@@ -743,11 +756,7 @@ impl ModelCalibrationSummary {
     pub fn diagnostic_string(&self) -> String {
         format!(
             "fill_ir={:.3}, as_ir={:.3}, lag_ir={:.3}, lag_decay={:.4}/day, any_degraded={}",
-            self.fill_ir,
-            self.as_ir,
-            self.lag_ir,
-            self.lag_mi_decay_rate,
-            self.any_degraded
+            self.fill_ir, self.as_ir, self.lag_ir, self.lag_mi_decay_rate, self.any_degraded
         )
     }
 }
@@ -796,11 +805,7 @@ impl ModelCalibrationOrchestrator {
             "Adverse Selection".to_string(),
             0.05,
         );
-        health_monitor.register_signal(
-            EdgeSignalKind::LeadLag,
-            "Lead-Lag".to_string(),
-            0.05,
-        );
+        health_monitor.register_signal(EdgeSignalKind::LeadLag, "Lead-Lag".to_string(), 0.05);
 
         Self {
             fill_model: CalibratedFillModel::new(fill_model),
@@ -832,11 +837,7 @@ impl ModelCalibrationOrchestrator {
             "Adverse Selection".to_string(),
             0.05,
         );
-        health_monitor.register_signal(
-            EdgeSignalKind::LeadLag,
-            "Lead-Lag".to_string(),
-            0.05,
-        );
+        health_monitor.register_signal(EdgeSignalKind::LeadLag, "Lead-Lag".to_string(), 0.05);
 
         Self {
             fill_model: CalibratedFillModel::with_config(fill_model, fill_config),
@@ -874,11 +875,8 @@ impl ModelCalibrationOrchestrator {
             as_ir * 0.05,
             timestamp_ms,
         );
-        self.health_monitor.update_signal(
-            EdgeSignalKind::LeadLag,
-            lag_mi,
-            timestamp_ms,
-        );
+        self.health_monitor
+            .update_signal(EdgeSignalKind::LeadLag, lag_mi, timestamp_ms);
     }
 
     /// Get aggregated calibration summary.
@@ -917,8 +915,8 @@ impl ModelCalibrationOrchestrator {
         let fill_degraded = self.fill_model.is_warmed_up()
             && self.fill_model.information_ratio() < self.ir_threshold;
 
-        let as_degraded = self.as_model.is_warmed_up()
-            && self.as_model.information_ratio() < self.ir_threshold;
+        let as_degraded =
+            self.as_model.is_warmed_up() && self.as_model.information_ratio() < self.ir_threshold;
 
         let lag_degraded = self.lag_model.is_mi_decaying();
 
@@ -929,15 +927,12 @@ impl ModelCalibrationOrchestrator {
     pub fn degraded_models(&self) -> Vec<&'static str> {
         let mut degraded = Vec::new();
 
-        if self.fill_model.is_warmed_up()
-            && self.fill_model.information_ratio() < self.ir_threshold
+        if self.fill_model.is_warmed_up() && self.fill_model.information_ratio() < self.ir_threshold
         {
             degraded.push("FillModel");
         }
 
-        if self.as_model.is_warmed_up()
-            && self.as_model.information_ratio() < self.ir_threshold
-        {
+        if self.as_model.is_warmed_up() && self.as_model.information_ratio() < self.ir_threshold {
             degraded.push("AdverseSelection");
         }
 
@@ -1329,15 +1324,21 @@ mod tests {
 
             // Fill model
             let (_, fill_pred_id) = orchestrator.fill_model.predict(5.0);
-            orchestrator.fill_model.record_outcome(fill_pred_id, i % 3 == 0);
+            orchestrator
+                .fill_model
+                .record_outcome(fill_pred_id, i % 3 == 0);
 
             // AS model
             let (_, as_pred_id) = orchestrator.as_model.predict();
-            orchestrator.as_model.record_outcome(as_pred_id, if i % 4 == 0 { 5.0 } else { 0.5 });
+            orchestrator
+                .as_model
+                .record_outcome(as_pred_id, if i % 4 == 0 { 5.0 } else { 0.5 });
 
             // Lag model
             let (_, _, lag_pred_id) = orchestrator.lag_model.predict(ts);
-            orchestrator.lag_model.record_outcome(lag_pred_id, i % 2 == 0);
+            orchestrator
+                .lag_model
+                .record_outcome(lag_pred_id, i % 2 == 0);
         }
 
         orchestrator.update_all(50000);

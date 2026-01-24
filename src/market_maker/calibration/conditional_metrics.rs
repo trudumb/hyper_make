@@ -607,9 +607,6 @@ mod tests {
         let cloned = cc.clone();
 
         assert_eq!(cloned.samples_by_regime(0), 1);
-        assert_eq!(
-            cloned.samples_by_type(&PredictionType::FillProbability),
-            1
-        );
+        assert_eq!(cloned.samples_by_type(&PredictionType::FillProbability), 1);
     }
 }

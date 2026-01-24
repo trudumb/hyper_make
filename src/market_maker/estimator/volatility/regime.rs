@@ -670,7 +670,7 @@ pub(crate) struct VolatilityRegimeTracker {
     /// Minimum transitions for de-escalating to lower regime (slow: vol mean-reverts)
     min_transitions_deescalate: u32,
     /// Thresholds relative to baseline
-    low_threshold: f64,     // σ < baseline × low_threshold → Low
+    low_threshold: f64, // σ < baseline × low_threshold → Low
     high_threshold: f64,    // σ > baseline × high_threshold → High
     extreme_threshold: f64, // σ > baseline × extreme_threshold → Extreme
     /// Jump ratio threshold for Extreme regime
@@ -850,7 +850,8 @@ mod tests {
         assert!((VolatilityRegime::Low.gamma_multiplier() - 0.8).abs() < 0.01);
         assert!((VolatilityRegime::Normal.gamma_multiplier() - 1.0).abs() < 0.01);
         assert!((VolatilityRegime::High.gamma_multiplier() - 1.5).abs() < 0.01);
-        assert!((VolatilityRegime::Extreme.gamma_multiplier() - 1.8).abs() < 0.01); // Reduced from 3.0
+        assert!((VolatilityRegime::Extreme.gamma_multiplier() - 1.8).abs() < 0.01);
+        // Reduced from 3.0
     }
 
     #[test]
@@ -858,13 +859,18 @@ mod tests {
         let mut calibrator = WarmupCalibrator::new(10); // Small for testing
 
         // Add observations simulating realistic BTC volatility
-        let observations = [0.00020, 0.00022, 0.00018, 0.00025, 0.00030,
-                           0.00019, 0.00021, 0.00023, 0.00028, 0.00024];
+        let observations = [
+            0.00020, 0.00022, 0.00018, 0.00025, 0.00030, 0.00019, 0.00021, 0.00023, 0.00028,
+            0.00024,
+        ];
 
         for (i, &sigma) in observations.iter().enumerate() {
             let result = calibrator.add_observation(sigma);
             if i < 9 {
-                assert!(result.is_none(), "Should not calibrate before min observations");
+                assert!(
+                    result.is_none(),
+                    "Should not calibrate before min observations"
+                );
             } else {
                 assert!(result.is_some(), "Should calibrate at min observations");
                 let cal = result.unwrap();
@@ -970,11 +976,19 @@ mod tests {
         let blender = RegimeParameterBlender::default();
         // Verify 10x kappa range (calm to cascade)
         let ratio = blender.kappa_range_ratio();
-        assert!((ratio - 10.0).abs() < 0.1, "Kappa should vary 10x, got {}", ratio);
+        assert!(
+            (ratio - 10.0).abs() < 0.1,
+            "Kappa should vary 10x, got {}",
+            ratio
+        );
 
         // Verify 5x gamma range (calm to cascade)
         let gamma_ratio = blender.gamma_range_ratio();
-        assert!((gamma_ratio - 5.0).abs() < 0.1, "Gamma should vary 5x, got {}", gamma_ratio);
+        assert!(
+            (gamma_ratio - 5.0).abs() < 0.1,
+            "Gamma should vary 5x, got {}",
+            gamma_ratio
+        );
     }
 
     #[test]
@@ -988,17 +1002,26 @@ mod tests {
         // Pure Low regime
         let low_belief = RegimeBeliefState::from_regime(VolatilityRegime::Low);
         let gamma_low = blender.blend_gamma(&low_belief);
-        assert!((gamma_low - 0.05).abs() < 0.001, "Low gamma should be 0.1 * 0.5 = 0.05");
+        assert!(
+            (gamma_low - 0.05).abs() < 0.001,
+            "Low gamma should be 0.1 * 0.5 = 0.05"
+        );
 
         // Pure Normal regime
         let normal_belief = RegimeBeliefState::from_regime(VolatilityRegime::Normal);
         let gamma_normal = blender.blend_gamma(&normal_belief);
-        assert!((gamma_normal - 0.1).abs() < 0.001, "Normal gamma should be 0.1 * 1.0 = 0.1");
+        assert!(
+            (gamma_normal - 0.1).abs() < 0.001,
+            "Normal gamma should be 0.1 * 1.0 = 0.1"
+        );
 
         // Pure Extreme regime
         let extreme_belief = RegimeBeliefState::from_regime(VolatilityRegime::Extreme);
         let gamma_extreme = blender.blend_gamma(&extreme_belief);
-        assert!((gamma_extreme - 0.25).abs() < 0.001, "Extreme gamma should be 0.1 * 2.5 = 0.25");
+        assert!(
+            (gamma_extreme - 0.25).abs() < 0.001,
+            "Extreme gamma should be 0.1 * 2.5 = 0.25"
+        );
     }
 
     #[test]
@@ -1012,12 +1035,18 @@ mod tests {
         // Pure Low regime (high kappa = more fills)
         let low_belief = RegimeBeliefState::from_regime(VolatilityRegime::Low);
         let kappa_low = blender.blend_kappa(&low_belief);
-        assert!((kappa_low - 2.0).abs() < 0.001, "Low kappa should be 1.0 * 2.0 = 2.0");
+        assert!(
+            (kappa_low - 2.0).abs() < 0.001,
+            "Low kappa should be 1.0 * 2.0 = 2.0"
+        );
 
         // Pure Extreme regime (low kappa = fewer fills)
         let extreme_belief = RegimeBeliefState::from_regime(VolatilityRegime::Extreme);
         let kappa_extreme = blender.blend_kappa(&extreme_belief);
-        assert!((kappa_extreme - 0.2).abs() < 0.001, "Extreme kappa should be 1.0 * 0.2 = 0.2");
+        assert!(
+            (kappa_extreme - 0.2).abs() < 0.001,
+            "Extreme kappa should be 1.0 * 0.2 = 0.2"
+        );
     }
 
     #[test]
@@ -1065,7 +1094,10 @@ mod tests {
         // Low regime should not be defensive
         let low_belief = RegimeBeliefState::from_regime(VolatilityRegime::Low);
         let params_low = blender.blend_all(&low_belief);
-        assert!(!params_low.is_defensive(), "Low regime should not be defensive");
+        assert!(
+            !params_low.is_defensive(),
+            "Low regime should not be defensive"
+        );
     }
 
     // ========================================================================

@@ -68,11 +68,11 @@ impl PredictionType {
     /// Default measurement delay in milliseconds for this prediction type.
     pub fn default_measurement_delay_ms(&self) -> u64 {
         match self {
-            PredictionType::FillProbability => 5000,    // 5s order lifetime
-            PredictionType::AdverseSelection => 2000,   // 2s post-fill
-            PredictionType::RegimeChange => 60000,      // 1 minute
-            PredictionType::PriceDirection => 1000,     // 1s default horizon
-            PredictionType::Volatility => 60000,        // 1 minute vol window
+            PredictionType::FillProbability => 5000, // 5s order lifetime
+            PredictionType::AdverseSelection => 2000, // 2s post-fill
+            PredictionType::RegimeChange => 60000,   // 1 minute
+            PredictionType::PriceDirection => 1000,  // 1s default horizon
+            PredictionType::Volatility => 60000,     // 1 minute vol window
         }
     }
 
@@ -1022,7 +1022,8 @@ impl CalibrationTracker {
         was_adverse: bool,
         regime: &str,
     ) {
-        self.adverse_selection.record(predicted_alpha, was_adverse, regime);
+        self.adverse_selection
+            .record(predicted_alpha, was_adverse, regime);
     }
 
     /// Get fill calibration metrics.
@@ -1263,10 +1264,19 @@ mod tests {
 
     #[test]
     fn test_prediction_type_display() {
-        assert_eq!(PredictionType::FillProbability.to_string(), "fill_probability");
-        assert_eq!(PredictionType::AdverseSelection.to_string(), "adverse_selection");
+        assert_eq!(
+            PredictionType::FillProbability.to_string(),
+            "fill_probability"
+        );
+        assert_eq!(
+            PredictionType::AdverseSelection.to_string(),
+            "adverse_selection"
+        );
         assert_eq!(PredictionType::RegimeChange.to_string(), "regime_change");
-        assert_eq!(PredictionType::PriceDirection.to_string(), "price_direction");
+        assert_eq!(
+            PredictionType::PriceDirection.to_string(),
+            "price_direction"
+        );
         assert_eq!(PredictionType::Volatility.to_string(), "volatility");
     }
 
@@ -1283,11 +1293,26 @@ mod tests {
 
     #[test]
     fn test_prediction_type_default_delay() {
-        assert_eq!(PredictionType::FillProbability.default_measurement_delay_ms(), 5000);
-        assert_eq!(PredictionType::AdverseSelection.default_measurement_delay_ms(), 2000);
-        assert_eq!(PredictionType::RegimeChange.default_measurement_delay_ms(), 60000);
-        assert_eq!(PredictionType::PriceDirection.default_measurement_delay_ms(), 1000);
-        assert_eq!(PredictionType::Volatility.default_measurement_delay_ms(), 60000);
+        assert_eq!(
+            PredictionType::FillProbability.default_measurement_delay_ms(),
+            5000
+        );
+        assert_eq!(
+            PredictionType::AdverseSelection.default_measurement_delay_ms(),
+            2000
+        );
+        assert_eq!(
+            PredictionType::RegimeChange.default_measurement_delay_ms(),
+            60000
+        );
+        assert_eq!(
+            PredictionType::PriceDirection.default_measurement_delay_ms(),
+            1000
+        );
+        assert_eq!(
+            PredictionType::Volatility.default_measurement_delay_ms(),
+            60000
+        );
     }
 
     #[test]
@@ -1296,12 +1321,7 @@ mod tests {
         features.insert("spread_bps".to_string(), 5.0);
         features.insert("volatility".to_string(), 0.02);
 
-        let log = PredictionLog::new(
-            PredictionType::FillProbability,
-            0.75,
-            0.9,
-            features.clone(),
-        );
+        let log = PredictionLog::new(PredictionType::FillProbability, 0.75, 0.9, features.clone());
 
         assert!(log.id > 0);
         assert!(log.timestamp > 0);
@@ -1316,13 +1336,8 @@ mod tests {
 
     #[test]
     fn test_prediction_log_with_regime() {
-        let log = PredictionLog::new(
-            PredictionType::AdverseSelection,
-            0.3,
-            0.8,
-            HashMap::new(),
-        )
-        .with_regime("Cascade");
+        let log = PredictionLog::new(PredictionType::AdverseSelection, 0.3, 0.8, HashMap::new())
+            .with_regime("Cascade");
 
         assert_eq!(log.regime, Some("Cascade".to_string()));
     }
@@ -1351,12 +1366,8 @@ mod tests {
 
     #[test]
     fn test_linked_prediction_outcome_squared_error() {
-        let prediction = PredictionLog::new(
-            PredictionType::FillProbability,
-            0.7,
-            0.9,
-            HashMap::new(),
-        );
+        let prediction =
+            PredictionLog::new(PredictionType::FillProbability, 0.7, 0.9, HashMap::new());
         let outcome = OutcomeLog::new(prediction.id, 1.0, 100);
 
         let linked = LinkedPredictionOutcome {
@@ -1401,12 +1412,8 @@ mod tests {
         let mut store = PredictionOutcomeStore::new(100, 50);
 
         // Log a prediction
-        let prediction = PredictionLog::new(
-            PredictionType::FillProbability,
-            0.75,
-            0.9,
-            HashMap::new(),
-        );
+        let prediction =
+            PredictionLog::new(PredictionType::FillProbability, 0.75, 0.9, HashMap::new());
         let pred_id = store.log_prediction(prediction);
 
         assert_eq!(store.pending_count(), 1);
@@ -1480,21 +1487,13 @@ mod tests {
         // Predict 0.8, get 1.0 -> error = 0.04
         // Predict 0.2, get 0.0 -> error = 0.04
         for _ in 0..10 {
-            let pred_high = PredictionLog::new(
-                PredictionType::FillProbability,
-                0.8,
-                0.9,
-                HashMap::new(),
-            );
+            let pred_high =
+                PredictionLog::new(PredictionType::FillProbability, 0.8, 0.9, HashMap::new());
             let id_high = store.log_prediction(pred_high);
             store.link_by_id(id_high, 1.0, 100);
 
-            let pred_low = PredictionLog::new(
-                PredictionType::FillProbability,
-                0.2,
-                0.9,
-                HashMap::new(),
-            );
+            let pred_low =
+                PredictionLog::new(PredictionType::FillProbability, 0.2, 0.9, HashMap::new());
             let id_low = store.log_prediction(pred_low);
             store.link_by_id(id_low, 0.0, 100);
         }
@@ -1513,12 +1512,8 @@ mod tests {
 
         // Only add 5 samples
         for _ in 0..5 {
-            let pred = PredictionLog::new(
-                PredictionType::FillProbability,
-                0.5,
-                0.9,
-                HashMap::new(),
-            );
+            let pred =
+                PredictionLog::new(PredictionType::FillProbability, 0.5, 0.9, HashMap::new());
             let id = store.log_prediction(pred);
             store.link_by_id(id, 1.0, 100);
         }
@@ -1534,12 +1529,8 @@ mod tests {
 
         // Add more pending than limit
         for _ in 0..8 {
-            let pred = PredictionLog::new(
-                PredictionType::FillProbability,
-                0.5,
-                0.9,
-                HashMap::new(),
-            );
+            let pred =
+                PredictionLog::new(PredictionType::FillProbability, 0.5, 0.9, HashMap::new());
             store.log_prediction(pred);
         }
         // Should cap at max_pending
@@ -1553,12 +1544,8 @@ mod tests {
 
         // Add more to exceed linked limit
         for _ in 0..15 {
-            let pred = PredictionLog::new(
-                PredictionType::FillProbability,
-                0.5,
-                0.9,
-                HashMap::new(),
-            );
+            let pred =
+                PredictionLog::new(PredictionType::FillProbability, 0.5, 0.9, HashMap::new());
             let id = store.log_prediction(pred);
             store.link_by_id(id, 1.0, 100);
         }
@@ -1596,12 +1583,8 @@ mod tests {
 
         // Add some data
         for _ in 0..5 {
-            let pred = PredictionLog::new(
-                PredictionType::FillProbability,
-                0.5,
-                0.9,
-                HashMap::new(),
-            );
+            let pred =
+                PredictionLog::new(PredictionType::FillProbability, 0.5, 0.9, HashMap::new());
             let id = store.log_prediction(pred);
             store.link_by_id(id, 1.0, 100);
         }
@@ -1680,7 +1663,10 @@ mod tests {
 
         // Should fail due to insufficient samples
         assert_eq!(metrics.n_samples, 20);
-        assert!(!metrics.is_well_calibrated(), "Should fail: insufficient samples");
+        assert!(
+            !metrics.is_well_calibrated(),
+            "Should fail: insufficient samples"
+        );
         assert!(!metrics.has_sufficient_samples());
     }
 
@@ -1744,7 +1730,10 @@ mod tests {
             is_reliable: true,
         };
 
-        assert!(!metrics.is_well_calibrated(), "Should fail: cal_error > 0.1");
+        assert!(
+            !metrics.is_well_calibrated(),
+            "Should fail: cal_error > 0.1"
+        );
     }
 
     #[test]
@@ -1779,13 +1768,17 @@ mod tests {
         // High resolution: extreme predictions that come true
         for _ in 0..25 {
             tracker.record(0.05, false, "Quiet"); // Low pred, doesn't happen
-            tracker.record(0.95, true, "Quiet");  // High pred, does happen
+            tracker.record(0.95, true, "Quiet"); // High pred, does happen
         }
 
         let metrics = tracker.metrics();
 
         // Resolution should be high (predictions far from base rate)
-        assert!(metrics.resolution > 0.1, "Resolution: {}", metrics.resolution);
+        assert!(
+            metrics.resolution > 0.1,
+            "Resolution: {}",
+            metrics.resolution
+        );
     }
 
     #[test]
@@ -1801,7 +1794,11 @@ mod tests {
         let metrics = tracker.metrics();
 
         // Reliability should be low (predictions match outcomes)
-        assert!(metrics.reliability < 0.1, "Reliability: {}", metrics.reliability);
+        assert!(
+            metrics.reliability < 0.1,
+            "Reliability: {}",
+            metrics.reliability
+        );
     }
 
     // ========================================================================
@@ -1935,7 +1932,11 @@ mod tests {
         }
 
         // Trend should be ~0
-        assert!(tracker.mi_trend.abs() < 0.001, "Trend: {}", tracker.mi_trend);
+        assert!(
+            tracker.mi_trend.abs() < 0.001,
+            "Trend: {}",
+            tracker.mi_trend
+        );
 
         // Half-life should be infinite (no decay)
         assert!(
@@ -1979,11 +1980,7 @@ mod tests {
         let projected = tracker.project_mi(10.0);
 
         // Should be approximately half
-        assert!(
-            (projected - 0.05).abs() < 0.01,
-            "Projected: {}",
-            projected
-        );
+        assert!((projected - 0.05).abs() < 0.01, "Projected: {}", projected);
 
         // Project 0 days: should be current MI
         let now = tracker.project_mi(0.0);

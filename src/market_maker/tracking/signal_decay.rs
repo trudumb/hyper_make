@@ -55,11 +55,11 @@ pub struct SignalDecayConfig {
 impl Default for SignalDecayConfig {
     fn default() -> Self {
         Self {
-            max_history_days: 90,        // 3 months of history
-            min_observations: 7,         // 1 week of data
-            warning_half_life_days: 30.0, // Warning if < 1 month
-            critical_half_life_days: 7.0, // Critical if < 1 week
-            min_mi_threshold: 0.005,     // 0.005 bits minimum
+            max_history_days: 90,            // 3 months of history
+            min_observations: 7,             // 1 week of data
+            warning_half_life_days: 30.0,    // Warning if < 1 month
+            critical_half_life_days: 7.0,    // Critical if < 1 week
+            min_mi_threshold: 0.005,         // 0.005 bits minimum
             significant_drop_threshold: 0.5, // 50% drop is significant
         }
     }
@@ -304,9 +304,7 @@ impl SignalDecayReport {
         let tracker = self
             .trackers
             .entry(signal_name.to_string())
-            .or_insert_with(|| {
-                SignalDecayTracker::new(signal_name, self.config.max_history_days)
-            });
+            .or_insert_with(|| SignalDecayTracker::new(signal_name, self.config.max_history_days));
 
         tracker.add_observation(timestamp_ms, mi_bits);
     }
@@ -346,10 +344,7 @@ impl SignalDecayReport {
                     alerts.push(SignalAlert {
                         signal_name: name.clone(),
                         severity: AlertSeverity::Critical,
-                        message: format!(
-                            "Signal decaying rapidly (half-life: {:.1} days)",
-                            hl
-                        ),
+                        message: format!("Signal decaying rapidly (half-life: {:.1} days)", hl),
                         current_mi,
                         half_life_days: Some(hl),
                         recent_change_pct: recent_change.map(|(_, pct)| pct),
@@ -359,10 +354,7 @@ impl SignalDecayReport {
                     alerts.push(SignalAlert {
                         signal_name: name.clone(),
                         severity: AlertSeverity::Warning,
-                        message: format!(
-                            "Signal aging (half-life: {:.1} days)",
-                            hl
-                        ),
+                        message: format!("Signal aging (half-life: {:.1} days)", hl),
                         current_mi,
                         half_life_days: Some(hl),
                         recent_change_pct: recent_change.map(|(_, pct)| pct),
@@ -449,7 +441,10 @@ impl SignalDecayReport {
                     AlertSeverity::Warning => "[WARNING]",
                     AlertSeverity::Info => "[INFO]",
                 };
-                lines.push(format!("{} {}: {}", severity, alert.signal_name, alert.message));
+                lines.push(format!(
+                    "{} {}: {}",
+                    severity, alert.signal_name, alert.message
+                ));
             }
         } else {
             lines.push("No alerts.".to_string());

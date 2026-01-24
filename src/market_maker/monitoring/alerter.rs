@@ -58,6 +58,14 @@ pub enum AlertType {
     ModelStale,
     /// Connection to exchange lost
     ConnectionLost,
+    /// Signal quality decaying (half-life below threshold)
+    SignalDecaying,
+    /// Insufficient samples for reliable calibration
+    InsufficientSamples,
+    /// Market regime has shifted
+    RegimeShift,
+    /// Information ratio dropped below 1.0 (model adding noise)
+    InformationRatioBelowOne,
 }
 
 impl AlertType {
@@ -73,6 +81,10 @@ impl AlertType {
             AlertType::PositionLimitApproaching => "PositionLimitApproaching",
             AlertType::ModelStale => "ModelStale",
             AlertType::ConnectionLost => "ConnectionLost",
+            AlertType::SignalDecaying => "SignalDecaying",
+            AlertType::InsufficientSamples => "InsufficientSamples",
+            AlertType::RegimeShift => "RegimeShift",
+            AlertType::InformationRatioBelowOne => "InformationRatioBelowOne",
         }
     }
 }
@@ -257,12 +269,7 @@ impl Alerter {
     /// * `ir` - Current information ratio
     /// * `component` - Name of the component (e.g., "fill_prob", "adverse_sel")
     /// * `timestamp` - Current timestamp in milliseconds
-    pub fn check_calibration(
-        &self,
-        ir: f64,
-        component: &str,
-        timestamp: u64,
-    ) -> Option<Alert> {
+    pub fn check_calibration(&self, ir: f64, component: &str, timestamp: u64) -> Option<Alert> {
         if self.should_dedupe(AlertType::CalibrationDegraded, timestamp) {
             return None;
         }
@@ -349,12 +356,7 @@ impl Alerter {
     /// * `current` - Current fill rate
     /// * `baseline` - Normal/expected fill rate
     /// * `timestamp` - Current timestamp in milliseconds
-    pub fn check_fill_rate(
-        &self,
-        current: f64,
-        baseline: f64,
-        timestamp: u64,
-    ) -> Option<Alert> {
+    pub fn check_fill_rate(&self, current: f64, baseline: f64, timestamp: u64) -> Option<Alert> {
         if baseline <= 0.0 {
             return None;
         }
@@ -500,11 +502,7 @@ impl Alerter {
     /// Get all unacknowledged alerts.
     pub fn unacknowledged_alerts(&self) -> Vec<Alert> {
         let alerts = self.alerts.read().unwrap();
-        alerts
-            .iter()
-            .filter(|a| !a.acknowledged)
-            .cloned()
-            .collect()
+        alerts.iter().filter(|a| !a.acknowledged).cloned().collect()
     }
 
     /// Get alerts by severity.
@@ -522,7 +520,10 @@ impl Alerter {
         let alerts = self.alerts.read().unwrap();
         alerts.iter().any(|a| {
             !a.acknowledged
-                && matches!(a.severity, AlertSeverity::Critical | AlertSeverity::Emergency)
+                && matches!(
+                    a.severity,
+                    AlertSeverity::Critical | AlertSeverity::Emergency
+                )
         })
     }
 

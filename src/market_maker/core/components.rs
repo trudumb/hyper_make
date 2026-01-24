@@ -481,10 +481,7 @@ mod tests {
 
     #[test]
     fn test_safety_components_construction() {
-        let safety = SafetyComponents::new(
-            KillSwitchConfig::default(),
-            RiskAggregator::new(),
-        );
+        let safety = SafetyComponents::new(KillSwitchConfig::default(), RiskAggregator::new());
         // Kill switch should not be triggered initially
         assert!(!safety.kill_switch.is_triggered());
         // Risk checker should be created with defaults
@@ -502,7 +499,10 @@ mod tests {
             DrawdownConfig::default(),
         );
         // Risk checker should enforce the custom limit
-        assert_eq!(safety.risk_checker.check_order_size(0.05), RiskCheckResult::Ok);
+        assert_eq!(
+            safety.risk_checker.check_order_size(0.05),
+            RiskCheckResult::Ok
+        );
         assert!(safety.risk_checker.check_order_size(0.2).is_hard_breach());
     }
 
@@ -516,7 +516,7 @@ mod tests {
         // Regime HMM should start with Normal as most likely
         let belief = stochastic.regime_hmm.regime_probabilities();
         assert!(belief[1] > 0.5); // Normal regime index is 1
-        // Ensemble should start empty
+                                  // Ensemble should start empty
         let summary = stochastic.ensemble.summary();
         assert_eq!(summary.total_models, 0);
     }

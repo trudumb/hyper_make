@@ -403,20 +403,20 @@ mod tests {
         // Simulate high volatility + high momentum (dangerous cascade scenario)
         // Interaction term vol_x_momentum should increase gamma
         let signals_dangerous = vec![
-            (GammaSignal::VolatilityRatio, 2.0),      // High vol
-            (GammaSignal::VolatilityXMomentum, 2.0),  // High vol×momentum product
-            (GammaSignal::RegimeXInventory, 0.0),     // Neutral
-            (GammaSignal::JumpXFlow, 0.0),            // Neutral
+            (GammaSignal::VolatilityRatio, 2.0),     // High vol
+            (GammaSignal::VolatilityXMomentum, 2.0), // High vol×momentum product
+            (GammaSignal::RegimeXInventory, 0.0),    // Neutral
+            (GammaSignal::JumpXFlow, 0.0),           // Neutral
         ];
 
         let gamma_dangerous = sg.effective_gamma(&signals_dangerous);
 
         // Simulate normal conditions
         let signals_normal = vec![
-            (GammaSignal::VolatilityRatio, 1.0),      // Normal vol
-            (GammaSignal::VolatilityXMomentum, 0.0),  // Low interaction
-            (GammaSignal::RegimeXInventory, 0.0),     // Neutral
-            (GammaSignal::JumpXFlow, 0.0),            // Neutral
+            (GammaSignal::VolatilityRatio, 1.0),     // Normal vol
+            (GammaSignal::VolatilityXMomentum, 0.0), // Low interaction
+            (GammaSignal::RegimeXInventory, 0.0),    // Neutral
+            (GammaSignal::JumpXFlow, 0.0),           // Neutral
         ];
 
         let gamma_normal = sg.effective_gamma(&signals_normal);

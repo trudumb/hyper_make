@@ -270,11 +270,7 @@ impl ChangepointDetector {
     /// Get probability that a changepoint occurred in the last k observations.
     pub fn changepoint_probability(&self, k: usize) -> f64 {
         // Sum probabilities for run lengths 0 to k-1
-        let sum: f64 = self
-            .run_length_probs
-            .iter()
-            .take(k)
-            .sum();
+        let sum: f64 = self.run_length_probs.iter().take(k).sum();
         sum.min(1.0)
     }
 
@@ -515,7 +511,7 @@ mod tests {
     fn test_entropy_based_warmup() {
         // Use high observation fallback to ensure entropy-based warmup is tested
         let mut detector = ChangepointDetector::new(ChangepointConfig {
-            warmup_observations: 1000, // High fallback
+            warmup_observations: 1000,     // High fallback
             warmup_entropy_threshold: 3.0, // Reasonable entropy threshold
             ..Default::default()
         });

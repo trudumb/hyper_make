@@ -62,7 +62,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Record price for dashboard unconditionally when we have a valid mid
         // This ensures dashboard shows price data even during warmup
         if self.latest_mid > 0.0 {
-            self.infra.prometheus.record_price_for_dashboard(self.latest_mid);
+            self.infra
+                .prometheus
+                .record_price_for_dashboard(self.latest_mid);
         }
 
         if result.is_some() {
@@ -750,16 +752,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.last_web_data2_time = Some(std::time::Instant::now());
 
         // 3. Update local position tracking if relevant
-        let local_position = self.position.position();
-        let drift = (exchange_position - local_position).abs();
+        // IMPORTANT: For HIP-3 DEXs, WebData2's clearinghouseState is the USDC clearinghouse,
+        // NOT the DEX's clearinghouse. The asset won't be found, resulting in exchange_position=0.
+        // Only sync position from WebData2 for validator perps (non-HIP-3).
+        if self.config.dex.is_none() {
+            let local_position = self.position.position();
+            let drift = (exchange_position - local_position).abs();
 
-        if drift > crate::EPSILON {
-            self.position.set_position(exchange_position);
-            debug!(
-                local = local_position,
-                exchange = exchange_position,
-                "Position synced from WebData2"
-            );
+            if drift > crate::EPSILON {
+                self.position.set_position(exchange_position);
+                debug!(
+                    local = local_position,
+                    exchange = exchange_position,
+                    "Position synced from WebData2"
+                );
+            }
         }
 
         // 4. Update MarginSizer state

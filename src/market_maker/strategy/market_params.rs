@@ -679,7 +679,7 @@ impl Default for MarketParams {
             margin_available: 0.0, // Will be fetched from margin sizer
             leverage: 1.0,         // Default 1x leverage
             // Kelly-Stochastic Allocation (stochastic integration)
-            kelly_alpha_touch: 0.15, // 15% informed at touch
+            kelly_alpha_touch: 0.15,     // 15% informed at touch
             kelly_alpha_decay_bps: 10.0, // Alpha decays with 10bp characteristic
             kelly_fraction: 0.25,        // Quarter Kelly (conservative)
             kelly_time_horizon: 60.0,    // Default 60s (will be computed from config method)
@@ -703,10 +703,10 @@ impl Default for MarketParams {
             tight_quoting_block_reason: Some("Warmup".to_string()),
             stochastic_spread_multiplier: 1.0, // No widening initially
             // Entropy-Based Distribution (always enabled)
-            entropy_min_entropy: 1.5, // At least ~4.5 effective levels
-            entropy_base_temperature: 1.0,  // Standard softmax
+            entropy_min_entropy: 1.5,      // At least ~4.5 effective levels
+            entropy_base_temperature: 1.0, // Standard softmax
             entropy_min_allocation_floor: 0.02, // 2% minimum per level
-            entropy_thompson_samples: 5,    // Moderate stochasticity
+            entropy_thompson_samples: 5,   // Moderate stochasticity
             // Adaptive Bayesian System
             use_adaptive_spreads: false,       // Default OFF for safety
             adaptive_spread_floor: 0.0008,     // 8 bps fallback floor
@@ -754,8 +754,8 @@ impl Default for MarketParams {
             is_toxic_joint: false,         // Not toxic initially
             sigma_kappa_correlation: -0.3, // Typical negative correlation
             // L2 Decision Engine Outputs (A-S Framework)
-            l2_reservation_shift: 0.0,  // No shift initially (neutral)
-            l2_spread_multiplier: 1.0,  // No widening initially
+            l2_reservation_shift: 0.0, // No shift initially (neutral)
+            l2_spread_multiplier: 1.0, // No widening initially
         }
     }
 }

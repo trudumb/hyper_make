@@ -46,9 +46,9 @@ mod momentum;
 pub mod mutual_info;
 mod parameter_estimator;
 pub mod regime_hmm;
-pub mod temporal;
 mod robust_kappa;
 mod soft_jump;
+pub mod temporal;
 pub(crate) mod tick_ewma;
 mod trend_persistence;
 mod volatility;
@@ -103,8 +103,8 @@ pub use mutual_info::{
 
 // Temporal feature engineering
 pub use temporal::{
-    FundingFeatures, MomentumScale, MultiScaleMomentum, TemporalFeatures,
-    TemporalMomentumFeatures, TimeOfDayFeatures,
+    FundingFeatures, MomentumScale, MultiScaleMomentum, TemporalFeatures, TemporalMomentumFeatures,
+    TimeOfDayFeatures,
 };
 
 // Lag analysis for cross-exchange signals
@@ -408,8 +408,8 @@ impl Default for EstimatorConfig {
             // Defaults
             // BTC mainnet typically runs 0.0002-0.0003 per-second volatility.
             // Setting baseline too low (0.0001) causes normal conditions to trigger Extreme regime.
-            default_sigma: 0.00025,         // 0.025% per-second (typical BTC mainnet)
-            default_kappa: 100.0,           // Moderate depth decay
+            default_sigma: 0.00025, // 0.025% per-second (typical BTC mainnet)
+            default_kappa: 100.0,   // Moderate depth decay
             default_arrival_intensity: 0.5, // 0.5 ticks per second
 
             // Kappa floor - disabled by default (trust Bayesian estimation)

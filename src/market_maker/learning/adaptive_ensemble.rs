@@ -157,7 +157,7 @@ impl AdaptiveEnsemble {
             min_weight: 0.05,                   // Each model gets at least 5%
             prior_weight: 0.2,                  // New models start with 20%
             decay_rate: 0.995,                  // 0.5% decay per update
-            min_predictions_for_weight: 20,    // Need 20 predictions to use model's IR
+            min_predictions_for_weight: 20,     // Need 20 predictions to use model's IR
         }
     }
 
@@ -436,7 +436,10 @@ impl AdaptiveEnsemble {
         let average_ir = if qualified_models.is_empty() {
             1.0
         } else {
-            qualified_models.iter().map(|p| p.information_ratio).sum::<f64>()
+            qualified_models
+                .iter()
+                .map(|p| p.information_ratio)
+                .sum::<f64>()
                 / qualified_models.len() as f64
         };
 
@@ -660,8 +663,14 @@ mod tests {
             ensemble.update_performance("Bad", 0.7, 0.35, 1000);
         }
 
-        assert!(!ensemble.is_model_degraded("Good"), "IR=1.5 is not degraded");
-        assert!(ensemble.is_model_degraded("Bad"), "IR=0.7 should be degraded");
+        assert!(
+            !ensemble.is_model_degraded("Good"),
+            "IR=1.5 is not degraded"
+        );
+        assert!(
+            ensemble.is_model_degraded("Bad"),
+            "IR=0.7 should be degraded"
+        );
     }
 
     #[test]

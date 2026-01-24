@@ -40,6 +40,8 @@ pub use market_maker::{
     AnomalyType,
     // HIP-3 Runtime Config
     AssetRuntimeConfig,
+    // Execution Quality Tracking
+    CancelAnalysis,
     // Tier 1: Liquidation Cascade
     CascadeDirection,
     // WebSocket Reconnection
@@ -51,6 +53,12 @@ pub use market_maker::{
     DynamicRiskConfig,
     // Core types
     EstimatorConfig,
+    ExecutionOrderState,
+    ExecutionSide,
+    FillMetrics,
+    FillRecord,
+    FillStatistics,
+    FillTracker,
     // Tier 2: Funding Rate
     FundingConfig,
     FundingRateEstimator,
@@ -98,7 +106,10 @@ pub use market_maker::{
     ModifyResult,
     // Configuration
     MonitoringConfig,
+    OrderEvent,
     OrderExecutor,
+    OrderLifecycle,
+    OrderLifecycleTracker,
     OrderManager,
     OrderResult,
     ParameterEstimator,
@@ -148,17 +159,6 @@ pub use market_maker::{
     VolatilityRegime,
     // WebSocket POST Configuration
     WsPostConfig,
-    // Execution Quality Tracking
-    CancelAnalysis,
-    FillMetrics,
-    FillRecord,
-    FillStatistics,
-    FillTracker,
-    OrderEvent,
-    OrderLifecycle,
-    OrderLifecycleTracker,
-    ExecutionOrderState,
-    ExecutionSide,
 };
 pub use meta::{
     AssetContext, AssetMeta, CollateralInfo, Meta, MetaAndAssetCtxs, PerpDex, PerpDexLimits,

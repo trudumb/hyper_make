@@ -452,8 +452,8 @@ impl ParameterAggregator {
             // === L2 Decision Engine Outputs (A-S Framework) ===
             // Set by QuoteEngine after decision_engine.should_quote() call
             // Default to neutral values; actual values populated in quote_engine.rs
-            l2_reservation_shift: 0.0,  // No shift initially
-            l2_spread_multiplier: 1.0,  // No widening initially
+            l2_reservation_shift: 0.0, // No shift initially
+            l2_spread_multiplier: 1.0, // No widening initially
         }
     }
 }

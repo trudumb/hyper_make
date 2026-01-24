@@ -175,7 +175,9 @@ impl OptimalController {
                     fill_side: state.position < 0.0, // Buy if short, sell if long
                 }
             }
-            Action::DumpInventory { target_position, .. } => ActionOutcome::DumpedInventory {
+            Action::DumpInventory {
+                target_position, ..
+            } => ActionOutcome::DumpedInventory {
                 amount: (state.position - target_position).abs(),
             },
             Action::BuildInventory { target, .. } => ActionOutcome::Quoted {
@@ -231,7 +233,8 @@ impl OptimalController {
         }
 
         // 5. Consider funding positioning
-        if state.funding_approaching(1.0) && state.predicted_funding.abs() > self.config.funding_threshold
+        if state.funding_approaching(1.0)
+            && state.predicted_funding.abs() > self.config.funding_threshold
         {
             // Build position opposite to funding direction
             let target = -state.predicted_funding.signum()
@@ -306,7 +309,8 @@ impl OptimalController {
     /// Terminal zone action: reduce inventory urgently.
     fn terminal_action(&self, state: &ControlState) -> Action {
         let time_remaining = state.time_remaining();
-        let urgency = (1.0 / time_remaining.max(0.01)).min(self.config.action_config.max_dump_urgency);
+        let urgency =
+            (1.0 / time_remaining.max(0.01)).min(self.config.action_config.max_dump_urgency);
 
         Action::DumpInventory {
             urgency,
@@ -322,8 +326,9 @@ impl OptimalController {
         if funding_rate.abs() > self.config.funding_threshold {
             // Negative funding = longs pay shorts → we want to be short
             // Positive funding = shorts pay longs → we want to be long
-            let target =
-                -funding_rate.signum() * self.config.max_position * self.config.max_funding_fraction;
+            let target = -funding_rate.signum()
+                * self.config.max_position
+                * self.config.max_funding_fraction;
 
             // Only if we're not already positioned
             if (state.position - target).abs() > 0.1 {
@@ -412,7 +417,9 @@ impl OptimalController {
         } else {
             // Reduce size proportionally
             match myopic {
-                QuoteDecision::Quote { expected_edge: _, .. } => Action::DefensiveQuote {
+                QuoteDecision::Quote {
+                    expected_edge: _, ..
+                } => Action::DefensiveQuote {
                     spread_multiplier: 1.0,
                     size_fraction: max_fraction,
                     reason: DefensiveReason::PositionLimitApproaching,
@@ -435,7 +442,10 @@ impl OptimalController {
                 ladder: Ladder::default(),
                 expected_value: *expected_edge,
             },
-            QuoteDecision::ReducedSize { fraction, reason: _ } => Action::DefensiveQuote {
+            QuoteDecision::ReducedSize {
+                fraction,
+                reason: _,
+            } => Action::DefensiveQuote {
                 spread_multiplier: 1.0,
                 size_fraction: *fraction,
                 reason: DefensiveReason::ModelDisagreement,
@@ -485,9 +495,7 @@ impl OptimalController {
 
 // === Trait implementations for trait-based architecture ===
 
-use super::traits::{
-    ControlOutput, ControlSolver, ControlStateProvider, ValueFunctionSolver,
-};
+use super::traits::{ControlOutput, ControlSolver, ControlStateProvider, ValueFunctionSolver};
 use crate::market_maker::strategy::MarketParams;
 
 impl ControlSolver for OptimalController {

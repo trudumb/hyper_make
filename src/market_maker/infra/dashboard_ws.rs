@@ -26,9 +26,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use std::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::metrics::dashboard::{
@@ -44,9 +44,7 @@ use super::metrics::dashboard::{
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DashboardPush {
     /// Full state snapshot (sent on connect + periodically)
-    Snapshot {
-        state: DashboardState,
-    },
+    Snapshot { state: DashboardState },
 
     /// Incremental update (throttled, only changed fields)
     Update {
@@ -60,9 +58,7 @@ pub enum DashboardPush {
     },
 
     /// New fill occurred (immediate push)
-    Fill {
-        record: FillRecord,
-    },
+    Fill { record: FillRecord },
 
     /// Connection status
     Connected {
@@ -80,7 +76,6 @@ pub enum DashboardCommand {
 
     /// Ping for keepalive
     Ping { id: u64 },
-
     // Phase 2 commands (not yet implemented):
     // SetGamma { id: u64, value: f64 },
     // SetQuotingState { id: u64, active: bool },
@@ -182,7 +177,12 @@ impl DashboardWsState {
     }
 
     /// Push an incremental update
-    pub fn push_update(&self, quotes: Option<LiveQuotes>, pnl: Option<PnLAttribution>, regime: Option<RegimeState>) {
+    pub fn push_update(
+        &self,
+        quotes: Option<LiveQuotes>,
+        pnl: Option<PnLAttribution>,
+        regime: Option<RegimeState>,
+    ) {
         self.push(DashboardPush::Update {
             quotes,
             pnl,
@@ -218,7 +218,11 @@ async fn handle_connection(socket: WebSocket, state: Arc<DashboardWsState>) {
     }
 
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
-    info!(client_id, count = count + 1, "Dashboard WS: client connected");
+    info!(
+        client_id,
+        count = count + 1,
+        "Dashboard WS: client connected"
+    );
 
     // Subscribe to broadcast channel
     let mut rx = state.tx.subscribe();

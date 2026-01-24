@@ -370,13 +370,14 @@ impl FillTracker {
         }
 
         // Adverse selection rate for this side
-        let (as_count, as_total) = side_fills.iter().fold((0usize, 0usize), |acc, fill| {
-            match fill.is_adversely_selected() {
-                Some(true) => (acc.0 + 1, acc.1 + 1),
-                Some(false) => (acc.0, acc.1 + 1),
-                None => acc,
-            }
-        });
+        let (as_count, as_total) =
+            side_fills.iter().fold((0usize, 0usize), |acc, fill| {
+                match fill.is_adversely_selected() {
+                    Some(true) => (acc.0 + 1, acc.1 + 1),
+                    Some(false) => (acc.0, acc.1 + 1),
+                    None => acc,
+                }
+            });
         let adverse_selection_rate = if as_total > 0 {
             as_count as f64 / as_total as f64
         } else {

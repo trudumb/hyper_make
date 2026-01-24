@@ -185,7 +185,6 @@ pub struct StochasticConfig {
     // - Softmax temperature controls distribution spread
     // - Thompson sampling adds controlled randomness
     // - Dirichlet smoothing prevents zero allocations
-
     /// Minimum entropy floor (bits).
     /// H_min = 1.5 → at least exp(1.5) ≈ 4.5 effective levels always active.
     /// H_min = 2.0 → at least exp(2.0) ≈ 7.4 effective levels always active.

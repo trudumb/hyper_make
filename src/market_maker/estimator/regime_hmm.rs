@@ -175,10 +175,30 @@ fn default_prior_counts() -> [[f64; NUM_REGIMES]; NUM_REGIMES] {
     let off_diag_count = 1.0 / 3.0;
 
     [
-        [diag_count, off_diag_count * 2.0, off_diag_count * 0.8, off_diag_count * 0.2],
-        [off_diag_count, diag_count, off_diag_count * 1.5, off_diag_count * 0.5],
-        [off_diag_count * 0.5, off_diag_count * 1.5, diag_count, off_diag_count],
-        [off_diag_count * 0.2, off_diag_count * 0.5, off_diag_count * 2.3, diag_count],
+        [
+            diag_count,
+            off_diag_count * 2.0,
+            off_diag_count * 0.8,
+            off_diag_count * 0.2,
+        ],
+        [
+            off_diag_count,
+            diag_count,
+            off_diag_count * 1.5,
+            off_diag_count * 0.5,
+        ],
+        [
+            off_diag_count * 0.5,
+            off_diag_count * 1.5,
+            diag_count,
+            off_diag_count,
+        ],
+        [
+            off_diag_count * 0.2,
+            off_diag_count * 0.5,
+            off_diag_count * 2.3,
+            diag_count,
+        ],
     ]
 }
 
@@ -352,16 +372,16 @@ impl RegimeHMM {
 
                 // Update standard deviations (using squared deviation EMA)
                 let vol_dev = (obs.volatility - params.mean_volatility).abs();
-                params.std_volatility =
-                    ((1.0 - alpha) * params.std_volatility.powi(2) + alpha * vol_dev.powi(2))
-                        .sqrt()
-                        .max(1e-9);
+                params.std_volatility = ((1.0 - alpha) * params.std_volatility.powi(2)
+                    + alpha * vol_dev.powi(2))
+                .sqrt()
+                .max(1e-9);
 
                 let spread_dev = (obs.spread_bps - params.mean_spread).abs();
-                params.std_spread =
-                    ((1.0 - alpha) * params.std_spread.powi(2) + alpha * spread_dev.powi(2))
-                        .sqrt()
-                        .max(0.1);
+                params.std_spread = ((1.0 - alpha) * params.std_spread.powi(2)
+                    + alpha * spread_dev.powi(2))
+                .sqrt()
+                .max(0.1);
             }
         }
     }
@@ -662,8 +682,10 @@ mod tests {
         );
 
         // Verify sum to 1
-        let sum =
-            belief_state.p_low + belief_state.p_normal + belief_state.p_high + belief_state.p_extreme;
+        let sum = belief_state.p_low
+            + belief_state.p_normal
+            + belief_state.p_high
+            + belief_state.p_extreme;
         assert!((sum - 1.0).abs() < 1e-9, "Belief state should sum to 1");
     }
 
@@ -700,12 +722,18 @@ mod tests {
         // High entropy (uncertain) - uniform-ish belief
         hmm.belief = [0.25, 0.25, 0.25, 0.25];
         let high_entropy = hmm.belief_entropy();
-        assert!(!hmm.is_confident(), "Uniform belief should not be confident");
+        assert!(
+            !hmm.is_confident(),
+            "Uniform belief should not be confident"
+        );
 
         // Low entropy (confident) - concentrated belief
         hmm.belief = [0.01, 0.95, 0.03, 0.01];
         let low_entropy = hmm.belief_entropy();
-        assert!(hmm.is_confident(), "Concentrated belief should be confident");
+        assert!(
+            hmm.is_confident(),
+            "Concentrated belief should be confident"
+        );
 
         assert!(
             high_entropy > low_entropy,
@@ -831,7 +859,10 @@ mod tests {
     fn test_flow_imbalance_clamping() {
         // Test that flow imbalance is properly clamped
         let obs1 = Observation::new(0.001, 5.0, 2.0);
-        assert!((obs1.flow_imbalance - 1.0).abs() < 1e-9, "Should clamp to 1.0");
+        assert!(
+            (obs1.flow_imbalance - 1.0).abs() < 1e-9,
+            "Should clamp to 1.0"
+        );
 
         let obs2 = Observation::new(0.001, 5.0, -2.0);
         assert!(

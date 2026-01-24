@@ -296,9 +296,9 @@ impl LearningModule {
         let current_drawdown = 0.0;
 
         // 5. Decision (pass realized_vol for A-S reservation shift)
-        let decision = self
-            .decision_engine
-            .should_quote(&prediction, &health, current_drawdown, params.sigma);
+        let decision =
+            self.decision_engine
+                .should_quote(&prediction, &health, current_drawdown, params.sigma);
 
         // 6. Log decision
         tracing::debug!(
@@ -317,11 +317,9 @@ impl LearningModule {
                 expected_edge,
                 ..
             } => {
-                let ladder = self.execution_optimizer.optimize_ladder(
-                    params,
-                    size_fraction,
-                    expected_edge,
-                );
+                let ladder =
+                    self.execution_optimizer
+                        .optimize_ladder(params, size_fraction, expected_edge);
                 Some(ladder)
             }
             QuoteDecision::ReducedSize { fraction, .. } => {
@@ -371,9 +369,9 @@ impl LearningModule {
         let health = self.confidence_tracker.model_health();
 
         // Get decision from engine (pass realized_vol for A-S reservation shift)
-        let decision = self
-            .decision_engine
-            .should_quote(&prediction, &health, current_drawdown, params.sigma);
+        let decision =
+            self.decision_engine
+                .should_quote(&prediction, &health, current_drawdown, params.sigma);
 
         // Log the decision
         tracing::debug!(
@@ -402,7 +400,8 @@ impl LearningModule {
         if self.config.health_log_interval == 0 {
             return false;
         }
-        self.quote_cycle_count.is_multiple_of(self.config.health_log_interval)
+        self.quote_cycle_count
+            .is_multiple_of(self.config.health_log_interval)
     }
 
     /// Log detailed calibration metrics for diagnostics.
@@ -446,7 +445,9 @@ impl LearningModule {
         position: f64,
         current_drawdown: f64,
     ) -> crate::market_maker::control::LearningModuleOutput {
-        use crate::market_maker::control::{GaussianEstimate, LearningModuleOutput, ModelPrediction};
+        use crate::market_maker::control::{
+            GaussianEstimate, LearningModuleOutput, ModelPrediction,
+        };
 
         // Build market state
         let state = self.build_market_state(params, position);
@@ -458,9 +459,9 @@ impl LearningModule {
         let health = self.confidence_tracker.model_health();
 
         // Get decision from engine (pass realized_vol for A-S reservation shift)
-        let decision = self
-            .decision_engine
-            .should_quote(&prediction, &health, current_drawdown, params.sigma);
+        let decision =
+            self.decision_engine
+                .should_quote(&prediction, &health, current_drawdown, params.sigma);
 
         // Convert model contributions
         let model_predictions: Vec<ModelPrediction> = prediction
@@ -479,7 +480,11 @@ impl LearningModule {
         let p_positive = if prediction.std > 1e-9 {
             crate::market_maker::control::types::normal_cdf(prediction.mean / prediction.std)
         } else {
-            if prediction.mean > 0.0 { 1.0 } else { 0.0 }
+            if prediction.mean > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
         };
 
         LearningModuleOutput {

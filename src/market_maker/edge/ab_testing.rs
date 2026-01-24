@@ -140,11 +140,7 @@ impl ABMetrics {
         }
 
         // Use average PnL per trade as the test statistic
-        let p1 = if n1 > 0.0 {
-            self.control_pnl / n1
-        } else {
-            0.0
-        };
+        let p1 = if n1 > 0.0 { self.control_pnl / n1 } else { 0.0 };
         let p2 = if n2 > 0.0 {
             self.treatment_pnl / n2
         } else {
@@ -348,11 +344,7 @@ impl ABTest {
     pub fn allocate(&self) -> ABVariant {
         if *self.concluded.read().unwrap() {
             // If concluded, always return winner
-            return self
-                .winner
-                .read()
-                .unwrap()
-                .unwrap_or(ABVariant::Control);
+            return self.winner.read().unwrap().unwrap_or(ABVariant::Control);
         }
 
         // Simple LCG: state = (a * state + c) mod m
@@ -541,12 +533,7 @@ impl ABTestManager {
 
     /// Get names of all active tests.
     pub fn active_test_names(&self) -> Vec<String> {
-        self.active_tests
-            .read()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect()
+        self.active_tests.read().unwrap().keys().cloned().collect()
     }
 
     /// Conclude a test and move to history.
@@ -792,9 +779,7 @@ mod tests {
         manager.create_test(config, 0).unwrap();
 
         // Conclude test
-        assert!(manager
-            .conclude_test("test1", ABVariant::Treatment)
-            .is_ok());
+        assert!(manager.conclude_test("test1", ABVariant::Treatment).is_ok());
 
         // Should be in history now
         let history = manager.test_history();
@@ -829,7 +814,11 @@ mod tests {
 
         let p_value = metrics.statistical_significance();
         // Treatment is clearly better, p-value should be small
-        assert!(p_value < 0.5, "p-value {} should indicate treatment better", p_value);
+        assert!(
+            p_value < 0.5,
+            "p-value {} should indicate treatment better",
+            p_value
+        );
     }
 
     #[test]

@@ -33,7 +33,14 @@
       "mcp__serena__get_current_config",
       "mcp__serena__check_onboarding_performed",
       "mcp__serena__think_about_task_adherence",
-      "Bash(cargo clean:*)"
+      "Bash(cargo clean:*)",
+      "Bash(find:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(echo:*)",
+      "Bash(cargo run:*)",
+      "Bash(curl:*)",
+      "Bash(kill:*)",
+      "Bash(ss:*)"
     ]
   }
 }

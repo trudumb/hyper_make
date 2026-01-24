@@ -115,8 +115,8 @@ impl ExecutionOptimizer {
                 .clamp(self.config.min_depth_bps, self.config.max_depth_bps);
 
             // Size decreases geometrically
-            let size = (total_size * size_decay.powi(i as i32) / size_sum)
-                .max(self.config.min_size);
+            let size =
+                (total_size * size_decay.powi(i as i32) / size_sum).max(self.config.min_size);
 
             // Calculate prices
             let bid_price = params.microprice * (1.0 - depth_bps / 10000.0);
@@ -146,12 +146,7 @@ impl ExecutionOptimizer {
     /// Evaluate utility of a ladder.
     ///
     /// Utility = E[PnL] - 0.5 × γ × Var[PnL]
-    fn evaluate_utility(
-        &self,
-        ladder: &Ladder,
-        params: &MarketParams,
-        _expected_edge: f64,
-    ) -> f64 {
+    fn evaluate_utility(&self, ladder: &Ladder, params: &MarketParams, _expected_edge: f64) -> f64 {
         let expected_pnl = self.expected_pnl(ladder, params);
         let variance = self.pnl_variance(ladder, params);
 
@@ -299,7 +294,10 @@ mod tests {
 
         // With 8bp depth, 2bp AS, 1.5bp fees → ~4.5bp edge
         // Should be positive
-        assert!(expected_pnl > 0.0, "Expected positive P&L, got {expected_pnl}");
+        assert!(
+            expected_pnl > 0.0,
+            "Expected positive P&L, got {expected_pnl}"
+        );
     }
 
     #[test]

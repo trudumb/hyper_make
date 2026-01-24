@@ -179,7 +179,8 @@ impl NormalGammaPosterior {
         // Marginal is t-distribution with 2α degrees of freedom
         // Variance = β/(α*κ) * (α/(α-1)) for α > 1
         if self.alpha > 1.0 {
-            let variance = self.beta / (self.alpha * self.kappa) * (self.alpha / (self.alpha - 1.0));
+            let variance =
+                self.beta / (self.alpha * self.kappa) * (self.alpha / (self.alpha - 1.0));
             variance.sqrt()
         } else {
             f64::INFINITY
@@ -191,8 +192,7 @@ impl NormalGammaPosterior {
         let kappa_new = self.kappa + 1.0;
         let mu_new = (self.kappa * self.mu + x) / kappa_new;
         let alpha_new = self.alpha + 0.5;
-        let beta_new =
-            self.beta + 0.5 * self.kappa * (x - self.mu).powi(2) / kappa_new;
+        let beta_new = self.beta + 0.5 * self.kappa * (x - self.mu).powi(2) / kappa_new;
 
         self.mu = mu_new;
         self.kappa = kappa_new;
@@ -213,9 +213,8 @@ impl NormalGammaPosterior {
         let kappa_new = self.kappa + n;
         let mu_new = (self.kappa * self.mu + n * x_bar) / kappa_new;
         let alpha_new = self.alpha + n / 2.0;
-        let beta_new = self.beta
-            + 0.5 * ss
-            + 0.5 * self.kappa * n * (x_bar - self.mu).powi(2) / kappa_new;
+        let beta_new =
+            self.beta + 0.5 * ss + 0.5 * self.kappa * n * (x_bar - self.mu).powi(2) / kappa_new;
 
         self.mu = mu_new;
         self.kappa = kappa_new;
@@ -468,7 +467,8 @@ pub fn normal_cdf(x: f64) -> f64 {
     let p = d
         * (-x * x / 2.0).exp()
         * t
-        * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+        * (0.319381530
+            + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
 
     if x >= 0.0 {
         1.0 - p

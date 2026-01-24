@@ -169,7 +169,10 @@ impl SimpleFillModel {
     /// Simple LCG random number generator for reproducibility.
     fn next_random(&mut self) -> f64 {
         // LCG parameters from Numerical Recipes
-        self.rng_state = self.rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
         (self.rng_state >> 33) as f64 / (1u64 << 31) as f64
     }
 
@@ -237,8 +240,13 @@ impl SimulationEngine {
             }
 
             // Simulate fills and P&L
-            let (bid_filled, ask_filled, step_pnl, spread_bps) =
-                Self::simulate_step(&action, &mut fill_model, config, position, config.max_position);
+            let (bid_filled, ask_filled, step_pnl, spread_bps) = Self::simulate_step(
+                &action,
+                &mut fill_model,
+                config,
+                position,
+                config.max_position,
+            );
 
             // Update position
             if bid_filled {
@@ -316,7 +324,10 @@ impl SimulationEngine {
         max_position: f64,
     ) -> (bool, bool, f64, Option<f64>) {
         match action {
-            Action::Quote { ladder, expected_value: _ } => {
+            Action::Quote {
+                ladder,
+                expected_value: _,
+            } => {
                 // Extract spread from ladder (simplified)
                 let spread_bps = ladder
                     .bids
@@ -495,7 +506,8 @@ impl MonteCarloResult {
         pnls.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let mean_pnl = pnls.iter().sum::<f64>() / n as f64;
-        let variance = pnls.iter().map(|p| (p - mean_pnl).powi(2)).sum::<f64>() / (n - 1).max(1) as f64;
+        let variance =
+            pnls.iter().map(|p| (p - mean_pnl).powi(2)).sum::<f64>() / (n - 1).max(1) as f64;
 
         let p5_idx = (n as f64 * 0.05).floor() as usize;
         let p95_idx = (n as f64 * 0.95).floor() as usize;
@@ -703,7 +715,11 @@ impl MarketScenario for CascadeScenario {
             // Recovery: edge recovering, uncertainty decreasing
             let recovery_progress =
                 (step - self.calm_steps - self.cascade_steps) as f64 / self.recovery_steps as f64;
-            (2.0 * recovery_progress, 5.0 * (1.0 - recovery_progress) + 1.0, 0.3 + 0.4 * recovery_progress)
+            (
+                2.0 * recovery_progress,
+                5.0 * (1.0 - recovery_progress) + 1.0,
+                0.3 + 0.4 * recovery_progress,
+            )
         } else {
             // Calm: normal conditions
             (3.0, 1.0, 0.7)
@@ -767,8 +783,16 @@ pub struct HistoricalReplay {
 
 impl HistoricalReplay {
     pub fn new(states: Vec<StateSnapshot>, params: Vec<MarketParams>, name: String) -> Self {
-        assert_eq!(states.len(), params.len(), "States and params must have same length");
-        Self { states, params, name }
+        assert_eq!(
+            states.len(),
+            params.len(),
+            "States and params must have same length"
+        );
+        Self {
+            states,
+            params,
+            name,
+        }
     }
 
     /// Create from a VecDeque (common in live systems).
@@ -777,7 +801,11 @@ impl HistoricalReplay {
         params: VecDeque<MarketParams>,
         name: String,
     ) -> Self {
-        Self::new(states.into_iter().collect(), params.into_iter().collect(), name)
+        Self::new(
+            states.into_iter().collect(),
+            params.into_iter().collect(),
+            name,
+        )
     }
 }
 

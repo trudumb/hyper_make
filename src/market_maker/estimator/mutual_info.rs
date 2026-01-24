@@ -386,13 +386,13 @@ impl SignalQualityTracker {
 
         // Simple linear regression
         let n = self.mi_history.len() as f64;
-        let (sum_t, sum_mi, sum_t2, sum_t_mi) = self.mi_history.iter().fold(
-            (0.0, 0.0, 0.0, 0.0),
-            |(st, sm, st2, stm), &(ts, mi)| {
-                let t = ts as f64 / (24.0 * 3600.0 * 1000.0); // Convert to days
-                (st + t, sm + mi, st2 + t * t, stm + t * mi)
-            },
-        );
+        let (sum_t, sum_mi, sum_t2, sum_t_mi) =
+            self.mi_history
+                .iter()
+                .fold((0.0, 0.0, 0.0, 0.0), |(st, sm, st2, stm), &(ts, mi)| {
+                    let t = ts as f64 / (24.0 * 3600.0 * 1000.0); // Convert to days
+                    (st + t, sm + mi, st2 + t * t, stm + t * mi)
+                });
 
         let denom = n * sum_t2 - sum_t * sum_t;
         if denom.abs() < 1e-10 {
@@ -524,7 +524,11 @@ impl SignalAuditManager {
             })
             .collect();
 
-        entries.sort_by(|a, b| b.mi_bits.partial_cmp(&a.mi_bits).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.mi_bits
+                .partial_cmp(&a.mi_bits)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         entries
     }
 
@@ -676,7 +680,11 @@ mod tests {
         let y: Vec<f64> = (0..100).map(|i| ((i as f64) * 1.618).cos()).collect(); // Different phase
 
         let mi = estimator.estimate_bits(&x, &y);
-        assert!(mi < 0.1, "MI for independent vars should be near 0, got {}", mi);
+        assert!(
+            mi < 0.1,
+            "MI for independent vars should be near 0, got {}",
+            mi
+        );
     }
 
     #[test]
@@ -702,7 +710,11 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
 
         let mi = estimator.estimate_bits(&x, &y);
-        assert!(mi > 1.0, "MI for linear relationship should be high, got {}", mi);
+        assert!(
+            mi > 1.0,
+            "MI for linear relationship should be high, got {}",
+            mi
+        );
     }
 
     #[test]
@@ -733,11 +745,9 @@ mod tests {
 
     #[test]
     fn test_signal_quality_tracker() {
-        let mut tracker = SignalQualityTracker::new(
-            SignalType::BookImbalance,
-            TargetType::PriceDirection,
-        )
-        .with_max_samples(100);
+        let mut tracker =
+            SignalQualityTracker::new(SignalType::BookImbalance, TargetType::PriceDirection)
+                .with_max_samples(100);
 
         // Add some correlated data
         for i in 0..100 {

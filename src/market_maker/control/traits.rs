@@ -487,7 +487,9 @@ impl StateSnapshot {
             let a3 = 1.421413741;
             let a4 = -1.453152027;
             let a5 = 1.061405429;
-            let erf_approx = 1.0 - (a1 * t + a2 * t.powi(2) + a3 * t.powi(3) + a4 * t.powi(4) + a5 * t.powi(5)) * (-z * z).exp();
+            let erf_approx = 1.0
+                - (a1 * t + a2 * t.powi(2) + a3 * t.powi(3) + a4 * t.powi(4) + a5 * t.powi(5))
+                    * (-z * z).exp();
             let erf_val = if z >= 0.0 { erf_approx } else { -erf_approx };
             0.5 * (1.0 + erf_val)
         } else if edge > 0.0 {

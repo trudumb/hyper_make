@@ -175,10 +175,14 @@ impl SimulationExecutor {
             }
 
             // Log the fill
-            self.log_event(OrderEvent::Fill, Some(order.clone()), format!(
-                "Filled {} @ {} (remaining: {})",
-                actual_fill, fill_price, order.size
-            ));
+            self.log_event(
+                OrderEvent::Fill,
+                Some(order.clone()),
+                format!(
+                    "Filled {} @ {} (remaining: {})",
+                    actual_fill, fill_price, order.size
+                ),
+            );
 
             let mut stats = self.stats.write().unwrap();
             stats.simulated_fills += 1;

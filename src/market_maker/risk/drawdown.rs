@@ -37,7 +37,10 @@ impl DrawdownLevel {
 
     /// Returns true if positions should be reduced at this level.
     pub fn should_reduce_position(&self) -> bool {
-        matches!(self, DrawdownLevel::Warning | DrawdownLevel::Critical | DrawdownLevel::Emergency)
+        matches!(
+            self,
+            DrawdownLevel::Warning | DrawdownLevel::Critical | DrawdownLevel::Emergency
+        )
     }
 }
 
@@ -438,8 +441,7 @@ mod tests {
 
     #[test]
     fn test_position_multiplier() {
-        let config = DrawdownConfig::default()
-            .with_position_reduction(0.5, 0.25);
+        let config = DrawdownConfig::default().with_position_reduction(0.5, 0.25);
         let mut tracker = DrawdownTracker::new(config, 10_000.0);
 
         // Normal - full size

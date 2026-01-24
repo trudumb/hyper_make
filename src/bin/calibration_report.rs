@@ -83,10 +83,7 @@ impl ModelReport {
         if ir >= 1.2 && brier < 0.2 {
             ("healthy".to_string(), "Strong predictive value".to_string())
         } else if ir >= 1.0 && brier < 0.25 {
-            (
-                "healthy".to_string(),
-                "Acceptable calibration".to_string(),
-            )
+            ("healthy".to_string(), "Acceptable calibration".to_string())
         } else if ir >= 0.9 {
             (
                 "degraded".to_string(),
@@ -171,11 +168,17 @@ fn generate_report(days: u32, demo: bool) -> CalibrationReport {
 
     let (models, signals) = if demo {
         // Generate demo data for illustration
-        (generate_demo_model_reports(), generate_demo_signal_reports())
+        (
+            generate_demo_model_reports(),
+            generate_demo_signal_reports(),
+        )
     } else {
         // In production: load from prediction log files
         // For now, generate trackers and report their state
-        (generate_live_model_reports(), generate_live_signal_reports())
+        (
+            generate_live_model_reports(),
+            generate_live_signal_reports(),
+        )
     };
 
     // Count health states
@@ -402,11 +405,7 @@ fn generate_live_signal_reports() -> Vec<SignalReport> {
         "Funding".to_string(),
         1.0,
     );
-    monitor.register_signal(
-        EdgeSignalKind::RegimeDetection,
-        "Regime".to_string(),
-        1.0,
-    );
+    monitor.register_signal(EdgeSignalKind::RegimeDetection, "Regime".to_string(), 1.0);
     monitor.register_signal(
         EdgeSignalKind::AdverseSelection,
         "Adverse Selection".to_string(),
@@ -459,10 +458,7 @@ fn print_ascii(report: &CalibrationReport) {
     let separator = "-".repeat(72);
 
     println!("{}", border);
-    println!(
-        "{:^72}",
-        "DAILY CALIBRATION REPORT"
-    );
+    println!("{:^72}", "DAILY CALIBRATION REPORT");
     println!("{}", border);
     println!(
         " Generated: {}",

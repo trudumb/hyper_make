@@ -12,8 +12,11 @@ mod event_loop;
 mod handlers;
 mod order_ops;
 mod quote_engine;
-mod reconcile;
+pub(crate) mod reconcile;
 mod recovery;
+
+#[cfg(test)]
+mod tests;
 
 use super::*;
 

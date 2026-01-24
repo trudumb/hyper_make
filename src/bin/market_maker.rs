@@ -9,13 +9,13 @@
 
 use alloy::signers::local::PrivateKeySigner;
 use axum::{routing::get, Json, Router};
-use tower_http::cors::{Any, CorsLayer};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
 use hyperliquid_rust_sdk::{
@@ -1637,6 +1637,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         async move { Json(prom.to_dashboard_state()) }
                     }),
                 )
+                // Health check endpoints for orchestration (k8s, load balancers)
+                .route("/healthz", get(|| async { axum::http::StatusCode::OK }))
+                .route("/readyz", get(|| async { axum::http::StatusCode::OK }))
                 .layer(cors);
 
             // Security: Bind to localhost only to prevent metrics exposure to network

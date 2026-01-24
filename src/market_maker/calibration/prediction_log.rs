@@ -433,14 +433,34 @@ mod tests {
         let log = PredictionLog::new(3);
 
         // Add 3 records
-        let id1 = log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        let id2 = log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.6, 0));
-        let id3 = log.record(PredictionRecord::new(3, PredictionType::FillProbability, 0.7, 0));
+        let id1 = log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        let id2 = log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.6,
+            0,
+        ));
+        let id3 = log.record(PredictionRecord::new(
+            3,
+            PredictionType::FillProbability,
+            0.7,
+            0,
+        ));
 
         assert_eq!(log.len(), 3);
 
         // Add 4th record - should evict oldest
-        let _id4 = log.record(PredictionRecord::new(4, PredictionType::FillProbability, 0.8, 0));
+        let _id4 = log.record(PredictionRecord::new(
+            4,
+            PredictionType::FillProbability,
+            0.8,
+            0,
+        ));
 
         assert_eq!(log.len(), 3);
 
@@ -456,9 +476,24 @@ mod tests {
     fn test_prediction_log_get_by_type() {
         let log = PredictionLog::new(100);
 
-        log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        log.record(PredictionRecord::new(2, PredictionType::AdverseSelection, 0.3, 0));
-        log.record(PredictionRecord::new(3, PredictionType::FillProbability, 0.7, 0));
+        log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        log.record(PredictionRecord::new(
+            2,
+            PredictionType::AdverseSelection,
+            0.3,
+            0,
+        ));
+        log.record(PredictionRecord::new(
+            3,
+            PredictionType::FillProbability,
+            0.7,
+            0,
+        ));
 
         let fills = log.get_by_type(PredictionType::FillProbability);
         assert_eq!(fills.len(), 2);
@@ -474,10 +509,30 @@ mod tests {
     fn test_prediction_log_get_by_regime() {
         let log = PredictionLog::new(100);
 
-        log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.5, 1));
-        log.record(PredictionRecord::new(3, PredictionType::FillProbability, 0.5, 2));
-        log.record(PredictionRecord::new(4, PredictionType::FillProbability, 0.5, 0));
+        log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.5,
+            1,
+        ));
+        log.record(PredictionRecord::new(
+            3,
+            PredictionType::FillProbability,
+            0.5,
+            2,
+        ));
+        log.record(PredictionRecord::new(
+            4,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
 
         assert_eq!(log.get_by_regime(0).len(), 2);
         assert_eq!(log.get_by_regime(1).len(), 1);
@@ -488,9 +543,24 @@ mod tests {
     fn test_prediction_log_get_resolved() {
         let log = PredictionLog::new(100);
 
-        let id1 = log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        let _id2 = log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.6, 0));
-        let id3 = log.record(PredictionRecord::new(3, PredictionType::FillProbability, 0.7, 0));
+        let id1 = log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        let _id2 = log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.6,
+            0,
+        ));
+        let id3 = log.record(PredictionRecord::new(
+            3,
+            PredictionType::FillProbability,
+            0.7,
+            0,
+        ));
 
         log.resolve(id1, true);
         log.resolve(id3, false);
@@ -505,8 +575,18 @@ mod tests {
 
         assert_eq!(log.resolution_rate(), 0.0); // Empty
 
-        let id1 = log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.6, 0));
+        let id1 = log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.6,
+            0,
+        ));
 
         assert_eq!(log.resolution_rate(), 0.0);
 
@@ -520,8 +600,18 @@ mod tests {
 
         assert!(log.aggregate_brier_score().is_none()); // No resolved predictions
 
-        let id1 = log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.9, 0));
-        let id2 = log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.1, 0));
+        let id1 = log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.9,
+            0,
+        ));
+        let id2 = log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.1,
+            0,
+        ));
 
         log.resolve(id1, true); // Brier = (0.9 - 1)^2 = 0.01
         log.resolve(id2, false); // Brier = (0.1 - 0)^2 = 0.01
@@ -536,10 +626,30 @@ mod tests {
 
         assert!(log.base_rate().is_none()); // No resolved predictions
 
-        let id1 = log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        let id2 = log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.5, 0));
-        let id3 = log.record(PredictionRecord::new(3, PredictionType::FillProbability, 0.5, 0));
-        let id4 = log.record(PredictionRecord::new(4, PredictionType::FillProbability, 0.5, 0));
+        let id1 = log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        let id2 = log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        let id3 = log.record(PredictionRecord::new(
+            3,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        let id4 = log.record(PredictionRecord::new(
+            4,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
 
         log.resolve(id1, true);
         log.resolve(id2, true);
@@ -554,8 +664,18 @@ mod tests {
     fn test_prediction_log_clear() {
         let log = PredictionLog::new(100);
 
-        log.record(PredictionRecord::new(1, PredictionType::FillProbability, 0.5, 0));
-        log.record(PredictionRecord::new(2, PredictionType::FillProbability, 0.6, 0));
+        log.record(PredictionRecord::new(
+            1,
+            PredictionType::FillProbability,
+            0.5,
+            0,
+        ));
+        log.record(PredictionRecord::new(
+            2,
+            PredictionType::FillProbability,
+            0.6,
+            0,
+        ));
 
         assert_eq!(log.len(), 2);
 

@@ -32,7 +32,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use hyperliquid_rust_sdk::market_maker::infra::{
-    DashboardThrottle, DashboardWsConfig, DashboardWsState, ws_handler,
+    ws_handler, DashboardThrottle, DashboardWsConfig, DashboardWsState,
 };
 
 use hyperliquid_rust_sdk::{
@@ -41,26 +41,45 @@ use hyperliquid_rust_sdk::{
 use tokio::sync::mpsc::unbounded_channel;
 
 use hyperliquid_rust_sdk::market_maker::infra::metrics::dashboard::{
-    BookLevel, BookSnapshot, CalibrationState, DashboardState, FillRecord, LiveQuotes,
-    PnLAttribution, PricePoint, QuoteFillStats, QuoteSnapshot, RegimeSnapshot, RegimeState,
-    SpreadBucket, classify_regime, compute_regime_probabilities,
+    classify_regime,
+    compute_regime_probabilities,
+    BookLevel,
+    BookSnapshot,
+    CalibrationState,
+    DashboardState,
+    FeatureCorrelationState,
     // Feature health visualization
-    FeatureHealthState, InteractionSignalState, SignalDecayState, SignalHealthInfo,
-    FeatureCorrelationState, FeatureValidationState, LagAnalysisState,
+    FeatureHealthState,
+    FeatureValidationState,
+    FillRecord,
+    InteractionSignalState,
+    LagAnalysisState,
+    LiveQuotes,
+    PnLAttribution,
+    PricePoint,
+    QuoteFillStats,
+    QuoteSnapshot,
+    RegimeSnapshot,
+    RegimeState,
+    SignalDecayState,
+    SignalHealthInfo,
+    SpreadBucket,
 };
-use std::collections::{HashMap, VecDeque};
 use hyperliquid_rust_sdk::market_maker::simulation::{
     CalibrationAnalyzer, FillSimulator, FillSimulatorConfig, MarketStateSnapshot, ModelPredictions,
     OutcomeTracker, PredictionLogger, SimulatedFill, SimulationExecutor,
 };
+use std::collections::{HashMap, VecDeque};
 
 use hyperliquid_rust_sdk::{
     Ladder, LadderConfig, LadderStrategy, MarketParams, OrderExecutor, QuoteConfig, RiskConfig,
 };
 
 // Adaptive GLFT components
-use hyperliquid_rust_sdk::market_maker::adaptive::{AdaptiveSpreadCalculator, AdaptiveBayesianConfig};
-use hyperliquid_rust_sdk::market_maker::process_models::{HJBInventoryController, HJBConfig};
+use hyperliquid_rust_sdk::market_maker::adaptive::{
+    AdaptiveBayesianConfig, AdaptiveSpreadCalculator,
+};
+use hyperliquid_rust_sdk::market_maker::process_models::{HJBConfig, HJBInventoryController};
 
 // ============================================================================
 // CLI Arguments
@@ -189,11 +208,8 @@ fn generate_mock_feature_health(cycle_count: u64) -> FeatureHealthState {
             ],
             // 5x5 correlation matrix (row-major)
             correlation_matrix: vec![
-                1.0, 0.3, -0.1, 0.2, 0.7,
-                0.3, 1.0, 0.4, -0.2, 0.1,
-                -0.1, 0.4, 1.0, 0.6, 0.0,
-                0.2, -0.2, 0.6, 1.0, 0.3,
-                0.7, 0.1, 0.0, 0.3, 1.0,
+                1.0, 0.3, -0.1, 0.2, 0.7, 0.3, 1.0, 0.4, -0.2, 0.1, -0.1, 0.4, 1.0, 0.6, 0.0, 0.2,
+                -0.2, 0.6, 1.0, 0.3, 0.7, 0.1, 0.0, 0.3, 1.0,
             ],
             vif: vec![2.1, 1.3, 1.8, 1.5, 2.0],
             condition_number: 8.5,
@@ -209,7 +225,7 @@ fn generate_mock_feature_health(cycle_count: u64) -> FeatureHealthState {
         lag_analysis: LagAnalysisState {
             optimal_lag_ms: -150,
             mi_at_lag: 0.032,
-            ccf: vec![],  // Would contain cross-correlation function
+            ccf: vec![], // Would contain cross-correlation function
             signal_ready: true,
             signal_name: "binance_mid".to_string(),
             target_name: "hyperliquid_mid".to_string(),
@@ -272,7 +288,7 @@ impl SimulationState {
         gamma: f64,
         target_spread_bps: f64,
         ladder_levels: usize,
-        target_liquidity: f64
+        target_liquidity: f64,
     ) -> Self {
         // Create production-style RiskConfig
         let risk_config = RiskConfig {
@@ -292,10 +308,10 @@ impl SimulationState {
 
         // Determine decimals based on asset
         let (decimals, sz_decimals) = match asset.as_str() {
-            "BTC" => (1, 4),  // $0.1 tick, 0.0001 BTC
-            "ETH" => (2, 3),  // $0.01 tick, 0.001 ETH
-            "SOL" => (3, 2),  // $0.001 tick, 0.01 SOL
-            _ => (2, 3),      // Default
+            "BTC" => (1, 4), // $0.1 tick, 0.0001 BTC
+            "ETH" => (2, 3), // $0.01 tick, 0.001 ETH
+            "SOL" => (3, 2), // $0.001 tick, 0.01 SOL
+            _ => (2, 3),     // Default
         };
 
         // Create adaptive components with defaults
@@ -349,7 +365,8 @@ impl SimulationState {
 
         // Update adaptive kappa from book depth
         if self.mid_price > 0.0 {
-            self.adaptive_spreads.on_l2_update(&bids, &asks, self.mid_price);
+            self.adaptive_spreads
+                .on_l2_update(&bids, &asks, self.mid_price);
         }
     }
 
@@ -450,7 +467,9 @@ impl SimulationState {
         params.adaptive_warmup_progress = self.adaptive_spreads.warmup_progress();
 
         // HJB optimal skew for inventory control
-        params.hjb_optimal_skew = self.hjb_controller.optimal_skew(self.inventory, self.max_position);
+        params.hjb_optimal_skew = self
+            .hjb_controller
+            .optimal_skew(self.inventory, self.max_position);
 
         // No cascade protection in paper trading
         params.should_pull_quotes = false;
@@ -621,7 +640,11 @@ enum MarketDataMessage {
 }
 
 /// Helper to create fill simulator trade
-fn create_market_trade(price: f64, size: f64, is_buy: bool) -> hyperliquid_rust_sdk::market_maker::simulation::fill_sim::MarketTrade {
+fn create_market_trade(
+    price: f64,
+    size: f64,
+    is_buy: bool,
+) -> hyperliquid_rust_sdk::market_maker::simulation::fill_sim::MarketTrade {
     hyperliquid_rust_sdk::market_maker::simulation::fill_sim::MarketTrade {
         timestamp_ns: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -642,9 +665,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Initialize logging using env_logger
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(&cli.log_level)
-    ).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&cli.log_level))
+        .init();
 
     // Create output directory
     std::fs::create_dir_all(&cli.output_dir)?;
@@ -739,11 +761,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Dashboard setup
-    let dashboard_state: Arc<RwLock<DashboardState>> = Arc::new(RwLock::new(DashboardState::default()));
+    let dashboard_state: Arc<RwLock<DashboardState>> =
+        Arc::new(RwLock::new(DashboardState::default()));
 
     // WebSocket dashboard state (None if dashboard disabled)
     let dashboard_ws_state: Option<Arc<DashboardWsState>> = if cli.dashboard {
-        Some(Arc::new(DashboardWsState::new(DashboardWsConfig::default())))
+        Some(Arc::new(
+            DashboardWsState::new(DashboardWsConfig::default()),
+        ))
     } else {
         None
     };
@@ -798,9 +823,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        info!(
-            "Dashboard enabled at http://localhost:3000/mm-dashboard-fixed.html"
-        );
+        info!("Dashboard enabled at http://localhost:3000/mm-dashboard-fixed.html");
         info!(
             "HTTP: http://localhost:{}/api/dashboard  WS: ws://localhost:{}/ws/dashboard",
             cli.metrics_port, cli.metrics_port
@@ -819,8 +842,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cumulative_pnl: f64 = 0.0;
 
     // New visualization buffers
-    let mut book_history: VecDeque<BookSnapshot> = VecDeque::with_capacity(360);  // 5 min at 1/sec
-    let mut price_history: VecDeque<PricePoint> = VecDeque::with_capacity(1800);  // 30 min at 1/sec
+    let mut book_history: VecDeque<BookSnapshot> = VecDeque::with_capacity(360); // 5 min at 1/sec
+    let mut price_history: VecDeque<PricePoint> = VecDeque::with_capacity(1800); // 30 min at 1/sec
     let mut quote_history: VecDeque<QuoteSnapshot> = VecDeque::with_capacity(360); // 30 min at 5/sec
     let mut spread_counts: HashMap<String, u32> = HashMap::new();
     let fill_stats: HashMap<(String, usize), (u32, f64)> = HashMap::new(); // (side, level) -> (count, size)
@@ -1268,7 +1291,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Orders Cancelled: {}", exec_stats.orders_cancelled);
     println!("  Orders Modified:  {}", exec_stats.orders_modified);
     println!("  Orders Rejected:  {}", exec_stats.orders_rejected);
-    println!("  Total Notional:   ${:.2}", exec_stats.total_notional_placed);
+    println!(
+        "  Total Notional:   ${:.2}",
+        exec_stats.total_notional_placed
+    );
 
     // Print outcome summary
     println!("\n{}", outcome_summary.format());
@@ -1319,7 +1345,10 @@ async fn subscribe_all_mids(
             Err(e) => {
                 retry_count += 1;
                 if retry_count > max_retries {
-                    error!("AllMids subscription failed after {} retries: {}", max_retries, e);
+                    error!(
+                        "AllMids subscription failed after {} retries: {}",
+                        max_retries, e
+                    );
                     return Err(e);
                 }
                 warn!(
@@ -1333,7 +1362,6 @@ async fn subscribe_all_mids(
     }
     Ok(())
 }
-
 
 async fn subscribe_all_mids_inner(
     base_url: BaseUrl,
@@ -1385,7 +1413,10 @@ async fn subscribe_l2_book(
             Err(e) => {
                 retry_count += 1;
                 if retry_count > max_retries {
-                    error!("L2Book subscription failed after {} retries: {}", max_retries, e);
+                    error!(
+                        "L2Book subscription failed after {} retries: {}",
+                        max_retries, e
+                    );
                     return Err(e);
                 }
                 warn!(
@@ -1399,7 +1430,6 @@ async fn subscribe_l2_book(
     }
     Ok(())
 }
-
 
 async fn subscribe_l2_book_inner(
     base_url: BaseUrl,
@@ -1448,7 +1478,11 @@ async fn subscribe_l2_book_inner(
                 Vec::new()
             };
 
-            if tx.send(MarketDataMessage::Book { bids, asks }).await.is_err() {
+            if tx
+                .send(MarketDataMessage::Book { bids, asks })
+                .await
+                .is_err()
+            {
                 return Ok(()); // Clean exit
             }
         }
@@ -1477,7 +1511,10 @@ async fn subscribe_trades(
             Err(e) => {
                 retry_count += 1;
                 if retry_count > max_retries {
-                    error!("Trades subscription failed after {} retries: {}", max_retries, e);
+                    error!(
+                        "Trades subscription failed after {} retries: {}",
+                        max_retries, e
+                    );
                     return Err(e);
                 }
                 warn!(
@@ -1491,7 +1528,6 @@ async fn subscribe_trades(
     }
     Ok(())
 }
-
 
 async fn subscribe_trades_inner(
     base_url: BaseUrl,
@@ -1521,13 +1557,15 @@ async fn subscribe_trades_inner(
                 }
                 if let (Ok(px), Ok(sz)) = (trade.px.parse::<f64>(), trade.sz.parse::<f64>()) {
                     let is_buy = trade.side == "B";
-                    if tx.send(MarketDataMessage::Trade {
-                        price: px,
-                        size: sz,
-                        is_buy,
-                    })
-                    .await
-                    .is_err() {
+                    if tx
+                        .send(MarketDataMessage::Trade {
+                            price: px,
+                            size: sz,
+                            is_buy,
+                        })
+                        .await
+                        .is_err()
+                    {
                         return Ok(()); // Clean exit
                     }
                 }

@@ -228,7 +228,11 @@ impl DashboardState {
     pub fn format_summary(&self) -> String {
         let pnl_sign = if self.pnl_usd >= 0.0 { "+" } else { "-" };
         let pnl_abs = self.pnl_usd.abs();
-        let session_sign = if self.session_pnl_usd >= 0.0 { "+" } else { "-" };
+        let session_sign = if self.session_pnl_usd >= 0.0 {
+            "+"
+        } else {
+            "-"
+        };
         let session_abs = self.session_pnl_usd.abs();
 
         let calib_status = if self.all_calibration_healthy(1.0) {
@@ -238,9 +242,9 @@ impl DashboardState {
         };
 
         let regime_indicator = match self.current_regime {
-            0 => "[=]",   // Calm
-            1 => "[~]",   // Volatile
-            2 => "[!]",   // Cascade
+            0 => "[=]", // Calm
+            1 => "[~]", // Volatile
+            2 => "[!]", // Cascade
             _ => "[?]",
         };
 

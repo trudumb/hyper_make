@@ -107,14 +107,14 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            oi_drop_threshold: -0.02,          // 2% OI drop
-            oi_drop_window_s: 60,              // 60 second window
-            funding_extreme_threshold: 0.001,  // 0.1% per 8h
-            spread_blowout_bps: 50.0,          // 50 bps
-            fill_rate_collapse_pct: 0.1,       // 10% of normal
-            model_ir_threshold: 0.8,           // IR < 0.8 is degraded
-            default_widen_multiplier: 2.0,     // 2x spreads for moderate
-            severe_widen_multiplier: 5.0,      // 5x spreads for severe
+            oi_drop_threshold: -0.02,         // 2% OI drop
+            oi_drop_window_s: 60,             // 60 second window
+            funding_extreme_threshold: 0.001, // 0.1% per 8h
+            spread_blowout_bps: 50.0,         // 50 bps
+            fill_rate_collapse_pct: 0.1,      // 10% of normal
+            model_ir_threshold: 0.8,          // IR < 0.8 is degraded
+            default_widen_multiplier: 2.0,    // 2x spreads for moderate
+            severe_widen_multiplier: 5.0,     // 5x spreads for severe
         }
     }
 }
@@ -286,7 +286,11 @@ impl CircuitBreakerMonitor {
     /// - `normal_rate`: Normal/expected fill rate
     ///
     /// Returns `Some(FillRateCollapse)` if fill rate has collapsed.
-    pub fn check_fill_rate(&self, current_rate: f64, normal_rate: f64) -> Option<CircuitBreakerType> {
+    pub fn check_fill_rate(
+        &self,
+        current_rate: f64,
+        normal_rate: f64,
+    ) -> Option<CircuitBreakerType> {
         if normal_rate <= 0.0 {
             return None;
         }
@@ -647,20 +651,20 @@ mod tests {
         // Normal conditions - no triggers
         let newly = monitor.check_all(
             1000000,
-            Some(0.0001),  // Normal funding
-            Some(20.0),    // Normal spread
+            Some(0.0001),     // Normal funding
+            Some(20.0),       // Normal spread
             Some((0.8, 1.0)), // Normal fill rate
-            Some(1.5),     // Healthy model
+            Some(1.5),        // Healthy model
         );
         assert!(newly.is_empty());
 
         // Extreme conditions
         let newly = monitor.check_all(
             1000000,
-            Some(0.005),   // Extreme funding
-            Some(100.0),   // Wide spread
+            Some(0.005),       // Extreme funding
+            Some(100.0),       // Wide spread
             Some((0.01, 1.0)), // Collapsed fills
-            Some(0.3),     // Degraded model
+            Some(0.3),         // Degraded model
         );
         assert!(!newly.is_empty());
         assert!(newly.contains(&CircuitBreakerType::FundingExtreme));

@@ -518,22 +518,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // This captures all the alpha signals used to make quote decisions
         {
             let now = chrono::Utc::now();
-            
+
             // Get regime probabilities from stochastic controller if enabled
-            let (regime_quiet, regime_trending, regime_volatile, regime_cascade) = 
+            let (regime_quiet, regime_trending, regime_volatile, regime_cascade) =
                 if self.stochastic.controller.is_enabled() {
                     let belief = self.stochastic.controller.belief();
-                    (belief.regime_probs[0], belief.regime_probs[1], belief.regime_probs[2], 
-                     (1.0 - market_params.cascade_size_factor).max(0.0))
+                    (
+                        belief.regime_probs[0],
+                        belief.regime_probs[1],
+                        belief.regime_probs[2],
+                        (1.0 - market_params.cascade_size_factor).max(0.0),
+                    )
                 } else {
                     // Fallback: use market params to estimate regime
                     let cascade = (1.0 - market_params.cascade_size_factor).max(0.0);
-                    let volatile = if market_params.jump_ratio > 2.0 { 0.3 } else { 0.0 };
-                    let trending = if market_params.sigma > 0.002 { 0.2 } else { 0.0 };
+                    let volatile = if market_params.jump_ratio > 2.0 {
+                        0.3
+                    } else {
+                        0.0
+                    };
+                    let trending = if market_params.sigma > 0.002 {
+                        0.2
+                    } else {
+                        0.0
+                    };
                     let quiet = (1.0 - cascade - volatile - trending).max(0.0);
                     (quiet, trending, volatile, cascade)
                 };
-            
+
             // Get changepoint info from stochastic controller
             let (cp_prob_5, cp_detected) = if self.stochastic.controller.is_enabled() {
                 let cp = self.stochastic.controller.changepoint_summary();
@@ -541,7 +553,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             } else {
                 (0.0, false)
             };
-            
+
             let signal_snapshot = SignalSnapshot {
                 timestamp_ms: now.timestamp_millis(),
                 time: now.format("%H:%M:%S").to_string(),
@@ -557,7 +569,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Momentum
                 momentum_bps: self.estimator.momentum_bps(),
                 flow_imbalance: market_params.book_imbalance,
-                falling_knife: if drift_adjusted_skew.is_opposed { drift_adjusted_skew.urgency_score } else { 0.0 },
+                falling_knife: if drift_adjusted_skew.is_opposed {
+                    drift_adjusted_skew.urgency_score
+                } else {
+                    0.0
+                },
                 // Volatility
                 sigma: market_params.sigma,
                 jump_ratio: market_params.jump_ratio,
@@ -570,8 +586,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 cp_prob_5,
                 cp_detected,
             };
-            self.infra.prometheus.dashboard().record_signal_snapshot(signal_snapshot);
-            
+            self.infra
+                .prometheus
+                .dashboard()
+                .record_signal_snapshot(signal_snapshot);
+
             // Update kappa diagnostics
             let kappa_diag = KappaDiagnostics {
                 posterior_mean: market_params.kappa,
@@ -584,8 +603,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 observation_count: self.tier1.adverse_selection.fills_measured() as usize,
                 mean_distance_bps: 0.0, // TODO: get from estimator
             };
-            self.infra.prometheus.dashboard().update_kappa_diagnostics(kappa_diag);
-            
+            self.infra
+                .prometheus
+                .dashboard()
+                .update_kappa_diagnostics(kappa_diag);
+
             // Update changepoint diagnostics if controller enabled
             if self.stochastic.controller.is_enabled() {
                 let cp = self.stochastic.controller.changepoint_summary();
@@ -597,7 +619,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     entropy: cp.entropy,
                     detected: cp.detected,
                 };
-                self.infra.prometheus.dashboard().update_changepoint_diagnostics(cp_diag);
+                self.infra
+                    .prometheus
+                    .dashboard()
+                    .update_changepoint_diagnostics(cp_diag);
             }
         }
 
@@ -706,7 +731,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
 
             // Get optimal action from Layer 3
-            let action = self.stochastic.controller.act(&learning_output, &trading_state);
+            let action = self
+                .stochastic
+                .controller
+                .act(&learning_output, &trading_state);
 
             // === L1→L2→L3→DECISION TRACE LOG ===
             // This is the key diagnostic trace showing the full pipeline
@@ -739,7 +767,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     debug!(reason = ?reason, "Layer 3: not quoting");
                     return Ok(());
                 }
-                Action::WaitToLearn { expected_info_gain, suggested_wait_cycles } => {
+                Action::WaitToLearn {
+                    expected_info_gain,
+                    suggested_wait_cycles,
+                } => {
                     debug!(
                         info_gain = %format!("{:.4}", expected_info_gain),
                         wait_cycles = suggested_wait_cycles,
@@ -759,7 +790,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             count = resting_oids.len(),
                             "WaitToLearn: cancelling resting orders to prevent stale quotes"
                         );
-                        self.executor.cancel_bulk_orders(&self.config.asset, resting_oids).await;
+                        self.executor
+                            .cancel_bulk_orders(&self.config.asset, resting_oids)
+                            .await;
                     }
                     return Ok(());
                 }
@@ -771,7 +804,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     debug!("Layer 3: build inventory mode");
                     // Continue with normal quoting
                 }
-                Action::DefensiveQuote { spread_multiplier, size_fraction, reason } => {
+                Action::DefensiveQuote {
+                    spread_multiplier,
+                    size_fraction,
+                    reason,
+                } => {
                     debug!(
                         spread_mult = %format!("{:.2}", spread_multiplier),
                         size_frac = %format!("{:.2}", size_fraction),
@@ -792,8 +829,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let ladder = self.strategy.calculate_ladder(
             &quote_config,
             self.position.position(),
-            self.effective_max_position,     // First-principles limit
-            decision_adjusted_liquidity,     // Decision-adjusted viable size
+            self.effective_max_position, // First-principles limit
+            decision_adjusted_liquidity, // Decision-adjusted viable size
             &market_params,
         );
 
@@ -855,7 +892,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 let mid = self.latest_mid;
                 let bid_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
                 let ask_spread_bps = ((best_ask.price - mid) / mid) * 10000.0;
-                
+
                 // Determine regime string from cascade_size_factor
                 let cascade_level = 1.0 - market_params.cascade_size_factor;
                 let regime = if cascade_level > 0.5 {
@@ -866,19 +903,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "Trending"
                 } else {
                     "Quiet"
-                }.to_string();
-                
+                }
+                .to_string();
+
                 // Determine defensive reason if any
                 let defensive_reason = if market_params.is_toxic_regime {
                     Some("Toxic regime detected".to_string())
                 } else if reduce_only_result.was_filtered {
                     Some("Reduce-only mode".to_string())
                 } else if decision_size_fraction < 1.0 {
-                    Some(format!("Decision filter: {:.0}% size", decision_size_fraction * 100.0))
+                    Some(format!(
+                        "Decision filter: {:.0}% size",
+                        decision_size_fraction * 100.0
+                    ))
                 } else {
                     None
                 };
-                
+
                 let decision = QuoteDecisionRecord {
                     timestamp_ms: now.timestamp_millis(),
                     time: now.format("%H:%M:%S").to_string(),
@@ -893,7 +934,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     inventory_skew: market_params.hjb_optimal_skew,
                     defensive_reason,
                 };
-                self.infra.prometheus.dashboard().record_quote_decision(decision);
+                self.infra
+                    .prometheus
+                    .dashboard()
+                    .record_quote_decision(decision);
             }
 
             // DIAGNOSTIC: Warn when ladder is completely empty after processing
@@ -930,8 +974,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let (mut bid, mut ask) = self.strategy.calculate_quotes(
                 &quote_config,
                 self.position.position(),
-                self.effective_max_position,     // First-principles limit
-                decision_adjusted_liquidity,     // Decision-adjusted viable size
+                self.effective_max_position, // First-principles limit
+                decision_adjusted_liquidity, // Decision-adjusted viable size
                 &market_params,
             );
 
@@ -973,7 +1017,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Update dashboard with current position
         let position = self.position.position();
         let position_value = position * self.latest_mid;
-        self.infra.dashboard.update_position(position, position_value);
+        self.infra
+            .dashboard
+            .update_position(position, position_value);
 
         Ok(())
     }

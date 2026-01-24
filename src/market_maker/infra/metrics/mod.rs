@@ -19,14 +19,27 @@ mod updates;
 use std::sync::{Arc, RwLock};
 
 use crate::market_maker::tracking::CalibrationTracker;
-use fields::MetricsInner;
 pub use dashboard::{
-    DashboardAggregator, DashboardConfig, DashboardState, LiveQuotes, PnLAttribution, RegimeState,
     // Feature health visualization types
-    CorrelatedPair, FeatureCorrelationState, FeatureHealthState, FeatureValidationInfo,
-    FeatureValidationState, InteractionSignalState, LagAnalysisState, LagPoint, SignalAlertInfo,
-    SignalDecayState, SignalHealthInfo,
+    CorrelatedPair,
+    DashboardAggregator,
+    DashboardConfig,
+    DashboardState,
+    FeatureCorrelationState,
+    FeatureHealthState,
+    FeatureValidationInfo,
+    FeatureValidationState,
+    InteractionSignalState,
+    LagAnalysisState,
+    LagPoint,
+    LiveQuotes,
+    PnLAttribution,
+    RegimeState,
+    SignalAlertInfo,
+    SignalDecayState,
+    SignalHealthInfo,
 };
+use fields::MetricsInner;
 pub use summary::MetricsSummary;
 
 /// Prometheus-compatible metrics collector.
@@ -109,7 +122,8 @@ impl PrometheusMetrics {
     /// - adverse: Loss from adverse selection (negative value expected)
     /// - fees: Exchange fees paid (negative value expected)
     pub fn record_pnl_attribution(&self, spread: f64, adverse: f64, fees: f64) {
-        self.dashboard.record_pnl_attribution(spread, adverse, 0.0, fees);
+        self.dashboard
+            .record_pnl_attribution(spread, adverse, 0.0, fees);
     }
 }
 

@@ -180,10 +180,7 @@ fn render_dashboard(state: &HealthState) {
     let bar_len = 40;
     let filled = (state.regime_confidence * bar_len as f64) as usize;
     let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_len - filled);
-    println!(
-        "║ [{}]                            ║",
-        bar
-    );
+    println!("║ [{}]                            ║", bar);
 
     println!("╠══════════════════════════════════════════════════════════════════════╣");
     println!("║ CIRCUIT BREAKERS                                                     ║");
@@ -193,7 +190,9 @@ fn render_dashboard(state: &HealthState) {
             state.breaker_type.unwrap_or("Unknown")
         );
     } else {
-        println!("║ Status: \x1B[32m✓ All Clear\x1B[0m                                              ║");
+        println!(
+            "║ Status: \x1B[32m✓ All Clear\x1B[0m                                              ║"
+        );
     }
 
     println!("╠══════════════════════════════════════════════════════════════════════╣");

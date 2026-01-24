@@ -339,11 +339,7 @@ fn estimate_fill_probability(depth_bps: f64, params: &MarketParams, horizon_s: f
 }
 
 /// Expected PnL given fill
-fn estimate_expected_pnl(
-    level: &LadderLevel,
-    params: &MarketParams,
-    side: Side,
-) -> f64 {
+fn estimate_expected_pnl(level: &LadderLevel, params: &MarketParams, side: Side) -> f64 {
     // PnL = spread_capture - adverse_selection - fees
     let spread_capture_bps = level.depth_bps;
     let as_bps = params.total_as_bps;
@@ -609,7 +605,11 @@ mod tests {
         // λ(50) = 10 × exp(-50/10) = 10 × exp(-5) = 0.067
         // P(fill in 1s) = 1 - exp(-0.067) = 0.065
         let p_50 = estimate_fill_probability(50.0, &params, 1.0);
-        assert!(p_50 < 0.1, "Fill prob at 50 bps should be low, got {}", p_50);
+        assert!(
+            p_50 < 0.1,
+            "Fill prob at 50 bps should be low, got {}",
+            p_50
+        );
 
         // Longer horizon = higher probability
         let p_1s = estimate_fill_probability(10.0, &params, 1.0);

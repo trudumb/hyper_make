@@ -450,8 +450,8 @@ impl LagDecayTracker {
         }
 
         // Current average MI
-        let avg_mi: f64 = self.history.iter().map(|(_, _, mi)| mi).sum::<f64>()
-            / self.history.len() as f64;
+        let avg_mi: f64 =
+            self.history.iter().map(|(_, _, mi)| mi).sum::<f64>() / self.history.len() as f64;
 
         if avg_mi <= 0.0 {
             return None;

@@ -39,7 +39,11 @@ impl BrierDecomposition {
         let n_f64 = n as f64;
 
         // Base rate
-        let o_bar: f64 = outcomes.iter().map(|&o| if o { 1.0 } else { 0.0 }).sum::<f64>() / n_f64;
+        let o_bar: f64 = outcomes
+            .iter()
+            .map(|&o| if o { 1.0 } else { 0.0 })
+            .sum::<f64>()
+            / n_f64;
 
         // Create bins
         let mut bins: Vec<Vec<(f64, bool)>> = vec![vec![]; num_bins];
@@ -60,8 +64,11 @@ impl BrierDecomposition {
 
             let n_k = bin.len() as f64;
             let p_bar_k: f64 = bin.iter().map(|(p, _)| p).sum::<f64>() / n_k;
-            let o_bar_k: f64 =
-                bin.iter().map(|(_, o)| if *o { 1.0 } else { 0.0 }).sum::<f64>() / n_k;
+            let o_bar_k: f64 = bin
+                .iter()
+                .map(|(_, o)| if *o { 1.0 } else { 0.0 })
+                .sum::<f64>()
+                / n_k;
 
             reliability += n_k * (p_bar_k - o_bar_k).powi(2);
             resolution += n_k * (o_bar_k - o_bar).powi(2);
@@ -193,13 +200,11 @@ impl CalibrationCurve {
 
     /// Get the bin with worst calibration
     pub fn worst_bin(&self) -> Option<&CalibrationPoint> {
-        self.points
-            .iter()
-            .max_by(|a, b| {
-                let err_a = (a.mean_predicted - a.realized_frequency).abs();
-                let err_b = (b.mean_predicted - b.realized_frequency).abs();
-                err_a.partial_cmp(&err_b).unwrap()
-            })
+        self.points.iter().max_by(|a, b| {
+            let err_a = (a.mean_predicted - a.realized_frequency).abs();
+            let err_b = (b.mean_predicted - b.realized_frequency).abs();
+            err_a.partial_cmp(&err_b).unwrap()
+        })
     }
 }
 
@@ -270,10 +275,7 @@ impl CalibrationAnalyzer {
 
         // Extract fill predictions and outcomes
         for (i, level) in record.predictions.levels.iter().enumerate() {
-            let was_filled = outcomes
-                .fills
-                .iter()
-                .any(|f| f.level_index == i);
+            let was_filled = outcomes.fills.iter().any(|f| f.level_index == i);
 
             // Add to overall
             self.fill_predictions_1s.push((level.p_fill_1s, was_filled));
@@ -321,7 +323,10 @@ impl CalibrationAnalyzer {
     }
 
     /// Compute conditional Brier for a specific slice
-    pub fn compute_conditional_brier(&self, slice: &ConditionalSlice) -> Option<BrierDecomposition> {
+    pub fn compute_conditional_brier(
+        &self,
+        slice: &ConditionalSlice,
+    ) -> Option<BrierDecomposition> {
         self.conditional_fill_predictions.get(slice).map(|data| {
             let (predictions, outcomes): (Vec<f64>, Vec<bool>) = data.iter().cloned().unzip();
             BrierDecomposition::compute(&predictions, &outcomes, self.num_bins)
@@ -751,7 +756,11 @@ impl StatisticalValidator {
     ///
     /// # Returns
     /// Test result with p-value from permutation distribution.
-    pub fn permutation_test(&self, returns: &[f64], n_permutations: usize) -> StatisticalTestResult {
+    pub fn permutation_test(
+        &self,
+        returns: &[f64],
+        n_permutations: usize,
+    ) -> StatisticalTestResult {
         let n = returns.len();
         if n < 2 {
             return StatisticalTestResult::new(
@@ -769,7 +778,9 @@ impl StatisticalValidator {
         // Simple LCG random number generator for reproducibility
         let mut rng_state = self.seed;
         let lcg_next = |state: &mut u64| -> u64 {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *state
         };
 
@@ -781,7 +792,11 @@ impl StatisticalValidator {
             // Randomly assign signs
             let mut perm_sum = 0.0;
             for &abs_ret in &abs_returns {
-                let sign = if lcg_next(&mut rng_state) % 2 == 0 { 1.0 } else { -1.0 };
+                let sign = if lcg_next(&mut rng_state) % 2 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 perm_sum += sign * abs_ret;
             }
             let perm_mean = perm_sum / n as f64;
@@ -848,7 +863,11 @@ impl StatisticalValidator {
                 mean,
                 std_dev,
                 ir,
-                if is_useful { "Model adds value" } else { "Model adds noise" }
+                if is_useful {
+                    "Model adds value"
+                } else {
+                    "Model adds noise"
+                }
             ),
         )
     }
@@ -891,7 +910,10 @@ impl StatisticalValidator {
         for result in results {
             if result.is_significant {
                 has_significant_test = true;
-                reasons.push(format!("{} is significant (p={:.4})", result.test_name, result.p_value));
+                reasons.push(format!(
+                    "{} is significant (p={:.4})",
+                    result.test_name, result.p_value
+                ));
             }
 
             if result.test_name == "Information Ratio" && result.statistic > 1.0 {
@@ -929,7 +951,8 @@ fn standard_normal_cdf(x: f64) -> f64 {
     // Abramowitz and Stegun approximation
     let t = 1.0 / (1.0 + 0.2316419 * x);
     let d = 0.3989423 * (-x * x / 2.0).exp();
-    let p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+    let p =
+        d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
 
     if sign > 0.0 {
         1.0 - p
@@ -1020,7 +1043,10 @@ mod tests {
         let brier = BrierDecomposition::compute(&predictions, &outcomes, 10);
 
         // With perfect calibration, reliability should be low
-        assert!(brier.reliability < 0.1, "Reliability should be low for good calibration");
+        assert!(
+            brier.reliability < 0.1,
+            "Reliability should be low for good calibration"
+        );
     }
 
     #[test]
@@ -1058,7 +1084,10 @@ mod tests {
         let brier = BrierDecomposition::compute(&predictions, &outcomes, 4);
 
         // Good discrimination should yield high IR
-        assert!(brier.information_ratio > 0.5, "IR should be positive for discriminating model");
+        assert!(
+            brier.information_ratio > 0.5,
+            "IR should be positive for discriminating model"
+        );
     }
 
     // ========================================================================
@@ -1084,7 +1113,10 @@ mod tests {
         // 52 wins out of 100 - too close to 50%
         let result = validator.binomial_test(52, 100);
 
-        assert!(!result.is_significant, "52% win rate should not be significant");
+        assert!(
+            !result.is_significant,
+            "52% win rate should not be significant"
+        );
         assert!(result.p_value > 0.05, "p-value should be > 0.05");
     }
 
@@ -1152,12 +1184,17 @@ mod tests {
         let validator = StatisticalValidator::default();
 
         // Returns with zero mean
-        let returns: Vec<f64> = (0..100).map(|i| if i % 2 == 0 { 0.01 } else { -0.01 }).collect();
+        let returns: Vec<f64> = (0..100)
+            .map(|i| if i % 2 == 0 { 0.01 } else { -0.01 })
+            .collect();
 
         let result = validator.t_test(&returns);
 
         // Should not be significant
-        assert!(!result.is_significant, "Zero mean returns should not be significant");
+        assert!(
+            !result.is_significant,
+            "Zero mean returns should not be significant"
+        );
     }
 
     #[test]
@@ -1180,7 +1217,10 @@ mod tests {
         let result = validator.permutation_test(&returns, 1000);
 
         // With all positive returns, permutation test should be significant
-        assert!(result.p_value < 0.1, "p-value should be low for consistent positive returns");
+        assert!(
+            result.p_value < 0.1,
+            "p-value should be low for consistent positive returns"
+        );
     }
 
     #[test]
@@ -1188,7 +1228,9 @@ mod tests {
         let validator = StatisticalValidator::new(42);
 
         // Random-looking returns (alternating)
-        let returns: Vec<f64> = (0..100).map(|i| if i % 2 == 0 { 0.01 } else { -0.01 }).collect();
+        let returns: Vec<f64> = (0..100)
+            .map(|i| if i % 2 == 0 { 0.01 } else { -0.01 })
+            .collect();
 
         let result = validator.permutation_test(&returns, 1000);
 
@@ -1235,7 +1277,11 @@ mod tests {
         let result = validator.information_ratio(&returns);
 
         // IR should be high (mean ~0.1, std ~0.007)
-        assert!(result.statistic > 1.0, "IR should be > 1.0 for consistent positive returns: {}", result.statistic);
+        assert!(
+            result.statistic > 1.0,
+            "IR should be > 1.0 for consistent positive returns: {}",
+            result.statistic
+        );
         assert!(result.details.contains("adds value"));
     }
 
@@ -1256,7 +1302,9 @@ mod tests {
     fn test_run_all_tests() {
         let validator = StatisticalValidator::default();
 
-        let returns: Vec<f64> = (0..100).map(|i| if i % 3 == 0 { -0.01 } else { 0.02 }).collect();
+        let returns: Vec<f64> = (0..100)
+            .map(|i| if i % 3 == 0 { -0.01 } else { 0.02 })
+            .collect();
         let wins = returns.iter().filter(|&&r| r > 0.0).count();
 
         let results = validator.run_all_tests(&returns, wins);
@@ -1318,7 +1366,9 @@ mod tests {
         let (should_keep, reasons) = validator.should_keep_model(&results);
 
         assert!(!should_keep, "Model with poor tests should not be kept");
-        assert!(reasons.iter().any(|r| r.contains("IR") || r.contains("significance")));
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("IR") || r.contains("significance")));
     }
 
     #[test]
@@ -1331,7 +1381,10 @@ mod tests {
         assert!((cdf_1 - 0.8413).abs() < 0.01, "CDF(1) should be ~0.8413");
 
         let cdf_neg1 = standard_normal_cdf(-1.0);
-        assert!((cdf_neg1 - 0.1587).abs() < 0.01, "CDF(-1) should be ~0.1587");
+        assert!(
+            (cdf_neg1 - 0.1587).abs() < 0.01,
+            "CDF(-1) should be ~0.1587"
+        );
 
         let cdf_2 = standard_normal_cdf(2.0);
         assert!((cdf_2 - 0.9772).abs() < 0.01, "CDF(2) should be ~0.9772");
@@ -1350,13 +1403,7 @@ mod tests {
 
     #[test]
     fn test_statistical_test_result_format() {
-        let result = StatisticalTestResult::new(
-            "Test Name",
-            2.5,
-            0.01,
-            100,
-            "Some details",
-        );
+        let result = StatisticalTestResult::new("Test Name", 2.5, 0.01, 100, "Some details");
 
         let formatted = result.format();
 

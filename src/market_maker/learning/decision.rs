@@ -54,7 +54,7 @@ impl Default for DecisionEngineConfig {
 
             // Inverse information asymmetry
             adverse_selection_sensitivity: 0.5, // Moderate reduction when informed flow detected
-            min_size_fraction: 0.5, // Never go below 50% - ensures continuous quoting
+            min_size_fraction: 0.5,             // Never go below 50% - ensures continuous quoting
 
             // Reservation shift
             baseline_sigma: 0.0001, // ~10 bps per second as baseline
@@ -109,9 +109,7 @@ impl DecisionEngine {
             };
         }
 
-        if model_health.overall == Health::Warning
-            && self.config.min_model_health == Health::Good
-        {
+        if model_health.overall == Health::Warning && self.config.min_model_health == Health::Good {
             return QuoteDecision::NoQuote {
                 reason: "Model health warning, require good".into(),
             };
@@ -149,8 +147,8 @@ impl DecisionEngine {
         // Size fraction: high when uncertain, reduced when informed flow detected
         let adverse_selection_factor =
             1.0 - self.config.adverse_selection_sensitivity * information_asymmetry;
-        let size_fraction =
-            adverse_selection_factor.clamp(self.config.min_size_fraction, self.config.max_size_fraction);
+        let size_fraction = adverse_selection_factor
+            .clamp(self.config.min_size_fraction, self.config.max_size_fraction);
 
         // High epistemic uncertainty (model disagreement) → reduce size further
         let epistemicity_ratio = ensemble.disagreement / sigma_mu;
@@ -182,7 +180,8 @@ impl DecisionEngine {
         // === SPREAD: Uncertainty Premium ===
         // High σ_μ (noisy edge estimate) → widen spread (Bayesian uncertainty premium)
         let edge_uncertainty_ratio = sigma_mu / self.config.baseline_edge_std.max(0.001);
-        let spread_multiplier = (1.0 + self.config.uncertainty_spread_scaling * edge_uncertainty_ratio)
+        let spread_multiplier = (1.0
+            + self.config.uncertainty_spread_scaling * edge_uncertainty_ratio)
             .clamp(1.0, self.config.max_spread_multiplier);
 
         // Confidence is HIGH when p ≈ 0.5 (we're confident that it's uncertain)
@@ -277,23 +276,29 @@ mod tests {
 
         // Test with positive edge
         let positive_edge = EnsemblePrediction {
-            mean: 3.0,  // 3bp expected edge
+            mean: 3.0, // 3bp expected edge
             std: 1.0,
             disagreement: 0.1,
             model_contributions: vec![],
         };
         let decision = engine.should_quote(&positive_edge, &health, 0.0, TEST_SIGMA);
-        assert!(matches!(decision, QuoteDecision::Quote { .. }), "Should quote with positive edge");
+        assert!(
+            matches!(decision, QuoteDecision::Quote { .. }),
+            "Should quote with positive edge"
+        );
 
         // Test with NEGATIVE edge - should STILL quote (key A-S insight)
         let negative_edge = EnsemblePrediction {
-            mean: -3.0,  // Negative edge
+            mean: -3.0, // Negative edge
             std: 1.0,
             disagreement: 0.1,
             model_contributions: vec![],
         };
         let decision = engine.should_quote(&negative_edge, &health, 0.0, TEST_SIGMA);
-        assert!(matches!(decision, QuoteDecision::Quote { .. }), "Should STILL quote with negative edge");
+        assert!(
+            matches!(decision, QuoteDecision::Quote { .. }),
+            "Should STILL quote with negative edge"
+        );
 
         // Test with zero edge - should quote
         let zero_edge = EnsemblePrediction {
@@ -303,7 +308,10 @@ mod tests {
             model_contributions: vec![],
         };
         let decision = engine.should_quote(&zero_edge, &health, 0.0, TEST_SIGMA);
-        assert!(matches!(decision, QuoteDecision::Quote { .. }), "Should quote with zero edge");
+        assert!(
+            matches!(decision, QuoteDecision::Quote { .. }),
+            "Should quote with zero edge"
+        );
     }
 
     #[test]
@@ -315,8 +323,8 @@ mod tests {
 
         // Near-zero edge = p ≈ 0.5 = uncertain = larger size
         let uncertain = EnsemblePrediction {
-            mean: 0.1,  // Near zero edge
-            std: 1.0,   // z = 0.1 → p ≈ 0.54 (close to 0.5)
+            mean: 0.1, // Near zero edge
+            std: 1.0,  // z = 0.1 → p ≈ 0.54 (close to 0.5)
             disagreement: 0.1,
             model_contributions: vec![],
         };
@@ -324,24 +332,40 @@ mod tests {
 
         // Large positive edge = p → 1 = informed = smaller size
         let confident = EnsemblePrediction {
-            mean: 5.0,  // Large edge
-            std: 1.0,   // z = 5 → p ≈ 1.0 (very confident direction)
+            mean: 5.0, // Large edge
+            std: 1.0,  // z = 5 → p ≈ 1.0 (very confident direction)
             disagreement: 0.1,
             model_contributions: vec![],
         };
         let decision_confident = engine.should_quote(&confident, &health, 0.0, TEST_SIGMA);
 
         match (decision_uncertain, decision_confident) {
-            (QuoteDecision::Quote { size_fraction: s_uncertain, confidence: c_uncertain, .. },
-             QuoteDecision::Quote { size_fraction: s_confident, confidence: c_confident, .. }) => {
+            (
+                QuoteDecision::Quote {
+                    size_fraction: s_uncertain,
+                    confidence: c_uncertain,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    size_fraction: s_confident,
+                    confidence: c_confident,
+                    ..
+                },
+            ) => {
                 // Uncertain prediction should have LARGER size (inverse of Kelly)
-                assert!(s_uncertain > s_confident,
+                assert!(
+                    s_uncertain > s_confident,
                     "Uncertain (p≈0.5) should have larger size than confident (p→1): {} vs {}",
-                    s_uncertain, s_confident);
+                    s_uncertain,
+                    s_confident
+                );
                 // Confidence is HIGH when p ≈ 0.5 (we're confident it's a coin flip)
-                assert!(c_uncertain > c_confident,
+                assert!(
+                    c_uncertain > c_confident,
                     "Confidence should be higher when p≈0.5: {} vs {}",
-                    c_uncertain, c_confident);
+                    c_uncertain,
+                    c_confident
+                );
             }
             _ => panic!("Expected both to be Quote decisions"),
         }
@@ -356,7 +380,7 @@ mod tests {
 
         let positive_edge = EnsemblePrediction {
             mean: 5.0,
-            std: 0.5,  // High confidence in direction
+            std: 0.5, // High confidence in direction
             disagreement: 0.1,
             model_contributions: vec![],
         };
@@ -371,10 +395,26 @@ mod tests {
         let decision_neg = engine.should_quote(&negative_edge, &health, 0.0, TEST_SIGMA);
 
         match (decision_pos, decision_neg) {
-            (QuoteDecision::Quote { reservation_shift: shift_pos, .. },
-             QuoteDecision::Quote { reservation_shift: shift_neg, .. }) => {
-                assert!(shift_pos > 0.0, "Positive edge should shift UP: {}", shift_pos);
-                assert!(shift_neg < 0.0, "Negative edge should shift DOWN: {}", shift_neg);
+            (
+                QuoteDecision::Quote {
+                    reservation_shift: shift_pos,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    reservation_shift: shift_neg,
+                    ..
+                },
+            ) => {
+                assert!(
+                    shift_pos > 0.0,
+                    "Positive edge should shift UP: {}",
+                    shift_pos
+                );
+                assert!(
+                    shift_neg < 0.0,
+                    "Negative edge should shift DOWN: {}",
+                    shift_neg
+                );
             }
             _ => panic!("Expected both to be Quote decisions"),
         }
@@ -388,26 +428,37 @@ mod tests {
 
         let certain_edge = EnsemblePrediction {
             mean: 2.0,
-            std: 0.5,   // Low uncertainty
+            std: 0.5, // Low uncertainty
             disagreement: 0.1,
             model_contributions: vec![],
         };
         let decision_certain = engine.should_quote(&certain_edge, &health, 0.0, TEST_SIGMA);
 
         let uncertain_edge = EnsemblePrediction {
-            mean: 2.0,  // Same edge
-            std: 5.0,   // High uncertainty
+            mean: 2.0, // Same edge
+            std: 5.0,  // High uncertainty
             disagreement: 0.1,
             model_contributions: vec![],
         };
         let decision_uncertain = engine.should_quote(&uncertain_edge, &health, 0.0, TEST_SIGMA);
 
         match (decision_certain, decision_uncertain) {
-            (QuoteDecision::Quote { spread_multiplier: sm_certain, .. },
-             QuoteDecision::Quote { spread_multiplier: sm_uncertain, .. }) => {
-                assert!(sm_uncertain > sm_certain,
+            (
+                QuoteDecision::Quote {
+                    spread_multiplier: sm_certain,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    spread_multiplier: sm_uncertain,
+                    ..
+                },
+            ) => {
+                assert!(
+                    sm_uncertain > sm_certain,
                     "Higher edge uncertainty should widen spread: {} vs {}",
-                    sm_uncertain, sm_certain);
+                    sm_uncertain,
+                    sm_certain
+                );
                 assert!(sm_certain >= 1.0, "Spread multiplier should be >= 1.0");
             }
             _ => panic!("Expected both to be Quote decisions"),
@@ -460,11 +511,22 @@ mod tests {
         let decision_high = engine.should_quote(&high_disagreement, &health, 0.0, TEST_SIGMA);
 
         match (decision_low, decision_high) {
-            (QuoteDecision::Quote { size_fraction: s_low, .. },
-             QuoteDecision::Quote { size_fraction: s_high, .. }) => {
-                assert!(s_high < s_low,
+            (
+                QuoteDecision::Quote {
+                    size_fraction: s_low,
+                    ..
+                },
+                QuoteDecision::Quote {
+                    size_fraction: s_high,
+                    ..
+                },
+            ) => {
+                assert!(
+                    s_high < s_low,
                     "High disagreement should reduce size: {} vs {}",
-                    s_high, s_low);
+                    s_high,
+                    s_low
+                );
                 assert!(s_high > 0.0, "Should still quote with high disagreement");
             }
             _ => panic!("Expected both to be Quote decisions"),
@@ -511,9 +573,12 @@ mod tests {
 
         match decision {
             QuoteDecision::Quote { size_fraction, .. } => {
-                assert!(size_fraction >= engine.config().min_size_fraction,
+                assert!(
+                    size_fraction >= engine.config().min_size_fraction,
                     "Size should never go below min: {} vs {}",
-                    size_fraction, engine.config().min_size_fraction);
+                    size_fraction,
+                    engine.config().min_size_fraction
+                );
             }
             _ => panic!("Expected Quote decision"),
         }

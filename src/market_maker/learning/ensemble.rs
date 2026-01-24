@@ -3,7 +3,9 @@
 //! Multiple edge models compete, weighted by recent performance.
 //! Uses softmax of recent scores to adaptively select models.
 
-use super::types::{EnsemblePrediction, MarketState, RingBuffer, TradingOutcome, WeightedPrediction};
+use super::types::{
+    EnsemblePrediction, MarketState, RingBuffer, TradingOutcome, WeightedPrediction,
+};
 
 /// Trait for edge prediction models.
 ///
@@ -43,7 +45,10 @@ impl Default for GLFTEdgeModel {
 impl GLFTEdgeModel {
     /// Create a new GLFT model.
     pub fn new(fee_bps: f64, gamma_base: f64) -> Self {
-        Self { fee_bps, gamma_base }
+        Self {
+            fee_bps,
+            gamma_base,
+        }
     }
 
     /// Calculate optimal half-spread using GLFT formula.

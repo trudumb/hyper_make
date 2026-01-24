@@ -204,9 +204,7 @@ impl SignalStandardizers {
             super::config::GammaSignal::SpreadRegime => self.spread_regime.standardize(raw),
             super::config::GammaSignal::CascadeSeverity => self.cascade.standardize(raw),
             // Interaction terms - raw is already the product
-            super::config::GammaSignal::VolatilityXMomentum => {
-                self.vol_x_momentum.standardize(raw)
-            }
+            super::config::GammaSignal::VolatilityXMomentum => self.vol_x_momentum.standardize(raw),
             super::config::GammaSignal::RegimeXInventory => {
                 self.regime_x_inventory.standardize(raw)
             }
@@ -215,11 +213,7 @@ impl SignalStandardizers {
     }
 
     /// Standardize a signal without updating (peek).
-    pub(super) fn standardize_peek(
-        &self,
-        signal: &super::config::GammaSignal,
-        raw: f64,
-    ) -> f64 {
+    pub(super) fn standardize_peek(&self, signal: &super::config::GammaSignal, raw: f64) -> f64 {
         match signal {
             super::config::GammaSignal::VolatilityRatio => self.vol_ratio.standardize_peek(raw),
             super::config::GammaSignal::JumpRatio => self.jump_ratio.standardize_peek(raw),

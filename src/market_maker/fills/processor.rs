@@ -429,11 +429,10 @@ impl FillProcessor {
             let drawdown = pnl_summary.drawdown();
 
             // Get learning module output for controller
-            let learning_output = state.learning.output(
-                &params,
-                state.position.position(),
-                drawdown,
-            );
+            let learning_output =
+                state
+                    .learning
+                    .output(&params, state.position.position(), drawdown);
 
             // Get realized adverse selection
             let realized_as_bps = state.adverse_selection.realized_as_bps();
@@ -496,7 +495,11 @@ impl FillProcessor {
         let as_threshold_bps = 2.0;
         let was_adverse = as_bps > as_threshold_bps;
         // Use toxic regime flag as AS probability proxy
-        let as_prob_estimate = if state.estimator.is_toxic_regime() { 0.5 } else { 0.1 };
+        let as_prob_estimate = if state.estimator.is_toxic_regime() {
+            0.5
+        } else {
+            0.1
+        };
         state
             .prometheus
             .record_as_calibration(as_prob_estimate, was_adverse, &regime);
