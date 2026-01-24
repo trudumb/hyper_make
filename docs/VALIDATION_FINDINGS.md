@@ -1,6 +1,6 @@
 # Validation Findings
 
-**Date:** 2026-01-22 (Updated)
+**Date:** 2026-01-24 (Updated)
 **Document:** docs/WORKFLOW.md Validation
 
 ---
@@ -12,9 +12,9 @@
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
 | Positive Sharpe Potential | **PASS** | GLFT model + proper risk controls |
-| Robust Infrastructure | **PASS** | 101K LOC, 984 passing tests |
+| Robust Infrastructure | **PASS** | 101K LOC, 1338 passing tests |
 | Order Book Competence | **PASS** | Multi-level ladder, queue tracking |
-| Test Coverage >80% | **PARTIAL** | 977 unit tests, 141 test files (~70%) |
+| Test Coverage >80% | **PARTIAL** | 1338 unit tests, 141 test files (~70%) |
 | No Linter Errors | **PASS** | Only style warnings (clippy) |
 | Documentation Updated | **PASS** | Current date, matches code |
 
@@ -47,11 +47,41 @@ All compiler warnings have been addressed:
 
 ### 3. Test Failure - FIXED
 
-All 984 tests now pass:
+All 1338 tests now pass:
 ```
-test result: ok. 977 passed; 0 failed; 0 ignored
-test result: ok. 7 passed; 0 failed; 0 ignored
+test result: ok. 1338 passed; 0 failed; 0 ignored
 ```
+
+### 4. HIP-3 Position Reset Bug - FIXED
+
+**Date:** 2026-01-24
+
+**Original Problem:** For HIP-3 DEX assets (e.g., `hyna:HYPE`), the position tracker was being incorrectly reset to 0 shortly after initialization, even though the initial position was correctly queried from the exchange.
+
+**Root Cause:** The `handle_web_data2()` function in `orchestrator/handlers.rs` was syncing position from `WebData2.clearinghouseState`, which contains the **USDC clearinghouse** state. However, HIP-3 assets are in a **separate DEX clearinghouse**, so the asset was not found, causing the position to default to `0.0`. The position sync logic then detected "drift" and reset the position to 0.
+
+**Timeline (from logs):**
+```
+13:39:38 - Queried initial position: -18.89 ✓
+13:39:40 - Position verified: -18.89 ✓
+13:39:42 - WebData2 arrives → Asset not found → exchange_position = 0.0
+13:39:42 - Drift detected → Position reset to 0.0 ✗
+13:39:42 - Quote cycle sees position = 0.00 (wrong!)
+```
+
+**Fix Applied:** Added a gate to skip position sync from WebData2 for HIP-3 DEXs (same pattern as already exists for margin sync):
+
+```rust
+// IMPORTANT: For HIP-3 DEXs, WebData2's clearinghouseState is the USDC clearinghouse,
+// NOT the DEX's clearinghouse. Only sync position for validator perps (non-HIP-3).
+if self.config.dex.is_none() {
+    // position sync logic...
+}
+```
+
+**File:** `src/market_maker/orchestrator/handlers.rs:754-765`
+
+**Impact:** HIP-3 positions now correctly persist and are only updated via fill events, not from incorrect WebData2 sync.
 
 ---
 
@@ -81,7 +111,7 @@ test result: ok. 7 passed; 0 failed; 0 ignored
 Total Rust LOC: 101,611
 Market maker modules: 24 directories
 Files with tests: 141
-Tests passing: 984 (977 + 7)
+Tests passing: 1338
 ```
 
 **Key Infrastructure Components:**
