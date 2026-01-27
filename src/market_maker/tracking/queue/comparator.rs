@@ -68,6 +68,12 @@ pub struct QueueValueConfig {
 
     /// Whether queue value comparison is enabled
     pub enabled: bool,
+
+    /// API call cost in bps for modification decisions.
+    /// This cost is subtracted from EV improvement when deciding whether to modify.
+    /// A modification is only approved if: EV(new) - EV(current) > api_cost_bps
+    /// Default: 3.0 bps (accounts for rate limit budget and queue loss)
+    pub api_cost_bps: f64,
 }
 
 impl Default for QueueValueConfig {
@@ -80,6 +86,7 @@ impl Default for QueueValueConfig {
             spread_capture_bps: 8.0,       // Estimated spread capture
             min_order_age_secs: 0.3,       // Wait 300ms before considering replacement
             enabled: true,
+            api_cost_bps: 3.0,             // API call cost in bps (rate limit + queue loss)
         }
     }
 }
@@ -234,6 +241,28 @@ impl<'a> QueueValueComparator<'a> {
         let current_ev = current_p_fill * self.config.spread_capture_bps;
         let new_ev = new_p_fill * self.config.spread_capture_bps;
 
+        // Calculate absolute EV improvement (in bps)
+        let ev_improvement_bps = new_ev - current_ev;
+
+        // API BUDGET GATE: Only modify if EV improvement exceeds API cost
+        // This prevents low-value modifications that burn rate limit budget
+        if ev_improvement_bps < self.config.api_cost_bps {
+            debug!(
+                oid = oid,
+                current_ev = %format!("{:.3}", current_ev),
+                new_ev = %format!("{:.3}", new_ev),
+                ev_improvement_bps = %format!("{:.3}", ev_improvement_bps),
+                api_cost_bps = %format!("{:.1}", self.config.api_cost_bps),
+                "Queue-aware: KEEPING order (EV improvement < API cost)"
+            );
+            return QueueValueDecision::Keep {
+                reason: QueueKeepReason::InsufficientImprovement,
+                current_ev,
+                replacement_ev: new_ev,
+            };
+        }
+
+        // Also check percentage improvement threshold for proportional gating
         let improvement_pct = if current_ev > 0.0 {
             (new_ev - current_ev) / current_ev
         } else {
@@ -252,7 +281,7 @@ impl<'a> QueueValueComparator<'a> {
                 new_p_fill = %format!("{:.3}", new_p_fill),
                 improvement_pct = %format!("{:.1}%", improvement_pct * 100.0),
                 threshold = %format!("{:.1}%", self.config.improvement_threshold * 100.0),
-                "Queue-aware: KEEPING order (insufficient improvement)"
+                "Queue-aware: KEEPING order (insufficient % improvement)"
             );
             QueueValueDecision::Keep {
                 reason: QueueKeepReason::InsufficientImprovement,
@@ -265,6 +294,7 @@ impl<'a> QueueValueComparator<'a> {
                 current_p_fill = %format!("{:.3}", current_p_fill),
                 new_p_fill = %format!("{:.3}", new_p_fill),
                 improvement_pct = %format!("{:.1}%", improvement_pct * 100.0),
+                ev_improvement_bps = %format!("{:.3}", ev_improvement_bps),
                 "Queue-aware: REPLACING order (sufficient improvement)"
             );
             QueueValueDecision::Replace { improvement_pct }
@@ -360,6 +390,8 @@ mod tests {
             default_queue_position: 5.0,
             refresh_threshold: 0.1,
             min_order_age_for_refresh: 0.1,
+            refresh_cost_bps: 5.0,       // EV cost of refresh
+            spread_capture_bps: 8.0,     // Expected spread capture
         })
     }
 
@@ -372,6 +404,7 @@ mod tests {
             spread_capture_bps: 8.0,
             min_order_age_secs: 0.0, // Disable age check for tests
             enabled: true,
+            api_cost_bps: 3.0,       // API call cost in bps
         }
     }
 

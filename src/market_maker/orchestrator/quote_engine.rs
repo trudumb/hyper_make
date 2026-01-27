@@ -130,6 +130,37 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Mark that we're doing a requote
         self.infra.proactive_rate_tracker.mark_requote();
 
+        // === KAPPA-BASED CYCLE SKIPPING (API Budget Conservation) ===
+        // When kappa is high (thick book, many fills expected), skip some cycles
+        // to let fills accumulate rather than churning through API budget.
+        // This is a stochastic skip - higher kappa = higher skip probability.
+        const HIGH_KAPPA_THRESHOLD: f64 = 5000.0; // fills/second - thick book
+        const MIN_KAPPA_CONFIDENCE: f64 = 0.7; // Only skip if confident in kappa estimate
+
+        let kappa = self.estimator.kappa();
+        let kappa_confidence = self.estimator.kappa_confidence();
+
+        if kappa > HIGH_KAPPA_THRESHOLD && kappa_confidence > MIN_KAPPA_CONFIDENCE {
+            // Skip probability increases with kappa (more fills expected = skip more cycles)
+            // At threshold: skip 0%, at 2x threshold: skip ~25%, at 3x: ~33%
+            let skip_prob = ((kappa - HIGH_KAPPA_THRESHOLD) / kappa) * 0.5;
+
+            // Use deterministic skip based on time to avoid randomness issues
+            // Skip if current second modulo pattern matches
+            let now = std::time::Instant::now();
+            let should_skip = (now.elapsed().as_millis() as f64 / 1000.0) % 1.0 < skip_prob;
+
+            if should_skip {
+                debug!(
+                    kappa = %format!("{:.0}", kappa),
+                    kappa_confidence = %format!("{:.2}", kappa_confidence),
+                    skip_prob = %format!("{:.2}", skip_prob),
+                    "Skipping quote cycle: high kappa - letting fills accumulate"
+                );
+                return Ok(());
+            }
+        }
+
         // === LEARNING MODULE: Periodic model health logging ===
         if self.learning.is_enabled() && self.learning.should_log_health() {
             let health = self.learning.model_health();

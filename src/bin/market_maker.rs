@@ -258,6 +258,26 @@ struct Cli {
     #[arg(long)]
     max_spread_bps: Option<f64>,
 
+    // === Quote Gate (API Budget Conservation) Flags ===
+    /// Quote when flat without directional edge signal.
+    /// When false (default): conserves API budget by only quoting when there's an edge signal.
+    /// When true: market-making mode, quotes both sides even without edge.
+    #[arg(long)]
+    quote_flat_without_edge: bool,
+
+    /// Disable quote gate entirely (always quote both sides).
+    /// Overrides quote_flat_without_edge setting.
+    #[arg(long)]
+    disable_quote_gate: bool,
+
+    /// Minimum |flow_imbalance| to have directional edge (default: 0.15)
+    #[arg(long)]
+    quote_gate_min_edge_signal: Option<f64>,
+
+    /// Minimum momentum confidence to trust weak edge signals (default: 0.45)
+    #[arg(long)]
+    quote_gate_min_edge_confidence: Option<f64>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1231,6 +1251,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collateral_symbol = collateral.symbol.clone();
 
     // Create market maker config
+    // Build StochasticConfig with CLI overrides for quote gate
+    let stochastic_config = {
+        let mut cfg = StochasticConfig::default();
+        // Quote Gate settings (API budget conservation)
+        if cli.disable_quote_gate {
+            cfg.enable_quote_gate = false;
+        }
+        if cli.quote_flat_without_edge {
+            cfg.quote_gate_flat_without_edge = true;
+        }
+        if let Some(v) = cli.quote_gate_min_edge_signal {
+            cfg.quote_gate_min_edge_signal = v;
+        }
+        if let Some(v) = cli.quote_gate_min_edge_confidence {
+            cfg.quote_gate_min_edge_confidence = v;
+        }
+        cfg
+    };
+
     let mm_config = MmConfig {
         asset: Arc::from(asset.as_str()),
         target_liquidity,
@@ -1240,7 +1279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decimals,
         sz_decimals,
         multi_asset: false, // Single-asset mode by default
-        stochastic: StochasticConfig::default(),
+        stochastic: stochastic_config,
         smart_reconcile: true, // Enable queue-preserving ORDER MODIFY by default
         reconcile: {
             let mut rc = ReconcileConfig::default();

@@ -428,9 +428,11 @@ pub struct StochasticConfig {
     pub quote_gate_cascade_threshold: f64,
 
     /// Quote both sides when flat, even without strong edge signal.
-    /// Market makers profit from spread capture, not direction.
+    /// When true (market-making mode): quotes both sides for spread capture.
+    /// When false (API budget mode): only quotes when directional edge detected.
     ///
-    /// Default: true (market-making mode)
+    /// Default: false (API budget conservation - prevents excessive API churn)
+    /// Use --quote-flat-without-edge to enable market-making mode.
     pub quote_gate_flat_without_edge: bool,
 }
 
@@ -531,7 +533,7 @@ impl Default for StochasticConfig {
             performance_min_capacity_fraction: 0.3,  // Never below 30%
 
             // Quote Gate (Directional Edge Gating)
-            // ENABLED by default - but with market-making appropriate defaults
+            // ENABLED by default - optimized for API budget conservation
             enable_quote_gate: true,
             quote_gate_min_edge_signal: 0.15,               // Lower threshold for MM (was 0.25)
             quote_gate_min_edge_confidence: 0.45,           // Below baseline (was 0.55)
@@ -540,7 +542,9 @@ impl Default for StochasticConfig {
             quote_gate_max_position_before_reduce_only: 0.7, // 70% of max = reduce only
             quote_gate_cascade_protection: true,
             quote_gate_cascade_threshold: 0.3,              // 70% cascade severity
-            quote_gate_flat_without_edge: true,             // MM mode: quote when flat
+            // API BUDGET CONSERVATION: Default false to avoid quoting in sideways markets
+            // Set --quote-flat-without-edge to enable market-making mode
+            quote_gate_flat_without_edge: false,            // Conserve API budget: only quote with edge
 
             // Calibrated Risk Model (Log-Additive Gamma)
             // ENABLED: Use log-additive gamma to prevent multiplicative explosion

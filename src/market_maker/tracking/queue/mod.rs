@@ -74,6 +74,8 @@ mod tests {
             default_queue_position: 5.0,
             refresh_threshold: 0.1,
             min_order_age_for_refresh: 0.1, // 100ms for fast tests
+            refresh_cost_bps: 5.0,          // EV cost of refresh
+            spread_capture_bps: 8.0,        // Expected spread capture
         })
     }
 
@@ -186,6 +188,8 @@ mod tests {
             default_queue_position: 5.0,
             refresh_threshold: 0.5,          // High threshold
             min_order_age_for_refresh: 0.05, // 50ms
+            refresh_cost_bps: 5.0,           // EV cost of refresh
+            spread_capture_bps: 8.0,         // Expected spread capture
         });
 
         // Place order with large queue ahead

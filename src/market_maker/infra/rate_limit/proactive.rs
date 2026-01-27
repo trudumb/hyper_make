@@ -328,3 +328,217 @@ pub struct ProactiveRateLimitMetrics {
     pub is_rate_limited: bool,
     pub consecutive_429s: u32,
 }
+
+// =============================================================================
+// Budget Pacer - EV-aware API budget allocation
+// =============================================================================
+
+/// Priority levels for API operations.
+///
+/// Higher priority operations get access to more of the budget.
+/// Emergency operations always succeed. Low-value operations are
+/// deprioritized when budget is tight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationPriority {
+    /// Emergency: cancel during cascade, close positions on kill switch.
+    /// Always allowed regardless of budget.
+    Emergency,
+
+    /// High-value: fills, response to significant price moves.
+    /// Allowed when budget > reserve threshold.
+    HighValue,
+
+    /// Normal: regular quote updates, standard modifications.
+    /// Allowed when budget > 2x reserve threshold.
+    Normal,
+
+    /// Low-value: small price drift corrections, minor size adjustments.
+    /// Allowed when budget > 3x reserve threshold.
+    LowValue,
+}
+
+/// Configuration for budget pacer.
+#[derive(Debug, Clone)]
+pub struct BudgetPacerConfig {
+    /// API budget per minute (subset of total IP weight limit).
+    /// Default: 600 (half of 1200 limit - leaves room for variability).
+    pub api_budget_per_minute: u32,
+
+    /// Fraction of budget reserved for high-value operations.
+    /// Default: 0.2 (20% reserved for emergencies and fills).
+    pub high_value_reserve: f64,
+
+    /// Enable budget pacing. When disabled, all operations are allowed.
+    /// Default: true.
+    pub enabled: bool,
+}
+
+impl Default for BudgetPacerConfig {
+    fn default() -> Self {
+        Self {
+            api_budget_per_minute: 600, // Half of 1200 limit
+            high_value_reserve: 0.2,    // 20% reserved
+            enabled: true,
+        }
+    }
+}
+
+/// Budget-aware API call pacer.
+///
+/// Allocates API budget to highest-value operations first.
+/// This prevents low-value operations (small price corrections) from
+/// consuming budget that should be reserved for high-value operations
+/// (fills, emergency cancels).
+///
+/// # Usage
+/// ```ignore
+/// let pacer = BudgetPacer::new(BudgetPacerConfig::default());
+///
+/// // Check before making API call
+/// if pacer.should_spend(OperationPriority::Normal) {
+///     pacer.record_spend(1);
+///     // ... make API call ...
+/// } else {
+///     // Skip low-priority operation to conserve budget
+/// }
+/// ```
+#[derive(Debug)]
+pub struct BudgetPacer {
+    config: BudgetPacerConfig,
+    /// Rolling window of API calls with timestamps
+    calls: Vec<Instant>,
+}
+
+impl Default for BudgetPacer {
+    fn default() -> Self {
+        Self::new(BudgetPacerConfig::default())
+    }
+}
+
+impl BudgetPacer {
+    /// Create a new budget pacer with the given configuration.
+    pub fn new(config: BudgetPacerConfig) -> Self {
+        let capacity = config.api_budget_per_minute as usize;
+        Self {
+            config,
+            calls: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Get the number of API calls made in the last minute.
+    pub fn spent_this_minute(&self) -> u32 {
+        let now = Instant::now();
+        let cutoff = now - Duration::from_secs(60);
+        self.calls.iter().filter(|&&t| t > cutoff).count() as u32
+    }
+
+    /// Get the remaining budget for this minute.
+    pub fn remaining_budget(&self) -> u32 {
+        self.config
+            .api_budget_per_minute
+            .saturating_sub(self.spent_this_minute())
+    }
+
+    /// Get the reserve threshold (minimum budget to maintain for high-value ops).
+    fn reserve_threshold(&self) -> u32 {
+        (self.config.api_budget_per_minute as f64 * self.config.high_value_reserve) as u32
+    }
+
+    /// Check if an operation at the given priority should be allowed.
+    ///
+    /// Returns true if the budget allows this operation, false if it should be skipped.
+    ///
+    /// # Priority Thresholds
+    /// - Emergency: Always allowed
+    /// - HighValue: Requires > 1x reserve threshold
+    /// - Normal: Requires > 2x reserve threshold
+    /// - LowValue: Requires > 3x reserve threshold
+    pub fn should_spend(&self, priority: OperationPriority) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+
+        let remaining = self.remaining_budget();
+        let reserve = self.reserve_threshold();
+
+        match priority {
+            OperationPriority::Emergency => true,
+            OperationPriority::HighValue => remaining > reserve,
+            OperationPriority::Normal => remaining > reserve * 2,
+            OperationPriority::LowValue => remaining > reserve * 3,
+        }
+    }
+
+    /// Record an API call (call after making the call).
+    pub fn record_spend(&mut self, count: u32) {
+        let now = Instant::now();
+        for _ in 0..count {
+            self.calls.push(now);
+        }
+
+        // Prune old entries periodically (when > 2x budget)
+        if self.calls.len() > self.config.api_budget_per_minute as usize * 2 {
+            let cutoff = now - Duration::from_secs(60);
+            self.calls.retain(|&t| t > cutoff);
+        }
+    }
+
+    /// Get metrics for logging/monitoring.
+    pub fn get_metrics(&self) -> BudgetPacerMetrics {
+        BudgetPacerMetrics {
+            budget_per_minute: self.config.api_budget_per_minute,
+            spent_this_minute: self.spent_this_minute(),
+            remaining: self.remaining_budget(),
+            reserve_threshold: self.reserve_threshold(),
+            enabled: self.config.enabled,
+        }
+    }
+
+    /// Determine the appropriate priority for a price modification.
+    ///
+    /// Uses price drift (in bps) to categorize the operation:
+    /// - Large moves (> 20 bps): HighValue - price discovery is important
+    /// - Medium moves (10-20 bps): Normal - standard quote maintenance
+    /// - Small moves (< 10 bps): LowValue - can be skipped if budget is tight
+    pub fn priority_for_price_drift(price_drift_bps: f64) -> OperationPriority {
+        if price_drift_bps > 20.0 {
+            OperationPriority::HighValue
+        } else if price_drift_bps > 10.0 {
+            OperationPriority::Normal
+        } else {
+            OperationPriority::LowValue
+        }
+    }
+
+    /// Determine the appropriate priority for a new order placement.
+    ///
+    /// New placements to cover gaps are important for market making.
+    pub fn priority_for_placement(is_best_level: bool) -> OperationPriority {
+        if is_best_level {
+            OperationPriority::HighValue // Best bid/ask must be covered
+        } else {
+            OperationPriority::Normal // Outer levels are less critical
+        }
+    }
+
+    /// Determine the appropriate priority for a cancel operation.
+    pub fn priority_for_cancel(is_emergency: bool, is_stale: bool) -> OperationPriority {
+        if is_emergency {
+            OperationPriority::Emergency
+        } else if is_stale {
+            OperationPriority::Normal // Clean up stale orders
+        } else {
+            OperationPriority::LowValue // Routine cleanup
+        }
+    }
+}
+
+/// Metrics from budget pacer.
+#[derive(Debug, Clone)]
+pub struct BudgetPacerMetrics {
+    pub budget_per_minute: u32,
+    pub spent_this_minute: u32,
+    pub remaining: u32,
+    pub reserve_threshold: u32,
+    pub enabled: bool,
+}

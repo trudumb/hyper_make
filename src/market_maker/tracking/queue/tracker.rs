@@ -213,23 +213,53 @@ impl QueuePositionTracker {
 
     /// Check if an order should be refreshed (replaced with new quote).
     ///
+    /// Uses EV-based comparison: only refresh if EV improvement > cost.
+    ///
     /// Returns true if:
     /// - Order is old enough (beyond min_order_age_for_refresh)
-    /// - Fill probability is below refresh_threshold
+    /// - Fill probability is below refresh_threshold OR
+    /// - EV of refreshed position > EV of current position + refresh_cost_bps
     pub fn should_refresh(&self, oid: u64, horizon_seconds: f64) -> bool {
         let position = match self.positions.get(&oid) {
             Some(p) => p,
             None => return false,
         };
 
-        // Check minimum age
+        // Check minimum age - protect young orders
         if position.age_seconds() < self.config.min_order_age_for_refresh {
             return false;
         }
 
-        // Check fill probability
-        let p_fill = self.fill_probability(oid, horizon_seconds).unwrap_or(0.0);
-        p_fill < self.config.refresh_threshold
+        // Calculate current fill probability
+        let p_fill_current = self.fill_probability(oid, horizon_seconds).unwrap_or(0.0);
+
+        // Fast path: if fill probability is very low, refresh is likely better
+        if p_fill_current < self.config.refresh_threshold {
+            return true;
+        }
+
+        // EV-based comparison for borderline cases
+        // Current EV = P(fill) * spread_capture
+        let ev_current = p_fill_current * self.config.spread_capture_bps;
+
+        // Estimate refreshed position EV
+        // When we refresh, we go to back of queue - estimate P(fill) for fresh order
+        let p_touch = self.probability_touch(oid, horizon_seconds).unwrap_or(0.0);
+        let expected_volume = self.config.expected_volume_per_second * horizon_seconds;
+        let estimated_depth = self.config.expected_volume_per_second * 0.5; // ~0.5s of volume
+
+        let p_exec_refreshed = if expected_volume > 0.0 {
+            (-estimated_depth / expected_volume).exp()
+        } else {
+            0.0
+        };
+        let p_fill_refreshed = p_touch * p_exec_refreshed;
+        let ev_refreshed = p_fill_refreshed * self.config.spread_capture_bps;
+
+        // Only refresh if improvement exceeds cost
+        // This prevents low-value refreshes that burn API budget
+        let ev_improvement = ev_refreshed - ev_current;
+        ev_improvement > self.config.refresh_cost_bps
     }
 
     /// Determine if an order should be preserved despite being off-target.
