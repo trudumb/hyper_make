@@ -810,7 +810,25 @@ pub(crate) fn apply_inventory_skew_with_drift(
         return;
     }
 
-    let offset = mid * total_skew_fraction;
+    // === MICROPRICE SANITY CHECK ===
+    // If mid (microprice) diverged significantly from market_mid, use market_mid instead
+    // This prevents cascading errors from upstream bugs (e.g., reservation_shift overflow)
+    let safe_mid = {
+        let ratio = mid / market_mid;
+        if ratio < 0.8 || ratio > 1.2 {
+            tracing::error!(
+                microprice = %format!("{:.4}", mid),
+                market_mid = %format!("{:.4}", market_mid),
+                ratio = %format!("{:.2}", ratio),
+                "CRITICAL: Microprice diverged >20% from market_mid - using market_mid for skew calculation"
+            );
+            market_mid
+        } else {
+            mid
+        }
+    };
+
+    let offset = safe_mid * total_skew_fraction;
 
     // Shift all prices by combined offset and RE-ROUND to exchange precision
     for level in &mut ladder.bids {
@@ -1235,5 +1253,138 @@ mod tests {
         // Prices should be integers (no fractional part)
         assert_eq!(ladder.bids[0].price, ladder.bids[0].price.round());
         assert_eq!(ladder.asks[0].price, ladder.asks[0].price.round());
+    }
+
+    /// Test that verifies the HIP-3 capital efficiency fix.
+    ///
+    /// The bug: When total_size is small (e.g., GLFT-derived target_liquidity = 1.3 HYPE),
+    /// individual levels fail min_notional check, triggering concentration fallback
+    /// to a single order BEFORE the entropy optimizer can distribute sizes.
+    ///
+    /// The fix: Use effective_max_position (margin-based capacity) for initial ladder
+    /// generation so levels pass min_notional, then let entropy optimizer allocate.
+    #[test]
+    fn test_hip3_capital_efficiency_fix() {
+        // HIP-3 scenario: HYPE at $22.80, $10 min notional, 10 levels
+        let mid = 22.80;
+        let min_notional = 10.0;
+        let num_levels = 10;
+
+        // Create depths (geometric spacing from 10bps to 100bps)
+        let depths: Vec<f64> = (0..num_levels)
+            .map(|i| 10.0 * (1.26_f64).powi(i as i32)) // ~10, 12.6, 15.9, 20, 25, 32, 40, 50, 63, 80
+            .collect();
+
+        // Scenario 1: Small total_size (like target_liquidity = 1.3 HYPE)
+        // Per-level = 1.3 / 10 = 0.13 HYPE
+        // Per-level notional = 0.13 * $22.80 = $2.96 < $10 → FAILS min_notional
+        let small_total_size = 1.3;
+        let small_sizes: Vec<f64> = vec![small_total_size / num_levels as f64; num_levels];
+
+        let ladder_small = build_raw_ladder(&depths, &small_sizes, mid, 2, 4, min_notional);
+
+        // With small sizes, ALL individual levels fail min_notional
+        // Concentration fallback should trigger → single order
+        assert_eq!(
+            ladder_small.bids.len(),
+            1,
+            "Small total_size should trigger concentration fallback to 1 level"
+        );
+        // The single order should use total size
+        let total_bid_size: f64 = ladder_small.bids.iter().map(|l| l.size).sum();
+        assert!(
+            (total_bid_size - small_total_size).abs() < 0.01,
+            "Concentration fallback should use full total_size"
+        );
+
+        // Scenario 2: Large total_size (like effective_max_position = 66 HYPE)
+        // Per-level = 66 / 10 = 6.6 HYPE
+        // Per-level notional = 6.6 * $22.80 = $150 > $10 → PASSES min_notional
+        let large_total_size = 66.0;
+        let large_sizes: Vec<f64> = vec![large_total_size / num_levels as f64; num_levels];
+
+        let ladder_large = build_raw_ladder(&depths, &large_sizes, mid, 2, 4, min_notional);
+
+        // With large sizes, ALL levels should pass min_notional
+        // No concentration fallback → multiple levels
+        assert_eq!(
+            ladder_large.bids.len(),
+            num_levels,
+            "Large total_size should result in {} levels, got {}",
+            num_levels,
+            ladder_large.bids.len()
+        );
+        assert_eq!(
+            ladder_large.asks.len(),
+            num_levels,
+            "Large total_size should result in {} ask levels, got {}",
+            num_levels,
+            ladder_large.asks.len()
+        );
+
+        // Verify each level has roughly the expected size
+        for (i, level) in ladder_large.bids.iter().enumerate() {
+            let expected_size = large_total_size / num_levels as f64;
+            assert!(
+                (level.size - expected_size).abs() < 0.1,
+                "Level {} size {} should be close to {}",
+                i,
+                level.size,
+                expected_size
+            );
+        }
+    }
+
+    /// Test the min_meaningful_size calculation used in ladder_strat.rs
+    /// This verifies our change from 1.5x to 1.05x multiplier.
+    #[test]
+    fn test_min_meaningful_size_calculation() {
+        let min_notional: f64 = 10.0;
+        let microprice: f64 = 22.80;
+
+        // Old calculation (1.5x) - overly conservative
+        let old_min_meaningful_size: f64 = (min_notional * 1.5) / microprice;
+        // = 15.0 / 22.80 = 0.658
+
+        // New calculation (1.05x) - allows more levels
+        let new_min_meaningful_size: f64 = (min_notional * 1.05) / microprice;
+        // = 10.5 / 22.80 = 0.461
+
+        // With 6 HYPE available:
+        let available: f64 = 6.0;
+
+        let old_max_levels = (available / old_min_meaningful_size).floor() as usize;
+        let new_max_levels = (available / new_min_meaningful_size).floor() as usize;
+
+        // Verify the actual values match our expectations
+        assert!(
+            (old_min_meaningful_size - 0.658).abs() < 0.01,
+            "old={}",
+            old_min_meaningful_size
+        );
+        assert!(
+            (new_min_meaningful_size - 0.461).abs() < 0.01,
+            "new={}",
+            new_min_meaningful_size
+        );
+
+        // Old: 6.0 / 0.658 = 9.1 → 9 levels
+        // New: 6.0 / 0.461 = 13.0 → 13 levels
+        assert!(
+            new_max_levels > old_max_levels,
+            "New multiplier should allow more levels: {} vs {}",
+            new_max_levels,
+            old_max_levels
+        );
+        assert!(
+            new_max_levels >= 13,
+            "With 1.05x multiplier, should get at least 13 levels, got {}",
+            new_max_levels
+        );
+        assert!(
+            old_max_levels <= 10,
+            "With 1.5x multiplier, should get at most 10 levels, got {}",
+            old_max_levels
+        );
     }
 }

@@ -603,10 +603,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Throttle if headroom < 10% (more aggressive than impulse control's 5%)
             // This gives buffer before we hit the hard 5% limit
             // Uses proactive_rate_tracker's minimum interval check
+            // BUT: If cache is stale, proceed anyway to break potential deadlock
             if let Some(ref cache) = self.infra.cached_rate_limit {
                 let headroom = cache.headroom_pct();
-                if headroom < 0.10 && !self.infra.proactive_rate_tracker.can_modify() {
-                    // Rate limit is tight AND we're within the minimum modify interval
+                let stale = cache.is_stale(std::time::Duration::from_secs(60));
+
+                if headroom < 0.10 && !self.infra.proactive_rate_tracker.can_modify() && !stale {
+                    // Rate limit is tight AND we're within the minimum modify interval AND cache is fresh
                     // Skip this cycle to conserve rate limit budget
                     debug!(
                         headroom_pct = %format!("{:.1}%", headroom * 100.0),
@@ -878,17 +881,32 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
             }
 
-            // Only throttle if headroom < 5% (approaching rate limit)
+            // Only throttle if headroom < 5% AND cache is fresh
+            // If cache is stale (>60s), proceed anyway to refresh it - this prevents deadlock
+            // where no requests → stale cache → perpetual throttle
             if let Some(ref cache) = self.infra.cached_rate_limit {
                 let headroom = cache.headroom_pct();
+                let stale = cache.is_stale(std::time::Duration::from_secs(60));
+
                 if headroom < 0.05 {
-                    warn!(
-                        headroom_pct = %format!("{:.1}%", headroom * 100.0),
-                        used = cache.n_requests_used,
-                        cap = cache.n_requests_cap,
-                        "Exchange rate limit low (<5% headroom) - throttling reconciliation"
-                    );
-                    return Ok(());
+                    if stale {
+                        info!(
+                            headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                            cache_age_secs = cache.fetched_at.elapsed().as_secs(),
+                            used = cache.n_requests_used,
+                            cap = cache.n_requests_cap,
+                            "Rate limit cache stale (>60s) - proceeding to refresh and break potential deadlock"
+                        );
+                        // Don't return - proceed to make a request which will refresh the cache
+                    } else {
+                        warn!(
+                            headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                            used = cache.n_requests_used,
+                            cap = cache.n_requests_cap,
+                            "Exchange rate limit low (<5% headroom) - throttling reconciliation"
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }

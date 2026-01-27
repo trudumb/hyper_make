@@ -15,11 +15,13 @@
 //! 4. **Thread Safety**: All structs are Send + Sync for concurrent access
 
 mod brier_score;
+mod coefficient_estimator;
 mod conditional_metrics;
 mod information_ratio;
 mod prediction_log;
 
 pub use brier_score::BrierScoreTracker;
+pub use coefficient_estimator::{CalibrationSample, CoefficientEstimator, CoefficientEstimatorConfig};
 pub use conditional_metrics::ConditionalCalibration;
 pub use information_ratio::InformationRatioTracker;
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};

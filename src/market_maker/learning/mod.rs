@@ -40,9 +40,12 @@ pub use ensemble::{EdgeModel, ModelEnsemble};
 pub use execution::ExecutionOptimizer;
 pub use types::*;
 
+use crate::market_maker::calibration::{CalibrationSample, CoefficientEstimator};
 use crate::market_maker::fills::FillEvent;
 use crate::market_maker::quoting::Ladder;
-use crate::market_maker::strategy::MarketParams;
+use crate::market_maker::strategy::{
+    CalibratedRiskModel, MarketParams, RiskFeatures, RiskModelConfig, WinLossTracker,
+};
 
 /// Configuration for the LearningModule.
 #[derive(Debug, Clone)]
@@ -107,6 +110,16 @@ pub struct LearningModule {
 
     /// Quote cycle counter for periodic logging
     quote_cycle_count: usize,
+
+    // === Risk Model Calibration ===
+    /// Coefficient estimator for calibrating risk model from fills
+    coefficient_estimator: CoefficientEstimator,
+
+    /// Kelly sizer for tracking win/loss ratios
+    kelly_tracker: WinLossTracker,
+
+    /// Risk model config for feature normalization consistency
+    risk_model_config: RiskModelConfig,
 }
 
 impl Default for LearningModule {
@@ -127,7 +140,32 @@ impl LearningModule {
             pending_predictions: Vec::new(),
             last_mid: 0.0,
             quote_cycle_count: 0,
+            coefficient_estimator: CoefficientEstimator::default(),
+            kelly_tracker: WinLossTracker::default(),
+            risk_model_config: RiskModelConfig::default(),
         }
+    }
+
+    /// Create a new learning module with custom risk model config.
+    pub fn with_risk_model_config(config: LearningConfig, risk_model_config: RiskModelConfig) -> Self {
+        Self {
+            config,
+            confidence_tracker: ModelConfidenceTracker::new(),
+            ensemble: ModelEnsemble::new(),
+            decision_engine: DecisionEngine::default(),
+            execution_optimizer: ExecutionOptimizer::default(),
+            pending_predictions: Vec::new(),
+            last_mid: 0.0,
+            quote_cycle_count: 0,
+            coefficient_estimator: CoefficientEstimator::default(),
+            kelly_tracker: WinLossTracker::default(),
+            risk_model_config,
+        }
+    }
+
+    /// Update the risk model config (e.g., after calibrating baselines).
+    pub fn update_risk_model_config(&mut self, config: RiskModelConfig) {
+        self.risk_model_config = config;
     }
 
     /// Check if learning is enabled.
@@ -203,6 +241,27 @@ impl LearningModule {
 
             // Update ensemble weights
             self.ensemble.update_weights(&outcome);
+
+            // === Risk Model Calibration Pipeline ===
+            // Record sample for coefficient estimator (log-additive gamma calibration)
+            // Use config to ensure baselines match those used in GLFTStrategy
+            let features = RiskFeatures::from_state(&outcome.prediction.state, &self.risk_model_config);
+            let sample = CalibrationSample {
+                timestamp_ms: outcome.prediction.timestamp_ms,
+                features,
+                realized_as_bps: outcome.realized_as_bps,
+                realized_edge_bps: outcome.realized_edge_bps,
+                is_buy: outcome.prediction.fill.is_buy,
+                depth_bps: outcome.prediction.depth_bps,
+            };
+            self.coefficient_estimator.record_sample(sample);
+
+            // Update Kelly win/loss tracker
+            if outcome.realized_edge_bps > 0.0 {
+                self.kelly_tracker.record_win(outcome.realized_edge_bps);
+            } else {
+                self.kelly_tracker.record_loss(-outcome.realized_edge_bps);
+            }
         }
     }
 
@@ -434,6 +493,64 @@ impl LearningModule {
     /// Get ensemble for inspection.
     pub fn ensemble(&self) -> &ModelEnsemble {
         &self.ensemble
+    }
+
+    // === Risk Model Calibration Accessors ===
+
+    /// Get the fitted calibrated risk model (if available).
+    ///
+    /// Returns Some(model) if coefficient estimator has enough samples.
+    pub fn fitted_risk_model(&self) -> Option<&CalibratedRiskModel> {
+        self.coefficient_estimator.fitted_model()
+    }
+
+    /// Check if risk model calibration is warmed up.
+    pub fn risk_model_warmed_up(&self) -> bool {
+        self.coefficient_estimator.is_warmed_up()
+    }
+
+    /// Get number of calibration samples.
+    pub fn calibration_sample_count(&self) -> usize {
+        self.coefficient_estimator.n_samples()
+    }
+
+    /// Get R² of risk model calibration.
+    pub fn risk_model_r_squared(&self) -> f64 {
+        self.coefficient_estimator.r_squared()
+    }
+
+    /// Get Kelly tracker win rate.
+    pub fn kelly_win_rate(&self) -> f64 {
+        self.kelly_tracker.win_rate()
+    }
+
+    /// Get Kelly tracker odds ratio.
+    pub fn kelly_odds_ratio(&self) -> f64 {
+        self.kelly_tracker.odds_ratio()
+    }
+
+    /// Get Kelly tracker statistics (avg_win, avg_loss, total_trades).
+    pub fn kelly_stats(&self) -> (f64, f64, u64) {
+        (
+            self.kelly_tracker.avg_win(),
+            self.kelly_tracker.avg_loss(),
+            self.kelly_tracker.total_trades(),
+        )
+    }
+
+    /// Check if Kelly tracker is warmed up.
+    pub fn kelly_warmed_up(&self) -> bool {
+        self.kelly_tracker.is_warmed_up()
+    }
+
+    /// Get the Kelly win/loss tracker for cloning to strategy.
+    pub fn kelly_tracker(&self) -> &WinLossTracker {
+        &self.kelly_tracker
+    }
+
+    /// Get the risk model config for consistency with strategy.
+    pub fn risk_model_config(&self) -> &RiskModelConfig {
+        &self.risk_model_config
     }
 
     /// Generate output for Layer 3 (StochasticController).

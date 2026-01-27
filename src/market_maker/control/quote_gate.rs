@@ -89,13 +89,19 @@ pub struct QuoteGateConfig {
 
     /// Minimum |flow_imbalance| to have directional edge.
     /// Below this threshold, we consider ourselves "edgeless".
-    /// Default: 0.25 (not too aggressive, allows some noise)
+    /// Default: 0.15 (market-making appropriate - quote unless very noisy)
     pub min_edge_signal: f64,
 
     /// Minimum momentum confidence to trust the edge signal.
-    /// Even with strong flow_imbalance, low confidence means uncertain.
-    /// Default: 0.55 (slightly above random)
+    /// This is ONLY required when signal is weak (below strong_signal_threshold).
+    /// Strong signals override this requirement.
+    /// Default: 0.45 (below baseline 0.50, allowing quoting in neutral conditions)
     pub min_edge_confidence: f64,
+
+    /// Signal strength that bypasses confidence requirement.
+    /// If |flow_imbalance| >= this, we trust it regardless of confidence.
+    /// Default: 0.50 (strong signal = trust it)
+    pub strong_signal_threshold: f64,
 
     /// Minimum position (as fraction of max) to trigger one-sided quoting.
     /// Below this, position is considered "flat".
@@ -114,18 +120,26 @@ pub struct QuoteGateConfig {
     /// Cascade threshold (cascade_size_factor below this = cascade).
     /// Default: 0.3 (70% cascade severity)
     pub cascade_threshold: f64,
+
+    /// Quote both sides when flat, even without strong edge signal.
+    /// Market makers profit from spread capture, not direction.
+    /// Only disable quoting during genuine danger (cascade, toxic regime).
+    /// Default: true (market-making mode)
+    pub quote_flat_without_edge: bool,
 }
 
 impl Default for QuoteGateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_edge_signal: 0.25,
-            min_edge_confidence: 0.55,
+            min_edge_signal: 0.15,
+            min_edge_confidence: 0.45,
+            strong_signal_threshold: 0.50,
             position_threshold: 0.05,
             max_position_before_reduce_only: 0.7,
             cascade_protection: true,
             cascade_threshold: 0.3,
+            quote_flat_without_edge: true,
         }
     }
 }
@@ -223,9 +237,14 @@ impl QuoteGate {
         let position_abs_ratio = position_ratio.abs();
 
         // 3. Check if we have directional edge
+        // Edge requires EITHER:
+        //   a) Signal >= min_edge_signal AND confidence >= min_edge_confidence
+        //   b) Signal >= strong_signal_threshold (strong signal bypasses confidence check)
         let signal_strength = input.flow_imbalance.abs();
-        let has_edge = signal_strength >= self.config.min_edge_signal
+        let strong_signal = signal_strength >= self.config.strong_signal_threshold;
+        let weak_signal_with_confidence = signal_strength >= self.config.min_edge_signal
             && input.momentum_confidence >= self.config.min_edge_confidence;
+        let has_edge = strong_signal || weak_signal_with_confidence;
 
         // Determine if position is significant
         let has_significant_position = position_abs_ratio >= self.config.position_threshold;
@@ -276,8 +295,18 @@ impl QuoteGate {
                     // Short without edge → only buy to reduce
                     QuoteDecision::QuoteOnlyBids { urgency }
                 }
+            } else if self.config.quote_flat_without_edge {
+                // MARKET MAKING MODE: Quote both sides even without edge.
+                // Market makers profit from spread capture, not direction.
+                // Only stop quoting during genuine danger (cascade, toxic regime).
+                debug!(
+                    flow_imbalance = %format!("{:.3}", input.flow_imbalance),
+                    momentum_conf = %format!("{:.2}", input.momentum_confidence),
+                    "Quote gate: no edge but quoting both (market-making mode)"
+                );
+                QuoteDecision::QuoteBoth
             } else {
-                // No edge, flat position → DON'T QUOTE, wait for signal
+                // DIRECTIONAL MODE: No edge, flat position → DON'T QUOTE, wait for signal
                 QuoteDecision::NoQuote {
                     reason: NoQuoteReason::NoEdgeFlat,
                 }
@@ -381,10 +410,30 @@ mod tests {
     }
 
     #[test]
-    fn test_no_edge_flat_should_not_quote() {
+    fn test_no_edge_flat_quotes_both_in_mm_mode() {
+        // Market-making mode (default): quote both sides even without edge
         let gate = QuoteGate::default();
         let input = QuoteGateInput {
-            flow_imbalance: 0.1, // Below threshold (0.25)
+            flow_imbalance: 0.1, // Below threshold
+            momentum_confidence: 0.5,
+            position: 0.0, // Flat
+            ..default_input()
+        };
+
+        let decision = gate.decide(&input);
+        // In MM mode, flat position without edge still quotes both sides
+        assert!(matches!(decision, QuoteDecision::QuoteBoth));
+    }
+
+    #[test]
+    fn test_no_edge_flat_no_quote_in_directional_mode() {
+        // Directional mode: don't quote when flat without edge
+        let gate = QuoteGate::new(QuoteGateConfig {
+            quote_flat_without_edge: false,
+            ..Default::default()
+        });
+        let input = QuoteGateInput {
+            flow_imbalance: 0.1, // Below threshold
             momentum_confidence: 0.5,
             position: 0.0, // Flat
             ..default_input()

@@ -5,14 +5,17 @@ use tracing::{debug, info, warn};
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig};
-use crate::market_maker::estimator::VolatilityRegime;
+// VolatilityRegime removed - regime_scalar was redundant with vol_scalar
 use crate::market_maker::quoting::{
     BayesianFillModel, DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator,
     EntropyConstrainedOptimizer, EntropyDistributionConfig, EntropyOptimizerConfig, Ladder,
     LadderConfig, LadderLevel, LadderParams, LevelOptimizationParams, MarketRegime,
 };
 
-use super::{MarketParams, QuotingStrategy, RiskConfig};
+use super::{
+    CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
+    RiskModelConfig,
+};
 
 /// GLFT Ladder Strategy - multi-level quoting with depth-dependent sizing.
 ///
@@ -47,6 +50,12 @@ pub struct LadderStrategy {
     depth_generator: DynamicDepthGenerator,
     /// Bayesian fill probability model (learns from observed fills)
     fill_model: BayesianFillModel,
+    /// Calibrated risk model for log-additive gamma computation
+    pub risk_model: CalibratedRiskModel,
+    /// Configuration for risk model feature normalization
+    pub risk_model_config: RiskModelConfig,
+    /// Kelly criterion position sizer
+    pub kelly_sizer: KellySizer,
 }
 
 impl LadderStrategy {
@@ -61,6 +70,9 @@ impl LadderStrategy {
             depth_generator: Self::create_depth_generator(&ladder_config),
             ladder_config,
             fill_model: BayesianFillModel::default(),
+            risk_model: CalibratedRiskModel::with_gamma_base(gamma_base),
+            risk_model_config: RiskModelConfig::default(),
+            kelly_sizer: KellySizer::default(),
         }
     }
 
@@ -68,6 +80,9 @@ impl LadderStrategy {
     pub fn with_config(risk_config: RiskConfig, ladder_config: LadderConfig) -> Self {
         Self {
             depth_generator: Self::create_depth_generator(&ladder_config),
+            risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
+            risk_model_config: RiskModelConfig::default(),
+            kelly_sizer: KellySizer::default(),
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::default(),
@@ -91,10 +106,56 @@ impl LadderStrategy {
         let tau = 10.0; // Default tau, will be updated
         Self {
             depth_generator: Self::create_depth_generator(&ladder_config),
+            risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
+            risk_model_config: RiskModelConfig::default(),
+            kelly_sizer: KellySizer::default(),
             risk_config,
             ladder_config,
             fill_model: BayesianFillModel::new(prior_alpha, prior_beta, sigma, tau),
         }
+    }
+
+    /// Create with full configuration including calibrated risk model.
+    pub fn with_full_config(
+        risk_config: RiskConfig,
+        ladder_config: LadderConfig,
+        risk_model_config: RiskModelConfig,
+        kelly_sizer: KellySizer,
+    ) -> Self {
+        Self {
+            depth_generator: Self::create_depth_generator(&ladder_config),
+            risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
+            risk_model_config,
+            kelly_sizer,
+            risk_config,
+            ladder_config,
+            fill_model: BayesianFillModel::default(),
+        }
+    }
+
+    /// Update the calibrated risk model (e.g., from coefficient estimator).
+    pub fn update_risk_model(&mut self, model: CalibratedRiskModel) {
+        self.risk_model = model;
+    }
+
+    /// Update risk model config.
+    pub fn update_risk_model_config(&mut self, config: RiskModelConfig) {
+        self.risk_model_config = config;
+    }
+
+    /// Record a winning trade for Kelly sizing.
+    pub fn record_win(&mut self, win_bps: f64) {
+        self.kelly_sizer.record_win(win_bps);
+    }
+
+    /// Record a losing trade for Kelly sizing.
+    pub fn record_loss(&mut self, loss_bps: f64) {
+        self.kelly_sizer.record_loss(loss_bps);
+    }
+
+    /// Check if Kelly sizer is warmed up.
+    pub fn kelly_warmed_up(&self) -> bool {
+        self.kelly_sizer.is_warmed_up()
     }
 
     // === Bayesian Fill Model Interface ===
@@ -179,8 +240,67 @@ impl LadderStrategy {
     }
 
     /// Calculate effective γ based on current market conditions.
-    /// (Same logic as GLFTStrategy for consistency)
+    ///
+    /// Supports two modes (same as GLFTStrategy):
+    /// 1. **Legacy (Multiplicative)**: γ = γ_base × vol × tox × inv × ...
+    /// 2. **Calibrated (Log-Additive)**: log(γ) = log(γ_base) + Σ βᵢ × xᵢ
+    ///
+    /// Blending controlled by `risk_model_config.risk_model_blend`.
     fn effective_gamma(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> f64 {
+        let cfg = &self.risk_config;
+        let blend = self.risk_model_config.risk_model_blend.clamp(0.0, 1.0);
+
+        // ============================================================
+        // MODE 1: LEGACY MULTIPLICATIVE GAMMA
+        // ============================================================
+        let gamma_legacy = if blend < 1.0 {
+            self.compute_legacy_gamma(market_params, position, max_position)
+        } else {
+            0.0
+        };
+
+        // ============================================================
+        // MODE 2: CALIBRATED LOG-ADDITIVE GAMMA
+        // ============================================================
+        let gamma_calibrated = if blend > 0.0 || self.risk_model_config.use_calibrated_risk_model {
+            let features = RiskFeatures::from_params(
+                market_params,
+                position,
+                max_position,
+                &self.risk_model_config,
+            );
+            self.risk_model.compute_gamma(&features)
+        } else {
+            0.0
+        };
+
+        // ============================================================
+        // BLEND BETWEEN MODELS
+        // ============================================================
+        let gamma_base = if blend <= 0.0 {
+            gamma_legacy
+        } else if blend >= 1.0 {
+            gamma_calibrated
+        } else {
+            gamma_legacy * (1.0 - blend) + gamma_calibrated * blend
+        };
+
+        // ============================================================
+        // POST-PROCESS SCALARS (always applied)
+        // ============================================================
+        let gamma_with_calib = gamma_base * market_params.calibration_gamma_mult;
+        let gamma_final = gamma_with_calib * market_params.tail_risk_multiplier;
+
+        gamma_final.clamp(cfg.gamma_min, cfg.gamma_max)
+    }
+
+    /// Compute gamma using legacy multiplicative model.
+    fn compute_legacy_gamma(
         &self,
         market_params: &MarketParams,
         position: f64,
@@ -217,62 +337,39 @@ impl LadderStrategy {
             1.0 + cfg.inventory_sensitivity * excess.powi(2)
         };
 
-        // Volatility regime scaling
-        let regime_scalar = match market_params.volatility_regime {
-            VolatilityRegime::Low => 0.8,
-            VolatilityRegime::Normal => 1.0,
-            VolatilityRegime::High => 1.5,
-            VolatilityRegime::Extreme => 2.5,
-        };
+        // NOTE: regime_scalar REMOVED - was redundant with vol_scalar
+        // Both responded to volatility, causing double-scaling
 
-        // Hawkes activity scaling
-        let hawkes_scalar = if market_params.hawkes_activity_percentile > 0.9 {
-            1.5
-        } else if market_params.hawkes_activity_percentile > 0.8 {
-            1.2
-        } else {
-            1.0
-        };
+        // Hawkes activity scaling (continuous, not threshold-based)
+        let hawkes_baseline = 0.5;
+        let hawkes_sensitivity = 2.0;
+        let hawkes_scalar = 1.0
+            + hawkes_sensitivity
+                * (market_params.hawkes_activity_percentile - hawkes_baseline).max(0.0);
 
-        // Time-of-day scaling (toxic hours have higher adverse selection)
-        // Trade history showed -13 to -15 bps edge during 06-08, 14-15 UTC
+        // Time-of-day scaling
         let time_scalar = cfg.time_of_day_multiplier();
 
-        // Book depth scaling (thin books → harder to exit → higher risk)
-        // FIRST PRINCIPLES: This replaces the arbitrary stochastic_spread_multiplier
+        // Book depth scaling
         let book_depth_scalar = cfg.book_depth_multiplier(market_params.near_touch_depth_usd);
 
-        // Warmup uncertainty scaling (parameter uncertainty → more conservative)
-        // FIRST PRINCIPLES: This replaces the arbitrary adaptive_uncertainty_factor
-        let warmup_scalar = cfg.warmup_multiplier(market_params.adaptive_warmup_progress);
-
-        // Kappa uncertainty scaling: express kappa estimation uncertainty through gamma
-        // FIRST PRINCIPLES: We now use market kappa (book/robust) during warmup instead of prior.
-        // However, market kappa has estimation error - express this through position sizing (gamma)
-        // not through overriding the kappa estimate itself.
-        // Range: 1.5x at 0% warmup (high uncertainty) → 1.0x at 100% warmup (converged)
-        let kappa_uncertainty_scalar = if market_params.adaptive_warmup_progress < 1.0 {
-            1.0 + (1.0 - market_params.adaptive_warmup_progress) * 0.5
+        // Uncertainty scaling
+        let uncertainty_scalar = if market_params.kappa_ci_width > 0.0 {
+            1.0 + (market_params.kappa_ci_width / 10.0).min(0.5)
         } else {
             1.0
         };
 
-        // Calibration fill-hungry scaling (reduce gamma to attract fills during warmup)
-        // FIRST PRINCIPLES: calibration_gamma_mult ∈ [0.3, 1.0]
-        // Lower values = tighter quotes = more fills for calibration
-        let calibration_scalar = market_params.calibration_gamma_mult;
-
+        // Combine (note: calibration and tail_risk applied in caller)
         let gamma_effective = cfg.gamma_base
             * vol_scalar
             * toxicity_scalar
             * inventory_scalar
-            * regime_scalar
             * hawkes_scalar
             * time_scalar
             * book_depth_scalar
-            * warmup_scalar
-            * kappa_uncertainty_scalar
-            * calibration_scalar;
+            * uncertainty_scalar;
+
         gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
@@ -411,15 +508,44 @@ impl LadderStrategy {
             0.0 // Use zero AS until warmed up
         };
 
-        // Apply cascade size reduction
-        let adjusted_size = target_liquidity * market_params.cascade_size_factor;
+        // Apply cascade size reduction to target_liquidity (but NOT to initial ladder generation)
+        let _adjusted_size = target_liquidity * market_params.cascade_size_factor;
+
+        // For initial ladder generation, use the full quoting capacity so that individual
+        // levels pass the min_notional filter. The entropy optimizer will then correctly
+        // allocate the actual available margin (available_for_bids/asks).
+        //
+        // FIXED: Previously used target_liquidity which was often much smaller than
+        // quoting capacity (e.g., 1.3 HYPE vs 66 HYPE), causing ALL levels to fail
+        // min_notional check, triggering concentration fallback BEFORE entropy optimizer.
+        let size_for_initial_ladder = effective_max_position * market_params.cascade_size_factor;
 
         // === L2 RESERVATION SHIFT (Avellaneda-Stoikov Framework) ===
         // Edge enters through the reservation price, not sizing.
         // δ_μ = μ/(γσ²) shifts where we center quotes:
         // - Positive edge → shift UP → aggressive asks, capturing positive drift
         // - Negative edge → shift DOWN → aggressive bids, capturing negative drift
-        let adjusted_microprice = market_params.microprice + market_params.l2_reservation_shift;
+        //
+        // l2_reservation_shift is now a FRACTION (±0.005 max = ±50 bps)
+        // Use multiplicative adjustment: adjusted = microprice × (1 + shift_fraction)
+        let adjusted_microprice = market_params.microprice * (1.0 + market_params.l2_reservation_shift);
+
+        // SAFETY: Validate adjusted microprice doesn't diverge from market_mid
+        let microprice_ratio = adjusted_microprice / market_params.market_mid;
+        let adjusted_microprice = if microprice_ratio < 0.8 || microprice_ratio > 1.2 {
+            // This should never happen with the new bounded shift formula
+            tracing::error!(
+                adjusted = %format!("{:.4}", adjusted_microprice),
+                microprice = %format!("{:.4}", market_params.microprice),
+                market_mid = %format!("{:.4}", market_params.market_mid),
+                l2_reservation_shift = %format!("{:.6}", market_params.l2_reservation_shift),
+                ratio = %format!("{:.2}", microprice_ratio),
+                "CRITICAL: Adjusted microprice diverged >20% from market_mid - using microprice directly"
+            );
+            market_params.microprice
+        } else {
+            adjusted_microprice
+        };
 
         let params = LadderParams {
             mid_price: adjusted_microprice,
@@ -428,7 +554,7 @@ impl LadderStrategy {
             kappa, // Use AS-adjusted kappa
             arrival_intensity: market_params.arrival_intensity,
             as_at_touch_bps,
-            total_size: adjusted_size,
+            total_size: size_for_initial_ladder, // Use full capacity to avoid min_notional filtering
             inventory_ratio,
             gamma,
             time_horizon,
@@ -512,23 +638,14 @@ impl LadderStrategy {
             }
         }
 
-        // === L2 SPREAD MULTIPLIER (Bayesian Uncertainty Premium) ===
-        // Unlike the deprecated arbitrary multipliers, this is principled:
-        // High σ_μ (noisy edge estimate) → widen spreads to protect against model error.
-        // Formula: spread_mult = 1.0 + uncertainty_scaling × (σ_μ / baseline_σ_μ)
-        // This is NOT bypassing GLFT - it's adding a Bayesian uncertainty premium on top.
-        if market_params.l2_spread_multiplier > 1.0 {
-            for depth in dynamic_depths.bid.iter_mut() {
-                *depth *= market_params.l2_spread_multiplier;
-            }
-            for depth in dynamic_depths.ask.iter_mut() {
-                *depth *= market_params.l2_spread_multiplier;
-            }
-            debug!(
-                l2_spread_mult = %format!("{:.2}x", market_params.l2_spread_multiplier),
-                "Applied L2 Bayesian uncertainty premium to spreads"
-            );
-        }
+        // === REMOVED: L2 SPREAD MULTIPLIER ===
+        // The l2_spread_multiplier has been removed. All uncertainty is now handled
+        // through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
+        // The GLFT formula naturally widens spreads when gamma increases due to uncertainty.
+        //
+        // The L2 Bayesian uncertainty premium (σ_μ based spread widening) is now
+        // incorporated into the gamma calculation via uncertainty_scalar, which provides
+        // a principled Bayesian approach that doesn't bypass the GLFT model.
 
         // === DEPRECATED: SPREAD MULTIPLIERS ===
         // FIRST PRINCIPLES REFACTOR: Arbitrary spread multipliers bypass the GLFT model.
@@ -780,9 +897,13 @@ impl LadderStrategy {
             // to avoid placing many sub-minimum orders that would be rejected.
             //
             // Formula: max_levels = available_capacity / min_meaningful_size
-            // where min_meaningful_size = 1.5 × (min_notional / price) to ensure each order
-            // is comfortably above exchange minimum notional requirements.
-            let min_meaningful_size = (config.min_notional * 1.5) / market_params.microprice;
+            // where min_meaningful_size = 1.05 × (min_notional / price) to ensure each order
+            // is slightly above exchange minimum notional requirements.
+            //
+            // CHANGED: Reduced from 1.5× to 1.05× to allow more levels with small capital.
+            // The 1.05× buffer handles rounding/slippage while enabling distribution.
+            // The entropy optimizer's notional constraints provide additional protection.
+            let min_meaningful_size = (config.min_notional * 1.05) / market_params.microprice;
 
             let max_bid_levels = if available_for_bids > EPSILON {
                 ((available_for_bids / min_meaningful_size).floor() as usize).max(1)

@@ -42,7 +42,7 @@ pub mod types;
 pub mod value;
 
 // Re-export key types
-pub use actions::{Action, ActionConfig, DefensiveReason, NoQuoteReason};
+pub use actions::{Action, ActionConfig, NoQuoteReason};
 pub use belief::BeliefState;
 pub use changepoint::{ChangepointConfig, ChangepointDetector};
 pub use quote_gate::{
@@ -264,16 +264,6 @@ impl StochasticController {
                     + ladder.asks.first().map(|a| a.size).unwrap_or(0.0);
                 state::ActionTaken::Quoted { spread_bps, size }
             }
-            Action::DefensiveQuote {
-                spread_multiplier,
-                size_fraction,
-                ..
-            } => {
-                state::ActionTaken::Quoted {
-                    spread_bps: 8.0 * spread_multiplier, // Base spread * multiplier
-                    size: *size_fraction,
-                }
-            }
             Action::DumpInventory {
                 target_position, ..
             } => state::ActionTaken::DumpedInventory {
@@ -457,24 +447,23 @@ impl StochasticController {
     }
 
     /// Convert myopic decision to action.
+    ///
+    /// NOTE: Both Quote and ReducedSize now map to Action::Quote.
+    /// Size reduction is handled by GLFT's inventory_scalar and cascade_size_factor,
+    /// not by arbitrary size_fraction values.
     fn myopic_to_action(&self, decision: &QuoteDecision) -> Action {
         match decision {
-            QuoteDecision::Quote {
-                expected_edge,
-                size_fraction: _,
-                ..
-            } => Action::Quote {
+            QuoteDecision::Quote { expected_edge, .. } => Action::Quote {
                 ladder: Ladder::default(),
                 expected_value: *expected_edge,
             },
-            QuoteDecision::ReducedSize {
-                fraction,
-                reason: _,
-            } => Action::DefensiveQuote {
-                spread_multiplier: 1.0,
-                size_fraction: *fraction,
-                reason: DefensiveReason::ModelDisagreement,
-            },
+            QuoteDecision::ReducedSize { .. } => {
+                // ReducedSize maps to Quote - gamma handles the risk
+                Action::Quote {
+                    ladder: Ladder::default(),
+                    expected_value: 0.0, // Conservative estimate
+                }
+            }
             QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::NegativeEdge,
             },
@@ -747,7 +736,6 @@ impl StochasticController {
                 Action::DumpInventory { .. } => "terminal/position management",
                 Action::BuildInventory { .. } => "funding capture",
                 Action::WaitToLearn { .. } => "information value",
-                Action::DefensiveQuote { .. } => "uncertainty/risk",
                 Action::NoQuote { .. } => "no quoting condition",
                 Action::Quote { .. } => "optimal quote",
             };

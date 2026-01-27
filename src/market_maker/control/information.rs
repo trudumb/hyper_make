@@ -129,12 +129,9 @@ impl InformationValue {
     }
 
     /// Calculate value of acting now.
-    fn value_of_acting(&self, state: &ControlState, action: &Action) -> f64 {
+    fn value_of_acting(&self, _state: &ControlState, action: &Action) -> f64 {
         match action {
             Action::Quote { expected_value, .. } => *expected_value,
-            Action::DefensiveQuote { size_fraction, .. } => {
-                state.expected_edge() * size_fraction * 0.5
-            }
             _ => 0.0,
         }
     }
@@ -269,12 +266,9 @@ impl ActionValueComparator {
     }
 
     /// Estimate action value.
-    fn action_value(&self, state: &ControlState, action: &Action) -> f64 {
+    fn action_value(&self, _state: &ControlState, action: &Action) -> f64 {
         match action {
             Action::Quote { expected_value, .. } => *expected_value,
-            Action::DefensiveQuote { size_fraction, .. } => {
-                state.expected_edge() * size_fraction * 0.5
-            }
             Action::NoQuote { .. } => -0.01,
             Action::WaitToLearn {
                 expected_info_gain, ..

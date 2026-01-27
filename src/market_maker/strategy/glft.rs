@@ -6,7 +6,10 @@ use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig};
 
-use super::{MarketParams, QuotingStrategy, RiskConfig};
+use super::{
+    CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
+    RiskModelConfig,
+};
 
 /// GLFT (Guéant-Lehalle-Fernandez-Tapia) optimal market making strategy.
 ///
@@ -25,19 +28,34 @@ use super::{MarketParams, QuotingStrategy, RiskConfig};
 /// ```
 /// where T = 1/λ (inverse of arrival intensity).
 ///
-/// ## Dynamic Risk Aversion:
+/// ## Dynamic Risk Aversion (Two Modes):
+///
+/// ### Legacy Mode (Multiplicative):
 /// ```text
-/// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar
+/// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar × ...
 /// ```
 ///
-/// This preserves GLFT's structure while adapting to:
-/// - Volatility regime (higher σ → more conservative)
-/// - Toxicity (high RV/BV → informed flow → widen)
-/// - Inventory utilization (near limits → reduce risk)
+/// ### Calibrated Mode (Log-Additive):
+/// ```text
+/// log(γ) = log(γ_base) + Σ βᵢ × xᵢ
+/// γ = exp(log_gamma).clamp(γ_min, γ_max)
+/// ```
+///
+/// The log-additive model prevents multiplicative explosion and uses calibrated
+/// coefficients from realized adverse selection data.
 #[derive(Debug, Clone)]
 pub struct GLFTStrategy {
     /// Risk configuration for dynamic γ calculation
     pub risk_config: RiskConfig,
+
+    /// Calibrated risk model for log-additive gamma computation
+    pub risk_model: CalibratedRiskModel,
+
+    /// Configuration for risk model feature normalization
+    pub risk_model_config: RiskModelConfig,
+
+    /// Kelly criterion position sizer
+    pub kelly_sizer: KellySizer,
 }
 
 impl GLFTStrategy {
@@ -51,20 +69,160 @@ impl GLFTStrategy {
                 gamma_base: gamma_base.clamp(0.01, 10.0),
                 ..Default::default()
             },
+            risk_model: CalibratedRiskModel::with_gamma_base(gamma_base),
+            risk_model_config: RiskModelConfig::default(),
+            kelly_sizer: KellySizer::default(),
         }
     }
 
     /// Create a new GLFT strategy with full risk configuration.
     pub fn with_config(risk_config: RiskConfig) -> Self {
-        Self { risk_config }
+        Self {
+            risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
+            risk_model_config: RiskModelConfig::default(),
+            kelly_sizer: KellySizer::default(),
+            risk_config,
+        }
+    }
+
+    /// Create a new GLFT strategy with full configuration including calibrated risk model.
+    pub fn with_full_config(
+        risk_config: RiskConfig,
+        risk_model_config: RiskModelConfig,
+        kelly_sizer: KellySizer,
+    ) -> Self {
+        Self {
+            risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
+            risk_config,
+            risk_model_config,
+            kelly_sizer,
+        }
+    }
+
+    /// Update the calibrated risk model (e.g., from coefficient estimator).
+    pub fn update_risk_model(&mut self, model: CalibratedRiskModel) {
+        self.risk_model = model;
+    }
+
+    /// Update risk model config (e.g., baselines from market observation).
+    pub fn update_risk_model_config(&mut self, config: RiskModelConfig) {
+        self.risk_model_config = config;
+    }
+
+    /// Record a winning trade for Kelly sizing.
+    pub fn record_win(&mut self, win_bps: f64) {
+        self.kelly_sizer.record_win(win_bps);
+    }
+
+    /// Record a losing trade for Kelly sizing.
+    pub fn record_loss(&mut self, loss_bps: f64) {
+        self.kelly_sizer.record_loss(loss_bps);
+    }
+
+    /// Check if Kelly sizer is warmed up.
+    pub fn kelly_warmed_up(&self) -> bool {
+        self.kelly_sizer.is_warmed_up()
     }
 
     /// Calculate effective γ based on current market conditions.
     ///
-    /// γ_effective = γ_base × vol_scalar × toxicity_scalar × inventory_scalar × hawkes_scalar × ...
+    /// Supports two modes:
+    /// 1. **Legacy (Multiplicative)**: γ = γ_base × vol × tox × inv × ...
+    /// 2. **Calibrated (Log-Additive)**: log(γ) = log(γ_base) + Σ βᵢ × xᵢ
     ///
-    /// Each scalar has mathematical justification - no ad-hoc multipliers.
+    /// Blending controlled by `risk_model_config.risk_model_blend`:
+    /// - blend=0.0: Pure legacy multiplicative
+    /// - blend=1.0: Pure log-additive calibrated
+    /// - blend=0.5: 50/50 blend
     fn effective_gamma(
+        &self,
+        market_params: &MarketParams,
+        position: f64,
+        max_position: f64,
+    ) -> f64 {
+        let cfg = &self.risk_config;
+        let blend = self.risk_model_config.risk_model_blend.clamp(0.0, 1.0);
+
+        // ============================================================
+        // MODE 1: LEGACY MULTIPLICATIVE GAMMA
+        // ============================================================
+        let gamma_legacy = if blend < 1.0 {
+            self.compute_legacy_gamma(market_params, position, max_position)
+        } else {
+            0.0 // Not needed if pure log-additive
+        };
+
+        // ============================================================
+        // MODE 2: CALIBRATED LOG-ADDITIVE GAMMA
+        // ============================================================
+        let gamma_calibrated = if blend > 0.0 || self.risk_model_config.use_calibrated_risk_model {
+            // Build normalized risk features
+            let features = RiskFeatures::from_params(
+                market_params,
+                position,
+                max_position,
+                &self.risk_model_config,
+            );
+
+            // Compute gamma via log-additive model
+            self.risk_model.compute_gamma(&features)
+        } else {
+            0.0 // Not needed if pure legacy
+        };
+
+        // ============================================================
+        // BLEND BETWEEN MODELS
+        // ============================================================
+        let gamma_base = if blend <= 0.0 {
+            gamma_legacy
+        } else if blend >= 1.0 {
+            gamma_calibrated
+        } else {
+            // Linear blend in gamma space (not log space)
+            gamma_legacy * (1.0 - blend) + gamma_calibrated * blend
+        };
+
+        // ============================================================
+        // POST-PROCESS SCALARS (always applied)
+        // ============================================================
+        // These are event-driven and can't be normalized into features:
+        // 1. calibration_gamma_mult: Fill rate controller during warmup
+        // 2. tail_risk_multiplier: Cascade detection (discrete event)
+        let gamma_with_calib = gamma_base * market_params.calibration_gamma_mult;
+        let gamma_final = gamma_with_calib * market_params.tail_risk_multiplier;
+
+        let gamma_clamped = gamma_final.clamp(cfg.gamma_min, cfg.gamma_max);
+
+        // Log comparison for shadow mode validation
+        if self.risk_model_config.use_calibrated_risk_model || blend > 0.0 {
+            debug!(
+                gamma_legacy = %format!("{:.4}", gamma_legacy),
+                gamma_calibrated = %format!("{:.4}", gamma_calibrated),
+                blend = %format!("{:.2}", blend),
+                gamma_base = %format!("{:.4}", gamma_base),
+                calib_mult = %format!("{:.3}", market_params.calibration_gamma_mult),
+                tail_mult = %format!("{:.3}", market_params.tail_risk_multiplier),
+                gamma_final = %format!("{:.4}", gamma_clamped),
+                "Gamma: legacy vs calibrated comparison"
+            );
+        } else {
+            debug!(
+                gamma_base = %format!("{:.3}", cfg.gamma_base),
+                gamma_raw = %format!("{:.4}", gamma_legacy),
+                calib_mult = %format!("{:.3}", market_params.calibration_gamma_mult),
+                tail_mult = %format!("{:.3}", market_params.tail_risk_multiplier),
+                gamma_clamped = %format!("{:.4}", gamma_clamped),
+                "Gamma: legacy mode"
+            );
+        }
+
+        gamma_clamped
+    }
+
+    /// Compute gamma using legacy multiplicative model.
+    ///
+    /// γ = γ_base × vol × tox × inv × hawkes × time × book × uncertainty
+    fn compute_legacy_gamma(
         &self,
         market_params: &MarketParams,
         position: f64,
@@ -73,17 +231,15 @@ impl GLFTStrategy {
         let cfg = &self.risk_config;
 
         // === VOLATILITY SCALING ===
-        // Higher realized vol → more risk per unit inventory
         let vol_ratio = market_params.sigma_effective / cfg.sigma_baseline.max(1e-9);
         let vol_scalar = if vol_ratio <= 1.0 {
-            1.0 // Don't reduce γ in low vol (often precedes spikes)
+            1.0
         } else {
             let raw = 1.0 + cfg.volatility_weight * (vol_ratio - 1.0);
             raw.min(cfg.max_volatility_multiplier)
         };
 
         // === TOXICITY SCALING ===
-        // High RV/BV indicates informed flow
         let toxicity_scalar = if market_params.jump_ratio <= cfg.toxicity_threshold {
             1.0
         } else {
@@ -91,7 +247,6 @@ impl GLFTStrategy {
         };
 
         // === INVENTORY SCALING ===
-        // Near position limits → less room for error
         let utilization = if max_position > EPSILON {
             (position.abs() / max_position).min(1.0)
         } else {
@@ -104,75 +259,27 @@ impl GLFTStrategy {
             1.0 + cfg.inventory_sensitivity * excess.powi(2)
         };
 
-        // === REMOVED: VOLATILITY REGIME SCALING ===
-        // FIRST PRINCIPLES: This was redundant with vol_scalar above.
-        // Both responded to volatility, causing double-scaling:
-        //   - vol_scalar: 1 + weight × (σ/σ_baseline - 1) [principled]
-        //   - regime_scalar: hardcoded 0.8/1.0/1.5/2.5 [ad-hoc]
-        //
-        // Volatility is already properly handled via vol_scalar which uses
-        // the continuous relationship between σ and γ scaling.
-        // The discrete regime buckets (Low/Normal/High/Extreme) with arbitrary
-        // multipliers lacked mathematical derivation.
-
-        // === HAWKES ACTIVITY SCALING (Tier 2) ===
-        // FIRST PRINCIPLES: High order flow intensity indicates potential informed trading.
-        // Instead of arbitrary thresholds (0.8, 0.9) with hardcoded multipliers (1.2, 1.5),
-        // use a continuous relationship derived from arrival intensity ratio:
-        //
-        //   hawkes_scalar = 1 + sensitivity × max(0, percentile - baseline)
-        //
-        // This is mathematically justified: when λ_current >> λ_baseline,
-        // the probability of informed flow increases, warranting wider spreads.
-        // The sensitivity parameter controls how aggressively we respond.
-        //
-        // With baseline=0.5 (median) and sensitivity=2.0:
-        //   - 50th percentile: scalar = 1.0 (no adjustment)
-        //   - 80th percentile: scalar = 1.0 + 2.0 × 0.3 = 1.6
-        //   - 95th percentile: scalar = 1.0 + 2.0 × 0.45 = 1.9
-        let hawkes_baseline = 0.5; // Median as baseline
-        let hawkes_sensitivity = 2.0; // How much to scale per unit above baseline
+        // === HAWKES ACTIVITY SCALING ===
+        let hawkes_baseline = 0.5;
+        let hawkes_sensitivity = 2.0;
         let hawkes_scalar = 1.0
             + hawkes_sensitivity
                 * (market_params.hawkes_activity_percentile - hawkes_baseline).max(0.0);
 
         // === TIME-OF-DAY SCALING ===
-        // Trade history showed -13 to -15 bps edge during 06-08, 14-15 UTC
         let time_scalar = cfg.time_of_day_multiplier();
 
-        // === BOOK DEPTH SCALING (FIRST PRINCIPLES) ===
-        // Thin order books → harder to exit → higher risk → higher γ
-        // This replaces the arbitrary stochastic_spread_multiplier
+        // === BOOK DEPTH SCALING ===
         let book_depth_scalar = cfg.book_depth_multiplier(market_params.near_touch_depth_usd);
 
-        // === WARMUP UNCERTAINTY SCALING (FIRST PRINCIPLES) ===
-        // Use Bayesian posterior CI width for principled uncertainty scaling.
-        // Wider credible interval → more parameter uncertainty → higher gamma.
-        // Falls back to progress-based scaling if CI data unavailable.
-        let warmup_scalar = if market_params.kappa_ci_width > 0.0 {
-            // CI-based: directly reflects posterior uncertainty
-            cfg.warmup_multiplier_from_ci(market_params.kappa_ci_width)
+        // === UNCERTAINTY SCALING ===
+        let uncertainty_scalar = if market_params.kappa_ci_width > 0.0 {
+            1.0 + (market_params.kappa_ci_width / 10.0).min(0.5)
         } else {
-            // Fallback: progress-based linear decay (legacy)
-            cfg.warmup_multiplier(market_params.adaptive_warmup_progress)
+            1.0
         };
 
-        // === CALIBRATION FILL-HUNGRY SCALING (FIRST PRINCIPLES) ===
-        // During calibration, reduce gamma to attract fills for parameter estimation.
-        // calibration_gamma_mult ∈ [0.3, 1.0]: lower = tighter quotes = more fills
-        // Once calibrated, calibration_gamma_mult = 1.0 (no adjustment).
-        let calibration_scalar = market_params.calibration_gamma_mult;
-
-        // === COMBINE AND CLAMP ===
-        // FIRST PRINCIPLES: Each scalar has mathematical justification:
-        //   - vol_scalar: σ/σ_baseline relationship (continuous)
-        //   - toxicity_scalar: RV/BV informed flow detection (continuous)
-        //   - inventory_scalar: quadratic near limits (optimal control)
-        //   - hawkes_scalar: order flow intensity (derived from λ)
-        //   - time_scalar: toxic hour edge (measured from data)
-        //   - book_depth_scalar: exit slippage (market microstructure)
-        //   - warmup_scalar: parameter uncertainty (Bayesian)
-        //   - calibration_scalar: fill rate targeting (controller)
+        // Combine (note: calibration and tail_risk applied in caller)
         let gamma_effective = cfg.gamma_base
             * vol_scalar
             * toxicity_scalar
@@ -180,27 +287,9 @@ impl GLFTStrategy {
             * hawkes_scalar
             * time_scalar
             * book_depth_scalar
-            * warmup_scalar
-            * calibration_scalar;
-        let gamma_clamped = gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max);
+            * uncertainty_scalar;
 
-        // Log gamma component breakdown for debugging strategy behavior
-        debug!(
-            gamma_base = %format!("{:.3}", cfg.gamma_base),
-            vol_scalar = %format!("{:.3}", vol_scalar),
-            tox_scalar = %format!("{:.3}", toxicity_scalar),
-            inv_scalar = %format!("{:.3}", inventory_scalar),
-            hawkes_scalar = %format!("{:.3}", hawkes_scalar),
-            time_scalar = %format!("{:.3}", time_scalar),
-            book_scalar = %format!("{:.3}", book_depth_scalar),
-            warmup_scalar = %format!("{:.3}", warmup_scalar),
-            calibration_scalar = %format!("{:.3}", calibration_scalar),
-            gamma_raw = %format!("{:.4}", gamma_effective),
-            gamma_clamped = %format!("{:.4}", gamma_clamped),
-            "Gamma component breakdown"
-        );
-
-        gamma_clamped
+        gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
     /// Calculate expected holding time from arrival intensity.
@@ -212,17 +301,25 @@ impl GLFTStrategy {
         (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
     }
 
-    /// Correct GLFT half-spread formula with fee recovery:
+    /// Correct Avellaneda-Stoikov optimal half-spread formula:
     ///
-    /// δ* = (1/γ) × ln(1 + γ/κ) + f_maker
+    /// δ = (1/γ) × ln(1 + γ/κ) + (1/2) × γ × σ² × T + f_maker
     ///
-    /// The fee term comes from the modified HJB equation:
-    /// dW = (δ - f_maker) × dN, so optimal δ* = δ_GLFT + f_maker
+    /// Term 1: GLFT liquidity-driven spread from HJB solution
+    /// Term 2: Volatility compensation for inventory risk during holding period (A-S extension)
+    /// Term 3: Fee recovery from modified HJB equation (dW = (δ - f_maker) × dN)
+    ///
+    /// The volatility compensation term ensures spreads widen appropriately in volatile markets.
+    /// With per-second σ and T in seconds, this produces meaningful spread widening:
+    /// - Normal conditions: +0.05 bps (negligible)
+    /// - High volatility (5× normal): +0.3 bps (meaningful protection)
     ///
     /// This is market-driven: when κ drops (thin book), spread widens automatically.
     /// When κ rises (deep book), spread tightens. Fee ensures minimum profitable spread.
-    fn half_spread(&self, gamma: f64, kappa: f64) -> f64 {
+    pub(crate) fn half_spread(&self, gamma: f64, kappa: f64, sigma: f64, time_horizon: f64) -> f64 {
         let ratio = gamma / kappa;
+
+        // Term 1: GLFT liquidity-driven spread
         let glft_spread = if ratio > 1e-9 && gamma > 1e-9 {
             (1.0 / gamma) * (1.0 + ratio).ln()
         } else {
@@ -231,8 +328,16 @@ impl GLFTStrategy {
             1.0 / kappa.max(1.0)
         };
 
-        // Add maker fee to ensure profitability (first-principles HJB modification)
-        glft_spread + self.risk_config.maker_fee_rate
+        // Term 2: Volatility compensation (A-S extension)
+        // Compensates for inventory risk during expected holding period
+        // With σ = 0.0002 (2 bps/√sec), T = 60s, γ = 0.15:
+        //   vol_comp = 0.5 × 0.15 × (0.0002)² × 60 = 3.6e-8 = 0.00036 bps
+        // With σ = 0.001 (10 bps/√sec, stressed), T = 60s, γ = 0.15:
+        //   vol_comp = 0.5 × 0.15 × (0.001)² × 60 = 4.5e-7 = 0.0045 bps
+        let vol_compensation = 0.5 * gamma * sigma.powi(2) * time_horizon;
+
+        // Term 3: Maker fee to ensure profitability (first-principles HJB modification)
+        glft_spread + vol_compensation + self.risk_config.maker_fee_rate
     }
 
     /// Proactive directional skew based on momentum predictions.
@@ -287,14 +392,14 @@ impl GLFTStrategy {
         // Positive momentum → we want to get filled on bids → negative skew (tighter bids)
         let direction = -momentum_bps.signum();
 
-        // Regime multiplier
-        use crate::market_maker::VolatilityRegime;
-        let regime_mult = match market_params.volatility_regime {
-            VolatilityRegime::Low => 1.2,     // Low vol, trust momentum
-            VolatilityRegime::Normal => 1.0,  // Normal behavior
-            VolatilityRegime::High => 0.5,    // Cautious in high vol
-            VolatilityRegime::Extreme => 0.2, // Very cautious in extreme vol
-        };
+        // Soft HMM regime blending (replaces hard switch)
+        // [p_low, p_normal, p_high, p_extreme] → weighted multiplier
+        // Key insight: Single parameter values are almost always wrong.
+        // Use belief state probabilities for smooth transitions.
+        let regime_mult = market_params.regime_probs[0] * 1.2  // Low: trust momentum
+            + market_params.regime_probs[1] * 1.0              // Normal: baseline
+            + market_params.regime_probs[2] * 0.5              // High: cautious
+            + market_params.regime_probs[3] * 0.2;             // Extreme: very cautious
 
         // Calculate proactive skew in bps
         let proactive_skew_bps = direction
@@ -471,10 +576,13 @@ impl QuotingStrategy for GLFTStrategy {
         let time_horizon = self.holding_time(market_params.arrival_intensity);
 
         // === 2. ASYMMETRIC GLFT HALF-SPREADS (First-Principles Fix 2) ===
-        // δ_bid = (1/γ) × ln(1 + γ/κ_bid) - wider if κ_bid < κ_ask (sell pressure)
-        // δ_ask = (1/γ) × ln(1 + γ/κ_ask) - wider if κ_ask < κ_bid (buy pressure)
-        let mut half_spread_bid = self.half_spread(gamma, kappa_bid);
-        let mut half_spread_ask = self.half_spread(gamma, kappa_ask);
+        // δ_bid = (1/γ) × ln(1 + γ/κ_bid) + (1/2) × γ × σ² × T - wider if κ_bid < κ_ask (sell pressure)
+        // δ_ask = (1/γ) × ln(1 + γ/κ_ask) + (1/2) × γ × σ² × T - wider if κ_ask < κ_bid (buy pressure)
+        // The volatility compensation term ensures spreads widen appropriately in volatile markets.
+        let sigma = market_params.sigma_effective;
+        let tau = time_horizon;
+        let mut half_spread_bid = self.half_spread(gamma, kappa_bid, sigma, tau);
+        let mut half_spread_ask = self.half_spread(gamma, kappa_ask, sigma, tau);
 
         // Symmetric half-spread for logging (average of bid/ask)
         let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
@@ -679,60 +787,45 @@ impl QuotingStrategy for GLFTStrategy {
             )
         };
 
-        // === 3a. HAWKES FLOW SKEWING (Tier 2) with Informed Flow Adjustment ===
-        // Use Hawkes-derived flow imbalance for additional directional adjustment
-        // High activity + imbalance → stronger signal than simple flow imbalance
+        // === 3a. HAWKES FLOW SKEWING (Tier 2) - DISABLED UNTIL CALIBRATED ===
+        // REMOVED: The 0.00005 coefficient was arbitrary, not empirically derived.
+        // The signal may have value but needs proper calibration:
+        // 1. Measure MI(hawkes_imbalance → price_change_5s)
+        // 2. If MI > 0, estimate E[Δp | imbalance] via regression
+        // 3. Set coefficient = regression_slope
         //
-        // When p_informed is high, reduce reliance on flow signals since they're
-        // likely from informed traders (adverse selection risk) rather than noise traders.
-        // flow_weight = 1 - p_informed (e.g., 80% noise → 80% weight)
-        let flow_weight = if market_params.flow_decomp_confidence > 0.3 {
-            (1.0 - market_params.p_informed).clamp(0.3, 1.0) // Min 30% weight
-        } else {
-            1.0 // Not confident in p_informed, use full flow signal
-        };
-        let hawkes_skew = if market_params.hawkes_activity_percentile > 0.7 {
-            // Significant activity - use Hawkes imbalance for flow prediction
-            // hawkes_imbalance > 0 = more buy pressure → skew asks tighter (encourage selling)
-            //
-            // DERIVATION of 0.00005 coefficient:
-            // - Target: ~0.5 bps skew per 0.1 imbalance at 100% activity
-            // - imbalance ∈ [-1, 1], so max |skew| = 0.00005 × 1.0 × 1.0 = 0.5 bps
-            // - This is calibrated to be < half-spread to avoid skew flipping quotes
-            // - Scaled by activity percentile (more confident signal at higher activity)
-            // - Weighted by noise probability (discount informed flow signals)
-            //
-            // TODO: Could be derived from E[Δp | imbalance] regression on historical data
-            market_params.hawkes_imbalance
-                * 0.00005
-                * market_params.hawkes_activity_percentile
-                * flow_weight
-        } else {
-            0.0 // Low activity - don't trust flow signal
-        };
+        // To re-enable, add hawkes_price_sensitivity to MarketParams and use:
+        //   hawkes_skew = imbalance × sensitivity × activity_percentile × flow_weight
+        let hawkes_skew = 0.0;
 
         // === 3b. FUNDING COST ADJUSTMENT (Tier 2) ===
-        // Incorporate perpetual funding cost into inventory decision
-        // Positive funding + long = cost → skew to reduce long
-        // Negative funding + short = cost → skew to reduce short
-        let funding_skew = if market_params.funding_rate.abs() > 0.0001 {
-            // Significant funding rate (> 1bp/hour)
-            // predicted_funding_cost is signed: positive = cost to current position
-            // If cost is positive and we're long, skew to sell (negative skew adds to bid_delta)
-            // If cost is positive and we're short, skew to buy (positive skew reduces bid_delta)
-            // Simplified: position * funding_rate gives us direction
-            let funding_pressure = position.signum() * market_params.funding_rate;
-            //
-            // DERIVATION of 0.01 coefficient:
-            // - funding_rate is in fraction per hour (e.g., 0.0001 = 1 bp/hour)
-            // - We want ~0.1 bps skew per 1 bp/hour funding rate
-            // - 0.01 × 0.0001 (1bp rate) = 0.000001 = 0.01 bps skew (as fraction)
-            // - Actually: 0.01 × 0.0001 = 1e-6 fractional = 0.01 bps - too small
-            // - With funding_rate = 0.001 (10 bp/hour), skew = 0.01 × 0.001 = 1e-5 = 0.1 bps
-            // - This is conservative: funding is long-term cost, shouldn't dominate short-term skew
-            //
-            // TODO: Could derive from: skew = funding_cost × expected_holding_time / spread
-            funding_pressure * 0.01
+        // Funding cost integration using proper carry cost model.
+        //
+        // Theory: Funding creates continuous position cost. Skew should reflect
+        // expected funding cost over holding period relative to expected spread.
+        //
+        // Formula: skew = funding_rate_per_sec × time_horizon × sensitivity
+        //
+        // With typical values:
+        // - funding_rate = 0.0001/hour = 2.78e-8/sec
+        // - time_horizon = 60 sec
+        // - sensitivity = 1.0
+        // - skew = 2.78e-8 × 60 × 1.0 = 1.67e-6 = 0.017 bps
+        //
+        // At extreme funding (0.001/hour = 10 bps/hour):
+        // - skew = 2.78e-7 × 60 = 1.67e-5 = 0.17 bps
+        let funding_skew = if market_params.funding_rate.abs() > 0.00001 {
+            // Convert funding rate to per-second (assuming input is per-hour)
+            let funding_rate_per_sec = market_params.funding_rate / 3600.0;
+
+            // Cost over expected holding period
+            let funding_cost_over_horizon = funding_rate_per_sec * time_horizon;
+
+            // Skew direction: positive funding + long position → positive skew (widen bids)
+            let funding_pressure = position.signum() * funding_cost_over_horizon;
+
+            // Sensitivity factor (1.0 = full economic impact, can tune lower for conservatism)
+            funding_pressure * self.risk_config.funding_skew_sensitivity
         } else {
             0.0
         };

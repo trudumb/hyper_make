@@ -61,7 +61,7 @@ fn default_soft_notional() -> bool {
     true
 }
 fn default_notional_soft_factor() -> f64 {
-    1.5
+    1.1 // CHANGED: Reduced from 1.5 to allow $10+ orders with small capital
 }
 fn default_redistribute() -> bool {
     true

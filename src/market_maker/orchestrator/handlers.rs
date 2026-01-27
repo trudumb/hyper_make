@@ -8,6 +8,7 @@ use crate::prelude::Result;
 use crate::Message;
 
 use super::super::{
+    estimator::HmmObservation,
     fills, messages, tracking::ws_order_state::WsFillEvent,
     tracking::ws_order_state::WsOrderUpdateEvent, MarketMaker, OrderExecutor, OrderState,
     QuotingStrategy, Side, TrackedOrder,
@@ -101,21 +102,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let _result = messages::process_trades(&trades, &ctx, &mut state)?;
 
         // === Phase 2/3 Component Updates ===
-        // TODO: Once regime_hmm is added to StochasticComponents, update here:
-        // Update regime HMM with trade observation
-        // let obs = HmmObservation {
-        //     volatility: self.estimator.sigma(),
-        //     spread_bps: self.tier2.spread_tracker.current_spread_bps().unwrap_or(5.0),
-        //     flow_imbalance: self.tier2.hawkes.flow_imbalance(),
-        // };
-        // self.stochastic.regime_hmm.forward_update(&obs);
-        //
-        // For now, log the observation data for debugging
-        trace!(
-            sigma = %format!("{:.6}", self.estimator.sigma()),
-            flow_imbalance = %format!("{:.3}", self.tier2.hawkes.flow_imbalance()),
-            "Trade observation processed (regime HMM not yet wired)"
+        // Update regime HMM with trade observation for soft regime blending
+        let obs = HmmObservation::new(
+            self.estimator.sigma(),
+            self.tier2.spread_tracker.current_spread_bps(),
+            self.tier2.hawkes.flow_imbalance(),
         );
+        self.stochastic.regime_hmm.forward_update(&obs);
+
+        // Log regime state periodically (when not in normal regime)
+        let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
+        if regime_probs[3] > 0.2 || regime_probs[2] > 0.4 {
+            trace!(
+                sigma = %format!("{:.6}", self.estimator.sigma()),
+                flow_imbalance = %format!("{:.3}", self.tier2.hawkes.flow_imbalance()),
+                p_extreme = %format!("{:.2}", regime_probs[3]),
+                p_high = %format!("{:.2}", regime_probs[2]),
+                "HMM regime elevated"
+            );
+        }
 
         Ok(())
     }

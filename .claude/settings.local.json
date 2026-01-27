@@ -40,7 +40,13 @@
       "Bash(cargo run:*)",
       "Bash(curl:*)",
       "Bash(kill:*)",
-      "Bash(ss:*)"
+      "Bash(ss:*)",
+      "WebSearch",
+      "WebFetch(domain:hummingbot.org)",
+      "WebFetch(domain:people.orie.cornell.edu)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:www.quantbeckman.com)",
+      "Bash(__NEW_LINE_f271302b2f8bb747__ echo \"\")"
     ]
   }
 }

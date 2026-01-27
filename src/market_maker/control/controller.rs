@@ -4,7 +4,7 @@
 //!   a* = argmax_a Q(s, a)
 //! where Q(s, a) = r(s, a) + γ E[V(s') | s, a]
 
-use super::actions::{Action, ActionConfig, DefensiveReason, NoQuoteReason};
+use super::actions::{Action, ActionConfig, NoQuoteReason};
 use super::state::ControlState;
 use super::value::{ActionOutcome, ExpectedValueComputer, ValueFunction};
 use crate::market_maker::learning::QuoteDecision;
@@ -143,15 +143,6 @@ impl OptimalController {
                 funding_value - 0.01 * position_delta
             }
 
-            Action::DefensiveQuote {
-                spread_multiplier, ..
-            } => {
-                // Reduced expected value from wider spreads
-                let edge = state.expected_edge();
-                let fill_prob_reduction = 1.0 / spread_multiplier; // Wider spreads fill less
-                edge * fill_prob_reduction * 0.5
-            }
-
             Action::WaitToLearn {
                 expected_info_gain, ..
             } => {
@@ -164,7 +155,7 @@ impl OptimalController {
     /// Convert action to outcome for value computation.
     fn action_to_outcome(&self, action: &Action, state: &ControlState) -> ActionOutcome {
         match action {
-            Action::Quote { .. } | Action::DefensiveQuote { .. } => {
+            Action::Quote { .. } => {
                 // Estimate fill probability from belief
                 let fill_prob = self.estimate_fill_prob(state);
                 let fill_size = 0.1; // Placeholder
@@ -209,17 +200,13 @@ impl OptimalController {
         });
 
         // 2. Consider quoting if conditions allow
+        // NOTE: DefensiveQuote has been removed. All uncertainty is now handled
+        // through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
+        // The GLFT formula naturally widens spreads when gamma increases.
         if state.can_quote() {
             candidates.push(Action::Quote {
                 ladder: Ladder::default(),
                 expected_value: state.expected_edge() * 0.1, // Simple estimate
-            });
-
-            // 3. Consider defensive quoting
-            candidates.push(Action::DefensiveQuote {
-                spread_multiplier: 1.5,
-                size_fraction: 0.5,
-                reason: DefensiveReason::RegimeUncertainty,
             });
         }
 
@@ -343,25 +330,26 @@ impl OptimalController {
     }
 
     /// Conservative action when models disagree.
-    fn conservative_action(&self, myopic: &QuoteDecision, _state: &ControlState) -> Action {
+    ///
+    /// NOTE: We now use Quote with full size instead of DefensiveQuote.
+    /// Uncertainty is handled through gamma scaling (kappa_ci_width → uncertainty_scalar).
+    /// The GLFT formula naturally widens spreads when gamma increases due to uncertainty.
+    fn conservative_action(&self, myopic: &QuoteDecision, state: &ControlState) -> Action {
         match myopic {
-            QuoteDecision::Quote {
-                size_fraction,
-                expected_edge: _,
-                ..
-            } => {
-                // Reduce size and widen spreads
-                Action::DefensiveQuote {
-                    spread_multiplier: 1.5,
-                    size_fraction: size_fraction * 0.5,
-                    reason: DefensiveReason::ModelDisagreement,
+            QuoteDecision::Quote { expected_edge, .. } => {
+                // Quote with full size - gamma already handles uncertainty
+                Action::Quote {
+                    ladder: Ladder::default(),
+                    expected_value: *expected_edge,
                 }
             }
-            QuoteDecision::ReducedSize { fraction, .. } => Action::DefensiveQuote {
-                spread_multiplier: 1.3,
-                size_fraction: fraction * 0.5,
-                reason: DefensiveReason::ModelDisagreement,
-            },
+            QuoteDecision::ReducedSize { .. } => {
+                // Quote with full size - gamma handles the risk
+                Action::Quote {
+                    ladder: Ladder::default(),
+                    expected_value: state.expected_edge(),
+                }
+            }
             QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::ModelDegraded,
             },
@@ -404,52 +392,72 @@ impl OptimalController {
     }
 
     /// Action constrained by position limits.
+    /// Action constrained by position limits.
+    ///
+    /// NOTE: We use Quote instead of DefensiveQuote. Position sizing is handled
+    /// by the GLFT strategy's cascade_size_factor and inventory scaling, not
+    /// by arbitrary size_fraction multipliers in the controller.
+    ///
+    /// CRITICAL: When over position limit, we MUST still quote reduce-only to work
+    /// off the position. The strategy layer (GLFT/ladder) handles this by:
+    /// - inventory_scalar increasing gamma to widen spreads
+    /// - Only quoting the side that reduces position
     fn position_constrained_action(&self, myopic: &QuoteDecision, state: &ControlState) -> Action {
-        // Calculate how much room we have
-        let room = (self.config.max_position * 0.95 - state.position.abs()).max(0.0);
+        // Calculate how much room we have (negative = over limit)
+        let room = self.config.max_position * 0.95 - state.position.abs();
         let max_fraction = room / self.config.max_position;
 
-        if max_fraction < 0.1 {
-            // Too close to limit, don't quote
-            Action::NoQuote {
+        // ALWAYS allow quoting - the strategy layer handles position limits via:
+        // 1. inventory_scalar increases gamma dramatically when at/over limit
+        // 2. Skew pushes quotes to reduce position (aggressive on reduce side)
+        // 3. reduce_only mode in ladder_strat blocks quotes that would increase position
+        //
+        // Previous bug: Blocking ALL quotes when over limit left position stuck!
+        // The right behavior is to let the strategy quote reduce-only.
+        match myopic {
+            QuoteDecision::Quote { expected_edge, .. } => {
+                // Log if over limit - strategy will handle with reduce-only
+                if max_fraction < 0.0 {
+                    tracing::debug!(
+                        position = %state.position,
+                        max_position = %self.config.max_position,
+                        room = %room,
+                        "Over position limit - strategy will quote reduce-only"
+                    );
+                }
+                Action::Quote {
+                    ladder: Ladder::default(),
+                    expected_value: *expected_edge,
+                }
+            }
+            QuoteDecision::ReducedSize { .. } => Action::Quote {
+                ladder: Ladder::default(),
+                expected_value: state.expected_edge(),
+            },
+            _ => Action::NoQuote {
                 reason: NoQuoteReason::RiskLimit,
-            }
-        } else {
-            // Reduce size proportionally
-            match myopic {
-                QuoteDecision::Quote {
-                    expected_edge: _, ..
-                } => Action::DefensiveQuote {
-                    spread_multiplier: 1.0,
-                    size_fraction: max_fraction,
-                    reason: DefensiveReason::PositionLimitApproaching,
-                },
-                _ => Action::NoQuote {
-                    reason: NoQuoteReason::RiskLimit,
-                },
-            }
+            },
         }
     }
 
     /// Convert myopic decision to action.
-    fn myopic_to_action(&self, myopic: &QuoteDecision, _state: &ControlState) -> Action {
+    ///
+    /// NOTE: Both Quote and ReducedSize now map to Action::Quote.
+    /// Size reduction is handled by GLFT's inventory_scalar and cascade_size_factor,
+    /// not by arbitrary size_fraction values.
+    fn myopic_to_action(&self, myopic: &QuoteDecision, state: &ControlState) -> Action {
         match myopic {
-            QuoteDecision::Quote {
-                size_fraction: _,
-                expected_edge,
-                ..
-            } => Action::Quote {
+            QuoteDecision::Quote { expected_edge, .. } => Action::Quote {
                 ladder: Ladder::default(),
                 expected_value: *expected_edge,
             },
-            QuoteDecision::ReducedSize {
-                fraction,
-                reason: _,
-            } => Action::DefensiveQuote {
-                spread_multiplier: 1.0,
-                size_fraction: *fraction,
-                reason: DefensiveReason::ModelDisagreement,
-            },
+            QuoteDecision::ReducedSize { .. } => {
+                // ReducedSize is converted to Quote - gamma handles the risk
+                Action::Quote {
+                    ladder: Ladder::default(),
+                    expected_value: state.expected_edge(),
+                }
+            }
             QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::NegativeEdge,
             },

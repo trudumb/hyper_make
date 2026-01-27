@@ -7,6 +7,11 @@
 /// - Latency-based spread floor
 /// - Book depth thresholds
 /// - Conditional tight quoting logic
+///
+/// NOTE: stochastic_spread_multiplier has been REMOVED.
+/// All uncertainty is now handled through gamma scaling (kappa_ci_width flows
+/// through uncertainty_scalar). The GLFT formula naturally widens spreads
+/// when gamma increases due to uncertainty.
 #[derive(Debug, Clone, Copy)]
 pub struct StochasticConstraintParams {
     /// Asset tick size in basis points.
@@ -22,9 +27,6 @@ pub struct StochasticConstraintParams {
 
     /// Whether tight quoting is currently allowed.
     pub tight_quoting_allowed: bool,
-
-    /// Combined spread widening factor [1.0, 2.0+].
-    pub stochastic_spread_multiplier: f64,
 }
 
 impl Default for StochasticConstraintParams {
@@ -34,7 +36,6 @@ impl Default for StochasticConstraintParams {
             latency_spread_floor: 0.0003,
             near_touch_depth_usd: 0.0,
             tight_quoting_allowed: false,
-            stochastic_spread_multiplier: 1.0,
         }
     }
 }
@@ -50,6 +51,7 @@ impl StochasticConstraintParams {
 
     /// Check if constraints allow tight spreads.
     pub fn can_quote_tight(&self) -> bool {
-        self.tight_quoting_allowed && self.stochastic_spread_multiplier < 1.2
+        // With stochastic_spread_multiplier removed, just check tight_quoting_allowed
+        self.tight_quoting_allowed
     }
 }

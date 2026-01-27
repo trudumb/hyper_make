@@ -41,15 +41,10 @@ pub enum Action {
         aggressiveness: f64,
     },
 
-    /// Widen spreads and reduce size (defensive mode).
-    DefensiveQuote {
-        /// Spread multiplier (> 1.0)
-        spread_multiplier: f64,
-        /// Size fraction (< 1.0)
-        size_fraction: f64,
-        /// Reason for defensive mode
-        reason: DefensiveReason,
-    },
+    // NOTE: DefensiveQuote has been removed. All uncertainty is now handled
+    // through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
+    // The GLFT formula naturally widens spreads when gamma increases due to uncertainty.
+    // This eliminates arbitrary spread_multiplier and size_fraction values.
 
     /// Wait to learn more before acting.
     WaitToLearn {
@@ -71,10 +66,7 @@ impl Default for Action {
 impl Action {
     /// Check if this action involves quoting.
     pub fn is_quoting(&self) -> bool {
-        matches!(
-            self,
-            Self::Quote { .. } | Self::DefensiveQuote { .. } | Self::BuildInventory { .. }
-        )
+        matches!(self, Self::Quote { .. } | Self::BuildInventory { .. })
     }
 
     /// Check if this action is a wait/no-action.
@@ -138,35 +130,9 @@ impl std::fmt::Display for NoQuoteReason {
     }
 }
 
-/// Reasons for defensive quoting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DefensiveReason {
-    /// Approaching session end
-    TerminalApproaching,
-    /// High model disagreement
-    ModelDisagreement,
-    /// Regime uncertainty
-    RegimeUncertainty,
-    /// Elevated toxicity
-    ElevatedToxicity,
-    /// Position limit approaching
-    PositionLimitApproaching,
-    /// Drawdown approaching limit
-    DrawdownElevated,
-}
-
-impl std::fmt::Display for DefensiveReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TerminalApproaching => write!(f, "terminal approaching"),
-            Self::ModelDisagreement => write!(f, "model disagreement"),
-            Self::RegimeUncertainty => write!(f, "regime uncertainty"),
-            Self::ElevatedToxicity => write!(f, "elevated toxicity"),
-            Self::PositionLimitApproaching => write!(f, "position limit approaching"),
-            Self::DrawdownElevated => write!(f, "drawdown elevated"),
-        }
-    }
-}
+// NOTE: DefensiveReason enum has been removed. All uncertainty is now handled
+// through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
+// The GLFT formula naturally widens spreads when gamma increases due to uncertainty.
 
 /// Configuration for action generation.
 #[derive(Debug, Clone)]
@@ -181,10 +147,8 @@ pub struct ActionConfig {
     pub funding_capture_threshold: f64,
     /// Maximum funding position (as fraction of max position)
     pub max_funding_position_fraction: f64,
-    /// Defensive spread multiplier range
-    pub defensive_spread_range: (f64, f64),
-    /// Defensive size range
-    pub defensive_size_range: (f64, f64),
+    // NOTE: defensive_spread_range and defensive_size_range have been removed.
+    // All uncertainty is now handled through gamma scaling.
 }
 
 impl Default for ActionConfig {
@@ -195,8 +159,6 @@ impl Default for ActionConfig {
             max_dump_urgency: 10.0,
             funding_capture_threshold: 5.0, // 5 bps
             max_funding_position_fraction: 0.5,
-            defensive_spread_range: (1.2, 2.0),
-            defensive_size_range: (0.3, 0.7),
         }
     }
 }

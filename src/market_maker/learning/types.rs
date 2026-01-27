@@ -367,9 +367,9 @@ pub enum QuoteDecision {
         /// Reservation price shift in price units (from A-S: μ/(γσ²))
         /// Positive = shift quotes up (aggressive asks), Negative = shift down (aggressive bids)
         reservation_shift: f64,
-        /// Spread multiplier from uncertainty premium (≥1.0)
-        /// Higher when edge estimate is noisy (Bayesian uncertainty premium)
-        spread_multiplier: f64,
+        // NOTE: spread_multiplier has been REMOVED. All uncertainty is now handled
+        // through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
+        // The GLFT formula naturally widens spreads when gamma increases due to uncertainty.
     },
 }
 
@@ -428,7 +428,7 @@ mod tests {
             confidence: 0.8,
             expected_edge: 2.0,
             reservation_shift: 0.001,
-            spread_multiplier: 1.2,
+            // NOTE: spread_multiplier removed - uncertainty flows through gamma
         };
         assert!(quote.is_quote());
         assert_eq!(quote.size_fraction(), 0.5);

@@ -69,6 +69,22 @@ pub struct RiskConfig {
     /// Hyperliquid maker fee: 0.00015 (1.5 bps)
     pub maker_fee_rate: f64,
 
+    /// Funding skew sensitivity for perpetual funding cost integration.
+    ///
+    /// Theory: Funding creates continuous position cost. Skew should reflect
+    /// expected funding cost over holding period.
+    ///
+    /// Formula: funding_skew = (funding_rate / 3600) × time_horizon × sensitivity
+    ///
+    /// Values:
+    /// - 1.0 = full economic impact (funding cost fully reflected in skew)
+    /// - 0.5 = conservative (funding cost partially reflected)
+    /// - 0.0 = disabled (no funding-based skew)
+    ///
+    /// Typical impact at extreme funding (10 bps/hour):
+    /// - sensitivity=1.0: ~0.17 bps skew over 60s horizon
+    pub funding_skew_sensitivity: f64,
+
     // ==================== Time-of-Day Risk Scaling ====================
     // FIRST PRINCIPLES: Adverse selection varies by time of day.
     // Trade history analysis (Dec 2025) showed toxic hours with -13 to -15 bps edge:
@@ -236,7 +252,9 @@ impl Default for RiskConfig {
         Self {
             // MAINNET OPTIMIZED: Lower gamma for liquid markets with deep books
             gamma_base: 0.15, // Reduced from 0.3 - liquid markets need less risk aversion
-            sigma_baseline: 0.0002, // 20bp per-second
+            sigma_baseline: 0.0002, // 2 bps per-√second (0.02% instantaneous volatility)
+                                    // Equivalent to ~32 bps daily vol in 252-day year
+                                    // Or ~12 bps per minute for short horizons
             volatility_weight: 0.5,
             // MAINNET OPTIMIZED: Cap vol scaling for liquid markets
             max_volatility_multiplier: 2.0, // Reduced from 3.0 - less extreme scaling
@@ -272,6 +290,9 @@ impl Default for RiskConfig {
             // FIRST PRINCIPLES: During warmup, parameter uncertainty → more risk averse
             enable_warmup_gamma_scaling: true,
             max_warmup_gamma_mult: 1.1, // 10% higher γ at start of warmup
+            // Funding skew sensitivity: 1.0 = full economic impact
+            // At extreme funding (10 bps/hour), produces ~0.17 bps skew over 60s horizon
+            funding_skew_sensitivity: 1.0,
         }
     }
 }
@@ -315,6 +336,8 @@ impl RiskConfig {
             // Reduced warmup penalty
             enable_warmup_gamma_scaling: true,
             max_warmup_gamma_mult: 1.05, // Minimal warmup penalty (5% vs 10%)
+            // Funding skew sensitivity: same as default
+            funding_skew_sensitivity: 1.0,
         }
     }
 }

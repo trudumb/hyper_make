@@ -339,6 +339,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             regime_probs[3],
         );
 
+        // Wire HMM regime probabilities to MarketParams for soft blending in GLFT
+        market_params.regime_probs = regime_probs;
+
         // Log regime state when not in normal regime
         if p_extreme > 0.3 || p_high > 0.5 || p_low > 0.7 {
             debug!(
@@ -759,19 +762,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     confidence,
                     expected_edge,
                     reservation_shift,
-                    spread_multiplier,
+                    ..  // spread_multiplier removed - uncertainty flows through gamma
                 } => {
                     debug!(
                         size_fraction = %format!("{:.0}%", size_fraction * 100.0),
                         confidence = %format!("{:.1}%", confidence * 100.0),
                         expected_edge = %format!("{:.2}bp", expected_edge),
                         reservation_shift = %format!("{:.6}", reservation_shift),
-                        spread_multiplier = %format!("{:.2}x", spread_multiplier),
                         "Decision engine: quoting"
                     );
                     // Set L2 outputs on market_params for downstream strategy
                     market_params.l2_reservation_shift = reservation_shift;
-                    market_params.l2_spread_multiplier = spread_multiplier;
+                    // NOTE: l2_spread_multiplier removed - uncertainty flows through gamma
                     size_fraction
                 }
             }
@@ -892,19 +894,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 Action::BuildInventory { .. } => {
                     debug!("Layer 3: build inventory mode");
                     // Continue with normal quoting
-                }
-                Action::DefensiveQuote {
-                    spread_multiplier,
-                    size_fraction,
-                    reason,
-                } => {
-                    debug!(
-                        spread_mult = %format!("{:.2}", spread_multiplier),
-                        size_frac = %format!("{:.2}", size_fraction),
-                        reason = ?reason,
-                        "Layer 3: defensive quote"
-                    );
-                    // Apply defensive adjustments through the strategy
                 }
                 Action::Quote { expected_value, .. } => {
                     debug!(expected_value = %format!("{:.4}", expected_value), "Layer 3: normal quote");

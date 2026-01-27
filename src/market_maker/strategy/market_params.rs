@@ -390,11 +390,10 @@ pub struct MarketParams {
     /// None if tight quoting is allowed.
     pub tight_quoting_block_reason: Option<String>,
 
-    /// Stochastic spread floor multiplier [1.0, 2.0+].
-    /// Combines all constraints into a single spread widening factor.
-    /// 1.0 = no widening (all constraints satisfied)
-    /// > 1.0 = widen spreads proportionally
-    pub stochastic_spread_multiplier: f64,
+    // NOTE: stochastic_spread_multiplier has been REMOVED.
+    // All uncertainty is now handled through gamma scaling (kappa_ci_width flows
+    // through uncertainty_scalar). The GLFT formula naturally widens spreads
+    // when gamma increases due to uncertainty.
 
     // ==================== Entropy-Based Distribution (always enabled) ====================
     /// Minimum entropy floor (bits). Distribution NEVER drops below this.
@@ -575,10 +574,10 @@ pub struct MarketParams {
     /// Add this to microprice when calculating bid/ask prices.
     pub l2_reservation_shift: f64,
 
-    /// Spread multiplier from L2 uncertainty premium (≥1.0).
-    /// From Bayesian framework: widen spreads when edge estimate is noisy.
-    /// Multiply optimal spread by this factor.
-    pub l2_spread_multiplier: f64,
+    // NOTE: l2_spread_multiplier has been REMOVED.
+    // The L2 Bayesian uncertainty premium now flows through gamma scaling
+    // via kappa_ci_width → uncertainty_scalar. This eliminates the arbitrary
+    // spread multiplier and routes all uncertainty through the GLFT formula.
 
     // ==================== Proactive Position Management (Small Fish) ====================
     /// Whether proactive directional skew is enabled.
@@ -718,7 +717,7 @@ impl Default for MarketParams {
             near_touch_depth_usd: 0.0,    // No depth data initially
             tight_quoting_allowed: false, // Conservative default
             tight_quoting_block_reason: Some("Warmup".to_string()),
-            stochastic_spread_multiplier: 1.0, // No widening initially
+            // NOTE: stochastic_spread_multiplier removed - uncertainty flows through gamma
             // Entropy-Based Distribution (always enabled)
             entropy_min_entropy: 1.5,      // At least ~4.5 effective levels
             entropy_base_temperature: 1.0, // Standard softmax
@@ -772,7 +771,7 @@ impl Default for MarketParams {
             sigma_kappa_correlation: -0.3, // Typical negative correlation
             // L2 Decision Engine Outputs (A-S Framework)
             l2_reservation_shift: 0.0, // No shift initially (neutral)
-            l2_spread_multiplier: 1.0, // No widening initially
+            // NOTE: l2_spread_multiplier removed - uncertainty flows through gamma
             // Proactive Position Management (Small Fish)
             enable_proactive_skew: false,            // Off by default, opt-in
             proactive_skew_sensitivity: 2.0,         // 2 bps per unit momentum×confidence
@@ -1013,7 +1012,7 @@ impl MarketParams {
             latency_spread_floor: self.latency_spread_floor,
             near_touch_depth_usd: self.near_touch_depth_usd,
             tight_quoting_allowed: self.tight_quoting_allowed,
-            stochastic_spread_multiplier: self.stochastic_spread_multiplier,
+            // NOTE: stochastic_spread_multiplier removed - uncertainty flows through gamma
         }
     }
 
@@ -1073,12 +1072,12 @@ impl MarketParams {
         let mut block_reason: Option<String> = None;
 
         if config.use_conditional_tight_quoting {
-            // Condition 1: Volatility regime must be Low or Normal
-            if self.volatility_regime != VolatilityRegime::Low
-                && self.volatility_regime != VolatilityRegime::Normal
-            {
+            // Condition 1: Use soft HMM probability instead of hard regime check
+            // Block tight quoting if P(High) + P(Extreme) > 0.5 (elevated regime)
+            let p_elevated = self.regime_probs[2] + self.regime_probs[3];
+            if p_elevated > 0.5 {
                 can_quote_tight = false;
-                block_reason = Some(format!("Vol regime {:?}", self.volatility_regime));
+                block_reason = Some(format!("Elevated regime P(H+E)={:.0}%", p_elevated * 100.0));
             }
 
             // Condition 2: Toxicity (predicted alpha) must be low
@@ -1143,8 +1142,8 @@ impl MarketParams {
         // This ensures spreads are computed through the principled formula:
         //   δ = (1/γ) × ln(1 + γ/κ)
         //
-        // Setting to 1.0 (no-op) - the field is kept for API compatibility.
-        self.stochastic_spread_multiplier = 1.0;
+        // NOTE: stochastic_spread_multiplier has been removed entirely.
+        // All uncertainty now flows through gamma via uncertainty_scalar.
 
         // === 4. Proactive Position Management (Small Fish Strategy) ===
         // Copy proactive skew config values from StochasticConfig to MarketParams

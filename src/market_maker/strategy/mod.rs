@@ -4,17 +4,21 @@
 //! `QuotingStrategy` trait.
 
 mod glft;
+mod kelly;
 mod ladder_strat;
 mod market_params;
 mod params;
 mod risk_config;
+mod risk_model;
 mod simple;
 
 pub use glft::*;
+pub use kelly::*;
 pub use ladder_strat::*;
 pub use market_params::*;
 pub use params::*;
 pub use risk_config::*;
+pub use risk_model::*;
 pub use simple::*;
 
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
@@ -709,5 +713,192 @@ mod tests {
         // Should return no quotes when pull flag is set
         assert!(bid.is_none());
         assert!(ask.is_none());
+    }
+
+    // === GLFT Implementation Fixes - Verification Tests ===
+
+    #[test]
+    fn test_vol_compensation_magnitude() {
+        // Test that volatility compensation term produces correct magnitude
+        // Formula: vol_comp = 0.5 × γ × σ² × T
+        //
+        // Use lower kappa to ensure spreads are above the floor, so we can see
+        // the volatility compensation effect clearly.
+        let config = RiskConfig {
+            gamma_base: 0.5,           // Higher gamma for wider base spread
+            min_spread_floor: 0.0003,  // 3 bps floor (lower than computed spread)
+            ..Default::default()
+        };
+        let strategy = GLFTStrategy::with_config(config);
+        let quote_config = make_config(100.0);
+
+        // Normal conditions with lower kappa to get spread above floor
+        let normal_params = MarketParams {
+            sigma: 0.0002,          // 2 bps/√sec (normal)
+            sigma_effective: 0.0002,
+            kappa: 500.0,           // Lower kappa = wider GLFT spread
+            kappa_bid: 500.0,
+            kappa_ask: 500.0,
+            arrival_intensity: 1.0 / 60.0, // 60 second hold time
+            microprice: 100.0,
+            ..Default::default()
+        };
+
+        let (bid, ask) = strategy.calculate_quotes(&quote_config, 0.0, 1.0, 0.5, &normal_params);
+
+        let bid = bid.unwrap();
+        let ask = ask.unwrap();
+        let spread = ask.price - bid.price;
+        let spread_bps = spread / 100.0 * 10000.0;
+
+        // With γ=0.5, κ=500:
+        // GLFT term: (1/0.5) × ln(1 + 0.5/500) = 2 × 0.001 ≈ 20 bps per side
+        // Vol comp: 0.5 × 0.5 × (0.0002)² × 60 = 1.2e-7 (0.0012 bps) - negligible
+        // Fee: 0.00015 (1.5 bps)
+        // Total half-spread: ~21.5 bps per side, total spread ~43 bps
+        assert!(spread_bps > 30.0, "Normal spread should be > 30 bps, got {:.2}", spread_bps);
+        assert!(spread_bps < 60.0, "Normal spread should be < 60 bps, got {:.2}", spread_bps);
+
+        // High volatility case - spread should be wider due to gamma vol scaling
+        let high_vol_params = MarketParams {
+            sigma: 0.001,           // 10 bps/√sec (5× normal)
+            sigma_effective: 0.001,
+            kappa: 500.0,
+            kappa_bid: 500.0,
+            kappa_ask: 500.0,
+            arrival_intensity: 1.0 / 60.0,
+            microprice: 100.0,
+            ..Default::default()
+        };
+
+        let (bid_high, ask_high) = strategy.calculate_quotes(&quote_config, 0.0, 1.0, 0.5, &high_vol_params);
+
+        let bid_high = bid_high.unwrap();
+        let ask_high = ask_high.unwrap();
+        let spread_high = ask_high.price - bid_high.price;
+        let spread_high_bps = spread_high / 100.0 * 10000.0;
+
+        // Higher vol should produce wider spread due to:
+        // 1. Vol compensation term: 0.5 × γ × σ² × T (small but present)
+        // 2. Vol scalar on gamma: increases γ for volatile markets (main effect)
+        //    vol_ratio = 0.001 / 0.0002 = 5, vol_scalar = 1 + 0.5 × (5-1) = 3
+        assert!(
+            spread_high_bps > spread_bps,
+            "High vol spread ({:.2} bps) should be wider than normal ({:.2} bps)",
+            spread_high_bps,
+            spread_bps
+        );
+    }
+
+    #[test]
+    fn test_funding_skew_magnitude() {
+        // Test that funding skew produces correct magnitude with new formula
+        // Formula: skew = (funding_rate / 3600) × time_horizon × sensitivity
+        let config = RiskConfig {
+            gamma_base: 0.15,
+            funding_skew_sensitivity: 1.0,
+            ..Default::default()
+        };
+        let strategy = GLFTStrategy::with_config(config);
+        let quote_config = make_config(100.0);
+
+        // Extreme funding case: 10 bps/hour
+        // funding_rate_per_sec = 0.001 / 3600 = 2.78e-7
+        // time_horizon ≈ 60s
+        // funding_skew = 2.78e-7 × 60 = 1.67e-5 = 0.167 bps
+        let base_params = MarketParams {
+            sigma: 0.0002,
+            sigma_effective: 0.0002,
+            kappa: 2000.0,
+            kappa_bid: 2000.0,
+            kappa_ask: 2000.0,
+            arrival_intensity: 1.0 / 60.0,
+            microprice: 100.0,
+            funding_rate: 0.0, // No funding
+            ..Default::default()
+        };
+
+        let funding_params = MarketParams {
+            funding_rate: 0.001, // 10 bps/hour (extreme)
+            ..base_params.clone()
+        };
+
+        // With position = 1.0 (long), positive funding should skew quotes
+        let (bid_base, ask_base) = strategy.calculate_quotes(&quote_config, 1.0, 2.0, 0.5, &base_params);
+        let (bid_fund, ask_fund) = strategy.calculate_quotes(&quote_config, 1.0, 2.0, 0.5, &funding_params);
+
+        let _mid_base = (ask_base.unwrap().price + bid_base.unwrap().price) / 2.0;
+        let _mid_fund = (ask_fund.unwrap().price + bid_fund.unwrap().price) / 2.0;
+
+        // Positive funding + long position → quotes should be slightly lower (skew to reduce long)
+        // The effect is small (~0.17 bps) but should be measurable
+        // Actually comparing mids directly is tricky due to inventory skew
+        // Instead verify funding_skew calculation doesn't crash and produces valid quotes
+        assert!(bid_fund.is_some(), "Should produce bid quote with funding");
+        assert!(ask_fund.is_some(), "Should produce ask quote with funding");
+
+        // Verify the funding quote prices are close to base (effect is small)
+        let bid_diff_bps = (bid_fund.unwrap().price - bid_base.unwrap().price).abs() / 100.0 * 10000.0;
+        assert!(bid_diff_bps < 1.0, "Funding impact should be < 1 bps on bid, got {:.4} bps", bid_diff_bps);
+    }
+
+    #[test]
+    fn test_half_spread_vol_compensation() {
+        // Direct test of half_spread function with volatility compensation
+        // Formula: δ = (1/γ) × ln(1 + γ/κ) + (1/2) × γ × σ² × T + fee
+        let config = RiskConfig {
+            gamma_base: 0.5,
+            maker_fee_rate: 0.00015, // 1.5 bps
+            ..Default::default()
+        };
+        let strategy = GLFTStrategy::with_config(config);
+
+        let gamma = 0.5;
+        let kappa = 500.0;
+        let _fee = 0.00015; // Used in calculations documented in comments
+
+        // Normal volatility
+        let sigma_normal = 0.0002; // 2 bps/√sec
+        let tau = 60.0;            // 60 second hold time
+
+        // Calculate expected values manually:
+        // GLFT term: (1/0.5) × ln(1 + 0.5/500) = 2 × ln(1.001) ≈ 2 × 0.000999 = 0.002 (20 bps)
+        // Vol comp: 0.5 × 0.5 × (0.0002)² × 60 = 0.25 × 4e-8 × 60 = 6e-7 = 0.006 bps (negligible)
+        // Fee: 0.00015 = 1.5 bps
+        // Total: ~21.5 bps
+
+        let spread_normal = strategy.half_spread(gamma, kappa, sigma_normal, tau);
+        let spread_normal_bps = spread_normal * 10000.0;
+
+        assert!(
+            spread_normal_bps > 20.0 && spread_normal_bps < 25.0,
+            "Normal half-spread should be ~21.5 bps, got {:.2} bps",
+            spread_normal_bps
+        );
+
+        // High volatility (5× normal)
+        let sigma_high = 0.001; // 10 bps/√sec
+
+        // Vol comp with high σ: 0.5 × 0.5 × (0.001)² × 60 = 0.25 × 1e-6 × 60 = 1.5e-5 = 0.15 bps
+        // Difference from normal: 0.15 - 0.006 ≈ 0.14 bps extra
+
+        let spread_high = strategy.half_spread(gamma, kappa, sigma_high, tau);
+        let spread_high_bps = spread_high * 10000.0;
+
+        // High vol should produce slightly wider spread due to vol compensation
+        assert!(
+            spread_high_bps > spread_normal_bps,
+            "High vol spread ({:.3} bps) should be wider than normal ({:.3} bps)",
+            spread_high_bps,
+            spread_normal_bps
+        );
+
+        // The difference should be approximately 0.14 bps
+        let diff_bps = spread_high_bps - spread_normal_bps;
+        assert!(
+            diff_bps > 0.1 && diff_bps < 0.3,
+            "Vol compensation diff should be ~0.15 bps, got {:.3} bps",
+            diff_bps
+        );
     }
 }

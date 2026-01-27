@@ -354,7 +354,7 @@ impl ParameterAggregator {
             near_touch_depth_usd: sources.near_touch_depth_usd,
             tight_quoting_allowed: false, // Conservative default, computed by caller
             tight_quoting_block_reason: Some("Warmup".to_string()),
-            stochastic_spread_multiplier: 1.0, // Computed dynamically
+            // NOTE: stochastic_spread_multiplier removed - uncertainty flows through gamma
 
             // === Adaptive Bayesian System ===
             use_adaptive_spreads: sources.stochastic_config.use_adaptive_spreads,
@@ -453,7 +453,7 @@ impl ParameterAggregator {
             // Set by QuoteEngine after decision_engine.should_quote() call
             // Default to neutral values; actual values populated in quote_engine.rs
             l2_reservation_shift: 0.0, // No shift initially
-            l2_spread_multiplier: 1.0, // No widening initially
+            // NOTE: l2_spread_multiplier removed - uncertainty flows through gamma
 
             // === Proactive Position Management (Small Fish Strategy) ===
             // These are populated from stochastic config for GLFT access

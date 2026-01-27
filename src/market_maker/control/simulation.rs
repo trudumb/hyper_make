@@ -123,7 +123,6 @@ pub struct ActionCounts {
     pub no_quote: usize,
     pub dump_inventory: usize,
     pub build_inventory: usize,
-    pub defensive_quote: usize,
     pub wait_to_learn: usize,
 }
 
@@ -235,7 +234,6 @@ impl SimulationEngine {
                 Action::NoQuote { .. } => action_counts.no_quote += 1,
                 Action::DumpInventory { .. } => action_counts.dump_inventory += 1,
                 Action::BuildInventory { .. } => action_counts.build_inventory += 1,
-                Action::DefensiveQuote { .. } => action_counts.defensive_quote += 1,
                 Action::WaitToLearn { .. } => action_counts.wait_to_learn += 1,
             }
 
@@ -343,36 +341,6 @@ impl SimulationEngine {
                 let ask_filled = can_sell && fill_model.would_fill(spread_bps / 2.0);
 
                 // P&L: spread capture - AS - fees
-                let mut pnl = 0.0;
-                if bid_filled {
-                    pnl += spread_bps / 2.0 - config.as_cost_bps - config.maker_fee_bps;
-                }
-                if ask_filled {
-                    pnl += spread_bps / 2.0 - config.as_cost_bps - config.maker_fee_bps;
-                }
-
-                (bid_filled, ask_filled, pnl, Some(spread_bps))
-            }
-
-            Action::DefensiveQuote {
-                spread_multiplier,
-                size_fraction,
-                ..
-            } => {
-                let base_spread = 8.0; // Default base spread
-                let spread_bps = base_spread * spread_multiplier;
-
-                let can_buy = position < max_position;
-                let can_sell = position > -max_position;
-
-                // Reduced fill probability due to wider spread
-                let bid_filled = can_buy
-                    && fill_model.would_fill(spread_bps / 2.0)
-                    && fill_model.next_random() < *size_fraction;
-                let ask_filled = can_sell
-                    && fill_model.would_fill(spread_bps / 2.0)
-                    && fill_model.next_random() < *size_fraction;
-
                 let mut pnl = 0.0;
                 if bid_filled {
                     pnl += spread_bps / 2.0 - config.as_cost_bps - config.maker_fee_bps;
@@ -922,7 +890,6 @@ mod tests {
             + result.action_counts.no_quote
             + result.action_counts.dump_inventory
             + result.action_counts.build_inventory
-            + result.action_counts.defensive_quote
             + result.action_counts.wait_to_learn;
 
         assert_eq!(total_actions, scenario.n_steps());

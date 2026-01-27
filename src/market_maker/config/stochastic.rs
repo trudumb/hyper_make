@@ -178,6 +178,69 @@ pub struct StochasticConfig {
     /// Default: 0.0002 (20 bps per second)
     pub sigma_baseline: f64,
 
+    // ==================== Calibrated Risk Model (Log-Additive Gamma) ====================
+    /// Feature flag: use log-additive calibrated risk model instead of multiplicative.
+    /// When enabled, gamma is computed as: γ = exp(log_gamma_base + Σ βᵢ × xᵢ)
+    /// This prevents multiplicative explosion that can occur with 11+ scalars.
+    /// Default: false (conservative - enable after shadow mode validation)
+    pub use_calibrated_risk_model: bool,
+
+    /// Blend factor for gradual rollout (0=old multiplicative, 1=new log-additive).
+    /// Use values in [0.0, 1.0] to gradually transition between models.
+    /// Default: 0.0 (start with old model)
+    pub risk_model_blend: f64,
+
+    /// Baseline kappa for risk feature normalization.
+    /// Used to compute excess_intensity = (κ_activity - κ_baseline) / κ_baseline.
+    /// Default: 2500.0 (reasonable prior for liquid markets)
+    pub kappa_baseline: f64,
+
+    /// Baseline book depth for risk feature normalization (USD).
+    /// Used to compute depth_depletion = 1 - depth/depth_baseline.
+    /// Default: 100,000 ($100k baseline)
+    pub book_depth_baseline_usd: f64,
+
+    /// Minimum samples required before using calibrated coefficients.
+    /// During warmup, conservative defaults (50% higher betas) are used.
+    /// Default: 100
+    pub min_calibration_samples: usize,
+
+    /// Hours after which calibration is considered stale.
+    /// When stale, model blends toward conservative defaults.
+    /// Default: 4.0
+    pub calibration_staleness_hours: f64,
+
+    // ==================== Kelly Criterion Sizing ====================
+    /// Feature flag: use Kelly criterion for position sizing.
+    /// When enabled, size = kelly_fraction × bankroll × f*, where f* = (pb - q) / b.
+    /// Default: false (conservative - enable after tracker warmup)
+    pub use_kelly_sizing: bool,
+
+    /// Minimum P(edge > 0) required to take a position.
+    /// Below this threshold, Kelly returns zero size.
+    /// Default: 0.55 (55% confidence required)
+    pub kelly_min_p_win: f64,
+
+    /// Minimum expected edge (bps) required to take a position.
+    /// Below this threshold, Kelly returns zero size.
+    /// Default: 2.0 (2 bps minimum edge)
+    pub kelly_min_edge_bps: f64,
+
+    /// Maximum position as fraction of bankroll.
+    /// Caps the Kelly fraction to limit concentration risk.
+    /// Default: 0.5 (50% max)
+    pub kelly_max_position_fraction: f64,
+
+    /// EWMA decay factor for win/loss tracking.
+    /// Higher values = slower adaptation (0.99 ≈ 100 trade half-life).
+    /// Default: 0.99
+    pub kelly_tracker_decay: f64,
+
+    /// Minimum trades before using Kelly (warmup period).
+    /// During warmup, uses 50% of position limit instead.
+    /// Default: 20
+    pub kelly_min_warmup_trades: usize,
+
     // ==================== Entropy-Based Distribution ====================
     // Entropy-based stochastic order distribution is always enabled.
     // Key features:
@@ -331,10 +394,16 @@ pub struct StochasticConfig {
     pub quote_gate_min_edge_signal: f64,
 
     /// Minimum momentum confidence to trust the edge signal.
-    /// Even with strong flow_imbalance, low confidence means uncertain.
+    /// Only required when signal is weak (below strong_signal_threshold).
     ///
-    /// Default: 0.55
+    /// Default: 0.45 (below baseline 0.50)
     pub quote_gate_min_edge_confidence: f64,
+
+    /// Signal strength that bypasses confidence requirement.
+    /// If |flow_imbalance| >= this, we trust it regardless of confidence.
+    ///
+    /// Default: 0.50 (strong signal = trust it)
+    pub quote_gate_strong_signal_threshold: f64,
 
     /// Minimum position (as fraction of max) to trigger one-sided quoting.
     /// Below this, position is considered "flat".
@@ -357,6 +426,12 @@ pub struct StochasticConfig {
     ///
     /// Default: 0.3 (70% cascade severity)
     pub quote_gate_cascade_threshold: f64,
+
+    /// Quote both sides when flat, even without strong edge signal.
+    /// Market makers profit from spread capture, not direction.
+    ///
+    /// Default: true (market-making mode)
+    pub quote_gate_flat_without_edge: bool,
 }
 
 impl Default for StochasticConfig {
@@ -416,9 +491,10 @@ impl Default for StochasticConfig {
             sigma_baseline: 0.0002, // 20 bps per second (matches RiskConfig)
 
             // Entropy-Based Distribution (always enabled)
-            entropy_min_entropy: 1.5,      // At least ~4.5 effective levels
-            entropy_base_temperature: 1.0, // Standard softmax
-            entropy_min_allocation_floor: 0.02, // 2% minimum per level
+            // CHANGED: Increased defaults to enforce better distribution with small capital
+            entropy_min_entropy: 2.0,      // At least ~7.4 effective levels (was 1.5 → ~4.5)
+            entropy_base_temperature: 1.2, // Slightly more uniform (was 1.0)
+            entropy_min_allocation_floor: 0.04, // 4% minimum per level (was 2%)
             entropy_thompson_samples: 5,   // Moderate stochasticity
 
             // Calibration Fill Rate Controller
@@ -455,14 +531,35 @@ impl Default for StochasticConfig {
             performance_min_capacity_fraction: 0.3,  // Never below 30%
 
             // Quote Gate (Directional Edge Gating)
-            // ENABLED by default - prevents whipsaw losses from random fills
+            // ENABLED by default - but with market-making appropriate defaults
             enable_quote_gate: true,
-            quote_gate_min_edge_signal: 0.25,               // |flow_imbalance| threshold
-            quote_gate_min_edge_confidence: 0.55,           // momentum confidence threshold
+            quote_gate_min_edge_signal: 0.15,               // Lower threshold for MM (was 0.25)
+            quote_gate_min_edge_confidence: 0.45,           // Below baseline (was 0.55)
+            quote_gate_strong_signal_threshold: 0.50,       // Strong signal bypasses confidence
             quote_gate_position_threshold: 0.05,            // 5% of max = "flat"
             quote_gate_max_position_before_reduce_only: 0.7, // 70% of max = reduce only
             quote_gate_cascade_protection: true,
             quote_gate_cascade_threshold: 0.3,              // 70% cascade severity
+            quote_gate_flat_without_edge: true,             // MM mode: quote when flat
+
+            // Calibrated Risk Model (Log-Additive Gamma)
+            // ENABLED: Use log-additive gamma to prevent multiplicative explosion
+            // The old system could compound 11 scalars to 45x; this bounds via exp(sum)
+            use_calibrated_risk_model: true,
+            risk_model_blend: 1.0,              // Full cutover to new model
+            kappa_baseline: 2500.0,             // Prior for liquid markets
+            book_depth_baseline_usd: 100_000.0, // $100k baseline
+            min_calibration_samples: 100,
+            calibration_staleness_hours: 4.0,
+
+            // Kelly Criterion Sizing
+            // DISABLED by default - enable after tracker warmup
+            use_kelly_sizing: false,
+            kelly_min_p_win: 0.55,
+            kelly_min_edge_bps: 2.0,
+            kelly_max_position_fraction: 0.5,
+            kelly_tracker_decay: 0.99,
+            kelly_min_warmup_trades: 20,
         }
     }
 }
@@ -562,10 +659,12 @@ impl StochasticConfig {
             enabled: self.enable_quote_gate,
             min_edge_signal: self.quote_gate_min_edge_signal,
             min_edge_confidence: self.quote_gate_min_edge_confidence,
+            strong_signal_threshold: self.quote_gate_strong_signal_threshold,
             position_threshold: self.quote_gate_position_threshold,
             max_position_before_reduce_only: self.quote_gate_max_position_before_reduce_only,
             cascade_protection: self.quote_gate_cascade_protection,
             cascade_threshold: self.quote_gate_cascade_threshold,
+            quote_flat_without_edge: self.quote_gate_flat_without_edge,
         }
     }
 }
