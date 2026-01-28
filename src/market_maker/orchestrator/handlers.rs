@@ -169,6 +169,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             calibrate_depth_as: self.stochastic.stochastic_config.calibrate_depth_as,
             learning: &mut self.learning,
             stochastic_controller: &mut self.stochastic.controller,
+            position_pnl: &mut self.stochastic.position_pnl,
             fee_bps: self.config.fee_bps,
         };
 

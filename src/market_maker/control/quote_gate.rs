@@ -27,7 +27,10 @@
 //! 2. Only quote the side that benefits from that view
 //! 3. When view is uncertain, DON'T TRADE (not just "widen spreads")
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use super::calibrated_edge::CalibratedEdgeSignal;
+use super::position_pnl_tracker::PositionPnLTracker;
 
 /// Quote decision from the Quote Gate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -390,6 +393,203 @@ impl QuoteGate {
             "QuoteGate[{} | {} | {:?}]",
             edge_status, position_status, decision
         )
+    }
+
+    /// Make a calibrated decision using Information Ratio-based edge detection.
+    ///
+    /// This replaces arbitrary thresholds with principled, data-derived values:
+    /// - Edge signal: IR > 1.0 means signal adds value (vs. arbitrary 0.15)
+    /// - Position threshold: Derived from P&L data (vs. arbitrary 0.05)
+    /// - Reduce-only threshold: Regime-specific, derived from P&L (vs. arbitrary 0.70)
+    /// - Cascade detection: Uses changepoint probability (vs. arbitrary 0.30)
+    ///
+    /// # Arguments
+    /// * `input` - Standard quote gate input
+    /// * `edge_signal` - Calibrated edge signal tracker
+    /// * `pnl_tracker` - Position P&L tracker
+    /// * `changepoint_prob` - Bayesian changepoint probability (from BOCD)
+    pub fn decide_calibrated(
+        &self,
+        input: &QuoteGateInput,
+        edge_signal: &CalibratedEdgeSignal,
+        pnl_tracker: &PositionPnLTracker,
+        changepoint_prob: f64,
+    ) -> QuoteDecision {
+        // If disabled, use legacy behavior
+        if !self.config.enabled {
+            return QuoteDecision::QuoteBoth;
+        }
+
+        // 1. During warmup, don't quote
+        if input.is_warmup {
+            debug!("Quote gate (calibrated): warmup");
+            return QuoteDecision::NoQuote {
+                reason: NoQuoteReason::Warmup,
+            };
+        }
+
+        // 2. Cascade protection using changepoint probability (not arbitrary threshold)
+        // High changepoint_prob means regime shift detected
+        const CHANGEPOINT_CASCADE_THRESHOLD: f64 = 0.70;
+        if self.config.cascade_protection && changepoint_prob > CHANGEPOINT_CASCADE_THRESHOLD {
+            warn!(
+                changepoint_prob = %format!("{:.3}", changepoint_prob),
+                "Quote gate (calibrated): regime change detected, pulling quotes"
+            );
+            return QuoteDecision::NoQuote {
+                reason: NoQuoteReason::Cascade,
+            };
+        }
+
+        // Also use cascade_size_factor as a fallback (empirical market data)
+        if self.config.cascade_protection
+            && input.cascade_size_factor < self.config.cascade_threshold
+        {
+            info!(
+                cascade_factor = %format!("{:.2}", input.cascade_size_factor),
+                "Quote gate (calibrated): cascade via OI drop"
+            );
+            return QuoteDecision::NoQuote {
+                reason: NoQuoteReason::Cascade,
+            };
+        }
+
+        // 3. Compute position ratio
+        let position_ratio = if input.max_position > 0.0 {
+            input.position / input.max_position
+        } else {
+            0.0
+        };
+        let position_abs_ratio = position_ratio.abs();
+
+        // 4. Get calibrated thresholds
+        // Position threshold: derived from P&L data (where E[PnL] crosses zero)
+        let position_threshold = pnl_tracker.derived_position_threshold();
+
+        // Reduce-only threshold: regime-specific (infer regime from changepoint)
+        // High changepoint_prob → cascade (regime 2), low → calm (regime 0)
+        let regime = if changepoint_prob > 0.5 {
+            2 // cascade
+        } else if changepoint_prob > 0.2 {
+            1 // volatile
+        } else {
+            0 // calm
+        };
+        let reduce_only_threshold = pnl_tracker.reduce_only_threshold(regime);
+
+        // 5. Check if we have directional edge using IR
+        // The only principled threshold: IR > 1.0 means signal adds information
+        let has_edge = edge_signal.is_useful();
+        let signal_weight = edge_signal.signal_weight();
+
+        // During warmup, fall back to effective threshold check
+        let has_edge = if !edge_signal.is_warmed_up() {
+            // Use cold-start threshold during calibration warmup
+            let effective_threshold = edge_signal.effective_edge_threshold();
+            input.flow_imbalance.abs() >= effective_threshold
+                && input.momentum_confidence >= self.config.min_edge_confidence
+        } else {
+            has_edge && signal_weight > 0.0
+        };
+
+        // Determine if position is significant (using derived threshold)
+        let has_significant_position = position_abs_ratio >= position_threshold;
+
+        // Determine if position is large (needs reduction priority)
+        let needs_reduction = position_abs_ratio >= reduce_only_threshold;
+
+        // Determine edge direction
+        let is_bullish = input.flow_imbalance > 0.0;
+
+        // Determine if position aligns with edge
+        let position_aligns_with_edge = if has_edge {
+            (input.position > 0.0 && is_bullish) || (input.position < 0.0 && !is_bullish)
+        } else {
+            false
+        };
+
+        // Decision logic (same structure as original, but with calibrated thresholds)
+        let decision = if has_edge {
+            if needs_reduction && !position_aligns_with_edge {
+                // Have edge but large position opposes it → URGENT reduce only
+                let urgency = (position_abs_ratio / 1.0).min(1.0);
+                if input.position > 0.0 {
+                    QuoteDecision::QuoteOnlyAsks { urgency }
+                } else {
+                    QuoteDecision::QuoteOnlyBids { urgency }
+                }
+            } else {
+                // Have edge, position is manageable or aligned → quote both
+                QuoteDecision::QuoteBoth
+            }
+        } else {
+            // No edge
+            if has_significant_position {
+                // No edge but have position → only quote to reduce
+                let urgency = (position_abs_ratio * 0.5).min(1.0);
+                if input.position > 0.0 {
+                    QuoteDecision::QuoteOnlyAsks { urgency }
+                } else {
+                    QuoteDecision::QuoteOnlyBids { urgency }
+                }
+            } else if self.config.quote_flat_without_edge {
+                // Market-making mode: quote both sides even without edge
+                debug!(
+                    signal_weight = %format!("{:.3}", signal_weight),
+                    ir_warmed_up = edge_signal.is_warmed_up(),
+                    "Quote gate (calibrated): no edge but quoting both (market-making mode)"
+                );
+                QuoteDecision::QuoteBoth
+            } else {
+                // No edge, flat position → DON'T QUOTE
+                QuoteDecision::NoQuote {
+                    reason: NoQuoteReason::NoEdgeFlat,
+                }
+            }
+        };
+
+        // Log calibrated decisions
+        match &decision {
+            QuoteDecision::NoQuote { reason } => {
+                info!(
+                    reason = %reason,
+                    signal_weight = %format!("{:.3}", signal_weight),
+                    ir_useful = has_edge,
+                    position_ratio = %format!("{:.2}", position_ratio),
+                    position_threshold = %format!("{:.2}", position_threshold),
+                    changepoint_prob = %format!("{:.3}", changepoint_prob),
+                    "Quote gate (calibrated): NO QUOTE"
+                );
+            }
+            QuoteDecision::QuoteOnlyBids { urgency } => {
+                info!(
+                    urgency = %format!("{:.2}", urgency),
+                    signal_weight = %format!("{:.3}", signal_weight),
+                    position_ratio = %format!("{:.2}", position_ratio),
+                    reduce_only_threshold = %format!("{:.2}", reduce_only_threshold),
+                    "Quote gate (calibrated): ONLY BIDS"
+                );
+            }
+            QuoteDecision::QuoteOnlyAsks { urgency } => {
+                info!(
+                    urgency = %format!("{:.2}", urgency),
+                    signal_weight = %format!("{:.3}", signal_weight),
+                    position_ratio = %format!("{:.2}", position_ratio),
+                    reduce_only_threshold = %format!("{:.2}", reduce_only_threshold),
+                    "Quote gate (calibrated): ONLY ASKS"
+                );
+            }
+            QuoteDecision::QuoteBoth => {
+                debug!(
+                    signal_weight = %format!("{:.3}", signal_weight),
+                    has_edge = has_edge,
+                    position_threshold = %format!("{:.2}", position_threshold),
+                    "Quote gate (calibrated): BOTH SIDES"
+                );
+            }
+        }
+
+        decision
     }
 }
 

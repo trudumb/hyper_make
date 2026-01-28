@@ -30,10 +30,12 @@
 
 pub mod actions;
 pub mod belief;
+pub mod calibrated_edge;
 pub mod changepoint;
 pub mod controller;
 pub mod information;
 pub mod interface;
+pub mod position_pnl_tracker;
 pub mod quote_gate;
 pub mod simulation;
 pub mod state;
@@ -44,7 +46,9 @@ pub mod value;
 // Re-export key types
 pub use actions::{Action, ActionConfig, NoQuoteReason};
 pub use belief::BeliefState;
+pub use calibrated_edge::{CalibratedEdgeConfig, CalibratedEdgeSignal, EdgeSignalDiagnostics};
 pub use changepoint::{ChangepointConfig, ChangepointDetector};
+pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, PositionPnLTracker};
 pub use quote_gate::{
     NoQuoteReason as QuoteGateNoQuoteReason, QuoteDecision as QuoteGateDecision, QuoteGate,
     QuoteGateConfig, QuoteGateInput,

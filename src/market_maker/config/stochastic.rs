@@ -434,6 +434,17 @@ pub struct StochasticConfig {
     /// Default: false (API budget conservation - prevents excessive API churn)
     /// Use --quote-flat-without-edge to enable market-making mode.
     pub quote_gate_flat_without_edge: bool,
+
+    // ==================== Calibrated Quote Gate (IR-Based Thresholds) ====================
+    /// Enable calibrated quote gate with IR-based thresholds.
+    /// When enabled, replaces arbitrary thresholds (0.15, 0.45, etc.) with:
+    /// - Edge signal: IR > 1.0 means signal adds value
+    /// - Position threshold: Derived from P&L data
+    /// - Reduce-only threshold: Regime-specific from P&L data
+    /// - Cascade detection: Uses changepoint probability
+    ///
+    /// Default: false (enable after collecting calibration data)
+    pub enable_calibrated_quote_gate: bool,
 }
 
 impl Default for StochasticConfig {
@@ -545,6 +556,10 @@ impl Default for StochasticConfig {
             // API BUDGET CONSERVATION: Default false to avoid quoting in sideways markets
             // Set --quote-flat-without-edge to enable market-making mode
             quote_gate_flat_without_edge: false,            // Conserve API budget: only quote with edge
+
+            // Calibrated Quote Gate (IR-Based Thresholds)
+            // DISABLED by default - enable after collecting calibration data
+            enable_calibrated_quote_gate: false,
 
             // Calibrated Risk Model (Log-Additive Gamma)
             // ENABLED: Use log-additive gamma to prevent multiplicative explosion

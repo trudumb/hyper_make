@@ -6,7 +6,10 @@ use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
     config::{ImpulseControlConfig, MetricsRecorder},
-    control::{QuoteGate, StochasticController, StochasticControllerConfig},
+    control::{
+        CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
+        QuoteGate, StochasticController, StochasticControllerConfig,
+    },
     estimator::{CalibrationController, CalibrationControllerConfig, RegimeHMM},
     execution::{FillTracker, OrderLifecycleTracker},
     fills::FillProcessor,
@@ -404,6 +407,15 @@ pub struct StochasticComponents {
     /// Quote gate: decides WHETHER to quote based on directional edge.
     /// Prevents whipsaw losses from random fills when no edge exists.
     pub quote_gate: QuoteGate,
+
+    // === Calibrated Thresholds (IR-Based) ===
+    /// Calibrated edge signal tracker.
+    /// Tracks whether flow_imbalance predicts price direction using IR > 1.0.
+    pub calibrated_edge: CalibratedEdgeSignal,
+
+    /// Position P&L tracker.
+    /// Derives position thresholds from actual P&L data.
+    pub position_pnl: PositionPnLTracker,
 }
 
 impl StochasticComponents {
@@ -483,6 +495,9 @@ impl StochasticComponents {
             position_ramp,
             performance_gating,
             quote_gate,
+            // Calibrated thresholds (IR-based)
+            calibrated_edge: CalibratedEdgeSignal::new(CalibratedEdgeConfig::default()),
+            position_pnl: PositionPnLTracker::new(PositionPnLConfig::default()),
         }
     }
 }

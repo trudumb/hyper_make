@@ -20,7 +20,7 @@ use super::dedup::FillDeduplicator;
 use super::{FillEvent, FillResult};
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
 use crate::market_maker::config::MetricsRecorder;
-use crate::market_maker::control::StochasticController;
+use crate::market_maker::control::{PositionPnLTracker, StochasticController};
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::PrometheusMetrics;
 use crate::market_maker::messages;
@@ -109,6 +109,10 @@ pub struct FillState<'a> {
     // Layer 3: Stochastic Controller
     /// POMDP-based sequential decision-making controller
     pub stochastic_controller: &'a mut StochasticController,
+
+    // Calibrated Thresholds
+    /// Position P&L tracker for deriving position thresholds from actual P&L data
+    pub position_pnl: &'a mut PositionPnLTracker,
 
     // Fee configuration for edge calculation
     /// Fee in basis points for edge calculation
@@ -453,6 +457,26 @@ impl FillProcessor {
             );
         }
 
+        // === Calibrated P&L Tracking (IR-Based Thresholds) ===
+        // Record P&L by position quantile and regime for threshold derivation.
+        // This enables deriving position thresholds from actual P&L data.
+        if state.max_position > 0.0 {
+            let position_ratio = state.position.position().abs() / state.max_position;
+            // Get regime from estimator (0=calm, 1=normal, 2=volatile/cascade)
+            let regime = match state.estimator.volatility_regime() {
+                crate::market_maker::estimator::VolatilityRegime::Low => 0,
+                crate::market_maker::estimator::VolatilityRegime::Normal => 0,
+                crate::market_maker::estimator::VolatilityRegime::High => 1,
+                crate::market_maker::estimator::VolatilityRegime::Extreme => 2,
+            };
+            // P&L in bps: (fill_pnl / notional) * 10000
+            let notional = fill.price * fill.size;
+            if notional > 0.0 {
+                let pnl_bps = (pnl_summary.total_pnl / notional) * 10000.0;
+                state.position_pnl.record(position_ratio, regime, pnl_bps);
+            }
+        }
+
         // Log fill summary
         let as_bps = state.adverse_selection.realized_as_bps();
         info!(
@@ -585,6 +609,7 @@ mod tests {
         metrics: &'a MetricsRecorder,
         learning: &'a mut crate::market_maker::learning::LearningModule,
         stochastic_controller: &'a mut StochasticController,
+        position_pnl: &'a mut PositionPnLTracker,
     ) -> FillState<'a> {
         FillState {
             position,
@@ -602,6 +627,7 @@ mod tests {
             calibrate_depth_as: true,
             learning,
             stochastic_controller,
+            position_pnl,
             fee_bps: 1.5,
         }
     }
@@ -621,6 +647,7 @@ mod tests {
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -634,6 +661,7 @@ mod tests {
             &metrics,
             &mut learning,
             &mut stochastic_controller,
+            &mut position_pnl,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -659,6 +687,7 @@ mod tests {
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -672,6 +701,7 @@ mod tests {
             &metrics,
             &mut learning,
             &mut stochastic_controller,
+            &mut position_pnl,
         );
 
         let fill1 = make_fill(1, 100, 1.0, 50000.0, true);
@@ -751,6 +781,7 @@ mod tests {
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -767,6 +798,7 @@ mod tests {
             &metrics,
             &mut learning,
             &mut stochastic_controller,
+            &mut position_pnl,
         );
 
         // Now WebSocket fill arrives for OID 100
@@ -803,6 +835,7 @@ mod tests {
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
 
         // No pre-registration - this is a normal fill
 
@@ -818,6 +851,7 @@ mod tests {
             &metrics,
             &mut learning,
             &mut stochastic_controller,
+            &mut position_pnl,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -851,6 +885,7 @@ mod tests {
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -870,6 +905,7 @@ mod tests {
                 &metrics,
                 &mut learning,
                 &mut stochastic_controller,
+                &mut position_pnl,
             );
             processor.process(&fill1, &mut state)
         };
@@ -893,6 +929,7 @@ mod tests {
                 &metrics,
                 &mut learning,
                 &mut stochastic_controller,
+                &mut position_pnl,
             );
             processor.process(&fill2, &mut state)
         };
@@ -925,6 +962,7 @@ mod tests {
         let metrics: MetricsRecorder = None;
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -945,6 +983,7 @@ mod tests {
                 &metrics,
                 &mut learning,
                 &mut stochastic_controller,
+                &mut position_pnl,
             );
             processor.process(&fill1, &mut state)
         };
@@ -974,6 +1013,7 @@ mod tests {
                 &metrics,
                 &mut learning,
                 &mut stochastic_controller,
+                &mut position_pnl,
             );
             processor.process(&fill2, &mut state)
         };
@@ -1004,6 +1044,7 @@ mod tests {
                 &metrics,
                 &mut learning,
                 &mut stochastic_controller,
+                &mut position_pnl,
             );
             processor.process(&fill3, &mut state)
         };

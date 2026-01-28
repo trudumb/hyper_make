@@ -933,6 +933,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
 
+        // === CALIBRATED EDGE SIGNAL: Track whether flow_imbalance predicts price direction ===
+        // This builds IR (Information Ratio) data for principled threshold derivation.
+        // 1. Record outcomes for mature predictions (from previous cycles)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.stochastic
+            .calibrated_edge
+            .record_outcomes(self.latest_mid, now_ms);
+
+        // 2. Make a new prediction for this cycle
+        // Infer regime from HMM: [p_low, p_normal, p_high, p_extreme]
+        let regime_idx = if p_extreme > 0.3 {
+            2 // cascade
+        } else if p_high > 0.3 || p_low > 0.5 {
+            1 // volatile
+        } else {
+            0 // calm
+        };
+        let _pred_id = self.stochastic.calibrated_edge.predict(
+            market_params.flow_imbalance,
+            self.latest_mid,
+            regime_idx,
+            now_ms,
+        );
+
         // === QUOTE GATE: Decide WHETHER to quote based on directional edge ===
         // This prevents whipsaw losses from random fills when we have no directional edge.
         // The gate uses flow_imbalance, momentum confidence, and position to decide.
@@ -945,7 +972,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             is_warmup: !self.estimator.is_warmed_up(),
             cascade_size_factor: market_params.cascade_size_factor,
         };
-        let quote_gate_decision = self.stochastic.quote_gate.decide(&quote_gate_input);
+
+        // Use calibrated decision if enabled, otherwise use legacy thresholds
+        let changepoint_prob = self.stochastic.controller.changepoint_summary().cp_prob_5;
+        let quote_gate_decision = if self.stochastic.stochastic_config.enable_calibrated_quote_gate
+        {
+            self.stochastic.quote_gate.decide_calibrated(
+                &quote_gate_input,
+                &self.stochastic.calibrated_edge,
+                &self.stochastic.position_pnl,
+                changepoint_prob,
+            )
+        } else {
+            self.stochastic.quote_gate.decide(&quote_gate_input)
+        };
 
         // Handle quote gate decision
         match &quote_gate_decision {

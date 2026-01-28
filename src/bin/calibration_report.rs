@@ -135,6 +135,60 @@ struct SignalReport {
     status: String,
 }
 
+/// Edge signal health report (calibrated quote gate).
+#[derive(Debug, Serialize, Deserialize)]
+struct EdgeSignalReport {
+    /// Overall Information Ratio across all regimes
+    overall_ir: f64,
+    /// Status: PREDICTIVE (IR>1), MARGINAL (0.9-1.0), NOISE (<0.9)
+    overall_status: String,
+    /// Per-regime breakdown
+    regime_breakdown: Vec<RegimeIRReport>,
+    /// MI decay rate (bits per day)
+    mi_decay_rate: f64,
+    /// Derived edge threshold from IR
+    derived_threshold: f64,
+    /// Sample count
+    n_predictions: usize,
+}
+
+/// Per-regime IR breakdown.
+#[derive(Debug, Serialize, Deserialize)]
+struct RegimeIRReport {
+    /// Regime name (calm, volatile, cascade)
+    regime: String,
+    /// Information Ratio for this regime
+    ir: f64,
+    /// Number of samples in this regime
+    n_samples: usize,
+    /// Status for this regime
+    status: String,
+}
+
+/// Position threshold report (calibrated from P&L).
+#[derive(Debug, Serialize, Deserialize)]
+struct PositionThresholdReport {
+    /// Derived position threshold (fraction of max)
+    derived_position_threshold: f64,
+    /// Default threshold for comparison
+    default_position_threshold: f64,
+    /// Per-regime reduce-only thresholds
+    reduce_only_thresholds: Vec<RegimeThreshold>,
+    /// Sample count
+    n_fills_recorded: usize,
+}
+
+/// Per-regime threshold.
+#[derive(Debug, Serialize, Deserialize)]
+struct RegimeThreshold {
+    /// Regime name
+    regime: String,
+    /// Threshold value
+    threshold: f64,
+    /// Note about this threshold
+    note: String,
+}
+
 /// Complete calibration report.
 #[derive(Debug, Serialize, Deserialize)]
 struct CalibrationReport {
@@ -146,6 +200,10 @@ struct CalibrationReport {
     models: Vec<ModelReport>,
     /// Signal health reports
     signals: Vec<SignalReport>,
+    /// Edge signal health (calibrated quote gate)
+    edge_signal: Option<EdgeSignalReport>,
+    /// Position threshold report (P&L derived)
+    position_thresholds: Option<PositionThresholdReport>,
     /// Overall system health
     overall_health: String,
     /// Active alerts
@@ -245,11 +303,24 @@ fn generate_report(days: u32, demo: bool) -> CalibrationReport {
         "OK: Models within acceptable parameters. Continue monitoring.".to_string()
     };
 
+    // Generate edge signal and position threshold reports
+    let (edge_signal, position_thresholds) = if demo {
+        (
+            Some(generate_demo_edge_signal_report()),
+            Some(generate_demo_position_threshold_report()),
+        )
+    } else {
+        // In production, these would be loaded from CalibratedEdgeSignal and PositionPnLTracker
+        (None, None)
+    };
+
     CalibrationReport {
         generated_at: chrono::Utc::now().to_rfc3339(),
         period_days: days,
         models,
         signals,
+        edge_signal,
+        position_thresholds,
         overall_health: overall_health.to_string(),
         alerts,
         summary: ReportSummary {
@@ -362,6 +433,63 @@ fn generate_live_model_reports() -> Vec<ModelReport> {
             }
         },
     ]
+}
+
+/// Generate demo edge signal report for illustration.
+fn generate_demo_edge_signal_report() -> EdgeSignalReport {
+    EdgeSignalReport {
+        overall_ir: 1.23,
+        overall_status: "PREDICTIVE".to_string(),
+        regime_breakdown: vec![
+            RegimeIRReport {
+                regime: "calm".to_string(),
+                ir: 1.31,
+                n_samples: 612,
+                status: "PREDICTIVE".to_string(),
+            },
+            RegimeIRReport {
+                regime: "volatile".to_string(),
+                ir: 0.98,
+                n_samples: 203,
+                status: "NOISE".to_string(),
+            },
+            RegimeIRReport {
+                regime: "cascade".to_string(),
+                ir: 0.71,
+                n_samples: 32,
+                status: "NOISE".to_string(),
+            },
+        ],
+        mi_decay_rate: 0.02,
+        derived_threshold: 0.18,
+        n_predictions: 847,
+    }
+}
+
+/// Generate demo position threshold report for illustration.
+fn generate_demo_position_threshold_report() -> PositionThresholdReport {
+    PositionThresholdReport {
+        derived_position_threshold: 0.08,
+        default_position_threshold: 0.05,
+        reduce_only_thresholds: vec![
+            RegimeThreshold {
+                regime: "calm".to_string(),
+                threshold: 0.72,
+                note: "standard".to_string(),
+            },
+            RegimeThreshold {
+                regime: "volatile".to_string(),
+                threshold: 0.58,
+                note: "reduced".to_string(),
+            },
+            RegimeThreshold {
+                regime: "cascade".to_string(),
+                threshold: 0.42,
+                note: "conservative".to_string(),
+            },
+        ],
+        n_fills_recorded: 523,
+    }
 }
 
 /// Generate demo signal reports for illustration.
@@ -530,6 +658,55 @@ fn print_ascii(report: &CalibrationReport) {
             );
         }
 
+        println!("{}", separator);
+    }
+
+    // Edge Signal Health Section (IR-Based Thresholds)
+    if let Some(edge) = &report.edge_signal {
+        println!(" EDGE SIGNAL HEALTH (IR-Based)");
+        println!("{}", separator);
+        let status_icon = match edge.overall_status.as_str() {
+            "PREDICTIVE" => "[OK]",
+            "MARGINAL" => "[!!]",
+            "NOISE" => "[XX]",
+            _ => "[??]",
+        };
+        println!(
+            " Overall IR: {:.2} {} {}",
+            edge.overall_ir, status_icon, edge.overall_status
+        );
+        println!(" Regime Breakdown:");
+        for regime in &edge.regime_breakdown {
+            let regime_icon = if regime.ir >= 1.0 { "[OK]" } else { "[!!]" };
+            println!(
+                "   - {:10} IR={:.2}, n={:>4} {}",
+                regime.regime, regime.ir, regime.n_samples, regime_icon
+            );
+        }
+        println!(
+            " MI Decay: {:.3} bits/day | Derived threshold: {:.2}",
+            edge.mi_decay_rate, edge.derived_threshold
+        );
+        println!(" Predictions: {}", edge.n_predictions);
+        println!("{}", separator);
+    }
+
+    // Position Threshold Section (P&L Derived)
+    if let Some(pos) = &report.position_thresholds {
+        println!(" POSITION THRESHOLDS (P&L Derived)");
+        println!("{}", separator);
+        println!(
+            " Derived position threshold: {:.2} (was {:.2})",
+            pos.derived_position_threshold, pos.default_position_threshold
+        );
+        println!(" Reduce-only thresholds:");
+        for rt in &pos.reduce_only_thresholds {
+            println!(
+                "   - {:10} {:.2} ({})",
+                rt.regime, rt.threshold, rt.note
+            );
+        }
+        println!(" Fills recorded: {}", pos.n_fills_recorded);
         println!("{}", separator);
     }
 
