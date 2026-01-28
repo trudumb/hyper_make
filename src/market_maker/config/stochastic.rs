@@ -558,8 +558,8 @@ impl Default for StochasticConfig {
             quote_gate_flat_without_edge: false,            // Conserve API budget: only quote with edge
 
             // Calibrated Quote Gate (IR-Based Thresholds)
-            // DISABLED by default - enable after collecting calibration data
-            enable_calibrated_quote_gate: false,
+            // ENABLED: Uses IR > 1.0 instead of arbitrary 0.15 threshold
+            enable_calibrated_quote_gate: true,
 
             // Calibrated Risk Model (Log-Additive Gamma)
             // ENABLED: Use log-additive gamma to prevent multiplicative explosion
