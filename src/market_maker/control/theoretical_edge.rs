@@ -404,6 +404,168 @@ impl Default for FillRateEstimator {
     }
 }
 
+// ============================================================================
+// Enhanced Edge Input
+// ============================================================================
+
+/// Enhanced input for edge calculation with depth and momentum signals.
+///
+/// Provides richer signal variance than book_imbalance alone, helping
+/// with P(correct) discrimination and breaking calibration bootstrap cycles.
+#[derive(Debug, Clone, Default)]
+pub struct EnhancedEdgeInput {
+    /// Base order book imbalance [-1, +1]
+    pub book_imbalance: f64,
+    /// Bid depth as fraction of total depth [0, 1]
+    pub bid_depth_ratio: f64,
+    /// Ask depth as fraction of total depth [0, 1]  
+    pub ask_depth_ratio: f64,
+    /// Short-term price momentum signal [-1, +1]
+    pub short_momentum: f64,
+    /// Spread in basis points
+    pub spread_bps: f64,
+    /// Volatility (fractional)
+    pub sigma: f64,
+    /// Expected holding time (seconds)
+    pub tau_seconds: f64,
+}
+
+impl EnhancedEdgeInput {
+    /// Create from basic parameters.
+    pub fn new(book_imbalance: f64, spread_bps: f64, sigma: f64, tau_seconds: f64) -> Self {
+        Self {
+            book_imbalance,
+            bid_depth_ratio: 0.5,
+            ask_depth_ratio: 0.5,
+            short_momentum: 0.0,
+            spread_bps,
+            sigma,
+            tau_seconds,
+        }
+    }
+    
+    /// Set depth ratios.
+    pub fn with_depth(mut self, bid_ratio: f64, ask_ratio: f64) -> Self {
+        self.bid_depth_ratio = bid_ratio.clamp(0.0, 1.0);
+        self.ask_depth_ratio = ask_ratio.clamp(0.0, 1.0);
+        self
+    }
+    
+    /// Set momentum signal.
+    pub fn with_momentum(mut self, momentum: f64) -> Self {
+        self.short_momentum = momentum.clamp(-1.0, 1.0);
+        self
+    }
+    
+    /// Compute enhanced imbalance by blending signals.
+    ///
+    /// Formula: imbalance + 0.3 * depth_diff + 0.2 * momentum
+    /// This widens the signal range from clustered values (0.3-0.5) to (0.1-0.9).
+    pub fn enhanced_imbalance(&self) -> f64 {
+        let depth_diff = self.bid_depth_ratio - self.ask_depth_ratio;
+        let enhanced = self.book_imbalance
+            + 0.3 * depth_diff
+            + 0.2 * self.short_momentum;
+        enhanced.clamp(-1.0, 1.0)
+    }
+}
+
+// ============================================================================
+// Bayesian Adverse Selection Tracker  
+// ============================================================================
+
+/// Bayesian tracker for adverse selection probability.
+///
+/// Uses Beta(α, β) posterior to learn P(adverse fill | fill).
+/// Starts with informative prior Beta(3, 17) → mean 0.15 (from PIN model estimates).
+///
+/// An "adverse" fill is one where price moved against the position after fill.
+#[derive(Debug, Clone)]
+pub struct BayesianAdverseTracker {
+    /// Beta α (adverse fills + prior)
+    alpha: f64,
+    /// Beta β (non-adverse fills + prior)
+    beta: f64,
+    /// Total fills observed
+    total_fills: u64,
+    /// Adverse fills observed
+    adverse_fills: u64,
+}
+
+impl BayesianAdverseTracker {
+    /// Create with prior Beta(3, 17) → mean 0.15.
+    pub fn new() -> Self {
+        Self {
+            alpha: 3.0,   // Prior adverse
+            beta: 17.0,   // Prior non-adverse → mean = 3/(3+17) = 0.15
+            total_fills: 0,
+            adverse_fills: 0,
+        }
+    }
+    
+    /// Update from fill outcome.
+    ///
+    /// # Arguments
+    /// * `was_adverse` - True if price moved against position after fill
+    pub fn update(&mut self, was_adverse: bool) {
+        self.total_fills += 1;
+        if was_adverse {
+            self.adverse_fills += 1;
+            self.alpha += 1.0;
+        } else {
+            self.beta += 1.0;
+        }
+    }
+    
+    /// Posterior mean of adverse selection probability.
+    pub fn mean(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+    
+    /// Posterior variance (uncertainty measure).
+    pub fn variance(&self) -> f64 {
+        let ab = self.alpha + self.beta;
+        (self.alpha * self.beta) / (ab * ab * (ab + 1.0))
+    }
+    
+    /// Get total fills observed.
+    pub fn total_fills(&self) -> u64 {
+        self.total_fills
+    }
+    
+    /// Get adverse fill count.
+    pub fn adverse_fills(&self) -> u64 {
+        self.adverse_fills
+    }
+    
+    /// Empirical adverse rate (ignoring prior).
+    pub fn empirical_rate(&self) -> f64 {
+        if self.total_fills == 0 {
+            return 0.15; // Return prior mean
+        }
+        self.adverse_fills as f64 / self.total_fills as f64
+    }
+    
+    /// Decay posterior toward prior (for regime changes).
+    pub fn decay(&mut self, retention: f64) {
+        let retention = retention.clamp(0.0, 1.0);
+        const PRIOR_ALPHA: f64 = 3.0;
+        const PRIOR_BETA: f64 = 17.0;
+        
+        self.alpha = PRIOR_ALPHA + (self.alpha - PRIOR_ALPHA) * retention;
+        self.beta = PRIOR_BETA + (self.beta - PRIOR_BETA) * retention;
+        self.total_fills = (self.total_fills as f64 * retention) as u64;
+        self.adverse_fills = (self.adverse_fills as f64 * retention) as u64;
+    }
+}
+
+impl Default for BayesianAdverseTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
 /// Configuration for theoretical edge estimation.
 #[derive(Debug, Clone)]
 pub struct TheoreticalEdgeConfig {
@@ -441,7 +603,7 @@ impl Default for TheoreticalEdgeConfig {
             min_imbalance: 0.10,   // Ignore very weak imbalances
             btc_correlation_threshold: 0.5, // Only use BTC signal if correlated
             btc_correlation_prior: 0.7,     // Assume HYPE correlates with BTC
-            fee_bps: 5.0,          // Conservative: 5 bps for HIP-3 (maker + buffer)
+            fee_bps: 1.5,          // Standard maker fee (matches main config)
         }
     }
 }
@@ -482,6 +644,8 @@ pub struct TheoreticalEdgeEstimator {
     cross_asset: CrossAssetSignal,
     /// Bayesian tracker for directional accuracy (regime-aware)
     alpha_tracker: RegimeAwareAlphaTracker,
+    /// Bayesian tracker for adverse selection probability
+    adverse_tracker: BayesianAdverseTracker,
     /// Fill rate estimator for P(fill) calculation
     fill_rate: FillRateEstimator,
     /// Number of edge calculations performed
@@ -502,6 +666,7 @@ impl TheoreticalEdgeEstimator {
             config,
             cross_asset: CrossAssetSignal::default(),
             alpha_tracker: RegimeAwareAlphaTracker::new(),
+            adverse_tracker: BayesianAdverseTracker::new(),
             fill_rate: FillRateEstimator::new(),
             calculations: 0,
             quotes_triggered: 0,
@@ -642,6 +807,122 @@ impl TheoreticalEdgeEstimator {
         }
     }
 
+    /// Calculate expected edge using enhanced inputs with depth and momentum blending.
+    ///
+    /// This method provides better signal variance than the basic `calculate_edge` by:
+    /// 1. Blending book_imbalance with depth ratios and momentum
+    /// 2. Using Bayesian-learned adverse_prior instead of static config value
+    ///
+    /// # Arguments
+    /// * `input` - Enhanced edge input with depth/momentum signals
+    ///
+    /// # Returns
+    /// `TheoreticalEdgeResult` with edge estimate using blended signals
+    pub fn calculate_edge_enhanced(&mut self, input: &EnhancedEdgeInput) -> TheoreticalEdgeResult {
+        self.calculations += 1;
+
+        // Compute enhanced imbalance by blending signals
+        let enhanced_imbalance = input.enhanced_imbalance();
+        let abs_imbalance = enhanced_imbalance.abs();
+
+        // Noise filter: require minimum imbalance
+        if abs_imbalance < self.config.min_imbalance {
+            return TheoreticalEdgeResult {
+                expected_edge_bps: 0.0,
+                directional_edge_bps: 0.0,
+                spread_edge_bps: input.spread_bps / 2.0,
+                adverse_cost_bps: 0.0,
+                fee_cost_bps: self.config.fee_bps,
+                btc_boost_bps: 0.0,
+                p_correct: 0.5,
+                should_quote: false,
+                direction: 0,
+            };
+        }
+
+        // Use Bayesian posterior alpha for directional accuracy
+        let posterior_alpha = self.alpha_tracker.mean();
+        
+        // P(direction correct | imbalance) = 0.5 + alpha * |imbalance|
+        let base_p_correct = 0.5 + posterior_alpha * abs_imbalance;
+
+        // Cross-asset boost from BTC signal
+        let btc_boost = self.cross_asset.directional_boost();
+        let btc_aligned = enhanced_imbalance.signum() == self.cross_asset.btc_return_bps.signum();
+        let btc_adjustment = if btc_aligned { btc_boost } else { -btc_boost.abs() * 0.5 };
+        
+        let p_correct = (base_p_correct + btc_adjustment).clamp(0.5, 0.85);
+
+        // Expected price move magnitude (σ√τ in bps)
+        let expected_move_bps = input.sigma * input.tau_seconds.sqrt() * 10_000.0;
+
+        // Components of expected edge:
+        // 1. Spread capture
+        let spread_edge_bps = input.spread_bps / 2.0;
+
+        // 2. Directional edge with uncertainty cost
+        let uncertainty_cost_bps = self.alpha_tracker.uncertainty_cost() * expected_move_bps;
+        let directional_edge_bps = expected_move_bps * (p_correct - 0.5) - uncertainty_cost_bps;
+
+        // 3. BTC boost contribution
+        let btc_boost_bps = expected_move_bps * btc_adjustment;
+
+        // 4. Adverse selection cost using BAYESIAN POSTERIOR (key enhancement)
+        let posterior_adverse = self.adverse_tracker.mean();
+        let adverse_cost_bps = expected_move_bps * posterior_adverse;
+
+        // 5. Trading fees
+        let fee_cost_bps = self.config.fee_bps;
+
+        // 6. P(fill) scaling
+        let p_fill = self.fill_rate.p_fill(input.tau_seconds);
+        
+        // Raw edge
+        let raw_edge_bps = spread_edge_bps + directional_edge_bps - adverse_cost_bps - fee_cost_bps;
+        
+        // Scale by fill probability
+        let fill_dampening = 0.5 + 0.5 * p_fill;
+        let expected_edge_bps = raw_edge_bps * fill_dampening;
+
+        // Should we quote?
+        let should_quote = expected_edge_bps >= self.config.min_edge_bps;
+
+        // Direction based on enhanced imbalance sign
+        let direction = if should_quote {
+            if enhanced_imbalance > 0.0 { 1 } else { -1 }
+        } else {
+            0
+        };
+
+        if should_quote {
+            self.quotes_triggered += 1;
+        }
+
+        // Periodic logging with Bayesian diagnostics
+        if self.calculations % 100 == 0 {
+            debug!(
+                calculations = self.calculations,
+                quotes_triggered = self.quotes_triggered,
+                posterior_adverse = %format!("{:.3}", posterior_adverse),
+                posterior_alpha = %format!("{:.3}", posterior_alpha),
+                enhanced_imbalance = %format!("{:.3}", enhanced_imbalance),
+                "Enhanced edge estimator stats"
+            );
+        }
+
+        TheoreticalEdgeResult {
+            expected_edge_bps,
+            directional_edge_bps,
+            spread_edge_bps,
+            adverse_cost_bps,
+            fee_cost_bps,
+            btc_boost_bps,
+            p_correct,
+            should_quote,
+            direction,
+        }
+    }
+
     /// Quick check if edge signal is active (for warmup status)
     pub fn is_active(&self) -> bool {
         true // Always active - uses priors, no warmup needed
@@ -714,6 +995,65 @@ impl TheoreticalEdgeEstimator {
             // Still record fill for rate estimation, but don't update alpha
             self.fill_rate.on_fill(now_ms);
         }
+    }
+    
+    /// Update adverse selection tracker from fill outcome.
+    ///
+    /// Call this when determining if a fill was adverse (price moved against position).
+    ///
+    /// # Arguments
+    /// * `was_adverse` - True if price moved against position after fill
+    pub fn update_adverse(&mut self, was_adverse: bool) {
+        self.adverse_tracker.update(was_adverse);
+        
+        debug!(
+            was_adverse = was_adverse,
+            posterior_adverse = %format!("{:.3}", self.adverse_tracker.mean()),
+            total_fills = self.adverse_tracker.total_fills(),
+            "Adverse selection tracker updated"
+        );
+    }
+    
+    /// Update both alpha and adverse trackers from fill with full context.
+    ///
+    /// # Arguments
+    /// * `imbalance` - Book imbalance at quote time
+    /// * `fill_side` - Side of fill (1=bought, -1=sold)
+    /// * `price_change_bps` - Price change since fill (positive = up)
+    /// * `now_ms` - Timestamp
+    pub fn update_from_fill_complete(
+        &mut self,
+        imbalance: f64,
+        fill_side: i8,
+        price_change_bps: f64,
+        now_ms: u64,
+    ) {
+        // Update alpha tracker
+        let predicted_direction = if imbalance > 0.0 { 1i8 } else { -1 };
+        let actual_direction = if price_change_bps > 0.0 { 1i8 } else if price_change_bps < 0.0 { -1 } else { 0 };
+        
+        if actual_direction != 0 {
+            self.update_from_fill(imbalance, predicted_direction, actual_direction, now_ms);
+            
+            // Update adverse tracker
+            // Adverse = price moved against our position
+            // If we bought (fill_side=1) and price fell (actual_direction=-1) → adverse
+            // If we sold (fill_side=-1) and price rose (actual_direction=1) → adverse
+            let was_adverse = fill_side != actual_direction;
+            self.adverse_tracker.update(was_adverse);
+        } else {
+            self.fill_rate.on_fill(now_ms);
+        }
+    }
+    
+    /// Get Bayesian adverse selection probability (posterior mean).
+    pub fn bayesian_adverse(&self) -> f64 {
+        self.adverse_tracker.mean()
+    }
+    
+    /// Get adverse tracker stats.
+    pub fn adverse_stats(&self) -> (u64, u64) {
+        (self.adverse_tracker.total_fills(), self.adverse_tracker.adverse_fills())
     }
     
     /// Get current Bayesian alpha (posterior mean).
@@ -811,7 +1151,7 @@ impl TheoreticalEdgeEstimator {
     /// * `fill_size` - Size of the fill (for weighting)
     pub fn update_from_fill_weighted(
         &mut self,
-        imbalance: f64,
+        _imbalance: f64,
         predicted_direction: i8,
         actual_direction: i8,
         now_ms: u64,

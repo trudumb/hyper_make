@@ -1,0 +1,4 @@
+The config field quote_gate_flat_without_edge defaults to false for API budget conservation. This means the system will NOT quote unless it detects positive edge. Combined with:                          1. IR not calibrated (only ~350 outcomes)
+  2. Theoretical edge returning negative values (-2.18 bps)                                                                                                                                                
+                                                                                                                                                                                                           
+  Result: NO QUOTE is working as designed.

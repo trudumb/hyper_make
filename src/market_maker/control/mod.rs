@@ -56,7 +56,8 @@ pub use quote_gate::{
     QuoteGateConfig, QuoteGateInput, ProbeConfig,
 };
 pub use theoretical_edge::{
-    CrossAssetSignal, TheoreticalEdgeConfig, TheoreticalEdgeEstimator, TheoreticalEdgeResult,
+    BayesianAdverseTracker, CrossAssetSignal, EnhancedEdgeInput, TheoreticalEdgeConfig,
+    TheoreticalEdgeEstimator, TheoreticalEdgeResult,
 };
 pub use hybrid_ev::{
     DecisionSource, HybridEVConfig, HybridEVEstimator, HybridEVInput, HybridEVResult,
