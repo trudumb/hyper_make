@@ -10,6 +10,7 @@ use super::super::{
     QuotingStrategy, Side,
 };
 use crate::market_maker::control::{QuoteGateDecision, QuoteGateInput};
+use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
@@ -963,6 +964,86 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // === QUOTE GATE: Decide WHETHER to quote based on directional edge ===
         // This prevents whipsaw losses from random fills when we have no directional edge.
         // The gate uses flow_imbalance, momentum confidence, and position to decide.
+
+        // === Phase 1: Compute Enhanced Flow ===
+        // Enhanced flow uses multiple signals for better IR calibration variance
+        // Import BookLevel and TradeData types for conversion
+        use crate::market_maker::estimator::{BookLevel, TradeData};
+
+        let enhanced_flow_ctx = EnhancedFlowContext {
+            book_imbalance: market_params.book_imbalance,
+            // Wire cached L2 book sizes (top 5 levels) for depth imbalance calculation
+            bid_levels: self
+                .cached_bid_sizes
+                .iter()
+                .map(|&size| BookLevel { size })
+                .collect(),
+            ask_levels: self
+                .cached_ask_sizes
+                .iter()
+                .map(|&size| BookLevel { size })
+                .collect(),
+            // Wire cached trades for momentum calculation
+            recent_trades: self
+                .cached_trades
+                .iter()
+                .map(|&(size, is_buy, timestamp_ms)| TradeData {
+                    size,
+                    is_buy,
+                    timestamp_ms,
+                })
+                .collect(),
+            kappa_effective: market_params.kappa,
+            kappa_avg: self.stochastic.enhanced_flow.avg_kappa(),
+            spread_bps: market_params.market_spread_bps.max(1.0),
+            now_ms,
+        };
+        let enhanced_flow_result = self.stochastic.enhanced_flow.compute(&enhanced_flow_ctx);
+        let enhanced_flow = enhanced_flow_result.enhanced_flow;
+        // Update kappa EMA for future computations
+        self.stochastic.enhanced_flow.update_kappa(market_params.kappa);
+
+        // Log enhanced flow diagnostics when depth or momentum contribute
+        // This helps verify the L2/trade wiring is working
+        if enhanced_flow_result.depth_component.abs() > 0.01
+            || enhanced_flow_result.momentum_component.abs() > 0.01
+        {
+            debug!(
+                enhanced_flow = %format!("{:.3}", enhanced_flow),
+                base_flow = %format!("{:.3}", enhanced_flow_result.base_flow),
+                depth_component = %format!("{:.3}", enhanced_flow_result.depth_component),
+                momentum_component = %format!("{:.3}", enhanced_flow_result.momentum_component),
+                kappa_component = %format!("{:.3}", enhanced_flow_result.kappa_component),
+                flow_variance = %format!("{:.4}", enhanced_flow_result.flow_variance),
+                bid_levels = self.cached_bid_sizes.len(),
+                ask_levels = self.cached_ask_sizes.len(),
+                recent_trades = self.cached_trades.len(),
+                "Enhanced flow with L2/trade data"
+            );
+        }
+
+        // === Phase 3: Compute MC EV for kappa-driven override ===
+        // Only compute when IR not calibrated and kappa is strong
+        let mc_ev_bps = if market_params.kappa > 1500.0 && !self.stochastic.calibrated_edge.is_useful() {
+            let mc_result = self.stochastic.mc_simulator.simulate_ev(
+                market_params.kappa,
+                enhanced_flow,
+                market_params.market_spread_bps.max(1.0),
+                1.0, // 1 second horizon
+            );
+            Some(mc_result.expected_ev_bps)
+        } else {
+            None
+        };
+
+        // === Phase 3: Compute kappa-driven spread ===
+        // Uses fill intensity to dynamically adjust spread (higher kappa → tighter spread)
+        let kappa_spread_result = self.stochastic.kappa_spread.compute_spread(
+            market_params.market_spread_bps.max(5.0), // Use market spread as base, floor at 5 bps
+            market_params.kappa,
+        );
+        market_params.kappa_spread_bps = Some(kappa_spread_result.spread_bps);
+
         let quote_gate_input = QuoteGateInput {
             flow_imbalance: market_params.flow_imbalance,
             momentum_confidence: market_params.p_momentum_continue,
@@ -976,6 +1057,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             spread_bps: market_params.market_spread_bps.max(1.0), // Floor to 1 bps
             sigma: market_params.sigma,
             tau_seconds: 1.0, // Default holding horizon of 1 second
+            // Fields for enhanced flow and kappa-driven decisions
+            kappa_effective: market_params.kappa,
+            enhanced_flow,
+            mc_ev_bps,
         };
 
         // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds

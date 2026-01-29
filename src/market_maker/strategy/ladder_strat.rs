@@ -638,6 +638,25 @@ impl LadderStrategy {
             }
         }
 
+        // === KAPPA-DRIVEN SPREAD CAP (Phase 3) ===
+        // When kappa is high (lots of fill intensity), cap spreads to be tighter.
+        // This allows us to be more aggressive when the market is active.
+        if let Some(kappa_cap_bps) = market_params.kappa_spread_bps {
+            // Only apply if kappa cap is meaningful (above floor)
+            if kappa_cap_bps > effective_floor_bps {
+                for depth in dynamic_depths.bid.iter_mut() {
+                    if *depth > kappa_cap_bps {
+                        *depth = kappa_cap_bps;
+                    }
+                }
+                for depth in dynamic_depths.ask.iter_mut() {
+                    if *depth > kappa_cap_bps {
+                        *depth = kappa_cap_bps;
+                    }
+                }
+            }
+        }
+
         // === REMOVED: L2 SPREAD MULTIPLIER ===
         // The l2_spread_multiplier has been removed. All uncertainty is now handled
         // through gamma scaling (kappa_ci_width flows through uncertainty_scalar).
@@ -678,6 +697,7 @@ impl LadderStrategy {
                 .and_then(|d| d.spread_at_touch())
                 .unwrap_or(0.0)),
             effective_floor_bps = %format!("{:.1}", effective_floor_bps),
+            kappa_spread_cap_bps = %format!("{:.1}", market_params.kappa_spread_bps.unwrap_or(0.0)),
             book_depth_usd = %format!("{:.0}", market_params.near_touch_depth_usd),
             warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
             adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,

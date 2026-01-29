@@ -11,7 +11,12 @@ use crate::market_maker::{
         QuoteGate, StochasticController, StochasticControllerConfig,
         TheoreticalEdgeEstimator,
     },
-    estimator::{CalibrationController, CalibrationControllerConfig, RegimeHMM},
+    estimator::{
+        CalibrationController, CalibrationControllerConfig, RegimeHMM,
+        EnhancedFlowConfig, EnhancedFlowEstimator,
+    },
+    quoting::{KappaSpreadConfig, KappaSpreadController},
+    simulation::{QuickMCConfig, QuickMCSimulator},
     execution::{FillTracker, OrderLifecycleTracker},
     fills::FillProcessor,
     infra::{
@@ -421,6 +426,19 @@ pub struct StochasticComponents {
     /// Theoretical edge estimator.
     /// Uses market microstructure priors when IR not calibrated.
     pub theoretical_edge: TheoreticalEdgeEstimator,
+
+    // === Enhanced Flow and MC Simulation (Phase 1-3) ===
+    /// Enhanced flow estimator: multi-feature composite flow signal.
+    /// Provides varied confidence values for better IR calibration.
+    pub enhanced_flow: EnhancedFlowEstimator,
+
+    /// Quick MC simulator: fast Monte Carlo EV estimation.
+    /// Used for proactive quoting decisions when IR not calibrated.
+    pub mc_simulator: QuickMCSimulator,
+
+    /// Kappa-driven spread controller: dynamic spread adjustment.
+    /// Tightens spreads when fill intensity is high.
+    pub kappa_spread: KappaSpreadController,
 }
 
 impl StochasticComponents {
@@ -505,6 +523,10 @@ impl StochasticComponents {
             position_pnl: PositionPnLTracker::new(PositionPnLConfig::default()),
             // Theoretical edge for fallback when IR not calibrated
             theoretical_edge: TheoreticalEdgeEstimator::new(),
+            // Enhanced flow and MC simulation (Phase 1-3)
+            enhanced_flow: EnhancedFlowEstimator::new(EnhancedFlowConfig::default()),
+            mc_simulator: QuickMCSimulator::new(QuickMCConfig::default()),
+            kappa_spread: KappaSpreadController::new(KappaSpreadConfig::default()),
         }
     }
     

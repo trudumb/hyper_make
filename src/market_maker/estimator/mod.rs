@@ -32,6 +32,7 @@ mod book_kappa;
 mod calibration_controller;
 mod covariance;
 mod directional_risk;
+pub mod enhanced_flow;
 pub mod fill_rate_model;
 mod hierarchical_kappa;
 pub mod informed_flow;
@@ -82,6 +83,10 @@ pub use directional_risk::{
 pub use fill_rate_model::{
     FillObservation, FillRateConfig, FillRateModel, FillRateStatistics,
     MarketState as FillRateMarketState,
+};
+pub use enhanced_flow::{
+    BookLevel, EnhancedFlowConfig, EnhancedFlowContext, EnhancedFlowEstimator, EnhancedFlowResult,
+    TradeData,
 };
 pub use informed_flow::{
     ComponentParams, FlowDecomposition, InformedFlowConfig, InformedFlowEstimator, TradeFeatures,

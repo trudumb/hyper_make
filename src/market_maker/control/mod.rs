@@ -33,6 +33,7 @@ pub mod belief;
 pub mod calibrated_edge;
 pub mod changepoint;
 pub mod controller;
+pub mod hybrid_ev;
 pub mod information;
 pub mod interface;
 pub mod position_pnl_tracker;
@@ -56,6 +57,9 @@ pub use quote_gate::{
 };
 pub use theoretical_edge::{
     CrossAssetSignal, TheoreticalEdgeConfig, TheoreticalEdgeEstimator, TheoreticalEdgeResult,
+};
+pub use hybrid_ev::{
+    DecisionSource, HybridEVConfig, HybridEVEstimator, HybridEVInput, HybridEVResult,
 };
 pub use controller::{ControllerConfig, OptimalController};
 pub use information::{InformationConfig, InformationValue};

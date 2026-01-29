@@ -6,6 +6,7 @@
 //! - Fill simulation based on market data
 //! - Prediction logging for calibration analysis
 //! - Outcome attribution for PnL decomposition
+//! - Quick Monte Carlo EV simulation for proactive quoting
 //!
 //! # Architecture
 //!
@@ -27,6 +28,7 @@ pub mod executor;
 pub mod fill_sim;
 pub mod outcome;
 pub mod prediction;
+pub mod quick_mc;
 
 pub use calibration::{
     BrierDecomposition, CalibrationAnalyzer, CalibrationCurve, ConditionalSlice,
@@ -38,3 +40,4 @@ pub use prediction::{
     LevelPrediction, MarketStateSnapshot, ModelPredictions, ObservedOutcomes, PredictionLogger,
     PredictionRecord,
 };
+pub use quick_mc::{MCSimulationResult, QuickMCConfig, QuickMCSimulator};

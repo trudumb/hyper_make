@@ -463,6 +463,9 @@ impl ParameterAggregator {
                 .stochastic_config
                 .proactive_min_momentum_confidence,
             proactive_min_momentum_bps: sources.stochastic_config.proactive_min_momentum_bps,
+
+            // Kappa-Driven Spread (Phase 3) - computed separately in quote_engine
+            kappa_spread_bps: None,
         }
     }
 }

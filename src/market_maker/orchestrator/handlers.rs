@@ -101,6 +101,31 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let _result = messages::process_trades(&trades, &ctx, &mut state)?;
 
+        // Cache trades for EnhancedFlowContext momentum calculation
+        // Buffer recent trades (size, is_buy, timestamp_ms) for the quote engine
+        const MAX_CACHED_TRADES: usize = 500;
+        for trade in &trades.data {
+            // Filter to our asset
+            if trade.coin != *self.config.asset {
+                continue;
+            }
+            // Parse trade data
+            let size: f64 = trade.sz.parse().unwrap_or(0.0);
+            if size <= 0.0 {
+                continue;
+            }
+            let is_buy = trade.side == "B";
+            let timestamp_ms = trade.time;
+
+            // Add to buffer
+            self.cached_trades.push_back((size, is_buy, timestamp_ms));
+
+            // Keep bounded
+            while self.cached_trades.len() > MAX_CACHED_TRADES {
+                self.cached_trades.pop_front();
+            }
+        }
+
         // === Phase 2/3 Component Updates ===
         // Update regime HMM with trade observation for soft regime blending
         let obs = HmmObservation::new(
@@ -382,6 +407,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Parse L2 data for dashboard and adaptive spreads
         // Recording is unconditional for dashboard; adaptive spreads only when valid
         if let Some((bids, asks)) = Self::parse_l2_for_adaptive(&l2_book.data.levels) {
+            // Cache top 5 bid/ask sizes for EnhancedFlowContext
+            // This enables depth imbalance calculation in the quote engine
+            self.cached_bid_sizes = bids.iter().take(5).map(|(_, sz)| *sz).collect();
+            self.cached_ask_sizes = asks.iter().take(5).map(|(_, sz)| *sz).collect();
+
             // Record book snapshot for dashboard unconditionally
             // This ensures dashboard shows data even during warmup
             self.infra

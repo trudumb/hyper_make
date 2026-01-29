@@ -33,7 +33,7 @@
 
 use tracing::trace;
 
-use crate::market_maker::calibration::InformationRatioTracker;
+use crate::market_maker::calibration::AdaptiveBinner;
 
 /// Number of regimes tracked (calm=0, volatile=1, cascade=2).
 pub const NUM_REGIMES: usize = 3;
@@ -188,8 +188,8 @@ struct EdgePrediction {
 /// Information Ratio as the principled threshold (IR > 1.0).
 #[derive(Debug)]
 pub struct CalibratedEdgeSignal {
-    /// Per-regime IR trackers.
-    ir_by_regime: [InformationRatioTracker; NUM_REGIMES],
+    /// Per-regime IR trackers using adaptive quantile-based binning.
+    ir_by_regime: [AdaptiveBinner; NUM_REGIMES],
 
     /// Pending predictions awaiting outcome measurement.
     pending: Vec<EdgePrediction>,
@@ -225,11 +225,12 @@ impl CalibratedEdgeSignal {
         bayesian_config: BayesianIRConfig,
     ) -> Self {
         let n_bins = config.ir_n_bins;
+        let max_samples = 500; // Rolling buffer size for adaptive binning
         Self {
             ir_by_regime: [
-                InformationRatioTracker::new(n_bins),
-                InformationRatioTracker::new(n_bins),
-                InformationRatioTracker::new(n_bins),
+                AdaptiveBinner::new(n_bins, max_samples),
+                AdaptiveBinner::new(n_bins, max_samples),
+                AdaptiveBinner::new(n_bins, max_samples),
             ],
             pending: Vec::with_capacity(config.max_pending),
             next_id: 1,

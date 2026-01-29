@@ -46,7 +46,8 @@
       "WebFetch(domain:people.orie.cornell.edu)",
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:www.quantbeckman.com)",
-      "Bash(__NEW_LINE_f271302b2f8bb747__ echo \"\")"
+      "Bash(__NEW_LINE_f271302b2f8bb747__ echo \"\")",
+      "mcp__serena__create_text_file"
     ]
   }
 }

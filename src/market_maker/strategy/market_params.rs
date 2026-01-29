@@ -595,6 +595,12 @@ pub struct MarketParams {
     /// Minimum momentum magnitude (bps) to apply proactive skew.
     /// Below this threshold, proactive skew is 0.
     pub proactive_min_momentum_bps: f64,
+
+    // ==================== Kappa-Driven Spread (Phase 3) ====================
+    /// Kappa-driven spread target (bps).
+    /// When kappa is high, spread can be tighter. Used to cap GLFT optimal spread.
+    /// None = no kappa spread adjustment applied.
+    pub kappa_spread_bps: Option<f64>,
 }
 
 impl Default for MarketParams {
@@ -777,6 +783,8 @@ impl Default for MarketParams {
             proactive_skew_sensitivity: 2.0,         // 2 bps per unit momentum×confidence
             proactive_min_momentum_confidence: 0.6,  // Need 60% confidence
             proactive_min_momentum_bps: 5.0,         // Need 5 bps minimum momentum
+            // Kappa-Driven Spread (Phase 3)
+            kappa_spread_bps: None, // No kappa spread cap until computed
         }
     }
 }

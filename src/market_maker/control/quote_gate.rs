@@ -246,6 +246,23 @@ pub struct QuoteGateInput {
     /// Expected holding time in seconds.
     /// Used in expected value calculations.
     pub tau_seconds: f64,
+
+    // === Fields for enhanced flow and kappa-driven decisions ===
+
+    /// Current kappa (fill intensity) estimate.
+    /// Used for MC simulation and kappa-driven spread adjustment.
+    /// Default: 1000.0
+    pub kappa_effective: f64,
+
+    /// Enhanced flow signal [-1, +1].
+    /// Multi-feature composite flow imbalance for IR calibration.
+    /// Default: 0.0 (uses book_imbalance as fallback)
+    pub enhanced_flow: f64,
+
+    /// Optional MC simulation EV result (bps).
+    /// If Some, can be used to override conservative decisions.
+    /// Default: None
+    pub mc_ev_bps: Option<f64>,
 }
 
 impl Default for QuoteGateInput {
@@ -262,6 +279,9 @@ impl Default for QuoteGateInput {
             spread_bps: 10.0,
             sigma: 0.001,
             tau_seconds: 1.0,
+            kappa_effective: 1000.0,
+            enhanced_flow: 0.0,
+            mc_ev_bps: None,
         }
     }
 }
@@ -800,6 +820,23 @@ impl QuoteGate {
                 "IR is_useful=true with meaningful data - respecting decision"
             );
             return ir_decision;
+        }
+
+        // === Phase 3: MC Override ===
+        // If Monte Carlo simulation says to quote AND kappa is strong, override conservative decision.
+        // This helps break the vicious cycle: more fills → better IR calibration.
+        const MC_KAPPA_THRESHOLD: f64 = 2000.0;
+        const MC_EV_THRESHOLD_BPS: f64 = 0.2;
+
+        if let Some(mc_ev) = input.mc_ev_bps {
+            if input.kappa_effective > MC_KAPPA_THRESHOLD && mc_ev > MC_EV_THRESHOLD_BPS {
+                info!(
+                    kappa_effective = %format!("{:.0}", input.kappa_effective),
+                    mc_ev_bps = %format!("{:.2}", mc_ev),
+                    "MC override: quoting based on kappa strength and positive MC EV"
+                );
+                return QuoteDecision::QuoteBoth;
+            }
         }
 
         // IR is NOT calibrated → use theoretical edge as fallback

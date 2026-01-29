@@ -175,6 +175,18 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     // === Session Tracking ===
     /// Session start time for controller terminal condition handling
     session_start_time: std::time::Instant,
+
+    // === L2 Book & Trade Cache (for EnhancedFlowContext) ===
+    /// Cached L2 bid sizes (top 5 levels) for EnhancedFlowContext depth imbalance.
+    /// Updated by handle_l2_book().
+    cached_bid_sizes: Vec<f64>,
+    /// Cached L2 ask sizes (top 5 levels) for EnhancedFlowContext depth imbalance.
+    /// Updated by handle_l2_book().
+    cached_ask_sizes: Vec<f64>,
+    /// Recent trades buffer for EnhancedFlowContext momentum calculation.
+    /// Stores (size, is_buy, timestamp_ms). Updated by handle_trades().
+    /// Bounded to MAX_CACHED_TRADES entries.
+    cached_trades: std::collections::VecDeque<(f64, bool, u64)>,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -294,6 +306,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_high_risk_state: false,
             learning: learning::LearningModule::default(),
             session_start_time: std::time::Instant::now(),
+            // L2 book & trade cache for EnhancedFlowContext
+            cached_bid_sizes: Vec::with_capacity(5),
+            cached_ask_sizes: Vec::with_capacity(5),
+            cached_trades: std::collections::VecDeque::with_capacity(500),
         }
     }
 

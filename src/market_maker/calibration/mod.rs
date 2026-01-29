@@ -14,12 +14,14 @@
 //! 3. **Regime Awareness**: All metrics can be sliced by regime for conditional analysis
 //! 4. **Thread Safety**: All structs are Send + Sync for concurrent access
 
+pub mod adaptive_binning;
 mod brier_score;
 mod coefficient_estimator;
 mod conditional_metrics;
 mod information_ratio;
 mod prediction_log;
 
+pub use adaptive_binning::AdaptiveBinner;
 pub use brier_score::BrierScoreTracker;
 pub use coefficient_estimator::{CalibrationSample, CoefficientEstimator, CoefficientEstimatorConfig};
 pub use conditional_metrics::ConditionalCalibration;
