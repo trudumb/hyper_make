@@ -971,17 +971,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             max_position: self.effective_max_position,
             is_warmup: !self.estimator.is_warmed_up(),
             cascade_size_factor: market_params.cascade_size_factor,
+            // Fields for theoretical edge calculation
+            book_imbalance: market_params.book_imbalance,
+            spread_bps: market_params.market_spread_bps.max(1.0), // Floor to 1 bps
+            sigma: market_params.sigma,
+            tau_seconds: 1.0, // Default holding horizon of 1 second
         };
 
-        // Use calibrated decision if enabled, otherwise use legacy thresholds
+        // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds
         let changepoint_prob = self.stochastic.controller.changepoint_summary().cp_prob_5;
         let quote_gate_decision = if self.stochastic.stochastic_config.enable_calibrated_quote_gate
         {
-            self.stochastic.quote_gate.decide_calibrated(
+            // Use theoretical edge fallback when IR not calibrated
+            self.stochastic.quote_gate.decide_with_theoretical_fallback(
                 &quote_gate_input,
                 &self.stochastic.calibrated_edge,
                 &self.stochastic.position_pnl,
                 changepoint_prob,
+                &mut self.stochastic.theoretical_edge,
             )
         } else {
             self.stochastic.quote_gate.decide(&quote_gate_input)

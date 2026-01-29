@@ -39,6 +39,7 @@ pub mod position_pnl_tracker;
 pub mod quote_gate;
 pub mod simulation;
 pub mod state;
+pub mod theoretical_edge;
 pub mod traits;
 pub mod types;
 pub mod value;
@@ -52,6 +53,9 @@ pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, Positi
 pub use quote_gate::{
     NoQuoteReason as QuoteGateNoQuoteReason, QuoteDecision as QuoteGateDecision, QuoteGate,
     QuoteGateConfig, QuoteGateInput,
+};
+pub use theoretical_edge::{
+    CrossAssetSignal, TheoreticalEdgeConfig, TheoreticalEdgeEstimator, TheoreticalEdgeResult,
 };
 pub use controller::{ControllerConfig, OptimalController};
 pub use information::{InformationConfig, InformationValue};

@@ -402,6 +402,23 @@ impl RegimeHMM {
     }
 
     /// Convert HMM belief state to the existing RegimeBeliefState type.
+    ///
+    /// This enables integration with `RegimeParameterBlender` for soft parameter blending:
+    /// ```ignore
+    /// let belief = hmm.to_belief_state();
+    /// let blended = blender.blend_all(&belief);
+    /// // Use blended.gamma, blended.kappa in GLFT calculation
+    /// ```
+    ///
+    /// # Future Integration
+    ///
+    /// This method is the integration point for connecting HMM regime detection
+    /// to the quote engine's parameter blending. Full wiring will create a
+    /// `RegimeAwareQuoteEngine` that:
+    /// 1. Holds `RegimeHMM` and `RegimeParameterBlender`
+    /// 2. On each update, calls `hmm.to_belief_state()` → `blender.blend_all()`
+    /// 3. Uses blended gamma/kappa in GLFT calculation
+    #[allow(dead_code)] // Reserved for future HMM → parameter blending integration
     pub(crate) fn to_belief_state(&self) -> RegimeBeliefState {
         RegimeBeliefState {
             p_low: self.belief[regime_idx::LOW],

@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 
 use super::calibrated_edge::{BayesianDecision, CalibratedEdgeSignal};
 use super::position_pnl_tracker::PositionPnLTracker;
+use super::theoretical_edge::TheoreticalEdgeEstimator;
 
 /// Quote decision from the Quote Gate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,6 +182,43 @@ pub struct QuoteGateInput {
     /// Cascade size factor [0, 1].
     /// 1.0 = no cascade, 0.0 = full cascade.
     pub cascade_size_factor: f64,
+
+    // === Fields for theoretical edge calculation ===
+    
+    /// Book imbalance signal [-1, +1].
+    /// Positive = more bid depth (bullish), Negative = more ask depth (bearish).
+    /// Used for theoretical edge estimation when IR not calibrated.
+    pub book_imbalance: f64,
+
+    /// Current bid-ask spread in basis points.
+    /// Used to calculate spread capture edge.
+    pub spread_bps: f64,
+
+    /// Current volatility estimate (fractional, e.g., 0.001 = 0.1%).
+    /// Used to estimate expected price movements.
+    pub sigma: f64,
+
+    /// Expected holding time in seconds.
+    /// Used in expected value calculations.
+    pub tau_seconds: f64,
+}
+
+impl Default for QuoteGateInput {
+    fn default() -> Self {
+        Self {
+            flow_imbalance: 0.0,
+            momentum_confidence: 0.5,
+            momentum_bps: 0.0,
+            position: 0.0,
+            max_position: 1.0,
+            is_warmup: false,
+            cascade_size_factor: 1.0,
+            book_imbalance: 0.0,
+            spread_bps: 10.0,
+            sigma: 0.001,
+            tau_seconds: 1.0,
+        }
+    }
 }
 
 /// The Quote Gate.
@@ -485,7 +523,7 @@ impl QuoteGate {
 
         // 5. Check if we have directional edge using IR
         // Either use Bayesian warmup (P(IR > 1.0) > tiered_threshold) or fixed threshold
-        let (has_edge, signal_weight, _bayesian_reason) = if self.config.use_bayesian_warmup {
+        let (has_edge, signal_weight, bayesian_decision): (bool, f64, Option<BayesianDecision>) = if self.config.use_bayesian_warmup {
             // Use Bayesian IR check with L2-adjusted prior
             // l2_confidence derived from momentum_confidence (as proxy)
             let l2_confidence = input.momentum_confidence.clamp(0.5, 1.0);
@@ -513,7 +551,7 @@ impl QuoteGate {
             } else {
                 0.0
             };
-            (decision.is_useful, weight, decision.reason)
+            (decision.is_useful, weight, Some(decision))
         } else {
             // Legacy: fixed sample count threshold
             let has_edge = edge_signal.is_useful();
@@ -528,8 +566,21 @@ impl QuoteGate {
             } else {
                 has_edge && signal_weight > 0.0
             };
-            (has_edge, signal_weight, "legacy".to_string())
+            (has_edge, signal_weight, None)
         };
+
+        // Log BayesianDecision diagnostics when available
+        if let Some(decision) = &bayesian_decision {
+            debug!(
+                bayesian_is_useful = decision.is_useful,
+                bayesian_posterior_prob = %format!("{:.3}", decision.posterior_prob),
+                bayesian_credible_lower = %format!("{:.3}", decision.credible_lower),
+                bayesian_post_mu = %format!("{:.3}", decision.post_mu),
+                bayesian_stopped_out = decision.stopped_out,
+                bayesian_reason = %decision.reason,
+                "BayesianDecision diagnostics"
+            );
+        }
 
         // Determine if position is significant (using derived threshold)
         let has_significant_position = position_abs_ratio >= position_threshold;
@@ -630,6 +681,137 @@ impl QuoteGate {
 
         decision
     }
+
+    /// Make a quote decision with theoretical edge fallback.
+    ///
+    /// This extends `decide_calibrated` by falling back to the theoretical edge model
+    /// when the IR-based edge signal is not yet calibrated. This solves the bootstrap
+    /// problem on illiquid assets where price rarely moves enough for IR calibration.
+    ///
+    /// ## Fallback Logic
+    ///
+    /// When IR is not calibrated (insufficient samples), instead of returning NoQuote,
+    /// we compute expected edge from book_imbalance using market microstructure theory:
+    ///
+    /// E[value] = spread/2 + σ√τ × (P(correct) - 0.5) - σ√τ × P(adverse)
+    ///
+    /// Where P(correct) = 0.50 + α × |book_imbalance| (α ≈ 0.25 from literature).
+    ///
+    /// # Arguments
+    /// * `input` - Standard quote gate input (extended with book_imbalance, spread, sigma, tau)
+    /// * `edge_signal` - Calibrated edge signal tracker
+    /// * `pnl_tracker` - Position P&L tracker for thresholds
+    /// * `changepoint_prob` - Bayesian changepoint probability
+    /// * `theoretical_edge` - Theoretical edge estimator for fallback
+    ///
+    /// # Returns
+    /// `QuoteDecision` using IR if calibrated, otherwise theoretical edge
+    pub fn decide_with_theoretical_fallback(
+        &self,
+        input: &QuoteGateInput,
+        edge_signal: &CalibratedEdgeSignal,
+        pnl_tracker: &PositionPnLTracker,
+        changepoint_prob: f64,
+        theoretical_edge: &mut TheoreticalEdgeEstimator,
+    ) -> QuoteDecision {
+        // First, try the IR-based decision
+        let ir_decision = self.decide_calibrated(input, edge_signal, pnl_tracker, changepoint_prob);
+
+        // If IR says we should quote, trust it
+        match &ir_decision {
+            QuoteDecision::QuoteBoth
+            | QuoteDecision::QuoteOnlyBids { .. }
+            | QuoteDecision::QuoteOnlyAsks { .. } => {
+                return ir_decision;
+            }
+            QuoteDecision::NoQuote { reason } => {
+                // Only fall back on NoEdgeFlat when IR isn't calibrated
+                if *reason != NoQuoteReason::NoEdgeFlat {
+                    return ir_decision;
+                }
+            }
+        }
+
+        // IR returned NoQuote with NoEdgeFlat reason
+        // Only trust IR if it's actually USEFUL (has detected statistically significant patterns)
+        // On illiquid assets, IR may have 100+ samples but all are "no price movement" → useless
+        if edge_signal.is_useful() {
+            // IR has detected statistically significant edge patterns → trust it
+            debug!(
+                total_outcomes = edge_signal.total_outcomes(),
+                "IR is_useful=true and says no edge - respecting decision"
+            );
+            return ir_decision;
+        }
+
+        // IR is NOT calibrated → use theoretical edge as fallback
+        let theoretical_result = theoretical_edge.calculate_edge(
+            input.book_imbalance,
+            input.spread_bps,
+            input.sigma,
+            input.tau_seconds,
+        );
+
+        info!(
+            expected_edge_bps = %format!("{:.2}", theoretical_result.expected_edge_bps),
+            p_correct = %format!("{:.2}", theoretical_result.p_correct),
+            book_imbalance = %format!("{:.3}", input.book_imbalance),
+            spread_bps = %format!("{:.1}", input.spread_bps),
+            should_quote = theoretical_result.should_quote,
+            direction = theoretical_result.direction,
+            ir_samples = edge_signal.total_outcomes(),
+            "Theoretical edge fallback (IR not calibrated)"
+        );
+
+        if !theoretical_result.should_quote {
+            // Even theoretical edge says no
+            return QuoteDecision::NoQuote {
+                reason: NoQuoteReason::NoEdgeFlat,
+            };
+        }
+
+        // Theoretical edge is positive → quote in that direction
+        // Compute position-based urgency
+        let position_ratio = if input.max_position > 0.0 {
+            (input.position / input.max_position).abs()
+        } else {
+            0.0
+        };
+
+        // Check if position would benefit from the edge direction
+        let position_aligned = (input.position > 0.0 && theoretical_result.direction > 0)
+            || (input.position < 0.0 && theoretical_result.direction < 0);
+
+        // If we have a large position opposing the edge, reduce-only mode
+        if position_ratio > 0.3 && !position_aligned && input.position.abs() > 0.0 {
+            let urgency = (position_ratio * 0.8).min(1.0);
+            if input.position > 0.0 {
+                return QuoteDecision::QuoteOnlyAsks { urgency };
+            } else {
+                return QuoteDecision::QuoteOnlyBids { urgency };
+            }
+        }
+
+        // Standard case: quote based on theoretical edge direction
+        match theoretical_result.direction {
+            1 => {
+                // Bullish edge - we want to buy
+                // Quote both sides but will skew toward bids
+                QuoteDecision::QuoteBoth
+            }
+            -1 => {
+                // Bearish edge - we want to sell  
+                // Quote both sides but will skew toward asks
+                QuoteDecision::QuoteBoth
+            }
+            _ => {
+                // Neutral (shouldn't happen if should_quote is true)
+                QuoteDecision::NoQuote {
+                    reason: NoQuoteReason::NoEdgeFlat,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -638,13 +820,8 @@ mod tests {
 
     fn default_input() -> QuoteGateInput {
         QuoteGateInput {
-            flow_imbalance: 0.0,
-            momentum_confidence: 0.5,
-            momentum_bps: 0.0,
-            position: 0.0,
-            max_position: 100.0,
-            is_warmup: false,
-            cascade_size_factor: 1.0,
+            max_position: 100.0,  // Override for test consistency
+            ..Default::default()
         }
     }
 

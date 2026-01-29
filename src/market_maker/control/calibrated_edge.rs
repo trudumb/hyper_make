@@ -31,6 +31,8 @@
 //!
 //! No arbitrary 0.15 or 0.45 thresholds - only information theory.
 
+use tracing::trace;
+
 use crate::market_maker::calibration::InformationRatioTracker;
 
 /// Number of regimes tracked (calm=0, volatile=1, cascade=2).
@@ -332,6 +334,18 @@ impl CalibratedEdgeSignal {
             // Use sigmoid-like mapping: p = 0.5 + 0.5 * tanh(imbalance * scale)
             // This maps |imbalance| = 0 → p = 0.5, |imbalance| = 1 → p ≈ 0.88
             let prob = 0.5 + 0.5 * (pred.flow_imbalance.abs() * 2.0).tanh();
+
+            // Log the prediction outcome with its unique ID for traceability
+            trace!(
+                prediction_id = pred.id,
+                flow_imbalance = %format!("{:.3}", pred.flow_imbalance),
+                price_change_bps = %format!("{:.2}", price_change_bps),
+                predicted_up = predicted_up,
+                actual_up = actual_up,
+                correct = correct,
+                regime = pred.regime,
+                "Edge prediction outcome"
+            );
 
             // Record to the appropriate regime tracker
             self.ir_by_regime[pred.regime].update(prob, correct);

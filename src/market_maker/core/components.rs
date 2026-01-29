@@ -9,6 +9,7 @@ use crate::market_maker::{
     control::{
         CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
         QuoteGate, StochasticController, StochasticControllerConfig,
+        TheoreticalEdgeEstimator,
     },
     estimator::{CalibrationController, CalibrationControllerConfig, RegimeHMM},
     execution::{FillTracker, OrderLifecycleTracker},
@@ -416,6 +417,10 @@ pub struct StochasticComponents {
     /// Position P&L tracker.
     /// Derives position thresholds from actual P&L data.
     pub position_pnl: PositionPnLTracker,
+
+    /// Theoretical edge estimator.
+    /// Uses market microstructure priors when IR not calibrated.
+    pub theoretical_edge: TheoreticalEdgeEstimator,
 }
 
 impl StochasticComponents {
@@ -498,6 +503,8 @@ impl StochasticComponents {
             // Calibrated thresholds (IR-based)
             calibrated_edge: CalibratedEdgeSignal::new(CalibratedEdgeConfig::default()),
             position_pnl: PositionPnLTracker::new(PositionPnLConfig::default()),
+            // Theoretical edge for fallback when IR not calibrated
+            theoretical_edge: TheoreticalEdgeEstimator::new(),
         }
     }
 }

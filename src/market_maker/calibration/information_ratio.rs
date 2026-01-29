@@ -335,7 +335,8 @@ impl InformationRatioTracker {
         // Variance of IR estimator: Var(IR̂) ≈ (1 + IR²/2) / n_eff
         // This is the asymptotic variance for Sharpe-like ratios
         let ir_var = (1.0 + ir_hat.powi(2) / 2.0) / n_eff;
-        let ir_se = ir_var.sqrt();
+        // Note: ir_se computed here but used only in combined posterior_var calculation below
+        let _ir_se = ir_var.sqrt();
 
         // Add prior variance contribution (inverse-variance weighting)
         let prior_var = if prior_df > 2.0 {
@@ -406,6 +407,20 @@ impl InformationRatioTracker {
         (lower.max(0.0), upper)
     }
 
+    /// Get the standard error of the IR estimate.
+    ///
+    /// Uses the asymptotic variance formula: Var(IR̂) ≈ (1 + IR²/2) / n_eff
+    /// Returns infinity if insufficient samples (n_eff < 2).
+    pub fn ir_standard_error(&self) -> f64 {
+        let n_eff = self.effective_sample_size();
+        if n_eff < 2.0 {
+            return f64::INFINITY;
+        }
+        let ir_hat = self.information_ratio();
+        let ir_var = (1.0 + ir_hat.powi(2) / 2.0) / n_eff;
+        ir_var.sqrt()
+    }
+
     /// Get posterior mean IR (with shrinkage).
     pub fn posterior_mean_ir(&self, prior_mean: f64, prior_df: f64) -> f64 {
         let n_eff = self.effective_sample_size();
@@ -444,6 +459,9 @@ impl InformationRatioTracker {
     ///
     /// Uses the approximation: t_cdf(x, df) ≈ Φ(x × √((df-2)/df)) for moderate df
     /// For small df, uses more conservative approximation.
+    ///
+    /// Note: This helper is kept for API completeness alongside approx_t_cdf.
+    #[allow(dead_code)]
     fn approx_t_cdf_upper(t: f64, df: f64) -> f64 {
         1.0 - Self::approx_t_cdf(t, df)
     }

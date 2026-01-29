@@ -111,7 +111,12 @@ impl VolatilityRegime {
 ///
 /// Key insight: Single parameter values are almost always wrong. Use the belief state
 /// to blend parameters based on regime probabilities.
-#[allow(dead_code)]
+///
+/// Integration path with `RegimeHMM`:
+/// ```ignore
+/// let belief = hmm.to_belief_state();
+/// let blended = blender.blend_all(&belief);
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RegimeBeliefState {
     /// Probability of Low (calm) regime
@@ -136,7 +141,6 @@ impl Default for RegimeBeliefState {
     }
 }
 
-#[allow(dead_code)]
 impl RegimeBeliefState {
     /// Create belief state from hard regime (all probability on one state).
     pub(crate) fn from_regime(regime: VolatilityRegime) -> Self {
