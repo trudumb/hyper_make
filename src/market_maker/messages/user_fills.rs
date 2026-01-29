@@ -198,6 +198,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -217,6 +218,7 @@ mod tests {
             stochastic_controller: &mut stochastic_controller,
             position_pnl: &mut position_pnl,
             fee_bps: 1.5,
+            theoretical_edge: &mut theoretical_edge,
         };
 
         // Create fill for wrong asset
@@ -270,6 +272,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -289,6 +292,7 @@ mod tests {
             stochastic_controller: &mut stochastic_controller,
             position_pnl: &mut position_pnl,
             fee_bps: 1.5,
+            theoretical_edge: &mut theoretical_edge,
         };
 
         let user_fills = UserFills {

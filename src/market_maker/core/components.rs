@@ -507,7 +507,35 @@ impl StochasticComponents {
             theoretical_edge: TheoreticalEdgeEstimator::new(),
         }
     }
+    
+    /// Synchronize volatility regime across all components.
+    ///
+    /// Call this periodically (e.g., each quote cycle) with the current regime
+    /// from `BeliefState.most_likely_regime()` or `RegimeHMM`.
+    ///
+    /// This ensures `TheoreticalEdgeEstimator` learns regime-specific alpha.
+    pub fn sync_regime(&mut self, regime: usize) {
+        self.theoretical_edge.set_regime(regime);
+    }
+    
+    /// Handle changepoint detection.
+    ///
+    /// Call this when `StochasticController.changepoint.should_reset_beliefs()` is true.
+    /// Decays alpha posteriors toward prior to "forget" old regime data.
+    ///
+    /// # Arguments
+    /// * `retention` - Fraction of posterior to keep (0.3 recommended)
+    /// * `all_regimes` - If true, decay all regimes; if false, only current
+    pub fn on_changepoint(&mut self, retention: f64, all_regimes: bool) {
+        self.theoretical_edge.decay_alpha(retention, all_regimes);
+        tracing::info!(
+            retention = %format!("{:.1}%", retention * 100.0),
+            all_regimes = all_regimes,
+            "Changepoint detected - decayed Bayesian alpha"
+        );
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

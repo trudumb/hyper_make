@@ -135,6 +135,49 @@ pub struct QuoteGateConfig {
     /// When true, uses P(IR > 1.0 | data) > tiered_threshold.
     /// Default: true
     pub use_bayesian_warmup: bool,
+
+    /// Minimum IR outcomes (not predictions) to trust is_useful().
+    /// On illiquid assets, we may have 100+ predictions but <10 outcomes
+    /// because price rarely moves enough to record a result.
+    /// Default: 25
+    pub min_ir_outcomes_for_trust: u64,
+
+    /// Configuration for active probing (Phase 3).
+    pub probe_config: ProbeConfig,
+}
+
+/// Configuration for active probing to generate learning data.
+#[derive(Debug, Clone)]
+pub struct ProbeConfig {
+    /// Enable probe mode.
+    /// Allows quoting with negative expected edge if information value is high.
+    pub enabled: bool,
+
+    /// Minimum alpha uncertainty (std dev) to trigger probing.
+    /// Only probe if we are uncertain about the alpha.
+    /// Default: 0.1
+    pub min_uncertainty: f64,
+
+    /// Maximum fill rate (fills/hour) to consider probing.
+    /// Only probe if we are not getting enough fills naturally.
+    /// Default: 10.0
+    pub max_fill_rate: f64,
+
+    /// Information value bonus in basis points.
+    /// effective_edge = expected_edge + info_value_bps
+    /// Default: 2.0
+    pub info_value_bps: f64,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_uncertainty: 0.1,
+            max_fill_rate: 10.0,
+            info_value_bps: 2.0,
+        }
+    }
 }
 
 impl Default for QuoteGateConfig {
@@ -150,6 +193,8 @@ impl Default for QuoteGateConfig {
             cascade_threshold: 0.3,
             quote_flat_without_edge: true,
             use_bayesian_warmup: true,
+            min_ir_outcomes_for_trust: 25,
+            probe_config: ProbeConfig::default(),
         }
     }
 }
@@ -733,13 +778,26 @@ impl QuoteGate {
         }
 
         // IR returned NoQuote with NoEdgeFlat reason
-        // Only trust IR if it's actually USEFUL (has detected statistically significant patterns)
-        // On illiquid assets, IR may have 100+ samples but all are "no price movement" → useless
-        if edge_signal.is_useful() {
-            // IR has detected statistically significant edge patterns → trust it
+        // Only trust IR if it has MEANINGFUL outcome data, not just predictions.
+        // On illiquid assets, IR may have 100+ predictions but <10 actual outcomes
+        // because price rarely moves enough to record a result.
+        let has_meaningful_ir_data = edge_signal.total_outcomes() >= self.config.min_ir_outcomes_for_trust;
+        
+        // Log outcome ratio for illiquidity diagnostics
+        let outcome_ratio = if edge_signal.total_predictions() > 0 {
+            edge_signal.total_outcomes() as f64 / edge_signal.total_predictions() as f64
+        } else {
+            0.0
+        };
+        
+        if edge_signal.is_useful() && has_meaningful_ir_data {
+            // IR has meaningful data AND detected no significant edge → trust it
             debug!(
                 total_outcomes = edge_signal.total_outcomes(),
-                "IR is_useful=true and says no edge - respecting decision"
+                total_predictions = edge_signal.total_predictions(),
+                outcome_ratio = %format!("{:.2}", outcome_ratio),
+                min_required = self.config.min_ir_outcomes_for_trust,
+                "IR is_useful=true with meaningful data - respecting decision"
             );
             return ir_decision;
         }
@@ -760,11 +818,75 @@ impl QuoteGate {
             should_quote = theoretical_result.should_quote,
             direction = theoretical_result.direction,
             ir_samples = edge_signal.total_outcomes(),
+            outcome_ratio = %format!("{:.2}", outcome_ratio),
             "Theoretical edge fallback (IR not calibrated)"
         );
 
+        // Soft threshold: allow QuoteBoth if edge is marginally negative
+        // This adds robustness to parameter uncertainty in alpha/adverse_prior
+        let min_edge_bps = theoretical_edge.config().min_edge_bps;
+        let is_marginally_negative = !theoretical_result.should_quote 
+            && theoretical_result.expected_edge_bps > -min_edge_bps / 2.0;
+        
         if !theoretical_result.should_quote {
-            // Even theoretical edge says no
+            // === Phase 3: Probe Mode ===
+            // If we are uncertain and need data, treat "info value" as edge.
+            // This encourages quoting even when edge is slightly negative/neutral.
+            let alpha_uncertainty = theoretical_edge.alpha_uncertainty();
+            let fill_rate = theoretical_edge.fill_rate_per_hour();
+            
+            // Check if position is "flat enough" to probe
+            let position_ratio = if input.max_position > 0.0 { 
+                input.position / input.max_position 
+            } else { 0.0 };
+            let is_flat_enough = position_ratio.abs() < self.config.position_threshold;
+            
+            let should_probe = self.config.probe_config.enabled
+                && !input.is_warmup
+                && is_flat_enough
+                && alpha_uncertainty >= self.config.probe_config.min_uncertainty
+                // If fill rate is low OR we have very few samples, we should probe
+                && (fill_rate <= self.config.probe_config.max_fill_rate || theoretical_edge.bayesian_fills() < 50);
+                
+            if should_probe {
+                let effective_edge = theoretical_result.expected_edge_bps + self.config.probe_config.info_value_bps;
+                
+                // If effective edge (including info value) is positive, we quote.
+                // We use a lower threshold (0.0) instead of min_edge_bps because we are paying for info.
+                if effective_edge > 0.0 {
+                    debug!(
+                        uncertainty = %format!("{:.3}", alpha_uncertainty),
+                        fill_rate = %format!("{:.2}", fill_rate),
+                        info_value = %format!("{:.2}", self.config.probe_config.info_value_bps),
+                        effective_edge = %format!("{:.2}", effective_edge),
+                        "Probe mode active - quoting to gather data"
+                    );
+                    return QuoteDecision::QuoteBoth;
+                }
+            }
+
+            // If marginally negative AND market-making mode, quote anyway
+            // If strongly negative, only quote if market-making mode enabled
+            let should_mm_quote = self.config.quote_flat_without_edge && !input.is_warmup;
+            
+            if is_marginally_negative && should_mm_quote {
+                debug!(
+                    edge_bps = %format!("{:.2}", theoretical_result.expected_edge_bps),
+                    threshold = %format!("{:.2}", -min_edge_bps / 2.0),
+                    "Marginal edge in MM mode - quoting both sides"
+                );
+                return QuoteDecision::QuoteBoth;
+            }
+            
+            if should_mm_quote {
+                debug!(
+                    ir_outcomes = edge_signal.total_outcomes(),
+                    outcome_ratio = %format!("{:.2}", outcome_ratio),
+                    "Theoretical edge negative but market-making mode enabled - quoting both sides"
+                );
+                return QuoteDecision::QuoteBoth;
+            }
+            
             return QuoteDecision::NoQuote {
                 reason: NoQuoteReason::NoEdgeFlat,
             };
@@ -997,6 +1119,46 @@ mod tests {
         };
 
         let decision = gate.decide(&input);
+        assert!(matches!(decision, QuoteDecision::QuoteBoth));
+    }
+
+    #[test]
+    fn test_probe_mode_activates_with_info_value() {
+        let mut config = QuoteGateConfig::default();
+        config.probe_config.enabled = true;
+        // High info value to overcome spread cost/fees
+        config.probe_config.info_value_bps = 50.0;
+        config.probe_config.min_uncertainty = 0.0; // Always trigger
+        config.probe_config.max_fill_rate = 100.0; // Always trigger
+
+        // Disable market making mode so we can test probe specifically
+        config.quote_flat_without_edge = false;
+        
+        let gate = QuoteGate::new(config);
+        
+        let input = QuoteGateInput {
+            flow_imbalance: 0.0, // No edge
+            // Large spread ensures theoretical edge is negative without probe info value
+            spread_bps: 20.0,    
+            position: 0.0,
+            ..default_input()
+        };
+
+        let edge_signal: CalibratedEdgeSignal = CalibratedEdgeSignal::new(Default::default());
+        let pnl_tracker: PositionPnLTracker = PositionPnLTracker::new(Default::default());
+        let mut theo_edge = TheoreticalEdgeEstimator::new();
+        
+        // changepoint_prob low -> IR not calibrated, will fallback to theoretical
+        // theoretical edge with 0 imbalance and 20bps spread will be negative
+        let decision = gate.decide_with_theoretical_fallback(
+            &input, 
+            &edge_signal, 
+            &pnl_tracker, 
+            0.0,
+            &mut theo_edge
+        );
+        
+        // Should quote both due to probe bonus
         assert!(matches!(decision, QuoteDecision::QuoteBoth));
     }
 }

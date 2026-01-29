@@ -117,6 +117,10 @@ pub struct FillState<'a> {
     // Fee configuration for edge calculation
     /// Fee in basis points for edge calculation
     pub fee_bps: f64,
+    
+    // Bayesian learning
+    /// Theoretical edge estimator for Bayesian alpha updates
+    pub theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
 }
 
 /// Fill processor - coordinates fill handling across modules.
@@ -528,6 +532,47 @@ impl FillProcessor {
             .prometheus
             .record_as_calibration(as_prob_estimate, was_adverse, &regime);
 
+        // === Bayesian Alpha Update ===
+        // Update the theoretical edge estimator with fill outcome for adaptive learning.
+        // This is the key feedback loop: did book imbalance predict price direction?
+        //
+        // For a buy fill:
+        //   - Predicted direction: +1 if book_imbalance > 0 (bullish), -1 otherwise
+        //   - Actual direction: determined by price movement after fill
+        //
+        // We use adverse selection as a proxy for price direction:
+        //   - Positive AS (price moved against us) = prediction was wrong
+        //   - Negative AS (price moved in our favor) = prediction was correct
+        let book_imbalance = state.estimator.book_imbalance();
+        let predicted_direction = if book_imbalance > 0.0 { 1i8 } else { -1 };
+        
+        // For buys: negative AS means price went up (correct if imbalance was positive)
+        // For sells: negative AS means price went down (correct if imbalance was negative)
+        // Simplified: was_adverse = false means our fill was "correct" (price moved in our favor)
+        let actual_direction = if fill.is_buy {
+            if was_adverse { -1i8 } else { 1 }  // Adverse on buy = price dropped
+        } else {
+            if was_adverse { 1i8 } else { -1 }   // Adverse on sell = price rose
+        };
+        
+        state.theoretical_edge.update_from_fill(
+            book_imbalance,
+            predicted_direction,
+            actual_direction,
+            timestamp_ms,
+        );
+
+        // Log learning update
+        let summary = state.theoretical_edge.bayesian_summary();
+        tracing::debug!(
+            alpha = %format!("{:.3}", summary.alpha),
+            uncertainty = %format!("{:.3}", summary.uncertainty),
+            acc = %format!("{:.2}", summary.empirical_accuracy),
+            fills = summary.total_fills,
+            lambda = %format!("{:.2}", summary.fill_rate_per_hour),
+            "Bayesian learning update"
+        );
+
         // Optional metrics recorder
         if let Some(m) = state.metrics {
             m.record_fill(fill.size, fill.is_buy);
@@ -610,6 +655,7 @@ mod tests {
         learning: &'a mut crate::market_maker::learning::LearningModule,
         stochastic_controller: &'a mut StochasticController,
         position_pnl: &'a mut PositionPnLTracker,
+        theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
     ) -> FillState<'a> {
         FillState {
             position,
@@ -629,6 +675,7 @@ mod tests {
             stochastic_controller,
             position_pnl,
             fee_bps: 1.5,
+            theoretical_edge,
         }
     }
 
@@ -648,6 +695,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         let mut state = make_test_state(
             &mut position,
@@ -662,6 +710,7 @@ mod tests {
             &mut learning,
             &mut stochastic_controller,
             &mut position_pnl,
+            &mut theoretical_edge,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -688,6 +737,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         let mut state = make_test_state(
             &mut position,
@@ -702,6 +752,7 @@ mod tests {
             &mut learning,
             &mut stochastic_controller,
             &mut position_pnl,
+            &mut theoretical_edge,
         );
 
         let fill1 = make_fill(1, 100, 1.0, 50000.0, true);
@@ -782,6 +833,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -799,6 +851,7 @@ mod tests {
             &mut learning,
             &mut stochastic_controller,
             &mut position_pnl,
+            &mut theoretical_edge,
         );
 
         // Now WebSocket fill arrives for OID 100
@@ -836,6 +889,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         // No pre-registration - this is a normal fill
 
@@ -852,6 +906,7 @@ mod tests {
             &mut learning,
             &mut stochastic_controller,
             &mut position_pnl,
+            &mut theoretical_edge,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -886,6 +941,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -906,6 +962,7 @@ mod tests {
                 &mut learning,
                 &mut stochastic_controller,
                 &mut position_pnl,
+                &mut theoretical_edge,
             );
             processor.process(&fill1, &mut state)
         };
@@ -930,6 +987,7 @@ mod tests {
                 &mut learning,
                 &mut stochastic_controller,
                 &mut position_pnl,
+                &mut theoretical_edge,
             );
             processor.process(&fill2, &mut state)
         };
@@ -963,6 +1021,7 @@ mod tests {
         let mut learning = crate::market_maker::learning::LearningModule::default();
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -984,6 +1043,7 @@ mod tests {
                 &mut learning,
                 &mut stochastic_controller,
                 &mut position_pnl,
+                &mut theoretical_edge,
             );
             processor.process(&fill1, &mut state)
         };
@@ -1014,6 +1074,7 @@ mod tests {
                 &mut learning,
                 &mut stochastic_controller,
                 &mut position_pnl,
+                &mut theoretical_edge,
             );
             processor.process(&fill2, &mut state)
         };
@@ -1045,6 +1106,7 @@ mod tests {
                 &mut learning,
                 &mut stochastic_controller,
                 &mut position_pnl,
+                &mut theoretical_edge,
             );
             processor.process(&fill3, &mut state)
         };

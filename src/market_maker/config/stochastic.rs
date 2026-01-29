@@ -685,6 +685,8 @@ impl StochasticConfig {
             cascade_threshold: self.quote_gate_cascade_threshold,
             quote_flat_without_edge: self.quote_gate_flat_without_edge,
             use_bayesian_warmup: true, // Enable Bayesian IR warmup by default
+            min_ir_outcomes_for_trust: 25, // Default: require meaningful IR data
+            probe_config: crate::market_maker::control::ProbeConfig::default(),
         }
     }
 }

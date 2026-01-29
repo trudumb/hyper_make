@@ -171,6 +171,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             stochastic_controller: &mut self.stochastic.controller,
             position_pnl: &mut self.stochastic.position_pnl,
             fee_bps: self.config.fee_bps,
+            theoretical_edge: &mut self.stochastic.theoretical_edge,
         };
 
         let result = messages::process_user_fills(

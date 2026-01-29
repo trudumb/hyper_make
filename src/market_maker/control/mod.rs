@@ -52,7 +52,7 @@ pub use changepoint::{ChangepointConfig, ChangepointDetector};
 pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, PositionPnLTracker};
 pub use quote_gate::{
     NoQuoteReason as QuoteGateNoQuoteReason, QuoteDecision as QuoteGateDecision, QuoteGate,
-    QuoteGateConfig, QuoteGateInput,
+    QuoteGateConfig, QuoteGateInput, ProbeConfig,
 };
 pub use theoretical_edge::{
     CrossAssetSignal, TheoreticalEdgeConfig, TheoreticalEdgeEstimator, TheoreticalEdgeResult,
