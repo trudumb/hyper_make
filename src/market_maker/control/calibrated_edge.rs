@@ -36,6 +36,91 @@ use crate::market_maker::calibration::InformationRatioTracker;
 /// Number of regimes tracked (calm=0, volatile=1, cascade=2).
 pub const NUM_REGIMES: usize = 3;
 
+/// Configuration for Bayesian IR estimation during warmup.
+///
+/// Replaces arbitrary fixed sample count thresholds with principled
+/// probabilistic thresholds based on P(IR > 1.0 | data).
+#[derive(Debug, Clone)]
+pub struct BayesianIRConfig {
+    /// Enable Bayesian IR warmup (vs fixed sample count).
+    /// Default: true
+    pub enabled: bool,
+
+    /// Minimum samples before any quoting (hard floor).
+    /// Default: 15
+    pub min_samples: usize,
+
+    /// Tiered confidence thresholds by sample count.
+    /// Default: [(0, 0.70), (20, 0.75), (50, 0.80), (100, 0.90)]
+    pub confidence_tiers: [(usize, f64); 4],
+
+    /// Prior mean for IR (shrinkage target).
+    /// Default: 0.9 (modest positive, avoids zero-IR bias)
+    pub prior_ir_mean: f64,
+
+    /// Prior degrees of freedom (shrinkage strength).
+    /// Higher = stronger pull toward prior_ir_mean.
+    /// Default: 6.0 (moderate shrinkage)
+    pub prior_df: f64,
+
+    /// Weight for L2 model confidence in prior.
+    /// 0.0 = ignore L2, 1.0 = full L2 influence.
+    /// Default: 0.5
+    pub l2_prior_weight: f64,
+
+    /// Stop-out threshold: halt quoting if P(IR > 1.0) drops below this
+    /// after sufficient samples.
+    /// Default: 0.60
+    pub stop_out_threshold: f64,
+
+    /// Minimum samples before stop-out applies.
+    /// Default: 30
+    pub stop_out_min_samples: usize,
+
+    /// Recovery threshold: resume after stop-out if P rises above this.
+    /// Default: 0.85
+    pub recovery_threshold: f64,
+}
+
+impl Default for BayesianIRConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_samples: 15,
+            confidence_tiers: [(0, 0.75), (20, 0.80), (50, 0.85), (100, 0.90)],
+            prior_ir_mean: 0.9,
+            prior_df: 6.0,
+            l2_prior_weight: 0.5,
+            stop_out_threshold: 0.60,
+            stop_out_min_samples: 30,
+            recovery_threshold: 0.85,
+        }
+    }
+}
+
+/// Result of Bayesian IR usefulness check.
+///
+/// Contains the decision plus all diagnostic information for logging.
+#[derive(Debug, Clone)]
+pub struct BayesianDecision {
+    /// Whether the edge signal is considered useful.
+    pub is_useful: bool,
+    /// Human-readable reason for the decision.
+    pub reason: String,
+    /// P(IR > 1.0 | data).
+    pub posterior_prob: f64,
+    /// Lower bound of 95% credible interval.
+    pub credible_lower: f64,
+    /// Prior mean used (may include L2 adjustment).
+    pub prior_mu_used: f64,
+    /// Posterior mean IR.
+    pub post_mu: f64,
+    /// Number of samples.
+    pub samples: usize,
+    /// Whether currently stopped out.
+    pub stopped_out: bool,
+}
+
 /// Configuration for calibrated edge signal tracking.
 #[derive(Debug, Clone)]
 pub struct CalibratedEdgeConfig {
@@ -113,16 +198,30 @@ pub struct CalibratedEdgeSignal {
     /// Configuration.
     config: CalibratedEdgeConfig,
 
+    /// Bayesian warmup configuration.
+    bayesian_config: BayesianIRConfig,
+
     /// Total predictions made (for warmup tracking).
     total_predictions: u64,
 
     /// Total outcomes recorded.
     total_outcomes: u64,
+
+    /// Whether currently stopped out (P < stop_out_threshold).
+    stopped_out: bool,
 }
 
 impl CalibratedEdgeSignal {
     /// Create a new calibrated edge signal tracker.
     pub fn new(config: CalibratedEdgeConfig) -> Self {
+        Self::with_bayesian_config(config, BayesianIRConfig::default())
+    }
+
+    /// Create a new calibrated edge signal tracker with custom Bayesian config.
+    pub fn with_bayesian_config(
+        config: CalibratedEdgeConfig,
+        bayesian_config: BayesianIRConfig,
+    ) -> Self {
         let n_bins = config.ir_n_bins;
         Self {
             ir_by_regime: [
@@ -133,8 +232,10 @@ impl CalibratedEdgeSignal {
             pending: Vec::with_capacity(config.max_pending),
             next_id: 1,
             config,
+            bayesian_config,
             total_predictions: 0,
             total_outcomes: 0,
+            stopped_out: false,
         }
     }
 
@@ -248,6 +349,315 @@ impl CalibratedEdgeSignal {
         }
 
         self.overall_ir() > 1.0
+    }
+
+    /// Immutable Bayesian check for read-only contexts.
+    ///
+    /// Returns decision without updating stop-out state.
+    /// Use this in `decide_calibrated` which takes `&self`.
+    pub fn bayesian_check(&self, l2_confidence: f64) -> BayesianDecision {
+        let cfg = &self.bayesian_config;
+        
+        // If Bayesian warmup is disabled, fall back to fixed threshold
+        if !cfg.enabled {
+            let is_useful = self.is_useful();
+            return BayesianDecision {
+                is_useful,
+                reason: if is_useful {
+                    "ir_above_1".to_string()
+                } else if self.is_warmed_up() {
+                    "ir_below_1".to_string()
+                } else {
+                    "warmup_incomplete".to_string()
+                },
+                posterior_prob: if self.is_warmed_up() { 0.5 } else { 0.0 },
+                credible_lower: 0.0,
+                prior_mu_used: cfg.prior_ir_mean,
+                post_mu: self.overall_ir(),
+                samples: self.total_samples(),
+                stopped_out: false,
+            };
+        }
+        
+        let n = self.total_samples();
+        
+        // Hard floor: require minimum samples before any quoting
+        if n < cfg.min_samples {
+            return BayesianDecision {
+                is_useful: false,
+                reason: format!("min_samples_not_met ({}/{})", n, cfg.min_samples),
+                posterior_prob: 0.0,
+                credible_lower: 0.0,
+                prior_mu_used: cfg.prior_ir_mean,
+                post_mu: self.overall_ir(),
+                samples: n,
+                stopped_out: self.stopped_out,
+            };
+        }
+
+        // Compute L2-adjusted prior mean
+        let l2_boost = (2.0 * (l2_confidence - 0.5)).clamp(0.0, 1.5);
+        let prior_mu_used = cfg.prior_ir_mean + cfg.l2_prior_weight * l2_boost;
+        
+        // Get posterior probability P(IR > 1.0 | data)
+        let posterior_prob = self.combined_posterior_prob(1.0, prior_mu_used, cfg.prior_df);
+        
+        // Get credible interval
+        let (credible_lower, _) = self.combined_credible_interval(0.95, prior_mu_used, cfg.prior_df);
+        
+        let post_mu = self.posterior_mean_ir(prior_mu_used, cfg.prior_df);
+        
+        // Check stop-out (read-only: use current state)
+        if self.stopped_out && posterior_prob < cfg.recovery_threshold {
+            return BayesianDecision {
+                is_useful: false,
+                reason: format!("stopped_out (P={:.2}<{:.2})", posterior_prob, cfg.recovery_threshold),
+                posterior_prob,
+                credible_lower,
+                prior_mu_used,
+                post_mu,
+                samples: n,
+                stopped_out: true,
+            };
+        }
+        
+        // Determine confidence threshold for current sample count (tiered)
+        let threshold = self.get_tiered_threshold(n);
+        
+        // Decision: P(IR > 1.0) > threshold
+        let is_useful = posterior_prob >= threshold;
+        
+        let reason = if is_useful {
+            format!("bayesian_ok (P={:.2}≥{:.2}, n={})", posterior_prob, threshold, n)
+        } else {
+            format!("bayesian_low (P={:.2}<{:.2}, n={})", posterior_prob, threshold, n)
+        };
+        
+        BayesianDecision {
+            is_useful,
+            reason,
+            posterior_prob,
+            credible_lower,
+            prior_mu_used,
+            post_mu,
+            samples: n,
+            stopped_out: false,
+        }
+    }
+
+    /// Bayesian check if edge signal is useful during warmup.
+    ///
+    /// Uses P(IR > 1.0 | data) > tiered_threshold instead of fixed sample count.
+    /// This allows quoting earlier when evidence is strong, while protecting
+    /// against false positives with tiered confidence requirements.
+    ///
+    /// # Arguments
+    /// * `l2_confidence` - L2 model confidence (0.5 to 1.0), used to adjust prior
+    ///
+    /// # Returns
+    /// (is_useful, reason, posterior_prob, credible_lower)
+    pub fn bayesian_is_useful(&mut self, l2_confidence: f64) -> BayesianDecision {
+        let cfg = &self.bayesian_config;
+        
+        // If Bayesian warmup is disabled, fall back to fixed threshold
+        if !cfg.enabled {
+            let is_useful = self.is_useful();
+            return BayesianDecision {
+                is_useful,
+                reason: if is_useful {
+                    "ir_above_1".to_string()
+                } else if self.is_warmed_up() {
+                    "ir_below_1".to_string()
+                } else {
+                    "warmup_incomplete".to_string()
+                },
+                posterior_prob: if self.is_warmed_up() { 0.5 } else { 0.0 },
+                credible_lower: 0.0,
+                prior_mu_used: cfg.prior_ir_mean,
+                post_mu: self.overall_ir(),
+                samples: self.total_samples(),
+                stopped_out: false,
+            };
+        }
+        
+        let n = self.total_samples();
+        
+        // Hard floor: require minimum samples before any quoting
+        if n < cfg.min_samples {
+            return BayesianDecision {
+                is_useful: false,
+                reason: format!("min_samples_not_met ({}/{})", n, cfg.min_samples),
+                posterior_prob: 0.0,
+                credible_lower: 0.0,
+                prior_mu_used: cfg.prior_ir_mean,
+                post_mu: self.overall_ir(),
+                samples: n,
+                stopped_out: self.stopped_out,
+            };
+        }
+
+        // Compute L2-adjusted prior mean
+        // L2 confidence maps to prior boost: min(2*(l2_conf - 0.5), 1.5)
+        let l2_boost = (2.0 * (l2_confidence - 0.5)).clamp(0.0, 1.5);
+        let prior_mu_used = cfg.prior_ir_mean + cfg.l2_prior_weight * l2_boost;
+        
+        // Get posterior probability P(IR > 1.0 | data)
+        let posterior_prob = self.combined_posterior_prob(1.0, prior_mu_used, cfg.prior_df);
+        
+        // Get credible interval
+        let (credible_lower, _) = self.combined_credible_interval(0.95, prior_mu_used, cfg.prior_df);
+        
+        let post_mu = self.posterior_mean_ir(prior_mu_used, cfg.prior_df);
+        
+        // Check stop-out: if evidence is strongly against us, halt
+        if n >= cfg.stop_out_min_samples {
+            if posterior_prob < cfg.stop_out_threshold && !self.stopped_out {
+                self.stopped_out = true;
+            }
+            // Recovery: resume if probability climbs back above recovery threshold
+            if self.stopped_out && posterior_prob >= cfg.recovery_threshold {
+                self.stopped_out = false;
+            }
+        }
+        
+        if self.stopped_out {
+            return BayesianDecision {
+                is_useful: false,
+                reason: format!("stopped_out (P={:.2}<{:.2})", posterior_prob, cfg.recovery_threshold),
+                posterior_prob,
+                credible_lower,
+                prior_mu_used,
+                post_mu,
+                samples: n,
+                stopped_out: true,
+            };
+        }
+        
+        // Determine confidence threshold for current sample count (tiered)
+        let threshold = self.get_tiered_threshold(n);
+        
+        // Decision: P(IR > 1.0) > threshold
+        let is_useful = posterior_prob >= threshold;
+        
+        let reason = if is_useful {
+            format!("bayesian_ok (P={:.2}≥{:.2}, n={})", posterior_prob, threshold, n)
+        } else {
+            format!("bayesian_low (P={:.2}<{:.2}, n={})", posterior_prob, threshold, n)
+        };
+        
+        BayesianDecision {
+            is_useful,
+            reason,
+            posterior_prob,
+            credible_lower,
+            prior_mu_used,
+            post_mu,
+            samples: n,
+            stopped_out: false,
+        }
+    }
+
+    /// Get the tiered confidence threshold for a given sample count.
+    pub(crate) fn get_tiered_threshold(&self, n: usize) -> f64 {
+        let tiers = &self.bayesian_config.confidence_tiers;
+        
+        // Find the highest tier that applies
+        let mut threshold = tiers[0].1; // Default to first tier
+        for &(min_samples, tier_threshold) in tiers {
+            if n >= min_samples {
+                threshold = tier_threshold;
+            }
+        }
+        threshold
+    }
+
+    /// Get the current tier threshold based on current sample count.
+    pub fn get_current_tier_threshold(&self) -> f64 {
+        self.get_tiered_threshold(self.total_samples())
+    }
+
+    /// Get the prior influence factor (0 = data dominates, 1 = prior dominates).
+    ///
+    /// This measures how much the shrinkage prior affects the posterior:
+    /// - High (>0.4 at n=30) suggests prior_df may be too high
+    /// - Low (<0.1 at n=50) means data has taken over
+    pub fn bayesian_prior_influence(&self) -> f64 {
+        let n = self.total_samples();
+        let prior_df = self.bayesian_config.prior_df;
+        prior_df / (prior_df + n as f64)
+    }
+
+    /// Get combined posterior probability across all regimes.
+    fn combined_posterior_prob(&self, threshold: f64, prior_mean: f64, prior_df: f64) -> f64 {
+        let mut total_samples = 0usize;
+        let mut weighted_prob = 0.0;
+
+        for tracker in &self.ir_by_regime {
+            let n = tracker.n_samples();
+            if n > 0 {
+                let p = tracker.posterior_prob_ir_above(threshold, prior_mean, prior_df);
+                total_samples += n;
+                weighted_prob += p * n as f64;
+            }
+        }
+
+        if total_samples > 0 {
+            weighted_prob / total_samples as f64
+        } else {
+            0.5 // Neutral when no data
+        }
+    }
+
+    /// Get combined credible interval across all regimes.
+    fn combined_credible_interval(
+        &self,
+        confidence: f64,
+        prior_mean: f64,
+        prior_df: f64,
+    ) -> (f64, f64) {
+        let mut total_samples = 0usize;
+        let mut weighted_lower = 0.0;
+        let mut weighted_upper = 0.0;
+
+        for tracker in &self.ir_by_regime {
+            let n = tracker.n_samples();
+            if n > 0 {
+                let (lower, upper) = tracker.ir_credible_interval(confidence, prior_mean, prior_df);
+                total_samples += n;
+                weighted_lower += lower * n as f64;
+                weighted_upper += upper * n as f64;
+            }
+        }
+
+        if total_samples > 0 {
+            (
+                weighted_lower / total_samples as f64,
+                weighted_upper / total_samples as f64,
+            )
+        } else {
+            (0.0, prior_mean * 2.0)
+        }
+    }
+
+    /// Get posterior mean IR (with shrinkage) across all regimes.
+    fn posterior_mean_ir(&self, prior_mean: f64, prior_df: f64) -> f64 {
+        let mut total_samples = 0usize;
+        let mut weighted_mean = 0.0;
+
+        for tracker in &self.ir_by_regime {
+            let n = tracker.n_samples();
+            if n > 0 {
+                let mean = tracker.posterior_mean_ir(prior_mean, prior_df);
+                total_samples += n;
+                weighted_mean += mean * n as f64;
+            }
+        }
+
+        if total_samples > 0 {
+            weighted_mean / total_samples as f64
+        } else {
+            prior_mean
+        }
     }
 
     /// Get the signal weight for blending.
@@ -694,5 +1104,74 @@ mod tests {
         assert_eq!(edge.total_samples(), 0);
         assert_eq!(edge.total_predictions(), 0);
         assert_eq!(edge.total_outcomes(), 0);
+    }
+
+    #[test]
+    fn test_tier_boundary_transitions() {
+        let config = make_config();
+        let edge = CalibratedEdgeSignal::new(config);
+        
+        // Test tier boundaries: 0.75 for n<20, 0.80 for 20≤n<50, 0.85 for 50≤n<100, 0.90 for n≥100
+        assert_eq!(edge.get_tiered_threshold(0), 0.75);
+        assert_eq!(edge.get_tiered_threshold(19), 0.75);
+        assert_eq!(edge.get_tiered_threshold(20), 0.80);  // Boundary transition
+        assert_eq!(edge.get_tiered_threshold(49), 0.80);
+        assert_eq!(edge.get_tiered_threshold(50), 0.85);  // Boundary transition
+        assert_eq!(edge.get_tiered_threshold(99), 0.85);
+        assert_eq!(edge.get_tiered_threshold(100), 0.90); // Boundary transition
+        assert_eq!(edge.get_tiered_threshold(1000), 0.90);
+    }
+
+    #[test]
+    fn test_bayesian_check_min_samples() {
+        let config = make_config();
+        let edge = CalibratedEdgeSignal::new(config);
+        
+        // No samples: should fail min_samples check
+        let decision = edge.bayesian_check(0.8);
+        assert!(!decision.is_useful);
+        assert!(decision.reason.contains("min_samples_not_met"));
+    }
+
+    #[test]
+    fn test_prior_influence_decay() {
+        let mut config = make_config();
+        config.min_samples_for_ir = 10;
+        let mut edge = CalibratedEdgeSignal::new(config);
+        
+        // Prior influence with no samples: prior_df / (prior_df + 0) = 1.0
+        let initial_influence = edge.bayesian_prior_influence();
+        assert!((initial_influence - 1.0).abs() < 0.01); // prior_df=6 dominates
+        
+        // Add samples and check influence decreases
+        for i in 0..30 {
+            edge.predict(0.8, 100.0, 0, i * 100);
+            edge.record_outcomes(100.05, i * 100 + 80);
+        }
+        
+        // At n=30: prior_influence = 6 / (6 + 30) = 0.167
+        let later_influence = edge.bayesian_prior_influence();
+        assert!(later_influence < 0.25);
+        assert!(later_influence > 0.10);
+    }
+
+    #[test]
+    fn test_single_regime_fallback() {
+        // Ensure single-regime data works (no divide-by-zero in weighted avg)
+        let mut config = make_config();
+        config.min_samples_for_ir = 10;
+        let mut edge = CalibratedEdgeSignal::new(config);
+        
+        // Only add samples to regime 0 (calm)
+        for i in 0..20 {
+            edge.predict(0.7, 100.0, 0, i * 100);
+            edge.record_outcomes(100.03, i * 100 + 80);
+        }
+        
+        // Should still compute valid decision
+        let decision = edge.bayesian_check(0.8);
+        assert!(decision.samples >= 15, "Expected at least 15 samples, got {}", decision.samples);
+        assert!(decision.posterior_prob >= 0.0);
+        assert!(decision.posterior_prob <= 1.0);
     }
 }

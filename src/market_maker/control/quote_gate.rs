@@ -29,7 +29,7 @@
 
 use tracing::{debug, info, warn};
 
-use super::calibrated_edge::CalibratedEdgeSignal;
+use super::calibrated_edge::{BayesianDecision, CalibratedEdgeSignal};
 use super::position_pnl_tracker::PositionPnLTracker;
 
 /// Quote decision from the Quote Gate.
@@ -129,6 +129,11 @@ pub struct QuoteGateConfig {
     /// Only disable quoting during genuine danger (cascade, toxic regime).
     /// Default: true (market-making mode)
     pub quote_flat_without_edge: bool,
+
+    /// Use Bayesian IR warmup instead of fixed sample count.
+    /// When true, uses P(IR > 1.0 | data) > tiered_threshold.
+    /// Default: true
+    pub use_bayesian_warmup: bool,
 }
 
 impl Default for QuoteGateConfig {
@@ -143,6 +148,7 @@ impl Default for QuoteGateConfig {
             cascade_protection: true,
             cascade_threshold: 0.3,
             quote_flat_without_edge: true,
+            use_bayesian_warmup: true,
         }
     }
 }
@@ -478,18 +484,51 @@ impl QuoteGate {
         let reduce_only_threshold = pnl_tracker.reduce_only_threshold(regime);
 
         // 5. Check if we have directional edge using IR
-        // The only principled threshold: IR > 1.0 means signal adds information
-        let has_edge = edge_signal.is_useful();
-        let signal_weight = edge_signal.signal_weight();
-
-        // During warmup, fall back to effective threshold check
-        let has_edge = if !edge_signal.is_warmed_up() {
-            // Use cold-start threshold during calibration warmup
-            let effective_threshold = edge_signal.effective_edge_threshold();
-            input.flow_imbalance.abs() >= effective_threshold
-                && input.momentum_confidence >= self.config.min_edge_confidence
+        // Either use Bayesian warmup (P(IR > 1.0) > tiered_threshold) or fixed threshold
+        let (has_edge, signal_weight, _bayesian_reason) = if self.config.use_bayesian_warmup {
+            // Use Bayesian IR check with L2-adjusted prior
+            // l2_confidence derived from momentum_confidence (as proxy)
+            let l2_confidence = input.momentum_confidence.clamp(0.5, 1.0);
+            let decision = edge_signal.bayesian_check(l2_confidence);
+            
+            // Compute diagnostics
+            let prior_influence = edge_signal.bayesian_prior_influence();
+            let tier_threshold = edge_signal.get_current_tier_threshold();
+            
+            // Log Bayesian decision details
+            debug!(
+                posterior_prob = %format!("{:.3}", decision.posterior_prob),
+                credible_lower = %format!("{:.3}", decision.credible_lower),
+                post_mu = %format!("{:.3}", decision.post_mu),
+                prior_influence = %format!("{:.2}", prior_influence),
+                prior_mu_used = %format!("{:.3}", decision.prior_mu_used),
+                samples = decision.samples,
+                tier_threshold = %format!("{:.2}", tier_threshold),
+                reason = %decision.reason,
+                "Bayesian IR decision"
+            );
+            
+            let weight = if decision.is_useful {
+                (edge_signal.overall_ir() - 1.0).max(0.0)
+            } else {
+                0.0
+            };
+            (decision.is_useful, weight, decision.reason)
         } else {
-            has_edge && signal_weight > 0.0
+            // Legacy: fixed sample count threshold
+            let has_edge = edge_signal.is_useful();
+            let signal_weight = edge_signal.signal_weight();
+            
+            // During warmup, fall back to effective threshold check
+            let has_edge = if !edge_signal.is_warmed_up() {
+                // Use cold-start threshold during calibration warmup
+                let effective_threshold = edge_signal.effective_edge_threshold();
+                input.flow_imbalance.abs() >= effective_threshold
+                    && input.momentum_confidence >= self.config.min_edge_confidence
+            } else {
+                has_edge && signal_weight > 0.0
+            };
+            (has_edge, signal_weight, "legacy".to_string())
         };
 
         // Determine if position is significant (using derived threshold)

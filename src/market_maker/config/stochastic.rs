@@ -684,6 +684,7 @@ impl StochasticConfig {
             cascade_protection: self.quote_gate_cascade_protection,
             cascade_threshold: self.quote_gate_cascade_threshold,
             quote_flat_without_edge: self.quote_gate_flat_without_edge,
+            use_bayesian_warmup: true, // Enable Bayesian IR warmup by default
         }
     }
 }
