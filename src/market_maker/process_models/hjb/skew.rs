@@ -548,4 +548,146 @@ impl HJBInventoryController {
             sigma: self.sigma,
         }
     }
+
+    // === Queue Value Methods (Phase 2: Churn Reduction) ===
+
+    /// Compute the queue value for an order at a given depth.
+    ///
+    /// # Arguments
+    /// * `queue_depth` - Number of units ahead in queue
+    /// * `half_spread_bps` - Half-spread in basis points (reward for filling)
+    ///
+    /// # Returns
+    /// Queue value in basis points. Higher = more valuable to preserve.
+    ///
+    /// # Formula
+    /// ```text
+    /// v(q) = (s/2) × exp(-α×q) - β×q
+    /// ```
+    pub fn queue_value(&self, queue_depth: f64, half_spread_bps: f64) -> f64 {
+        if !self.config.use_queue_value {
+            return 0.0;
+        }
+
+        let alpha = self.config.queue_alpha;
+        let beta = self.config.queue_beta;
+
+        // Exponential term: expected fill value decays with queue depth
+        let exp_term = (half_spread_bps / 2.0) * (-alpha * queue_depth).exp();
+
+        // Linear term: opportunity cost of maintaining queue position
+        let lin_term = beta * queue_depth;
+
+        // Queue value = expected value minus cost
+        (exp_term - lin_term).max(0.0)
+    }
+
+    /// Check if an order should be preserved based on its queue value.
+    ///
+    /// # Arguments
+    /// * `queue_depth` - Number of units ahead in queue
+    /// * `half_spread_bps` - Half-spread in basis points
+    ///
+    /// # Returns
+    /// True if the order's queue value exceeds the modify cost threshold.
+    pub fn should_preserve_queue(&self, queue_depth: f64, half_spread_bps: f64) -> bool {
+        if !self.config.use_queue_value {
+            return false; // Disabled = don't preserve
+        }
+
+        self.queue_value(queue_depth, half_spread_bps) >= self.config.queue_modify_cost_bps
+    }
+
+    /// Compute optimal skew with queue position consideration.
+    ///
+    /// This extends the standard optimal skew by adding a term that accounts
+    /// for the value of the current queue position. If the order has significant
+    /// queue value, the controller recommends smaller adjustments to preserve
+    /// the queue position.
+    ///
+    /// # Arguments
+    /// * `position` - Current inventory position
+    /// * `max_position` - Maximum position for normalization
+    /// * `queue_depth` - Current queue depth ahead
+    /// * `current_spread_bps` - Current spread in basis points
+    ///
+    /// # Returns
+    /// Tuple of (optimal_skew, queue_value_bps, should_preserve)
+    pub fn optimal_skew_with_queue(
+        &self,
+        position: f64,
+        max_position: f64,
+        queue_depth: f64,
+        current_spread_bps: f64,
+    ) -> (f64, f64, bool) {
+        let base_skew = self.optimal_skew(position, max_position);
+        let half_spread = current_spread_bps / 2.0;
+        let queue_val = self.queue_value(queue_depth, half_spread);
+        let should_preserve = self.should_preserve_queue(queue_depth, half_spread);
+
+        // If queue is valuable, dampen the skew adjustment
+        let adjusted_skew = if should_preserve && self.config.use_queue_value {
+            // Reduce skew magnitude when queue is valuable
+            // The more valuable the queue, the less we want to move
+            let damping = 1.0 - (queue_val / (queue_val + self.config.queue_modify_cost_bps));
+            base_skew * damping
+        } else {
+            base_skew
+        };
+
+        (adjusted_skew, queue_val, should_preserve)
+    }
+
+    /// Compute the break-even queue depth for order preservation.
+    ///
+    /// Orders at or beyond this depth have no economic value to preserve.
+    ///
+    /// # Arguments
+    /// * `half_spread_bps` - Half-spread in basis points
+    pub fn break_even_queue_depth(&self, half_spread_bps: f64) -> f64 {
+        // Solve: (s/2) × exp(-α×q) - β×q = modify_cost
+        // Using Newton-Raphson iteration
+
+        let target = self.config.queue_modify_cost_bps;
+        let s2 = half_spread_bps / 2.0;
+        let alpha = self.config.queue_alpha;
+        let beta = self.config.queue_beta;
+
+        // Initial guess
+        let mut q = if s2 > target {
+            -((2.0 * target) / s2).ln() / alpha
+        } else {
+            0.0
+        };
+
+        // Newton-Raphson iterations
+        for _ in 0..10 {
+            let exp_aq = (-alpha * q).exp();
+            let f = s2 * exp_aq - beta * q - target;
+            let f_prime = -alpha * s2 * exp_aq - beta;
+
+            if f_prime.abs() < 1e-10 {
+                break;
+            }
+
+            let delta = f / f_prime;
+            q -= delta;
+
+            if delta.abs() < 1e-6 {
+                break;
+            }
+        }
+
+        q.max(0.0).min(100.0) // Cap at 100 units
+    }
+
+    /// Get queue value configuration parameters for diagnostics.
+    pub fn queue_config(&self) -> (f64, f64, f64, bool) {
+        (
+            self.config.queue_alpha,
+            self.config.queue_beta,
+            self.config.queue_modify_cost_bps,
+            self.config.use_queue_value,
+        )
+    }
 }

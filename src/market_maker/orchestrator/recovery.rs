@@ -569,22 +569,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // For validator perps, collateral is in perps clearinghouse (USDC)
         let (account_value, margin_used, total_notional, liquidation_price) =
             if self.config.dex.is_some() {
-                // HIP-3: Get account value from spot balance
-                // Phase 3: Use local cache if available and populated
+                // HIP-3: Get account value from spot balance (total amount)
+                // Use local cache if available, otherwise fall back to REST
                 let account_value = if !self.spot_balance_cache.is_empty() {
-                    self.config
-                        .collateral
-                        .available_balance_from_spot_map(&self.spot_balance_cache)
+                    // Cache stores total balance (not available), which is what we want
+                    self.spot_balance_cache
+                        .get(&self.config.collateral.symbol)
+                        .copied()
                         .unwrap_or(0.0)
                 } else {
-                    // Fallback to REST if cache is empty (e.g. startup failed)
+                    // Fallback to REST if cache is empty
                     let balances = self
                         .info_client
                         .user_token_balances(self.user_address)
                         .await?;
                     self.config
                         .collateral
-                        .available_balance_from_spot(&balances.balances)
+                        .balance_from_spot(&balances.balances)
+                        .map(|(total, _hold)| total)
                         .unwrap_or(0.0)
                 };
 

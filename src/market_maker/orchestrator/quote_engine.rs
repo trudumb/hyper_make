@@ -1126,6 +1126,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             competitor_snipe_prob: market_params.competitor_snipe_prob,
             competitor_spread_factor: market_params.competitor_spread_factor,
             competitor_count: market_params.competitor_count,
+            // Phase 9: Rate Limit Shadow Price
+            // Get headroom from cached rate limit info
+            rate_limit_headroom_pct: self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .map(|c| c.headroom_pct())
+                .unwrap_or(1.0),
+            // Derive vol_regime from sigma relative to baseline
+            vol_regime: {
+                let vol_ratio = market_params.sigma / 0.0001; // Relative to 1bp/sec baseline
+                if vol_ratio < 0.5 {
+                    0 // Low
+                } else if vol_ratio < 2.0 {
+                    1 // Normal
+                } else if vol_ratio < 5.0 {
+                    2 // High
+                } else {
+                    3 // Extreme
+                }
+            },
         };
 
         // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds

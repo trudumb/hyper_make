@@ -394,4 +394,101 @@ impl QueuePositionTracker {
             best_ask: self.best_ask,
         }
     }
+
+    // === HJB Queue Value Integration (Phase 2: Churn Reduction) ===
+
+    /// Compute the HJB queue value for an order.
+    ///
+    /// This uses the queue value formula from the HJB extension:
+    /// v(q) = (s/2) × exp(-α×q) - β×q
+    ///
+    /// # Arguments
+    /// * `oid` - Order ID to evaluate
+    /// * `half_spread_bps` - Half-spread in basis points
+    /// * `alpha` - Queue value decay rate (default 0.1)
+    /// * `beta` - Linear cost (default 0.02)
+    pub fn order_queue_value(
+        &self,
+        oid: u64,
+        half_spread_bps: f64,
+        alpha: f64,
+        beta: f64,
+    ) -> Option<f64> {
+        let position = self.positions.get(&oid)?;
+
+        // Queue depth ahead (in units)
+        let q = position.depth_ahead;
+
+        // Queue value formula: (s/2) × exp(-α×q) - β×q
+        let exp_term = (half_spread_bps / 2.0) * (-alpha * q).exp();
+        let lin_term = beta * q;
+
+        Some((exp_term - lin_term).max(0.0))
+    }
+
+    /// Check if an order should be preserved based on HJB queue value.
+    ///
+    /// # Arguments
+    /// * `oid` - Order ID to evaluate
+    /// * `half_spread_bps` - Half-spread in basis points
+    /// * `alpha` - Queue value decay rate
+    /// * `beta` - Linear cost
+    /// * `modify_cost_bps` - Threshold cost of modifying (default 3 bps)
+    pub fn should_preserve_by_hjb_value(
+        &self,
+        oid: u64,
+        half_spread_bps: f64,
+        alpha: f64,
+        beta: f64,
+        modify_cost_bps: f64,
+    ) -> bool {
+        self.order_queue_value(oid, half_spread_bps, alpha, beta)
+            .map(|v| v >= modify_cost_bps)
+            .unwrap_or(false)
+    }
+
+    /// Compute total queue value across all orders.
+    ///
+    /// # Arguments
+    /// * `half_spread_bps` - Half-spread in basis points
+    /// * `alpha` - Queue value decay rate
+    /// * `beta` - Linear cost
+    pub fn total_queue_value(
+        &self,
+        half_spread_bps: f64,
+        alpha: f64,
+        beta: f64,
+    ) -> f64 {
+        self.positions
+            .keys()
+            .filter_map(|&oid| self.order_queue_value(oid, half_spread_bps, alpha, beta))
+            .sum()
+    }
+
+    /// Get queue depth for an order.
+    ///
+    /// Returns None if order is not tracked.
+    pub fn queue_depth(&self, oid: u64) -> Option<f64> {
+        self.positions.get(&oid).map(|p| p.depth_ahead)
+    }
+
+    /// Evaluate all orders for queue value preservation.
+    ///
+    /// Returns a list of (oid, queue_value, should_preserve) tuples.
+    pub fn evaluate_all_queue_values(
+        &self,
+        half_spread_bps: f64,
+        alpha: f64,
+        beta: f64,
+        modify_cost_bps: f64,
+    ) -> Vec<(u64, f64, bool)> {
+        self.positions
+            .keys()
+            .filter_map(|&oid| {
+                let value = self.order_queue_value(oid, half_spread_bps, alpha, beta)?;
+                let preserve = value >= modify_cost_bps;
+                Some((oid, value, preserve))
+            })
+            .collect()
+    }
 }

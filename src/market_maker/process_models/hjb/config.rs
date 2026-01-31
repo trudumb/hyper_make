@@ -44,10 +44,11 @@ pub struct HJBConfig {
     /// Below this, momentum is considered noise.
     pub min_continuation_prob: f64,
 
-    // === EWMA Smoothing for Stability ===
+    // === EWMA Smoothing for Stability (Legacy) ===
     /// EWMA half-life for smoothing drift estimates (seconds).
     /// Longer values give more stable but slower-reacting signals.
     /// Range: [5.0, 60.0], Default: 15.0
+    /// NOTE: Deprecated in favor of OU drift model when use_ou_drift is true.
     pub drift_ewma_half_life_secs: f64,
 
     /// Window size for momentum statistics (data points).
@@ -57,6 +58,44 @@ pub struct HJBConfig {
     /// Minimum observations before using smoothed signals.
     /// Range: [10, 50], Default: 20
     pub min_warmup_observations: usize,
+
+    // === Ornstein-Uhlenbeck Drift Model ===
+    /// Enable OU drift model (replaces EWMA for drift smoothing).
+    /// When true, uses mean-reverting OU process with threshold gating
+    /// to filter noise-induced reconciliations.
+    pub use_ou_drift: bool,
+
+    /// OU mean reversion rate (θ).
+    /// Higher values = faster mean reversion.
+    /// At θ=0.5, half-life is ~1.4 seconds.
+    /// Range: [0.1, 2.0], Default: 0.5
+    pub ou_theta: f64,
+
+    /// OU reconciliation threshold multiplier (k).
+    /// Only reconcile if |innovation| > k × σ × √dt.
+    /// Higher values filter more noise but may miss regime changes.
+    /// Range: [1.0, 4.0], Default: 2.0
+    pub ou_reconcile_k: f64,
+
+    // === Queue Value Parameters ===
+    /// Enable HJB queue value preservation.
+    /// When true, considers queue position value before cancelling orders.
+    pub use_queue_value: bool,
+
+    /// Queue value decay rate (α).
+    /// Higher values = queue value decays faster with depth.
+    /// Range: [0.05, 0.3], Default: 0.1
+    pub queue_alpha: f64,
+
+    /// Queue value linear cost (β).
+    /// Penalizes orders deep in queue.
+    /// Range: [0.01, 0.05], Default: 0.02
+    pub queue_beta: f64,
+
+    /// Cost of modifying an order (in bps).
+    /// Only cancel+replace if queue value < this cost.
+    /// Range: [1.0, 10.0], Default: 3.0
+    pub queue_modify_cost_bps: f64,
 }
 
 impl Default for HJBConfig {
@@ -73,10 +112,19 @@ impl Default for HJBConfig {
             opposition_sensitivity: 1.5,
             max_drift_urgency: 3.0,
             min_continuation_prob: 0.5,
-            // EWMA smoothing for stability
+            // EWMA smoothing for stability (legacy, used when use_ou_drift is false)
             drift_ewma_half_life_secs: 15.0,
             momentum_stats_window: 50,
             min_warmup_observations: 20,
+            // OU drift model (preferred over EWMA)
+            use_ou_drift: true,
+            ou_theta: 0.5,           // ~1.4s half-life
+            ou_reconcile_k: 2.0,     // 2σ threshold
+            // Queue value parameters
+            use_queue_value: true,
+            queue_alpha: 0.1,
+            queue_beta: 0.02,
+            queue_modify_cost_bps: 3.0,
         }
     }
 }

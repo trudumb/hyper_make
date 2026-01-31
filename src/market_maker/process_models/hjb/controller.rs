@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use super::config::HJBConfig;
+use super::ou_drift::{OUDriftConfig, OUDriftEstimator, OUUpdateResult};
 use super::summary::MomentumStats;
 
 /// HJB-derived optimal inventory controller.
@@ -15,10 +16,12 @@ use super::summary::MomentumStats;
 /// 2. **Terminal Penalty**: Forces position reduction as session end approaches
 /// 3. **Funding Integration**: Accounts for perpetual funding costs in carry
 /// 4. **Optimal Inventory Target**: Not always zero (funding affects target)
+/// 5. **OU Drift Model**: Mean-reverting drift with threshold gating (reduces churn)
 ///
 /// The controller is stateful, tracking:
 /// - Session timing for terminal penalty
 /// - Funding rate EWMA for carry cost estimation
+/// - OU drift process for noise-filtered drift estimation
 #[derive(Debug, Clone)]
 pub struct HJBInventoryController {
     pub(super) config: HJBConfig,
@@ -38,7 +41,7 @@ pub struct HJBInventoryController {
     /// Whether controller is initialized
     pub(super) initialized: bool,
 
-    // === EWMA Smoothing State ===
+    // === EWMA Smoothing State (Legacy, used when use_ou_drift=false) ===
     /// EWMA alpha for drift smoothing
     pub(super) drift_alpha: f64,
 
@@ -56,6 +59,16 @@ pub struct HJBInventoryController {
 
     /// Number of drift updates received
     pub(super) drift_update_count: u64,
+
+    // === OU Drift Model (Phase 1: Churn Reduction) ===
+    /// OU drift estimator with threshold gating
+    pub(super) ou_drift: OUDriftEstimator,
+
+    /// Last OU update result (for diagnostics)
+    pub(super) last_ou_result: Option<OUUpdateResult>,
+
+    /// Timestamp of last OU update (milliseconds)
+    pub(super) last_ou_update_ms: u64,
 }
 
 impl HJBInventoryController {
@@ -70,6 +83,17 @@ impl HJBInventoryController {
 
         let momentum_capacity = config.momentum_stats_window + 10;
 
+        // Create OU drift estimator from config
+        let ou_config = OUDriftConfig {
+            theta: config.ou_theta,
+            mu: 0.0, // Neutral drift
+            reconcile_k: config.ou_reconcile_k,
+            initial_sigma_drift: 0.001,
+            min_variance: 1e-12,
+            max_variance: 0.01,
+        };
+        let ou_drift = OUDriftEstimator::new(ou_config);
+
         Self {
             config,
             session_start: Instant::now(),
@@ -77,13 +101,17 @@ impl HJBInventoryController {
             funding_rate_ewma: 0.0,
             funding_alpha,
             initialized: false,
-            // EWMA state
+            // EWMA state (legacy)
             drift_alpha,
             drift_ewma: 0.0,
             variance_mult_ewma: 1.0,
             momentum_history: VecDeque::with_capacity(momentum_capacity),
             continuation_history: VecDeque::with_capacity(momentum_capacity),
             drift_update_count: 0,
+            // OU drift state
+            ou_drift,
+            last_ou_result: None,
+            last_ou_update_ms: 0,
         }
     }
 
@@ -120,7 +148,7 @@ impl HJBInventoryController {
         }
     }
 
-    /// Update momentum/drift signals with EWMA smoothing.
+    /// Update momentum/drift signals with EWMA smoothing (legacy path).
     ///
     /// This method should be called on each quote cycle to maintain
     /// smooth drift estimates that reduce noise in skew adjustments.
@@ -157,9 +185,26 @@ impl HJBInventoryController {
         let momentum_frac = momentum_bps / 10000.0;
         let estimated_drift = momentum_frac / 0.5; // Per-second drift
 
-        // EWMA smooth the drift estimate
-        self.drift_ewma =
-            self.drift_alpha * estimated_drift + (1.0 - self.drift_alpha) * self.drift_ewma;
+        // === OU Drift Update (Phase 1: Churn Reduction) ===
+        if self.config.use_ou_drift {
+            // Get current timestamp in milliseconds
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            // Update OU drift estimator
+            let ou_result = self.ou_drift.update(now_ms, estimated_drift);
+            self.last_ou_result = Some(ou_result);
+            self.last_ou_update_ms = now_ms;
+
+            // Use OU-filtered drift for smoothed estimate
+            self.drift_ewma = ou_result.drift;
+        } else {
+            // Legacy EWMA path
+            self.drift_ewma =
+                self.drift_alpha * estimated_drift + (1.0 - self.drift_alpha) * self.drift_ewma;
+        }
 
         // Compute and smooth variance multiplier
         let q = if max_position.abs() > 1e-10 {
@@ -197,7 +242,11 @@ impl HJBInventoryController {
 
     /// Check if drift smoothing is warmed up.
     pub fn is_drift_warmed_up(&self) -> bool {
-        self.drift_update_count >= self.config.min_warmup_observations as u64
+        if self.config.use_ou_drift {
+            self.ou_drift.is_warmed_up()
+        } else {
+            self.drift_update_count >= self.config.min_warmup_observations as u64
+        }
     }
 
     /// Get smoothed drift estimate (per-second).
@@ -208,6 +257,46 @@ impl HJBInventoryController {
     /// Get smoothed variance multiplier.
     pub fn smoothed_variance_multiplier(&self) -> f64 {
         self.variance_mult_ewma
+    }
+
+    /// Check if the last OU update triggered a reconciliation.
+    ///
+    /// Returns true if:
+    /// - OU drift is disabled (always reconcile)
+    /// - The last update's innovation exceeded the threshold
+    ///
+    /// This can be used by the reconciliation logic to skip cycles
+    /// when the drift change is purely noise.
+    pub fn is_ou_reconciled(&self) -> bool {
+        if !self.config.use_ou_drift {
+            return true; // Legacy mode always reconciles
+        }
+
+        self.last_ou_result.map(|r| r.reconciled).unwrap_or(true)
+    }
+
+    /// Get the last OU update result for diagnostics.
+    pub fn last_ou_result(&self) -> Option<OUUpdateResult> {
+        self.last_ou_result
+    }
+
+    /// Get OU drift summary for diagnostics.
+    pub fn ou_drift_summary(&self) -> super::ou_drift::OUDriftSummary {
+        self.ou_drift.summary()
+    }
+
+    /// Check if a hypothetical drift change would exceed OU threshold.
+    ///
+    /// Useful for pre-checking if a reconciliation is needed before
+    /// actually updating the drift state.
+    pub fn would_ou_reconcile(&self, observed_drift: f64, dt_seconds: f64) -> bool {
+        if !self.config.use_ou_drift {
+            return true;
+        }
+
+        let predicted = self.ou_drift.predict(dt_seconds);
+        let innovation = observed_drift - predicted;
+        self.ou_drift.threshold_exceeded(innovation, dt_seconds)
     }
 
     /// Get momentum statistics for diagnostics.

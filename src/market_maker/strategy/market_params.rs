@@ -258,6 +258,12 @@ pub struct MarketParams {
     /// Estimated number of active competitor MMs.
     pub competitor_count: f64,
 
+    // === Phase 9: Rate Limit Death Spiral Prevention ===
+    /// Rate limit headroom as fraction [0, 1].
+    /// 1.0 = full budget available, 0.0 = exhausted.
+    /// Used for quota-aware ladder density and shadow pricing.
+    pub rate_limit_headroom_pct: f64,
+
     // === Tier 2: Funding Rate ===
     /// Current funding rate (annualized)
     pub funding_rate: f64,
@@ -753,6 +759,8 @@ impl Default for MarketParams {
             competitor_snipe_prob: 0.1,      // 10% baseline
             competitor_spread_factor: 1.0,   // No adjustment
             competitor_count: 3.0,           // Assume 3 competitors
+            // Phase 9: Rate Limit Death Spiral Prevention
+            rate_limit_headroom_pct: 1.0,    // Full budget available
             // Tier 2: Funding Rate
             funding_rate: 0.0,
             predicted_funding_cost: 0.0,

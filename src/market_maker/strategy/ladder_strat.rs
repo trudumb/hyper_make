@@ -207,6 +207,89 @@ impl LadderStrategy {
         self.fill_model.log_diagnostics();
     }
 
+    // =========================================================================
+    // Quota-Aware Ladder Density (Death Spiral Prevention)
+    // =========================================================================
+
+    /// Compute effective number of levels based on rate limit headroom.
+    ///
+    /// When quota is scarce, reduce the number of levels to conserve budget.
+    /// Uses concave (sqrt) scaling to provide smooth degradation without
+    /// step discontinuities that cause oscillation.
+    ///
+    /// # Arguments
+    /// * `base_levels` - The configured number of levels
+    /// * `headroom_pct` - Current quota headroom as fraction [0, 1]
+    ///
+    /// # Returns
+    /// Effective number of levels to place, in [1, base_levels]
+    ///
+    /// # Scaling
+    /// - headroom >= 50%: scale = 1.0 (full levels)
+    /// - headroom <= 5%: scale = 0.1 (minimum presence)
+    /// - Between: concave sqrt scaling for smooth degradation
+    pub fn compute_effective_levels(base_levels: usize, headroom_pct: f64) -> usize {
+        let scale = if headroom_pct >= 0.50 {
+            1.0
+        } else if headroom_pct <= 0.05 {
+            0.1 // Minimum presence
+        } else {
+            // Concave: sqrt(normalized_headroom) for smooth degradation
+            let normalized = (headroom_pct - 0.05) / 0.45;
+            0.1 + 0.9 * normalized.sqrt()
+        };
+
+        let effective = ((base_levels as f64 * scale).round() as usize).max(1);
+
+        if effective < base_levels {
+            debug!(
+                base_levels = base_levels,
+                headroom_pct = %format!("{:.1}%", headroom_pct * 100.0),
+                scale = %format!("{:.2}", scale),
+                effective_levels = effective,
+                "Quota-aware level reduction"
+            );
+        }
+
+        effective
+    }
+
+    /// Compute size multiplier when levels are reduced.
+    ///
+    /// When we have fewer levels, each level should have larger size to:
+    /// 1. Maximize expected fill value per API request
+    /// 2. Maintain similar total liquidity provision
+    /// 3. Ensure each request "counts" more
+    ///
+    /// # Arguments
+    /// * `headroom_pct` - Current quota headroom as fraction [0, 1]
+    ///
+    /// # Returns
+    /// Size multiplier, in [1.0, 1.5]
+    ///
+    /// # Formula
+    /// - headroom >= 50%: multiplier = 1.0 (normal sizing)
+    /// - headroom < 50%: multiplier = 1.0 + deficit (linear increase)
+    /// - At 10% headroom: multiplier = 1.4
+    /// - At 5% headroom: multiplier = 1.45
+    pub fn compute_size_multiplier(headroom_pct: f64) -> f64 {
+        if headroom_pct >= 0.50 {
+            1.0 // Normal sizing
+        } else {
+            // As headroom drops, increase size per level
+            let deficit = (0.50 - headroom_pct).min(0.45);
+            let multiplier = 1.0 + deficit;
+
+            debug!(
+                headroom_pct = %format!("{:.1}%", headroom_pct * 100.0),
+                size_multiplier = %format!("{:.2}", multiplier),
+                "Quota-aware size scaling"
+            );
+
+            multiplier
+        }
+    }
+
     /// Create a depth generator that inherits settings from ladder config
     fn create_depth_generator(ladder_config: &LadderConfig) -> DynamicDepthGenerator {
         // Spread floor should ensure profitability after fees

@@ -7,8 +7,10 @@
 //! - `reconcile`: Order reconciliation and ladder management
 //! - `order_ops`: Order placement, cancellation, and tracking
 //! - `recovery`: Recovery logic, safety sync, and state refresh
+//! - `event_accumulator`: Event-driven quote update triggering (Phase 3: Churn Reduction)
 
 mod event_loop;
+pub(crate) mod event_accumulator;
 mod handlers;
 mod order_ops;
 mod quote_engine;
@@ -17,6 +19,8 @@ mod recovery;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use event_accumulator::{AffectedTracker, EventAccumulator, EventAccumulatorStats};
 
 use super::*;
 

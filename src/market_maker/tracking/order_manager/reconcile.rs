@@ -90,6 +90,16 @@ pub struct DynamicReconcileConfig {
     pub max_modify_price_bps: f64,
     /// Enable priority-based matching (ensures best levels are covered first)
     pub use_priority_matching: bool,
+    // === HJB Queue Value Integration (Phase 2: Churn Reduction) ===
+    /// Enable HJB queue value preservation.
+    /// When true, uses the HJB queue value formula to preserve valuable queue positions.
+    pub use_hjb_queue_value: bool,
+    /// HJB queue value decay rate (α). Default: 0.1
+    pub hjb_queue_alpha: f64,
+    /// HJB queue value linear cost (β). Default: 0.02
+    pub hjb_queue_beta: f64,
+    /// HJB queue value modify cost threshold (bps). Default: 3.0
+    pub hjb_queue_modify_cost_bps: f64,
 }
 
 impl Default for DynamicReconcileConfig {
@@ -103,6 +113,11 @@ impl Default for DynamicReconcileConfig {
             optimal_spread_bps: 20.0,   // Default ~20 bps
             max_modify_price_bps: 50.0, // Default 50 bps
             use_priority_matching: true,
+            // HJB queue value integration
+            use_hjb_queue_value: true,
+            hjb_queue_alpha: 0.1,
+            hjb_queue_beta: 0.02,
+            hjb_queue_modify_cost_bps: 3.0,
         }
     }
 }
@@ -148,6 +163,11 @@ impl DynamicReconcileConfig {
             optimal_spread_bps,
             max_modify_price_bps,
             use_priority_matching: true,
+            // HJB queue value integration (defaults)
+            use_hjb_queue_value: true,
+            hjb_queue_alpha: 0.1,
+            hjb_queue_beta: 0.02,
+            hjb_queue_modify_cost_bps: 3.0,
         }
     }
 
@@ -558,7 +578,41 @@ pub fn priority_based_matching(
             matched_orders.insert(order.oid);
             matched_targets.insert(priority);
 
+            // === HJB Queue Value Check (Phase 2: Churn Reduction) ===
+            // Use HJB queue value formula if enabled and tracker available.
+            // This provides an economic foundation for preservation decisions:
+            // v(q) = (s/2) × exp(-α×q) - β×q
+            // Preserve if v(q) >= modify_cost_bps
+            let hjb_preserve = if config.use_hjb_queue_value {
+                if let Some(qt) = queue_tracker {
+                    let half_spread = config.optimal_spread_bps / 2.0;
+                    qt.should_preserve_by_hjb_value(
+                        order.oid,
+                        half_spread,
+                        config.hjb_queue_alpha,
+                        config.hjb_queue_beta,
+                        config.hjb_queue_modify_cost_bps,
+                    )
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if hjb_preserve {
+                // HJB queue value is high enough - preserve this order
+                debug!(
+                    oid = order.oid,
+                    price = order.price,
+                    target_price = target.price,
+                    "HJB queue value: preserving order (value >= modify_cost_bps)"
+                );
+                continue; // Skip any modification - preserve queue position
+            }
+
             // Check queue value using EV comparison if tracker available
+            // (This is the legacy P(fill) based check)
             // Spread capture estimate: use target depth as proxy for spread capture
             let spread_capture_bps = target.depth_bps.max(config.optimal_spread_bps / 2.0);
             let (should_preserve, reason) = if let Some(qt) = queue_tracker {

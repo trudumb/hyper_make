@@ -499,6 +499,9 @@ impl ParameterAggregator {
             adverse_uncertainty: 0.1,     // Moderate uncertainty
             adverse_regime: 1,            // Normal regime
             bayesian_gamma_mult: 1.0,     // No adjustment until computed
+
+            // === Phase 9: Rate Limit Death Spiral Prevention ===
+            rate_limit_headroom_pct: 1.0, // Full budget available by default, updated by caller
         }
     }
 }

@@ -1118,11 +1118,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // For HIP-3 DEXs, collateral is in spot balance (USDE, USDH, etc.)
         // For validator perps, collateral is in perps clearinghouse (USDC)
         let account_value: f64 = if dex.is_some() {
-            // HIP-3: Get account value from spot balance
+            // HIP-3: Get account value from spot balance (total, not available)
+            // The collateral token (e.g., USDE) holds the full deposited amount.
             match info_client.user_token_balances(user_address).await {
                 Ok(balances) => collateral
-                    .available_balance_from_spot(&balances.balances)
-                    .unwrap_or(0.0),
+                    .balance_from_spot(&balances.balances)
+                    .map(|(total, _hold)| total) // Use total, not total-hold
+                    .unwrap_or_else(|| {
+                        warn!(
+                            "Collateral {} not found in spot balances, using 0",
+                            collateral.symbol
+                        );
+                        0.0
+                    }),
                 Err(e) => {
                     warn!("Failed to query spot balances for HIP-3: {e}, using 0");
                     0.0

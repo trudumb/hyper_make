@@ -5,6 +5,115 @@
 
 use std::time::{Duration, Instant};
 
+// =============================================================================
+// Cumulative Quota State - Death Spiral Prevention
+// =============================================================================
+
+/// Tracks cumulative quota exhaustion and implements exponential backoff with jitter.
+///
+/// When the rate limit headroom is exhausted (<5%), the system records this as a
+/// "cumulative exhaustion" event. Consecutive exhaustions trigger exponentially
+/// increasing backoff periods to break the death spiral pattern:
+///
+/// - 1st exhaustion: 30s backoff (± 50% jitter)
+/// - 2nd exhaustion: 60s backoff
+/// - 3rd exhaustion: 120s backoff
+/// - 4th exhaustion: 240s backoff
+/// - Max: 600s (10 minutes)
+///
+/// The jitter prevents herd behavior when multiple systems hit limits simultaneously.
+#[derive(Debug, Clone)]
+pub struct CumulativeQuotaState {
+    /// Consecutive exhaustion events
+    pub consecutive_exhaustions: u32,
+    /// Timestamp of last exhaustion
+    pub last_exhaustion: Option<Instant>,
+    /// When the backoff expires
+    pub backoff_until: Option<Instant>,
+}
+
+impl Default for CumulativeQuotaState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CumulativeQuotaState {
+    /// Create new quota state.
+    pub fn new() -> Self {
+        Self {
+            consecutive_exhaustions: 0,
+            last_exhaustion: None,
+            backoff_until: None,
+        }
+    }
+
+    /// Record a quota exhaustion event and compute backoff.
+    ///
+    /// Returns the backoff duration that was set (includes jitter).
+    pub fn record_exhaustion(&mut self) -> Duration {
+        self.consecutive_exhaustions += 1;
+        self.last_exhaustion = Some(Instant::now());
+
+        // Exponential backoff: 30s, 60s, 120s, 240s... max 10min
+        let base = Duration::from_secs(30);
+        let multiplier = 2.0_f64.powi((self.consecutive_exhaustions - 1).min(4) as i32);
+        let backoff = Duration::from_secs_f64(
+            (base.as_secs_f64() * multiplier).min(600.0)
+        );
+
+        // Add jitter: ± 50% uniform noise (queuing theory: avoid herd behavior)
+        let jitter_factor = 0.5 + rand::random::<f64>(); // [0.5, 1.5]
+        let jittered = Duration::from_secs_f64(backoff.as_secs_f64() * jitter_factor);
+
+        self.backoff_until = Some(Instant::now() + jittered);
+
+        tracing::warn!(
+            consecutive_exhaustions = self.consecutive_exhaustions,
+            base_backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+            jittered_backoff_secs = %format!("{:.1}", jittered.as_secs_f64()),
+            "Cumulative quota exhaustion - entering exponential backoff"
+        );
+
+        jittered
+    }
+
+    /// Check if currently in backoff period.
+    pub fn is_in_backoff(&self) -> bool {
+        self.backoff_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    /// Get remaining backoff time (if in backoff).
+    pub fn remaining_backoff(&self) -> Option<Duration> {
+        self.backoff_until.and_then(|until| {
+            let now = Instant::now();
+            if now < until {
+                Some(until - now)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Reset on successful API call after recovery.
+    pub fn reset_on_success(&mut self) {
+        if self.consecutive_exhaustions > 0 {
+            tracing::info!(
+                previous_exhaustions = self.consecutive_exhaustions,
+                "Quota recovered - resetting exhaustion counter"
+            );
+            self.consecutive_exhaustions = 0;
+            self.backoff_until = None;
+        }
+    }
+}
+
+// =============================================================================
+// Proactive Rate Limit Configuration
+// =============================================================================
+
 /// Configuration for proactive rate limit tracking.
 ///
 /// Hyperliquid rate limits (per docs):
@@ -54,6 +163,7 @@ impl Default for ProactiveRateLimitConfig {
 ///
 /// Tracks API usage to avoid hitting limits rather than reacting to errors.
 /// Also handles 429 response backoff with exponential increase.
+/// Now also tracks cumulative quota exhaustion for death spiral prevention.
 #[derive(Debug)]
 pub struct ProactiveRateLimitTracker {
     config: ProactiveRateLimitConfig,
@@ -71,6 +181,8 @@ pub struct ProactiveRateLimitTracker {
     backoff_until: Option<Instant>,
     /// Consecutive 429 errors (for exponential backoff)
     consecutive_429s: u32,
+    /// Cumulative quota exhaustion state (death spiral prevention)
+    cumulative_quota: CumulativeQuotaState,
 }
 
 impl Default for ProactiveRateLimitTracker {
@@ -91,6 +203,7 @@ impl ProactiveRateLimitTracker {
             last_modify: Instant::now() - Duration::from_secs(10), // Allow immediate first modify
             backoff_until: None,
             consecutive_429s: 0,
+            cumulative_quota: CumulativeQuotaState::new(),
         }
     }
 
@@ -105,6 +218,7 @@ impl ProactiveRateLimitTracker {
             last_modify: Instant::now() - Duration::from_secs(10), // Allow immediate first modify
             backoff_until: None,
             consecutive_429s: 0,
+            cumulative_quota: CumulativeQuotaState::new(),
         }
     }
 
@@ -230,6 +344,38 @@ impl ProactiveRateLimitTracker {
         }
         self.consecutive_429s = 0;
         self.backoff_until = None;
+        // Also reset cumulative quota exhaustion on success
+        self.cumulative_quota.reset_on_success();
+    }
+
+    // =========================================================================
+    // Cumulative Quota Methods (Death Spiral Prevention)
+    // =========================================================================
+
+    /// Record cumulative quota exhaustion and enter exponential backoff.
+    ///
+    /// Call this when headroom < 5% and we would otherwise try to place orders.
+    /// Returns the backoff duration that was set.
+    pub fn record_cumulative_exhaustion(&mut self) -> Duration {
+        self.cumulative_quota.record_exhaustion()
+    }
+
+    /// Check if we're in cumulative quota backoff.
+    ///
+    /// When true, the system should NOT attempt to place orders - let fills
+    /// accumulate to restore quota before resuming.
+    pub fn is_cumulative_backoff(&self) -> bool {
+        self.cumulative_quota.is_in_backoff()
+    }
+
+    /// Get remaining cumulative backoff time.
+    pub fn remaining_cumulative_backoff(&self) -> Option<Duration> {
+        self.cumulative_quota.remaining_backoff()
+    }
+
+    /// Get consecutive exhaustion count (for monitoring/alerting).
+    pub fn cumulative_exhaustion_count(&self) -> u32 {
+        self.cumulative_quota.consecutive_exhaustions
     }
 
     /// Check if we're currently in 429 backoff.

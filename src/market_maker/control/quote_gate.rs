@@ -72,6 +72,8 @@ pub enum NoQuoteReason {
     Cascade,
     /// Manual override
     Manual,
+    /// Rate limit quota exhausted (shadow price too high)
+    QuotaExhausted,
 }
 
 impl std::fmt::Display for NoQuoteReason {
@@ -81,6 +83,7 @@ impl std::fmt::Display for NoQuoteReason {
             NoQuoteReason::NoEdgeFlat => write!(f, "no_edge_flat"),
             NoQuoteReason::Cascade => write!(f, "cascade"),
             NoQuoteReason::Manual => write!(f, "manual"),
+            NoQuoteReason::QuotaExhausted => write!(f, "quota_exhausted"),
         }
     }
 }
@@ -371,6 +374,19 @@ pub struct QuoteGateInput {
     /// Estimated number of active competitor MMs.
     /// Default: 3.0
     pub competitor_count: f64,
+
+    // === Phase 9: Rate Limit Shadow Price Fields ===
+
+    /// Rate limit headroom as fraction [0, 1].
+    /// 1.0 = full budget available, 0.0 = exhausted.
+    /// Used for shadow price calculation and quota-aware decisions.
+    /// Default: 1.0
+    pub rate_limit_headroom_pct: f64,
+
+    /// Volatility regime indicator (0=low, 1=normal, 2=high, 3=extreme).
+    /// Higher regimes → faster quota recharge via fills → lower shadow price.
+    /// Default: 1 (normal)
+    pub vol_regime: u8,
 }
 
 impl Default for QuoteGateInput {
@@ -413,6 +429,9 @@ impl Default for QuoteGateInput {
             competitor_snipe_prob: 0.1,       // 10% baseline snipe risk
             competitor_spread_factor: 1.0,    // No competition adjustment
             competitor_count: 3.0,            // Assume 3 competitors
+            // Phase 9: Rate Limit Shadow Price defaults
+            rate_limit_headroom_pct: 1.0,     // Full budget available
+            vol_regime: 1,                    // Normal volatility
         }
     }
 }
@@ -420,11 +439,17 @@ impl Default for QuoteGateInput {
 /// The Quote Gate.
 ///
 /// Determines WHETHER to quote (and which sides) based on directional edge.
+/// Now includes bistability escape mechanisms to prevent getting stuck in
+/// low-quote attractor states.
 #[derive(Debug)]
 pub struct QuoteGate {
     config: QuoteGateConfig,
     /// Bayesian bootstrap tracker for adaptive calibration exit.
     bootstrap_tracker: BayesianBootstrapTracker,
+    /// Last time a quote was placed (for time-decaying thresholds).
+    last_quote_time: Option<std::time::Instant>,
+    /// Consecutive cycles without quoting (for ε-probing escalation).
+    consecutive_no_quote_cycles: u32,
 }
 
 impl Default for QuoteGate {
@@ -437,7 +462,12 @@ impl QuoteGate {
     /// Create a new Quote Gate with the given configuration.
     pub fn new(config: QuoteGateConfig) -> Self {
         let bootstrap_tracker = BayesianBootstrapTracker::new(config.bootstrap_config.clone());
-        Self { config, bootstrap_tracker }
+        Self {
+            config,
+            bootstrap_tracker,
+            last_quote_time: None,
+            consecutive_no_quote_cycles: 0,
+        }
     }
 
     /// Get the configuration.
@@ -453,6 +483,240 @@ impl QuoteGate {
     /// Get reference to bootstrap tracker.
     pub fn bootstrap_tracker(&self) -> &BayesianBootstrapTracker {
         &self.bootstrap_tracker
+    }
+
+    // =========================================================================
+    // Shadow Price for Request Cost (Death Spiral Prevention)
+    // =========================================================================
+
+    /// Compute the shadow price of making an API request in basis points.
+    ///
+    /// The shadow price represents the marginal value of quota - it explodes
+    /// nonlinearly as headroom approaches zero. This is derived from the MDP
+    /// formalization where λ ≈ ∂V/∂h (marginal value of quota).
+    ///
+    /// The shadow price is regime-dependent:
+    /// - High volatility → more fills → faster quota recharge → lower shadow price
+    /// - Low volatility → fewer fills → slower recharge → higher shadow price
+    ///
+    /// # Arguments
+    /// * `headroom_pct` - Current quota headroom as fraction [0, 1]
+    /// * `vol_regime` - Volatility regime (0=low, 1=normal, 2=high, 3=extreme)
+    ///
+    /// # Returns
+    /// Shadow price in basis points. When this exceeds expected edge, don't quote.
+    ///
+    /// # Boundaries
+    /// - When headroom >= 50%: shadow price = 0 (free to quote)
+    /// - When headroom <= 5%: shadow price = 100 bps (effectively infinite)
+    /// - Between: cubic explosion λ ∝ (1 - h)³
+    pub fn compute_request_shadow_price(headroom_pct: f64, vol_regime: u8) -> f64 {
+        // Regime adjustment: high-vol → fills → faster recharge → lower shadow
+        let regime_mult = match vol_regime {
+            0 => 1.2,  // Low volatility: conservative (fills rare)
+            1 => 1.0,  // Normal: baseline
+            2 => 0.7,  // High: can afford more requests
+            3 => 0.5,  // Extreme: fills plentiful
+            _ => 1.0,  // Fallback
+        };
+
+        // When headroom is high (>50%), shadow price ≈ 0
+        if headroom_pct >= 0.50 {
+            return 0.0;
+        }
+
+        // When headroom is critically low (<=5%), shadow price → ∞
+        // Effectively prohibit quoting
+        if headroom_pct <= 0.05 {
+            return 100.0;
+        }
+
+        // Sigmoid-like explosion between 5% and 50%
+        // Normalized x ∈ [0, 1] where x=0 at 50% headroom, x=1 at 5% headroom
+        let x = (0.50 - headroom_pct) / 0.45;
+
+        // Base price for cubic explosion
+        let base_price = 50.0; // Max shadow price in bps (before regime adjustment)
+
+        // Cubic curve: steeper as headroom drops
+        // At 30% headroom: x ≈ 0.44, shadow ≈ 4.3 bps
+        // At 15% headroom: x ≈ 0.78, shadow ≈ 23.7 bps
+        // At 10% headroom: x ≈ 0.89, shadow ≈ 35.2 bps
+        let shadow = base_price * x.powi(3) * regime_mult;
+
+        // Log at debug level for transparency
+        debug!(
+            headroom_pct = %format!("{:.1}%", headroom_pct * 100.0),
+            vol_regime = vol_regime,
+            regime_mult = %format!("{:.2}", regime_mult),
+            shadow_bps = %format!("{:.2}", shadow),
+            "Shadow price computed"
+        );
+
+        shadow
+    }
+
+    /// Check if edge justifies the shadow price of requesting.
+    ///
+    /// Returns true if the expected edge exceeds the shadow price.
+    /// This internalizes quota cost into quoting decisions.
+    pub fn edge_justifies_request(&self, expected_edge_bps: f64, input: &QuoteGateInput) -> bool {
+        let shadow_price = Self::compute_request_shadow_price(
+            input.rate_limit_headroom_pct,
+            input.vol_regime,
+        );
+        expected_edge_bps > shadow_price
+    }
+
+    // =========================================================================
+    // Bistability Escape Mechanisms
+    // =========================================================================
+
+    /// Record that a quote was placed (resets no-quote counters).
+    pub fn record_quote_placed(&mut self) {
+        self.last_quote_time = Some(std::time::Instant::now());
+        self.consecutive_no_quote_cycles = 0;
+    }
+
+    /// Record a no-quote cycle (for ε-probing escalation).
+    pub fn record_no_quote_cycle(&mut self) {
+        self.consecutive_no_quote_cycles += 1;
+    }
+
+    /// Get time since last quote in seconds.
+    pub fn time_since_last_quote(&self) -> f64 {
+        self.last_quote_time
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Compute adjusted min_edge threshold that decays over time.
+    ///
+    /// The longer the system has been in no-quote state, the lower the threshold
+    /// becomes. This helps escape bistable traps where:
+    /// - Few quotes → few fills → uncertain posteriors → even fewer quotes
+    ///
+    /// # Arguments
+    /// * `base_min_edge` - The base minimum edge threshold (from config or calibration)
+    ///
+    /// # Returns
+    /// Adjusted threshold, typically in [0.2 × base, 1.0 × base]
+    ///
+    /// # Time Decay
+    /// - 0-60s without quote: no decay (use base threshold)
+    /// - 60-300s: linear decay to 20% of base
+    /// - >300s: floor at 20% of base
+    pub fn adjusted_min_edge_threshold(&self, base_min_edge: f64) -> f64 {
+        let time_since = self.time_since_last_quote();
+
+        if time_since < 60.0 {
+            return base_min_edge;
+        }
+
+        // Linear decay from 60s to 300s
+        // decay ∈ [0, 1] where 0 = no decay, 1 = max decay
+        let decay = ((time_since - 60.0) / 240.0).min(1.0);
+
+        // Threshold drops to 20% of base at max decay
+        base_min_edge * (1.0 - 0.8 * decay)
+    }
+
+    /// Determine if we should perform an ε-probe to escape bistability.
+    ///
+    /// ε-probing tunnels through bistable barriers by occasionally forcing
+    /// a quote even when edge is marginal. This generates fills which:
+    /// 1. Restore rate limit quota (fills contribute to recharge)
+    /// 2. Generate calibration data (fills update posteriors)
+    /// 3. Test if conditions have changed (edge may have returned)
+    ///
+    /// # Arguments
+    /// * `input` - Contains rate_limit_headroom_pct for budget check
+    ///
+    /// # Returns
+    /// True if we should override NoEdgeFlat and force a quote
+    ///
+    /// # ε Schedule
+    /// - Only probe when headroom > 30% (must have quota budget)
+    /// - ε increases with time stuck in no-quote state
+    /// - After 60s: ε = 0.02 (2% chance per cycle)
+    /// - After 300s: ε = 0.10 (10% chance per cycle)
+    pub fn should_epsilon_probe(&self, input: &QuoteGateInput) -> bool {
+        // Only probe when we have quota budget
+        if input.rate_limit_headroom_pct < 0.30 {
+            return false;
+        }
+
+        let time_since = self.time_since_last_quote();
+
+        // Don't probe if we've been quoting recently
+        if time_since < 60.0 {
+            return false;
+        }
+
+        // ε increases with time stuck in no-quote state
+        let base_epsilon = 0.02;
+        let max_epsilon = 0.10;
+        let time_factor = ((time_since - 60.0) / 240.0).min(1.0);
+        let epsilon = base_epsilon + (max_epsilon - base_epsilon) * time_factor;
+
+        let probe = rand::random::<f64>() < epsilon;
+
+        if probe {
+            info!(
+                time_since_quote_secs = %format!("{:.1}", time_since),
+                epsilon = %format!("{:.3}", epsilon),
+                headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
+                "ε-probe triggered: forcing quote to escape bistable trap"
+            );
+        }
+
+        probe
+    }
+
+    /// Check if we should enter inventory-forcing mode.
+    ///
+    /// When quota is nearly exhausted AND we have a position, use remaining
+    /// quota ONLY for reduce-only orders. This:
+    /// 1. Preserves quota for risk-reducing fills
+    /// 2. Generates fills that restore quota
+    /// 3. Reduces exposure when we can't actively manage risk
+    ///
+    /// # Arguments
+    /// * `input` - Contains rate_limit_headroom_pct and position
+    ///
+    /// # Returns
+    /// Some(QuoteDecision) if we should quote only one side for position reduction,
+    /// None if inventory-forcing mode is not triggered
+    pub fn inventory_forcing_decision(&self, input: &QuoteGateInput) -> Option<QuoteDecision> {
+        // Only activate when quota is critically low
+        if input.rate_limit_headroom_pct >= 0.10 {
+            return None;
+        }
+
+        // Only activate if we have a meaningful position
+        let position_threshold = input.max_position * 0.01; // 1% of max
+        if input.position.abs() < position_threshold {
+            return None;
+        }
+
+        // Determine which side reduces position
+        // High urgency (1.0) because quota is exhausted
+        let (reduce_decision, side_name) = if input.position > 0.0 {
+            // Long → quote asks to sell and reduce
+            (QuoteDecision::QuoteOnlyAsks { urgency: 1.0 }, "asks")
+        } else {
+            // Short → quote bids to buy and reduce
+            (QuoteDecision::QuoteOnlyBids { urgency: 1.0 }, "bids")
+        };
+
+        warn!(
+            position = %format!("{:.4}", input.position),
+            headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
+            reduce_side = %side_name,
+            "Quota exhausted with position - entering inventory-forcing mode"
+        );
+
+        Some(reduce_decision)
     }
 
     /// Compute hierarchical P(correct) by fusing L1/L2/L3 beliefs.
@@ -1230,6 +1494,37 @@ impl QuoteGate {
         changepoint_prob: f64,
         theoretical_edge: &mut TheoreticalEdgeEstimator,
     ) -> QuoteDecision {
+        // =======================================================================
+        // PHASE 9: RATE LIMIT DEATH SPIRAL PREVENTION
+        // Check quota-aware overrides FIRST, before any other logic
+        // =======================================================================
+
+        // 1. Shadow price check: veto all quoting when quota exhausted
+        //    This internalizes request cost and prevents burning budget on low-edge situations
+        let shadow_price = Self::compute_request_shadow_price(
+            input.rate_limit_headroom_pct,
+            input.vol_regime,
+        );
+        if shadow_price >= 100.0 {
+            // Quota essentially exhausted - don't quote at all
+            warn!(
+                headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
+                shadow_price_bps = %format!("{:.1}", shadow_price),
+                "Rate limit shadow price infinite - quota exhausted"
+            );
+            self.record_no_quote_cycle();
+            return QuoteDecision::NoQuote {
+                reason: NoQuoteReason::QuotaExhausted,
+            };
+        }
+
+        // 2. Inventory forcing: when quota is critically low AND we have position,
+        //    use remaining quota ONLY for reduce-only orders
+        if let Some(forcing_decision) = self.inventory_forcing_decision(input) {
+            self.record_quote_placed();
+            return forcing_decision;
+        }
+
         // === BAYESIAN BOOTSTRAP MODE ===
         // Check if we should still be in bootstrap phase
         let exit_decision = self.bootstrap_tracker.should_exit(edge_signal.total_outcomes());
@@ -1241,22 +1536,33 @@ impl QuoteGate {
         // First, try the IR-based decision
         let ir_decision = self.decide_calibrated(input, edge_signal, pnl_tracker, changepoint_prob);
 
-        // If IR says we should quote, trust it
+        // If IR says we should quote, trust it and record
         match &ir_decision {
             QuoteDecision::QuoteBoth
             | QuoteDecision::QuoteOnlyBids { .. }
             | QuoteDecision::QuoteOnlyAsks { .. } => {
+                self.record_quote_placed();
                 return ir_decision;
             }
             QuoteDecision::NoQuote { reason } => {
                 // Only fall back on NoEdgeFlat when IR isn't calibrated
                 if *reason != NoQuoteReason::NoEdgeFlat {
+                    self.record_no_quote_cycle();
                     return ir_decision;
                 }
             }
         }
 
         // IR returned NoQuote with NoEdgeFlat reason
+        // === PHASE 3: BISTABILITY ESCAPE - ε-PROBING ===
+        // When stuck in NoEdgeFlat for too long, occasionally force a quote to:
+        // 1. Restore rate limit quota (fills contribute to recharge)
+        // 2. Generate calibration data (fills update posteriors)
+        // 3. Test if conditions have changed (edge may have returned)
+        if self.should_epsilon_probe(input) {
+            self.record_quote_placed();
+            return QuoteDecision::QuoteBoth;
+        }
         // Log outcome ratio for illiquidity diagnostics
         let outcome_ratio = if edge_signal.total_predictions() > 0 {
             edge_signal.total_outcomes() as f64 / edge_signal.total_predictions() as f64
@@ -1292,6 +1598,7 @@ impl QuoteGate {
                     book_imbalance = %format!("{:.3}", input.book_imbalance),
                     "BAYESIAN BOOTSTRAP: Forcing quote (posterior not yet confident)"
                 );
+                self.record_quote_placed();
                 return QuoteDecision::QuoteBoth;
             }
 
@@ -1303,6 +1610,7 @@ impl QuoteGate {
                     p_calibrated = %format!("{:.3}", exit_decision.p_calibrated),
                     "BOOTSTRAP MM mode: quoting to gather calibration data"
                 );
+                self.record_quote_placed();
                 return QuoteDecision::QuoteBoth;
             }
         }
@@ -1321,6 +1629,7 @@ impl QuoteGate {
                 p_calibrated = %format!("{:.3}", exit_decision.p_calibrated),
                 "IR is_useful=true with meaningful data - respecting decision"
             );
+            self.record_no_quote_cycle();
             return ir_decision;
         }
 
@@ -1344,6 +1653,7 @@ impl QuoteGate {
                     ev_thresh = %format!("{:.2}", mc_ev_thresh),
                     "MC override: thresholds adjusted by calibration confidence"
                 );
+                self.record_quote_placed();
                 return QuoteDecision::QuoteBoth;
             }
         }
@@ -1351,6 +1661,7 @@ impl QuoteGate {
         // === L3 URGENCY OVERRIDE (Phase 6) ===
         // Override when L3 indicates high urgency AND posterior supports action
         if let Some(decision) = self.check_l3_urgency_override(input) {
+            self.record_quote_placed();
             return decision;
         }
 
@@ -1414,6 +1725,7 @@ impl QuoteGate {
                         effective_edge = %format!("{:.2}", effective_edge),
                         "Probe mode active - quoting to gather data"
                     );
+                    self.record_quote_placed();
                     return QuoteDecision::QuoteBoth;
                 }
             }
@@ -1428,6 +1740,7 @@ impl QuoteGate {
                     threshold = %format!("{:.2}", -min_edge_bps / 2.0),
                     "Marginal edge in MM mode - quoting both sides"
                 );
+                self.record_quote_placed();
                 return QuoteDecision::QuoteBoth;
             }
 
@@ -1437,9 +1750,11 @@ impl QuoteGate {
                     outcome_ratio = %format!("{:.2}", outcome_ratio),
                     "Theoretical edge negative but market-making mode enabled - quoting both sides"
                 );
+                self.record_quote_placed();
                 return QuoteDecision::QuoteBoth;
             }
 
+            self.record_no_quote_cycle();
             return QuoteDecision::NoQuote {
                 reason: NoQuoteReason::NoEdgeFlat,
             };
@@ -1460,6 +1775,7 @@ impl QuoteGate {
         // If we have a large position opposing the edge, reduce-only mode
         if position_ratio > 0.3 && !position_aligned && input.position.abs() > 0.0 {
             let urgency = (position_ratio * 0.8).min(1.0);
+            self.record_quote_placed();
             if input.position > 0.0 {
                 return QuoteDecision::QuoteOnlyAsks { urgency };
             } else {
@@ -1468,7 +1784,7 @@ impl QuoteGate {
         }
 
         // Standard case: quote based on theoretical edge direction
-        match theoretical_result.direction {
+        let decision = match theoretical_result.direction {
             1 => {
                 // Bullish edge - we want to buy
                 // Quote both sides but will skew toward bids
@@ -1485,7 +1801,15 @@ impl QuoteGate {
                     reason: NoQuoteReason::NoEdgeFlat,
                 }
             }
+        };
+
+        // Track quote/no-quote cycle
+        match &decision {
+            QuoteDecision::NoQuote { .. } => self.record_no_quote_cycle(),
+            _ => self.record_quote_placed(),
         }
+
+        decision
     }
 
     /// Get the current Bayesian bootstrap exit decision (for diagnostics).

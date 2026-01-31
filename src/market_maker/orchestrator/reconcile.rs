@@ -717,27 +717,84 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             "[Reconcile] ASK levels (price@size)"
         );
 
-        // === EMPTY LADDER RECOVERY ===
+        // === EMPTY LADDER RECOVERY (QUOTA-AWARE) ===
         // When local tracking is completely empty but we have target quotes,
-        // this is a CRITICAL recovery situation. Bypass drift/impulse checks
-        // and immediately place all target orders to restore quoting.
+        // this is a CRITICAL recovery situation. However, we MUST respect rate
+        // limits to avoid death spiral: empty → aggressive recovery → burn quota
+        // → fail → empty → repeat.
         let ladder_empty = current_bids.is_empty() && current_asks.is_empty();
         let has_targets = !bid_levels.is_empty() || !ask_levels.is_empty();
 
         if ladder_empty && has_targets {
-            warn!(
-                target_bids = bid_levels.len(),
-                target_asks = ask_levels.len(),
-                "EMPTY LADDER DETECTED - forcing immediate replenishment (bypassing all checks)"
-            );
+            // QUOTA-AWARE CHECK: Get current headroom before deciding recovery strategy
+            let headroom = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .map(|c| c.headroom_pct())
+                .unwrap_or(1.0);
+
+            // Check if we're in cumulative quota backoff
+            let in_backoff = self.infra.proactive_rate_tracker.is_cumulative_backoff();
+
+            if in_backoff {
+                // CRITICAL: Do NOT burn quota while in backoff - let fills accumulate
+                let remaining = self
+                    .infra
+                    .proactive_rate_tracker
+                    .remaining_cumulative_backoff();
+                warn!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    backoff_remaining_secs = %format!("{:.1}", remaining.map(|d| d.as_secs_f64()).unwrap_or(0.0)),
+                    "EMPTY LADDER but in quota backoff - SKIPPING recovery to break death spiral"
+                );
+                return Ok(());
+            }
+
+            if headroom < 0.05 {
+                // CRITICAL: Quota exhausted - do NOT try to recover
+                // Record exhaustion and enter backoff
+                let backoff = self
+                    .infra
+                    .proactive_rate_tracker
+                    .record_cumulative_exhaustion();
+                warn!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+                    "EMPTY LADDER but quota exhausted - entering conservation mode with backoff"
+                );
+                return Ok(());
+            }
+
+            // Prepare levels for placement
+            let mut bid_places: Vec<(f64, f64)> =
+                bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let mut ask_places: Vec<(f64, f64)> =
+                ask_levels.iter().map(|l| (l.price, l.size)).collect();
+
+            if headroom < 0.20 {
+                // LOW QUOTA: Place minimal presence only (1-2 levels per side)
+                // This restores quoting without burning through remaining budget
+                let max_levels = 2;
+                bid_places.truncate(max_levels);
+                ask_places.truncate(max_levels);
+                warn!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    bid_levels = bid_places.len(),
+                    ask_levels = ask_places.len(),
+                    "EMPTY LADDER with low quota - placing minimal levels only"
+                );
+            } else {
+                warn!(
+                    target_bids = bid_levels.len(),
+                    target_asks = ask_levels.len(),
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    "EMPTY LADDER DETECTED - forcing immediate replenishment"
+                );
+            }
 
             // Delegate to place_bulk_ladder_orders for proper CLOID tracking
             // This prevents orphan orders by using the pending registration flow
-            let bid_places: Vec<(f64, f64)> =
-                bid_levels.iter().map(|l| (l.price, l.size)).collect();
-            let ask_places: Vec<(f64, f64)> =
-                ask_levels.iter().map(|l| (l.price, l.size)).collect();
-
             let mut placed_count = 0usize;
             if !bid_places.is_empty() {
                 placed_count += bid_places.len();
