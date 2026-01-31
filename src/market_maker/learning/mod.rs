@@ -26,10 +26,12 @@
 //! This is online learning with labels from trading outcomes.
 
 pub mod adaptive_ensemble;
+pub mod competitor_model;
 pub mod confidence;
 pub mod decision;
 pub mod ensemble;
 pub mod execution;
+pub mod rl_agent;
 pub mod types;
 
 // Re-export key types
@@ -38,6 +40,14 @@ pub use confidence::{AggregateConfidence, ModelConfidenceTracker};
 pub use decision::DecisionEngine;
 pub use ensemble::{EdgeModel, ModelEnsemble};
 pub use execution::ExecutionOptimizer;
+pub use rl_agent::{
+    MDPAction, MDPState, QLearningAgent, QLearningConfig, RLPolicyRecommendation,
+    Reward, RewardConfig, ExplorationStrategy,
+};
+pub use competitor_model::{
+    CompetitorModel, CompetitorModelConfig, CompetitorSummary,
+    MarketEvent, Side, BayesianGamma, SnipeTracker,
+};
 pub use types::*;
 
 use crate::market_maker::calibration::{CalibrationSample, CoefficientEstimator};

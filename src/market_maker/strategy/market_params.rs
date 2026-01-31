@@ -203,6 +203,61 @@ pub struct MarketParams {
     /// Hawkes activity percentile [0, 1] - where current intensity sits in history
     pub hawkes_activity_percentile: f64,
 
+    // --- Hawkes Excitation Prediction (Phase 7: Bayesian Fusion) ---
+    /// Probability of cluster/cascade in next τ seconds.
+    /// High values indicate elevated risk of self-exciting price cascades.
+    /// Source: HawkesExcitationPredictor.p_cluster(τ)
+    pub hawkes_p_cluster: f64,
+
+    /// Edge penalty multiplier [0.5, 1.0] for quoting decisions.
+    /// Lower values = more conservative quoting during high excitation.
+    /// Formula: 1.0 - (1.0 - min_penalty) × √p_cluster
+    pub hawkes_excitation_penalty: f64,
+
+    /// Whether we're in a high excitation state.
+    /// True when: branching_ratio > 0.7 OR intensity_percentile > 0.8
+    pub hawkes_is_high_excitation: bool,
+
+    /// Current branching ratio n = α/β from GMM calibration.
+    /// Critical threshold: n → 1 indicates near-critical regime.
+    /// Range: [0, 1) for stationary processes.
+    pub hawkes_branching_ratio: f64,
+
+    /// Spread widening factor for defensive quoting [1.0, 3.0].
+    /// Multiplied with GLFT optimal spread during high excitation.
+    /// Formula: 1 + 0.3×(intensity_ratio - 1) + 0.5×n²
+    pub hawkes_spread_widening: f64,
+
+    /// Expected time to next cluster event (seconds).
+    /// Lower values indicate imminent cluster risk.
+    pub hawkes_expected_cluster_time: f64,
+
+    /// Excess intensity ratio: λ_current / λ_baseline.
+    /// Values > 1 indicate elevated activity above normal.
+    pub hawkes_excess_intensity_ratio: f64,
+
+    // --- Phase 8: RL Policy Recommendations ---
+    /// RL recommended spread delta (bps). Positive = widen.
+    pub rl_spread_delta_bps: f64,
+    /// RL recommended bid skew (bps).
+    pub rl_bid_skew_bps: f64,
+    /// RL recommended ask skew (bps).
+    pub rl_ask_skew_bps: f64,
+    /// RL policy confidence [0, 1].
+    pub rl_confidence: f64,
+    /// Whether RL is exploring (vs exploiting).
+    pub rl_is_exploration: bool,
+    /// Expected Q-value from RL agent.
+    pub rl_expected_q: f64,
+
+    // --- Phase 8: Competitor Model ---
+    /// Competitor snipe probability [0, 1].
+    pub competitor_snipe_prob: f64,
+    /// Competitor-driven spread widening factor.
+    pub competitor_spread_factor: f64,
+    /// Estimated number of active competitor MMs.
+    pub competitor_count: f64,
+
     // === Tier 2: Funding Rate ===
     /// Current funding rate (annualized)
     pub funding_rate: f64,
@@ -601,6 +656,31 @@ pub struct MarketParams {
     /// When kappa is high, spread can be tighter. Used to cap GLFT optimal spread.
     /// None = no kappa spread adjustment applied.
     pub kappa_spread_bps: Option<f64>,
+
+    // ==================== Bayesian Gamma Components (Alpha Plan) ====================
+    /// Trend confidence [0, 1] from directional signals.
+    /// High confidence → can quote tighter spreads (lower gamma).
+    /// Source: momentum persistence, book imbalance consistency, etc.
+    pub trend_confidence: f64,
+
+    /// Bootstrap calibration confidence [0, 1] - P(calibrated) from Bayesian bootstrap.
+    /// Low confidence → need fills → quote tighter (lower gamma).
+    /// High confidence → calibrated → normal GLFT behavior.
+    pub bootstrap_confidence: f64,
+
+    /// Adverse selection uncertainty (std dev of posterior).
+    /// High uncertainty → quote wider (higher gamma) for safety.
+    /// Source: RegimeAwareBayesianAdverse.variance().sqrt()
+    pub adverse_uncertainty: f64,
+
+    /// Current adverse selection regime (0=Calm, 1=Normal, 2=Volatile).
+    /// Volatile regime → wider spreads (higher gamma).
+    pub adverse_regime: usize,
+
+    /// Bayesian gamma multiplier computed from above components.
+    /// Pre-computed in orchestrator: bayesian_gamma_mult = trend_discount × bootstrap_discount × uncertainty_premium × regime_mult
+    /// Range: [0.7, 1.5] typically.
+    pub bayesian_gamma_mult: f64,
 }
 
 impl Default for MarketParams {
@@ -654,6 +734,25 @@ impl Default for MarketParams {
             hawkes_sell_intensity: 0.0,
             hawkes_imbalance: 0.0,
             hawkes_activity_percentile: 0.5,
+            // Hawkes Excitation Prediction (Phase 7: Bayesian Fusion)
+            hawkes_p_cluster: 0.0,               // No cluster risk initially
+            hawkes_excitation_penalty: 1.0,      // No penalty (full edge)
+            hawkes_is_high_excitation: false,    // Not excited initially
+            hawkes_branching_ratio: 0.3,         // Moderate default (from prior)
+            hawkes_spread_widening: 1.0,         // No widening initially
+            hawkes_expected_cluster_time: f64::INFINITY, // No imminent cluster
+            hawkes_excess_intensity_ratio: 1.0,  // At baseline
+            // Phase 8: RL Policy Recommendations
+            rl_spread_delta_bps: 0.0,
+            rl_bid_skew_bps: 0.0,
+            rl_ask_skew_bps: 0.0,
+            rl_confidence: 0.0,
+            rl_is_exploration: false,
+            rl_expected_q: 0.0,
+            // Phase 8: Competitor Model
+            competitor_snipe_prob: 0.1,      // 10% baseline
+            competitor_spread_factor: 1.0,   // No adjustment
+            competitor_count: 3.0,           // Assume 3 competitors
             // Tier 2: Funding Rate
             funding_rate: 0.0,
             predicted_funding_cost: 0.0,
@@ -785,6 +884,12 @@ impl Default for MarketParams {
             proactive_min_momentum_bps: 5.0,         // Need 5 bps minimum momentum
             // Kappa-Driven Spread (Phase 3)
             kappa_spread_bps: None, // No kappa spread cap until computed
+            // Bayesian Gamma Components (Alpha Plan)
+            trend_confidence: 0.5,        // 50% confidence initially (uncertain)
+            bootstrap_confidence: 0.0,    // Not calibrated initially
+            adverse_uncertainty: 0.1,     // Moderate uncertainty (10% std)
+            adverse_regime: 1,            // Normal regime initially
+            bayesian_gamma_mult: 1.0,     // No adjustment until computed
         }
     }
 }

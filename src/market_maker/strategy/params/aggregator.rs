@@ -211,6 +211,30 @@ impl ParameterAggregator {
             hawkes_sell_intensity: sources.hawkes.lambda_sell(),
             hawkes_imbalance: sources.hawkes.flow_imbalance(),
             hawkes_activity_percentile: sources.hawkes.intensity_percentile(),
+            // Hawkes Excitation Prediction (Phase 7: Bayesian Fusion)
+            // These will be populated from HawkesExcitationPredictor in orchestrator
+            hawkes_p_cluster: 0.0,               // Default until predictor integrated
+            hawkes_excitation_penalty: 1.0,      // Default full edge
+            hawkes_is_high_excitation: false,    // Default not excited
+            hawkes_branching_ratio: 0.3,         // Default moderate
+            hawkes_spread_widening: 1.0,         // Default no widening
+            hawkes_expected_cluster_time: f64::INFINITY, // Default no imminent
+            hawkes_excess_intensity_ratio: 1.0,  // Default at baseline
+
+            // Phase 8: RL Policy Recommendations
+            // These will be populated from QLearningAgent in orchestrator
+            rl_spread_delta_bps: 0.0,            // Default no adjustment
+            rl_bid_skew_bps: 0.0,
+            rl_ask_skew_bps: 0.0,
+            rl_confidence: 0.0,                  // Default no confidence
+            rl_is_exploration: false,
+            rl_expected_q: 0.0,
+
+            // Phase 8: Competitor Model
+            // These will be populated from CompetitorModel in orchestrator
+            competitor_snipe_prob: 0.1,          // Default 10% baseline
+            competitor_spread_factor: 1.0,       // Default no adjustment
+            competitor_count: 3.0,               // Default 3 competitors
 
             // === Tier 2: Funding Rate ===
             funding_rate: sources.funding.current_rate(),
@@ -466,6 +490,15 @@ impl ParameterAggregator {
 
             // Kappa-Driven Spread (Phase 3) - computed separately in quote_engine
             kappa_spread_bps: None,
+
+            // === Bayesian Gamma Components (Alpha Plan) ===
+            // These are populated from QuoteGate and TheoreticalEdgeEstimator
+            // Default to neutral values; actual values populated in quote_engine.rs
+            trend_confidence: 0.5,        // 50% initially (uncertain)
+            bootstrap_confidence: 0.0,    // Not calibrated initially
+            adverse_uncertainty: 0.1,     // Moderate uncertainty
+            adverse_regime: 1,            // Normal regime
+            bayesian_gamma_mult: 1.0,     // No adjustment until computed
         }
     }
 }

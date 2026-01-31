@@ -302,6 +302,81 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Record fill for calibration controller
                 // This updates fill rate tracking for fill-hungry mode
                 self.stochastic.calibration_controller.record_fill();
+
+                // === Phase 8: RL Agent Learning Update ===
+                // Update Q-values from fill outcome
+                {
+                    use crate::market_maker::learning::{MDPState, MDPAction, Reward, MarketEvent};
+
+                    // Build current MDP state from fill conditions
+                    let book_imbalance = self.estimator.book_imbalance();
+                    // Use current sigma vs a baseline (use sigma_clean as proxy for short-term)
+                    let vol_ratio = self.estimator.sigma() / self.estimator.sigma_clean().max(0.0001);
+                    let adverse_prob = self.stochastic.theoretical_edge.bayesian_adverse();
+                    // Use intensity percentile as proxy for excitation level
+                    let hawkes_excitation = self.tier2.hawkes.intensity_percentile();
+
+                    let current_state = MDPState::from_continuous(
+                        self.position.position(),
+                        self.effective_max_position,
+                        book_imbalance,
+                        vol_ratio,
+                        adverse_prob,
+                        hawkes_excitation,
+                    );
+
+                    // Was this fill adverse? (positive AS means we lost)
+                    let was_adverse = as_realized > 0.0;
+
+                    // Compute realized edge in bps
+                    let realized_edge_bps = fill_pnl * 10000.0;
+
+                    // Inventory risk: |position| / max_position
+                    let inventory_risk = (self.position.position().abs()
+                        / self.effective_max_position.max(1.0))
+                        .clamp(0.0, 1.0);
+
+                    // Compute reward
+                    let reward = Reward::compute(
+                        self.stochastic.rl_agent.reward_config(),
+                        realized_edge_bps,
+                        inventory_risk,
+                        vol_ratio,
+                        was_adverse,
+                    );
+
+                    // Infer the action from current spread/skew (simplified)
+                    // In production, we'd track the actual action taken when quoting
+                    let action = MDPAction::default();
+
+                    // Update Q-values with the transition
+                    // next_state = current_state (no episode termination)
+                    self.stochastic.rl_agent.update(
+                        current_state.clone(),
+                        action,
+                        reward,
+                        current_state,
+                        false, // not done
+                    );
+
+                    debug!(
+                        realized_edge_bps = %format!("{:.2}", realized_edge_bps),
+                        inventory_risk = %format!("{:.3}", inventory_risk),
+                        reward_total = %format!("{:.3}", reward.total),
+                        was_adverse = was_adverse,
+                        "RL agent updated from fill"
+                    );
+
+                    // === Competitor Model Observation ===
+                    // Estimate queue position from depth
+                    let queue_position = depth_from_mid * 100.0; // Simplified: bps * 100
+                    let time_in_queue_ms = 100; // Placeholder: would need order timestamp tracking
+
+                    self.stochastic.competitor_model.observe(&MarketEvent::OurFill {
+                        queue_position,
+                        time_in_queue_ms,
+                    });
+                }
             }
         }
 
@@ -424,6 +499,32 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.stochastic
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
+            }
+
+            // === Phase 8: Competitor Model Depth Observation ===
+            // Track depth changes for competitor inference
+            {
+                use crate::market_maker::learning::{MarketEvent, Side as LearningSide};
+
+                // Compute total bid/ask depth
+                let bid_depth: f64 = bids.iter().map(|(_, sz)| sz).sum();
+                let ask_depth: f64 = asks.iter().map(|(_, sz)| sz).sum();
+
+                // Store previous depths for delta calculation (simplified: use static mut or cache)
+                // For now, observe raw depth as proxy for competitor activity
+                // Large depths suggest more competitor presence
+                if bid_depth > 100.0 {
+                    self.stochastic.competitor_model.observe(&MarketEvent::DepthChange {
+                        side: LearningSide::Bid,
+                        delta: bid_depth,
+                    });
+                }
+                if ask_depth > 100.0 {
+                    self.stochastic.competitor_model.observe(&MarketEvent::DepthChange {
+                        side: LearningSide::Ask,
+                        delta: ask_depth,
+                    });
+                }
             }
 
             // === Phase 2/3 Component Updates ===

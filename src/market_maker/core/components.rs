@@ -439,6 +439,15 @@ pub struct StochasticComponents {
     /// Kappa-driven spread controller: dynamic spread adjustment.
     /// Tightens spreads when fill intensity is high.
     pub kappa_spread: KappaSpreadController,
+
+    // === Phase 8: RL and Competitor Modeling ===
+    /// Q-Learning agent for adaptive quoting policy.
+    /// Uses Thompson sampling on Bayesian Q-values for exploration.
+    pub rl_agent: crate::market_maker::learning::QLearningAgent,
+
+    /// Competitor model for rival MM inference.
+    /// Tracks snipe probability and queue competition.
+    pub competitor_model: crate::market_maker::learning::CompetitorModel,
 }
 
 impl StochasticComponents {
@@ -527,6 +536,9 @@ impl StochasticComponents {
             enhanced_flow: EnhancedFlowEstimator::new(EnhancedFlowConfig::default()),
             mc_simulator: QuickMCSimulator::new(QuickMCConfig::default()),
             kappa_spread: KappaSpreadController::new(KappaSpreadConfig::default()),
+            // Phase 8: RL and Competitor Modeling
+            rl_agent: crate::market_maker::learning::QLearningAgent::default(),
+            competitor_model: crate::market_maker::learning::CompetitorModel::default(),
         }
     }
     

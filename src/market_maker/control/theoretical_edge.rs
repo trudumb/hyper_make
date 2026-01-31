@@ -565,6 +565,398 @@ impl Default for BayesianAdverseTracker {
     }
 }
 
+// ============================================================================
+// Regime-Aware Bayesian Adverse Selection Tracker
+// ============================================================================
+
+/// Prior configurations for each regime.
+/// Per-regime priors reflect structural expectations:
+/// - Calm regime: lower adverse selection (E[p] = 0.10)
+/// - Normal regime: moderate adverse selection (E[p] = 0.15)
+/// - Volatile regime: higher adverse selection (E[p] = 0.25)
+const REGIME_ADVERSE_PRIORS: [(f64, f64); 3] = [
+    (3.0, 27.0),  // Calm: E[p] = 3/30 = 0.10
+    (3.0, 17.0),  // Normal: E[p] = 3/20 = 0.15
+    (5.0, 15.0),  // Volatile: E[p] = 5/20 = 0.25
+];
+
+/// Summary of regime-aware adverse selection state.
+#[derive(Debug, Clone)]
+pub struct AdverseSummary {
+    /// Current regime index (0=Calm, 1=Normal, 2=Volatile).
+    pub current_regime: usize,
+    /// Posterior mean for each regime.
+    pub regime_means: [f64; 3],
+    /// Fills observed per regime.
+    pub fills_per_regime: [u64; 3],
+    /// Empirical adverse rate per regime (ignoring prior).
+    pub adverse_rate_per_regime: [f64; 3],
+    /// Posterior variance for current regime.
+    pub current_variance: f64,
+    /// 95% credible interval for current regime.
+    pub credible_interval_95: (f64, f64),
+}
+
+/// Regime-aware Bayesian tracker for adverse selection probability.
+///
+/// Maintains separate Beta posteriors for each volatility regime:
+/// - Regime 0: Calm (low volatility)
+/// - Regime 1: Normal
+/// - Regime 2: Volatile (high volatility, cascades)
+///
+/// This prevents high-volatility adverse fills from contaminating calm-regime
+/// beliefs, allowing tighter spreads in calm markets while maintaining
+/// appropriate conservatism in volatile conditions.
+#[derive(Debug, Clone)]
+pub struct RegimeAwareBayesianAdverse {
+    /// Per-regime Beta posteriors: [(alpha, beta); 3]
+    regimes: [(f64, f64); 3],
+    /// Current regime index
+    current_regime: usize,
+    /// Fill counts per regime
+    fills_per_regime: [u64; 3],
+    /// Adverse fill counts per regime
+    adverse_per_regime: [u64; 3],
+}
+
+impl RegimeAwareBayesianAdverse {
+    /// Create with regime-specific priors.
+    pub fn new() -> Self {
+        Self {
+            regimes: REGIME_ADVERSE_PRIORS,
+            current_regime: 1, // Start in normal regime
+            fills_per_regime: [0; 3],
+            adverse_per_regime: [0; 3],
+        }
+    }
+
+    /// Classify and update current regime based on market conditions.
+    ///
+    /// # Arguments
+    /// * `vol_ratio` - Current volatility / baseline volatility
+    /// * `spread_ratio` - Current spread / typical spread
+    /// * `cascade_prob` - Probability of cascade from changepoint detector
+    pub fn update_regime(&mut self, vol_ratio: f64, spread_ratio: f64, cascade_prob: f64) {
+        self.current_regime = if cascade_prob > 0.5 || vol_ratio > 2.0 {
+            2 // Volatile
+        } else if vol_ratio < 0.7 && spread_ratio < 0.8 {
+            0 // Calm
+        } else {
+            1 // Normal
+        };
+    }
+
+    /// Set the current regime directly.
+    pub fn set_regime(&mut self, regime: usize) {
+        self.current_regime = regime.min(2);
+    }
+
+    /// Get current regime index.
+    pub fn current_regime(&self) -> usize {
+        self.current_regime
+    }
+
+    /// Update with fill outcome (standard update).
+    ///
+    /// # Arguments
+    /// * `was_adverse` - True if price moved against position after fill
+    pub fn update(&mut self, was_adverse: bool) {
+        self.update_weighted(was_adverse, 0.0, 1.0);
+    }
+
+    /// Update with impact-weighted fill outcome.
+    ///
+    /// Uses impact weighting to emphasize painful adverse fills:
+    /// - High urgency score → higher weight (quadratic)
+    /// - Large adverse selection bps → higher weight (log scale)
+    ///
+    /// # Arguments
+    /// * `was_adverse` - True if price moved against position after fill
+    /// * `urgency_score` - Urgency score from L3 controller [0, 4+]
+    /// * `realized_as_bps` - Realized adverse selection in basis points
+    pub fn update_weighted(
+        &mut self,
+        was_adverse: bool,
+        urgency_score: f64,
+        realized_as_bps: f64,
+    ) {
+        // Impact weight: emphasize painful adverse fills
+        let urgency_weight = urgency_score.powi(2) / 4.0; // Quadratic [0, ~4]
+        let size_weight = (1.0 + realized_as_bps.abs() / 5.0).ln().max(0.0); // Log scale
+        let w = 1.0 + urgency_weight + size_weight;
+
+        let (alpha, beta) = &mut self.regimes[self.current_regime];
+
+        if was_adverse {
+            *alpha += w;
+            self.adverse_per_regime[self.current_regime] += 1;
+        } else {
+            *beta += w;
+        }
+        self.fills_per_regime[self.current_regime] += 1;
+    }
+
+    /// Get posterior mean for current regime.
+    pub fn mean(&self) -> f64 {
+        let (alpha, beta) = self.regimes[self.current_regime];
+        alpha / (alpha + beta)
+    }
+
+    /// Get posterior mean for a specific regime.
+    pub fn mean_for_regime(&self, regime: usize) -> f64 {
+        let regime = regime.min(2);
+        let (alpha, beta) = self.regimes[regime];
+        alpha / (alpha + beta)
+    }
+
+    /// Get posterior variance for current regime (uncertainty).
+    pub fn variance(&self) -> f64 {
+        let (alpha, beta) = self.regimes[self.current_regime];
+        let n = alpha + beta;
+        alpha * beta / (n * n * (n + 1.0))
+    }
+
+    /// Get 95% credible interval for current regime.
+    ///
+    /// Uses normal approximation for Beta distribution when α, β are large enough.
+    pub fn credible_interval_95(&self) -> (f64, f64) {
+        let mean = self.mean();
+        let std = self.variance().sqrt();
+        let lower = (mean - 1.96 * std).max(0.0);
+        let upper = (mean + 1.96 * std).min(1.0);
+        (lower, upper)
+    }
+
+    /// Get total fills across all regimes.
+    pub fn total_fills(&self) -> u64 {
+        self.fills_per_regime.iter().sum()
+    }
+
+    /// Get adverse fills for current regime.
+    pub fn adverse_fills_current(&self) -> u64 {
+        self.adverse_per_regime[self.current_regime]
+    }
+
+    /// Get empirical adverse rate for current regime (ignoring prior).
+    pub fn empirical_rate(&self) -> f64 {
+        let fills = self.fills_per_regime[self.current_regime];
+        if fills == 0 {
+            return self.mean(); // Return prior mean
+        }
+        self.adverse_per_regime[self.current_regime] as f64 / fills as f64
+    }
+
+    /// Decay all regime posteriors toward their priors.
+    ///
+    /// Call this when a hard changepoint is detected.
+    ///
+    /// # Arguments
+    /// * `retention` - Fraction of posterior to keep [0, 1]
+    pub fn decay_all(&mut self, retention: f64) {
+        let retention = retention.clamp(0.0, 1.0);
+
+        for (i, (alpha, beta)) in self.regimes.iter_mut().enumerate() {
+            let (prior_alpha, prior_beta) = REGIME_ADVERSE_PRIORS[i];
+            *alpha = prior_alpha + (*alpha - prior_alpha) * retention;
+            *beta = prior_beta + (*beta - prior_beta) * retention;
+        }
+
+        for fills in &mut self.fills_per_regime {
+            *fills = (*fills as f64 * retention) as u64;
+        }
+        for adverse in &mut self.adverse_per_regime {
+            *adverse = (*adverse as f64 * retention) as u64;
+        }
+    }
+
+    /// Decay only current regime (for soft regime-local reset).
+    pub fn decay_current(&mut self, retention: f64) {
+        let retention = retention.clamp(0.0, 1.0);
+        let r = self.current_regime;
+
+        let (prior_alpha, prior_beta) = REGIME_ADVERSE_PRIORS[r];
+        let (alpha, beta) = &mut self.regimes[r];
+        *alpha = prior_alpha + (*alpha - prior_alpha) * retention;
+        *beta = prior_beta + (*beta - prior_beta) * retention;
+
+        self.fills_per_regime[r] = (self.fills_per_regime[r] as f64 * retention) as u64;
+        self.adverse_per_regime[r] = (self.adverse_per_regime[r] as f64 * retention) as u64;
+    }
+
+    // =========================================================================
+    // Phase 7: Hawkes-Bayesian Fusion
+    // =========================================================================
+
+    /// Update regime considering Hawkes excitation state.
+    ///
+    /// Hawkes high excitation (high branching ratio, high intensity) is a leading
+    /// indicator of regime transitions. When Hawkes signals excitation:
+    /// - Prefer volatile regime classification
+    /// - Faster transition to volatile regime
+    /// - Slower transition back to calm regime
+    ///
+    /// # Arguments
+    /// * `vol_ratio` - Current volatility / baseline volatility
+    /// * `spread_ratio` - Current spread / typical spread
+    /// * `cascade_prob` - Probability of cascade from changepoint detector
+    /// * `hawkes_is_high_excitation` - Whether Hawkes predictor indicates high excitation
+    /// * `hawkes_branching_ratio` - Current n = α/β from Hawkes calibration
+    pub fn update_regime_with_hawkes(
+        &mut self,
+        vol_ratio: f64,
+        spread_ratio: f64,
+        cascade_prob: f64,
+        hawkes_is_high_excitation: bool,
+        hawkes_branching_ratio: f64,
+    ) {
+        // Hawkes excitation boost: when n > 0.5, add to cascade_prob
+        let hawkes_cascade_boost = if hawkes_is_high_excitation {
+            // Quadratic boost: n=0.7 → +0.12, n=0.9 → +0.32
+            (hawkes_branching_ratio - 0.5).max(0.0).powi(2) * 2.0
+        } else {
+            0.0
+        };
+
+        // Effective cascade probability with Hawkes contribution
+        let effective_cascade_prob = (cascade_prob + hawkes_cascade_boost).min(1.0);
+
+        // Regime classification with Hawkes-aware thresholds
+        self.current_regime = if effective_cascade_prob > 0.4 || vol_ratio > 1.8 || hawkes_is_high_excitation {
+            2 // Volatile - enter earlier with Hawkes signal
+        } else if vol_ratio < 0.6 && spread_ratio < 0.7 && hawkes_branching_ratio < 0.4 {
+            0 // Calm - require low Hawkes excitation to be calm
+        } else {
+            1 // Normal
+        };
+    }
+
+    /// Update with Hawkes-weighted fill outcome.
+    ///
+    /// During high Hawkes excitation, fills carry more information about
+    /// adverse selection probability. This method increases update weight
+    /// when excitation is high, allowing faster posterior adaptation
+    /// during volatile periods.
+    ///
+    /// # Arguments
+    /// * `was_adverse` - True if price moved against position after fill
+    /// * `urgency_score` - Urgency score from L3 controller [0, 4+]
+    /// * `realized_as_bps` - Realized adverse selection in basis points
+    /// * `hawkes_excitation_penalty` - From HawkesExcitationPredictor [0.5, 1.0]
+    /// * `hawkes_p_cluster` - P(cluster) from predictor [0, 1]
+    pub fn update_weighted_with_hawkes(
+        &mut self,
+        was_adverse: bool,
+        urgency_score: f64,
+        realized_as_bps: f64,
+        hawkes_excitation_penalty: f64,
+        hawkes_p_cluster: f64,
+    ) {
+        // Base weight from urgency and size
+        let urgency_weight = urgency_score.powi(2) / 4.0;
+        let size_weight = (1.0 + realized_as_bps.abs() / 5.0).ln().max(0.0);
+        let base_w = 1.0 + urgency_weight + size_weight;
+
+        // Hawkes excitation boost:
+        // Lower penalty (high excitation) → higher weight
+        // Higher P(cluster) → higher weight for adverse fills
+        let excitation_factor = 1.0 / hawkes_excitation_penalty.max(0.5); // [1.0, 2.0]
+        
+        // Cluster probability adds information especially for adverse fills
+        let cluster_boost = if was_adverse {
+            // Adverse during high cluster prob = highly informative
+            1.0 + hawkes_p_cluster * 2.0 // [1.0, 3.0]
+        } else {
+            // Non-adverse during high cluster prob = also informative (market absorbing flow)
+            1.0 + hawkes_p_cluster * 0.5 // [1.0, 1.5]
+        };
+
+        let w = base_w * excitation_factor * cluster_boost;
+
+        let (alpha, beta) = &mut self.regimes[self.current_regime];
+
+        if was_adverse {
+            *alpha += w;
+            self.adverse_per_regime[self.current_regime] += 1;
+        } else {
+            *beta += w;
+        }
+        self.fills_per_regime[self.current_regime] += 1;
+    }
+
+    /// Get effective adverse selection rate incorporating Hawkes state.
+    ///
+    /// When Hawkes excitation is high, use more conservative estimate
+    /// (closer to credible interval upper bound).
+    ///
+    /// # Arguments
+    /// * `hawkes_p_cluster` - P(cluster) from predictor [0, 1]
+    /// * `hawkes_is_high_excitation` - Whether in high excitation state
+    pub fn effective_adverse_with_hawkes(
+        &self,
+        hawkes_p_cluster: f64,
+        hawkes_is_high_excitation: bool,
+    ) -> f64 {
+        let mean = self.mean();
+        let (_, upper_ci) = self.credible_interval_95();
+
+        // During high excitation, blend toward upper credible interval
+        if hawkes_is_high_excitation {
+            // Linear blend: p_cluster=0.5 → 75% upper, p_cluster=1.0 → 100% upper
+            let blend_factor = (hawkes_p_cluster - 0.5).max(0.0) * 2.0; // [0, 1]
+            let conservative_blend = 0.5 + blend_factor * 0.5; // [0.5, 1.0]
+            mean * (1.0 - conservative_blend) + upper_ci * conservative_blend
+        } else {
+            mean
+        }
+    }
+
+    /// Get diagnostic summary.
+    pub fn summary(&self) -> AdverseSummary {
+        let regime_means = [
+            self.mean_for_regime(0),
+            self.mean_for_regime(1),
+            self.mean_for_regime(2),
+        ];
+
+        let adverse_rate_per_regime = [
+            if self.fills_per_regime[0] > 0 {
+                self.adverse_per_regime[0] as f64 / self.fills_per_regime[0] as f64
+            } else {
+                regime_means[0]
+            },
+            if self.fills_per_regime[1] > 0 {
+                self.adverse_per_regime[1] as f64 / self.fills_per_regime[1] as f64
+            } else {
+                regime_means[1]
+            },
+            if self.fills_per_regime[2] > 0 {
+                self.adverse_per_regime[2] as f64 / self.fills_per_regime[2] as f64
+            } else {
+                regime_means[2]
+            },
+        ];
+
+        AdverseSummary {
+            current_regime: self.current_regime,
+            regime_means,
+            fills_per_regime: self.fills_per_regime,
+            adverse_rate_per_regime,
+            current_variance: self.variance(),
+            credible_interval_95: self.credible_interval_95(),
+        }
+    }
+
+    /// Get regime posterior (alpha, beta) for a specific regime.
+    pub fn regime_posterior(&self, regime: usize) -> (f64, f64) {
+        self.regimes[regime.min(2)]
+    }
+}
+
+impl Default for RegimeAwareBayesianAdverse {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Configuration for theoretical edge estimation.
 #[derive(Debug, Clone)]
@@ -644,8 +1036,8 @@ pub struct TheoreticalEdgeEstimator {
     cross_asset: CrossAssetSignal,
     /// Bayesian tracker for directional accuracy (regime-aware)
     alpha_tracker: RegimeAwareAlphaTracker,
-    /// Bayesian tracker for adverse selection probability
-    adverse_tracker: BayesianAdverseTracker,
+    /// Bayesian tracker for adverse selection probability (regime-aware)
+    adverse_tracker: RegimeAwareBayesianAdverse,
     /// Fill rate estimator for P(fill) calculation
     fill_rate: FillRateEstimator,
     /// Number of edge calculations performed
@@ -666,7 +1058,7 @@ impl TheoreticalEdgeEstimator {
             config,
             cross_asset: CrossAssetSignal::default(),
             alpha_tracker: RegimeAwareAlphaTracker::new(),
-            adverse_tracker: BayesianAdverseTracker::new(),
+            adverse_tracker: RegimeAwareBayesianAdverse::new(),
             fill_rate: FillRateEstimator::new(),
             calculations: 0,
             quotes_triggered: 0,
@@ -867,9 +1259,21 @@ impl TheoreticalEdgeEstimator {
         // 3. BTC boost contribution
         let btc_boost_bps = expected_move_bps * btc_adjustment;
 
-        // 4. Adverse selection cost using BAYESIAN POSTERIOR (key enhancement)
+        // 4. Adverse selection cost using REGIME-AWARE BAYESIAN POSTERIOR
+        // Use posterior mean, but be conservative when uncertainty is high
         let posterior_adverse = self.adverse_tracker.mean();
-        let adverse_cost_bps = expected_move_bps * posterior_adverse;
+        let adverse_uncertainty = self.adverse_tracker.variance().sqrt();
+        let (_, upper_ci) = self.adverse_tracker.credible_interval_95();
+
+        // Conservative adjustment: use upper bound of credible interval in high-uncertainty situations
+        let effective_adverse = if adverse_uncertainty > 0.05 {
+            // High uncertainty: use 75th percentile (mean + 0.67 std)
+            (posterior_adverse + 0.67 * adverse_uncertainty).min(upper_ci)
+        } else {
+            posterior_adverse
+        };
+
+        let adverse_cost_bps = expected_move_bps * effective_adverse;
 
         // 5. Trading fees
         let fee_cost_bps = self.config.fee_bps;
@@ -1005,12 +1409,40 @@ impl TheoreticalEdgeEstimator {
     /// * `was_adverse` - True if price moved against position after fill
     pub fn update_adverse(&mut self, was_adverse: bool) {
         self.adverse_tracker.update(was_adverse);
-        
+
+        let summary = self.adverse_tracker.summary();
         debug!(
             was_adverse = was_adverse,
             posterior_adverse = %format!("{:.3}", self.adverse_tracker.mean()),
             total_fills = self.adverse_tracker.total_fills(),
-            "Adverse selection tracker updated"
+            regime = summary.current_regime,
+            regime_means = ?summary.regime_means,
+            "Adverse selection tracker updated (regime-aware)"
+        );
+    }
+
+    /// Update adverse selection tracker with impact weighting (regime-aware).
+    ///
+    /// Uses impact weighting to emphasize painful fills:
+    /// - High urgency score → higher weight
+    /// - Large realized adverse selection → higher weight
+    ///
+    /// # Arguments
+    /// * `was_adverse` - True if price moved against position after fill
+    /// * `urgency_score` - L3 controller urgency score [0, 4+]
+    /// * `realized_as_bps` - Realized adverse selection in basis points
+    pub fn update_adverse_weighted(&mut self, was_adverse: bool, urgency_score: f64, realized_as_bps: f64) {
+        self.adverse_tracker.update_weighted(was_adverse, urgency_score, realized_as_bps);
+
+        let summary = self.adverse_tracker.summary();
+        debug!(
+            was_adverse = was_adverse,
+            urgency_score = %format!("{:.2}", urgency_score),
+            realized_as_bps = %format!("{:.2}", realized_as_bps),
+            posterior_adverse = %format!("{:.3}", self.adverse_tracker.mean()),
+            regime = summary.current_regime,
+            credible_interval = ?summary.credible_interval_95,
+            "Adverse selection tracker updated (weighted, regime-aware)"
         );
     }
     
@@ -1051,9 +1483,42 @@ impl TheoreticalEdgeEstimator {
         self.adverse_tracker.mean()
     }
     
-    /// Get adverse tracker stats.
+    /// Get adverse tracker stats (total fills, adverse fills for current regime).
     pub fn adverse_stats(&self) -> (u64, u64) {
-        (self.adverse_tracker.total_fills(), self.adverse_tracker.adverse_fills())
+        (self.adverse_tracker.total_fills(), self.adverse_tracker.adverse_fills_current())
+    }
+
+    /// Get full adverse selection summary for diagnostics.
+    pub fn adverse_summary(&self) -> AdverseSummary {
+        self.adverse_tracker.summary()
+    }
+
+    /// Get adverse selection credible interval (95%) for current regime.
+    pub fn adverse_credible_interval(&self) -> (f64, f64) {
+        self.adverse_tracker.credible_interval_95()
+    }
+
+    /// Update adverse tracker regime based on market conditions.
+    ///
+    /// # Arguments
+    /// * `vol_ratio` - Current volatility / baseline volatility
+    /// * `spread_ratio` - Current spread / typical spread
+    /// * `cascade_prob` - Probability of cascade from changepoint detector
+    pub fn update_adverse_regime(&mut self, vol_ratio: f64, spread_ratio: f64, cascade_prob: f64) {
+        self.adverse_tracker.update_regime(vol_ratio, spread_ratio, cascade_prob);
+    }
+
+    /// Decay adverse posteriors (for changepoint handling).
+    ///
+    /// # Arguments
+    /// * `retention` - Fraction of posterior to keep (0.0-1.0)
+    /// * `all_regimes` - If true, decay all regimes; if false, only current
+    pub fn decay_adverse(&mut self, retention: f64, all_regimes: bool) {
+        if all_regimes {
+            self.adverse_tracker.decay_all(retention);
+        } else {
+            self.adverse_tracker.decay_current(retention);
+        }
     }
     
     /// Get current Bayesian alpha (posterior mean).
@@ -1419,5 +1884,311 @@ mod tests {
         
         // Higher alpha → higher p_correct → higher directional edge
         assert!(result_after.p_correct > result_before.p_correct);
+    }
+
+    // ==================== Regime-Aware Bayesian Adverse Tests ====================
+
+    #[test]
+    fn test_regime_adverse_priors() {
+        let tracker = RegimeAwareBayesianAdverse::new();
+
+        // Check regime-specific priors
+        // Calm (0): E[p] = 0.10
+        assert!((tracker.mean_for_regime(0) - 0.10).abs() < 0.01);
+        // Normal (1): E[p] = 0.15
+        assert!((tracker.mean_for_regime(1) - 0.15).abs() < 0.01);
+        // Volatile (2): E[p] = 0.25
+        assert!((tracker.mean_for_regime(2) - 0.25).abs() < 0.01);
+
+        // Default regime is Normal (1)
+        assert_eq!(tracker.current_regime(), 1);
+    }
+
+    #[test]
+    fn test_regime_adverse_regime_switching() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+
+        // Initial mean is normal regime
+        let normal_mean = tracker.mean();
+
+        // Switch to volatile
+        tracker.set_regime(2);
+        let volatile_mean = tracker.mean();
+
+        // Volatile should have higher adverse prior
+        assert!(volatile_mean > normal_mean);
+        assert!((volatile_mean - 0.25).abs() < 0.01);
+
+        // Switch to calm
+        tracker.set_regime(0);
+        let calm_mean = tracker.mean();
+
+        // Calm should have lower adverse prior
+        assert!(calm_mean < normal_mean);
+        assert!((calm_mean - 0.10).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_regime_adverse_auto_classification() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+
+        // High volatility and/or cascade → Volatile regime
+        tracker.update_regime(2.5, 1.0, 0.3); // vol_ratio=2.5 > 2.0
+        assert_eq!(tracker.current_regime(), 2);
+
+        tracker.update_regime(1.0, 1.0, 0.6); // cascade_prob=0.6 > 0.5
+        assert_eq!(tracker.current_regime(), 2);
+
+        // Low volatility and tight spread → Calm regime
+        tracker.update_regime(0.6, 0.7, 0.1); // vol<0.7, spread<0.8
+        assert_eq!(tracker.current_regime(), 0);
+
+        // Normal conditions
+        tracker.update_regime(1.0, 1.0, 0.2);
+        assert_eq!(tracker.current_regime(), 1);
+    }
+
+    #[test]
+    fn test_regime_adverse_updates_in_current_regime() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1); // Normal
+
+        // Add adverse fills in normal regime
+        for _ in 0..10 {
+            tracker.update(true); // Adverse
+        }
+
+        // Normal regime mean should increase
+        assert!(tracker.mean() > 0.15);
+
+        // Other regimes should be unchanged (still at prior)
+        assert!((tracker.mean_for_regime(0) - 0.10).abs() < 0.01);
+        assert!((tracker.mean_for_regime(2) - 0.25).abs() < 0.01);
+
+        // Fill count should be tracked per regime
+        let summary = tracker.summary();
+        assert_eq!(summary.fills_per_regime[1], 10);
+        assert_eq!(summary.fills_per_regime[0], 0);
+        assert_eq!(summary.fills_per_regime[2], 0);
+    }
+
+    #[test]
+    fn test_regime_adverse_weighted_updates() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        let _initial_mean = tracker.mean();
+
+        // High-impact adverse fill (high urgency, large AS)
+        tracker.update_weighted(true, 3.0, 15.0); // urgency=3, as_bps=15
+
+        let after_weighted = tracker.mean();
+
+        // Reset and do normal update
+        tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+        tracker.update(true);
+
+        let after_normal = tracker.mean();
+
+        // Weighted adverse update should shift posterior more than normal
+        assert!(after_weighted > after_normal);
+    }
+
+    #[test]
+    fn test_regime_adverse_credible_interval() {
+        let tracker = RegimeAwareBayesianAdverse::new();
+
+        let (lower, upper) = tracker.credible_interval_95();
+
+        // CI should contain the mean
+        let mean = tracker.mean();
+        assert!(lower <= mean);
+        assert!(upper >= mean);
+
+        // CI bounds should be valid probabilities
+        assert!(lower >= 0.0);
+        assert!(upper <= 1.0);
+    }
+
+    #[test]
+    fn test_regime_adverse_decay() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        // Add data to shift away from prior
+        for _ in 0..20 {
+            tracker.update(true);
+        }
+
+        let before_decay = tracker.mean();
+        assert!(before_decay > 0.15); // Should have moved up from prior
+
+        // Decay with 50% retention
+        tracker.decay_current(0.5);
+
+        let after_decay = tracker.mean();
+
+        // Should move back toward prior but not fully
+        assert!(after_decay < before_decay);
+        assert!(after_decay > 0.15);
+    }
+
+    #[test]
+    fn test_regime_adverse_variance_decreases() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        let initial_variance = tracker.variance();
+
+        // Add data
+        for _ in 0..50 {
+            tracker.update(false); // Favorable fills
+        }
+
+        // Variance should decrease with more observations
+        assert!(tracker.variance() < initial_variance);
+    }
+
+    #[test]
+    fn test_estimator_uses_regime_adverse() {
+        let mut estimator = TheoreticalEdgeEstimator::new();
+
+        // Get edge in normal regime
+        estimator.set_regime(1);
+        let result_normal = estimator.calculate_edge_enhanced(&EnhancedEdgeInput {
+            book_imbalance: 0.4,
+            spread_bps: 20.0,
+            sigma: 0.001,
+            tau_seconds: 1.0,
+            ..Default::default()
+        });
+
+        // Switch to volatile regime (higher adverse prior)
+        estimator.update_adverse_regime(2.5, 1.5, 0.6); // Triggers volatile
+
+        let result_volatile = estimator.calculate_edge_enhanced(&EnhancedEdgeInput {
+            book_imbalance: 0.4,
+            spread_bps: 20.0,
+            sigma: 0.001,
+            tau_seconds: 1.0,
+            ..Default::default()
+        });
+
+        // Volatile regime should have higher adverse cost → lower expected edge
+        assert!(result_volatile.adverse_cost_bps > result_normal.adverse_cost_bps);
+        assert!(result_volatile.expected_edge_bps < result_normal.expected_edge_bps);
+    }
+
+    // ==================== Phase 7: Hawkes-Bayesian Fusion Tests ====================
+
+    #[test]
+    fn test_regime_adverse_hawkes_update_regime() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+
+        // Without Hawkes excitation, normal volatility → Normal regime
+        tracker.update_regime_with_hawkes(1.0, 1.0, 0.2, false, 0.3);
+        assert_eq!(tracker.current_regime(), 1); // Normal
+
+        // With Hawkes high excitation, should shift to Volatile
+        tracker.update_regime_with_hawkes(1.0, 1.0, 0.2, true, 0.8);
+        assert_eq!(tracker.current_regime(), 2); // Volatile
+
+        // Low vol + low Hawkes → Calm
+        tracker.update_regime_with_hawkes(0.5, 0.6, 0.1, false, 0.2);
+        assert_eq!(tracker.current_regime(), 0); // Calm
+
+        // Low vol but high Hawkes branching → can't be calm
+        tracker.update_regime_with_hawkes(0.5, 0.6, 0.1, false, 0.6);
+        assert_eq!(tracker.current_regime(), 1); // Normal (not calm due to Hawkes)
+    }
+
+    #[test]
+    fn test_regime_adverse_hawkes_cascade_boost() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+
+        // Low cascade prob but high Hawkes excitation → should become volatile
+        // Hawkes boost: (0.8 - 0.5)^2 * 2.0 = 0.09 * 2.0 = 0.18
+        // Effective cascade = 0.3 + 0.18 = 0.48 > 0.4 threshold
+        tracker.update_regime_with_hawkes(1.5, 1.0, 0.3, true, 0.8);
+        assert_eq!(tracker.current_regime(), 2); // Volatile
+    }
+
+    #[test]
+    fn test_regime_adverse_hawkes_weighted_update() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        // High excitation adverse fill (low penalty, high p_cluster)
+        tracker.update_weighted_with_hawkes(true, 2.0, 10.0, 0.6, 0.8);
+        let high_excitation_mean = tracker.mean();
+
+        // Reset
+        let mut tracker2 = RegimeAwareBayesianAdverse::new();
+        tracker2.set_regime(1);
+
+        // Normal excitation adverse fill (high penalty, low p_cluster)
+        tracker2.update_weighted_with_hawkes(true, 2.0, 10.0, 1.0, 0.1);
+        let normal_excitation_mean = tracker2.mean();
+
+        // High excitation should update more strongly
+        assert!(high_excitation_mean > normal_excitation_mean);
+    }
+
+    #[test]
+    fn test_regime_adverse_hawkes_favorable_update() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        let initial_mean = tracker.mean();
+
+        // High excitation favorable fill (market absorbing flow well)
+        tracker.update_weighted_with_hawkes(false, 1.0, 5.0, 0.5, 0.9);
+
+        // Should decrease adverse mean (favorable fill during stress = informative)
+        assert!(tracker.mean() < initial_mean);
+    }
+
+    #[test]
+    fn test_effective_adverse_with_hawkes_calm() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        let base_mean = tracker.mean();
+
+        // No excitation: should return base mean
+        let effective = tracker.effective_adverse_with_hawkes(0.0, false);
+        assert!((effective - base_mean).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_effective_adverse_with_hawkes_excited() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        let base_mean = tracker.mean();
+        let (_, upper_ci) = tracker.credible_interval_95();
+
+        // High excitation: should blend toward upper CI
+        let effective = tracker.effective_adverse_with_hawkes(0.9, true);
+
+        // Should be between mean and upper CI
+        assert!(effective > base_mean);
+        assert!(effective <= upper_ci);
+    }
+
+    #[test]
+    fn test_effective_adverse_hawkes_p_cluster_scaling() {
+        let mut tracker = RegimeAwareBayesianAdverse::new();
+        tracker.set_regime(1);
+
+        // Moderate cluster prob
+        let effective_moderate = tracker.effective_adverse_with_hawkes(0.6, true);
+
+        // High cluster prob
+        let effective_high = tracker.effective_adverse_with_hawkes(0.95, true);
+
+        // Higher p_cluster should give more conservative estimate
+        assert!(effective_high > effective_moderate);
     }
 }

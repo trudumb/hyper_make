@@ -1044,6 +1044,40 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
         market_params.kappa_spread_bps = Some(kappa_spread_result.spread_bps);
 
+        // === Phase 8: RL Agent Policy Recommendation ===
+        // Build MDP state from current market conditions
+        let mdp_state = crate::market_maker::learning::MDPState::from_continuous(
+            self.position.position(),
+            self.effective_max_position,
+            market_params.book_imbalance,
+            market_params.sigma / market_params.sigma_effective.max(0.0001), // vol ratio
+            self.stochastic.theoretical_edge.bayesian_adverse(),
+            market_params.hawkes_branching_ratio,
+        );
+
+        // Get RL policy recommendation (exploration during bootstrap, exploitation after)
+        let explore = !self.stochastic.calibrated_edge.is_useful();
+        let rl_recommendation = crate::market_maker::learning::RLPolicyRecommendation::from_agent(
+            &mut self.stochastic.rl_agent,
+            &mdp_state,
+            explore,
+        );
+
+        // Populate MarketParams with RL recommendations
+        market_params.rl_spread_delta_bps = rl_recommendation.spread_delta_bps;
+        market_params.rl_bid_skew_bps = rl_recommendation.bid_skew_bps;
+        market_params.rl_ask_skew_bps = rl_recommendation.ask_skew_bps;
+        market_params.rl_confidence = rl_recommendation.confidence;
+        market_params.rl_is_exploration = rl_recommendation.is_exploration;
+        market_params.rl_expected_q = rl_recommendation.expected_q;
+
+        // === Phase 8: Competitor Model Inference ===
+        // Get competitor summary and populate MarketParams
+        let competitor_summary = self.stochastic.competitor_model.summary();
+        market_params.competitor_snipe_prob = competitor_summary.snipe_rate;
+        market_params.competitor_spread_factor = competitor_summary.competition_spread_factor;
+        market_params.competitor_count = competitor_summary.n_competitors;
+
         let quote_gate_input = QuoteGateInput {
             flow_imbalance: market_params.flow_imbalance,
             momentum_confidence: market_params.p_momentum_continue,
@@ -1061,6 +1095,37 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             kappa_effective: market_params.kappa,
             enhanced_flow,
             mc_ev_bps,
+            // Hierarchical Edge Belief (L2/L3 Fusion)
+            // L2 inputs from learning module - TODO: wire from decision_engine
+            l2_p_positive_edge: None, // Will be populated when L2 is integrated
+            l2_model_health: 0.0,     // Default unhealthy until wired
+            // L3 inputs from stochastic controller
+            l3_trust: market_params.bootstrap_confidence.min(1.0),
+            l3_belief: if market_params.should_quote_edge {
+                Some(0.6) // Favorable conditions
+            } else {
+                Some(0.4) // Unfavorable conditions
+            },
+            urgency_score: market_params.urgency_score,
+            // Adverse selection variance from RegimeAwareBayesianAdverse
+            adverse_variance: market_params.adverse_uncertainty.powi(2),
+            // Phase 7: Hawkes Excitation fields from MarketParams
+            hawkes_p_cluster: market_params.hawkes_p_cluster,
+            hawkes_excitation_penalty: market_params.hawkes_excitation_penalty,
+            hawkes_is_high_excitation: market_params.hawkes_is_high_excitation,
+            hawkes_spread_widening: market_params.hawkes_spread_widening,
+            hawkes_branching_ratio: market_params.hawkes_branching_ratio,
+            // Phase 8: RL Policy Recommendations from MarketParams
+            rl_spread_delta_bps: market_params.rl_spread_delta_bps,
+            rl_bid_skew_bps: market_params.rl_bid_skew_bps,
+            rl_ask_skew_bps: market_params.rl_ask_skew_bps,
+            rl_confidence: market_params.rl_confidence,
+            rl_is_exploration: market_params.rl_is_exploration,
+            rl_expected_q: market_params.rl_expected_q,
+            // Phase 8: Competitor Model from MarketParams
+            competitor_snipe_prob: market_params.competitor_snipe_prob,
+            competitor_spread_factor: market_params.competitor_spread_factor,
+            competitor_count: market_params.competitor_count,
         };
 
         // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds

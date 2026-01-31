@@ -1,0 +1,1308 @@
+//! Phase 8: Reinforcement Learning Agent for Competitive Quoting
+//!
+//! This module implements an MDP-based approach to quoting decisions with:
+//! - Discretized state space (inventory, OBI, regime, posteriors)
+//! - Action space (spread adjustments, skew modifications)
+//! - Q-learning with Thompson sampling for Bayesian exploration
+//! - Competitor modeling for game-theoretic adaptation
+//!
+//! Theory: Frame quoting as an MDP where the agent learns optimal policies
+//! by exploring via Thompson sampling on Bayesian Q-value posteriors.
+
+use std::collections::HashMap;
+use tracing::debug;
+
+// ============================================================================
+// MDP State Space
+// ============================================================================
+
+/// Discretized inventory bucket for state representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InventoryBucket {
+    /// Large short position (< -50% of max)
+    LargeShort,
+    /// Moderate short position (-50% to -20%)
+    ModerateShort,
+    /// Small short position (-20% to -5%)
+    SmallShort,
+    /// Neutral position (-5% to +5%)
+    Neutral,
+    /// Small long position (+5% to +20%)
+    SmallLong,
+    /// Moderate long position (+20% to +50%)
+    ModerateLong,
+    /// Large long position (> +50%)
+    LargeLong,
+}
+
+impl InventoryBucket {
+    /// Convert continuous position to bucket.
+    pub fn from_position(position: f64, max_position: f64) -> Self {
+        if max_position <= 0.0 {
+            return Self::Neutral;
+        }
+        let ratio = position / max_position;
+        match ratio {
+            r if r < -0.5 => Self::LargeShort,
+            r if r < -0.2 => Self::ModerateShort,
+            r if r < -0.05 => Self::SmallShort,
+            r if r < 0.05 => Self::Neutral,
+            r if r < 0.2 => Self::SmallLong,
+            r if r < 0.5 => Self::ModerateLong,
+            _ => Self::LargeLong,
+        }
+    }
+
+    /// Get bucket index (0-6).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::LargeShort => 0,
+            Self::ModerateShort => 1,
+            Self::SmallShort => 2,
+            Self::Neutral => 3,
+            Self::SmallLong => 4,
+            Self::ModerateLong => 5,
+            Self::LargeLong => 6,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 7;
+}
+
+/// Discretized order book imbalance bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImbalanceBucket {
+    /// Strong sell pressure (< -0.4)
+    StrongSell,
+    /// Moderate sell pressure (-0.4 to -0.15)
+    ModerateSell,
+    /// Weak sell pressure (-0.15 to -0.05)
+    WeakSell,
+    /// Neutral (-0.05 to +0.05)
+    Neutral,
+    /// Weak buy pressure (+0.05 to +0.15)
+    WeakBuy,
+    /// Moderate buy pressure (+0.15 to +0.4)
+    ModerateBuy,
+    /// Strong buy pressure (> +0.4)
+    StrongBuy,
+}
+
+impl ImbalanceBucket {
+    /// Convert continuous imbalance to bucket.
+    pub fn from_imbalance(imbalance: f64) -> Self {
+        match imbalance {
+            i if i < -0.4 => Self::StrongSell,
+            i if i < -0.15 => Self::ModerateSell,
+            i if i < -0.05 => Self::WeakSell,
+            i if i < 0.05 => Self::Neutral,
+            i if i < 0.15 => Self::WeakBuy,
+            i if i < 0.4 => Self::ModerateBuy,
+            _ => Self::StrongBuy,
+        }
+    }
+
+    /// Get bucket index (0-6).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::StrongSell => 0,
+            Self::ModerateSell => 1,
+            Self::WeakSell => 2,
+            Self::Neutral => 3,
+            Self::WeakBuy => 4,
+            Self::ModerateBuy => 5,
+            Self::StrongBuy => 6,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 7;
+}
+
+/// Discretized volatility regime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VolatilityBucket {
+    /// Very low volatility (< 0.5x baseline)
+    VeryLow,
+    /// Low volatility (0.5x to 0.8x baseline)
+    Low,
+    /// Normal volatility (0.8x to 1.2x baseline)
+    Normal,
+    /// High volatility (1.2x to 2x baseline)
+    High,
+    /// Very high volatility (> 2x baseline)
+    VeryHigh,
+}
+
+impl VolatilityBucket {
+    /// Convert volatility ratio to bucket.
+    pub fn from_vol_ratio(vol_ratio: f64) -> Self {
+        match vol_ratio {
+            r if r < 0.5 => Self::VeryLow,
+            r if r < 0.8 => Self::Low,
+            r if r < 1.2 => Self::Normal,
+            r if r < 2.0 => Self::High,
+            _ => Self::VeryHigh,
+        }
+    }
+
+    /// Get bucket index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::VeryLow => 0,
+            Self::Low => 1,
+            Self::Normal => 2,
+            Self::High => 3,
+            Self::VeryHigh => 4,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 5;
+}
+
+/// Discretized adverse selection posterior belief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdverseBucket {
+    /// Very low adverse risk (< 0.1)
+    VeryLow,
+    /// Low adverse risk (0.1 to 0.2)
+    Low,
+    /// Moderate adverse risk (0.2 to 0.35)
+    Moderate,
+    /// High adverse risk (0.35 to 0.5)
+    High,
+    /// Very high adverse risk (> 0.5)
+    VeryHigh,
+}
+
+impl AdverseBucket {
+    /// Convert posterior mean to bucket.
+    pub fn from_posterior_mean(mean: f64) -> Self {
+        match mean {
+            m if m < 0.1 => Self::VeryLow,
+            m if m < 0.2 => Self::Low,
+            m if m < 0.35 => Self::Moderate,
+            m if m < 0.5 => Self::High,
+            _ => Self::VeryHigh,
+        }
+    }
+
+    /// Get bucket index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::VeryLow => 0,
+            Self::Low => 1,
+            Self::Moderate => 2,
+            Self::High => 3,
+            Self::VeryHigh => 4,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 5;
+}
+
+/// Discretized Hawkes excitation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExcitationBucket {
+    /// Calm (branching ratio < 0.3)
+    Calm,
+    /// Normal (0.3 to 0.6)
+    Normal,
+    /// Elevated (0.6 to 0.8)
+    Elevated,
+    /// High (0.8 to 0.9)
+    High,
+    /// Critical (> 0.9)
+    Critical,
+}
+
+impl ExcitationBucket {
+    /// Convert branching ratio to bucket.
+    pub fn from_branching_ratio(ratio: f64) -> Self {
+        match ratio {
+            r if r < 0.3 => Self::Calm,
+            r if r < 0.6 => Self::Normal,
+            r if r < 0.8 => Self::Elevated,
+            r if r < 0.9 => Self::High,
+            _ => Self::Critical,
+        }
+    }
+
+    /// Get bucket index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Calm => 0,
+            Self::Normal => 1,
+            Self::Elevated => 2,
+            Self::High => 3,
+            Self::Critical => 4,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 5;
+}
+
+/// Complete discretized MDP state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MDPState {
+    /// Inventory bucket
+    pub inventory: InventoryBucket,
+    /// Order book imbalance bucket
+    pub imbalance: ImbalanceBucket,
+    /// Volatility bucket
+    pub volatility: VolatilityBucket,
+    /// Adverse selection posterior bucket
+    pub adverse: AdverseBucket,
+    /// Hawkes excitation bucket
+    pub excitation: ExcitationBucket,
+}
+
+impl MDPState {
+    /// Create from continuous state values.
+    pub fn from_continuous(
+        position: f64,
+        max_position: f64,
+        book_imbalance: f64,
+        vol_ratio: f64,
+        adverse_posterior: f64,
+        hawkes_branching: f64,
+    ) -> Self {
+        Self {
+            inventory: InventoryBucket::from_position(position, max_position),
+            imbalance: ImbalanceBucket::from_imbalance(book_imbalance),
+            volatility: VolatilityBucket::from_vol_ratio(vol_ratio),
+            adverse: AdverseBucket::from_posterior_mean(adverse_posterior),
+            excitation: ExcitationBucket::from_branching_ratio(hawkes_branching),
+        }
+    }
+
+    /// Convert to flat state index for Q-table lookup.
+    /// Total states = 7 * 7 * 5 * 5 * 5 = 6,125
+    pub fn to_index(&self) -> usize {
+        let mut idx = self.inventory.index();
+        idx = idx * ImbalanceBucket::COUNT + self.imbalance.index();
+        idx = idx * VolatilityBucket::COUNT + self.volatility.index();
+        idx = idx * AdverseBucket::COUNT + self.adverse.index();
+        idx = idx * ExcitationBucket::COUNT + self.excitation.index();
+        idx
+    }
+
+    /// Total number of discrete states.
+    pub const STATE_COUNT: usize = InventoryBucket::COUNT
+        * ImbalanceBucket::COUNT
+        * VolatilityBucket::COUNT
+        * AdverseBucket::COUNT
+        * ExcitationBucket::COUNT;
+}
+
+impl Default for MDPState {
+    fn default() -> Self {
+        Self {
+            inventory: InventoryBucket::Neutral,
+            imbalance: ImbalanceBucket::Neutral,
+            volatility: VolatilityBucket::Normal,
+            adverse: AdverseBucket::Moderate,
+            excitation: ExcitationBucket::Normal,
+        }
+    }
+}
+
+// ============================================================================
+// Action Space
+// ============================================================================
+
+/// Spread adjustment action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpreadAction {
+    /// Tighten spread significantly (-3 bps)
+    TightenLarge,
+    /// Tighten spread moderately (-1.5 bps)
+    TightenSmall,
+    /// Keep current spread (0 bps)
+    Maintain,
+    /// Widen spread moderately (+1.5 bps)
+    WidenSmall,
+    /// Widen spread significantly (+3 bps)
+    WidenLarge,
+}
+
+impl SpreadAction {
+    /// Get the spread delta in basis points.
+    pub fn delta_bps(&self) -> f64 {
+        match self {
+            Self::TightenLarge => -3.0,
+            Self::TightenSmall => -1.5,
+            Self::Maintain => 0.0,
+            Self::WidenSmall => 1.5,
+            Self::WidenLarge => 3.0,
+        }
+    }
+
+    /// Get action index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::TightenLarge => 0,
+            Self::TightenSmall => 1,
+            Self::Maintain => 2,
+            Self::WidenSmall => 3,
+            Self::WidenLarge => 4,
+        }
+    }
+
+    /// Create from index.
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::TightenLarge,
+            1 => Self::TightenSmall,
+            2 => Self::Maintain,
+            3 => Self::WidenSmall,
+            _ => Self::WidenLarge,
+        }
+    }
+
+    /// Number of spread actions.
+    pub const COUNT: usize = 5;
+}
+
+/// Skew adjustment action (asymmetric bid/ask).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkewAction {
+    /// Strongly favor asks (bid wider by 2 bps)
+    StrongAskBias,
+    /// Moderately favor asks (bid wider by 1 bps)
+    ModerateAskBias,
+    /// Symmetric quotes
+    Symmetric,
+    /// Moderately favor bids (ask wider by 1 bps)
+    ModerateBidBias,
+    /// Strongly favor bids (ask wider by 2 bps)
+    StrongBidBias,
+}
+
+impl SkewAction {
+    /// Get bid skew in basis points (positive = wider bid).
+    pub fn bid_skew_bps(&self) -> f64 {
+        match self {
+            Self::StrongAskBias => 2.0,
+            Self::ModerateAskBias => 1.0,
+            Self::Symmetric => 0.0,
+            Self::ModerateBidBias => -1.0,
+            Self::StrongBidBias => -2.0,
+        }
+    }
+
+    /// Get ask skew in basis points (positive = wider ask).
+    pub fn ask_skew_bps(&self) -> f64 {
+        -self.bid_skew_bps()
+    }
+
+    /// Get action index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::StrongAskBias => 0,
+            Self::ModerateAskBias => 1,
+            Self::Symmetric => 2,
+            Self::ModerateBidBias => 3,
+            Self::StrongBidBias => 4,
+        }
+    }
+
+    /// Create from index.
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::StrongAskBias,
+            1 => Self::ModerateAskBias,
+            2 => Self::Symmetric,
+            3 => Self::ModerateBidBias,
+            _ => Self::StrongBidBias,
+        }
+    }
+
+    /// Number of skew actions.
+    pub const COUNT: usize = 5;
+}
+
+/// Complete action for the MDP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MDPAction {
+    /// Spread adjustment
+    pub spread: SpreadAction,
+    /// Skew adjustment
+    pub skew: SkewAction,
+}
+
+impl MDPAction {
+    /// Create a new action.
+    pub fn new(spread: SpreadAction, skew: SkewAction) -> Self {
+        Self { spread, skew }
+    }
+
+    /// Convert to flat action index.
+    /// Total actions = 5 * 5 = 25
+    pub fn to_index(&self) -> usize {
+        self.spread.index() * SkewAction::COUNT + self.skew.index()
+    }
+
+    /// Create from flat index.
+    pub fn from_index(idx: usize) -> Self {
+        let spread_idx = idx / SkewAction::COUNT;
+        let skew_idx = idx % SkewAction::COUNT;
+        Self {
+            spread: SpreadAction::from_index(spread_idx),
+            skew: SkewAction::from_index(skew_idx),
+        }
+    }
+
+    /// Total number of actions.
+    pub const ACTION_COUNT: usize = SpreadAction::COUNT * SkewAction::COUNT;
+
+    /// Get the bid spread delta in bps.
+    pub fn bid_delta_bps(&self) -> f64 {
+        self.spread.delta_bps() + self.skew.bid_skew_bps()
+    }
+
+    /// Get the ask spread delta in bps.
+    pub fn ask_delta_bps(&self) -> f64 {
+        self.spread.delta_bps() + self.skew.ask_skew_bps()
+    }
+}
+
+impl Default for MDPAction {
+    fn default() -> Self {
+        Self {
+            spread: SpreadAction::Maintain,
+            skew: SkewAction::Symmetric,
+        }
+    }
+}
+
+// ============================================================================
+// Reward Function
+// ============================================================================
+
+/// Configuration for reward computation.
+#[derive(Debug, Clone)]
+pub struct RewardConfig {
+    /// Weight for realized edge component
+    pub edge_weight: f64,
+    /// Weight for inventory risk penalty
+    pub inventory_penalty_weight: f64,
+    /// Weight for volatility penalty
+    pub volatility_penalty_weight: f64,
+    /// Weight for adverse selection penalty
+    pub adverse_penalty_weight: f64,
+    /// Discount factor for future rewards
+    pub gamma: f64,
+}
+
+impl Default for RewardConfig {
+    fn default() -> Self {
+        Self {
+            edge_weight: 1.0,
+            inventory_penalty_weight: 0.1,
+            volatility_penalty_weight: 0.05,
+            adverse_penalty_weight: 0.2,
+            gamma: 0.95,
+        }
+    }
+}
+
+/// Reward signal from a transition.
+#[derive(Debug, Clone, Copy)]
+pub struct Reward {
+    /// Total reward
+    pub total: f64,
+    /// Edge component (can be negative for adverse fills)
+    pub edge_component: f64,
+    /// Inventory risk penalty (always non-positive)
+    pub inventory_penalty: f64,
+    /// Volatility penalty (always non-positive)
+    pub volatility_penalty: f64,
+    /// Adverse selection penalty (always non-positive)
+    pub adverse_penalty: f64,
+}
+
+impl Reward {
+    /// Compute reward from transition.
+    pub fn compute(
+        config: &RewardConfig,
+        realized_edge_bps: f64,
+        inventory_risk: f64,  // |position| / max_position
+        vol_ratio: f64,
+        was_adverse: bool,
+    ) -> Self {
+        let edge_component = config.edge_weight * realized_edge_bps;
+
+        // Quadratic inventory penalty
+        let inventory_penalty =
+            -config.inventory_penalty_weight * inventory_risk.powi(2) * 10.0;
+
+        // Volatility penalty (penalize holding in high vol)
+        let vol_penalty_factor = (vol_ratio - 1.0).max(0.0);
+        let volatility_penalty =
+            -config.volatility_penalty_weight * vol_penalty_factor * inventory_risk * 5.0;
+
+        // Adverse selection penalty
+        let adverse_penalty = if was_adverse {
+            -config.adverse_penalty_weight * realized_edge_bps.abs()
+        } else {
+            0.0
+        };
+
+        let total = edge_component + inventory_penalty + volatility_penalty + adverse_penalty;
+
+        Self {
+            total,
+            edge_component,
+            inventory_penalty,
+            volatility_penalty,
+            adverse_penalty,
+        }
+    }
+}
+
+// ============================================================================
+// Bayesian Q-Value with Thompson Sampling
+// ============================================================================
+
+/// Bayesian posterior for a Q-value (Normal-Gamma conjugate prior).
+///
+/// Models Q(s, a) ~ Normal(μ, 1/τ) where:
+/// - μ | τ ~ Normal(μ₀, 1/(κ₀τ))
+/// - τ ~ Gamma(α, β)
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct BayesianQValue {
+    /// Prior mean
+    mu_0: f64,
+    /// Prior precision scale
+    kappa_0: f64,
+    /// Posterior mean (updated)
+    mu_n: f64,
+    /// Posterior precision scale
+    kappa_n: f64,
+    /// Gamma shape parameter
+    alpha: f64,
+    /// Gamma rate parameter
+    beta: f64,
+    /// Number of observations
+    n: u64,
+}
+
+impl BayesianQValue {
+    /// Create with prior centered at zero.
+    pub fn new() -> Self {
+        Self {
+            mu_0: 0.0,
+            kappa_0: 0.01,  // Weak prior on mean
+            mu_n: 0.0,
+            kappa_n: 0.01,
+            alpha: 1.0,     // Weak prior on precision
+            beta: 1.0,
+            n: 0,
+        }
+    }
+
+    /// Create with specified prior mean (for warm start).
+    pub fn with_prior(prior_mean: f64, prior_strength: f64) -> Self {
+        Self {
+            mu_0: prior_mean,
+            kappa_0: prior_strength,
+            mu_n: prior_mean,
+            kappa_n: prior_strength,
+            alpha: 1.0,
+            beta: 1.0,
+            n: 0,
+        }
+    }
+
+    /// Update posterior with observed reward.
+    pub fn update(&mut self, reward: f64) {
+        self.n += 1;
+
+        // Update sufficient statistics
+        let kappa_new = self.kappa_n + 1.0;
+        let mu_new = (self.kappa_n * self.mu_n + reward) / kappa_new;
+
+        // Update Gamma parameters
+        let alpha_new = self.alpha + 0.5;
+        let beta_new = self.beta
+            + 0.5 * (reward - self.mu_n).powi(2) * self.kappa_n / kappa_new;
+
+        self.mu_n = mu_new;
+        self.kappa_n = kappa_new;
+        self.alpha = alpha_new;
+        self.beta = beta_new;
+    }
+
+    /// Get posterior mean of Q-value.
+    pub fn mean(&self) -> f64 {
+        self.mu_n
+    }
+
+    /// Get posterior variance of Q-value.
+    pub fn variance(&self) -> f64 {
+        if self.alpha <= 1.0 {
+            return 100.0; // High variance for weak prior
+        }
+        self.beta / ((self.alpha - 1.0) * self.kappa_n)
+    }
+
+    /// Get posterior standard deviation.
+    pub fn std(&self) -> f64 {
+        self.variance().sqrt()
+    }
+
+    /// Sample from posterior (Thompson sampling).
+    pub fn sample(&self) -> f64 {
+        // Sample precision from Gamma
+        let tau = sample_gamma(self.alpha, self.beta);
+        // Sample mean from Normal
+        let sigma = (1.0 / (self.kappa_n * tau)).sqrt();
+        self.mu_n + sigma * sample_standard_normal()
+    }
+
+    /// Get upper confidence bound (UCB).
+    pub fn ucb(&self, c: f64) -> f64 {
+        self.mean() + c * self.std()
+    }
+
+    /// Number of observations.
+    pub fn count(&self) -> u64 {
+        self.n
+    }
+}
+
+impl Default for BayesianQValue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Q-Learning Agent
+// ============================================================================
+
+/// Configuration for the Q-learning agent.
+#[derive(Debug, Clone)]
+pub struct QLearningConfig {
+    /// Learning rate for TD updates
+    pub learning_rate: f64,
+    /// Discount factor
+    pub gamma: f64,
+    /// Exploration strategy
+    pub exploration: ExplorationStrategy,
+    /// Minimum observations before exploitation
+    pub min_observations: u64,
+    /// UCB exploration constant (if using UCB)
+    pub ucb_c: f64,
+    /// Reward configuration
+    pub reward_config: RewardConfig,
+}
+
+impl Default for QLearningConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: 0.1,
+            gamma: 0.95,
+            exploration: ExplorationStrategy::ThompsonSampling,
+            min_observations: 10,
+            ucb_c: 2.0,
+            reward_config: RewardConfig::default(),
+        }
+    }
+}
+
+/// Exploration strategy for action selection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub enum ExplorationStrategy {
+    /// Thompson sampling on Bayesian Q-values
+    ThompsonSampling,
+    /// Upper Confidence Bound
+    UCB,
+    /// Epsilon-greedy with decay
+    EpsilonGreedy { epsilon: f64, decay: f64 },
+}
+
+/// Q-learning agent with Bayesian Q-values.
+#[derive(Debug)]
+pub struct QLearningAgent {
+    /// Configuration
+    config: QLearningConfig,
+    /// Q-table: state -> action -> BayesianQValue
+    q_table: HashMap<usize, Vec<BayesianQValue>>,
+    /// Episode count
+    episodes: u64,
+    /// Total reward accumulated
+    total_reward: f64,
+    /// Recent rewards for monitoring
+    recent_rewards: Vec<f64>,
+    /// Last state-action for TD update
+    last_state_action: Option<(MDPState, MDPAction)>,
+}
+
+impl QLearningAgent {
+    /// Create a new Q-learning agent.
+    pub fn new(config: QLearningConfig) -> Self {
+        Self {
+            config,
+            q_table: HashMap::new(),
+            episodes: 0,
+            total_reward: 0.0,
+            recent_rewards: Vec::with_capacity(1000),
+            last_state_action: None,
+        }
+    }
+
+    /// Get Q-values for a state (initialize if needed).
+    fn get_q_values(&mut self, state: &MDPState) -> &mut Vec<BayesianQValue> {
+        let idx = state.to_index();
+        self.q_table.entry(idx).or_insert_with(|| {
+            vec![BayesianQValue::new(); MDPAction::ACTION_COUNT]
+        })
+    }
+
+    /// Select action using the configured exploration strategy.
+    pub fn select_action(&mut self, state: &MDPState) -> MDPAction {
+        // Copy config values to avoid borrow issues
+        let min_observations = self.config.min_observations;
+        let exploration = self.config.exploration;
+        let ucb_c = self.config.ucb_c;
+        let episodes = self.episodes;
+
+        let q_values = self.get_q_values(state);
+
+        // Check if we have enough observations for exploitation
+        let total_obs: u64 = q_values.iter().map(|q| q.count()).sum();
+        if total_obs < min_observations {
+            // Pure exploration: uniform random
+            let action_idx = (sample_uniform() * MDPAction::ACTION_COUNT as f64) as usize;
+            return MDPAction::from_index(action_idx.min(MDPAction::ACTION_COUNT - 1));
+        }
+
+        let action_idx = match exploration {
+            ExplorationStrategy::ThompsonSampling => {
+                // Sample from each Q-value posterior and select max
+                q_values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| (i, q.sample()))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
+            ExplorationStrategy::UCB => {
+                // Select action with highest UCB
+                q_values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| (i, q.ucb(ucb_c)))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
+            ExplorationStrategy::EpsilonGreedy { epsilon, decay } => {
+                let effective_epsilon = epsilon * decay.powf(episodes as f64);
+                if sample_uniform() < effective_epsilon {
+                    // Random action
+                    (sample_uniform() * MDPAction::ACTION_COUNT as f64) as usize
+                } else {
+                    // Greedy action
+                    q_values
+                        .iter()
+                        .enumerate()
+                        .map(|(i, q)| (i, q.mean()))
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                }
+            }
+        };
+
+        MDPAction::from_index(action_idx.min(MDPAction::ACTION_COUNT - 1))
+    }
+
+    /// Update Q-values with observed transition.
+    pub fn update(
+        &mut self,
+        state: MDPState,
+        action: MDPAction,
+        reward: Reward,
+        next_state: MDPState,
+        done: bool,
+    ) {
+        // Copy gamma to avoid borrow issues
+        let gamma = self.config.gamma;
+
+        // Get max Q-value for next state
+        let max_next_q = if done {
+            0.0
+        } else {
+            let next_q_values = self.get_q_values(&next_state);
+            next_q_values
+                .iter()
+                .map(|q| q.mean())
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap_or(0.0)
+        };
+
+        // TD target
+        let td_target = reward.total + gamma * max_next_q;
+
+        // Update Q-value with Bayesian posterior update
+        let action_idx = action.to_index();
+        let state_idx = state.to_index();
+        let q_values = self.get_q_values(&state);
+        q_values[action_idx].update(td_target);
+        let q_mean = q_values[action_idx].mean();
+        let q_std = q_values[action_idx].std();
+
+        // Track rewards
+        self.total_reward += reward.total;
+        self.recent_rewards.push(reward.total);
+        if self.recent_rewards.len() > 1000 {
+            self.recent_rewards.remove(0);
+        }
+
+        debug!(
+            state_idx = state_idx,
+            action_idx = action_idx,
+            reward = %format!("{:.3}", reward.total),
+            td_target = %format!("{:.3}", td_target),
+            q_mean = %format!("{:.3}", q_mean),
+            q_std = %format!("{:.3}", q_std),
+            "Q-learning update"
+        );
+    }
+
+    /// Record start of a new episode.
+    pub fn start_episode(&mut self, _initial_state: MDPState) {
+        self.episodes += 1;
+        self.last_state_action = None;
+    }
+
+    /// Get the greedy action (exploitation only).
+    pub fn get_greedy_action(&mut self, state: &MDPState) -> MDPAction {
+        let q_values = self.get_q_values(state);
+        let action_idx = q_values
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (i, q.mean()))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        MDPAction::from_index(action_idx)
+    }
+
+    /// Get Q-value statistics for a state.
+    pub fn get_q_stats(&mut self, state: &MDPState) -> QValueStats {
+        let q_values = self.get_q_values(state);
+        let best_idx = q_values
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (i, q.mean()))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let best_q = &q_values[best_idx];
+
+        QValueStats {
+            best_action: MDPAction::from_index(best_idx),
+            best_q_mean: best_q.mean(),
+            best_q_std: best_q.std(),
+            best_q_count: best_q.count(),
+            total_observations: q_values.iter().map(|q| q.count()).sum(),
+        }
+    }
+
+    /// Get summary statistics.
+    pub fn summary(&self) -> AgentSummary {
+        let recent_reward = if self.recent_rewards.is_empty() {
+            0.0
+        } else {
+            self.recent_rewards.iter().sum::<f64>() / self.recent_rewards.len() as f64
+        };
+
+        AgentSummary {
+            episodes: self.episodes,
+            total_reward: self.total_reward,
+            recent_avg_reward: recent_reward,
+            states_visited: self.q_table.len(),
+        }
+    }
+
+    /// Get the reward configuration.
+    pub fn reward_config(&self) -> &RewardConfig {
+        &self.config.reward_config
+    }
+
+    /// Record the last state-action pair (for delayed reward updates).
+    pub fn set_last_state_action(&mut self, state: MDPState, action: MDPAction) {
+        self.last_state_action = Some((state, action));
+    }
+
+    /// Get and clear the last state-action pair.
+    pub fn take_last_state_action(&mut self) -> Option<(MDPState, MDPAction)> {
+        self.last_state_action.take()
+    }
+}
+
+impl Default for QLearningAgent {
+    fn default() -> Self {
+        Self::new(QLearningConfig::default())
+    }
+}
+
+/// Q-value statistics for a state.
+#[derive(Debug, Clone)]
+pub struct QValueStats {
+    /// Best action according to posterior mean
+    pub best_action: MDPAction,
+    /// Posterior mean of best Q-value
+    pub best_q_mean: f64,
+    /// Posterior std of best Q-value
+    pub best_q_std: f64,
+    /// Observations for best action
+    pub best_q_count: u64,
+    /// Total observations for this state
+    pub total_observations: u64,
+}
+
+/// Agent summary statistics.
+#[derive(Debug, Clone)]
+pub struct AgentSummary {
+    /// Total episodes
+    pub episodes: u64,
+    /// Total cumulative reward
+    pub total_reward: f64,
+    /// Recent average reward
+    pub recent_avg_reward: f64,
+    /// Number of unique states visited
+    pub states_visited: usize,
+}
+
+// ============================================================================
+// RL Policy Recommendation
+// ============================================================================
+
+/// Policy recommendation from the RL agent.
+#[derive(Debug, Clone)]
+pub struct RLPolicyRecommendation {
+    /// Recommended spread delta (bps)
+    pub spread_delta_bps: f64,
+    /// Recommended bid skew (bps)
+    pub bid_skew_bps: f64,
+    /// Recommended ask skew (bps)
+    pub ask_skew_bps: f64,
+    /// Confidence in recommendation [0, 1]
+    pub confidence: f64,
+    /// Whether this is exploration or exploitation
+    pub is_exploration: bool,
+    /// Underlying MDP action
+    pub action: MDPAction,
+    /// Expected Q-value
+    pub expected_q: f64,
+    /// Q-value uncertainty
+    pub q_uncertainty: f64,
+}
+
+impl RLPolicyRecommendation {
+    /// Create from agent action selection.
+    pub fn from_agent(
+        agent: &mut QLearningAgent,
+        state: &MDPState,
+        explore: bool,
+    ) -> Self {
+        let action = if explore {
+            agent.select_action(state)
+        } else {
+            agent.get_greedy_action(state)
+        };
+
+        let stats = agent.get_q_stats(state);
+
+        // Confidence based on observations and uncertainty
+        let obs_factor = (stats.total_observations as f64 / 100.0).min(1.0);
+        let uncertainty_factor = 1.0 / (1.0 + stats.best_q_std);
+        let confidence = obs_factor * uncertainty_factor;
+
+        Self {
+            spread_delta_bps: action.spread.delta_bps(),
+            bid_skew_bps: action.skew.bid_skew_bps(),
+            ask_skew_bps: action.skew.ask_skew_bps(),
+            confidence,
+            is_exploration: explore && action != stats.best_action,
+            action,
+            expected_q: stats.best_q_mean,
+            q_uncertainty: stats.best_q_std,
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions for Sampling
+// ============================================================================
+
+/// Sample from standard normal distribution (Box-Muller transform).
+fn sample_standard_normal() -> f64 {
+    let u1 = sample_uniform();
+    let u2 = sample_uniform();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Sample from Gamma distribution (Marsaglia and Tsang's method).
+fn sample_gamma(alpha: f64, beta: f64) -> f64 {
+    if alpha < 1.0 {
+        // Use Ahrens-Dieter method for alpha < 1
+        let u = sample_uniform();
+        return sample_gamma(alpha + 1.0, beta) * u.powf(1.0 / alpha);
+    }
+
+    let d = alpha - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+
+    loop {
+        let x = sample_standard_normal();
+        let v = (1.0 + c * x).powi(3);
+        if v > 0.0 {
+            let u = sample_uniform();
+            if u < 1.0 - 0.0331 * x.powi(4) {
+                return d * v / beta;
+            }
+            if u.ln() < 0.5 * x.powi(2) + d * (1.0 - v + v.ln()) {
+                return d * v / beta;
+            }
+        }
+    }
+}
+
+/// Sample from uniform distribution [0, 1).
+fn sample_uniform() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Simple LCG for sampling (replace with proper RNG in production)
+    static mut SEED: u64 = 0;
+    unsafe {
+        if SEED == 0 {
+            SEED = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(12345);
+        }
+        SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (SEED >> 33) as f64 / (1u64 << 31) as f64
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inventory_bucket_from_position() {
+        assert_eq!(
+            InventoryBucket::from_position(-60.0, 100.0),
+            InventoryBucket::LargeShort
+        );
+        assert_eq!(
+            InventoryBucket::from_position(-30.0, 100.0),
+            InventoryBucket::ModerateShort
+        );
+        assert_eq!(
+            InventoryBucket::from_position(-10.0, 100.0),
+            InventoryBucket::SmallShort
+        );
+        assert_eq!(
+            InventoryBucket::from_position(0.0, 100.0),
+            InventoryBucket::Neutral
+        );
+        assert_eq!(
+            InventoryBucket::from_position(10.0, 100.0),
+            InventoryBucket::SmallLong
+        );
+        assert_eq!(
+            InventoryBucket::from_position(30.0, 100.0),
+            InventoryBucket::ModerateLong
+        );
+        assert_eq!(
+            InventoryBucket::from_position(60.0, 100.0),
+            InventoryBucket::LargeLong
+        );
+    }
+
+    #[test]
+    fn test_imbalance_bucket_from_imbalance() {
+        assert_eq!(
+            ImbalanceBucket::from_imbalance(-0.5),
+            ImbalanceBucket::StrongSell
+        );
+        assert_eq!(
+            ImbalanceBucket::from_imbalance(-0.25),
+            ImbalanceBucket::ModerateSell
+        );
+        assert_eq!(
+            ImbalanceBucket::from_imbalance(0.0),
+            ImbalanceBucket::Neutral
+        );
+        assert_eq!(
+            ImbalanceBucket::from_imbalance(0.25),
+            ImbalanceBucket::ModerateBuy
+        );
+        assert_eq!(
+            ImbalanceBucket::from_imbalance(0.5),
+            ImbalanceBucket::StrongBuy
+        );
+    }
+
+    #[test]
+    fn test_mdp_state_to_index() {
+        let state1 = MDPState::default();
+        let state2 = MDPState {
+            inventory: InventoryBucket::LargeLong,
+            imbalance: ImbalanceBucket::StrongBuy,
+            volatility: VolatilityBucket::VeryHigh,
+            adverse: AdverseBucket::VeryHigh,
+            excitation: ExcitationBucket::Critical,
+        };
+
+        let idx1 = state1.to_index();
+        let idx2 = state2.to_index();
+
+        assert!(idx1 < MDPState::STATE_COUNT);
+        assert!(idx2 < MDPState::STATE_COUNT);
+        assert_ne!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_mdp_action_deltas() {
+        let action = MDPAction::new(SpreadAction::TightenSmall, SkewAction::ModerateBidBias);
+        assert_eq!(action.spread.delta_bps(), -1.5);
+        assert_eq!(action.skew.bid_skew_bps(), -1.0);
+        assert_eq!(action.skew.ask_skew_bps(), 1.0);
+        assert_eq!(action.bid_delta_bps(), -2.5);
+        assert_eq!(action.ask_delta_bps(), -0.5);
+    }
+
+    #[test]
+    fn test_mdp_action_round_trip() {
+        for i in 0..MDPAction::ACTION_COUNT {
+            let action = MDPAction::from_index(i);
+            assert_eq!(action.to_index(), i);
+        }
+    }
+
+    #[test]
+    fn test_reward_computation() {
+        let config = RewardConfig::default();
+        let reward = Reward::compute(&config, 2.0, 0.3, 1.0, false);
+
+        assert!(reward.edge_component > 0.0);
+        assert!(reward.inventory_penalty <= 0.0);
+        assert_eq!(reward.volatility_penalty, 0.0); // vol_ratio = 1.0
+        assert_eq!(reward.adverse_penalty, 0.0);    // not adverse
+    }
+
+    #[test]
+    fn test_reward_adverse_penalty() {
+        let config = RewardConfig::default();
+        let reward = Reward::compute(&config, -3.0, 0.2, 1.0, true);
+
+        assert!(reward.edge_component < 0.0);
+        assert!(reward.adverse_penalty < 0.0);
+    }
+
+    #[test]
+    fn test_bayesian_q_value_update() {
+        let mut q = BayesianQValue::new();
+        assert_eq!(q.count(), 0);
+        assert_eq!(q.mean(), 0.0);
+
+        q.update(1.0);
+        assert_eq!(q.count(), 1);
+        assert!(q.mean() > 0.0);
+
+        q.update(1.0);
+        q.update(1.0);
+        assert_eq!(q.count(), 3);
+        assert!(q.mean() > 0.5); // Should converge toward 1.0
+    }
+
+    #[test]
+    fn test_bayesian_q_value_variance_decreases() {
+        let mut q = BayesianQValue::new();
+        let initial_var = q.variance();
+
+        for _ in 0..10 {
+            q.update(0.5);
+        }
+
+        assert!(q.variance() < initial_var);
+    }
+
+    #[test]
+    fn test_q_learning_agent_action_selection() {
+        let mut agent = QLearningAgent::default();
+        let state = MDPState::default();
+
+        // Should be able to select actions
+        let action = agent.select_action(&state);
+        assert!(action.to_index() < MDPAction::ACTION_COUNT);
+    }
+
+    #[test]
+    fn test_q_learning_agent_update() {
+        let mut agent = QLearningAgent::default();
+        let state = MDPState::default();
+        let action = MDPAction::default();
+        let reward = Reward {
+            total: 1.0,
+            edge_component: 1.0,
+            inventory_penalty: 0.0,
+            volatility_penalty: 0.0,
+            adverse_penalty: 0.0,
+        };
+        let next_state = MDPState::default();
+
+        agent.update(state, action, reward, next_state, false);
+
+        let summary = agent.summary();
+        assert!(summary.total_reward > 0.0);
+    }
+
+    #[test]
+    fn test_rl_policy_recommendation() {
+        let mut agent = QLearningAgent::default();
+        let state = MDPState::default();
+
+        let rec = RLPolicyRecommendation::from_agent(&mut agent, &state, false);
+
+        assert!(rec.spread_delta_bps >= -3.0 && rec.spread_delta_bps <= 3.0);
+        assert!(rec.confidence >= 0.0 && rec.confidence <= 1.0);
+    }
+
+    #[test]
+    fn test_thompson_sampling_varies() {
+        let mut q = BayesianQValue::new();
+        // Add some observations to get non-trivial posterior
+        for _ in 0..10 {
+            q.update(1.0);
+        }
+
+        // Samples should vary (stochastic)
+        let samples: Vec<f64> = (0..100).map(|_| q.sample()).collect();
+        let mean = samples.iter().sum::<f64>() / 100.0;
+        let variance = samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / 100.0;
+
+        // Variance should be positive (samples differ)
+        assert!(variance > 0.0);
+    }
+}
