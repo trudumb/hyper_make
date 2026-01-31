@@ -379,6 +379,70 @@ impl LadderStrategy {
         (1.0 / safe_intensity).min(self.risk_config.max_holding_time)
     }
 
+    /// Compute Bayesian-informed gamma adjustment for spread calculation.
+    ///
+    /// Combines four components from Bayesian posteriors:
+    /// 1. **Trend confidence discount**: High confidence → tighter spreads
+    /// 2. **Bootstrap fill encouragement**: Low P(calibrated) → need fills → tighter
+    /// 3. **Adverse selection uncertainty premium**: High uncertainty → wider spreads
+    /// 4. **Regime adjustment**: Volatile regime → wider spreads
+    ///
+    /// # Arguments
+    /// * `market_params` - Contains Bayesian components (trend_confidence, bootstrap_confidence, etc.)
+    ///
+    /// # Returns
+    /// Multiplier for base gamma, typically in [0.7, 1.5]
+    pub fn compute_bayesian_gamma_adjustment(&self, market_params: &MarketParams) -> f64 {
+        let cfg = &self.risk_config;
+
+        // Component 1: Trend confidence discount
+        // High confidence in direction → can quote tighter
+        // trend_confidence ∈ [0, 1], capped at 0.6 for safety
+        let capped_confidence = market_params.trend_confidence.clamp(0.0, 0.6);
+        let trend_discount = 1.0 - capped_confidence * 0.4; // [0.76, 1.0]
+
+        // Component 2: Bootstrap fill encouragement
+        // Low calibration confidence → need fills → quote tighter
+        // bootstrap_confidence ∈ [0, 1], 0 = uncalibrated, 1 = fully calibrated
+        let bootstrap_discount = 0.8 + 0.2 * market_params.bootstrap_confidence; // [0.8, 1.0]
+
+        // Component 3: Adverse selection uncertainty premium
+        // High uncertainty in adverse posterior → quote wider for safety
+        // adverse_uncertainty is std dev of posterior, typically 0.01-0.15
+        let uncertainty_premium = 1.0 + market_params.adverse_uncertainty * 2.0; // [1.0, ~1.3]
+
+        // Component 4: Regime adjustment
+        // Volatile regime → wider spreads
+        let regime_mult = match market_params.adverse_regime {
+            0 => 0.9,  // Calm: slightly tighter
+            1 => 1.0,  // Normal: baseline
+            2 => 1.3,  // Volatile: significantly wider
+            _ => 1.0,  // Fallback
+        };
+
+        // Combine multiplicatively
+        let raw_mult = trend_discount * bootstrap_discount * uncertainty_premium * regime_mult;
+
+        // Bound to reasonable range
+        let bayesian_mult = raw_mult.clamp(cfg.gamma_min / cfg.gamma_base, cfg.gamma_max / cfg.gamma_base);
+
+        tracing::debug!(
+            trend_confidence = %format!("{:.3}", market_params.trend_confidence),
+            trend_discount = %format!("{:.3}", trend_discount),
+            bootstrap_confidence = %format!("{:.3}", market_params.bootstrap_confidence),
+            bootstrap_discount = %format!("{:.3}", bootstrap_discount),
+            adverse_uncertainty = %format!("{:.3}", market_params.adverse_uncertainty),
+            uncertainty_premium = %format!("{:.3}", uncertainty_premium),
+            adverse_regime = market_params.adverse_regime,
+            regime_mult = %format!("{:.2}", regime_mult),
+            raw_mult = %format!("{:.3}", raw_mult),
+            bayesian_mult = %format!("{:.3}", bayesian_mult),
+            "Bayesian gamma adjustment computed"
+        );
+
+        bayesian_mult
+    }
+
     /// Build a MarketRegime from MarketParams for entropy-based allocation.
     ///
     /// The MarketRegime provides market state signals that the entropy optimizer
@@ -437,33 +501,52 @@ impl LadderStrategy {
             "Quoting capacity: user max_position is for reduce-only only"
         );
 
-        // === GAMMA: Adaptive vs Legacy ===
+        // === GAMMA: Adaptive vs Legacy with Bayesian Adjustment ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma
         // When disabled: use multiplicative RiskConfig gamma
         //
-        // In BOTH paths, apply calibration_gamma_mult for fill-hungry mode during warmup.
-        // calibration_gamma_mult ∈ [0.3, 1.0]: reduces gamma to tighten quotes for calibration fills.
+        // In BOTH paths, apply:
+        // 1. calibration_gamma_mult for fill-hungry mode during warmup
+        // 2. bayesian_gamma_mult for posterior-driven adjustments (trend, bootstrap, adverse)
         let calibration_scalar = market_params.calibration_gamma_mult;
+
+        // Compute Bayesian gamma adjustment from posteriors
+        // If pre-computed in MarketParams, use that; otherwise compute here
+        let bayesian_scalar = if (market_params.bayesian_gamma_mult - 1.0).abs() > 0.001 {
+            market_params.bayesian_gamma_mult
+        } else {
+            self.compute_bayesian_gamma_adjustment(market_params)
+        };
 
         let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
             // Adaptive gamma: log-additive scaling prevents multiplicative explosion
             // Still apply tail risk multiplier for cascade protection
             // Apply calibration scalar for fill-hungry mode
+            // Apply Bayesian scalar for posterior-driven adjustments
             let adaptive_gamma = market_params.adaptive_gamma;
             debug!(
                 adaptive_gamma = %format!("{:.4}", adaptive_gamma),
                 tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
                 calibration_mult = %format!("{:.2}", calibration_scalar),
+                bayesian_mult = %format!("{:.3}", bayesian_scalar),
                 warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-                "Ladder using ADAPTIVE gamma"
+                "Ladder using ADAPTIVE gamma with BAYESIAN adjustment"
             );
-            adaptive_gamma * market_params.tail_risk_multiplier * calibration_scalar
+            adaptive_gamma * market_params.tail_risk_multiplier * calibration_scalar * bayesian_scalar
         } else {
             // Legacy: multiplicative RiskConfig gamma
             // Note: effective_gamma() already includes calibration_scalar
             let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
             let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
-            gamma_with_liq * market_params.tail_risk_multiplier
+            let legacy_gamma = gamma_with_liq * market_params.tail_risk_multiplier;
+            debug!(
+                base_gamma = %format!("{:.4}", base_gamma),
+                gamma_with_liq = %format!("{:.4}", gamma_with_liq),
+                tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
+                bayesian_mult = %format!("{:.3}", bayesian_scalar),
+                "Ladder using LEGACY gamma with BAYESIAN adjustment"
+            );
+            legacy_gamma * bayesian_scalar
         };
 
         // === KAPPA: Robust V3 > Adaptive > Legacy ===

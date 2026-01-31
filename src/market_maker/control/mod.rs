@@ -29,6 +29,7 @@
 //! - Position management (sequential effects)
 
 pub mod actions;
+pub mod bayesian_bootstrap;
 pub mod belief;
 pub mod calibrated_edge;
 pub mod changepoint;
@@ -47,6 +48,9 @@ pub mod value;
 
 // Re-export key types
 pub use actions::{Action, ActionConfig, NoQuoteReason};
+pub use bayesian_bootstrap::{
+    BayesianBootstrapConfig, BayesianBootstrapTracker, BayesianExitDecision, BootstrapSummary,
+};
 pub use belief::BeliefState;
 pub use calibrated_edge::{CalibratedEdgeConfig, CalibratedEdgeSignal, EdgeSignalDiagnostics};
 pub use changepoint::{ChangepointConfig, ChangepointDetector};
@@ -56,8 +60,9 @@ pub use quote_gate::{
     QuoteGateConfig, QuoteGateInput, ProbeConfig,
 };
 pub use theoretical_edge::{
-    BayesianAdverseTracker, CrossAssetSignal, EnhancedEdgeInput, TheoreticalEdgeConfig,
-    TheoreticalEdgeEstimator, TheoreticalEdgeResult,
+    AdverseSummary, BayesianAdverseTracker, CrossAssetSignal, EnhancedEdgeInput,
+    RegimeAwareBayesianAdverse, TheoreticalEdgeConfig, TheoreticalEdgeEstimator,
+    TheoreticalEdgeResult,
 };
 pub use hybrid_ev::{
     DecisionSource, HybridEVConfig, HybridEVEstimator, HybridEVInput, HybridEVResult,

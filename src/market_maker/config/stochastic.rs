@@ -687,6 +687,7 @@ impl StochasticConfig {
             use_bayesian_warmup: true, // Enable Bayesian IR warmup by default
             min_ir_outcomes_for_trust: 25, // Default: require meaningful IR data
             probe_config: crate::market_maker::control::ProbeConfig::default(),
+            bootstrap_config: crate::market_maker::control::BayesianBootstrapConfig::default(),
         }
     }
 }

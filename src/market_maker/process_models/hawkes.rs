@@ -852,6 +852,379 @@ impl OnlineHawkesCalibrator {
 }
 
 // ============================================================================
+// Hawkes Excitation Predictor (Bayesian Fusion)
+// ============================================================================
+
+/// Configuration for Hawkes excitation prediction.
+#[derive(Debug, Clone)]
+pub struct HawkesExcitationConfig {
+    /// Threshold branching ratio above which we consider high excitation
+    /// (n = α/β, typically concerning when n > 0.7)
+    pub high_excitation_branching_ratio: f64,
+
+    /// Threshold intensity percentile for early warning
+    pub high_intensity_percentile: f64,
+
+    /// Time horizon for cluster probability (seconds)
+    pub cluster_horizon_secs: f64,
+
+    /// Minimum penalty multiplier (never go below this)
+    pub min_penalty: f64,
+
+    /// Maximum penalty multiplier (cap at this)
+    pub max_penalty: f64,
+}
+
+impl Default for HawkesExcitationConfig {
+    fn default() -> Self {
+        Self {
+            high_excitation_branching_ratio: 0.7,
+            high_intensity_percentile: 0.8,
+            cluster_horizon_secs: 10.0,
+            min_penalty: 0.5,
+            max_penalty: 1.0,
+        }
+    }
+}
+
+/// Prediction result from Hawkes excitation analysis.
+#[derive(Debug, Clone, Copy)]
+pub struct HawkesExcitationPrediction {
+    /// Probability of cluster occurring in next tau seconds
+    pub p_cluster: f64,
+
+    /// Penalty multiplier for edge calculation (0.5-1.0)
+    /// Lower values = more conservative quoting
+    pub excitation_penalty: f64,
+
+    /// Whether we're in a high excitation state
+    pub is_high_excitation: bool,
+
+    /// Current branching ratio from calibration
+    pub branching_ratio: f64,
+
+    /// Current intensity percentile
+    pub intensity_percentile: f64,
+
+    /// Excess intensity ratio: λ_current / λ_baseline
+    pub excess_intensity_ratio: f64,
+
+    /// Expected time to next cluster event (seconds)
+    pub expected_cluster_time_secs: f64,
+
+    /// Recommended spread widening factor
+    pub spread_widening_factor: f64,
+}
+
+impl Default for HawkesExcitationPrediction {
+    fn default() -> Self {
+        Self {
+            p_cluster: 0.0,
+            excitation_penalty: 1.0,
+            is_high_excitation: false,
+            branching_ratio: 0.0,
+            intensity_percentile: 0.5,
+            excess_intensity_ratio: 1.0,
+            expected_cluster_time_secs: f64::INFINITY,
+            spread_widening_factor: 1.0,
+        }
+    }
+}
+
+/// Hawkes Excitation Predictor - Bayesian fusion of Hawkes process with quoting decisions.
+///
+/// Uses the branching ratio (n = α/β) and current intensity to predict:
+/// 1. P(cluster in next τ seconds) - probability of cascade/clustering
+/// 2. Excitation penalty - multiplier for edge calculation
+/// 3. Spread widening factor - how much to widen spreads defensively
+///
+/// # Theory
+///
+/// For a Hawkes process with intensity λ(t) = λ₀ + Σᵢ α × e^(-β(t-tᵢ)):
+/// - Branching ratio n = α/β determines criticality (n < 1 for stationarity)
+/// - When n → 1, the process becomes critical (infinite clustering)
+/// - Excess intensity λ_excess = λ(t) - λ₀ measures current excitation level
+///
+/// The probability of k additional events given one triggering event follows
+/// a negative binomial distribution with mean n/(1-n). This allows us to
+/// compute P(cluster) = P(≥1 child event | current excitation).
+///
+/// # Integration with Bayesian Adverse Selection
+///
+/// The excitation penalty directly modifies expected edge:
+/// ```text
+/// effective_edge = base_edge × excitation_penalty
+/// ```
+///
+/// When P(cluster) is high, excitation_penalty is low, reducing quoting aggressiveness.
+#[derive(Debug, Clone)]
+pub struct HawkesExcitationPredictor {
+    config: HawkesExcitationConfig,
+
+    /// Latest GMM calibration result
+    latest_calibration: Option<HawkesGmmResult>,
+
+    /// Latest summary from order flow estimator
+    latest_summary: Option<HawkesSummary>,
+
+    /// Baseline intensity (λ₀) from calibration
+    baseline_intensity: f64,
+
+    /// EWMA of intensity percentile for smoothing
+    ewma_intensity_percentile: f64,
+
+    /// EWMA decay factor
+    ewma_alpha: f64,
+}
+
+impl HawkesExcitationPredictor {
+    /// Create a new predictor with default config.
+    pub fn new() -> Self {
+        Self::with_config(HawkesExcitationConfig::default())
+    }
+
+    /// Create a new predictor with custom config.
+    pub fn with_config(config: HawkesExcitationConfig) -> Self {
+        Self {
+            config,
+            latest_calibration: None,
+            latest_summary: None,
+            baseline_intensity: 0.5, // Default baseline
+            ewma_intensity_percentile: 0.5,
+            ewma_alpha: 0.1, // Smooth over ~10 updates
+        }
+    }
+
+    /// Update with new GMM calibration result.
+    pub fn update_calibration(&mut self, calibration: HawkesGmmResult) {
+        self.baseline_intensity = calibration.lambda_0;
+        self.latest_calibration = Some(calibration);
+    }
+
+    /// Update with new Hawkes summary.
+    pub fn update_summary(&mut self, summary: HawkesSummary) {
+        // Update EWMA of intensity percentile
+        self.ewma_intensity_percentile = self.ewma_alpha * summary.intensity_percentile
+            + (1.0 - self.ewma_alpha) * self.ewma_intensity_percentile;
+
+        self.latest_summary = Some(summary);
+    }
+
+    /// Get current branching ratio (α/β).
+    pub fn branching_ratio(&self) -> f64 {
+        self.latest_calibration
+            .map(|c| c.branching_ratio)
+            .unwrap_or(0.3) // Conservative default
+    }
+
+    /// Get current intensity percentile.
+    pub fn intensity_percentile(&self) -> f64 {
+        self.latest_summary
+            .as_ref()
+            .map(|s| s.intensity_percentile)
+            .unwrap_or(0.5)
+    }
+
+    /// Compute P(cluster in next τ seconds).
+    ///
+    /// Uses the branching ratio and current excitation level to estimate
+    /// the probability of a clustering event (cascade) occurring.
+    ///
+    /// # Theory
+    ///
+    /// For a Hawkes process, the expected number of child events from one
+    /// parent event is n = α/β. The excess intensity above baseline
+    /// represents "potential parents" that could trigger clusters.
+    ///
+    /// P(cluster | excitation) ≈ 1 - (1 - n)^(excess_events × decay_factor)
+    ///
+    /// where:
+    /// - excess_events = (λ_current - λ₀) × τ
+    /// - decay_factor = (1 - e^(-β×τ)) / (β×τ) accounts for decay during horizon
+    pub fn p_cluster(&self, tau_secs: f64) -> f64 {
+        let n = self.branching_ratio();
+
+        // Get current total intensity
+        let lambda_current = self
+            .latest_summary
+            .as_ref()
+            .map(|s| s.lambda_total)
+            .unwrap_or(self.baseline_intensity);
+
+        // Excess intensity above baseline
+        let lambda_excess = (lambda_current - self.baseline_intensity).max(0.0);
+
+        // If no excess or no calibration, low cluster probability
+        if lambda_excess < 0.01 || n < 0.01 {
+            return 0.0;
+        }
+
+        // Get beta from calibration (decay rate)
+        let beta = self
+            .latest_calibration
+            .map(|c| c.beta)
+            .unwrap_or(0.1);
+
+        // Expected excess events in horizon, accounting for decay
+        // ∫₀^τ λ_excess × e^(-β×t) dt = λ_excess × (1 - e^(-β×τ)) / β
+        let decay_integral = if beta > 0.001 {
+            (1.0 - (-beta * tau_secs).exp()) / beta
+        } else {
+            tau_secs // Linear for very slow decay
+        };
+
+        let excess_events = lambda_excess * decay_integral;
+
+        // P(at least one child) = 1 - (1-n)^excess_events
+        // For small n, this ≈ n × excess_events
+        // For n close to 1, this approaches 1 quickly
+        let p_no_cluster = (1.0 - n).powf(excess_events);
+
+        (1.0 - p_no_cluster).clamp(0.0, 1.0)
+    }
+
+    /// Compute excitation penalty for edge calculation.
+    ///
+    /// Returns a multiplier in [min_penalty, max_penalty] that reduces
+    /// expected edge when cluster probability is high.
+    ///
+    /// # Formula
+    ///
+    /// ```text
+    /// penalty = max_penalty - (max_penalty - min_penalty) × p_cluster^γ
+    /// ```
+    ///
+    /// where γ = 0.5 (square root) to make the penalty responsive but not
+    /// overly aggressive for moderate cluster probabilities.
+    pub fn excitation_penalty(&self) -> f64 {
+        let p_cluster = self.p_cluster(self.config.cluster_horizon_secs);
+
+        let penalty_range = self.config.max_penalty - self.config.min_penalty;
+
+        // Square root scaling: responsive but not too aggressive
+        let reduction = penalty_range * p_cluster.sqrt();
+
+        (self.config.max_penalty - reduction).clamp(self.config.min_penalty, self.config.max_penalty)
+    }
+
+    /// Check if we're in a high excitation state.
+    ///
+    /// High excitation is defined as:
+    /// - Branching ratio > threshold (default 0.7), OR
+    /// - Intensity percentile > threshold (default 0.8)
+    pub fn is_high_excitation(&self) -> bool {
+        let n = self.branching_ratio();
+        let intensity_pct = self.intensity_percentile();
+
+        n > self.config.high_excitation_branching_ratio
+            || intensity_pct > self.config.high_intensity_percentile
+    }
+
+    /// Compute spread widening factor.
+    ///
+    /// Returns a multiplier >= 1.0 to widen spreads during high excitation.
+    ///
+    /// # Formula
+    ///
+    /// Based on excess intensity and branching ratio:
+    /// ```text
+    /// widening = 1 + k₁ × (intensity_ratio - 1) + k₂ × n²
+    /// ```
+    ///
+    /// where:
+    /// - k₁ = 0.3 (intensity sensitivity)
+    /// - k₂ = 0.5 (branching ratio sensitivity, squared for non-linearity)
+    pub fn spread_widening_factor(&self) -> f64 {
+        let lambda_current = self
+            .latest_summary
+            .as_ref()
+            .map(|s| s.lambda_total)
+            .unwrap_or(self.baseline_intensity);
+
+        let intensity_ratio = lambda_current / self.baseline_intensity.max(0.01);
+        let n = self.branching_ratio();
+
+        // Widening components
+        let intensity_component = 0.3 * (intensity_ratio - 1.0).max(0.0);
+        let branching_component = 0.5 * n * n;
+
+        (1.0 + intensity_component + branching_component).clamp(1.0, 3.0)
+    }
+
+    /// Expected time to next cluster event (seconds).
+    ///
+    /// Based on the intensity of "cluster-triggering" events and the
+    /// conditional probability of cascade given a trigger.
+    pub fn expected_cluster_time(&self) -> f64 {
+        let p_cluster = self.p_cluster(self.config.cluster_horizon_secs);
+
+        if p_cluster < 0.001 {
+            return f64::INFINITY;
+        }
+
+        // Rough estimate: horizon / p_cluster (geometric distribution)
+        self.config.cluster_horizon_secs / p_cluster
+    }
+
+    /// Get full prediction result.
+    pub fn predict(&self) -> HawkesExcitationPrediction {
+        let tau = self.config.cluster_horizon_secs;
+        let p_cluster = self.p_cluster(tau);
+        let penalty = self.excitation_penalty();
+        let is_high = self.is_high_excitation();
+        let n = self.branching_ratio();
+        let intensity_pct = self.intensity_percentile();
+
+        let lambda_current = self
+            .latest_summary
+            .as_ref()
+            .map(|s| s.lambda_total)
+            .unwrap_or(self.baseline_intensity);
+
+        let excess_ratio = lambda_current / self.baseline_intensity.max(0.01);
+
+        HawkesExcitationPrediction {
+            p_cluster,
+            excitation_penalty: penalty,
+            is_high_excitation: is_high,
+            branching_ratio: n,
+            intensity_percentile: intensity_pct,
+            excess_intensity_ratio: excess_ratio,
+            expected_cluster_time_secs: self.expected_cluster_time(),
+            spread_widening_factor: self.spread_widening_factor(),
+        }
+    }
+
+    /// Diagnostic summary for logging.
+    pub fn diagnostic_summary(&self) -> String {
+        let pred = self.predict();
+        format!(
+            "Hawkes: p_cluster={:.3} penalty={:.3} n={:.3} intensity_pct={:.2} excess_ratio={:.2} widening={:.2}",
+            pred.p_cluster,
+            pred.excitation_penalty,
+            pred.branching_ratio,
+            pred.intensity_percentile,
+            pred.excess_intensity_ratio,
+            pred.spread_widening_factor,
+        )
+    }
+
+    /// Reset predictor state.
+    pub fn reset(&mut self) {
+        self.latest_calibration = None;
+        self.latest_summary = None;
+        self.baseline_intensity = 0.5;
+        self.ewma_intensity_percentile = 0.5;
+    }
+}
+
+impl Default for HawkesExcitationPredictor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1312,5 +1685,230 @@ mod tests {
         // Should return minimal lambda_0 and no excitation
         assert!(r.lambda_0 >= 0.0);
         assert!(r.alpha >= 0.0);
+    }
+
+    // ============================================================================
+    // HawkesExcitationPredictor Tests
+    // ============================================================================
+
+    #[test]
+    fn test_excitation_predictor_new() {
+        let predictor = HawkesExcitationPredictor::new();
+        assert!(predictor.branching_ratio() >= 0.0);
+        assert!(predictor.intensity_percentile() >= 0.0);
+    }
+
+    #[test]
+    fn test_excitation_predictor_default_prediction() {
+        let predictor = HawkesExcitationPredictor::new();
+        let pred = predictor.predict();
+
+        // Without calibration, should return safe defaults
+        assert!(pred.p_cluster >= 0.0 && pred.p_cluster <= 1.0);
+        assert!(pred.excitation_penalty >= 0.5 && pred.excitation_penalty <= 1.0);
+        assert!(!pred.is_high_excitation);
+    }
+
+    #[test]
+    fn test_excitation_predictor_with_calibration() {
+        let mut predictor = HawkesExcitationPredictor::new();
+
+        // Add a calibration with moderate branching ratio
+        let calibration = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.03,
+            beta: 0.1,
+            branching_ratio: 0.3,
+            sample_mean: 5.0,
+            sample_variance: 8.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        predictor.update_calibration(calibration);
+
+        assert!((predictor.branching_ratio() - 0.3).abs() < 1e-6);
+        assert!(!predictor.is_high_excitation()); // 0.3 < 0.7 threshold
+    }
+
+    #[test]
+    fn test_excitation_predictor_high_branching_ratio() {
+        let mut predictor = HawkesExcitationPredictor::new();
+
+        // Add a calibration with high branching ratio (near critical)
+        let calibration = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.08,
+            beta: 0.1,
+            branching_ratio: 0.8, // > 0.7 threshold
+            sample_mean: 5.0,
+            sample_variance: 20.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        predictor.update_calibration(calibration);
+
+        assert!(predictor.is_high_excitation());
+        
+        // Add summary with elevated intensity
+        let summary = HawkesSummary {
+            is_warmed_up: true,
+            lambda_buy: 1.0,
+            lambda_sell: 1.0,
+            lambda_total: 2.0, // 4x baseline
+            flow_imbalance: 0.0,
+            intensity_percentile: 0.9,
+            trade_count: 100,
+            recent_events: 50,
+            expected_trades_1m: 120.0,
+            buy_volume: 100.0,
+            sell_volume: 100.0,
+        };
+        predictor.update_summary(summary);
+
+        let pred = predictor.predict();
+
+        // High branching ratio + elevated intensity = high cluster probability
+        assert!(pred.p_cluster > 0.5);
+        // Should reduce edge penalty
+        assert!(pred.excitation_penalty < 0.8);
+        // Should widen spreads
+        assert!(pred.spread_widening_factor > 1.0);
+    }
+
+    #[test]
+    fn test_excitation_predictor_p_cluster_bounds() {
+        let mut predictor = HawkesExcitationPredictor::new();
+
+        // Even with extreme parameters, p_cluster should be bounded
+        let calibration = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.095,
+            beta: 0.1,
+            branching_ratio: 0.95, // Very close to critical
+            sample_mean: 5.0,
+            sample_variance: 50.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        predictor.update_calibration(calibration);
+
+        let summary = HawkesSummary {
+            is_warmed_up: true,
+            lambda_buy: 5.0,
+            lambda_sell: 5.0,
+            lambda_total: 10.0, // 20x baseline
+            flow_imbalance: 0.0,
+            intensity_percentile: 0.99,
+            trade_count: 500,
+            recent_events: 100,
+            expected_trades_1m: 600.0,
+            buy_volume: 500.0,
+            sell_volume: 500.0,
+        };
+        predictor.update_summary(summary);
+
+        let p = predictor.p_cluster(10.0);
+        assert!(p >= 0.0 && p <= 1.0);
+    }
+
+    #[test]
+    fn test_excitation_penalty_range() {
+        let mut predictor = HawkesExcitationPredictor::new();
+
+        // Test with various calibrations
+        for branching in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let calibration = HawkesGmmResult {
+                lambda_0: 0.5,
+                alpha: branching * 0.1,
+                beta: 0.1,
+                branching_ratio: branching,
+                sample_mean: 5.0,
+                sample_variance: 5.0 * (1.0 + branching) / (1.0 - branching).max(0.01),
+                n_windows: 100,
+                fit_quality: 1.0,
+            };
+            predictor.update_calibration(calibration);
+
+            let penalty = predictor.excitation_penalty();
+            assert!(
+                penalty >= 0.5 && penalty <= 1.0,
+                "Penalty {} out of range for branching {}", penalty, branching
+            );
+        }
+    }
+
+    #[test]
+    fn test_spread_widening_factor() {
+        let mut predictor = HawkesExcitationPredictor::new();
+
+        // Calm conditions
+        let calibration = HawkesGmmResult {
+            lambda_0: 0.5,
+            alpha: 0.02,
+            beta: 0.1,
+            branching_ratio: 0.2,
+            sample_mean: 5.0,
+            sample_variance: 6.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        predictor.update_calibration(calibration);
+
+        let summary = HawkesSummary {
+            is_warmed_up: true,
+            lambda_buy: 0.25,
+            lambda_sell: 0.25,
+            lambda_total: 0.5, // At baseline
+            flow_imbalance: 0.0,
+            intensity_percentile: 0.5,
+            trade_count: 50,
+            recent_events: 20,
+            expected_trades_1m: 30.0,
+            buy_volume: 50.0,
+            sell_volume: 50.0,
+        };
+        predictor.update_summary(summary);
+
+        let widening = predictor.spread_widening_factor();
+        // At baseline intensity with low branching, widening should be near 1
+        assert!(widening >= 1.0 && widening < 1.3);
+    }
+
+    #[test]
+    fn test_diagnostic_summary() {
+        let predictor = HawkesExcitationPredictor::new();
+        let summary = predictor.diagnostic_summary();
+        
+        // Should contain key metrics
+        assert!(summary.contains("p_cluster="));
+        assert!(summary.contains("penalty="));
+        assert!(summary.contains("n="));
+    }
+
+    #[test]
+    fn test_predictor_reset() {
+        let mut predictor = HawkesExcitationPredictor::new();
+
+        // Add calibration
+        let calibration = HawkesGmmResult {
+            lambda_0: 1.0,
+            alpha: 0.05,
+            beta: 0.1,
+            branching_ratio: 0.5,
+            sample_mean: 10.0,
+            sample_variance: 30.0,
+            n_windows: 100,
+            fit_quality: 1.0,
+        };
+        predictor.update_calibration(calibration);
+
+        // Verify it took effect
+        assert!((predictor.branching_ratio() - 0.5).abs() < 1e-6);
+
+        // Reset
+        predictor.reset();
+
+        // Should be back to defaults
+        assert!((predictor.branching_ratio() - 0.3).abs() < 1e-6); // Default is 0.3
     }
 }

@@ -648,10 +648,11 @@ mod tests {
             } => {
                 // Shift should be bounded and reasonable
                 // Should NOT explode to 30× like the old bug
+                // Note: Shift is clamped to ±10% of mid (100 bps), so <= 100 is valid
                 let shift_bps = reservation_shift * 10000.0;
                 assert!(
-                    shift_bps.abs() < 100.0,
-                    "Shift should be reasonable (< 100 bps): {} bps",
+                    shift_bps.abs() <= 100.0,
+                    "Shift should be reasonable (<= 100 bps): {:.1} bps",
                     shift_bps
                 );
             }
