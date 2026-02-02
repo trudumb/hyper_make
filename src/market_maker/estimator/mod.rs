@@ -43,6 +43,7 @@ mod kappa;
 mod kappa_orchestrator;
 pub mod lag_analysis;
 mod microprice;
+pub mod threshold_kappa;
 mod mock;
 mod momentum;
 pub mod mutual_info;
@@ -130,7 +131,15 @@ pub use regime_kappa::{RegimeKappaBreakdown, RegimeKappaConfig, RegimeKappaEstim
 pub use vpin::{VpinConfig, VpinEstimator};
 
 // BOCPD for detecting feature→κ relationship breaks
-pub use bocpd_kappa::{BOCPDKappaConfig, BOCPDKappaPredictor, N_FEATURES as BOCPD_N_FEATURES};
+// First-Principles: AdaptiveHazard for non-stationary changepoint detection
+pub use bocpd_kappa::{
+    AdaptiveHazard, AdaptiveHazardConfig, BOCPDKappaConfig, BOCPDKappaPredictor,
+    N_FEATURES as BOCPD_N_FEATURES,
+};
+
+// First-Principles: Threshold-dependent kappa (TAR model)
+// κ depends on deviation from equilibrium: mean-reversion vs momentum regimes
+pub use threshold_kappa::{ThresholdKappa, ThresholdKappaConfig, ThresholdKappaRegime};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

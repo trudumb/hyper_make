@@ -37,6 +37,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
     /// Handle AllMids message - updates mid price and triggers quote refresh.
     async fn handle_all_mids(&mut self, all_mids: crate::ws::message_types::AllMids) -> Result<()> {
+        // === First-Principles Gap 2: Capture previous mid for return calculation ===
+        let prev_mid = self.latest_mid;
+
         // HARMONIZED: Use effective_max_position for position utilization calculations
         let ctx = messages::MessageContext::new(
             self.config.asset.clone(),
@@ -72,6 +75,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         if result.is_some() {
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
+
+            // === First-Principles Gap 2: Update ThresholdKappa with return observation ===
+            // Feed return_bps to ThresholdKappa for TAR model regime detection.
+            // This determines whether we're in mean-reversion or momentum regime.
+            if prev_mid > 0.0 && self.latest_mid > 0.0 {
+                let return_bps = (self.latest_mid - prev_mid) / prev_mid * 10_000.0;
+                self.stochastic.threshold_kappa.update(return_bps);
+            }
 
             // === Phase 3: Event-Driven Quote Updates ===
             // Instead of calling update_quotes() on every AllMids, record the event
@@ -423,15 +434,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.stochastic.calibration_controller.record_fill();
 
                 // === V2 INTEGRATION: BOCPD Kappa Relationship Update ===
-                // Update BOCPD with observed features→kappa relationship
-                // This allows BOCPD to detect when relationships break
+                // Update BOCPD with observed features→kappa relationship + stress signals.
+                // First-Principles Gap 1: Adaptive hazard rate based on market stress.
                 if let Some(features) = self.stochastic.bocpd_kappa_features.take() {
                     let realized_kappa = self.estimator.kappa();
-                    let changepoint = self.stochastic.bocpd_kappa.update(&features, realized_kappa);
+
+                    // Gather stress signals for adaptive hazard rate
+                    let vpin = self.stochastic.vpin.vpin();
+                    let hawkes_intensity_ratio = self.tier2.hawkes.intensity_ratio();
+                    let size_anomaly_sigma = self.stochastic.trade_size_dist.anomaly_sigma();
+
+                    // Use stress-aware BOCPD update (First-Principles Gap 1)
+                    let changepoint = self.stochastic.bocpd_kappa.update_with_stress(
+                        &features,
+                        realized_kappa,
+                        vpin,
+                        hawkes_intensity_ratio,
+                        size_anomaly_sigma,
+                    );
+
                     if changepoint {
+                        let hazard = self.stochastic.bocpd_kappa.last_hazard_rate();
+                        let stress = self.stochastic.bocpd_kappa.market_stress_index();
                         tracing::debug!(
                             realized_kappa = %format!("{:.0}", realized_kappa),
-                            "BOCPD: Changepoint detected in kappa relationship"
+                            hazard = %format!("{:.4}", hazard),
+                            stress = %format!("{:.2}", stress),
+                            vpin = %format!("{:.2}", vpin),
+                            "BOCPD: Changepoint detected (stress-aware)"
                         );
                     }
                 }

@@ -21,6 +21,7 @@ use crate::market_maker::{
         CumulativeOFI, CumulativeOFIConfig,
         TradeSizeDistribution, TradeSizeDistributionConfig,
         BOCPDKappaConfig, BOCPDKappaPredictor,
+        ThresholdKappa, ThresholdKappaConfig,
     },
     calibration::SignalDecayTracker,
     quoting::{KappaSpreadConfig, KappaSpreadController},
@@ -508,6 +509,12 @@ pub struct StochasticComponents {
     /// Cached BOCPD features for update after fill.
     /// Stored during quote generation, used to update BOCPD when fill occurs.
     pub bocpd_kappa_features: Option<[f64; 4]>,
+
+    // === First-Principles Gap 2: Threshold-Dependent Kappa (TAR Model) ===
+    /// Threshold kappa: mean-reversion vs momentum regime detection.
+    /// Implements TAR model where κ decays when price deviates beyond threshold.
+    /// Used to widen spreads during momentum regimes (large moves).
+    pub threshold_kappa: ThresholdKappa,
 }
 
 impl StochasticComponents {
@@ -613,6 +620,8 @@ impl StochasticComponents {
             bocpd_kappa: BOCPDKappaPredictor::new(BOCPDKappaConfig::default()),
             signal_decay: SignalDecayTracker::new(),
             bocpd_kappa_features: None,
+            // First-Principles Gap 2: Threshold-Dependent Kappa (TAR Model)
+            threshold_kappa: ThresholdKappa::new(ThresholdKappaConfig::default()),
         }
     }
     

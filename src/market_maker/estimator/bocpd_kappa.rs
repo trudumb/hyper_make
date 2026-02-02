@@ -103,6 +103,124 @@ impl Default for BOCPDKappaConfig {
     }
 }
 
+// =============================================================================
+// FIRST-PRINCIPLES: Adaptive Hazard Rate
+// =============================================================================
+//
+// The probability of a regime change is NOT constant - it depends on market stress.
+// High VPIN, elevated Hawkes intensity, or trade size anomalies all increase
+// the probability that the feature→κ relationship has broken.
+//
+// Mathematical grounding:
+//   h(t) = h_base × (1 + α×VPIN + β×(λ_hawkes - 1) + γ×size_anomaly)
+//
+// This replaces the constant hazard assumption with a state-dependent one.
+// =============================================================================
+
+/// Configuration for adaptive hazard rate.
+#[derive(Debug, Clone)]
+pub struct AdaptiveHazardConfig {
+    /// Base hazard rate when market is calm
+    pub base_rate: f64,
+    /// Sensitivity to VPIN (informed trading probability)
+    pub vpin_sensitivity: f64,
+    /// Sensitivity to Hawkes intensity (trade clustering)
+    pub intensity_sensitivity: f64,
+    /// Sensitivity to trade size anomalies
+    pub anomaly_sensitivity: f64,
+    /// Maximum hazard rate (cap to avoid numerical issues)
+    pub max_rate: f64,
+}
+
+impl Default for AdaptiveHazardConfig {
+    fn default() -> Self {
+        Self {
+            base_rate: 0.005,
+            vpin_sensitivity: 0.02,      // VPIN=0.5 → 1% additional hazard
+            intensity_sensitivity: 0.01, // 2× baseline intensity → 1% additional hazard
+            anomaly_sensitivity: 0.015,  // 3σ anomaly → 4.5% additional hazard
+            max_rate: 0.1,               // Cap at 10%
+        }
+    }
+}
+
+/// Adaptive hazard rate that increases with market stress.
+///
+/// First-Principles: The probability of a structural break (regime change)
+/// should increase when market conditions are stressed:
+/// - High VPIN indicates informed trading → relationships may break
+/// - High Hawkes intensity indicates clustering → momentum regime
+/// - Large trade sizes indicate institutional flow → different dynamics
+#[derive(Debug, Clone)]
+pub struct AdaptiveHazard {
+    config: AdaptiveHazardConfig,
+    /// Current hazard rate (cached for diagnostics)
+    current_hazard: f64,
+    /// Current market stress index [0, 1]
+    stress_index: f64,
+}
+
+impl Default for AdaptiveHazard {
+    fn default() -> Self {
+        Self::new(AdaptiveHazardConfig::default())
+    }
+}
+
+impl AdaptiveHazard {
+    /// Create a new adaptive hazard calculator.
+    pub fn new(config: AdaptiveHazardConfig) -> Self {
+        Self {
+            current_hazard: config.base_rate,
+            stress_index: 0.0,
+            config,
+        }
+    }
+
+    /// Compute time-varying hazard rate based on market stress.
+    ///
+    /// # Arguments
+    /// * `vpin` - VPIN score [0, 1], higher = more informed trading
+    /// * `hawkes_intensity_ratio` - Current λ / baseline μ, >1 = elevated
+    /// * `size_anomaly_sigma` - Trade size deviation in sigmas, >3 = anomalous
+    ///
+    /// # Returns
+    /// Hazard rate (probability of regime change per observation)
+    pub fn compute(&mut self, vpin: f64, hawkes_intensity_ratio: f64, size_anomaly_sigma: f64) -> f64 {
+        // Compute stress contributions
+        let vpin_stress = self.config.vpin_sensitivity * vpin;
+        let intensity_stress = self.config.intensity_sensitivity
+            * (hawkes_intensity_ratio - 1.0).max(0.0);
+        let anomaly_stress = self.config.anomaly_sensitivity * size_anomaly_sigma.max(0.0);
+
+        // Total stress multiplier
+        let total_stress = 1.0 + vpin_stress + intensity_stress + anomaly_stress;
+
+        // Compute adaptive hazard
+        let hazard = (self.config.base_rate * total_stress).min(self.config.max_rate);
+
+        // Cache for diagnostics
+        self.current_hazard = hazard;
+        self.stress_index = (total_stress - 1.0) / 3.0; // Normalize to [0, 1] roughly
+
+        hazard
+    }
+
+    /// Get current hazard rate (from last compute call).
+    pub fn current_hazard(&self) -> f64 {
+        self.current_hazard
+    }
+
+    /// Get current market stress index [0, 1].
+    pub fn stress_index(&self) -> f64 {
+        self.stress_index.clamp(0.0, 1.0)
+    }
+
+    /// Get base (unstressed) hazard rate.
+    pub fn base_rate(&self) -> f64 {
+        self.config.base_rate
+    }
+}
+
 /// Sufficient statistics for Bayesian linear regression at one run length.
 #[derive(Debug, Clone)]
 struct RegressionStats {
@@ -250,6 +368,12 @@ pub struct BOCPDKappaPredictor {
     /// Cached probability of being in new regime
     p_new_regime_cached: f64,
 
+    /// Adaptive hazard calculator (first-principles: non-stationary changepoint probability)
+    adaptive_hazard: AdaptiveHazard,
+
+    /// Last computed hazard rate (for diagnostics)
+    last_hazard_rate: f64,
+
     /// Whether a changepoint was detected on last update
     last_changepoint_detected: bool,
 }
@@ -264,12 +388,19 @@ impl BOCPDKappaPredictor {
     /// Create a new BOCPD Kappa Predictor.
     pub fn new(config: BOCPDKappaConfig) -> Self {
         let max_len = config.max_run_length;
+        let base_hazard = config.hazard_rate;
 
         // Initialize with all mass on run length 0
         let mut run_length_probs = vec![0.0; max_len + 1];
         run_length_probs[0] = 1.0;
 
         let run_stats = vec![RegressionStats::default(); max_len + 1];
+
+        // Initialize adaptive hazard with base rate from config
+        let adaptive_config = AdaptiveHazardConfig {
+            base_rate: base_hazard,
+            ..Default::default()
+        };
 
         Self {
             config,
@@ -279,16 +410,48 @@ impl BOCPDKappaPredictor {
             recent_errors: VecDeque::with_capacity(100),
             max_recent: 100,
             p_new_regime_cached: 1.0, // Start in "new regime"
+            adaptive_hazard: AdaptiveHazard::new(adaptive_config),
+            last_hazard_rate: base_hazard,
             last_changepoint_detected: false,
         }
     }
 
-    /// Update with new observation. Returns true if changepoint detected.
+    /// Update with new observation using constant hazard rate. Returns true if changepoint detected.
+    ///
+    /// For first-principles grounding, prefer `update_with_stress` which uses adaptive hazard.
     pub fn update(&mut self, features: &[f64; N_FEATURES], realized_kappa: f64) -> bool {
+        self.update_internal(features, realized_kappa, self.config.hazard_rate)
+    }
+
+    /// Update with new observation using adaptive (stress-dependent) hazard rate.
+    ///
+    /// First-Principles: The probability of a regime change is NOT constant.
+    /// It increases with market stress indicators.
+    ///
+    /// # Arguments
+    /// * `features` - Feature vector for kappa prediction
+    /// * `realized_kappa` - Actual observed kappa
+    /// * `vpin` - VPIN score [0, 1] indicating informed trading probability
+    /// * `hawkes_intensity_ratio` - Current Hawkes intensity / baseline (>1 = elevated)
+    /// * `size_anomaly_sigma` - Trade size deviation in sigmas (>3 = anomalous)
+    pub fn update_with_stress(
+        &mut self,
+        features: &[f64; N_FEATURES],
+        realized_kappa: f64,
+        vpin: f64,
+        hawkes_intensity_ratio: f64,
+        size_anomaly_sigma: f64,
+    ) -> bool {
+        let hazard = self.adaptive_hazard.compute(vpin, hawkes_intensity_ratio, size_anomaly_sigma);
+        self.last_hazard_rate = hazard;
+        self.update_internal(features, realized_kappa, hazard)
+    }
+
+    /// Internal update method with explicit hazard rate.
+    fn update_internal(&mut self, features: &[f64; N_FEATURES], realized_kappa: f64, hazard: f64) -> bool {
         self.observation_count += 1;
 
         let max_len = self.config.max_run_length;
-        let hazard = self.config.hazard_rate;
 
         // Compute predictive probabilities for each run length
         let mut pred_probs = vec![0.0; max_len + 1];
@@ -504,6 +667,25 @@ impl BOCPDKappaPredictor {
         }
 
         coefs
+    }
+
+    // =========================================================================
+    // First-Principles: Adaptive Hazard Diagnostics
+    // =========================================================================
+
+    /// Get last computed hazard rate.
+    pub fn last_hazard_rate(&self) -> f64 {
+        self.last_hazard_rate
+    }
+
+    /// Get current market stress index from adaptive hazard [0, 1].
+    pub fn market_stress_index(&self) -> f64 {
+        self.adaptive_hazard.stress_index()
+    }
+
+    /// Get base (unstressed) hazard rate.
+    pub fn base_hazard_rate(&self) -> f64 {
+        self.adaptive_hazard.base_rate()
     }
 
     /// Reset the predictor.

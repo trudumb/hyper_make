@@ -218,6 +218,17 @@ impl HawkesOrderFlowEstimator {
         self.lambda_buy + self.lambda_sell
     }
 
+    /// Get intensity ratio (current / baseline).
+    ///
+    /// Used for adaptive hazard rate in BOCPD (First-Principles Gap 1).
+    /// - 1.0: Normal activity (at baseline)
+    /// - >1.0: Elevated activity (higher changepoint probability)
+    /// - <1.0: Low activity
+    pub fn intensity_ratio(&self) -> f64 {
+        let baseline = 2.0 * self.config.mu;
+        self.lambda_total() / baseline
+    }
+
     /// Get flow imbalance from intensities.
     ///
     /// Returns value in [-1, 1]:

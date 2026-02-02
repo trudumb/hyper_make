@@ -1113,6 +1113,15 @@ impl TradeSizeDistribution {
         (self.cached_median - self.median_ema).abs() / self.cached_std
     }
 
+    /// Alias for median_sigma (used by adaptive hazard rate).
+    ///
+    /// Returns the number of standard deviations the current median
+    /// trade size is from the EMA baseline. Used for stress detection
+    /// in BOCPD adaptive hazard (First-Principles Gap 1).
+    pub fn anomaly_sigma(&self) -> f64 {
+        self.median_sigma()
+    }
+
     /// Check if trade sizes are anomalous.
     ///
     /// Returns true if median jumped > threshold sigmas above EMA baseline.

@@ -1,7 +1,7 @@
 //! Quote generation engine for the market maker.
 
 use chrono::Timelike;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::prelude::Result;
 
@@ -714,16 +714,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Get spread multiplier from circuit breaker if applicable
-        let spread_multiplier = match breaker_action {
+        let mut spread_multiplier = match breaker_action {
             Some(CircuitBreakerAction::WidenSpreads { multiplier }) => multiplier,
             _ => 1.0,
         };
+
+        // === First-Principles Gap 2: Apply ThresholdKappa regime-based spread multiplier ===
+        // During momentum regimes (large price moves), widen spreads to reduce adverse selection.
+        let threshold_kappa_mult = self.stochastic.threshold_kappa.regime().spread_multiplier();
+        if threshold_kappa_mult > 1.0 && self.stochastic.threshold_kappa.is_warmed_up() {
+            spread_multiplier *= threshold_kappa_mult;
+            trace!(
+                regime = ?self.stochastic.threshold_kappa.regime(),
+                kappa_ratio = %format!("{:.2}", self.stochastic.threshold_kappa.kappa_ratio()),
+                multiplier = %format!("{:.2}", threshold_kappa_mult),
+                "ThresholdKappa: Momentum regime detected, widening spreads"
+            );
+        }
 
         // Apply circuit breaker spread multiplier to market params if needed
         if spread_multiplier > 1.0 {
             debug!(
                 multiplier = %format!("{:.2}", spread_multiplier),
-                "Circuit breaker: widening spreads"
+                "Spread widening active (circuit breaker + threshold kappa)"
             );
             // The spread multiplier will be applied in the strategy
         }
