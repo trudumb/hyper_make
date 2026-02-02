@@ -98,9 +98,13 @@ impl Ladder {
         );
 
         // 5. Apply inventory skew with drift adjustment (re-rounds for exchange precision)
+        // Use effective_inventory_ratio from Position Continuation Model (HOLD/ADD/REDUCE)
+        // - HOLD: 0.0 (no skew, symmetric quotes)
+        // - ADD: negative (reverse skew, tighter on position-building side)
+        // - REDUCE: positive (normal skew, tighter on position-reducing side)
         apply_inventory_skew_with_drift(
             &mut ladder,
-            params.inventory_ratio,
+            params.effective_inventory_ratio,
             params.gamma,
             params.sigma,
             params.time_horizon,
@@ -220,9 +224,10 @@ impl Ladder {
         );
 
         // 6. Apply inventory skew with drift adjustment
+        // Use effective_inventory_ratio from Position Continuation Model (HOLD/ADD/REDUCE)
         apply_inventory_skew_with_drift(
             &mut ladder,
-            params.inventory_ratio,
+            params.effective_inventory_ratio,
             params.gamma,
             params.sigma,
             params.time_horizon,

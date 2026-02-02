@@ -12,6 +12,7 @@ use crate::market_maker::{
         TheoreticalEdgeEstimator,
     },
     stochastic::{StochasticControlBuilder, StochasticControlConfig},
+    strategy::{PositionDecisionConfig, PositionDecisionEngine},
     estimator::{
         CalibrationController, CalibrationControllerConfig, RegimeHMM,
         EnhancedFlowConfig, EnhancedFlowEstimator,
@@ -455,6 +456,14 @@ pub struct StochasticComponents {
     /// Derives quotes from posteriors over (μ, σ², κ), not heuristics.
     /// β_t = E[μ | data] provides predictive bias from NIG posterior.
     pub beliefs_builder: StochasticControlBuilder,
+
+    // === Position Continuation Model ===
+    /// Position decision engine: HOLD/ADD/REDUCE based on Bayesian continuation.
+    /// Transforms inventory_ratio based on P(continuation | fills, regime).
+    /// - HOLD: inventory_ratio = 0 (no skew, symmetric quotes)
+    /// - ADD: inventory_ratio < 0 (reverse skew, tighter on position-building side)
+    /// - REDUCE: inventory_ratio > 0 (normal skew, tighter on position-reducing side)
+    pub position_decision: PositionDecisionEngine,
 }
 
 impl StochasticComponents {
@@ -548,6 +557,8 @@ impl StochasticComponents {
             competitor_model: crate::market_maker::learning::CompetitorModel::default(),
             // First-Principles Stochastic Control
             beliefs_builder: StochasticControlBuilder::new(StochasticControlConfig::default()),
+            // Position Continuation Model (HOLD/ADD/REDUCE)
+            position_decision: PositionDecisionEngine::new(PositionDecisionConfig::default()),
         }
     }
     

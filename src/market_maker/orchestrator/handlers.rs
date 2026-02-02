@@ -159,6 +159,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
+        // === Position Continuation Model: Sync regime ===
+        // Map HMM regime probabilities to continuation model regime names
+        // The model uses regime-specific priors: cascade (high), bursty, normal, quiet (low)
+        let continuation_regime = if regime_probs[3] > 0.3 {
+            "cascade" // Extreme volatility → high continuation prior (0.8)
+        } else if regime_probs[2] > 0.4 {
+            "bursty" // High volatility → elevated continuation prior (0.6)
+        } else if regime_probs[0] > 0.5 {
+            "quiet" // Low volatility → low continuation prior (0.3)
+        } else {
+            "normal" // Normal volatility → neutral prior (0.5)
+        };
+
+        // Check if regime changed and reset if needed
+        if self.stochastic.position_decision.current_regime() != continuation_regime {
+            debug!(
+                old_regime = %self.stochastic.position_decision.current_regime(),
+                new_regime = %continuation_regime,
+                p_extreme = %format!("{:.2}", regime_probs[3]),
+                "Position continuation: regime change detected"
+            );
+            self.stochastic.position_decision.reset_for_regime(continuation_regime);
+        }
+
         Ok(())
     }
 
@@ -502,6 +526,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // remaining = size - filled; if order not found, assume full fill
                     let is_full_fill = self.orders.get_order(fill.oid).map_or(true, |o| o.size - o.filled <= 0.0);
                     let _trigger = self.event_accumulator.on_fill(side, fill.oid, size, is_full_fill);
+
+                    // === Position Continuation Model: Update posterior on fill ===
+                    // Track whether fill is aligned with current position direction
+                    // Aligned fills increase P(continuation), adverse fills decrease it
+                    let fill_side_sign = if side == Side::Buy { 1.0 } else { -1.0 };
+                    let position_sign = self.position.position().signum();
+                    self.stochastic.position_decision.observe_fill(fill_side_sign, position_sign, size);
                 }
                 // Note: actual reconciliation happens in event loop via check_event_accumulator()
                 Ok(())

@@ -235,6 +235,16 @@ pub struct LadderParams {
     pub rl_ask_skew_bps: f64,
     /// Confidence in RL recommendation [0, 1]. Scales the adjustment magnitude.
     pub rl_confidence: f64,
+
+    // === Position Continuation Model ===
+    /// Position action from PositionDecisionEngine (HOLD/ADD/REDUCE).
+    /// Used to transform inventory_ratio for skew calculation.
+    pub position_action: crate::market_maker::strategy::PositionAction,
+    /// Effective inventory ratio after HOLD/ADD/REDUCE transformation.
+    /// - HOLD: 0.0 (no skew, symmetric quotes)
+    /// - ADD: negative (reverse skew, tighter on position-building side)
+    /// - REDUCE: positive × urgency (normal mean-reversion)
+    pub effective_inventory_ratio: f64,
 }
 
 #[cfg(test)]
@@ -292,6 +302,9 @@ mod tests {
             rl_bid_skew_bps: 0.0,
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
+            // Position continuation disabled for this test
+            position_action: crate::market_maker::strategy::PositionAction::default(),
+            effective_inventory_ratio: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -344,10 +357,16 @@ mod tests {
             rl_bid_skew_bps: 0.0,
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
+            // Position continuation disabled for this test
+            position_action: crate::market_maker::strategy::PositionAction::default(),
+            effective_inventory_ratio: 0.0,
         };
 
         let params_long = LadderParams {
             inventory_ratio: 0.5,
+            // IMPORTANT: Generator now uses effective_inventory_ratio for skew
+            // Set it to match inventory_ratio to test inventory skew behavior
+            effective_inventory_ratio: 0.5,
             ..params_neutral.clone()
         };
 
@@ -407,6 +426,9 @@ mod tests {
             rl_bid_skew_bps: 0.0,
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
+            // Position continuation disabled for this test
+            position_action: crate::market_maker::strategy::PositionAction::default(),
+            effective_inventory_ratio: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -463,6 +485,9 @@ mod tests {
             rl_bid_skew_bps: 0.0,
             rl_ask_skew_bps: 0.0,
             rl_confidence: 0.0,
+            // Position continuation disabled for this test
+            position_action: crate::market_maker::strategy::PositionAction::default(),
+            effective_inventory_ratio: 0.3, // Matches inventory_ratio for REDUCE
         };
 
         // Same params but WITHOUT drift adjustment

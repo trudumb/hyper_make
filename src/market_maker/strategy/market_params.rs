@@ -745,6 +745,28 @@ pub struct MarketParams {
     /// Longer time without adverse move → higher confidence in position.
     /// Updated when price moves against position direction.
     pub time_since_adverse_move: f64,
+
+    // ==================== Position Continuation Model ====================
+    /// Position action decided by PositionDecisionEngine.
+    /// HOLD/ADD/REDUCE based on Bayesian continuation probability.
+    /// Used to transform inventory_ratio for GLFT skew calculation.
+    pub position_action: super::PositionAction,
+
+    /// P(continuation) from Beta-Binomial posterior.
+    /// Higher values indicate the position direction is likely to continue.
+    /// Range: [0, 1], prior mean depends on regime.
+    pub continuation_p: f64,
+
+    /// Confidence in continuation estimate [0, 1].
+    /// Based on variance reduction from uniform prior.
+    /// Higher with more fill observations.
+    pub continuation_confidence: f64,
+
+    /// Effective inventory ratio after HOLD/ADD/REDUCE transformation.
+    /// - HOLD: 0.0 (no skew)
+    /// - ADD: negative (reverse skew to build position)
+    /// - REDUCE: positive (normal mean-reversion)
+    pub effective_inventory_ratio: f64,
 }
 
 impl Default for MarketParams {
@@ -970,6 +992,11 @@ impl Default for MarketParams {
             // Position Direction Confidence
             position_direction_confidence: 0.5, // Neutral confidence initially
             time_since_adverse_move: 0.0,       // No history initially
+            // Position Continuation Model
+            position_action: super::PositionAction::default(), // Default REDUCE
+            continuation_p: 0.5,                // Neutral prior
+            continuation_confidence: 0.0,       // No confidence until fills observed
+            effective_inventory_ratio: 0.0,     // Will be computed from position_action
         }
     }
 }

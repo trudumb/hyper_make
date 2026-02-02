@@ -543,6 +543,14 @@ impl ParameterAggregator {
             // using the fields above (belief_predictive_bias, belief_confidence, flow_imbalance)
             position_direction_confidence: 0.5, // Default neutral, computed at use site
             time_since_adverse_move: 0.0,       // Tracked externally in orchestrator state
+
+            // === Position Continuation Model (HOLD/ADD/REDUCE) ===
+            // Defaults populated here; actual values computed in quote_engine.rs
+            // from PositionDecisionEngine.decide() based on fills and regime
+            position_action: super::super::PositionAction::default(),
+            continuation_p: 0.5,           // Default 50% continuation (uninformed prior)
+            continuation_confidence: 0.0,  // Default no confidence (will be computed)
+            effective_inventory_ratio: 0.0, // Default no transformation (computed from position_action)
         }
     }
 }

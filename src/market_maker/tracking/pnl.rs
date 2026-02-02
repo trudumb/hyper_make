@@ -570,6 +570,19 @@ impl PnLTracker {
         &self.inventory_snapshots
     }
 
+    /// Get recent fills (most recent first).
+    ///
+    /// Returns an iterator over the last `n` fills, useful for
+    /// analyzing position direction and fill alignment.
+    pub fn recent_fills(&self, n: usize) -> impl Iterator<Item = &FillRecord> {
+        self.fills.iter().rev().take(n)
+    }
+
+    /// Get all fills.
+    pub fn fills(&self) -> &VecDeque<FillRecord> {
+        &self.fills
+    }
+
     /// Get unrealized P&L at current mid price.
     pub fn unrealized_pnl(&self, current_mid: f64) -> f64 {
         if self.position.abs() < 1e-9 {

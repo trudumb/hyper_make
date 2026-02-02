@@ -15,6 +15,7 @@ use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
+use crate::market_maker::strategy::action_to_inventory_ratio;
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
@@ -430,6 +431,63 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // (p_continuation was computed earlier from self.estimator.momentum_continuation_probability())
         // This was hardcoded to 0.5 in aggregator.rs, causing Quote Gate to never open
         market_params.p_momentum_continue = p_continuation;
+
+        // === Position Continuation Model (HOLD/ADD/REDUCE) ===
+        // Decide whether to HOLD, ADD, or REDUCE position based on Bayesian continuation probability.
+        // This transforms inventory_ratio for GLFT skew calculation:
+        // - HOLD: inventory_ratio = 0 (no skew, symmetric quotes)
+        // - ADD: inventory_ratio < 0 (reverse skew, tighter on position-building side)
+        // - REDUCE: inventory_ratio > 0 (normal skew, tighter on position-reducing side)
+        {
+            let position = self.position.position();
+            let max_position = self.effective_max_position;
+
+            // Get belief drift and confidence for alignment check
+            let belief_drift = market_params.belief_predictive_bias;
+            let belief_confidence = market_params.belief_confidence;
+
+            // Compute expected edge from current AS model (approximate)
+            let edge_bps = market_params.current_edge_bps;
+
+            // Decide position action using the engine
+            let position_action = self.stochastic.position_decision.decide(
+                position,
+                max_position,
+                belief_drift,
+                belief_confidence,
+                edge_bps,
+            );
+
+            // Compute raw inventory ratio
+            let raw_inventory_ratio = if max_position > 1e-9 {
+                position / max_position
+            } else {
+                0.0
+            };
+
+            // Transform inventory_ratio based on position action
+            let effective_inventory_ratio = action_to_inventory_ratio(position_action, raw_inventory_ratio);
+
+            // Update market_params with position continuation values
+            market_params.position_action = position_action;
+            market_params.continuation_p = self.stochastic.position_decision.prob_continuation();
+            market_params.continuation_confidence = self.stochastic.position_decision.confidence();
+            market_params.effective_inventory_ratio = effective_inventory_ratio;
+
+            // Log position decisions when position is significant (>1% of max)
+            if position.abs() > max_position * 0.01 {
+                info!(
+                    position_action = ?position_action,
+                    continuation_p = %format!("{:.3}", market_params.continuation_p),
+                    continuation_conf = %format!("{:.3}", market_params.continuation_confidence),
+                    raw_inv_ratio = %format!("{:.3}", raw_inventory_ratio),
+                    effective_inv_ratio = %format!("{:.3}", effective_inventory_ratio),
+                    belief_drift_bps = %format!("{:.2}", belief_drift * 10000.0),
+                    belief_conf = %format!("{:.3}", belief_confidence),
+                    "Position continuation decision"
+                );
+            }
+        }
 
         // === Regime-Aware Parameters ===
         // Get HMM regime probabilities for soft blending

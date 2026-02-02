@@ -743,6 +743,9 @@ impl LadderStrategy {
             rl_bid_skew_bps: market_params.rl_bid_skew_bps,
             rl_ask_skew_bps: market_params.rl_ask_skew_bps,
             rl_confidence: market_params.rl_confidence,
+            // Position Continuation Model (HOLD/ADD/REDUCE)
+            position_action: market_params.position_action,
+            effective_inventory_ratio: market_params.effective_inventory_ratio,
         };
 
         // === SPREAD FLOOR: Adaptive vs Static ===
