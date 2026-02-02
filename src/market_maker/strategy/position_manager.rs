@@ -96,6 +96,8 @@ pub struct PositionDecisionConfig {
     pub max_position_for_add: f64,
     /// Minimum belief confidence to use for alignment (default: 0.3)
     pub min_belief_confidence: f64,
+    /// Use fused continuation probability (multi-signal fusion) (default: true)
+    pub use_fused_probability: bool,
 }
 
 impl Default for PositionDecisionConfig {
@@ -111,6 +113,7 @@ impl Default for PositionDecisionConfig {
             min_significant_position: 0.01,
             max_position_for_add: 0.5,
             min_belief_confidence: 0.3,
+            use_fused_probability: true, // Use enhanced multi-signal fusion by default
         }
     }
 }
@@ -175,8 +178,19 @@ impl PositionDecisionEngine {
             return PositionAction::Reduce { urgency: 0.0 };
         }
 
-        let p_cont = self.continuation.prob_continuation();
-        let conf = self.continuation.confidence();
+        // Use fused probability if enabled (multi-signal fusion)
+        // Otherwise fall back to simple Beta mean
+        let (p_cont, conf) = if self.config.use_fused_probability {
+            (
+                self.continuation.prob_continuation_fused(),
+                self.continuation.confidence_fused(),
+            )
+        } else {
+            (
+                self.continuation.prob_continuation(),
+                self.continuation.confidence(),
+            )
+        };
         let position_sign = position.signum();
 
         // Check alignment: position direction matches belief drift
@@ -262,13 +276,61 @@ impl PositionDecisionEngine {
     }
 
     /// Get current P(continuation).
+    ///
+    /// Returns fused probability if configured, otherwise simple Beta mean.
     pub fn prob_continuation(&self) -> f64 {
-        self.continuation.prob_continuation()
+        if self.config.use_fused_probability {
+            self.continuation.prob_continuation_fused()
+        } else {
+            self.continuation.prob_continuation()
+        }
     }
 
     /// Get current confidence.
+    ///
+    /// Returns fused confidence if configured, otherwise variance-based.
     pub fn confidence(&self) -> f64 {
-        self.continuation.confidence()
+        if self.config.use_fused_probability {
+            self.continuation.confidence_fused()
+        } else {
+            self.continuation.confidence()
+        }
+    }
+
+    /// Update external signals for multi-signal fusion.
+    ///
+    /// This should be called each quote cycle with the latest signal values
+    /// from BOCD, momentum model, trend tracker, and HMM.
+    ///
+    /// # Arguments
+    /// * `changepoint_prob` - From BOCD `changepoint_probability(5)`
+    /// * `changepoint_entropy` - From BOCD `run_length_entropy()`
+    /// * `momentum_continuation` - From MomentumModel `continuation_probability()`
+    /// * `trend_agreement` - From TrendSignal `timeframe_agreement`
+    /// * `trend_confidence` - From TrendSignal `trend_confidence`
+    /// * `regime_probs` - From HMM `regime_probabilities()` [quiet, normal, bursty, cascade]
+    pub fn update_signals(
+        &mut self,
+        changepoint_prob: f64,
+        changepoint_entropy: f64,
+        momentum_continuation: f64,
+        trend_agreement: f64,
+        trend_confidence: f64,
+        regime_probs: [f64; 4],
+    ) {
+        self.continuation.update_signals(
+            changepoint_prob,
+            changepoint_entropy,
+            momentum_continuation,
+            trend_agreement,
+            trend_confidence,
+            regime_probs,
+        );
+    }
+
+    /// Get diagnostic summary of continuation signals.
+    pub fn signal_summary(&self) -> crate::market_maker::stochastic::continuation::ContinuationSignalSummary {
+        self.continuation.signal_summary()
     }
 
     /// Get current regime.
@@ -443,9 +505,55 @@ mod tests {
         // Reset to cascade regime
         engine.reset_for_regime("cascade");
 
-        // Should have cascade prior now
+        // Also update signals to reflect cascade regime
+        // (in production, this would come from HMM and other signal sources)
+        engine.update_signals(
+            0.0,                       // No changepoint
+            2.0,                       // Normal entropy
+            0.7,                       // High momentum continuation (typical in cascade)
+            0.5,                       // Some trend agreement
+            0.5,                       // Some trend confidence
+            [0.0, 0.0, 0.2, 0.8],     // Cascade-dominant regime
+        );
+
+        // Should have elevated continuation probability reflecting cascade regime
         let p_after = engine.prob_continuation();
-        assert!(p_after > 0.7, "Cascade regime should have high prior");
+        assert!(
+            p_after > 0.6,
+            "Cascade regime with supportive signals should have elevated prior: {}",
+            p_after
+        );
         assert_eq!(engine.current_regime(), "cascade");
+    }
+
+    #[test]
+    fn test_signal_update_affects_decision() {
+        let mut engine = PositionDecisionEngine::default();
+
+        // Build up some fills
+        for _ in 0..15 {
+            engine.observe_fill(1.0, 1.0, 1.0);
+        }
+        let p_before = engine.prob_continuation();
+
+        // Simulate changepoint detection
+        engine.update_signals(
+            0.8,                       // High changepoint
+            0.5,                       // Low entropy
+            0.5,                       // Neutral momentum
+            0.0,                       // No trend
+            0.0,                       // No trend confidence
+            [0.2, 0.5, 0.2, 0.1],     // Normal regime
+        );
+
+        let p_after = engine.prob_continuation();
+
+        // Changepoint should reduce continuation probability
+        assert!(
+            p_after < p_before,
+            "Changepoint should reduce p_cont: before={}, after={}",
+            p_before,
+            p_after
+        );
     }
 }

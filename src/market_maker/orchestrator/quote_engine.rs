@@ -442,6 +442,59 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let position = self.position.position();
             let max_position = self.effective_max_position;
 
+            // === Enhanced Multi-Signal Fusion for Position Continuation ===
+            // Wire BOCD changepoint, momentum, trend, and regime signals to continuation model.
+            // This enables the model to:
+            // 1. Discount fill history when changepoint detected (regime shift)
+            // 2. Boost continuation when momentum and trend agree with position
+            // 3. Use regime-appropriate priors (cascade = high continuation)
+            {
+                // Get BOCD changepoint signals from stochastic controller
+                let cp_summary = self.stochastic.controller.changepoint_summary();
+                let changepoint_prob = if cp_summary.warmed_up {
+                    cp_summary.cp_prob_5
+                } else {
+                    0.0 // Ignore changepoint during BOCD warmup
+                };
+                let changepoint_entropy = cp_summary.entropy;
+
+                // Get momentum continuation probability
+                let momentum_p = self.estimator.momentum_continuation_probability();
+
+                // Get trend signal
+                let position_value = (position.abs() * self.latest_mid).max(1.0);
+                let trend_signal = self.estimator.trend_signal(position_value);
+
+                // Get HMM regime probabilities [quiet, normal, bursty, cascade]
+                let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
+
+                // Update continuation model with all signals
+                self.stochastic.position_decision.update_signals(
+                    changepoint_prob,
+                    changepoint_entropy,
+                    momentum_p,
+                    trend_signal.timeframe_agreement,
+                    trend_signal.trend_confidence,
+                    regime_probs,
+                );
+
+                // Log signal fusion diagnostics when position is significant
+                if position.abs() > max_position * 0.05 {
+                    let summary = self.stochastic.position_decision.signal_summary();
+                    debug!(
+                        p_fill_raw = %format!("{:.3}", summary.p_fill_raw),
+                        p_fill_discounted = %format!("{:.3}", summary.p_fill_discounted),
+                        p_momentum = %format!("{:.3}", summary.p_momentum),
+                        p_trend = %format!("{:.3}", summary.p_trend),
+                        p_regime = %format!("{:.3}", summary.p_regime),
+                        p_fused = %format!("{:.3}", summary.p_fused),
+                        cp_discount = %format!("{:.3}", summary.changepoint_discount),
+                        fused_conf = %format!("{:.3}", summary.fused_confidence),
+                        "Position continuation signal fusion"
+                    );
+                }
+            }
+
             // Get belief drift and confidence for alignment check
             let belief_drift = market_params.belief_predictive_bias;
             let belief_confidence = market_params.belief_confidence;

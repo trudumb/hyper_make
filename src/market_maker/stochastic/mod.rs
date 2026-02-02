@@ -79,7 +79,7 @@ pub mod hjb_solver;
 // Re-export key types
 pub use beliefs::{BeliefSummary, MarketBeliefs, Regime};
 pub use conjugate::{FillIntensityPosterior, NormalInverseGamma};
-pub use continuation::ContinuationPosterior;
+pub use continuation::{ContinuationFusionConfig, ContinuationPosterior, ContinuationSignalSummary};
 pub use hjb_solver::{HJBDiagnostics, HJBQuotes, HJBSolver, HJBSolverConfig};
 
 /// Configuration for the stochastic control system.
