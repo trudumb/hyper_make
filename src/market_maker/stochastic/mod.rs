@@ -175,6 +175,17 @@ impl StochasticControlConfig {
 }
 
 /// Builder for gradual integration of first-principles system.
+///
+/// # Deprecation Notice (Phase 7)
+///
+/// This struct is DEPRECATED in favor of `CentralBeliefState` in the `belief` module.
+/// The centralized belief system provides:
+/// - Single source of truth for all Bayesian beliefs
+/// - Point-in-time snapshots via `BeliefSnapshot`
+/// - Unified update path via `BeliefUpdate` enum
+///
+/// This struct is retained for backward compatibility but is no longer updated
+/// with price observations. Use `market_maker.central_beliefs()` instead.
 #[derive(Debug, Clone)]
 pub struct StochasticControlBuilder {
     config: StochasticControlConfig,

@@ -21,6 +21,7 @@ mod conditional_metrics;
 mod information_ratio;
 pub mod model_gating;
 mod prediction_log;
+pub mod signal_decay;
 
 pub use adaptive_binning::AdaptiveBinner;
 pub use brier_score::BrierScoreTracker;
@@ -29,6 +30,9 @@ pub use conditional_metrics::ConditionalCalibration;
 pub use information_ratio::InformationRatioTracker;
 pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};
+pub use signal_decay::{
+    LatencyStats, SignalDecayConfig, SignalDecayTracker, SignalEmission, SignalOutcome,
+};
 
 /// Minimum samples required for reliable calibration metrics.
 pub const MIN_SAMPLES_FOR_CALIBRATION: usize = 100;

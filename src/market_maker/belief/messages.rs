@@ -154,6 +154,37 @@ pub enum BeliefUpdate {
         mi: f64,
     },
 
+    /// Microstructure update from VPIN/OFI estimators.
+    ///
+    /// Published by: VpinEstimator, EnhancedFlowEstimator
+    MicrostructureUpdate {
+        /// VPIN value [0, 1]
+        vpin: f64,
+        /// VPIN velocity (rate of change)
+        vpin_velocity: f64,
+        /// Depth-weighted OFI [-1, 1]
+        depth_ofi: f64,
+        /// Liquidity evaporation score [0, 1]
+        liquidity_evaporation: f64,
+        /// Order flow direction [-1, 1]
+        order_flow_direction: f64,
+        /// Confidence in estimates [0, 1]
+        confidence: f64,
+        /// Number of VPIN buckets
+        vpin_buckets: usize,
+        // === Phase 1A: Toxic Volume Refinements ===
+        /// Trade size sigma (deviation from baseline)
+        trade_size_sigma: f64,
+        /// Toxicity acceleration factor [1.0, 2.0]
+        toxicity_acceleration: f64,
+        /// Cumulative OFI with decay [-1, 1]
+        cofi: f64,
+        /// COFI velocity
+        cofi_velocity: f64,
+        /// Whether sustained shift detected
+        is_sustained_shift: bool,
+    },
+
     // =========================================================================
     // Control
     // =========================================================================

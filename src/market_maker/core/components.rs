@@ -16,7 +16,13 @@ use crate::market_maker::{
     estimator::{
         CalibrationController, CalibrationControllerConfig, RegimeHMM,
         EnhancedFlowConfig, EnhancedFlowEstimator,
+        LiquidityEvaporationConfig, LiquidityEvaporationDetector,
+        VpinConfig, VpinEstimator,
+        CumulativeOFI, CumulativeOFIConfig,
+        TradeSizeDistribution, TradeSizeDistributionConfig,
+        BOCPDKappaConfig, BOCPDKappaPredictor,
     },
+    calibration::SignalDecayTracker,
     quoting::{KappaSpreadConfig, KappaSpreadController},
     simulation::{QuickMCConfig, QuickMCSimulator},
     execution::{FillTracker, OrderLifecycleTracker},
@@ -451,10 +457,15 @@ pub struct StochasticComponents {
     /// Tracks snipe probability and queue competition.
     pub competitor_model: crate::market_maker::learning::CompetitorModel,
 
-    // === First-Principles Stochastic Control ===
-    /// Bayesian belief system and HJB solver for first-principles quoting.
-    /// Derives quotes from posteriors over (μ, σ², κ), not heuristics.
-    /// β_t = E[μ | data] provides predictive bias from NIG posterior.
+    // === First-Principles Stochastic Control (DEPRECATED) ===
+    /// DEPRECATED (Phase 7): Use `CentralBeliefState` instead.
+    ///
+    /// This field is no longer updated - price observations now flow to
+    /// `central_beliefs` in the MarketMaker struct. Retained for backward
+    /// compatibility but will be removed in a future version.
+    ///
+    /// Previously: Bayesian belief system for first-principles quoting.
+    /// Now: Use `market_maker.central_beliefs().snapshot()` for beliefs.
     pub beliefs_builder: StochasticControlBuilder,
 
     // === Position Continuation Model ===
@@ -464,6 +475,39 @@ pub struct StochasticComponents {
     /// - ADD: inventory_ratio < 0 (reverse skew, tighter on position-building side)
     /// - REDUCE: inventory_ratio > 0 (normal skew, tighter on position-reducing side)
     pub position_decision: PositionDecisionEngine,
+
+    // === Microstructure Signals (Phase 1: Alpha-Generating Architecture) ===
+    /// VPIN estimator: Volume-Synchronized Probability of Informed Trading.
+    /// Provides toxicity signal [0, 1] based on volume-classified buckets.
+    pub vpin: VpinEstimator,
+
+    /// Liquidity evaporation detector: detects rapid depth drops.
+    /// Provides evaporation score [0, 1] for pre-cascade detection.
+    pub liquidity_evaporation: LiquidityEvaporationDetector,
+
+    // === Phase 1A Refinements: Toxic Volume Detection ===
+    /// Cumulative OFI with decay: distinguishes temporary flickers from sustained shifts.
+    /// Raw OFI is noisy - COFI accumulates with decay to filter noise.
+    pub cofi: CumulativeOFI,
+
+    /// Trade size distribution tracker: detects anomalous trade sizes.
+    /// 3σ jump in median trade size during rising VPIN = accelerated toxicity.
+    pub trade_size_dist: TradeSizeDistribution,
+
+    // === V2 Refinements: Statistical Improvements ===
+    /// BOCPD predictor for detecting feature→κ relationship breaks.
+    /// Uses Bayesian Online Change Point Detection to track when regression
+    /// coefficients change, indicating the need to fall back to priors.
+    pub bocpd_kappa: BOCPDKappaPredictor,
+
+    /// Signal decay tracker for latency-adjusted calibration.
+    /// Tracks signal value decay over time and computes latency-adjusted IR.
+    /// Helps identify when signals are stale by the time we act.
+    pub signal_decay: SignalDecayTracker,
+
+    /// Cached BOCPD features for update after fill.
+    /// Stored during quote generation, used to update BOCPD when fill occurs.
+    pub bocpd_kappa_features: Option<[f64; 4]>,
 }
 
 impl StochasticComponents {
@@ -559,6 +603,16 @@ impl StochasticComponents {
             beliefs_builder: StochasticControlBuilder::new(StochasticControlConfig::default()),
             // Position Continuation Model (HOLD/ADD/REDUCE)
             position_decision: PositionDecisionEngine::new(PositionDecisionConfig::default()),
+            // Microstructure Signals (Phase 1: Alpha-Generating Architecture)
+            vpin: VpinEstimator::new(VpinConfig::default()),
+            liquidity_evaporation: LiquidityEvaporationDetector::new(LiquidityEvaporationConfig::default()),
+            // Phase 1A Refinements: Toxic Volume Detection
+            cofi: CumulativeOFI::new(CumulativeOFIConfig::default()),
+            trade_size_dist: TradeSizeDistribution::new(TradeSizeDistributionConfig::default()),
+            // V2 Refinements: Statistical Improvements
+            bocpd_kappa: BOCPDKappaPredictor::new(BOCPDKappaConfig::default()),
+            signal_decay: SignalDecayTracker::new(),
+            bocpd_kappa_features: None,
         }
     }
     

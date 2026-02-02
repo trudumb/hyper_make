@@ -28,6 +28,7 @@
 //! - `parameter_estimator`: Main orchestrator
 
 pub mod as_decomposition;
+pub mod bocpd_kappa;
 mod book_kappa;
 mod calibration_controller;
 mod covariance;
@@ -56,6 +57,7 @@ mod trend_persistence;
 mod volatility;
 pub mod volatility_filter;
 mod volume;
+pub mod vpin;
 
 // V2 re-exports (will be used when integrated)
 #[allow(unused_imports)]
@@ -86,8 +88,10 @@ pub use fill_rate_model::{
     MarketState as FillRateMarketState,
 };
 pub use enhanced_flow::{
-    BookLevel, EnhancedFlowConfig, EnhancedFlowContext, EnhancedFlowEstimator, EnhancedFlowResult,
-    TradeData,
+    BookLevel, CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig, EnhancedFlowContext,
+    EnhancedFlowEstimator, EnhancedFlowResult, LiquidityEvaporationConfig,
+    LiquidityEvaporationDetector, TradeData, TradeSizeDistribution, TradeSizeDistributionConfig,
+    TradeSizeStats,
 };
 pub use informed_flow::{
     ComponentParams, FlowDecomposition, InformedFlowConfig, InformedFlowEstimator, TradeFeatures,
@@ -121,6 +125,12 @@ pub use regime_hmm::{EmissionParams, Observation as HmmObservation, RegimeHMM, N
 
 // Regime-conditioned kappa estimation
 pub use regime_kappa::{RegimeKappaBreakdown, RegimeKappaConfig, RegimeKappaEstimator};
+
+// VPIN (Volume-Synchronized Probability of Informed Trading)
+pub use vpin::{VpinConfig, VpinEstimator};
+
+// BOCPD for detecting feature→κ relationship breaks
+pub use bocpd_kappa::{BOCPDKappaConfig, BOCPDKappaPredictor, N_FEATURES as BOCPD_N_FEATURES};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

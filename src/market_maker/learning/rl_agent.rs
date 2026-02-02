@@ -426,6 +426,268 @@ impl SkewAction {
     pub const COUNT: usize = 5;
 }
 
+// ============================================================================
+// Phase 6A.2: Parameter-Based RL Actions
+// ============================================================================
+// Instead of directly modifying spreads/skews in bps, tune multipliers
+// on the HJB-optimal parameters. This keeps RL within safe stochastic
+// control bounds and is more theoretically sound.
+
+/// Risk aversion (γ) multiplier action.
+/// Applied to base γ from HJB solver: effective_γ = base_γ × multiplier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GammaAction {
+    /// Very defensive (2.0× base γ = wider spreads)
+    VeryDefensive,
+    /// Moderately defensive (1.5× base γ)
+    Defensive,
+    /// Use base γ as-is (1.0×)
+    Neutral,
+    /// Moderately aggressive (0.75× base γ = tighter spreads)
+    Aggressive,
+    /// Very aggressive (0.5× base γ)
+    VeryAggressive,
+}
+
+impl GammaAction {
+    /// Get multiplier for γ.
+    pub fn multiplier(&self) -> f64 {
+        match self {
+            Self::VeryDefensive => 2.0,
+            Self::Defensive => 1.5,
+            Self::Neutral => 1.0,
+            Self::Aggressive => 0.75,
+            Self::VeryAggressive => 0.5,
+        }
+    }
+
+    /// Get action index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::VeryDefensive => 0,
+            Self::Defensive => 1,
+            Self::Neutral => 2,
+            Self::Aggressive => 3,
+            Self::VeryAggressive => 4,
+        }
+    }
+
+    /// Create from index.
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::VeryDefensive,
+            1 => Self::Defensive,
+            2 => Self::Neutral,
+            3 => Self::Aggressive,
+            _ => Self::VeryAggressive,
+        }
+    }
+
+    /// Number of γ actions.
+    pub const COUNT: usize = 5;
+}
+
+/// Inventory skew (ω) multiplier action.
+/// Applied to base skew from position manager: effective_ω = base_ω × multiplier
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OmegaAction {
+    /// Strong skew (2.0× = aggressively clear inventory)
+    StrongSkew,
+    /// Moderate skew (1.5×)
+    ModerateSkew,
+    /// Use base skew as-is (1.0×)
+    Neutral,
+    /// Reduced skew (0.5× = slower inventory clearing)
+    ReducedSkew,
+    /// Minimal skew (0.25× = almost ignore inventory)
+    MinimalSkew,
+}
+
+impl OmegaAction {
+    /// Get multiplier for ω.
+    pub fn multiplier(&self) -> f64 {
+        match self {
+            Self::StrongSkew => 2.0,
+            Self::ModerateSkew => 1.5,
+            Self::Neutral => 1.0,
+            Self::ReducedSkew => 0.5,
+            Self::MinimalSkew => 0.25,
+        }
+    }
+
+    /// Get action index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::StrongSkew => 0,
+            Self::ModerateSkew => 1,
+            Self::Neutral => 2,
+            Self::ReducedSkew => 3,
+            Self::MinimalSkew => 4,
+        }
+    }
+
+    /// Create from index.
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::StrongSkew,
+            1 => Self::ModerateSkew,
+            2 => Self::Neutral,
+            3 => Self::ReducedSkew,
+            _ => Self::MinimalSkew,
+        }
+    }
+
+    /// Number of ω actions.
+    pub const COUNT: usize = 5;
+}
+
+/// Quote intensity action.
+/// Controls what fraction of maximum size to quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntensityAction {
+    /// Don't quote at all (wait for better conditions)
+    NoQuote,
+    /// Quote at 25% of max size
+    Light,
+    /// Quote at 50% of max size
+    Moderate,
+    /// Quote at 75% of max size
+    Heavy,
+    /// Quote at full size
+    Full,
+}
+
+impl IntensityAction {
+    /// Get intensity as fraction [0, 1].
+    pub fn intensity(&self) -> f64 {
+        match self {
+            Self::NoQuote => 0.0,
+            Self::Light => 0.25,
+            Self::Moderate => 0.5,
+            Self::Heavy => 0.75,
+            Self::Full => 1.0,
+        }
+    }
+
+    /// Get action index (0-4).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::NoQuote => 0,
+            Self::Light => 1,
+            Self::Moderate => 2,
+            Self::Heavy => 3,
+            Self::Full => 4,
+        }
+    }
+
+    /// Create from index.
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::NoQuote,
+            1 => Self::Light,
+            2 => Self::Moderate,
+            3 => Self::Heavy,
+            _ => Self::Full,
+        }
+    }
+
+    /// Number of intensity actions.
+    pub const COUNT: usize = 5;
+}
+
+/// Complete parameter-based action for the MDP.
+/// Tunes γ, ω multipliers and quote intensity instead of raw bps adjustments.
+/// Total actions: 5 × 5 × 5 = 125 (more than 27 but still tractable)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParameterAction {
+    /// Risk aversion multiplier
+    pub gamma: GammaAction,
+    /// Inventory skew multiplier
+    pub omega: OmegaAction,
+    /// Quote intensity
+    pub intensity: IntensityAction,
+}
+
+impl ParameterAction {
+    /// Create a new parameter action.
+    pub fn new(gamma: GammaAction, omega: OmegaAction, intensity: IntensityAction) -> Self {
+        Self { gamma, omega, intensity }
+    }
+
+    /// Create from flat index.
+    pub fn from_index(idx: usize) -> Self {
+        let intensity_idx = idx % IntensityAction::COUNT;
+        let remaining = idx / IntensityAction::COUNT;
+        let omega_idx = remaining % OmegaAction::COUNT;
+        let gamma_idx = remaining / OmegaAction::COUNT;
+
+        Self {
+            gamma: GammaAction::from_index(gamma_idx),
+            omega: OmegaAction::from_index(omega_idx),
+            intensity: IntensityAction::from_index(intensity_idx),
+        }
+    }
+
+    /// Convert to flat index.
+    pub fn to_index(&self) -> usize {
+        let mut idx = self.gamma.index();
+        idx = idx * OmegaAction::COUNT + self.omega.index();
+        idx = idx * IntensityAction::COUNT + self.intensity.index();
+        idx
+    }
+
+    /// Get γ multiplier.
+    pub fn gamma_multiplier(&self) -> f64 {
+        self.gamma.multiplier()
+    }
+
+    /// Get ω multiplier.
+    pub fn omega_multiplier(&self) -> f64 {
+        self.omega.multiplier()
+    }
+
+    /// Get quote intensity [0, 1].
+    pub fn quote_intensity(&self) -> f64 {
+        self.intensity.intensity()
+    }
+
+    /// Total number of parameter actions.
+    pub const ACTION_COUNT: usize = GammaAction::COUNT * OmegaAction::COUNT * IntensityAction::COUNT;
+
+    /// Default neutral action (no changes to base parameters).
+    pub fn neutral() -> Self {
+        Self {
+            gamma: GammaAction::Neutral,
+            omega: OmegaAction::Neutral,
+            intensity: IntensityAction::Full,
+        }
+    }
+
+    /// Defensive action (wider spreads, strong skew, full quote).
+    pub fn defensive() -> Self {
+        Self {
+            gamma: GammaAction::Defensive,
+            omega: OmegaAction::StrongSkew,
+            intensity: IntensityAction::Full,
+        }
+    }
+
+    /// Cautious action (don't quote).
+    pub fn cautious() -> Self {
+        Self {
+            gamma: GammaAction::VeryDefensive,
+            omega: OmegaAction::Neutral,
+            intensity: IntensityAction::NoQuote,
+        }
+    }
+}
+
+impl Default for ParameterAction {
+    fn default() -> Self {
+        Self::neutral()
+    }
+}
+
 /// Complete action for the MDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MDPAction {
@@ -1304,5 +1566,74 @@ mod tests {
 
         // Variance should be positive (samples differ)
         assert!(variance > 0.0);
+    }
+
+    // ========================================================================
+    // Phase 6A.2: Parameter Action Tests
+    // ========================================================================
+
+    #[test]
+    fn test_gamma_action_multipliers() {
+        assert_eq!(GammaAction::VeryDefensive.multiplier(), 2.0);
+        assert_eq!(GammaAction::Defensive.multiplier(), 1.5);
+        assert_eq!(GammaAction::Neutral.multiplier(), 1.0);
+        assert_eq!(GammaAction::Aggressive.multiplier(), 0.75);
+        assert_eq!(GammaAction::VeryAggressive.multiplier(), 0.5);
+    }
+
+    #[test]
+    fn test_omega_action_multipliers() {
+        assert_eq!(OmegaAction::StrongSkew.multiplier(), 2.0);
+        assert_eq!(OmegaAction::ModerateSkew.multiplier(), 1.5);
+        assert_eq!(OmegaAction::Neutral.multiplier(), 1.0);
+        assert_eq!(OmegaAction::ReducedSkew.multiplier(), 0.5);
+        assert_eq!(OmegaAction::MinimalSkew.multiplier(), 0.25);
+    }
+
+    #[test]
+    fn test_intensity_action_values() {
+        assert_eq!(IntensityAction::NoQuote.intensity(), 0.0);
+        assert_eq!(IntensityAction::Light.intensity(), 0.25);
+        assert_eq!(IntensityAction::Moderate.intensity(), 0.5);
+        assert_eq!(IntensityAction::Heavy.intensity(), 0.75);
+        assert_eq!(IntensityAction::Full.intensity(), 1.0);
+    }
+
+    #[test]
+    fn test_parameter_action_round_trip() {
+        // Test all 125 parameter actions round-trip through index
+        for i in 0..ParameterAction::ACTION_COUNT {
+            let action = ParameterAction::from_index(i);
+            let recovered = action.to_index();
+            assert_eq!(i, recovered, "Index {} didn't round-trip", i);
+        }
+    }
+
+    #[test]
+    fn test_parameter_action_count() {
+        // 5 × 5 × 5 = 125 actions
+        assert_eq!(ParameterAction::ACTION_COUNT, 125);
+    }
+
+    #[test]
+    fn test_parameter_action_neutral() {
+        let neutral = ParameterAction::neutral();
+        assert_eq!(neutral.gamma_multiplier(), 1.0);
+        assert_eq!(neutral.omega_multiplier(), 1.0);
+        assert_eq!(neutral.quote_intensity(), 1.0);
+    }
+
+    #[test]
+    fn test_parameter_action_defensive() {
+        let defensive = ParameterAction::defensive();
+        assert!(defensive.gamma_multiplier() > 1.0, "Defensive should have higher γ");
+        assert!(defensive.omega_multiplier() > 1.0, "Defensive should have higher skew");
+        assert_eq!(defensive.quote_intensity(), 1.0, "Defensive should still quote");
+    }
+
+    #[test]
+    fn test_parameter_action_cautious() {
+        let cautious = ParameterAction::cautious();
+        assert_eq!(cautious.quote_intensity(), 0.0, "Cautious should not quote");
     }
 }

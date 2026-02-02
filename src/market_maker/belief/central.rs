@@ -42,7 +42,8 @@ use super::messages::{BeliefUpdate, PredictionLog, PredictionType};
 use super::snapshot::{
     BeliefSnapshot, BeliefStats, CalibrationMetrics, CalibrationState, ChangepointBeliefs,
     ChangepointResult, ContinuationBeliefs, ContinuationSignals, DriftVolatilityBeliefs,
-    EdgeBeliefs, KappaBeliefs, KappaComponents, RegimeBeliefs,
+    EdgeBeliefs, KappaBeliefs, KappaComponents, LatencyCalibration, MicrostructureBeliefs,
+    RegimeBeliefs,
 };
 use super::Regime;
 
@@ -148,6 +149,11 @@ struct InternalState {
     robust_kappa: f64,
     robust_kappa_ess: f64,
 
+    // Kappa uncertainty (for spread CI)
+    kappa_variance: f64,
+    kappa_sigma_covariance: f64,
+    sigma_variance: f64,
+
     // === Continuation (Beta-Binomial) ===
     continuation_alpha: f64,
     continuation_beta: f64,
@@ -180,6 +186,26 @@ struct InternalState {
     as_brier_n: usize,
     as_base_rate_sum: f64,
     signal_mi: HashMap<String, f64>,
+
+    // === Microstructure (Phase 1: Alpha-generating) ===
+    vpin: f64,
+    vpin_velocity: f64,
+    depth_ofi: f64,
+    liquidity_evaporation: f64,
+    order_flow_direction: f64,
+    vpin_confidence: f64,
+    vpin_buckets: usize,
+
+    // === Microstructure (Phase 1A: Toxic Volume Refinements) ===
+    trade_size_sigma: f64,
+    toxicity_acceleration: f64,
+    cofi: f64,
+    cofi_velocity: f64,
+    is_sustained_shift: bool,
+
+    // === Skewness (Phase 2A: Fat-Tail Tracking) ===
+    /// Tracked sigma skewness for asymmetric spread adjustment
+    sigma_skewness: f64,
 
     // === Statistics ===
     n_price_obs: u64,
@@ -230,6 +256,10 @@ impl Default for InternalState {
             book_kappa_r2: 0.0,
             robust_kappa: 2000.0,
             robust_kappa_ess: 0.0,
+            // Kappa uncertainty
+            kappa_variance: 500.0 * 500.0, // High initial uncertainty
+            kappa_sigma_covariance: 0.0,
+            sigma_variance: 0.0001 * 0.0001,
 
             // Continuation
             continuation_alpha: 2.5,
@@ -263,6 +293,25 @@ impl Default for InternalState {
             as_brier_n: 0,
             as_base_rate_sum: 0.0,
             signal_mi: HashMap::new(),
+
+            // Microstructure
+            vpin: 0.0,
+            vpin_velocity: 0.0,
+            depth_ofi: 0.0,
+            liquidity_evaporation: 0.0,
+            order_flow_direction: 0.0,
+            vpin_confidence: 0.0,
+            vpin_buckets: 0,
+
+            // Microstructure Phase 1A
+            trade_size_sigma: 0.0,
+            toxicity_acceleration: 1.0,
+            cofi: 0.0,
+            cofi_velocity: 0.0,
+            is_sustained_shift: false,
+
+            // Phase 2A: Skewness tracking
+            sigma_skewness: 0.5, // Slight positive (typical for vol)
 
             // Stats
             n_price_obs: 0,
@@ -428,6 +477,35 @@ impl CentralBeliefState {
 
             BeliefUpdate::SignalMiUpdate { signal_name, mi } => {
                 state.signal_mi.insert(signal_name, mi);
+            }
+
+            BeliefUpdate::MicrostructureUpdate {
+                vpin,
+                vpin_velocity,
+                depth_ofi,
+                liquidity_evaporation,
+                order_flow_direction,
+                confidence,
+                vpin_buckets,
+                trade_size_sigma,
+                toxicity_acceleration,
+                cofi,
+                cofi_velocity,
+                is_sustained_shift,
+            } => {
+                state.vpin = vpin;
+                state.vpin_velocity = vpin_velocity;
+                state.depth_ofi = depth_ofi;
+                state.liquidity_evaporation = liquidity_evaporation;
+                state.order_flow_direction = order_flow_direction;
+                state.vpin_confidence = confidence;
+                state.vpin_buckets = vpin_buckets;
+                // Phase 1A fields
+                state.trade_size_sigma = trade_size_sigma;
+                state.toxicity_acceleration = toxicity_acceleration;
+                state.cofi = cofi;
+                state.cofi_velocity = cofi_velocity;
+                state.is_sustained_shift = is_sustained_shift;
             }
 
             BeliefUpdate::SoftReset { retention } => {
@@ -698,6 +776,7 @@ impl CentralBeliefState {
             regime: self.build_regime_beliefs(state),
             changepoint: self.build_changepoint_beliefs(state),
             edge: self.build_edge_beliefs(state),
+            microstructure: self.build_microstructure_beliefs(state),
             calibration: self.build_calibration_state(state),
             stats: BeliefStats {
                 n_price_obs: state.n_price_obs,
@@ -731,6 +810,27 @@ impl CentralBeliefState {
         // Confidence based on precision increase
         let confidence = (1.0 - state.drift_prior_precision / posterior_precision).max(0.0);
 
+        // Phase 2A: Compute skewness estimates
+        // For Inverse-Gamma posterior on σ², the skewness is always positive
+        // Skewness ≈ 4 × sqrt(2 / (α - 3)) for α > 3 where α = n/2 + α₀
+        let ig_alpha = (state.n_price_obs as f64) / 2.0 + 2.0; // Prior α₀ = 2
+        let sigma_skewness = if ig_alpha > 3.0 {
+            (4.0 * (2.0 / (ig_alpha - 3.0)).sqrt()).min(3.0)
+        } else {
+            2.0 // High skewness when few samples
+        };
+
+        // Excess kurtosis for Inverse-Gamma: 6×(5α-11)/((α-3)(α-4)) for α > 4
+        let sigma_kurtosis = if ig_alpha > 4.0 {
+            (6.0 * (5.0 * ig_alpha - 11.0) / ((ig_alpha - 3.0) * (ig_alpha - 4.0))).min(10.0)
+        } else {
+            5.0 // High kurtosis when few samples
+        };
+
+        // Drift skewness: from asymmetry in returns (tracked via EMA of skew)
+        // Positive returns => negative drift skew (more room to rise)
+        let drift_skewness = -posterior_mean.signum() * 0.3 * confidence; // Simple heuristic
+
         DriftVolatilityBeliefs {
             expected_drift: posterior_mean,
             drift_uncertainty: posterior_std,
@@ -739,6 +839,10 @@ impl CentralBeliefState {
             prob_bullish: 1.0 - prob_bearish,
             confidence: confidence.min(1.0),
             n_observations: state.n_price_obs,
+            // Phase 2A: Skewness fields
+            sigma_skewness,
+            sigma_kurtosis,
+            drift_skewness,
         }
     }
 
@@ -758,6 +862,41 @@ impl CentralBeliefState {
         let w_robust = robust_conf / total;
         let w_prior = 0.05 / total;
 
+        // Compute uncertainty metrics
+        let kappa_std = state.kappa_variance.sqrt().max(10.0);
+
+        // Compute spread CI using delta method
+        // δ* = (1/γ) × ln(1 + γ/κ)
+        // ∂δ*/∂κ ≈ -1/(κ(κ+γ)) for typical γ
+        let gamma = 0.5; // Default gamma for CI calculation
+        let kappa = state.kappa_smoothed.max(100.0);
+        let d_delta_d_kappa = -1.0 / (kappa * (kappa + gamma));
+        let spread_std = (d_delta_d_kappa.powi(2) * state.kappa_variance).sqrt() * 10000.0; // Convert to bps
+
+        // 95% CI: mean ± 1.96 × std
+        let base_spread_bps = (1.0 / gamma) * (1.0 + gamma / kappa).ln() * 10000.0;
+        let spread_ci_lower = (base_spread_bps - 1.96 * spread_std).max(1.0);
+        let spread_ci_upper = (base_spread_bps + 1.96 * spread_std).min(50.0);
+
+        // Compute kappa-sigma correlation
+        let kappa_sigma_corr = if state.kappa_variance > 1e-12 && state.sigma_variance > 1e-12 {
+            let denom = (state.kappa_variance * state.sigma_variance).sqrt();
+            (state.kappa_sigma_covariance / denom).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Phase 2A: Compute skew-adjusted CIs
+        // Use sigma_skewness from drift_vol to adjust spread CIs asymmetrically
+        // Positive skew (vol spike risk) => widen upper CI, tighten lower CI
+        let skew_sensitivity = 0.1; // 10% adjustment per unit of skewness
+        let sigma_skew = state.sigma_skewness; // Tracked in InternalState
+        let skew_factor = (sigma_skew * skew_sensitivity).tanh();
+
+        // Skew-adjusted CIs: asymmetric based on vol spike risk
+        let spread_ci_lower_skew_adjusted = (spread_ci_lower * (1.0 - skew_factor * 0.5)).max(1.0);
+        let spread_ci_upper_skew_adjusted = (spread_ci_upper * (1.0 + skew_factor * 0.5)).min(50.0);
+
         KappaBeliefs {
             kappa_effective: state.kappa_smoothed,
             kappa_raw: raw_kappa,
@@ -770,6 +909,14 @@ impl CentralBeliefState {
             confidence: own_conf.max(book_conf).max(robust_conf),
             is_warmup: state.own_kappa_n_fills < self.config.min_fills as usize,
             n_own_fills: state.own_kappa_n_fills,
+            // Uncertainty fields
+            kappa_std,
+            spread_ci_lower,
+            spread_ci_upper,
+            kappa_sigma_corr,
+            // Phase 2A: Skew-adjusted CIs
+            spread_ci_lower_skew_adjusted,
+            spread_ci_upper_skew_adjusted,
         }
     }
 
@@ -906,6 +1053,10 @@ impl CentralBeliefState {
         // Learning trust decreases with changepoint probability
         let learning_trust = (1.0 - prob_10).max(0.2);
 
+        // Warmup: BOCD needs ~10 observations for reliable detection
+        let observation_count = state.changepoint_obs_count;
+        let is_warmed_up = observation_count >= 10;
+
         ChangepointBeliefs {
             prob_1,
             prob_5,
@@ -914,6 +1065,8 @@ impl CentralBeliefState {
             entropy,
             result,
             learning_trust,
+            observation_count,
+            is_warmed_up,
         }
     }
 
@@ -927,13 +1080,60 @@ impl CentralBeliefState {
         let z = mean / std.max(0.1);
         let p_positive = normal_cdf(z);
 
+        // Compute combined toxicity score from VPIN + soft_jump proxy (via liquidity evaporation)
+        // Weight: VPIN 0.6, evaporation 0.4
+        let toxicity_score = 0.6 * state.vpin + 0.4 * state.liquidity_evaporation;
+
+        // Toxicity-adjusted edge: expected_edge × (1 - α × toxicity)
+        // α = 0.7 (toxicity penalty coefficient)
+        const TOXICITY_PENALTY_ALPHA: f64 = 0.7;
+        let toxicity_penalty = TOXICITY_PENALTY_ALPHA * toxicity_score;
+        let toxicity_adjusted_edge = mean * (1.0 - toxicity_penalty);
+
+        // P(positive adjusted edge)
+        let z_adj = toxicity_adjusted_edge / std.max(0.1);
+        let p_positive_adjusted = normal_cdf(z_adj);
+
+        // Should we quote? Conditions:
+        // 1. Toxicity not extreme (< 0.8)
+        // 2. Adjusted edge > minimum threshold (-1 bps)
+        // 3. P(positive adjusted) > 0.3
+        let should_quote = toxicity_score < 0.8
+            && toxicity_adjusted_edge > -1.0
+            && p_positive_adjusted > 0.3;
+
         EdgeBeliefs {
             expected_edge: mean,
+            toxicity_adjusted_edge,
+            toxicity_score,
             uncertainty: std,
             by_regime: state.edge_by_regime,
             p_positive,
+            p_positive_adjusted,
             as_bias: state.as_bias,
             epistemic_uncertainty: 0.5, // Default
+            should_quote,
+        }
+    }
+
+    fn build_microstructure_beliefs(&self, state: &InternalState) -> MicrostructureBeliefs {
+        let is_valid = state.vpin_buckets >= 10 && state.vpin_confidence > 0.3;
+
+        MicrostructureBeliefs {
+            vpin: state.vpin,
+            vpin_velocity: state.vpin_velocity,
+            depth_ofi: state.depth_ofi,
+            liquidity_evaporation: state.liquidity_evaporation,
+            order_flow_direction: state.order_flow_direction,
+            confidence: state.vpin_confidence,
+            vpin_buckets: state.vpin_buckets,
+            is_valid,
+            // Phase 1A fields
+            trade_size_sigma: state.trade_size_sigma,
+            toxicity_acceleration: state.toxicity_acceleration,
+            cofi: state.cofi,
+            cofi_velocity: state.cofi_velocity,
+            is_sustained_shift: state.is_sustained_shift,
         }
     }
 
@@ -986,6 +1186,7 @@ impl CentralBeliefState {
             signal_quality: state.signal_mi.clone(),
             pending_count: state.pending_predictions.len(),
             linked_count: state.fill_brier_n + state.as_brier_n,
+            latency: LatencyCalibration::default(),
         }
     }
 

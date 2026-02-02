@@ -34,6 +34,7 @@ use super::calibrated_edge::{BayesianDecision, CalibratedEdgeSignal};
 use super::changepoint::MarketRegime;
 use super::position_pnl_tracker::PositionPnLTracker;
 use super::theoretical_edge::TheoreticalEdgeEstimator;
+use crate::market_maker::belief::BeliefSnapshot;
 
 /// Quote decision from the Quote Gate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -406,6 +407,173 @@ pub struct QuoteGateInput {
     /// Higher regimes → faster quota recharge via fills → lower shadow price.
     /// Default: 1 (normal)
     pub vol_regime: u8,
+
+    // === Phase 6: Centralized Belief Snapshot ===
+    /// Direct access to centralized belief state for unified decision making.
+    /// When Some, provides:
+    /// - `beliefs.drift_vol` for drift/volatility posteriors
+    /// - `beliefs.kappa` for fill intensity beliefs
+    /// - `beliefs.regime` for market regime state
+    /// - `beliefs.changepoint` for BOCD state
+    /// - `beliefs.continuation` for position continuation beliefs
+    /// - `beliefs.calibration` for model quality metrics
+    pub beliefs: Option<BeliefSnapshot>,
+}
+
+impl QuoteGateInput {
+    // === Phase 6: Unified belief accessors ===
+    // These methods prefer centralized beliefs when available, falling back to input fields.
+
+    /// Get effective sigma (volatility) from beliefs or input field.
+    pub fn effective_sigma(&self) -> f64 {
+        if let Some(ref beliefs) = self.beliefs {
+            if beliefs.is_warmed_up() && beliefs.drift_vol.expected_sigma > 0.0 {
+                return beliefs.drift_vol.expected_sigma;
+            }
+        }
+        self.sigma
+    }
+
+    /// Get effective kappa (fill intensity) from beliefs or input field.
+    pub fn effective_kappa(&self) -> f64 {
+        if let Some(ref beliefs) = self.beliefs {
+            if beliefs.is_warmed_up() && beliefs.kappa.kappa_effective > 0.0 {
+                return beliefs.kappa.kappa_effective;
+            }
+        }
+        self.kappa_effective
+    }
+
+    /// Get overall belief confidence [0, 1].
+    pub fn belief_confidence(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.overall_confidence())
+            .unwrap_or(0.0)
+    }
+
+    /// Get drift confidence from beliefs.
+    pub fn drift_confidence(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.drift_vol.confidence)
+            .unwrap_or(0.0)
+    }
+
+    /// Get kappa confidence from beliefs.
+    pub fn kappa_confidence(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.kappa.confidence)
+            .unwrap_or(0.0)
+    }
+
+    /// Get regime confidence from beliefs.
+    pub fn regime_confidence(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.regime.confidence)
+            .unwrap_or(0.0)
+    }
+
+    /// Get continuation probability from beliefs.
+    pub fn continuation_probability(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.continuation.p_fused)
+            .unwrap_or(0.5)
+    }
+
+    /// Get changepoint probability (5-obs window) from beliefs.
+    pub fn changepoint_probability(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.changepoint.prob_5)
+            .unwrap_or(0.0)
+    }
+
+    /// Check if beliefs indicate a changepoint is pending/confirmed.
+    pub fn changepoint_detected(&self) -> bool {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.changepoint.result.is_detected())
+            .unwrap_or(false)
+    }
+
+    /// Get learning trust factor from changepoint beliefs.
+    /// Lower when changepoint is likely (stale model).
+    pub fn learning_trust(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.changepoint.learning_trust)
+            .unwrap_or(1.0)
+    }
+
+    /// Check if belief system is warmed up.
+    pub fn beliefs_warmed_up(&self) -> bool {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.is_warmed_up())
+            .unwrap_or(false)
+    }
+
+    /// Get expected edge from beliefs (bps).
+    pub fn expected_edge_bps(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.edge.expected_edge)
+            .unwrap_or(0.0)
+    }
+
+    /// Get probability of positive edge from beliefs.
+    pub fn prob_positive_edge(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.edge.p_positive)
+            .unwrap_or(0.5)
+    }
+
+    /// Get fill prediction information ratio from beliefs.
+    pub fn fill_ir(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.calibration.fill.information_ratio)
+            .unwrap_or(0.0)
+    }
+
+    /// Get adverse selection information ratio from beliefs.
+    pub fn as_ir(&self) -> f64 {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.calibration.adverse_selection.information_ratio)
+            .unwrap_or(0.0)
+    }
+
+    /// Check if fill model adds value (IR > 1.0 with enough samples).
+    pub fn fill_model_calibrated(&self) -> bool {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.calibration.fill.adds_value())
+            .unwrap_or(false)
+    }
+
+    /// Check if AS model adds value (IR > 1.0 with enough samples).
+    pub fn as_model_calibrated(&self) -> bool {
+        self.beliefs
+            .as_ref()
+            .map(|b| b.calibration.adverse_selection.adds_value())
+            .unwrap_or(false)
+    }
+
+    /// Get current regime from beliefs.
+    pub fn current_regime(&self) -> Option<crate::market_maker::belief::Regime> {
+        self.beliefs.as_ref().map(|b| b.regime.current)
+    }
+
+    /// Get regime probabilities from beliefs.
+    pub fn regime_probs(&self) -> Option<[f64; 4]> {
+        self.beliefs.as_ref().map(|b| b.regime.probs)
+    }
 }
 
 impl Default for QuoteGateInput {
@@ -451,6 +619,8 @@ impl Default for QuoteGateInput {
             // Phase 9: Rate Limit Shadow Price defaults
             rate_limit_headroom_pct: 1.0,     // Full budget available
             vol_regime: 1,                    // Normal volatility
+            // Phase 6: Centralized Belief Snapshot
+            beliefs: None,
         }
     }
 }

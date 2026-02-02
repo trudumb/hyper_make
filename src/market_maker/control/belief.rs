@@ -7,10 +7,30 @@
 use super::interface::{GaussianEstimate, LearningModuleOutput, ModelPrediction};
 use super::types::{DirichletPosterior, GammaPosterior, NormalGammaPosterior};
 
-/// Complete belief state for the stochastic controller.
+/// Complete belief state for the stochastic controller (Layer 3).
 ///
-/// Wraps Layer 2 outputs in proper Bayesian form and maintains
-/// sufficient statistics for sequential updates.
+/// # Purpose
+///
+/// This struct tracks **model ensemble weights** and **fill rate beliefs** for
+/// the adaptive learning system. It is used by `AdaptiveEnsemble` for model
+/// selection and weighting.
+///
+/// # Distinction from CentralBeliefState
+///
+/// This is **NOT** the same as `belief::CentralBeliefState` which tracks:
+/// - Market beliefs (drift, volatility, regime)
+/// - Fill intensity (kappa)
+/// - Changepoint detection (BOCD)
+/// - Continuation probability
+///
+/// This struct tracks:
+/// - Fill rate lambda (Gamma posterior)
+/// - Adverse selection distribution
+/// - Model ensemble weights (Dirichlet posterior)
+/// - Edge estimates by regime
+///
+/// The two systems are complementary - this one for model selection,
+/// `CentralBeliefState` for market state estimation.
 #[derive(Debug, Clone)]
 pub struct BeliefState {
     // === Fill rate belief ===

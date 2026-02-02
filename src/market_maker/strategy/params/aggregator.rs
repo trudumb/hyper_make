@@ -9,6 +9,7 @@ use crate::market_maker::process_models::{
     DriftAdjustedSkew, FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,
     LiquidationCascadeDetector, SpreadProcessEstimator,
 };
+use crate::market_maker::belief::BeliefSnapshot;
 use crate::market_maker::stochastic::StochasticControlBuilder;
 
 use super::super::MarketParams;
@@ -85,10 +86,16 @@ pub struct ParameterSources<'a> {
     /// Whether to use dynamic spread ceiling (true if no CLI override).
     pub use_dynamic_spread_ceiling: bool,
 
-    // First-principles belief system
+    // First-principles belief system (DEPRECATED - Phase 7)
+    /// DEPRECATED: Use `beliefs` field instead. This field is retained for
+    /// fallback when beliefs is None, but beliefs_builder is no longer updated.
     /// Reference to beliefs_builder for Bayesian posterior-derived values.
-    /// Provides E[μ | data] (predictive_bias) and E[σ | data] for HJB optimization.
     pub beliefs_builder: &'a StochasticControlBuilder,
+
+    // === Centralized Belief State (Phase 5) ===
+    /// Centralized belief snapshot for unified parameter access.
+    /// When Some, these values are preferred over scattered sources.
+    pub beliefs: Option<&'a BeliefSnapshot>,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -455,8 +462,17 @@ impl ParameterAggregator {
 
             // === New Latent State Estimators (Phases 2-7) ===
             // Particle Filter Volatility (Phase 2)
-            sigma_particle: est.sigma_particle_filter(),
-            regime_probs: est.regime_probabilities(),
+            // Phase 5: Use centralized beliefs when available
+            sigma_particle: if let Some(beliefs) = sources.beliefs {
+                beliefs.drift_vol.expected_sigma
+            } else {
+                est.sigma_particle_filter()
+            },
+            regime_probs: if let Some(beliefs) = sources.beliefs {
+                beliefs.regime.probs
+            } else {
+                est.regime_probabilities()
+            },
 
             // Informed Flow Model (Phase 3)
             p_informed: est.p_informed(),
@@ -503,7 +519,12 @@ impl ParameterAggregator {
             // === Bayesian Gamma Components (Alpha Plan) ===
             // These are populated from QuoteGate and TheoreticalEdgeEstimator
             // Default to neutral values; actual values populated in quote_engine.rs
-            trend_confidence: 0.5,        // 50% initially (uncertain)
+            // Phase 5: Use centralized beliefs when available
+            trend_confidence: if let Some(beliefs) = sources.beliefs {
+                beliefs.continuation.signal_summary.trend_confidence
+            } else {
+                0.5 // 50% initially (uncertain)
+            },
             bootstrap_confidence: 0.0,    // Not calibrated initially
             adverse_uncertainty: 0.1,     // Moderate uncertainty
             adverse_regime: 1,            // Normal regime
@@ -513,31 +534,65 @@ impl ParameterAggregator {
             rate_limit_headroom_pct: 1.0, // Full budget available by default, updated by caller
 
             // === Predictive Bias (A-S Extension) ===
-            changepoint_prob: 0.0,        // Populated from stochastic controller in quote_engine
+            // Phase 5: Use centralized beliefs when available
+            changepoint_prob: if let Some(beliefs) = sources.beliefs {
+                beliefs.changepoint.prob_5
+            } else {
+                0.0 // Populated from stochastic controller in quote_engine
+            },
             spread_widening_mult: 1.0,    // Populated from QuoteGate when pending confirmation
 
             // === First-Principles Stochastic Control (Belief System) ===
-            // Read from Bayesian posterior over (μ, σ², κ) instead of hardcoding
-            belief_predictive_bias: sources.beliefs_builder.predictive_bias(),
+            // Phase 7: Centralized beliefs are the single source of truth.
+            // Fallbacks to beliefs_builder are DEPRECATED and only for safety.
+            belief_predictive_bias: if let Some(beliefs) = sources.beliefs {
+                beliefs.drift_vol.expected_drift
+            } else {
+                // DEPRECATED: beliefs_builder is no longer updated
+                sources.beliefs_builder.predictive_bias()
+            },
             belief_expected_sigma: {
-                let belief_sigma = sources.beliefs_builder.expected_sigma();
-                // Use belief sigma if warmed up, else fall back to estimator
-                if sources.beliefs_builder.is_warmed_up() && belief_sigma > 0.0 {
-                    belief_sigma
+                // Phase 7: Centralized beliefs are primary
+                if let Some(beliefs) = sources.beliefs {
+                    if beliefs.is_warmed_up() && beliefs.drift_vol.expected_sigma > 0.0 {
+                        beliefs.drift_vol.expected_sigma
+                    } else {
+                        est.sigma_clean()
+                    }
                 } else {
-                    est.sigma_clean()
+                    // DEPRECATED fallback: beliefs_builder is no longer updated
+                    let belief_sigma = sources.beliefs_builder.expected_sigma();
+                    if sources.beliefs_builder.is_warmed_up() && belief_sigma > 0.0 {
+                        belief_sigma
+                    } else {
+                        est.sigma_clean()
+                    }
                 }
             },
             belief_expected_kappa: {
-                let belief_kappa = sources.beliefs_builder.expected_kappa();
-                // Use belief kappa if warmed up, else fall back to estimator
-                if sources.beliefs_builder.is_warmed_up() && belief_kappa > 0.0 {
-                    belief_kappa
+                // Phase 7: Centralized beliefs are primary
+                if let Some(beliefs) = sources.beliefs {
+                    if beliefs.is_warmed_up() && beliefs.kappa.kappa_effective > 0.0 {
+                        beliefs.kappa.kappa_effective
+                    } else {
+                        est.kappa()
+                    }
                 } else {
-                    est.kappa()
+                    // DEPRECATED fallback: beliefs_builder is no longer updated
+                    let belief_kappa = sources.beliefs_builder.expected_kappa();
+                    if sources.beliefs_builder.is_warmed_up() && belief_kappa > 0.0 {
+                        belief_kappa
+                    } else {
+                        est.kappa()
+                    }
                 }
             },
-            belief_confidence: sources.beliefs_builder.beliefs().overall_confidence(),
+            belief_confidence: if let Some(beliefs) = sources.beliefs {
+                beliefs.overall_confidence()
+            } else {
+                // DEPRECATED fallback: beliefs_builder is no longer updated
+                sources.beliefs_builder.beliefs().overall_confidence()
+            },
             use_belief_system: sources.beliefs_builder.config().enable_belief_system,
             // Position direction confidence - will be computed in RiskFeatures::from_params
             // using the fields above (belief_predictive_bias, belief_confidence, flow_imbalance)
@@ -547,9 +602,18 @@ impl ParameterAggregator {
             // === Position Continuation Model (HOLD/ADD/REDUCE) ===
             // Defaults populated here; actual values computed in quote_engine.rs
             // from PositionDecisionEngine.decide() based on fills and regime
+            // Phase 5: Use centralized beliefs when available
             position_action: super::super::PositionAction::default(),
-            continuation_p: 0.5,           // Default 50% continuation (uninformed prior)
-            continuation_confidence: 0.0,  // Default no confidence (will be computed)
+            continuation_p: if let Some(beliefs) = sources.beliefs {
+                beliefs.continuation.p_fused
+            } else {
+                0.5 // Default 50% continuation (uninformed prior)
+            },
+            continuation_confidence: if let Some(beliefs) = sources.beliefs {
+                beliefs.continuation.confidence_fused
+            } else {
+                0.0 // Default no confidence (will be computed)
+            },
             effective_inventory_ratio: 0.0, // Default no transformation (computed from position_action)
         }
     }

@@ -44,6 +44,10 @@ pub struct BeliefSnapshot {
     /// Trading edge beliefs
     pub edge: EdgeBeliefs,
 
+    // === Microstructure (Phase 1: Alpha-generating) ===
+    /// Microstructure-based toxicity signals
+    pub microstructure: MicrostructureBeliefs,
+
     // === Calibration ===
     /// Model calibration metrics
     pub calibration: CalibrationState,
@@ -62,6 +66,7 @@ impl Default for BeliefSnapshot {
             regime: RegimeBeliefs::default(),
             changepoint: ChangepointBeliefs::default(),
             edge: EdgeBeliefs::default(),
+            microstructure: MicrostructureBeliefs::default(),
             calibration: CalibrationState::default(),
             stats: BeliefStats::default(),
         }
@@ -149,6 +154,26 @@ pub struct DriftVolatilityBeliefs {
 
     /// Number of price observations
     pub n_observations: u64,
+
+    // === Fat-Tail Skewness Fields (Phase 2A: Statistical Refinements) ===
+
+    /// Skewness of the sigma posterior distribution.
+    ///
+    /// Positive = right-skewed (vol spike risk).
+    /// Typical values: 0.5 to 2.0 for vol processes.
+    /// Use for asymmetric spread adjustment.
+    pub sigma_skewness: f64,
+
+    /// Excess kurtosis of sigma posterior (fat tails indicator).
+    ///
+    /// 0 = Gaussian, >0 = fat tails.
+    /// High kurtosis means extreme moves more likely than Gaussian predicts.
+    pub sigma_kurtosis: f64,
+
+    /// Skewness of drift belief distribution.
+    ///
+    /// Asymmetry in drift belief; affects directional confidence.
+    pub drift_skewness: f64,
 }
 
 impl Default for DriftVolatilityBeliefs {
@@ -161,11 +186,66 @@ impl Default for DriftVolatilityBeliefs {
             prob_bullish: 0.5,
             confidence: 0.0,
             n_observations: 0,
+            // Phase 2A: Fat-tail skewness (neutral defaults)
+            sigma_skewness: 0.5,   // Slight positive (typical for vol)
+            sigma_kurtosis: 0.0,   // Gaussian
+            drift_skewness: 0.0,   // Symmetric
         }
     }
 }
 
+impl DriftVolatilityBeliefs {
+    /// Check if vol spike risk is elevated based on skewness.
+    ///
+    /// Returns true if sigma_skewness > 1.0 (right-skewed distribution).
+    /// When true, consider widening spreads asymmetrically.
+    pub fn has_vol_spike_risk(&self) -> bool {
+        self.sigma_skewness > 1.0
+    }
+
+    /// Check if distribution has fat tails.
+    ///
+    /// Returns true if sigma_kurtosis > 3.0 (excess kurtosis).
+    /// Fat tails mean extreme moves are more likely than Gaussian predicts.
+    pub fn has_fat_tails(&self) -> bool {
+        self.sigma_kurtosis > 3.0
+    }
+
+    /// Get asymmetric spread adjustment factor for bid side.
+    ///
+    /// When sigma is right-skewed (vol spike risk), tighten bid spread.
+    /// Returns a multiplier in [0.8, 1.0].
+    pub fn bid_spread_factor(&self, sensitivity: f64) -> f64 {
+        let skew_factor = (self.sigma_skewness * sensitivity).tanh();
+        (1.0 - skew_factor * 0.1).clamp(0.8, 1.0)
+    }
+
+    /// Get asymmetric spread adjustment factor for ask side.
+    ///
+    /// When sigma is right-skewed (vol spike risk), widen ask spread.
+    /// Returns a multiplier in [1.0, 1.2].
+    pub fn ask_spread_factor(&self, sensitivity: f64) -> f64 {
+        let skew_factor = (self.sigma_skewness * sensitivity).tanh();
+        (1.0 + skew_factor * 0.1).clamp(1.0, 1.2)
+    }
+
+    /// Get a "tail risk" score [0, 1] combining skewness and kurtosis.
+    ///
+    /// Higher values indicate more extreme event risk.
+    pub fn tail_risk_score(&self) -> f64 {
+        let skew_contrib = (self.sigma_skewness / 2.0).min(1.0);
+        let kurt_contrib = (self.sigma_kurtosis / 6.0).min(1.0);
+        (0.6 * skew_contrib + 0.4 * kurt_contrib).clamp(0.0, 1.0)
+    }
+}
+
 /// Fill intensity (kappa) beliefs from confidence-weighted blending.
+///
+/// ## Uncertainty Propagation (Phase 2)
+///
+/// Includes posterior uncertainty for kappa and derived spread confidence
+/// intervals. Use `spread_ci_lower` and `spread_ci_upper` to assess the
+/// range of plausible optimal spreads.
 #[derive(Debug, Clone)]
 pub struct KappaBeliefs {
     /// EWMA-smoothed effective kappa
@@ -185,6 +265,45 @@ pub struct KappaBeliefs {
 
     /// Number of own fills observed
     pub n_own_fills: usize,
+
+    // === Uncertainty Fields (Phase 2: Alpha-generating) ===
+
+    /// Standard deviation of kappa posterior.
+    ///
+    /// Higher values indicate more uncertainty in fill intensity.
+    /// Use for spread widening when uncertain.
+    pub kappa_std: f64,
+
+    /// Lower bound of 95% CI for optimal spread (bps).
+    ///
+    /// Derived from joint (κ, σ) uncertainty using delta method.
+    pub spread_ci_lower: f64,
+
+    /// Upper bound of 95% CI for optimal spread (bps).
+    ///
+    /// When uncertain, quote at `spread_ci_upper` for safety.
+    pub spread_ci_upper: f64,
+
+    /// Correlation between kappa and sigma.
+    ///
+    /// Negative correlation (typical) means spread widening during vol.
+    /// Use for covariance-aware spread calculation.
+    pub kappa_sigma_corr: f64,
+
+    // === Skew-Adjusted CIs (Phase 2A: Statistical Refinements) ===
+
+    /// Skew-adjusted lower bound of spread CI.
+    ///
+    /// Tighter than spread_ci_lower when sigma is left-skewed (vol drop likely).
+    /// Adjustment: lower × (1 - σ_skew × skew_sensitivity) for positive skew.
+    pub spread_ci_lower_skew_adjusted: f64,
+
+    /// Skew-adjusted upper bound of spread CI.
+    ///
+    /// Wider than spread_ci_upper when sigma is right-skewed (vol spike likely).
+    /// This is the DEFENSIVE bound - quote here when vol spike risk is high.
+    /// Adjustment: upper × (1 + σ_skew × skew_sensitivity) for positive skew.
+    pub spread_ci_upper_skew_adjusted: f64,
 }
 
 impl Default for KappaBeliefs {
@@ -196,7 +315,95 @@ impl Default for KappaBeliefs {
             confidence: 0.0,
             is_warmup: true,
             n_own_fills: 0,
+            // Uncertainty defaults
+            kappa_std: 500.0, // High uncertainty initially
+            spread_ci_lower: 3.0, // ~3 bps min
+            spread_ci_upper: 10.0, // ~10 bps max
+            kappa_sigma_corr: 0.0, // Unknown correlation
+            // Phase 2A: Skew-adjusted CIs (default = same as base CI)
+            spread_ci_lower_skew_adjusted: 3.0,
+            spread_ci_upper_skew_adjusted: 10.0,
         }
+    }
+}
+
+impl KappaBeliefs {
+    /// Get spread uncertainty (half-width of CI in bps).
+    pub fn spread_uncertainty(&self) -> f64 {
+        (self.spread_ci_upper - self.spread_ci_lower) / 2.0
+    }
+
+    /// Get recommended spread adjustment factor for uncertainty.
+    ///
+    /// When uncertainty is high, this returns > 1.0 to widen spreads.
+    /// Formula: 1.0 + uncertainty_scale × (spread_uncertainty / base_spread)
+    pub fn uncertainty_adjustment(&self, base_spread_bps: f64, uncertainty_scale: f64) -> f64 {
+        if base_spread_bps < 1e-6 {
+            return 1.0;
+        }
+        let relative_uncertainty = self.spread_uncertainty() / base_spread_bps;
+        1.0 + uncertainty_scale * relative_uncertainty.min(1.0)
+    }
+
+    /// Get coefficient of variation for kappa (CV = σ/μ).
+    ///
+    /// CV > 0.5 indicates high uncertainty, consider widening.
+    pub fn kappa_cv(&self) -> f64 {
+        if self.kappa_effective < 1e-6 {
+            return 1.0;
+        }
+        self.kappa_std / self.kappa_effective
+    }
+
+    // === Skew-Adjusted CI Methods (Phase 2A) ===
+
+    /// Get skew-adjusted spread uncertainty.
+    ///
+    /// This is the half-width of the asymmetric CI.
+    pub fn skew_adjusted_spread_uncertainty(&self) -> f64 {
+        (self.spread_ci_upper_skew_adjusted - self.spread_ci_lower_skew_adjusted) / 2.0
+    }
+
+    /// Get the defensive spread (upper skew-adjusted CI).
+    ///
+    /// Use this spread when vol spike risk is elevated.
+    /// This is wider than the base CI upper bound.
+    pub fn defensive_spread(&self) -> f64 {
+        self.spread_ci_upper_skew_adjusted
+    }
+
+    /// Get the aggressive spread (lower skew-adjusted CI).
+    ///
+    /// Use this spread when vol is expected to drop.
+    /// This is tighter than the base CI lower bound.
+    pub fn aggressive_spread(&self) -> f64 {
+        self.spread_ci_lower_skew_adjusted
+    }
+
+    /// Check if skew adjustment is significant.
+    ///
+    /// Returns true if skew-adjusted CI differs from base CI by > 10%.
+    pub fn is_skew_significant(&self) -> bool {
+        let upper_diff = (self.spread_ci_upper_skew_adjusted - self.spread_ci_upper).abs();
+        let lower_diff = (self.spread_ci_lower_skew_adjusted - self.spread_ci_lower).abs();
+
+        let base_width = self.spread_ci_upper - self.spread_ci_lower;
+        if base_width < 0.1 {
+            return false;
+        }
+
+        (upper_diff / base_width > 0.1) || (lower_diff / base_width > 0.1)
+    }
+
+    /// Get recommended spread given vol spike risk level.
+    ///
+    /// - `vol_risk = 0.0` → use aggressive (lower) spread
+    /// - `vol_risk = 0.5` → use midpoint
+    /// - `vol_risk = 1.0` → use defensive (upper) spread
+    pub fn recommended_spread(&self, vol_risk: f64) -> f64 {
+        let vol_risk = vol_risk.clamp(0.0, 1.0);
+        self.spread_ci_lower_skew_adjusted
+            + vol_risk * (self.spread_ci_upper_skew_adjusted - self.spread_ci_lower_skew_adjusted)
     }
 }
 
@@ -322,6 +529,13 @@ pub struct ChangepointBeliefs {
     /// Trust factor for learning module [0, 1]
     /// Lower when changepoint is likely (stale model)
     pub learning_trust: f64,
+
+    /// Number of changepoint observations processed
+    pub observation_count: usize,
+
+    /// Whether BOCD has enough observations for reliable detection
+    /// (typically requires ~10 observations to avoid false positives)
+    pub is_warmed_up: bool,
 }
 
 impl Default for ChangepointBeliefs {
@@ -334,6 +548,8 @@ impl Default for ChangepointBeliefs {
             entropy: 2.0,
             result: ChangepointResult::None,
             learning_trust: 1.0,
+            observation_count: 0,
+            is_warmed_up: false,
         }
     }
 }
@@ -363,10 +579,33 @@ impl ChangepointResult {
 }
 
 /// Trading edge beliefs.
+///
+/// ## Toxicity Adjustment (Phase 3: Medium Alpha)
+///
+/// The `toxicity_adjusted_edge` field accounts for informed trader probability,
+/// providing a more realistic edge estimate during toxic flow periods.
+///
+/// Formula: `toxicity_adjusted_edge = expected_edge × (1 - α × toxicity_score)`
+///
+/// where:
+/// - `α` = toxicity penalty coefficient (typically 0.5-0.8)
+/// - `toxicity_score` = combined VPIN + soft_jump toxicity [0, 1]
 #[derive(Debug, Clone)]
 pub struct EdgeBeliefs {
-    /// Expected edge (bps)
+    /// Expected edge (bps) - raw estimate
     pub expected_edge: f64,
+
+    /// Toxicity-adjusted edge (bps).
+    ///
+    /// This is the edge estimate after accounting for informed flow.
+    /// Use this for actual quoting decisions.
+    pub toxicity_adjusted_edge: f64,
+
+    /// Combined toxicity score [0, 1].
+    ///
+    /// Fuses VPIN and soft_jump toxicity for robust detection.
+    /// Higher values = more informed flow = lower effective edge.
+    pub toxicity_score: f64,
 
     /// Uncertainty in edge estimate (bps)
     pub uncertainty: f64,
@@ -377,23 +616,253 @@ pub struct EdgeBeliefs {
     /// Probability of positive edge
     pub p_positive: f64,
 
+    /// Probability of positive toxicity-adjusted edge
+    pub p_positive_adjusted: f64,
+
     /// Adverse selection bias correction
     pub as_bias: f64,
 
     /// Epistemic uncertainty (model disagreement)
     pub epistemic_uncertainty: f64,
+
+    /// Should we quote? Based on toxicity-adjusted edge.
+    ///
+    /// False when toxicity is too high or edge is negative.
+    pub should_quote: bool,
 }
 
 impl Default for EdgeBeliefs {
     fn default() -> Self {
         Self {
             expected_edge: 0.0,
+            toxicity_adjusted_edge: 0.0,
+            toxicity_score: 0.0,
             uncertainty: 2.0, // 2 bps uncertainty
             by_regime: [1.0, 0.5, -0.5], // Positive in calm, negative in volatile
             p_positive: 0.5,
+            p_positive_adjusted: 0.5,
             as_bias: 0.0,
             epistemic_uncertainty: 0.5,
+            should_quote: true,
         }
+    }
+}
+
+impl EdgeBeliefs {
+    /// Get the recommended edge for quoting (toxicity-adjusted).
+    pub fn effective_edge(&self) -> f64 {
+        self.toxicity_adjusted_edge
+    }
+
+    /// Get toxicity penalty factor [0, 1].
+    ///
+    /// 0 = full edge retained, 1 = no edge (fully toxic)
+    pub fn toxicity_penalty(&self) -> f64 {
+        self.toxicity_score
+    }
+
+    /// Check if edge is profitable after toxicity adjustment.
+    pub fn is_profitable(&self) -> bool {
+        self.toxicity_adjusted_edge > 0.0
+    }
+
+    /// Get conservative edge (lower bound of CI).
+    ///
+    /// Use when uncertain and want to be defensive.
+    pub fn conservative_edge(&self) -> f64 {
+        self.toxicity_adjusted_edge - 1.96 * self.uncertainty
+    }
+
+    /// Compute expected PnL per trade (in bps).
+    ///
+    /// Accounts for toxicity and adverse selection.
+    pub fn expected_pnl_bps(&self) -> f64 {
+        self.toxicity_adjusted_edge - self.as_bias
+    }
+}
+
+// =============================================================================
+// Microstructure Beliefs (Phase 1: Alpha-Generating)
+// =============================================================================
+
+/// Microstructure-based toxicity and flow signals.
+///
+/// These signals provide real-time estimates of order flow toxicity
+/// and market quality. They are leading indicators of adverse selection.
+///
+/// ## Key Signals
+///
+/// - **VPIN**: Volume-synchronized probability of informed trading
+/// - **Depth OFI**: Depth-weighted order flow imbalance
+/// - **Liquidity Evaporation**: Rapid depth drops near the touch
+///
+/// ## Usage
+///
+/// ```ignore
+/// let beliefs = belief_state.snapshot();
+///
+/// // Use VPIN for toxicity assessment
+/// if beliefs.microstructure.vpin > 0.7 {
+///     // High informed flow - widen spreads
+/// }
+///
+/// // Use liquidity evaporation for defense
+/// if beliefs.microstructure.liquidity_evaporation > 0.5 {
+///     // Book thinning - reduce position
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct MicrostructureBeliefs {
+    /// VPIN: Volume-synchronized probability of informed trading [0, 1].
+    ///
+    /// Higher values indicate more toxic (informed) flow.
+    /// - < 0.3: Safe, noise-dominated market
+    /// - 0.3-0.5: Normal
+    /// - 0.5-0.7: Elevated toxicity
+    /// - > 0.7: Dangerous, likely informed flow
+    pub vpin: f64,
+
+    /// VPIN velocity (rate of change).
+    ///
+    /// Positive = toxicity increasing (danger).
+    /// Negative = toxicity decreasing (improving).
+    pub vpin_velocity: f64,
+
+    /// Depth-weighted order flow imbalance [-1, 1].
+    ///
+    /// Unlike simple OFI, this weights levels by distance from mid.
+    /// Positive = buying pressure, Negative = selling pressure.
+    pub depth_ofi: f64,
+
+    /// Liquidity evaporation score [0, 1].
+    ///
+    /// Measures how much near-touch depth has dropped from recent peak.
+    /// High values indicate market makers pulling quotes (danger signal).
+    pub liquidity_evaporation: f64,
+
+    /// Order flow direction from VPIN buckets [-1, 1].
+    ///
+    /// Signed measure of recent order flow direction.
+    pub order_flow_direction: f64,
+
+    /// Confidence in microstructure estimates [0, 1].
+    ///
+    /// Based on data quantity and quality.
+    pub confidence: f64,
+
+    /// Number of VPIN buckets completed.
+    pub vpin_buckets: usize,
+
+    /// Whether microstructure signals are valid (enough data).
+    pub is_valid: bool,
+
+    // === Phase 1A: Toxic Volume Refinements ===
+    /// Trade size sigma: deviation of current median from baseline.
+    ///
+    /// > 3.0 indicates anomalous trade size regime (potential sweep).
+    pub trade_size_sigma: f64,
+
+    /// Toxicity acceleration factor [1.0, 2.0].
+    ///
+    /// Multiplier for VPIN when trade sizes are anomalous.
+    /// 1.0 = normal, 2.0 = maximum acceleration.
+    pub toxicity_acceleration: f64,
+
+    /// Cumulative OFI with decay [-1, 1].
+    ///
+    /// Distinguishes temporary book flickers from sustained shifts.
+    /// Positive = sustained bid pressure, Negative = sustained ask pressure.
+    pub cofi: f64,
+
+    /// COFI velocity (momentum of the imbalance).
+    pub cofi_velocity: f64,
+
+    /// Whether a sustained supply/demand shift is detected.
+    pub is_sustained_shift: bool,
+}
+
+impl Default for MicrostructureBeliefs {
+    fn default() -> Self {
+        Self {
+            vpin: 0.0,
+            vpin_velocity: 0.0,
+            depth_ofi: 0.0,
+            liquidity_evaporation: 0.0,
+            order_flow_direction: 0.0,
+            confidence: 0.0,
+            vpin_buckets: 0,
+            is_valid: false,
+            // Phase 1A fields
+            trade_size_sigma: 0.0,
+            toxicity_acceleration: 1.0, // No acceleration by default
+            cofi: 0.0,
+            cofi_velocity: 0.0,
+            is_sustained_shift: false,
+        }
+    }
+}
+
+impl MicrostructureBeliefs {
+    /// Check if market is in toxic state.
+    ///
+    /// Combines multiple signals for robust toxicity detection.
+    /// Enhanced with Phase 1A refinements: trade size anomaly and COFI.
+    pub fn is_toxic(&self) -> bool {
+        if !self.is_valid {
+            return false; // Can't assess without data
+        }
+
+        // High VPIN or rapidly increasing VPIN (with toxicity acceleration)
+        let effective_vpin = self.vpin * self.toxicity_acceleration;
+        let vpin_toxic = effective_vpin > 0.6 || (effective_vpin > 0.4 && self.vpin_velocity > 0.1);
+
+        // Significant liquidity evaporation
+        let evaporation_toxic = self.liquidity_evaporation > 0.5;
+
+        // Trade size anomaly (large orders + high VPIN = danger)
+        let size_anomaly_toxic = self.trade_size_sigma > 3.0 && self.vpin > 0.4;
+
+        // Sustained directional shift with high VPIN
+        let shift_toxic = self.is_sustained_shift && self.vpin > 0.5;
+
+        vpin_toxic || evaporation_toxic || size_anomaly_toxic || shift_toxic
+    }
+
+    /// Get combined toxicity score [0, 1].
+    ///
+    /// Weighted combination of all toxicity signals.
+    /// Enhanced with Phase 1A: trade size anomaly and COFI.
+    pub fn toxicity_score(&self) -> f64 {
+        if !self.is_valid {
+            return 0.5; // Uncertain default
+        }
+
+        // Apply toxicity acceleration from trade size anomaly
+        let accelerated_vpin = (self.vpin * self.toxicity_acceleration).min(1.0);
+
+        // Base weights: VPIN (0.4), velocity (0.15), evaporation (0.2)
+        // New weights: trade_size (0.1), COFI magnitude (0.15)
+        let base = 0.4 * accelerated_vpin
+            + 0.15 * (self.vpin_velocity.max(0.0) * 2.0).min(1.0) // Scale velocity to [0, 1]
+            + 0.2 * self.liquidity_evaporation
+            + 0.1 * (self.trade_size_sigma / 5.0).min(1.0) // Normalize sigma to [0, 1]
+            + 0.15 * self.cofi.abs(); // COFI magnitude
+
+        base.clamp(0.0, 1.0)
+    }
+
+    /// Get spread multiplier based on microstructure [1.0, 3.0].
+    ///
+    /// Use to widen spreads when toxicity is elevated.
+    pub fn spread_multiplier(&self) -> f64 {
+        let toxicity = self.toxicity_score();
+        // Linear scaling: toxicity 0 -> 1.0x, toxicity 1 -> 3.0x
+        1.0 + 2.0 * toxicity
+    }
+
+    /// Get effective VPIN with toxicity acceleration.
+    pub fn effective_vpin(&self) -> f64 {
+        (self.vpin * self.toxicity_acceleration).min(1.0)
     }
 }
 
@@ -418,6 +887,86 @@ pub struct CalibrationState {
 
     /// Linked (resolved) predictions
     pub linked_count: usize,
+
+    /// Latency-adjusted calibration metrics (Phase 7.1)
+    pub latency: LatencyCalibration,
+}
+
+/// Latency-adjusted calibration metrics.
+///
+/// Tracks signal value decay and computes IR only for "fresh" predictions.
+/// This helps identify when our processing latency exceeds the signal's alpha duration.
+#[derive(Debug, Clone)]
+pub struct LatencyCalibration {
+    /// VPIN latency-adjusted IR (computed only for fresh signals)
+    pub vpin_latency_adjusted_ir: f64,
+
+    /// Time until VPIN signal value drops below 0.5 (ms)
+    pub vpin_alpha_duration_ms: f64,
+
+    /// Flow signal latency-adjusted IR
+    pub flow_latency_adjusted_ir: f64,
+
+    /// Time until flow signal drops below 0.5 (ms)
+    pub flow_alpha_duration_ms: f64,
+
+    /// Maximum processing time to capture alpha (ms)
+    /// This is the minimum of all signal alpha durations.
+    pub signal_latency_budget_ms: f64,
+
+    /// True if our processing latency exceeds the signal's alpha duration.
+    /// When true, we're providing "free options" to faster participants.
+    pub is_latency_constrained: bool,
+
+    /// Mean latency from signal to quote (ms)
+    pub mean_signal_to_quote_ms: f64,
+
+    /// P95 latency from signal to quote (ms)
+    pub p95_signal_to_quote_ms: f64,
+
+    /// Ratio of fresh_ir to all_ir (>1 = freshness matters)
+    pub ir_degradation_ratio: f64,
+}
+
+impl Default for LatencyCalibration {
+    fn default() -> Self {
+        Self {
+            vpin_latency_adjusted_ir: 0.0,
+            vpin_alpha_duration_ms: 50.0, // Conservative default
+            flow_latency_adjusted_ir: 0.0,
+            flow_alpha_duration_ms: 100.0, // Conservative default
+            signal_latency_budget_ms: 50.0,
+            is_latency_constrained: false,
+            mean_signal_to_quote_ms: 0.0,
+            p95_signal_to_quote_ms: 0.0,
+            ir_degradation_ratio: 1.0,
+        }
+    }
+}
+
+impl LatencyCalibration {
+    /// Check if a specific signal is latency-constrained.
+    pub fn is_signal_constrained(&self, signal_name: &str, processing_latency_ms: f64) -> bool {
+        match signal_name {
+            "vpin" => processing_latency_ms > self.vpin_alpha_duration_ms,
+            "flow" | "ofi" | "cofi" => processing_latency_ms > self.flow_alpha_duration_ms,
+            _ => processing_latency_ms > self.signal_latency_budget_ms,
+        }
+    }
+
+    /// Get alpha duration for a signal.
+    pub fn alpha_duration(&self, signal_name: &str) -> f64 {
+        match signal_name {
+            "vpin" => self.vpin_alpha_duration_ms,
+            "flow" | "ofi" | "cofi" => self.flow_alpha_duration_ms,
+            _ => self.signal_latency_budget_ms,
+        }
+    }
+
+    /// Check if freshness matters (ir_degradation_ratio > 1.2)
+    pub fn freshness_matters(&self) -> bool {
+        self.ir_degradation_ratio > 1.2
+    }
 }
 
 impl Default for CalibrationState {
@@ -428,6 +977,7 @@ impl Default for CalibrationState {
             signal_quality: std::collections::HashMap::new(),
             pending_count: 0,
             linked_count: 0,
+            latency: LatencyCalibration::default(),
         }
     }
 }
@@ -609,5 +1159,133 @@ mod tests {
         // IR > 2.0 → quality capped at 1.0
         metrics.information_ratio = 3.0;
         assert!((metrics.quality_score() - 1.0).abs() < 1e-10);
+    }
+
+    // === Phase 2A: Skewness Tests ===
+
+    #[test]
+    fn test_drift_vol_skewness_defaults() {
+        let dv = DriftVolatilityBeliefs::default();
+
+        // Default: slight positive skewness (typical for vol)
+        assert!((dv.sigma_skewness - 0.5).abs() < 1e-10);
+        assert!((dv.sigma_kurtosis - 0.0).abs() < 1e-10);
+        assert!((dv.drift_skewness - 0.0).abs() < 1e-10);
+
+        // Not elevated at defaults
+        assert!(!dv.has_vol_spike_risk());
+        assert!(!dv.has_fat_tails());
+    }
+
+    #[test]
+    fn test_drift_vol_vol_spike_risk() {
+        let mut dv = DriftVolatilityBeliefs::default();
+
+        // Low skewness: no spike risk
+        dv.sigma_skewness = 0.5;
+        assert!(!dv.has_vol_spike_risk());
+
+        // High skewness: spike risk
+        dv.sigma_skewness = 1.5;
+        assert!(dv.has_vol_spike_risk());
+    }
+
+    #[test]
+    fn test_drift_vol_fat_tails() {
+        let mut dv = DriftVolatilityBeliefs::default();
+
+        // Low kurtosis: no fat tails
+        dv.sigma_kurtosis = 2.0;
+        assert!(!dv.has_fat_tails());
+
+        // High kurtosis: fat tails
+        dv.sigma_kurtosis = 5.0;
+        assert!(dv.has_fat_tails());
+    }
+
+    #[test]
+    fn test_drift_vol_spread_factors() {
+        let mut dv = DriftVolatilityBeliefs::default();
+        let sensitivity = 1.0;
+
+        // Neutral skewness: factors near 1.0
+        dv.sigma_skewness = 0.0;
+        let bid = dv.bid_spread_factor(sensitivity);
+        let ask = dv.ask_spread_factor(sensitivity);
+        assert!((bid - 1.0).abs() < 0.01);
+        assert!((ask - 1.0).abs() < 0.01);
+
+        // High positive skewness: tighter bid, wider ask
+        dv.sigma_skewness = 2.0;
+        let bid_high = dv.bid_spread_factor(sensitivity);
+        let ask_high = dv.ask_spread_factor(sensitivity);
+        assert!(bid_high < 1.0); // Tighter
+        assert!(ask_high > 1.0); // Wider
+    }
+
+    #[test]
+    fn test_drift_vol_tail_risk_score() {
+        let mut dv = DriftVolatilityBeliefs::default();
+
+        // Low skewness and kurtosis: low tail risk
+        dv.sigma_skewness = 0.0;
+        dv.sigma_kurtosis = 0.0;
+        assert!(dv.tail_risk_score() < 0.1);
+
+        // High skewness and kurtosis: high tail risk
+        dv.sigma_skewness = 2.0;
+        dv.sigma_kurtosis = 6.0;
+        assert!(dv.tail_risk_score() > 0.8);
+    }
+
+    #[test]
+    fn test_kappa_skew_adjusted_defaults() {
+        let kappa = KappaBeliefs::default();
+
+        // Default: skew-adjusted CIs equal base CIs
+        assert!((kappa.spread_ci_lower_skew_adjusted - kappa.spread_ci_lower).abs() < 1e-10);
+        assert!((kappa.spread_ci_upper_skew_adjusted - kappa.spread_ci_upper).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_kappa_defensive_aggressive_spread() {
+        let mut kappa = KappaBeliefs::default();
+        kappa.spread_ci_lower_skew_adjusted = 3.0;
+        kappa.spread_ci_upper_skew_adjusted = 12.0;
+
+        assert!((kappa.aggressive_spread() - 3.0).abs() < 1e-10);
+        assert!((kappa.defensive_spread() - 12.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_kappa_recommended_spread() {
+        let mut kappa = KappaBeliefs::default();
+        kappa.spread_ci_lower_skew_adjusted = 4.0;
+        kappa.spread_ci_upper_skew_adjusted = 10.0;
+
+        // vol_risk = 0 → lower bound
+        assert!((kappa.recommended_spread(0.0) - 4.0).abs() < 1e-10);
+
+        // vol_risk = 1 → upper bound
+        assert!((kappa.recommended_spread(1.0) - 10.0).abs() < 1e-10);
+
+        // vol_risk = 0.5 → midpoint
+        assert!((kappa.recommended_spread(0.5) - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_kappa_skew_significant() {
+        let mut kappa = KappaBeliefs::default();
+        kappa.spread_ci_lower = 3.0;
+        kappa.spread_ci_upper = 10.0;
+
+        // Same as base: not significant
+        kappa.spread_ci_lower_skew_adjusted = 3.0;
+        kappa.spread_ci_upper_skew_adjusted = 10.0;
+        assert!(!kappa.is_skew_significant());
+
+        // Large difference: significant
+        kappa.spread_ci_upper_skew_adjusted = 12.0; // 2 bps diff on 7 bps width = 28%
+        assert!(kappa.is_skew_significant());
     }
 }

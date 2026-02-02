@@ -8,6 +8,7 @@ use crate::prelude::Result;
 use crate::Message;
 
 use super::super::{
+    belief::BeliefUpdate,
     estimator::HmmObservation,
     fills, messages, tracking::ws_order_state::WsFillEvent,
     tracking::ws_order_state::WsOrderUpdateEvent, MarketMaker, OrderExecutor, OrderState,
@@ -135,6 +136,88 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Keep bounded
             while self.cached_trades.len() > MAX_CACHED_TRADES {
                 self.cached_trades.pop_front();
+            }
+
+            // Phase 7: Forward market trade to centralized belief state (primary consumer)
+            let trade_price: f64 = trade.px.parse().unwrap_or(0.0);
+            if trade_price > 0.0 {
+                self.central_beliefs.update(BeliefUpdate::MarketTrade {
+                    price: trade_price,
+                    mid: self.latest_mid,
+                    timestamp_ms,
+                });
+            }
+
+            // === Phase 1: Microstructure Signals - VPIN Update ===
+            // Feed trade to VPIN estimator. When a bucket completes, publish MicrostructureUpdate.
+            // VPIN uses tick rule (price vs mid) to classify trades, not explicit is_buy.
+
+            // Phase 1A: Feed trade to size distribution tracker
+            self.stochastic.trade_size_dist.on_trade(size);
+
+            if let Some(_vpin_value) = self.stochastic.vpin.on_trade(size, trade_price, self.latest_mid, timestamp_ms) {
+                // Bucket completed - publish microstructure update to central beliefs
+                let vpin = self.stochastic.vpin.vpin();
+                let vpin_velocity = self.stochastic.vpin.vpin_velocity();
+                let order_flow_direction = self.stochastic.vpin.order_flow_direction();
+                let vpin_buckets = self.stochastic.vpin.bucket_count();
+
+                // Get depth-weighted imbalance from cached book sizes
+                // Note: using imbalance (static snapshot) rather than OFI (delta)
+                // since we don't track previous book state here
+                use crate::market_maker::estimator::BookLevel;
+                let bid_levels: Vec<BookLevel> = self.cached_bid_sizes.iter()
+                    .map(|&sz| BookLevel { size: sz })
+                    .collect();
+                let ask_levels: Vec<BookLevel> = self.cached_ask_sizes.iter()
+                    .map(|&sz| BookLevel { size: sz })
+                    .collect();
+                let depth_ofi = self.stochastic.enhanced_flow.depth_weighted_imbalance(
+                    &bid_levels,
+                    &ask_levels,
+                );
+
+                // Get liquidity evaporation (updated by L2 handler, just read current value)
+                let liquidity_evaporation = self.stochastic.liquidity_evaporation.evaporation_score();
+
+                // Confidence based on bucket count (more buckets = more confidence)
+                let confidence = (vpin_buckets as f64 / 50.0).min(1.0);
+
+                // Phase 1A: Get trade size anomaly metrics
+                let trade_size_sigma = self.stochastic.trade_size_dist.median_sigma();
+                let toxicity_acceleration = self.stochastic.trade_size_dist.toxicity_acceleration(vpin);
+
+                // Phase 1A: Get COFI metrics (updated by L2 handler)
+                let cofi = self.stochastic.cofi.cofi();
+                let cofi_velocity = self.stochastic.cofi.cofi_velocity();
+                let is_sustained_shift = self.stochastic.cofi.is_sustained_shift();
+
+                self.central_beliefs.update(BeliefUpdate::MicrostructureUpdate {
+                    vpin,
+                    vpin_velocity,
+                    depth_ofi,
+                    liquidity_evaporation,
+                    order_flow_direction,
+                    confidence,
+                    vpin_buckets,
+                    // Phase 1A fields
+                    trade_size_sigma,
+                    toxicity_acceleration,
+                    cofi,
+                    cofi_velocity,
+                    is_sustained_shift,
+                });
+
+                trace!(
+                    vpin = %format!("{:.3}", vpin),
+                    vpin_velocity = %format!("{:.4}", vpin_velocity),
+                    depth_ofi = %format!("{:.3}", depth_ofi),
+                    liquidity_evaporation = %format!("{:.3}", liquidity_evaporation),
+                    vpin_buckets = vpin_buckets,
+                    trade_size_sigma = %format!("{:.2}", trade_size_sigma),
+                    cofi = %format!("{:.3}", cofi),
+                    "Microstructure update: VPIN bucket completed"
+                );
             }
         }
 
@@ -338,6 +421,40 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Record fill for calibration controller
                 // This updates fill rate tracking for fill-hungry mode
                 self.stochastic.calibration_controller.record_fill();
+
+                // === V2 INTEGRATION: BOCPD Kappa Relationship Update ===
+                // Update BOCPD with observed features→kappa relationship
+                // This allows BOCPD to detect when relationships break
+                if let Some(features) = self.stochastic.bocpd_kappa_features.take() {
+                    let realized_kappa = self.estimator.kappa();
+                    let changepoint = self.stochastic.bocpd_kappa.update(&features, realized_kappa);
+                    if changepoint {
+                        tracing::debug!(
+                            realized_kappa = %format!("{:.0}", realized_kappa),
+                            "BOCPD: Changepoint detected in kappa relationship"
+                        );
+                    }
+                }
+
+                // DUAL-WRITE (Phase 3): Forward fill to centralized belief state
+                let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
+                let timestamp_ms = fill.time;
+                // Determine if fill is aligned with current position direction
+                let is_aligned = (is_buy && self.position.position() > 0.0)
+                    || (!is_buy && self.position.position() < 0.0);
+                // Realized edge = -realized_as (opposite signs: AS loss = negative edge)
+                let realized_edge_bps = -as_realized * 10000.0;
+                self.central_beliefs.update(BeliefUpdate::OwnFill {
+                    price: fill_price,
+                    size: fill_size,
+                    mid: self.latest_mid,
+                    is_buy,
+                    is_aligned,
+                    realized_as_bps: as_realized * 10000.0,
+                    realized_edge_bps,
+                    timestamp_ms,
+                    order_id: Some(fill.oid),
+                });
 
                 // === Phase 8: RL Agent Learning Update ===
                 // Update Q-values from fill outcome
@@ -588,6 +705,29 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.stochastic
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
+            }
+
+            // === Phase 1: Microstructure Signals - Liquidity Evaporation ===
+            // Feed near-touch depth to evaporation detector
+            // Use top 3 levels on each side as "near touch"
+            {
+                let near_bid_depth: f64 = bids.iter().take(3).map(|(_, sz)| sz).sum();
+                let near_ask_depth: f64 = asks.iter().take(3).map(|(_, sz)| sz).sum();
+                let near_touch_depth = near_bid_depth + near_ask_depth;
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.stochastic.liquidity_evaporation.on_book(near_touch_depth, timestamp_ms);
+
+                // Phase 1A: Update COFI (Cumulative OFI with decay)
+                // We use top-of-book depth as the OFI proxy
+                // Delta = current depth change (we use depth directly since COFI handles decay)
+                // For proper COFI, we'd track previous depths, but this approximation works
+                // by treating current depth as a "flow" signal
+                let bid_delta = near_bid_depth * 0.1; // Scale factor to normalize
+                let ask_delta = near_ask_depth * 0.1;
+                self.stochastic.cofi.on_book_update(bid_delta, ask_delta, timestamp_ms);
             }
 
             // === Phase 8: Competitor Model Depth Observation ===

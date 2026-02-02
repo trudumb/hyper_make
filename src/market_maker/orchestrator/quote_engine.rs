@@ -9,6 +9,7 @@ use super::super::{
     quoting, MarketMaker, OrderExecutor, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
     QuotingStrategy, Side,
 };
+use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 use crate::market_maker::control::{QuoteGateDecision, QuoteGateInput};
 use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
@@ -89,10 +90,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
-        // === FIRST-PRINCIPLES BELIEF SYSTEM: Update with price observations ===
+        // === CENTRALIZED BELIEF SYSTEM: Update with price observations ===
+        // Phase 7: Removed dual-write - centralized beliefs are now the single source of truth.
         // This feeds price returns to the Bayesian posterior over (μ, σ²).
         // The resulting E[μ | data] becomes belief_predictive_bias in MarketParams.
-        let n_obs_before = self.stochastic.beliefs_builder.beliefs().n_price_obs;
+        let n_obs_before = self.central_beliefs.snapshot().drift_vol.n_observations;
         let can_observe = self.latest_mid > 0.0 && self.prev_mid_for_beliefs > 0.0;
 
         if can_observe {
@@ -102,22 +104,32 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .unwrap_or(1.0)  // Default to 1 second on first observation
                 .max(0.001);     // Floor to avoid division issues
 
-            self.stochastic.beliefs_builder.observe_price(price_return, dt);
+            // Phase 7: Primary write to centralized belief state (removed old beliefs_builder.observe_price)
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.central_beliefs.update(BeliefUpdate::PriceReturn {
+                return_frac: price_return,
+                dt_secs: dt,
+                timestamp_ms,
+            });
 
             // Log belief updates periodically (every 10 observations during warmup, then every 100)
-            let beliefs = self.stochastic.beliefs_builder.beliefs();
-            let log_interval = if beliefs.n_price_obs < 100 { 10 } else { 100 };
-            if beliefs.n_price_obs % log_interval == 0 || beliefs.predictive_bias().abs() > 0.0005 {
+            // Phase 7: Use centralized belief snapshot for logging
+            let beliefs = self.central_beliefs.snapshot();
+            let log_interval = if beliefs.drift_vol.n_observations < 100 { 10 } else { 100 };
+            if beliefs.drift_vol.n_observations % log_interval == 0 || beliefs.drift_vol.expected_drift.abs() > 0.0005 {
                 info!(
                     price_return_bps = %format!("{:.2}", price_return * 10000.0),
                     dt_secs = %format!("{:.3}", dt),
-                    predictive_bias_bps = %format!("{:.2}", beliefs.predictive_bias() * 10000.0),
-                    expected_sigma = %format!("{:.6}", beliefs.expected_sigma),
-                    drift_confidence = %format!("{:.3}", beliefs.drift_confidence()),
+                    predictive_bias_bps = %format!("{:.2}", beliefs.drift_vol.expected_drift * 10000.0),
+                    expected_sigma = %format!("{:.6}", beliefs.drift_vol.expected_sigma),
+                    drift_confidence = %format!("{:.3}", beliefs.drift_vol.confidence),
                     overall_confidence = %format!("{:.3}", beliefs.overall_confidence()),
-                    n_price_obs = beliefs.n_price_obs,
-                    prob_bullish = %format!("{:.3}", beliefs.prob_bullish()),
-                    prob_bearish = %format!("{:.3}", beliefs.prob_bearish()),
+                    n_price_obs = beliefs.drift_vol.n_observations,
+                    prob_bullish = %format!("{:.3}", beliefs.drift_vol.prob_bullish),
+                    prob_bearish = %format!("{:.3}", beliefs.drift_vol.prob_bearish),
                     "Beliefs updated with price observation"
                 );
             }
@@ -146,6 +158,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.stochastic
             .calibration_controller
             .update_calibration_status(as_fills_measured, kappa_confidence);
+
+        // === CENTRALIZED BELIEF SNAPSHOT (Phase 4) ===
+        // Take a point-in-time snapshot of all beliefs for use throughout this quote cycle.
+        // This replaces scattered reads from beliefs_builder, regime_hmm, and changepoint.
+        let belief_snapshot: BeliefSnapshot = self.central_beliefs.snapshot();
 
         // HIP-3: OI cap pre-flight check (fast path for unlimited)
         // This is on the hot path, so we use pre-computed values from runtime config
@@ -375,6 +392,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             adaptive_spreads: &self.stochastic.adaptive_spreads,
             // First-principles belief system
             beliefs_builder: &self.stochastic.beliefs_builder,
+            // === Phase 5: Centralized belief snapshot ===
+            beliefs: Some(&belief_snapshot),
             position: self.position.position(),
             max_position: self.config.max_position,
             latest_mid: self.latest_mid,
@@ -407,20 +426,99 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
+        // === V2 INTEGRATION: BOCPD Kappa Relationship Tracking ===
+        // Use BOCPD to detect when feature→κ relationships change.
+        // If in a new regime, widen spreads by reducing effective kappa.
+        {
+            // Build features for BOCPD: [funding_magnitude, book_depth_velocity, oi_velocity, momentum]
+            // Create FundingFeatures from available data
+            let funding_rate_8h = self.tier2.funding.ewma_rate();
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            // Use current rate as prev_rate for simplicity (delta will be ~0)
+            let prev_funding_rate = self.tier2.funding.current_rate();
+            let funding_features = crate::market_maker::estimator::FundingFeatures::new(
+                timestamp_ms,
+                funding_rate_8h,
+                prev_funding_rate,
+            );
+            let funding_magnitude = funding_features.funding_magnitude_proximity;
+            let book_depth_velocity = 0.0; // TODO: wire from book depth changes
+            let oi_velocity = 0.0; // TODO: wire from OI changes
+            let momentum_normalized = (market_params.momentum_bps / 10.0).clamp(-1.0, 1.0);
+            
+            let bocpd_features = [
+                funding_magnitude,
+                book_depth_velocity,
+                oi_velocity,
+                momentum_normalized,
+            ];
+            
+            // Get BOCPD prediction and state
+            let p_new_regime = self.stochastic.bocpd_kappa.p_new_regime();
+            let bocpd_warmed = self.stochastic.bocpd_kappa.is_warmed_up();
+            
+            // If BOCPD detects new regime, reduce kappa confidence
+            // This causes wider spreads when relationships are unstable
+            if bocpd_warmed && p_new_regime > 0.3 {
+                // Reduce kappa by p_new_regime fraction (new regime = use prior = lower kappa)
+                let kappa_discount = 1.0 - (p_new_regime * 0.5); // Max 50% reduction
+                let old_kappa = market_params.kappa;
+                market_params.kappa *= kappa_discount;
+                
+                debug!(
+                    p_new_regime = %format!("{:.3}", p_new_regime),
+                    kappa_discount = %format!("{:.2}", kappa_discount),
+                    old_kappa = %format!("{:.0}", old_kappa),
+                    new_kappa = %format!("{:.0}", market_params.kappa),
+                    funding_mag = %format!("{:.2}", funding_magnitude),
+                    "BOCPD: Kappa relationship unstable, widening spreads"
+                );
+            }
+            
+            // Store features for BOCPD update after fill (in fill handler)
+            // This allows us to update BOCPD with realized kappa from actual fills
+            self.stochastic.bocpd_kappa_features = Some(bocpd_features);
+        }
+
+        // === V2 INTEGRATION: Belief Skewness Spread Adjustment ===
+        // Use fat-tail awareness from belief system to adjust spreads asymmetrically.
+        // Positive skewness = higher vol spike risk = widen spreads defensively.
+        if belief_snapshot.drift_vol.sigma_skewness > 0.5 {
+            let skew = belief_snapshot.drift_vol.sigma_skewness;
+            let tail_risk = belief_snapshot.drift_vol.tail_risk_score();
+            
+            // Adjust spread widening based on skewness
+            // High positive skewness = risk of upward vol spike
+            if tail_risk > 0.3 {
+                let widening = 1.0 + (tail_risk * 0.2); // Up to 20% wider
+                market_params.spread_widening_mult *= widening;
+                
+                debug!(
+                    sigma_skewness = %format!("{:.2}", skew),
+                    tail_risk = %format!("{:.2}", tail_risk),
+                    widening = %format!("{:.2}", widening),
+                    "Belief skewness: applying defensive spread widening"
+                );
+            }
+        }
+
         // Log belief system status when it's actively influencing quotes OR during warmup
         // Confidence threshold is 0.3 for GLFT to use beliefs, but we log earlier for diagnostics
+        // PHASE 4: Now using centralized belief snapshot instead of scattered reads
         if market_params.use_belief_system {
-            let beliefs = self.stochastic.beliefs_builder.beliefs();
             let is_active = market_params.belief_confidence > 0.3;
             // Log every 20 observations during warmup, or when active
-            if is_active || beliefs.n_price_obs % 20 == 0 {
+            if is_active || belief_snapshot.drift_vol.n_observations % 20 == 0 {
                 info!(
                     belief_bias_bps = %format!("{:.2}", market_params.belief_predictive_bias * 10000.0),
                     belief_confidence = %format!("{:.3}", market_params.belief_confidence),
                     belief_sigma = %format!("{:.6}", market_params.belief_expected_sigma),
-                    drift_prob_bullish = %format!("{:.2}", beliefs.prob_bullish()),
-                    drift_prob_bearish = %format!("{:.2}", beliefs.prob_bearish()),
-                    n_price_obs = beliefs.n_price_obs,
+                    drift_prob_bullish = %format!("{:.2}", belief_snapshot.drift_vol.prob_bullish),
+                    drift_prob_bearish = %format!("{:.2}", belief_snapshot.drift_vol.prob_bearish),
+                    n_price_obs = belief_snapshot.drift_vol.n_observations,
                     is_active = is_active,
                     "Belief system status (active when confidence > 0.3)"
                 );
@@ -449,14 +547,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // 2. Boost continuation when momentum and trend agree with position
             // 3. Use regime-appropriate priors (cascade = high continuation)
             {
-                // Get BOCD changepoint signals from stochastic controller
-                let cp_summary = self.stochastic.controller.changepoint_summary();
-                let changepoint_prob = if cp_summary.warmed_up {
-                    cp_summary.cp_prob_5
+                // Get BOCD changepoint signals from centralized belief snapshot
+                // PHASE 4: Now using centralized belief snapshot instead of scattered reads
+                let changepoint_prob = if belief_snapshot.changepoint.is_warmed_up {
+                    belief_snapshot.changepoint.prob_5
                 } else {
                     0.0 // Ignore changepoint during BOCD warmup
                 };
-                let changepoint_entropy = cp_summary.entropy;
+                let changepoint_entropy = belief_snapshot.changepoint.entropy;
 
                 // Get momentum continuation probability
                 let momentum_p = self.estimator.momentum_continuation_probability();
@@ -466,7 +564,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 let trend_signal = self.estimator.trend_signal(position_value);
 
                 // Get HMM regime probabilities [quiet, normal, bursty, cascade]
-                let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
+                // PHASE 4: Now using centralized belief snapshot instead of scattered reads
+                let regime_probs = belief_snapshot.regime.probs;
 
                 // Update continuation model with all signals
                 self.stochastic.position_decision.update_signals(
@@ -555,6 +654,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Wire HMM regime probabilities to MarketParams for soft blending in GLFT
         market_params.regime_probs = regime_probs;
+
+        // Phase 7: Forward regime update to centralized belief state (primary consumer)
+        self.central_beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: regime_probs,
+            features: None, // Could add HMM features later for diagnostics
+        });
+
+        // Phase 7: Forward volatility observation for changepoint detection (primary consumer)
+        // BOCD uses volatility observations to detect regime shifts
+        if market_params.sigma > 0.0 {
+            self.central_beliefs.update(BeliefUpdate::ChangepointObs {
+                observation: market_params.sigma,
+            });
+        }
 
         // Log regime state when not in normal regime
         if p_extreme > 0.3 || p_high > 0.5 || p_low > 0.7 {
@@ -883,13 +996,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     (quiet, trending, volatile, cascade)
                 };
 
-            // Get changepoint info from stochastic controller
-            let (cp_prob_5, cp_detected) = if self.stochastic.controller.is_enabled() {
-                let cp = self.stochastic.controller.changepoint_summary();
-                (cp.cp_prob_5, cp.detected)
-            } else {
-                (0.0, false)
-            };
+            // Get changepoint info from centralized belief snapshot
+            // PHASE 4: Now using centralized belief snapshot instead of scattered reads
+            let cp_prob_5 = belief_snapshot.changepoint.prob_5;
+            let cp_detected = belief_snapshot.changepoint.result != crate::market_maker::belief::ChangepointResult::None;
 
             let signal_snapshot = SignalSnapshot {
                 timestamp_ms: now.timestamp_millis(),
@@ -945,16 +1055,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .dashboard()
                 .update_kappa_diagnostics(kappa_diag);
 
-            // Update changepoint diagnostics if controller enabled
-            if self.stochastic.controller.is_enabled() {
-                let cp = self.stochastic.controller.changepoint_summary();
+            // Update changepoint diagnostics from centralized belief snapshot
+            // PHASE 4: Now using centralized belief snapshot instead of scattered reads
+            {
+                use crate::market_maker::belief::ChangepointResult;
                 let cp_diag = ChangepointDiagnostics {
-                    cp_prob_1: cp.cp_prob_1,
-                    cp_prob_5: cp.cp_prob_5,
-                    cp_prob_10: cp.cp_prob_10,
-                    run_length: cp.most_likely_run as u32,
-                    entropy: cp.entropy,
-                    detected: cp.detected,
+                    cp_prob_1: belief_snapshot.changepoint.prob_1,
+                    cp_prob_5: belief_snapshot.changepoint.prob_5,
+                    cp_prob_10: belief_snapshot.changepoint.prob_10,
+                    run_length: belief_snapshot.changepoint.run_length as u32,
+                    entropy: belief_snapshot.changepoint.entropy,
+                    detected: belief_snapshot.changepoint.result != ChangepointResult::None,
                 };
                 self.infra
                     .prometheus
@@ -1090,8 +1201,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 l2_p_positive = %format!("{:.3}", learning_output.p_positive_edge),
                 l2_decision = %format!("{:?}", learning_output.myopic_decision).chars().take(40).collect::<String>(),
                 // Layer 3 (StochasticController)
-                l3_trust = %format!("{:.2}", self.stochastic.controller.learning_trust()),
-                l3_cp_prob = %format!("{:.3}", self.stochastic.controller.changepoint_summary().cp_prob_5),
+                // PHASE 4: Using centralized belief snapshot for changepoint values
+                l3_trust = %format!("{:.2}", belief_snapshot.changepoint.learning_trust),
+                l3_cp_prob = %format!("{:.3}", belief_snapshot.changepoint.prob_5),
                 l3_action = %format!("{:?}", action).chars().take(40).collect::<String>(),
                 // Final
                 position = %format!("{:.4}", self.position.position()),
@@ -1368,21 +1480,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     3 // Extreme
                 }
             },
+            // Phase 6: Pass centralized belief snapshot for unified decision making
+            beliefs: Some(belief_snapshot.clone()),
         };
 
         // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds
         // IMPORTANT: Only use changepoint probability after BOCD warmup to avoid
         // false positives at startup (BOCD always shows cp_prob=1.0 before warmup)
-        let cp_summary = self.stochastic.controller.changepoint_summary();
-        let changepoint_prob = if cp_summary.warmed_up {
-            cp_summary.cp_prob_5
+        // PHASE 4: Now using centralized belief snapshot instead of scattered reads
+        let changepoint_prob = if belief_snapshot.changepoint.is_warmed_up {
+            belief_snapshot.changepoint.prob_5
         } else {
             // Log during warmup so we can verify the fix is working
-            if cp_summary.observation_count % 10 == 0 || cp_summary.observation_count < 5 {
+            if belief_snapshot.changepoint.observation_count % 10 == 0
+                || belief_snapshot.changepoint.observation_count < 5
+            {
                 debug!(
-                    raw_cp_prob = %format!("{:.3}", cp_summary.cp_prob_5),
-                    observations = cp_summary.observation_count,
-                    entropy = %format!("{:.2}", cp_summary.entropy),
+                    raw_cp_prob = %format!("{:.3}", belief_snapshot.changepoint.prob_5),
+                    observations = belief_snapshot.changepoint.observation_count,
+                    entropy = %format!("{:.2}", belief_snapshot.changepoint.entropy),
                     "BOCD warmup: ignoring changepoint probability (would cause false quote pulling)"
                 );
             }

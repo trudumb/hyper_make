@@ -60,6 +60,19 @@
 //! 3. **Reduced threshold spaghetti** - 70-80% fewer if-else branches
 //! 4. **Easy testing** - Mock BeliefSnapshot instead of 10 modules
 //! 5. **Clean interface for new signals** - Just add to BeliefUpdate enum
+//!
+//! ## Migration Status (Phase 8 Complete)
+//!
+//! This module is now the **primary** belief system. The following are deprecated:
+//!
+//! - `stochastic::StochasticControlBuilder` - No longer updated with price observations
+//! - `stochastic::beliefs::MarketBeliefs` - Use `BeliefSnapshot.drift_vol` instead
+//!
+//! The following remain in use for their specialized purposes:
+//!
+//! - `control::belief::BeliefState` - Model ensemble weights (different purpose)
+//! - `estimator::RegimeHMM` - Still provides regime probabilities (forwarded here)
+//! - `control::changepoint` - Still provides BOCD (forwarded here)
 
 mod central;
 mod messages;

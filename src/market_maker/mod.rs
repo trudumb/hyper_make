@@ -67,6 +67,7 @@ pub use strategy::*;
 pub use tracking::*;
 
 use alloy::primitives::Address;
+use belief::{CentralBeliefConfig, CentralBeliefState};
 use tracing::{error, info, warn};
 
 use crate::InfoClient;
@@ -202,6 +203,12 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     prev_mid_for_beliefs: f64,
     /// Last time beliefs were updated (for computing dt).
     last_beliefs_update: Option<std::time::Instant>,
+
+    // === Centralized Belief State (Phase 2) ===
+    /// Single source of truth for all Bayesian beliefs.
+    /// Replaces fragmented belief modules with unified state management.
+    /// Consumers read via snapshot() for consistent point-in-time views.
+    central_beliefs: CentralBeliefState,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -330,6 +337,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // First-principles belief system
             prev_mid_for_beliefs: 0.0,
             last_beliefs_update: None,
+            // Centralized belief state (single source of truth)
+            central_beliefs: CentralBeliefState::new(CentralBeliefConfig::default()),
         }
     }
 
@@ -377,6 +386,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Get count of tracked orders.
     pub fn orders_count(&self) -> usize {
         self.orders.order_ids().len()
+    }
+
+    /// Get centralized belief state reference for monitoring.
+    pub fn central_beliefs(&self) -> &CentralBeliefState {
+        &self.central_beliefs
+    }
+
+    /// Get mutable centralized belief state reference for updates.
+    pub fn central_beliefs_mut(&mut self) -> &mut CentralBeliefState {
+        &mut self.central_beliefs
     }
 
     // =========================================================================

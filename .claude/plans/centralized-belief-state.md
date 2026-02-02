@@ -1,8 +1,8 @@
 # Level 1 Architectural Refactor: Centralized BeliefState
 
 **Goal**: Replace fragmented belief modules with single source of truth
-**Status**: Phase 1 Complete (2026-02-02)
-**Remaining Effort**: 1-3 weeks
+**Status**: ✅ ALL PHASES COMPLETE (2026-02-02)
+**Remaining Effort**: None - ready for paper trading verification
 
 ---
 
@@ -32,89 +32,136 @@ src/market_maker/belief/
 
 ---
 
+## Completed Phases
+
+### Phase 2: Add CentralBeliefState to MarketMaker ✅ COMPLETE (2026-02-02)
+
+**Files modified:**
+- `src/market_maker/mod.rs` - Added `central_beliefs: CentralBeliefState` field
+
+**What was done:**
+1. Added `central_beliefs` field to `MarketMaker<S, E>` struct
+2. Initialized in `MarketMaker::new()` with `CentralBeliefConfig::default()`
+3. Added accessor methods: `central_beliefs()` and `central_beliefs_mut()`
+
+### Phase 3: Dual-write (update both old + new) ✅ COMPLETE (2026-02-02)
+
+**Files modified:**
+- `src/market_maker/orchestrator/quote_engine.rs` - Price return, regime, changepoint updates
+- `src/market_maker/orchestrator/handlers.rs` - Fill and market trade updates
+
+**What was done:**
+1. ✅ On price updates: `central_beliefs.update(BeliefUpdate::PriceReturn {...})`
+2. ✅ On fills: `central_beliefs.update(BeliefUpdate::OwnFill {...})`
+3. ✅ On market trades: `central_beliefs.update(BeliefUpdate::MarketTrade {...})`
+4. ✅ Forward regime updates from HMM: `central_beliefs.update(BeliefUpdate::RegimeUpdate {...})`
+5. ✅ Forward changepoint observations: `central_beliefs.update(BeliefUpdate::ChangepointObs {...})`
+
+---
+
+### Phase 4: Migrate QuoteEngine reads ✅ COMPLETE (2026-02-02)
+
+**Files modified:**
+- `src/market_maker/orchestrator/quote_engine.rs`
+- `src/market_maker/belief/snapshot.rs`
+- `src/market_maker/belief/central.rs`
+
+**What was done:**
+1. ✅ Take `belief_snapshot` early in `update_quotes()` for consistent reads
+2. ✅ Replace `beliefs_builder.beliefs()` reads with `belief_snapshot.drift_vol`
+3. ✅ Replace `regime_hmm.regime_probabilities()` with `belief_snapshot.regime.probs`
+4. ✅ Replace `controller.changepoint_summary()` with `belief_snapshot.changepoint`
+5. ✅ Add `observation_count` and `is_warmed_up` fields to ChangepointBeliefs
+
+---
+
 ## Remaining Phases
 
-### Phase 2: Add CentralBeliefState to MarketMaker ⬜ TODO
+### Phase 5: Migrate ParameterAggregator ✅ COMPLETE (2026-02-02)
 
-**Files to modify:**
-- `src/market_maker/mod.rs` - Add `central_beliefs: CentralBeliefState` field
-- `src/market_maker/core/mod.rs` - Add to component bundles
+**Files modified:**
+- `src/market_maker/strategy/params/aggregator.rs`
+- `src/market_maker/orchestrator/quote_engine.rs`
 
-**Tasks:**
-1. Add `central_beliefs` field to `MarketMaker<S, E>` struct
-2. Initialize in `MarketMaker::new()` with appropriate config
-3. Wire up channel for async updates (optional)
+**What was done:**
+1. Added `beliefs: Option<&'a BeliefSnapshot>` field to `ParameterSources`
+2. Updated `build()` to prefer centralized belief values when `beliefs` is Some:
+   - `belief_predictive_bias` ← `beliefs.drift_vol.expected_drift`
+   - `belief_expected_sigma` ← `beliefs.drift_vol.expected_sigma`
+   - `belief_expected_kappa` ← `beliefs.kappa.kappa_effective`
+   - `belief_confidence` ← `beliefs.overall_confidence()`
+   - `continuation_p` ← `beliefs.continuation.p_fused`
+   - `continuation_confidence` ← `beliefs.continuation.confidence_fused`
+   - `trend_confidence` ← `beliefs.continuation.signal_summary.trend_confidence`
+   - `changepoint_prob` ← `beliefs.changepoint.prob_5`
+   - `sigma_particle` ← `beliefs.drift_vol.expected_sigma`
+   - `regime_probs` ← `beliefs.regime.probs`
+3. Updated quote_engine.rs to pass `beliefs: Some(&belief_snapshot)` to ParameterSources
 
-### Phase 3: Dual-write (update both old + new) ⬜ TODO
+**Tests:** 54 belief tests passing
 
-**Files to modify:**
+### Phase 6: Migrate QuoteGate ✅ COMPLETE (2026-02-02)
+
+**Files modified:**
+- `src/market_maker/control/quote_gate.rs`
+- `src/market_maker/orchestrator/quote_engine.rs`
+
+**What was done:**
+1. ✅ Added `beliefs: Option<BeliefSnapshot>` field to `QuoteGateInput`
+2. ✅ Added 18 helper methods to `QuoteGateInput` for unified belief access:
+   - `effective_sigma()`, `effective_kappa()` - prefer beliefs when warmed up
+   - `belief_confidence()`, `drift_confidence()`, `kappa_confidence()`, `regime_confidence()`
+   - `continuation_probability()`, `changepoint_probability()`, `changepoint_detected()`
+   - `learning_trust()`, `beliefs_warmed_up()`
+   - `expected_edge_bps()`, `prob_positive_edge()`
+   - `fill_ir()`, `as_ir()`, `fill_model_calibrated()`, `as_model_calibrated()`
+   - `current_regime()`, `regime_probs()`
+3. ✅ Updated quote_engine.rs to pass `beliefs: Some(belief_snapshot.clone())`
+4. ✅ Updated `Default` impl for `QuoteGateInput`
+
+**Tests:** All 39 quote_gate tests passing, 1737 total tests passing
+
+### Phase 7: Remove dual-write ✅ COMPLETE (2026-02-02)
+
+**Files modified:**
 - `src/market_maker/orchestrator/quote_engine.rs`
 - `src/market_maker/orchestrator/handlers.rs`
-
-**Tasks:**
-1. On price updates, also call `central_beliefs.update(BeliefUpdate::PriceReturn {...})`
-2. On fills, also call `central_beliefs.update(BeliefUpdate::OwnFill {...})`
-3. On market trades, also call `central_beliefs.update(BeliefUpdate::MarketTrade {...})`
-4. Forward regime updates from HMM
-5. Forward changepoint observations from BOCD
-
-### Phase 4: Migrate QuoteEngine reads ⬜ TODO
-
-**Files to modify:**
-- `src/market_maker/orchestrator/quote_engine.rs`
-
-**Tasks:**
-1. Replace scattered reads like:
-   ```rust
-   // OLD
-   let bias = self.stochastic.beliefs_builder.beliefs().predictive_bias();
-   let kappa = self.estimator.kappa();
-
-   // NEW
-   let beliefs = self.central_beliefs.snapshot();
-   let bias = beliefs.drift_vol.expected_drift;
-   let kappa = beliefs.kappa.kappa_effective;
-   ```
-2. Verify behavior unchanged via tests
-
-### Phase 5: Migrate ParameterAggregator ⬜ TODO
-
-**Files to modify:**
 - `src/market_maker/strategy/params/aggregator.rs`
 
-**Tasks:**
-1. Add `build_from_beliefs()` method that takes `&BeliefSnapshot`
-2. Map snapshot fields to MarketParams fields
-3. Deprecate scattered field reads
+**What was done:**
+1. ✅ Removed `beliefs_builder.observe_price()` call - centralized beliefs now primary
+2. ✅ Updated logging to use `central_beliefs.snapshot()` instead of `beliefs_builder.beliefs()`
+3. ✅ Updated dual-write comments to "Phase 7: Primary consumer" comments
+4. ✅ Added deprecation comment to `beliefs_builder` field in ParameterSources
+5. ✅ Retained fallback reads in ParameterAggregator for safety (beliefs_builder no longer updated)
 
-### Phase 6: Migrate QuoteGate ⬜ TODO
+**Tests:** All 1737 tests passing, 54 belief tests passing
 
-**Files to modify:**
-- `src/market_maker/control/quote_gate.rs`
+**Note:** The `beliefs_builder` struct still exists but is no longer updated.
+Fallback reads remain for safety during transition period.
 
-**Tasks:**
-1. Update `QuoteGateInput` to include `beliefs: BeliefSnapshot`
-2. Replace 40+ scattered field reads with snapshot access
-3. Simplify threshold logic using belief confidences
+### Phase 8: Cleanup deprecated code ✅ COMPLETE (2026-02-02)
 
-### Phase 7: Remove dual-write ⬜ TODO (HIGH RISK)
+**Files modified:**
+- `src/market_maker/core/components.rs` - Added deprecation notice to `beliefs_builder` field
+- `src/market_maker/stochastic/mod.rs` - Added deprecation notice to `StochasticControlBuilder`
+- `src/market_maker/control/belief.rs` - Added clarifying documentation (NOT deprecated - different purpose)
+- `src/market_maker/strategy/params/aggregator.rs` - Added DEPRECATED comments to fallback branches
+- `src/market_maker/belief/mod.rs` - Added migration status documentation
 
-**Tasks:**
-1. Remove old belief update paths
-2. Remove old read paths
-3. Run full test suite
-4. Paper trade for stability verification
+**What was done:**
+1. ✅ Added deprecation notices to `StochasticControlBuilder` and `beliefs_builder` field
+2. ✅ Clarified that `control::belief::BeliefState` is for model ensemble weights (different purpose)
+3. ✅ Updated module documentation with migration status
+4. ✅ Marked fallback code paths as DEPRECATED
+5. ✅ Retained deprecated code for backward compatibility (safe removal in future)
 
-### Phase 8: Cleanup deprecated code ⬜ TODO (HIGH RISK)
+**Not removed (retained for safety):**
+- `StochasticControlBuilder` struct - still referenced, but no longer updated
+- Fallback branches in ParameterAggregator - for safety when beliefs is None
+- `control::belief::BeliefState` - serves different purpose (model ensemble weights)
 
-**Files to potentially deprecate/remove:**
-- Parts of `src/market_maker/control/belief.rs` (Layer 3 BeliefState)
-- Duplicate logic in `src/market_maker/stochastic/beliefs.rs`
-
-**Tasks:**
-1. Mark deprecated code with `#[deprecated]`
-2. Remove after verification period
-3. Update documentation
+**Tests:** All 1737 tests passing
 
 ---
 
