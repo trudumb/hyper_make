@@ -506,10 +506,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Log belief system status when it's actively influencing quotes OR during warmup
-        // Confidence threshold is 0.3 for GLFT to use beliefs, but we log earlier for diagnostics
+        // CRITICAL FIX: Lowered threshold from 0.3 to 0.15 to activate beliefs earlier.
+        // Data showed confidence reaching 0.20 but never 0.30, leaving system directionless.
         // PHASE 4: Now using centralized belief snapshot instead of scattered reads
         if market_params.use_belief_system {
-            let is_active = market_params.belief_confidence > 0.3;
+            let is_active = market_params.belief_confidence > 0.15;
             // Log every 20 observations during warmup, or when active
             if is_active || belief_snapshot.drift_vol.n_observations % 20 == 0 {
                 info!(
@@ -520,7 +521,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     drift_prob_bearish = %format!("{:.2}", belief_snapshot.drift_vol.prob_bearish),
                     n_price_obs = belief_snapshot.drift_vol.n_observations,
                     is_active = is_active,
-                    "Belief system status (active when confidence > 0.3)"
+                    "Belief system status (active when confidence > 0.15)"
                 );
             }
         }

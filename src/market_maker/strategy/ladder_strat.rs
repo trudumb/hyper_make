@@ -769,6 +769,13 @@ impl LadderStrategy {
         };
         let effective_floor_bps = effective_floor_frac * 10_000.0;
 
+        // === CRITICAL FIX: Add conditional adverse selection buffer ===
+        // Fills cluster around toxic moments. Unconditional AS ≠ E[AS | fill].
+        // Data shows 7-13 bps AS on every fill, meaning we systematically lose.
+        // Add a safety buffer based on observed fill-conditional AS.
+        const CONDITIONAL_AS_BUFFER_BPS: f64 = 5.0; // Conservative buffer for E[AS|fill]
+        let effective_floor_bps = effective_floor_bps + CONDITIONAL_AS_BUFFER_BPS;
+
         // === DYNAMIC DEPTHS: GLFT-optimal depth computation with Bayesian bounds ===
         // Compute depths from effective gamma and kappa using GLFT formula:
         // δ* = (1/γ) × ln(1 + γ/κ)

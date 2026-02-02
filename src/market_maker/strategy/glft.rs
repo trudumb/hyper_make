@@ -1077,8 +1077,10 @@ impl QuotingStrategy for GLFTStrategy {
         // The bias shifts BOTH sides in the same direction:
         //   - bid_delta = half_spread + skew - β/2 (widen when β < 0)
         //   - ask_delta = half_spread - skew + β/2 (tighten when β < 0)
+        // CRITICAL FIX: Lowered from 0.3 to 0.15 - belief system was never activating,
+        // causing buys/sells with no regard to actual price action.
         let predictive_bias = if market_params.use_belief_system
-            && market_params.belief_confidence > 0.3
+            && market_params.belief_confidence > 0.15
         {
             // First-principles: Use β_t = E[μ | data] from NIG posterior
             // This is mathematically derived, not a heuristic
