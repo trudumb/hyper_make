@@ -486,6 +486,14 @@ impl AdaptiveSpreadCalculator {
         self.floor.learned_spread_floor()
     }
 
+    /// Get the Bayesian posterior mean of fill-conditional adverse selection.
+    /// This is E[AS | fill] - the expected AS given that we got filled.
+    /// Fills cluster around toxic moments, so E[AS | fill] > E[AS] unconditional.
+    /// Returns in fractional terms (multiply by 10000 for bps).
+    pub fn floor_as_posterior_mean(&self) -> f64 {
+        self.floor.posterior_mean()
+    }
+
     /// Get blended kappa from Bayesian estimator.
     ///
     /// The BlendedKappaEstimator has its own well-calibrated prior (κ=2500 for BTC).

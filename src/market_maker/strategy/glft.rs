@@ -1077,22 +1077,26 @@ impl QuotingStrategy for GLFTStrategy {
         // The bias shifts BOTH sides in the same direction:
         //   - bid_delta = half_spread + skew - β/2 (widen when β < 0)
         //   - ask_delta = half_spread - skew + β/2 (tighten when β < 0)
-        // CRITICAL FIX: Lowered from 0.3 to 0.15 - belief system was never activating,
-        // causing buys/sells with no regard to actual price action.
-        let predictive_bias = if market_params.use_belief_system
-            && market_params.belief_confidence > 0.15
-        {
+        //
+        // FIRST-PRINCIPLES: Confidence-weighted continuous influence
+        // Instead of threshold gating (magic number), scale bias by confidence.
+        // This is mathematically correct: β_effective = β × confidence
+        // When confidence=0.2, we believe 20% of the signal; when 1.0, 100%.
+        let predictive_bias = if market_params.use_belief_system {
             // First-principles: Use β_t = E[μ | data] from NIG posterior
-            // This is mathematically derived, not a heuristic
-            let bias = market_params.belief_predictive_bias;
+            // SCALED by confidence - no arbitrary threshold
+            let raw_bias = market_params.belief_predictive_bias;
+            let confidence = market_params.belief_confidence;
+            let bias = raw_bias * confidence;
 
-            if bias.abs() > 0.0001 {
+            if raw_bias.abs() > 0.0001 && confidence > 0.01 {
                 debug!(
-                    belief_bias_bps = %format!("{:.2}", bias * 10000.0),
-                    belief_confidence = %format!("{:.3}", market_params.belief_confidence),
+                    raw_belief_bias_bps = %format!("{:.2}", raw_bias * 10000.0),
+                    confidence_scaled_bias_bps = %format!("{:.2}", bias * 10000.0),
+                    belief_confidence = %format!("{:.3}", confidence),
                     belief_sigma = %format!("{:.6}", market_params.belief_expected_sigma),
                     belief_kappa = %format!("{:.0}", market_params.belief_expected_kappa),
-                    "Predictive bias from first-principles beliefs (NIG posterior)"
+                    "Predictive bias: confidence-weighted (β × conf)"
                 );
             }
             bias

@@ -216,6 +216,14 @@ impl ParameterAggregator {
             predicted_alpha: sources.adverse_selection.predicted_alpha(),
             as_warmed_up: sources.adverse_selection.is_warmed_up(),
             depth_decay_as: Some(sources.depth_decay_as.clone()),
+            // Conditional AS posterior mean from Bayesian fill AS tracker.
+            // E[AS | fill] from Normal posterior updated on each fill.
+            // Returns Some(bps) when warmed up, None during warmup.
+            conditional_as_posterior_mean_bps: if sources.adaptive_spreads.is_warmed_up() {
+                Some(sources.adaptive_spreads.floor_as_posterior_mean() * 10000.0)
+            } else {
+                None // Use 0 buffer during warmup (don't penalize before measuring)
+            },
 
             // === Tier 1: Liquidation Cascade ===
             tail_risk_multiplier: sources.liquidation_detector.tail_risk_multiplier(),

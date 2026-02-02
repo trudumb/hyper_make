@@ -769,12 +769,23 @@ impl LadderStrategy {
         };
         let effective_floor_bps = effective_floor_frac * 10_000.0;
 
-        // === CRITICAL FIX: Add conditional adverse selection buffer ===
-        // Fills cluster around toxic moments. Unconditional AS ≠ E[AS | fill].
-        // Data shows 7-13 bps AS on every fill, meaning we systematically lose.
-        // Add a safety buffer based on observed fill-conditional AS.
-        const CONDITIONAL_AS_BUFFER_BPS: f64 = 5.0; // Conservative buffer for E[AS|fill]
-        let effective_floor_bps = effective_floor_bps + CONDITIONAL_AS_BUFFER_BPS;
+        // === CONDITIONAL AS: Learned from data, not magic numbers ===
+        // E[AS | fill] ≠ E[AS] unconditional. Fills cluster around toxic moments.
+        // The fill tracker maintains a Bayesian posterior of realized fill AS.
+        // Use the posterior mean as the buffer - this is statistically grounded.
+        // If no fill data yet, use 0 buffer (don't penalize before measuring).
+        let conditional_as_buffer_bps = market_params.conditional_as_posterior_mean_bps.unwrap_or(0.0);
+        let effective_floor_bps = effective_floor_bps + conditional_as_buffer_bps;
+
+        // Log when conditional AS buffer is active (learned from fill data)
+        if conditional_as_buffer_bps > 0.1 {
+            debug!(
+                conditional_as_buffer_bps = %format!("{:.2}", conditional_as_buffer_bps),
+                base_floor_bps = %format!("{:.2}", effective_floor_frac * 10_000.0),
+                total_floor_bps = %format!("{:.2}", effective_floor_bps),
+                "Conditional AS buffer from Bayesian posterior (E[AS|fill])"
+            );
+        }
 
         // === DYNAMIC DEPTHS: GLFT-optimal depth computation with Bayesian bounds ===
         // Compute depths from effective gamma and kappa using GLFT formula:

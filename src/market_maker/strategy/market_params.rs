@@ -189,6 +189,12 @@ pub struct MarketParams {
     /// Used by ladder for depth-aware spread capture.
     pub depth_decay_as: Option<DepthDecayAS>,
 
+    /// Conditional adverse selection: E[AS | fill] posterior mean (bps).
+    /// Learned from Bayesian update on realized fill AS, NOT a magic number.
+    /// This captures that fills cluster around toxic moments, so
+    /// E[AS | fill] ≠ E[AS] unconditional. None during warmup.
+    pub conditional_as_posterior_mean_bps: Option<f64>,
+
     // === Tier 1: Liquidation Cascade ===
     /// Tail risk multiplier for gamma [1.0, 5.0].
     /// Multiply gamma by this during cascade conditions.
@@ -813,6 +819,7 @@ impl Default for MarketParams {
             predicted_alpha: 0.0,      // Default: no informed flow detected
             as_warmed_up: false,       // Starts not warmed up
             depth_decay_as: None,      // No calibrated model initially
+            conditional_as_posterior_mean_bps: None, // Learned from fill AS data, not magic number
             // Tier 1: Liquidation Cascade
             tail_risk_multiplier: 1.0, // Default: no tail risk scaling
             should_pull_quotes: false, // Default: don't pull quotes

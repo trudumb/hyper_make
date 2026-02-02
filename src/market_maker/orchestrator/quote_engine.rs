@@ -505,23 +505,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
 
-        // Log belief system status when it's actively influencing quotes OR during warmup
-        // CRITICAL FIX: Lowered threshold from 0.3 to 0.15 to activate beliefs earlier.
-        // Data showed confidence reaching 0.20 but never 0.30, leaving system directionless.
+        // Log belief system status (continuously active - no threshold gating)
+        // FIRST-PRINCIPLES: Beliefs influence quotes proportional to confidence.
+        // confidence=0.20 means 20% of the signal is used, not binary on/off.
         // PHASE 4: Now using centralized belief snapshot instead of scattered reads
         if market_params.use_belief_system {
-            let is_active = market_params.belief_confidence > 0.15;
-            // Log every 20 observations during warmup, or when active
-            if is_active || belief_snapshot.drift_vol.n_observations % 20 == 0 {
+            let confidence = market_params.belief_confidence;
+            let raw_bias_bps = market_params.belief_predictive_bias * 10000.0;
+            let effective_bias_bps = raw_bias_bps * confidence;
+
+            // Log every 20 observations or when bias is meaningful
+            if effective_bias_bps.abs() > 0.1 || belief_snapshot.drift_vol.n_observations % 20 == 0 {
                 info!(
-                    belief_bias_bps = %format!("{:.2}", market_params.belief_predictive_bias * 10000.0),
-                    belief_confidence = %format!("{:.3}", market_params.belief_confidence),
+                    raw_belief_bias_bps = %format!("{:.2}", raw_bias_bps),
+                    effective_bias_bps = %format!("{:.2}", effective_bias_bps),
+                    belief_confidence = %format!("{:.3}", confidence),
                     belief_sigma = %format!("{:.6}", market_params.belief_expected_sigma),
                     drift_prob_bullish = %format!("{:.2}", belief_snapshot.drift_vol.prob_bullish),
                     drift_prob_bearish = %format!("{:.2}", belief_snapshot.drift_vol.prob_bearish),
                     n_price_obs = belief_snapshot.drift_vol.n_observations,
-                    is_active = is_active,
-                    "Belief system status (active when confidence > 0.15)"
+                    "Belief system: confidence-weighted (bias × conf)"
                 );
             }
         }
