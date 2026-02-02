@@ -225,6 +225,16 @@ pub struct LadderParams {
     pub funding_rate: f64,
     /// Whether to apply funding skew to the ladder
     pub use_funding_skew: bool,
+
+    // === RL Policy Adjustments ===
+    /// RL-recommended spread delta (bps). Positive = widen, Negative = tighten.
+    pub rl_spread_delta_bps: f64,
+    /// RL-recommended bid skew (bps). Positive = widen bid (favor buying).
+    pub rl_bid_skew_bps: f64,
+    /// RL-recommended ask skew (bps). Positive = widen ask (favor selling).
+    pub rl_ask_skew_bps: f64,
+    /// Confidence in RL recommendation [0, 1]. Scales the adjustment magnitude.
+    pub rl_confidence: f64,
 }
 
 #[cfg(test)]
@@ -277,6 +287,11 @@ mod tests {
             urgency_score: 0.0,
             funding_rate: 0.0,
             use_funding_skew: false,
+            // RL disabled for this test
+            rl_spread_delta_bps: 0.0,
+            rl_bid_skew_bps: 0.0,
+            rl_ask_skew_bps: 0.0,
+            rl_confidence: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -324,6 +339,11 @@ mod tests {
             urgency_score: 0.0,
             funding_rate: 0.0,
             use_funding_skew: false,
+            // RL disabled for this test
+            rl_spread_delta_bps: 0.0,
+            rl_bid_skew_bps: 0.0,
+            rl_ask_skew_bps: 0.0,
+            rl_confidence: 0.0,
         };
 
         let params_long = LadderParams {
@@ -382,6 +402,11 @@ mod tests {
             urgency_score: 0.0,
             funding_rate: 0.0,
             use_funding_skew: false,
+            // RL disabled for this test
+            rl_spread_delta_bps: 0.0,
+            rl_bid_skew_bps: 0.0,
+            rl_ask_skew_bps: 0.0,
+            rl_confidence: 0.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -433,6 +458,11 @@ mod tests {
             urgency_score: 2.0, // Above 0.5 threshold
             funding_rate: 0.0,
             use_funding_skew: false,
+            // RL disabled for this test
+            rl_spread_delta_bps: 0.0,
+            rl_bid_skew_bps: 0.0,
+            rl_ask_skew_bps: 0.0,
+            rl_confidence: 0.0,
         };
 
         // Same params but WITHOUT drift adjustment

@@ -35,16 +35,25 @@ impl RiskSeverity {
 }
 
 /// Recommended action from a risk assessment.
+///
+/// Actions are ordered from least to most severe:
+/// None < Warn < WidenSpreads < SkewAway < ReduceOnly < PullSide < PullQuotes < Kill
 #[derive(Debug, Clone, PartialEq)]
 pub enum RiskAction {
     /// No action needed
     None,
     /// Log a warning
     Warn(String),
-    /// Enter reduce-only mode
-    ReduceOnly,
     /// Widen spreads by the given factor
     WidenSpreads(f64),
+    /// Skew quotes away from a position (shift spreads)
+    /// First f64 is skew in bps (positive = widen asks, tighten bids)
+    SkewAway(f64),
+    /// Enter reduce-only mode
+    ReduceOnly,
+    /// Pull quotes on one side only
+    /// true = pull buys, false = pull sells
+    PullSide(bool),
     /// Pull all quotes
     PullQuotes,
     /// Trigger kill switch with reason
@@ -63,9 +72,81 @@ impl RiskAction {
             self,
             RiskAction::ReduceOnly
                 | RiskAction::WidenSpreads(_)
+                | RiskAction::SkewAway(_)
+                | RiskAction::PullSide(_)
                 | RiskAction::PullQuotes
                 | RiskAction::Kill(_)
         )
+    }
+
+    /// Get the severity level of this action.
+    pub fn severity(&self) -> RiskSeverity {
+        match self {
+            RiskAction::None => RiskSeverity::None,
+            RiskAction::Warn(_) => RiskSeverity::Low,
+            RiskAction::WidenSpreads(_) => RiskSeverity::Medium,
+            RiskAction::SkewAway(_) => RiskSeverity::Medium,
+            RiskAction::ReduceOnly => RiskSeverity::High,
+            RiskAction::PullSide(_) => RiskSeverity::High,
+            RiskAction::PullQuotes => RiskSeverity::High,
+            RiskAction::Kill(_) => RiskSeverity::Critical,
+        }
+    }
+
+    /// Get spread multiplier for this action.
+    pub fn spread_multiplier(&self) -> f64 {
+        match self {
+            RiskAction::None => 1.0,
+            RiskAction::Warn(_) => 1.0,
+            RiskAction::WidenSpreads(mult) => *mult,
+            RiskAction::SkewAway(_) => 1.2, // Slight widening with skew
+            RiskAction::ReduceOnly => 1.5,
+            RiskAction::PullSide(_) => 1.5,
+            RiskAction::PullQuotes => f64::INFINITY, // No quotes
+            RiskAction::Kill(_) => f64::INFINITY,
+        }
+    }
+
+    /// Get size multiplier for this action.
+    pub fn size_multiplier(&self) -> f64 {
+        match self {
+            RiskAction::None => 1.0,
+            RiskAction::Warn(_) => 1.0,
+            RiskAction::WidenSpreads(_) => 0.8,
+            RiskAction::SkewAway(_) => 0.8,
+            RiskAction::ReduceOnly => 0.5,
+            RiskAction::PullSide(_) => 0.5,
+            RiskAction::PullQuotes => 0.0,
+            RiskAction::Kill(_) => 0.0,
+        }
+    }
+
+    /// Check if this action prevents placing new orders.
+    pub fn prevents_new_orders(&self) -> bool {
+        matches!(self, RiskAction::PullQuotes | RiskAction::Kill(_))
+    }
+
+    /// Check if this action is reduce-only mode.
+    pub fn is_reduce_only(&self) -> bool {
+        matches!(self, RiskAction::ReduceOnly)
+    }
+
+    /// Get skew adjustment in bps (positive = skew toward selling).
+    pub fn skew_bps(&self) -> f64 {
+        match self {
+            RiskAction::SkewAway(bps) => *bps,
+            _ => 0.0,
+        }
+    }
+
+    /// Check if this action pulls a specific side.
+    /// Returns Some(true) if buys should be pulled, Some(false) if sells,
+    /// None if neither or both.
+    pub fn pulled_side(&self) -> Option<bool> {
+        match self {
+            RiskAction::PullSide(pull_buys) => Some(*pull_buys),
+            _ => None,
+        }
     }
 }
 

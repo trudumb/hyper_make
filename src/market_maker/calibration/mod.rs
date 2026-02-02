@@ -19,6 +19,7 @@ mod brier_score;
 mod coefficient_estimator;
 mod conditional_metrics;
 mod information_ratio;
+pub mod model_gating;
 mod prediction_log;
 
 pub use adaptive_binning::AdaptiveBinner;
@@ -26,6 +27,7 @@ pub use brier_score::BrierScoreTracker;
 pub use coefficient_estimator::{CalibrationSample, CoefficientEstimator, CoefficientEstimatorConfig};
 pub use conditional_metrics::ConditionalCalibration;
 pub use information_ratio::InformationRatioTracker;
+pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};
 
 /// Minimum samples required for reliable calibration metrics.

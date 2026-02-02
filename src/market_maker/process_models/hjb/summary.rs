@@ -5,7 +5,7 @@
 /// Contains both the total skew and its components for analysis.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DriftAdjustedSkew {
-    /// Total optimal skew (base + drift urgency).
+    /// Total optimal skew (base + drift urgency + predictive bias).
     pub total_skew: f64,
 
     /// Base HJB skew (γσ²qT + terminal + funding).
@@ -14,6 +14,11 @@ pub struct DriftAdjustedSkew {
     /// Additional urgency from momentum-position opposition.
     /// Same sign as base_skew when opposed (amplifies reduction).
     pub drift_urgency: f64,
+
+    /// Predictive bias from changepoint detection.
+    /// β_t = -sensitivity × prob_excess × σ
+    /// Negative when regime change is imminent → widen bids, tighten asks.
+    pub predictive_bias: f64,
 
     /// Variance multiplier for inventory risk.
     /// > 1.0 when opposed, used for σ²_effective calculation.

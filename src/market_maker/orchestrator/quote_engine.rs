@@ -88,6 +88,55 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
+        // === FIRST-PRINCIPLES BELIEF SYSTEM: Update with price observations ===
+        // This feeds price returns to the Bayesian posterior over (μ, σ²).
+        // The resulting E[μ | data] becomes belief_predictive_bias in MarketParams.
+        let n_obs_before = self.stochastic.beliefs_builder.beliefs().n_price_obs;
+        let can_observe = self.latest_mid > 0.0 && self.prev_mid_for_beliefs > 0.0;
+
+        if can_observe {
+            let price_return = (self.latest_mid - self.prev_mid_for_beliefs) / self.prev_mid_for_beliefs;
+            let dt = self.last_beliefs_update
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(1.0)  // Default to 1 second on first observation
+                .max(0.001);     // Floor to avoid division issues
+
+            self.stochastic.beliefs_builder.observe_price(price_return, dt);
+
+            // Log belief updates periodically (every 10 observations during warmup, then every 100)
+            let beliefs = self.stochastic.beliefs_builder.beliefs();
+            let log_interval = if beliefs.n_price_obs < 100 { 10 } else { 100 };
+            if beliefs.n_price_obs % log_interval == 0 || beliefs.predictive_bias().abs() > 0.0005 {
+                info!(
+                    price_return_bps = %format!("{:.2}", price_return * 10000.0),
+                    dt_secs = %format!("{:.3}", dt),
+                    predictive_bias_bps = %format!("{:.2}", beliefs.predictive_bias() * 10000.0),
+                    expected_sigma = %format!("{:.6}", beliefs.expected_sigma),
+                    drift_confidence = %format!("{:.3}", beliefs.drift_confidence()),
+                    overall_confidence = %format!("{:.3}", beliefs.overall_confidence()),
+                    n_price_obs = beliefs.n_price_obs,
+                    prob_bullish = %format!("{:.3}", beliefs.prob_bullish()),
+                    prob_bearish = %format!("{:.3}", beliefs.prob_bearish()),
+                    "Beliefs updated with price observation"
+                );
+            }
+        }
+
+        // DEBUG: Log belief state every 5 cycles during initial debugging
+        if n_obs_before % 5 == 0 || !can_observe {
+            info!(
+                latest_mid = %format!("{:.4}", self.latest_mid),
+                prev_mid = %format!("{:.4}", self.prev_mid_for_beliefs),
+                can_observe = can_observe,
+                n_price_obs = n_obs_before,
+                "Belief observation check"
+            );
+        }
+
+        // Update tracking for next iteration
+        self.prev_mid_for_beliefs = self.latest_mid;
+        self.last_beliefs_update = Some(std::time::Instant::now());
+
         // Update calibration controller with current calibration status
         // This uses AS fills measured and kappa confidence to track calibration progress
         // and adjust fill-hungry gamma multiplier accordingly
@@ -323,6 +372,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             stochastic_config: &self.stochastic.stochastic_config,
             drift_adjusted_skew,
             adaptive_spreads: &self.stochastic.adaptive_spreads,
+            // First-principles belief system
+            beliefs_builder: &self.stochastic.beliefs_builder,
             position: self.position.position(),
             max_position: self.config.max_position,
             latest_mid: self.latest_mid,
@@ -355,6 +406,26 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
+        // Log belief system status when it's actively influencing quotes OR during warmup
+        // Confidence threshold is 0.3 for GLFT to use beliefs, but we log earlier for diagnostics
+        if market_params.use_belief_system {
+            let beliefs = self.stochastic.beliefs_builder.beliefs();
+            let is_active = market_params.belief_confidence > 0.3;
+            // Log every 20 observations during warmup, or when active
+            if is_active || beliefs.n_price_obs % 20 == 0 {
+                info!(
+                    belief_bias_bps = %format!("{:.2}", market_params.belief_predictive_bias * 10000.0),
+                    belief_confidence = %format!("{:.3}", market_params.belief_confidence),
+                    belief_sigma = %format!("{:.6}", market_params.belief_expected_sigma),
+                    drift_prob_bullish = %format!("{:.2}", beliefs.prob_bullish()),
+                    drift_prob_bearish = %format!("{:.2}", beliefs.prob_bearish()),
+                    n_price_obs = beliefs.n_price_obs,
+                    is_active = is_active,
+                    "Belief system status (active when confidence > 0.3)"
+                );
+            }
+        }
+
         // FIX: Wire p_momentum_continue from actual momentum model
         // (p_continuation was computed earlier from self.estimator.momentum_continuation_probability())
         // This was hardcoded to 0.5 in aggregator.rs, causing Quote Gate to never open
@@ -383,6 +454,39 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 p_extreme = %format!("{:.2}", p_extreme),
                 "HMM regime probabilities"
             );
+        }
+
+        // === Lead-Lag Signal Integration ===
+        // Wire cross-exchange lead-lag signal for predictive skew
+        // Uses Binance → Hyperliquid price discovery when lag analyzer is warmed up
+        let lag_model = &self.stochastic.model_calibration.lag_model;
+        if lag_model.is_warmed_up() {
+            let analyzer = lag_model.analyzer();
+            let mi = analyzer.best_lag_mi();
+            let lag_ms = analyzer.best_lag_ms();
+
+            // Confidence based on mutual information (0.02 bits = threshold, 0.1 bits = full)
+            let confidence = ((mi - 0.02) / 0.08).clamp(0.0, 1.0);
+            market_params.lead_lag_confidence = confidence;
+
+            // Signal: use momentum_bps scaled by lag confidence as proxy
+            // TODO: Replace with actual Binance return when external feed is available
+            // For now, momentum serves as directional signal amplified by lead-lag confidence
+            if lag_ms < 0 && confidence > 0.3 {
+                // Negative lag = signal leads target (Binance leads Hyperliquid)
+                // Amplify momentum signal by confidence
+                market_params.lead_lag_signal_bps = market_params.momentum_bps * confidence * 0.5;
+
+                if market_params.lead_lag_signal_bps.abs() > 1.0 {
+                    debug!(
+                        lag_ms = lag_ms,
+                        mi = %format!("{:.4}", mi),
+                        confidence = %format!("{:.2}", confidence),
+                        signal_bps = %format!("{:.2}", market_params.lead_lag_signal_bps),
+                        "Lead-lag signal active"
+                    );
+                }
+            }
         }
 
         // Get spread multiplier from circuit breaker if applicable
@@ -1063,6 +1167,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             explore,
         );
 
+        // Store state-action pair for credit assignment when fill occurs
+        self.stochastic.rl_agent.set_last_state_action(
+            mdp_state.clone(),
+            rl_recommendation.action.clone(),
+        );
+
         // Populate MarketParams with RL recommendations
         market_params.rl_spread_delta_bps = rl_recommendation.spread_delta_bps;
         market_params.rl_bid_skew_bps = rl_recommendation.bid_skew_bps;
@@ -1150,7 +1260,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
 
         // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds
-        let changepoint_prob = self.stochastic.controller.changepoint_summary().cp_prob_5;
+        // IMPORTANT: Only use changepoint probability after BOCD warmup to avoid
+        // false positives at startup (BOCD always shows cp_prob=1.0 before warmup)
+        let cp_summary = self.stochastic.controller.changepoint_summary();
+        let changepoint_prob = if cp_summary.warmed_up {
+            cp_summary.cp_prob_5
+        } else {
+            // Log during warmup so we can verify the fix is working
+            if cp_summary.observation_count % 10 == 0 || cp_summary.observation_count < 5 {
+                debug!(
+                    raw_cp_prob = %format!("{:.3}", cp_summary.cp_prob_5),
+                    observations = cp_summary.observation_count,
+                    entropy = %format!("{:.2}", cp_summary.entropy),
+                    "BOCD warmup: ignoring changepoint probability (would cause false quote pulling)"
+                );
+            }
+            0.0 // Ignore changepoint during warmup
+        };
         let quote_gate_decision = if self.stochastic.stochastic_config.enable_calibrated_quote_gate
         {
             // Use theoretical edge fallback when IR not calibrated
@@ -1210,6 +1336,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             QuoteGateDecision::QuoteBoth => {
                 // Normal path - quote both sides with skew
             }
+            QuoteGateDecision::WidenSpreads { multiplier, changepoint_prob } => {
+                // Changepoint pending confirmation - apply spread widening
+                info!(
+                    multiplier = %format!("{:.2}", multiplier),
+                    changepoint_prob = %format!("{:.3}", changepoint_prob),
+                    "Quote gate: widening spreads (changepoint pending)"
+                );
+                // Update market_params with the widening multiplier and changepoint_prob
+                market_params.spread_widening_mult = *multiplier;
+                market_params.changepoint_prob = *changepoint_prob;
+            }
         }
 
         // Try multi-level ladder quoting first
@@ -1257,9 +1394,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         bid_quotes.clear();
                     }
                 }
-                QuoteGateDecision::QuoteBoth | QuoteGateDecision::NoQuote { .. } => {
+                QuoteGateDecision::QuoteBoth
+                | QuoteGateDecision::NoQuote { .. }
+                | QuoteGateDecision::WidenSpreads { .. } => {
                     // QuoteBoth: normal, no filtering
                     // NoQuote: should have returned early, but defensive
+                    // WidenSpreads: quote both sides (spread widening applied earlier)
                 }
             }
 
@@ -1267,6 +1407,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
             // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)
             let margin_state = self.infra.margin_sizer.state();
+            // Get unrealized P&L for underwater position protection
+            let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
                 max_position: self.effective_max_position,
@@ -1279,6 +1421,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 liquidation_price: margin_state.liquidation_price,
                 liquidation_buffer_ratio: margin_state.liquidation_buffer_ratio(),
                 liquidation_trigger_threshold: quoting::DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
+                // Underwater position protection - prevents forcing sales at a loss
+                unrealized_pnl,
             };
             let reduce_only_result = quoting::QuoteFilter::apply_reduce_only_with_exchange_limits(
                 &mut bid_quotes,
@@ -1411,15 +1555,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         bid = None;
                     }
                 }
-                QuoteGateDecision::QuoteBoth | QuoteGateDecision::NoQuote { .. } => {
+                QuoteGateDecision::QuoteBoth
+                | QuoteGateDecision::NoQuote { .. }
+                | QuoteGateDecision::WidenSpreads { .. } => {
                     // QuoteBoth: normal, no filtering
                     // NoQuote: should have returned early, but defensive
+                    // WidenSpreads: quote both sides (spread widening applied earlier)
                 }
             }
 
             // Reduce-only mode: when over max position, position value, OR margin utilization
             // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)
             let margin_state = self.infra.margin_sizer.state();
+            // Get unrealized P&L for underwater position protection
+            let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
                 max_position: self.effective_max_position,
@@ -1432,6 +1581,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 liquidation_price: margin_state.liquidation_price,
                 liquidation_buffer_ratio: margin_state.liquidation_buffer_ratio(),
                 liquidation_trigger_threshold: quoting::DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
+                // Underwater position protection - prevents forcing sales at a loss
+                unrealized_pnl,
             };
             quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
 

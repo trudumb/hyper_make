@@ -74,6 +74,12 @@ pub struct CalibratedRiskModel {
     /// Per unit model_uncertainty from kappa_ci_width [0, 1]
     pub beta_uncertainty: f64,
 
+    /// Per unit position_direction_confidence [0, 1]
+    /// NEGATIVE coefficient: high confidence → LOWER gamma → more two-sided quoting
+    /// confidence=1 → exp(-0.4) ≈ 0.67× gamma
+    /// This replaces magic threshold logic in quote_gate with principled gamma modulation
+    pub beta_confidence: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -115,6 +121,9 @@ impl Default for CalibratedRiskModel {
             beta_book_depth: 0.3,
             // full uncertainty → exp(0.2) ≈ 1.2× gamma
             beta_uncertainty: 0.2,
+            // NEGATIVE: high confidence → lower gamma (more two-sided quoting)
+            // confidence=1 → exp(-0.4) ≈ 0.67× gamma
+            beta_confidence: -0.4,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -151,6 +160,8 @@ impl CalibratedRiskModel {
             beta_hawkes: 0.6,
             beta_book_depth: 0.45,
             beta_uncertainty: 0.3,
+            // Less negative during warmup (more cautious about confidence)
+            beta_confidence: -0.2,
             ..Default::default()
         }
     }
@@ -162,6 +173,9 @@ impl CalibratedRiskModel {
     /// log(γ) = log(γ_base) + Σ βᵢ × xᵢ
     /// γ = exp(log_gamma).clamp(γ_min, γ_max)
     /// ```
+    ///
+    /// Note: beta_confidence is NEGATIVE, so high confidence DECREASES gamma,
+    /// leading to tighter two-sided quotes when position is from informed flow.
     pub fn compute_gamma(&self, features: &RiskFeatures) -> f64 {
         let log_gamma = self.log_gamma_base
             + self.beta_volatility * features.excess_volatility
@@ -169,7 +183,8 @@ impl CalibratedRiskModel {
             + self.beta_inventory * features.inventory_fraction
             + self.beta_hawkes * features.excess_intensity
             + self.beta_book_depth * features.depth_depletion
-            + self.beta_uncertainty * features.model_uncertainty;
+            + self.beta_uncertainty * features.model_uncertainty
+            + self.beta_confidence * features.position_direction_confidence;
 
         log_gamma.exp().clamp(self.gamma_min, self.gamma_max)
     }
@@ -235,6 +250,8 @@ impl CalibratedRiskModel {
                 + defaults.beta_book_depth * alpha,
             beta_uncertainty: self.beta_uncertainty * (1.0 - alpha)
                 + defaults.beta_uncertainty * alpha,
+            beta_confidence: self.beta_confidence * (1.0 - alpha)
+                + defaults.beta_confidence * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -270,6 +287,13 @@ pub struct RiskFeatures {
 
     /// Model uncertainty from kappa_ci_width, normalized [0, 1]
     pub model_uncertainty: f64,
+
+    /// Position direction confidence [0, 1].
+    /// High confidence (>0.5) = position likely from informed flow.
+    /// Based on: fill alignment, belief drift alignment, time held without adverse move.
+    /// When high, beta_confidence (negative) REDUCES gamma → more two-sided quoting.
+    /// When low, gamma stays high → natural urgency to reduce position.
+    pub position_direction_confidence: f64,
 }
 
 impl RiskFeatures {
@@ -324,6 +348,18 @@ impl RiskFeatures {
         // CI width of 0.3 (converged) → 0.1, CI width of 3.0 → 1.0
         let model_uncertainty = (params.kappa_ci_width / 3.0).clamp(0.0, 1.0);
 
+        // === Position Direction Confidence ===
+        // Use pre-computed value from MarketParams if available, else compute from params
+        let position_direction_confidence = if params.position_direction_confidence > 0.01
+            && params.position_direction_confidence < 0.99
+        {
+            // Use pre-computed value
+            params.position_direction_confidence
+        } else {
+            // Compute on-the-fly using the MarketParams method
+            params.compute_position_direction_confidence(position, max_position)
+        };
+
         Self {
             excess_volatility,
             toxicity_score,
@@ -331,6 +367,7 @@ impl RiskFeatures {
             excess_intensity,
             depth_depletion,
             model_uncertainty,
+            position_direction_confidence,
         }
     }
 
@@ -343,6 +380,7 @@ impl RiskFeatures {
             excess_intensity: 0.0,
             depth_depletion: 0.0,
             model_uncertainty: 0.0,
+            position_direction_confidence: 0.5, // Neutral confidence
         }
     }
 
@@ -355,6 +393,7 @@ impl RiskFeatures {
             excess_intensity: 3.0,
             depth_depletion: 1.0,
             model_uncertainty: 1.0,
+            position_direction_confidence: 0.0, // No confidence → high gamma
         }
     }
 
@@ -406,6 +445,10 @@ impl RiskFeatures {
         // Higher p_informed suggests more uncertainty about flow
         let model_uncertainty = state.p_informed.clamp(0.0, 1.0);
 
+        // Position direction confidence - not available in MarketState, use neutral
+        // This is only used in live trading context anyway
+        let position_direction_confidence = 0.5;
+
         Self {
             excess_volatility,
             toxicity_score,
@@ -413,6 +456,7 @@ impl RiskFeatures {
             excess_intensity,
             depth_depletion,
             model_uncertainty,
+            position_direction_confidence,
         }
     }
 }
@@ -473,17 +517,24 @@ mod tests {
     }
 
     #[test]
-    fn test_neutral_features_give_base_gamma() {
+    fn test_neutral_features_give_expected_gamma() {
         let model = CalibratedRiskModel::default();
         let neutral = RiskFeatures::neutral();
 
         let gamma = model.compute_gamma(&neutral);
 
-        // With neutral features, gamma should be close to base (0.15)
+        // With neutral features:
+        // - All risk features are 0
+        // - position_direction_confidence = 0.5 (neutral)
+        // - beta_confidence = -0.4
+        // So: log(gamma) = log(0.15) + (-0.4 * 0.5) = log(0.15) - 0.2
+        // gamma = exp(log(0.15) - 0.2) ≈ 0.122
+        let expected = (0.15_f64.ln() - 0.4 * 0.5).exp();
         assert!(
-            (gamma - 0.15).abs() < 0.01,
-            "Neutral features should give base gamma: got {}",
-            gamma
+            (gamma - expected).abs() < 0.01,
+            "Neutral features should give expected gamma: got {}, expected {}",
+            gamma,
+            expected
         );
     }
 
@@ -498,6 +549,7 @@ mod tests {
             excess_intensity: 0.5,
             depth_depletion: 0.5,
             model_uncertainty: 0.5,
+            position_direction_confidence: 0.5, // Neutral confidence
         };
 
         let gamma_neutral = model.compute_gamma(&neutral);
@@ -547,6 +599,45 @@ mod tests {
         assert!(
             (blended_zero.beta_volatility - model.beta_volatility).abs() < 0.01,
             "Zero blend should preserve original"
+        );
+    }
+
+    #[test]
+    fn test_high_confidence_reduces_gamma() {
+        let model = CalibratedRiskModel::default();
+
+        // Low confidence (adverse position) → higher gamma
+        let low_confidence = RiskFeatures {
+            position_direction_confidence: 0.0,
+            ..Default::default()
+        };
+
+        // High confidence (informed position) → lower gamma
+        let high_confidence = RiskFeatures {
+            position_direction_confidence: 1.0,
+            ..Default::default()
+        };
+
+        let gamma_low_conf = model.compute_gamma(&low_confidence);
+        let gamma_high_conf = model.compute_gamma(&high_confidence);
+
+        // beta_confidence is NEGATIVE, so:
+        // high confidence → exp(beta * 1.0) = exp(-0.4) ≈ 0.67× gamma
+        // low confidence → exp(beta * 0.0) = 1.0× gamma
+        assert!(
+            gamma_high_conf < gamma_low_conf,
+            "High confidence should REDUCE gamma: high={}, low={}",
+            gamma_high_conf,
+            gamma_low_conf
+        );
+
+        // The ratio should be approximately exp(-0.4) ≈ 0.67
+        let ratio = gamma_high_conf / gamma_low_conf;
+        let expected_ratio = (-0.4_f64).exp();
+        assert!(
+            (ratio - expected_ratio).abs() < 0.01,
+            "Ratio should be exp(-0.4) ≈ 0.67: got {}",
+            ratio
         );
     }
 }

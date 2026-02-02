@@ -445,6 +445,18 @@ pub struct StochasticConfig {
     ///
     /// Default: false (enable after collecting calibration data)
     pub enable_calibrated_quote_gate: bool,
+
+    // ==================== Predictive Bias Extension (A-S Model) ====================
+    /// Sensitivity for predictive bias β_t calculation.
+    /// β_t = -sensitivity × prob_excess × σ
+    /// Higher values = more aggressive skew when changepoint is detected.
+    /// Default: 2.0 (expect 2σ move on confirmed changepoint)
+    pub predictive_bias_sensitivity: f64,
+
+    /// Minimum changepoint probability to activate predictive bias.
+    /// Below this threshold, no predictive bias is applied.
+    /// Default: 0.3
+    pub predictive_bias_threshold: f64,
 }
 
 impl Default for StochasticConfig {
@@ -553,13 +565,18 @@ impl Default for StochasticConfig {
             quote_gate_max_position_before_reduce_only: 0.7, // 70% of max = reduce only
             quote_gate_cascade_protection: true,
             quote_gate_cascade_threshold: 0.3,              // 70% cascade severity
-            // API BUDGET CONSERVATION: Default false to avoid quoting in sideways markets
-            // Set --quote-flat-without-edge to enable market-making mode
-            quote_gate_flat_without_edge: false,            // Conserve API budget: only quote with edge
+            // MARKET MAKING MODE: Quote both sides even without edge signal
+            // Market makers profit from spread capture, not direction
+            quote_gate_flat_without_edge: true,             // Enable market-making mode
 
             // Calibrated Quote Gate (IR-Based Thresholds)
             // ENABLED: Uses IR > 1.0 instead of arbitrary 0.15 threshold
             enable_calibrated_quote_gate: true,
+
+            // Predictive Bias Extension (A-S Model)
+            // Sensitivity and threshold for predictive skew from changepoint detection
+            predictive_bias_sensitivity: 2.0, // 2σ expected move on confirmed changepoint
+            predictive_bias_threshold: 0.3,   // Activate when cp_prob > 30%
 
             // Calibrated Risk Model (Log-Additive Gamma)
             // ENABLED: Use log-additive gamma to prevent multiplicative explosion
@@ -688,6 +705,8 @@ impl StochasticConfig {
             min_ir_outcomes_for_trust: 25, // Default: require meaningful IR data
             probe_config: crate::market_maker::control::ProbeConfig::default(),
             bootstrap_config: crate::market_maker::control::BayesianBootstrapConfig::default(),
+            // Default to ThinDex for conservative changepoint thresholds
+            market_regime: crate::market_maker::control::MarketRegime::ThinDex,
         }
     }
 }

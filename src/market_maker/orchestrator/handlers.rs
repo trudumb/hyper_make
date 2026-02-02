@@ -72,7 +72,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
 
-            self.update_quotes().await
+            // === Phase 3: Event-Driven Quote Updates ===
+            // Instead of calling update_quotes() on every AllMids, record the event
+            // to the accumulator. The event loop will check should_trigger() and
+            // call update_quotes() only when meaningful events have accumulated.
+            if self.event_accumulator.is_enabled() {
+                // Record mid price update - only triggers if move exceeds threshold (default 5 bps)
+                let _trigger = self.event_accumulator.on_mid_update(self.latest_mid);
+                // Note: actual reconciliation happens in event loop via check_event_accumulator()
+                Ok(())
+            } else {
+                // Fallback: event-driven mode disabled, use original timed polling
+                self.update_quotes().await
+            }
         } else {
             Ok(())
         }
@@ -345,27 +357,46 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         was_adverse,
                     );
 
-                    // Infer the action from current spread/skew (simplified)
-                    // In production, we'd track the actual action taken when quoting
-                    let action = MDPAction::default();
+                    // Get the actual state-action pair that was used when quoting
+                    // This enables proper credit assignment for Q-learning
+                    if let Some((state, action)) = self.stochastic.rl_agent.take_last_state_action()
+                    {
+                        // Update Q-values with the transition using the ACTUAL action
+                        self.stochastic.rl_agent.update(
+                            state,
+                            action.clone(),
+                            reward,
+                            current_state,
+                            false, // not done
+                        );
 
-                    // Update Q-values with the transition
-                    // next_state = current_state (no episode termination)
-                    self.stochastic.rl_agent.update(
-                        current_state.clone(),
-                        action,
-                        reward,
-                        current_state,
-                        false, // not done
-                    );
-
-                    debug!(
-                        realized_edge_bps = %format!("{:.2}", realized_edge_bps),
-                        inventory_risk = %format!("{:.3}", inventory_risk),
-                        reward_total = %format!("{:.3}", reward.total),
-                        was_adverse = was_adverse,
-                        "RL agent updated from fill"
-                    );
+                        debug!(
+                            realized_edge_bps = %format!("{:.2}", realized_edge_bps),
+                            inventory_risk = %format!("{:.3}", inventory_risk),
+                            reward_total = %format!("{:.3}", reward.total),
+                            was_adverse = was_adverse,
+                            action_spread = %format!("{:.1}", action.spread.delta_bps()),
+                            action_skew = %format!("{:.1}", action.skew.bid_skew_bps()),
+                            "RL agent updated from fill (actual action)"
+                        );
+                    } else {
+                        // Fallback: no stored action (shouldn't happen normally)
+                        let action = MDPAction::default();
+                        self.stochastic.rl_agent.update(
+                            current_state.clone(),
+                            action,
+                            reward,
+                            current_state,
+                            false,
+                        );
+                        debug!(
+                            realized_edge_bps = %format!("{:.2}", realized_edge_bps),
+                            inventory_risk = %format!("{:.3}", inventory_risk),
+                            reward_total = %format!("{:.3}", reward.total),
+                            was_adverse = was_adverse,
+                            "RL agent updated from fill (default action - no stored state)"
+                        );
+                    }
 
                     // === Competitor Model Observation ===
                     // Estimate queue position from depth
@@ -449,8 +480,35 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.infra.last_margin_refresh = std::time::Instant::now();
         }
 
+        // === Phase 3: Event-Driven Quote Updates ===
+        // Instead of calling update_quotes() on every fill, record fill events
+        // to the accumulator. Fills are high-priority and typically trigger immediately.
         if result.should_update_quotes {
-            self.update_quotes().await
+            if self.event_accumulator.is_enabled() {
+                // Record fill events for each processed fill
+                for fill in &user_fills.data.fills {
+                    if fill.coin != *self.config.asset {
+                        continue;
+                    }
+                    let side = if fill.side == "B" || fill.side.to_lowercase() == "buy" {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    };
+                    let size: f64 = fill.sz.parse().unwrap_or(0.0);
+                    // Track if this was a full fill (remaining size = 0)
+                    // Check if order is now fully filled by looking at orders tracker
+                    // Check if this was a full fill (remaining size = 0)
+                    // remaining = size - filled; if order not found, assume full fill
+                    let is_full_fill = self.orders.get_order(fill.oid).map_or(true, |o| o.size - o.filled <= 0.0);
+                    let _trigger = self.event_accumulator.on_fill(side, fill.oid, size, is_full_fill);
+                }
+                // Note: actual reconciliation happens in event loop via check_event_accumulator()
+                Ok(())
+            } else {
+                // Fallback: event-driven mode disabled, use original timed polling
+                self.update_quotes().await
+            }
         } else {
             Ok(())
         }
@@ -1043,5 +1101,70 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position = %format!("{:.4}", self.position.position()),
             "Periodic component update (Phase 2/3 components not yet wired)"
         );
+    }
+
+    /// Check event accumulator and trigger quote update if needed.
+    ///
+    /// # Phase 3: Event-Driven Churn Reduction
+    ///
+    /// This method checks if accumulated events should trigger a quote update.
+    /// It replaces the previous approach where every AllMids message triggered
+    /// a full reconciliation cycle.
+    ///
+    /// Events are only triggered when:
+    /// - Mid price moves > threshold (default 5 bps)
+    /// - A fill is received (high priority)
+    /// - Queue depletion detected (P(fill) < 5%)
+    /// - Signal changes significantly
+    /// - Fallback timer expires (default 5s)
+    ///
+    /// This reduces order churn from ~94% to target 20-40% by only
+    /// reconciling when meaningful changes have occurred.
+    pub(crate) async fn check_event_accumulator(&mut self) -> crate::prelude::Result<()> {
+        // Skip if event-driven mode is disabled
+        if !self.event_accumulator.is_enabled() {
+            return Ok(());
+        }
+
+        // Check if we should trigger based on accumulated events
+        if let Some(trigger) = self.event_accumulator.should_trigger() {
+            debug!(
+                event = ?trigger.event,
+                scope = ?trigger.scope,
+                priority = trigger.priority(),
+                "Event accumulator: triggering quote update"
+            );
+
+            // Call update_quotes to perform the reconciliation
+            self.update_quotes().await?;
+
+            // Reset the accumulator after successful reconciliation
+            self.event_accumulator.reset();
+
+            // Log stats periodically
+            let stats = self.event_accumulator.stats();
+            if stats.total_reconciles % 100 == 0 {
+                info!(
+                    total_events = stats.total_events,
+                    total_reconciles = stats.total_reconciles,
+                    filter_ratio = %format!("{:.1}%", stats.filter_ratio() * 100.0),
+                    reconcile_frequency = %format!("{:.3}", stats.reconcile_frequency()),
+                    "Event accumulator stats (churn reduction)"
+                );
+            }
+        }
+
+        // Also check fallback timer (ensures quotes don't become stale)
+        if let Some(fallback_trigger) = self.event_accumulator.check_fallback() {
+            debug!(
+                event = ?fallback_trigger.event,
+                "Event accumulator: fallback timer triggered"
+            );
+
+            self.update_quotes().await?;
+            self.event_accumulator.reset();
+        }
+
+        Ok(())
     }
 }

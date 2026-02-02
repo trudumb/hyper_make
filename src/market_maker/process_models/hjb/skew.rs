@@ -5,6 +5,11 @@ use crate::market_maker::estimator::TrendSignal;
 use super::controller::HJBInventoryController;
 use super::summary::{DriftAdjustedSkew, HJBSummary};
 
+/// Default predictive bias threshold (minimum changepoint_prob to activate).
+const DEFAULT_PREDICTIVE_BIAS_THRESHOLD: f64 = 0.3;
+/// Default predictive bias sensitivity (σ multiplier).
+const DEFAULT_PREDICTIVE_BIAS_SENSITIVITY: f64 = 2.0;
+
 impl HJBInventoryController {
     /// Compute optimal inventory skew from HJB solution.
     ///
@@ -60,6 +65,58 @@ impl HJBInventoryController {
         self.optimal_skew(position, max_position) * 10000.0
     }
 
+    /// Compute predictive bias from changepoint probability.
+    ///
+    /// Returns a bias term β_t to add to the A-S skew formula:
+    /// ```text
+    /// δ^b = δ - γσ²qT/2 + β_t/2    (bid offset + predictive shift)
+    /// δ^a = δ + γσ²qT/2 + β_t/2    (ask offset + predictive shift)
+    /// ```
+    ///
+    /// Where β_t = -sensitivity × prob_excess × σ:
+    /// - Negative β_t (predict down): Widen bids, narrow asks → sell aggressively
+    /// - Positive β_t (predict up): Narrow bids, widen asks → buy aggressively
+    ///
+    /// # Arguments
+    /// * `changepoint_prob` - Probability of regime change [0, 1] from BOCD
+    /// * `sigma` - Current volatility estimate (per-second fractional)
+    /// * `sensitivity` - Bias sensitivity (default: 2.0 = expect 2σ move)
+    /// * `threshold` - Minimum prob to activate (default: 0.3)
+    ///
+    /// # Returns
+    /// Predictive bias in fractional units. Negative = expect price to fall.
+    pub fn predictive_bias(
+        changepoint_prob: f64,
+        sigma: f64,
+        sensitivity: f64,
+        threshold: f64,
+    ) -> f64 {
+        // Ramp function: only activate above baseline prob
+        // Maps [threshold, 1.0] → [0.0, 1.0]
+        if changepoint_prob <= threshold {
+            return 0.0;
+        }
+
+        let prob_excess = (changepoint_prob - threshold) / (1.0 - threshold);
+
+        // Negative bias = expect price to fall = widen bids, tighten asks
+        // During regime changes (high changepoint prob), we expect downside moves
+        // so we preemptively skew to reduce long exposure / avoid buying
+        -sensitivity * prob_excess * sigma
+    }
+
+    /// Compute predictive bias with default parameters.
+    ///
+    /// Uses DEFAULT_PREDICTIVE_BIAS_SENSITIVITY (2.0) and DEFAULT_PREDICTIVE_BIAS_THRESHOLD (0.3).
+    pub fn predictive_bias_default(changepoint_prob: f64, sigma: f64) -> f64 {
+        Self::predictive_bias(
+            changepoint_prob,
+            sigma,
+            DEFAULT_PREDICTIVE_BIAS_SENSITIVITY,
+            DEFAULT_PREDICTIVE_BIAS_THRESHOLD,
+        )
+    }
+
     /// Compute drift-adjusted optimal skew from HJB solution with momentum.
     ///
     /// # Theory
@@ -104,6 +161,7 @@ impl HJBInventoryController {
                 total_skew: base_skew,
                 base_skew,
                 drift_urgency: 0.0,
+                predictive_bias: 0.0,
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
@@ -118,6 +176,7 @@ impl HJBInventoryController {
                 total_skew: base_skew,
                 base_skew,
                 drift_urgency: 0.0,
+                predictive_bias: 0.0,
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
@@ -152,6 +211,7 @@ impl HJBInventoryController {
                 total_skew: base_skew,
                 base_skew,
                 drift_urgency: 0.0,
+                predictive_bias: 0.0,
                 variance_multiplier: 1.0,
                 is_opposed,
                 urgency_score: 0.0,
@@ -229,6 +289,7 @@ impl HJBInventoryController {
             total_skew: base_skew + drift_urgency,
             base_skew,
             drift_urgency,
+            predictive_bias: 0.0,
             variance_multiplier: variance_multiplier_capped,
             is_opposed,
             urgency_score: urgency_score.min(5.0),
@@ -284,6 +345,7 @@ impl HJBInventoryController {
                 total_skew: base_skew,
                 base_skew,
                 drift_urgency: 0.0,
+                predictive_bias: 0.0,
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
@@ -298,6 +360,7 @@ impl HJBInventoryController {
                 total_skew: base_skew,
                 base_skew,
                 drift_urgency: 0.0,
+                predictive_bias: 0.0,
                 variance_multiplier: 1.0,
                 is_opposed: false,
                 urgency_score: 0.0,
@@ -357,6 +420,7 @@ impl HJBInventoryController {
                 total_skew: base_skew,
                 base_skew,
                 drift_urgency: 0.0,
+                predictive_bias: 0.0,
                 variance_multiplier: 1.0,
                 is_opposed,
                 urgency_score: 0.0,
@@ -428,6 +492,7 @@ impl HJBInventoryController {
             total_skew: base_skew + drift_urgency,
             base_skew,
             drift_urgency,
+            predictive_bias: 0.0,
             variance_multiplier: variance_multiplier_capped,
             is_opposed,
             urgency_score: urgency_score.min(6.0), // Max now 6.0 with trend

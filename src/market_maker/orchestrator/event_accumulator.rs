@@ -21,30 +21,32 @@ use crate::market_maker::events::quote_trigger::{
 use crate::market_maker::tracking::Side;
 
 /// Tracks which parts of the ladder are affected by pending events.
+#[allow(dead_code)] // WIP: Will be used when event handlers are wired
 #[derive(Debug, Clone, Default)]
-pub(crate) struct AffectedTracker {
+struct AffectedTracker {
     /// Whether bids are affected.
-    pub(crate) bids_affected: bool,
+    bids_affected: bool,
     /// Whether asks are affected.
-    pub(crate) asks_affected: bool,
+    asks_affected: bool,
     /// Specific order IDs affected.
-    pub(crate) affected_oids: Vec<u64>,
+    affected_oids: Vec<u64>,
     /// Accumulated price move (bps).
-    pub(crate) accumulated_price_move_bps: f64,
+    accumulated_price_move_bps: f64,
     /// Whether a fill occurred.
-    pub(crate) had_fill: bool,
+    had_fill: bool,
     /// Maximum event priority seen.
-    pub(crate) max_priority: u8,
+    max_priority: u8,
 }
 
+#[allow(dead_code)] // WIP: Methods will be used when event handlers are wired
 impl AffectedTracker {
     /// Create a new affected tracker.
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// Record an event that affects a side.
-    pub(crate) fn record_side(&mut self, side: Side, priority: u8) {
+    fn record_side(&mut self, side: Side, priority: u8) {
         match side {
             Side::Buy => self.bids_affected = true,
             Side::Sell => self.asks_affected = true,
@@ -53,7 +55,7 @@ impl AffectedTracker {
     }
 
     /// Record an event that affects a specific order.
-    pub(crate) fn record_order(&mut self, oid: u64, side: Side, priority: u8) {
+    fn record_order(&mut self, oid: u64, side: Side, priority: u8) {
         if !self.affected_oids.contains(&oid) {
             self.affected_oids.push(oid);
         }
@@ -61,7 +63,7 @@ impl AffectedTracker {
     }
 
     /// Record a price move.
-    pub(crate) fn record_price_move(&mut self, delta_bps: f64, priority: u8) {
+    fn record_price_move(&mut self, delta_bps: f64, priority: u8) {
         self.accumulated_price_move_bps += delta_bps;
         self.bids_affected = true;
         self.asks_affected = true;
@@ -69,13 +71,13 @@ impl AffectedTracker {
     }
 
     /// Record a fill.
-    pub(crate) fn record_fill(&mut self, side: Side, oid: u64, priority: u8) {
+    fn record_fill(&mut self, side: Side, oid: u64, priority: u8) {
         self.had_fill = true;
         self.record_order(oid, side, priority);
     }
 
     /// Convert to reconcile scope.
-    pub(crate) fn to_scope(&self) -> ReconcileScope {
+    fn to_scope(&self) -> ReconcileScope {
         if !self.bids_affected && !self.asks_affected {
             return ReconcileScope::None;
         }
@@ -109,12 +111,13 @@ impl AffectedTracker {
     }
 
     /// Reset the tracker.
-    pub(crate) fn reset(&mut self) {
+    fn reset(&mut self) {
         *self = Self::default();
     }
 }
 
 /// Accumulates events and decides when to trigger reconciliation.
+#[allow(dead_code)] // WIP: Fields will be used when event handlers are wired
 #[derive(Debug)]
 pub(crate) struct EventAccumulator {
     config: EventDrivenConfig,
@@ -144,6 +147,7 @@ pub(crate) struct EventAccumulator {
     events_filtered: u64,
 }
 
+#[allow(dead_code)] // WIP: Methods will be used when event handlers are wired
 impl EventAccumulator {
     /// Create a new event accumulator.
     pub(crate) fn new(config: EventDrivenConfig) -> Self {
@@ -418,6 +422,7 @@ impl EventAccumulator {
 }
 
 /// Statistics for event accumulator.
+#[allow(dead_code)] // WIP: Will be used for monitoring when event handlers are wired
 #[derive(Debug, Clone)]
 pub(crate) struct EventAccumulatorStats {
     pub(crate) total_events: u64,
@@ -429,6 +434,7 @@ pub(crate) struct EventAccumulatorStats {
     pub(crate) max_pending_priority: u8,
 }
 
+#[allow(dead_code)] // WIP: Methods will be used for monitoring
 impl EventAccumulatorStats {
     /// Calculate filter ratio (events filtered / total events).
     pub(crate) fn filter_ratio(&self) -> f64 {

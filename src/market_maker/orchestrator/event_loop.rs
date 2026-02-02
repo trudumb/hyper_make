@@ -373,9 +373,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.stochastic.hjb_controller.start_session();
         debug!("HJB inventory controller session started");
 
-        // Safety sync interval (15 seconds) - catch orphan orders and state divergence more quickly
-        // Reduced from 60s to help catch orders that get out of sync with local tracking
-        let mut sync_interval = tokio::time::interval(Duration::from_secs(15));
+        // Safety sync interval (5 seconds) - catch orphan orders and state divergence more quickly
+        // FIX: Reduced from 15s to 5s to reduce state sync lag
+        // 15s interval was causing SafetySync snapshot to be 1-5s stale
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
         // Skip the immediate first tick
         sync_interval.tick().await;
 
@@ -463,6 +464,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                                 if let Err(e) = self.safety_sync().await {
                                     warn!("Event-driven sync failed: {e}");
                                 }
+                            }
+
+                            // === Phase 3: Event-Driven Quote Updates (Churn Reduction) ===
+                            // Check if accumulated events should trigger a quote update.
+                            // This replaces the previous timed polling approach with
+                            // event-driven updates that only reconcile when meaningful changes occur.
+                            if let Err(e) = self.check_event_accumulator().await {
+                                warn!("Event accumulator quote update failed: {e}");
                             }
                         }
                         None => {

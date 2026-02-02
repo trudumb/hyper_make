@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 
 use super::bayesian_bootstrap::{BayesianBootstrapConfig, BayesianBootstrapTracker, BayesianExitDecision};
 use super::calibrated_edge::{BayesianDecision, CalibratedEdgeSignal};
+use super::changepoint::MarketRegime;
 use super::position_pnl_tracker::PositionPnLTracker;
 use super::theoretical_edge::TheoreticalEdgeEstimator;
 
@@ -52,6 +53,16 @@ pub enum QuoteDecision {
     QuoteOnlyAsks {
         /// Urgency level [0, 1] - higher = more aggressive pricing
         urgency: f64,
+    },
+
+    /// Quote both sides but widen spreads (changepoint pending confirmation)
+    /// Used when: changepoint probability is high but not yet confirmed.
+    /// This fixes the "pending widening" bug where we logged but didn't actually widen.
+    WidenSpreads {
+        /// Spread multiplier [1.0, 2.0+] - how much to widen spreads
+        multiplier: f64,
+        /// Current changepoint probability for logging/diagnostics
+        changepoint_prob: f64,
     },
 
     /// Don't quote at all - wait for signal
@@ -151,6 +162,13 @@ pub struct QuoteGateConfig {
 
     /// Configuration for Bayesian bootstrap tracking.
     pub bootstrap_config: BayesianBootstrapConfig,
+
+    /// Market regime for regime-aware changepoint thresholds.
+    /// ThinDex: High threshold (0.85), requires 2 confirmations
+    /// LiquidCex: Standard threshold (0.5), requires 1 confirmation
+    /// Cascade: Low threshold (0.3), requires 1 confirmation
+    /// Default: ThinDex (conservative for DEX environments)
+    pub market_regime: MarketRegime,
 }
 
 /// Configuration for active probing to generate learning data.
@@ -203,6 +221,7 @@ impl Default for QuoteGateConfig {
             min_ir_outcomes_for_trust: 25,
             probe_config: ProbeConfig::default(),
             bootstrap_config: BayesianBootstrapConfig::default(),
+            market_regime: MarketRegime::ThinDex, // Conservative default for DEX
         }
     }
 }
@@ -441,6 +460,11 @@ impl Default for QuoteGateInput {
 /// Determines WHETHER to quote (and which sides) based on directional edge.
 /// Now includes bistability escape mechanisms to prevent getting stuck in
 /// low-quote attractor states.
+///
+/// Regime-aware changepoint detection:
+/// - ThinDex: threshold=0.85, requires 2 consecutive high-prob signals
+/// - LiquidCex: threshold=0.50, requires 1 confirmation
+/// - Cascade: threshold=0.30, requires 1 confirmation
 #[derive(Debug)]
 pub struct QuoteGate {
     config: QuoteGateConfig,
@@ -450,6 +474,9 @@ pub struct QuoteGate {
     last_quote_time: Option<std::time::Instant>,
     /// Consecutive cycles without quoting (for ε-probing escalation).
     consecutive_no_quote_cycles: u32,
+    /// Consecutive cycles with high changepoint probability.
+    /// Used for confirmation-based regime change detection.
+    consecutive_high_changepoint: u32,
 }
 
 impl Default for QuoteGate {
@@ -467,6 +494,7 @@ impl QuoteGate {
             bootstrap_tracker,
             last_quote_time: None,
             consecutive_no_quote_cycles: 0,
+            consecutive_high_changepoint: 0,
         }
     }
 
@@ -483,6 +511,35 @@ impl QuoteGate {
     /// Get reference to bootstrap tracker.
     pub fn bootstrap_tracker(&self) -> &BayesianBootstrapTracker {
         &self.bootstrap_tracker
+    }
+
+    /// Get the current market regime.
+    pub fn market_regime(&self) -> MarketRegime {
+        self.config.market_regime
+    }
+
+    /// Set the market regime for regime-aware changepoint thresholds.
+    ///
+    /// This allows runtime adaptation based on detected market conditions:
+    /// - ThinDex: High threshold (0.85), requires 2 confirmations
+    /// - LiquidCex: Standard threshold (0.50), requires 1 confirmation
+    /// - Cascade: Low threshold (0.30), requires 1 confirmation
+    pub fn set_market_regime(&mut self, regime: MarketRegime) {
+        if self.config.market_regime != regime {
+            info!(
+                old_regime = ?self.config.market_regime,
+                new_regime = ?regime,
+                "Quote gate: market regime changed"
+            );
+            self.config.market_regime = regime;
+            // Reset confirmation counter on regime change
+            self.consecutive_high_changepoint = 0;
+        }
+    }
+
+    /// Get the current changepoint confirmation count.
+    pub fn changepoint_confirmation_count(&self) -> u32 {
+        self.consecutive_high_changepoint
     }
 
     // =========================================================================
@@ -917,10 +974,17 @@ impl QuoteGate {
             false
         };
 
-        // Decision logic
+        // Decision logic - SIMPLIFIED via gamma modulation
+        //
+        // The position_direction_confidence feature in RiskFeatures handles the
+        // "position from informed flow" case via gamma modulation (beta_confidence < 0):
+        // - High confidence → lower gamma → tighter two-sided quotes
+        // - Low confidence → higher gamma → natural inventory skew via GLFT
+        //
+        // Only go one-sided for EXTREME positions (needs_reduction threshold, e.g. 70%)
         let decision = if has_edge {
             if needs_reduction && !position_aligns_with_edge {
-                // Have edge but large position opposes it → URGENT reduce only
+                // Have edge but VERY large position opposes it → URGENT reduce only
                 let urgency = (position_abs_ratio / 1.0).min(1.0);
                 if input.position > 0.0 {
                     // Long opposing bearish edge → sell urgently
@@ -931,29 +995,35 @@ impl QuoteGate {
                 }
             } else {
                 // Have edge, position is manageable or aligned → quote both with skew
-                // (The skew is handled by the strategy, not the gate)
+                // (The skew is handled by the strategy via gamma modulation)
                 QuoteDecision::QuoteBoth
             }
         } else {
-            // No edge
-            if has_significant_position {
-                // No edge but have position → only quote to reduce
-                let urgency = (position_abs_ratio * 0.5).min(1.0); // Less urgent than opposed
+            // No edge - rely on gamma modulation, not magic thresholds
+            //
+            // PRINCIPLED APPROACH: Position direction confidence modulates gamma:
+            // - High confidence (position from informed fills) → low gamma → quote both tightly
+            // - Low confidence (adverse position) → high gamma → wide spreads + natural skew
+            //
+            // Only go one-sided for EXTREME positions (>70% threshold)
+            if needs_reduction {
+                // Very large position without edge → safety valve: reduce only
+                let urgency = (position_abs_ratio * 0.5).min(1.0);
                 if input.position > 0.0 {
-                    // Long without edge → only sell to reduce
                     QuoteDecision::QuoteOnlyAsks { urgency }
                 } else {
-                    // Short without edge → only buy to reduce
                     QuoteDecision::QuoteOnlyBids { urgency }
                 }
-            } else if self.config.quote_flat_without_edge {
-                // MARKET MAKING MODE: Quote both sides even without edge.
-                // Market makers profit from spread capture, not direction.
-                // Only stop quoting during genuine danger (cascade, toxic regime).
+            } else if self.config.quote_flat_without_edge || has_significant_position {
+                // MARKET MAKING MODE OR moderate position: Quote both sides.
+                // Let gamma modulation via position_direction_confidence handle the risk.
+                // - Informed positions get tight two-sided quotes
+                // - Adverse positions get wide quotes with natural inventory skew
                 debug!(
                     flow_imbalance = %format!("{:.3}", input.flow_imbalance),
                     momentum_conf = %format!("{:.2}", input.momentum_confidence),
-                    "Quote gate: no edge but quoting both (market-making mode)"
+                    has_significant_position = has_significant_position,
+                    "Quote gate: quoting both (gamma modulation handles risk)"
                 );
                 QuoteDecision::QuoteBoth
             } else {
@@ -999,6 +1069,15 @@ impl QuoteGate {
                     momentum_conf = %format!("{:.2}", input.momentum_confidence),
                     has_edge = has_edge,
                     "Quote gate: BOTH SIDES"
+                );
+            }
+            QuoteDecision::WidenSpreads { multiplier, changepoint_prob } => {
+                info!(
+                    multiplier = %format!("{:.2}", multiplier),
+                    changepoint_prob = %format!("{:.3}", changepoint_prob),
+                    flow_imbalance = %format!("{:.3}", input.flow_imbalance),
+                    position_ratio = %format!("{:.2}", position_ratio),
+                    "Quote gate: BOTH SIDES (widened spreads)"
                 );
             }
         }
@@ -1226,7 +1305,7 @@ impl QuoteGate {
     /// * `pnl_tracker` - Position P&L tracker
     /// * `changepoint_prob` - Bayesian changepoint probability (from BOCD)
     pub fn decide_calibrated(
-        &self,
+        &mut self,
         input: &QuoteGateInput,
         edge_signal: &CalibratedEdgeSignal,
         pnl_tracker: &PositionPnLTracker,
@@ -1245,17 +1324,94 @@ impl QuoteGate {
             };
         }
 
-        // 2. Cascade protection using changepoint probability (not arbitrary threshold)
-        // High changepoint_prob means regime shift detected
-        const CHANGEPOINT_CASCADE_THRESHOLD: f64 = 0.70;
-        if self.config.cascade_protection && changepoint_prob > CHANGEPOINT_CASCADE_THRESHOLD {
-            warn!(
-                changepoint_prob = %format!("{:.3}", changepoint_prob),
-                "Quote gate (calibrated): regime change detected, pulling quotes"
-            );
-            return QuoteDecision::NoQuote {
-                reason: NoQuoteReason::Cascade,
-            };
+        // 2. Regime-aware cascade protection using changepoint probability
+        // Different market regimes require different sensitivity levels:
+        // - ThinDex: High threshold (0.85) with 2 confirmations to avoid false positives
+        // - LiquidCex: Standard threshold (0.50) with 1 confirmation
+        // - Cascade: Very sensitive (0.30) with 1 confirmation
+        let (changepoint_threshold, required_confirmations) = match self.config.market_regime {
+            MarketRegime::ThinDex => (0.85, 2),
+            MarketRegime::LiquidCex => (0.50, 1),
+            MarketRegime::Cascade => (0.30, 1),
+        };
+
+        if self.config.cascade_protection {
+            if changepoint_prob > changepoint_threshold {
+                // Increment consecutive high-prob counter
+                self.consecutive_high_changepoint += 1;
+
+                // Only trigger if we have enough confirmations
+                if self.consecutive_high_changepoint >= required_confirmations {
+                    // FIX: Check if position opposes the inferred market direction
+                    // If position opposes flow, accelerate exit instead of pulling all quotes
+                    // This prevents getting stuck with an opposed position during regime change
+                    let position_opposes = (input.position > 0.0 && input.flow_imbalance < -0.3)
+                        || (input.position < 0.0 && input.flow_imbalance > 0.3);
+
+                    if position_opposes && input.position.abs() > input.max_position * 0.01 {
+                        // Accelerate exit instead of pulling all quotes
+                        let urgency = (input.position.abs() / input.max_position).min(1.0);
+                        warn!(
+                            changepoint_prob = %format!("{:.3}", changepoint_prob),
+                            position = %format!("{:.4}", input.position),
+                            flow_imbalance = %format!("{:.3}", input.flow_imbalance),
+                            urgency = %format!("{:.2}", urgency),
+                            regime = ?self.config.market_regime,
+                            "Quote gate: regime change but position opposed - accelerating exit"
+                        );
+                        if input.position > 0.0 {
+                            // Long position + sell pressure → quote asks to reduce
+                            return QuoteDecision::QuoteOnlyAsks { urgency };
+                        } else {
+                            // Short position + buy pressure → quote bids to reduce
+                            return QuoteDecision::QuoteOnlyBids { urgency };
+                        }
+                    }
+
+                    // No position or aligned with flow - safe to pull quotes
+                    warn!(
+                        changepoint_prob = %format!("{:.3}", changepoint_prob),
+                        threshold = %format!("{:.2}", changepoint_threshold),
+                        confirmations = self.consecutive_high_changepoint,
+                        regime = ?self.config.market_regime,
+                        "Quote gate (calibrated): regime change CONFIRMED, pulling quotes"
+                    );
+                    return QuoteDecision::NoQuote {
+                        reason: NoQuoteReason::Cascade,
+                    };
+                } else {
+                    // Pending confirmation - return WidenSpreads instead of just logging
+                    // This fixes the bug where we logged "widening spreads" but didn't actually widen
+                    let confirmations = self.consecutive_high_changepoint;
+                    let progress = confirmations as f64 / required_confirmations as f64;
+                    // Spread multiplier ramps from 1.0 to 2.0 as confirmations increase
+                    let multiplier = 1.0 + progress;
+
+                    info!(
+                        changepoint_prob = %format!("{:.3}", changepoint_prob),
+                        threshold = %format!("{:.2}", changepoint_threshold),
+                        confirmations = confirmations,
+                        required = required_confirmations,
+                        regime = ?self.config.market_regime,
+                        spread_mult = %format!("{:.2}", multiplier),
+                        "Quote gate: changepoint pending confirmation, applying spread widening"
+                    );
+                    return QuoteDecision::WidenSpreads {
+                        multiplier,
+                        changepoint_prob,
+                    };
+                }
+            } else {
+                // Reset counter when probability drops below threshold
+                if self.consecutive_high_changepoint > 0 {
+                    debug!(
+                        changepoint_prob = %format!("{:.3}", changepoint_prob),
+                        previous_confirmations = self.consecutive_high_changepoint,
+                        "Quote gate: changepoint probability subsided, resetting counter"
+                    );
+                }
+                self.consecutive_high_changepoint = 0;
+            }
         }
 
         // Also use cascade_size_factor as a fallback (empirical market data)
@@ -1371,10 +1527,19 @@ impl QuoteGate {
             false
         };
 
-        // Decision logic (same structure as original, but with calibrated thresholds)
+        // Decision logic - SIMPLIFIED via gamma modulation
+        //
+        // The position_direction_confidence feature in RiskFeatures now handles the
+        // "position from informed flow" case via gamma modulation (beta_confidence < 0):
+        // - High confidence → lower gamma → tighter two-sided quotes
+        // - Low confidence → higher gamma → natural inventory skew via GLFT
+        //
+        // This removes magic threshold-based one-sided quoting in favor of the
+        // principled GLFT formula: δ = (1/γ) × ln(1 + γ/κ) with inventory skew.
         let decision = if has_edge {
             if needs_reduction && !position_aligns_with_edge {
-                // Have edge but large position opposes it → URGENT reduce only
+                // Have edge but VERY large position opposes it → URGENT reduce only
+                // This is a safety valve for extreme positions only (e.g., >70% of max)
                 let urgency = (position_abs_ratio / 1.0).min(1.0);
                 if input.position > 0.0 {
                     QuoteDecision::QuoteOnlyAsks { urgency }
@@ -1383,28 +1548,41 @@ impl QuoteGate {
                 }
             } else {
                 // Have edge, position is manageable or aligned → quote both
+                // Let gamma modulation via position_direction_confidence handle urgency
                 QuoteDecision::QuoteBoth
             }
         } else {
-            // No edge
-            if has_significant_position {
-                // No edge but have position → only quote to reduce
+            // No edge (IR not useful or not calibrated)
+            //
+            // PRINCIPLED APPROACH: Don't use magic has_significant_position threshold.
+            // Instead, rely on gamma modulation:
+            // - If position is from informed flow → high confidence → low gamma → quote both
+            // - If position is adverse → low confidence → high gamma → wide spreads + skew
+            //
+            // Only go one-sided for EXTREME positions (needs_reduction threshold, e.g. 70%)
+            if needs_reduction {
+                // Very large position without edge → safety valve: reduce only
                 let urgency = (position_abs_ratio * 0.5).min(1.0);
                 if input.position > 0.0 {
                     QuoteDecision::QuoteOnlyAsks { urgency }
                 } else {
                     QuoteDecision::QuoteOnlyBids { urgency }
                 }
-            } else if self.config.quote_flat_without_edge {
-                // Market-making mode: quote both sides even without edge
+            } else if self.config.quote_flat_without_edge || has_significant_position {
+                // Market-making mode OR moderate position: quote both sides
+                // Let gamma modulation handle the risk via position_direction_confidence
+                // - High confidence positions get tight two-sided quotes
+                // - Low confidence positions get wide quotes with inventory skew
                 debug!(
                     signal_weight = %format!("{:.3}", signal_weight),
                     ir_warmed_up = edge_signal.is_warmed_up(),
-                    "Quote gate (calibrated): no edge but quoting both (market-making mode)"
+                    has_significant_position = has_significant_position,
+                    position_ratio = %format!("{:.2}", position_ratio),
+                    "Quote gate (calibrated): quoting both (gamma modulation handles risk)"
                 );
                 QuoteDecision::QuoteBoth
             } else {
-                // No edge, flat position → DON'T QUOTE
+                // No edge, flat position, not market-making mode → DON'T QUOTE
                 QuoteDecision::NoQuote {
                     reason: NoQuoteReason::NoEdgeFlat,
                 }
@@ -1448,6 +1626,15 @@ impl QuoteGate {
                     has_edge = has_edge,
                     position_threshold = %format!("{:.2}", position_threshold),
                     "Quote gate (calibrated): BOTH SIDES"
+                );
+            }
+            QuoteDecision::WidenSpreads { multiplier, changepoint_prob: cp } => {
+                info!(
+                    multiplier = %format!("{:.2}", multiplier),
+                    changepoint_prob = %format!("{:.3}", cp),
+                    signal_weight = %format!("{:.3}", signal_weight),
+                    position_ratio = %format!("{:.2}", position_ratio),
+                    "Quote gate (calibrated): BOTH SIDES (widened spreads)"
                 );
             }
         }
@@ -1540,7 +1727,8 @@ impl QuoteGate {
         match &ir_decision {
             QuoteDecision::QuoteBoth
             | QuoteDecision::QuoteOnlyBids { .. }
-            | QuoteDecision::QuoteOnlyAsks { .. } => {
+            | QuoteDecision::QuoteOnlyAsks { .. }
+            | QuoteDecision::WidenSpreads { .. } => {
                 self.record_quote_placed();
                 return ir_decision;
             }
@@ -1869,31 +2057,67 @@ mod tests {
     }
 
     #[test]
-    fn test_no_edge_long_should_only_quote_asks() {
+    fn test_no_edge_moderate_position_should_quote_both() {
+        // With the principled gamma modulation approach, moderate positions (10%)
+        // without edge should quote both sides. Gamma modulation via
+        // position_direction_confidence handles the risk via wider spreads and skew.
         let gate = QuoteGate::default();
         let input = QuoteGateInput {
             flow_imbalance: 0.1, // Below threshold
             momentum_confidence: 0.5,
-            position: 10.0, // Long (10% of max)
+            position: 10.0, // Long (10% of max) - moderate, not extreme
             ..default_input()
         };
 
         let decision = gate.decide(&input);
-        assert!(matches!(decision, QuoteDecision::QuoteOnlyAsks { .. }));
+        // With quote_flat_without_edge=true (default), moderate positions quote both
+        assert!(
+            matches!(decision, QuoteDecision::QuoteBoth),
+            "Moderate position (10%) should quote both with gamma modulation, got {:?}",
+            decision
+        );
     }
 
     #[test]
-    fn test_no_edge_short_should_only_quote_bids() {
+    fn test_no_edge_extreme_position_should_reduce_only() {
+        // Only EXTREME positions (>70% of max) should go one-sided as a safety valve
         let gate = QuoteGate::default();
         let input = QuoteGateInput {
             flow_imbalance: 0.1, // Below threshold
             momentum_confidence: 0.5,
-            position: -10.0, // Short (10% of max)
+            position: 80.0,     // Long (80% of max) - EXTREME
+            max_position: 100.0,
             ..default_input()
         };
 
         let decision = gate.decide(&input);
-        assert!(matches!(decision, QuoteDecision::QuoteOnlyBids { .. }));
+        // Extreme positions without edge → reduce only (safety valve)
+        assert!(
+            matches!(decision, QuoteDecision::QuoteOnlyAsks { .. }),
+            "Extreme position (80%) without edge should reduce only, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn test_no_edge_extreme_short_should_reduce_only() {
+        // Only EXTREME positions (>70% of max) should go one-sided as a safety valve
+        let gate = QuoteGate::default();
+        let input = QuoteGateInput {
+            flow_imbalance: 0.1, // Below threshold
+            momentum_confidence: 0.5,
+            position: -80.0,    // Short (80% of max) - EXTREME
+            max_position: 100.0,
+            ..default_input()
+        };
+
+        let decision = gate.decide(&input);
+        // Extreme positions without edge → reduce only (safety valve)
+        assert!(
+            matches!(decision, QuoteDecision::QuoteOnlyBids { .. }),
+            "Extreme short position (80%) without edge should reduce only, got {:?}",
+            decision
+        );
     }
 
     #[test]

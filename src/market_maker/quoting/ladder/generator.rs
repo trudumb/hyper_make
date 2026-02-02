@@ -86,10 +86,12 @@ impl Ladder {
         );
 
         // 4. Build raw ladder (before skew)
+        // Pass market_mid to prevent quotes crossing the actual market spread
         let mut ladder = build_raw_ladder(
             &depths,
             &sizes,
             params.mid_price,
+            params.market_mid,
             params.decimals,
             params.sz_decimals,
             params.min_notional,
@@ -112,6 +114,18 @@ impl Ladder {
             params.urgency_score,
             params.funding_rate,
             params.use_funding_skew,
+        );
+
+        // 6. Apply RL policy adjustments (spread delta + asymmetric skew)
+        apply_rl_adjustments(
+            &mut ladder,
+            params.rl_spread_delta_bps,
+            params.rl_bid_skew_bps,
+            params.rl_ask_skew_bps,
+            params.rl_confidence,
+            params.mid_price,
+            params.market_mid,
+            params.decimals,
         );
 
         ladder
@@ -192,12 +206,14 @@ impl Ladder {
         );
 
         // 5. Build raw ladder with asymmetric depths
+        // Pass market_mid to prevent quotes crossing the actual market spread
         let mut ladder = build_asymmetric_ladder(
             &bid_depths,
             &bid_sizes,
             &ask_depths,
             &ask_sizes,
             params.mid_price,
+            params.market_mid,
             params.decimals,
             params.sz_decimals,
             params.min_notional,
@@ -220,6 +236,18 @@ impl Ladder {
             params.urgency_score,
             params.funding_rate,
             params.use_funding_skew,
+        );
+
+        // 7. Apply RL policy adjustments (spread delta + asymmetric skew)
+        apply_rl_adjustments(
+            &mut ladder,
+            params.rl_spread_delta_bps,
+            params.rl_bid_skew_bps,
+            params.rl_ask_skew_bps,
+            params.rl_confidence,
+            params.mid_price,
+            params.market_mid,
+            params.decimals,
         );
 
         ladder
@@ -466,10 +494,17 @@ pub(crate) fn allocate_sizes(
 /// Creates symmetric bid/ask levels around mid price, applying
 /// proper price rounding and size truncation per exchange requirements.
 /// Uses SmallVec to avoid heap allocation for typical ladder sizes.
+///
+/// # Safe Base Prices
+///
+/// To prevent quotes crossing the market spread when microprice diverges from market_mid:
+/// - Bids use `min(mid, market_mid)` as base - never built above market_mid
+/// - Asks use `max(mid, market_mid)` as base - never built below market_mid
 pub(crate) fn build_raw_ladder(
     depths: &[f64],
     sizes: &[f64],
     mid: f64,
+    market_mid: f64,
     decimals: u32,
     sz_decimals: u32,
     min_notional: f64,
@@ -481,6 +516,7 @@ pub(crate) fn build_raw_ladder(
         num_sizes = sizes.len(),
         total_size = %format!("{:.6}", total_size),
         mid = %format!("{:.4}", mid),
+        market_mid = %format!("{:.4}", market_mid),
         min_notional = %format!("{:.2}", min_notional),
         "build_raw_ladder called"
     );
@@ -488,17 +524,24 @@ pub(crate) fn build_raw_ladder(
     let mut bids = LadderLevels::new();
     let mut asks = LadderLevels::new();
 
+    // FIX: Use safe base prices to prevent crossing market spread
+    // When microprice < market_mid (selling pressure), asks must still be above market_mid
+    // When microprice > market_mid (buying pressure), bids must still be below market_mid
+    let bid_base = mid.min(market_mid);
+    let ask_base = mid.max(market_mid);
+
     for (&depth_bps, &size) in depths.iter().zip(sizes.iter()) {
         if size < EPSILON {
             continue;
         }
 
-        // Calculate price offset from mid
-        let offset = mid * (depth_bps / 10000.0);
+        // Calculate price offset using safe bases
+        let bid_offset = bid_base * (depth_bps / 10000.0);
+        let ask_offset = ask_base * (depth_bps / 10000.0);
 
         // Round prices per exchange requirements
-        let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
-        let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+        let bid_price = round_to_significant_and_decimal(bid_base - bid_offset, 5, decimals);
+        let ask_price = round_to_significant_and_decimal(ask_base + ask_offset, 5, decimals);
 
         // Truncate size
         let size = truncate_float(size, sz_decimals, false);
@@ -526,8 +569,8 @@ pub(crate) fn build_raw_ladder(
         let total_size: f64 = sizes.iter().sum();
         let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = depths.first() {
-            let offset = mid * (tightest_depth / 10000.0);
-            let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
+            let offset = bid_base * (tightest_depth / 10000.0);
+            let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
 
             if bid_price * total_size_truncated >= min_notional {
                 tracing::info!(
@@ -550,8 +593,8 @@ pub(crate) fn build_raw_ladder(
         let total_size: f64 = sizes.iter().sum();
         let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = depths.first() {
-            let offset = mid * (tightest_depth / 10000.0);
-            let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+            let offset = ask_base * (tightest_depth / 10000.0);
+            let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
 
             if ask_price * total_size_truncated >= min_notional {
                 tracing::info!(
@@ -590,6 +633,12 @@ pub(crate) fn build_raw_ladder(
 /// Each side gets its own depth array and corresponding size array.
 /// This is used when bid/ask depths differ (e.g., different κ for each side).
 /// Uses SmallVec to avoid heap allocation for typical ladder sizes.
+///
+/// # Safe Base Prices
+///
+/// To prevent quotes crossing the market spread when microprice diverges from market_mid:
+/// - Bids use `min(mid, market_mid)` as base - never built above market_mid
+/// - Asks use `max(mid, market_mid)` as base - never built below market_mid
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_asymmetric_ladder(
     bid_depths: &[f64],
@@ -597,6 +646,7 @@ pub(crate) fn build_asymmetric_ladder(
     ask_depths: &[f64],
     ask_sizes: &[f64],
     mid: f64,
+    market_mid: f64,
     decimals: u32,
     sz_decimals: u32,
     min_notional: f64,
@@ -604,14 +654,20 @@ pub(crate) fn build_asymmetric_ladder(
     let mut bids = LadderLevels::new();
     let mut asks = LadderLevels::new();
 
-    // Build bid levels
+    // FIX: Use safe base prices to prevent crossing market spread
+    // When microprice < market_mid (selling pressure), asks must still be above market_mid
+    // When microprice > market_mid (buying pressure), bids must still be below market_mid
+    let bid_base = mid.min(market_mid);
+    let ask_base = mid.max(market_mid);
+
+    // Build bid levels using safe base
     for (&depth_bps, &size) in bid_depths.iter().zip(bid_sizes.iter()) {
         if size < EPSILON {
             continue;
         }
 
-        let offset = mid * (depth_bps / 10000.0);
-        let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
+        let offset = bid_base * (depth_bps / 10000.0);
+        let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
         let size = truncate_float(size, sz_decimals, false);
 
         if bid_price * size >= min_notional {
@@ -623,14 +679,14 @@ pub(crate) fn build_asymmetric_ladder(
         }
     }
 
-    // Build ask levels
+    // Build ask levels using safe base
     for (&depth_bps, &size) in ask_depths.iter().zip(ask_sizes.iter()) {
         if size < EPSILON {
             continue;
         }
 
-        let offset = mid * (depth_bps / 10000.0);
-        let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+        let offset = ask_base * (depth_bps / 10000.0);
+        let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
         let size = truncate_float(size, sz_decimals, false);
 
         if ask_price * size >= min_notional {
@@ -647,8 +703,8 @@ pub(crate) fn build_asymmetric_ladder(
         let total_size: f64 = bid_sizes.iter().sum();
         let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = bid_depths.first() {
-            let offset = mid * (tightest_depth / 10000.0);
-            let bid_price = round_to_significant_and_decimal(mid - offset, 5, decimals);
+            let offset = bid_base * (tightest_depth / 10000.0);
+            let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
 
             if bid_price * total_size_truncated >= min_notional {
                 tracing::info!(
@@ -672,8 +728,8 @@ pub(crate) fn build_asymmetric_ladder(
         let total_size: f64 = ask_sizes.iter().sum();
         let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = ask_depths.first() {
-            let offset = mid * (tightest_depth / 10000.0);
-            let ask_price = round_to_significant_and_decimal(mid + offset, 5, decimals);
+            let offset = ask_base * (tightest_depth / 10000.0);
+            let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
 
             if ask_price * total_size_truncated >= min_notional {
                 tracing::info!(
@@ -887,6 +943,87 @@ pub(crate) fn apply_inventory_skew_with_drift(
     }
 }
 
+/// Apply RL policy adjustments to the ladder.
+///
+/// RL recommendations adjust quotes after all other calculations:
+/// - `spread_delta_bps`: Widens (+) or tightens (-) both sides equally
+/// - `bid_skew_bps`: Additional adjustment to bid side only
+/// - `ask_skew_bps`: Additional adjustment to ask side only
+///
+/// Adjustments are scaled by `confidence` (0-1) to ensure uncertain
+/// recommendations have minimal impact.
+///
+/// Safety guards:
+/// - Bids cannot go above market_mid (prevents crossing)
+/// - Asks cannot go below market_mid (prevents crossing)
+/// - Max adjustment capped at ±5 bps per side
+pub(crate) fn apply_rl_adjustments(
+    ladder: &mut Ladder,
+    spread_delta_bps: f64,
+    bid_skew_bps: f64,
+    ask_skew_bps: f64,
+    confidence: f64,
+    _mid: f64,
+    market_mid: f64,
+    decimals: u32,
+) {
+    // Skip if confidence too low or no adjustment needed
+    if confidence < 0.1 {
+        return;
+    }
+
+    // Scale adjustments by confidence
+    let effective_confidence = confidence.clamp(0.0, 1.0);
+
+    // Total bid adjustment: spread_delta (widens both) + bid_skew (positive widens bid)
+    // Positive spread_delta = widen = move bid DOWN (further from mid)
+    // Positive bid_skew = widen bid = move bid DOWN
+    let raw_bid_adj_bps = spread_delta_bps + bid_skew_bps;
+    let raw_ask_adj_bps = spread_delta_bps + ask_skew_bps;
+
+    // Clamp to reasonable bounds before scaling
+    let clamped_bid_adj = raw_bid_adj_bps.clamp(-5.0, 5.0);
+    let clamped_ask_adj = raw_ask_adj_bps.clamp(-5.0, 5.0);
+
+    // Scale by confidence
+    let bid_adj_bps = clamped_bid_adj * effective_confidence;
+    let ask_adj_bps = clamped_ask_adj * effective_confidence;
+
+    // Skip if negligible adjustment
+    if bid_adj_bps.abs() < 0.1 && ask_adj_bps.abs() < 0.1 {
+        return;
+    }
+
+    // Log RL adjustment
+    tracing::info!(
+        spread_delta_bps = %format!("{:.2}", spread_delta_bps),
+        bid_skew_bps = %format!("{:.2}", bid_skew_bps),
+        ask_skew_bps = %format!("{:.2}", ask_skew_bps),
+        confidence = %format!("{:.2}", confidence),
+        effective_bid_adj_bps = %format!("{:.2}", bid_adj_bps),
+        effective_ask_adj_bps = %format!("{:.2}", ask_adj_bps),
+        "RL adjustment applied to ladder"
+    );
+
+    // Apply to bids: positive adjustment = widen = lower price
+    for level in &mut ladder.bids {
+        let adj_frac = bid_adj_bps / 10000.0;
+        let new_price = level.price * (1.0 - adj_frac);
+        // Safety: don't let bid go above market_mid
+        let safe_price = new_price.min(market_mid * 0.9999);
+        level.price = round_to_significant_and_decimal(safe_price, 5, decimals);
+    }
+
+    // Apply to asks: positive adjustment = widen = higher price
+    for level in &mut ladder.asks {
+        let adj_frac = ask_adj_bps / 10000.0;
+        let new_price = level.price * (1.0 + adj_frac);
+        // Safety: don't let ask go below market_mid
+        let safe_price = new_price.max(market_mid * 1.0001);
+        level.price = round_to_significant_and_decimal(safe_price, 5, decimals);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,8 +1211,9 @@ mod tests {
         let depths = vec![2.0, 5.0, 10.0];
         let sizes = vec![0.5, 0.3, 0.2];
         let mid = 100.0;
+        let market_mid = 100.0; // No divergence in test
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, 2, 4, 10.0);
+        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 2, 4, 10.0);
 
         assert_eq!(ladder.bids.len(), 3);
         assert_eq!(ladder.asks.len(), 3);
@@ -1090,8 +1228,10 @@ mod tests {
     fn test_build_raw_ladder_min_notional() {
         let depths = vec![2.0, 5.0];
         let sizes = vec![0.001, 0.5]; // First level too small for $10 notional at $100
+        let mid = 100.0;
+        let market_mid = 100.0; // No divergence in test
 
-        let ladder = build_raw_ladder(&depths, &sizes, 100.0, 2, 4, 10.0);
+        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 2, 4, 10.0);
 
         // Only second level should make it (0.5 * $100 = $50 > $10)
         assert_eq!(ladder.bids.len(), 1);
@@ -1281,7 +1421,7 @@ mod tests {
         let small_total_size = 1.3;
         let small_sizes: Vec<f64> = vec![small_total_size / num_levels as f64; num_levels];
 
-        let ladder_small = build_raw_ladder(&depths, &small_sizes, mid, 2, 4, min_notional);
+        let ladder_small = build_raw_ladder(&depths, &small_sizes, mid, mid, 2, 4, min_notional);
 
         // With small sizes, ALL individual levels fail min_notional
         // Concentration fallback should trigger → single order
@@ -1303,7 +1443,7 @@ mod tests {
         let large_total_size = 66.0;
         let large_sizes: Vec<f64> = vec![large_total_size / num_levels as f64; num_levels];
 
-        let ladder_large = build_raw_ladder(&depths, &large_sizes, mid, 2, 4, min_notional);
+        let ladder_large = build_raw_ladder(&depths, &large_sizes, mid, mid, 2, 4, min_notional);
 
         // With large sizes, ALL levels should pass min_notional
         // No concentration fallback → multiple levels
@@ -1386,5 +1526,130 @@ mod tests {
             "With 1.5x multiplier, should get at most 10 levels, got {}",
             old_max_levels
         );
+    }
+
+    #[test]
+    fn test_rl_adjustments_widen_spreads() {
+        let mut ladder = Ladder {
+            bids: smallvec![
+                LadderLevel { price: 99.95, size: 1.0, depth_bps: 5.0 },
+                LadderLevel { price: 99.90, size: 1.0, depth_bps: 10.0 },
+            ],
+            asks: smallvec![
+                LadderLevel { price: 100.05, size: 1.0, depth_bps: 5.0 },
+                LadderLevel { price: 100.10, size: 1.0, depth_bps: 10.0 },
+            ],
+        };
+
+        // RL recommends widening by 2 bps with high confidence
+        apply_rl_adjustments(
+            &mut ladder,
+            2.0,  // spread_delta: widen both sides by 2 bps
+            0.0,  // no bid skew
+            0.0,  // no ask skew
+            0.9,  // 90% confidence
+            100.0,
+            100.0,
+            2,
+        );
+
+        // Bids should be LOWER (further from mid) after widening
+        // 2 bps * 0.9 confidence = 1.8 bps effective widen
+        // 99.95 * (1 - 0.00018) ≈ 99.932
+        assert!(ladder.bids[0].price < 99.95, "Bid should move down (widen): {}", ladder.bids[0].price);
+
+        // Asks should be HIGHER (further from mid) after widening
+        // 100.05 * (1 + 0.00018) ≈ 100.068
+        assert!(ladder.asks[0].price > 100.05, "Ask should move up (widen): {}", ladder.asks[0].price);
+    }
+
+    #[test]
+    fn test_rl_adjustments_asymmetric_skew() {
+        let mut ladder = Ladder {
+            bids: smallvec![
+                LadderLevel { price: 99.95, size: 1.0, depth_bps: 5.0 },
+            ],
+            asks: smallvec![
+                LadderLevel { price: 100.05, size: 1.0, depth_bps: 5.0 },
+            ],
+        };
+
+        // RL recommends widening bid (positive = widen) and tightening ask (negative = tighten)
+        // This creates asymmetry favoring buying
+        apply_rl_adjustments(
+            &mut ladder,
+            0.0,   // no symmetric spread delta
+            2.0,   // widen bid by 2 bps
+            -2.0,  // tighten ask by 2 bps
+            1.0,   // 100% confidence
+            100.0,
+            100.0,
+            2,
+        );
+
+        // Bid widened = lower price
+        assert!(ladder.bids[0].price < 99.95, "Bid should widen (move down): {}", ladder.bids[0].price);
+        // Ask tightened = lower price (closer to mid)
+        assert!(ladder.asks[0].price < 100.05, "Ask should tighten (move down): {}", ladder.asks[0].price);
+    }
+
+    #[test]
+    fn test_rl_adjustments_low_confidence_ignored() {
+        let mut ladder = Ladder {
+            bids: smallvec![
+                LadderLevel { price: 99.95, size: 1.0, depth_bps: 5.0 },
+            ],
+            asks: smallvec![
+                LadderLevel { price: 100.05, size: 1.0, depth_bps: 5.0 },
+            ],
+        };
+
+        let original_bid = ladder.bids[0].price;
+        let original_ask = ladder.asks[0].price;
+
+        // RL recommends large adjustment but with LOW confidence
+        apply_rl_adjustments(
+            &mut ladder,
+            5.0,  // large spread delta
+            0.0,
+            0.0,
+            0.05, // Only 5% confidence - below 10% threshold
+            100.0,
+            100.0,
+            2,
+        );
+
+        // Prices should be unchanged (low confidence ignored)
+        assert_eq!(ladder.bids[0].price, original_bid, "Bid should be unchanged");
+        assert_eq!(ladder.asks[0].price, original_ask, "Ask should be unchanged");
+    }
+
+    #[test]
+    fn test_rl_adjustments_safety_guard_bid_crossing() {
+        let mut ladder = Ladder {
+            bids: smallvec![
+                LadderLevel { price: 99.99, size: 1.0, depth_bps: 1.0 }, // Very close to mid
+            ],
+            asks: smallvec![
+                LadderLevel { price: 100.01, size: 1.0, depth_bps: 1.0 },
+            ],
+        };
+
+        // RL recommends TIGHTENING (negative) which could cross mid
+        apply_rl_adjustments(
+            &mut ladder,
+            -10.0,  // Aggressive tightening
+            0.0,
+            0.0,
+            1.0,
+            100.0,
+            100.0, // market_mid = 100
+            2,
+        );
+
+        // Safety guard: bid should not go above market_mid * 0.9999
+        assert!(ladder.bids[0].price < 100.0, "Bid must stay below mid: {}", ladder.bids[0].price);
+        // Safety guard: ask should not go below market_mid * 1.0001
+        assert!(ladder.asks[0].price > 100.0, "Ask must stay above mid: {}", ladder.asks[0].price);
     }
 }

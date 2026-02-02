@@ -10,6 +10,9 @@ mod market_params;
 mod params;
 mod risk_config;
 mod risk_model;
+mod signal_integration;
+#[cfg(test)]
+mod signal_integration_test;
 mod simple;
 
 pub use glft::*;
@@ -19,6 +22,7 @@ pub use market_params::*;
 pub use params::*;
 pub use risk_config::*;
 pub use risk_model::*;
+pub use signal_integration::*;
 pub use simple::*;
 
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};

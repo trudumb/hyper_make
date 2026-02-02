@@ -47,6 +47,7 @@ mod momentum;
 pub mod mutual_info;
 mod parameter_estimator;
 pub mod regime_hmm;
+pub mod regime_kappa;
 mod robust_kappa;
 mod soft_jump;
 pub mod temporal;
@@ -117,6 +118,9 @@ pub use lag_analysis::{LagAnalyzer, LagAnalyzerConfig, LagDecayTracker};
 
 // HMM-based regime detection
 pub use regime_hmm::{EmissionParams, Observation as HmmObservation, RegimeHMM, NUM_REGIMES};
+
+// Regime-conditioned kappa estimation
+pub use regime_kappa::{RegimeKappaBreakdown, RegimeKappaConfig, RegimeKappaEstimator};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

@@ -53,7 +53,9 @@ pub use bayesian_bootstrap::{
 };
 pub use belief::BeliefState;
 pub use calibrated_edge::{CalibratedEdgeConfig, CalibratedEdgeSignal, EdgeSignalDiagnostics};
-pub use changepoint::{ChangepointConfig, ChangepointDetector};
+pub use changepoint::{
+    ChangepointConfig, ChangepointDetector, ChangepointSummary, ChangePointResult, MarketRegime,
+};
 pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, PositionPnLTracker};
 pub use quote_gate::{
     NoQuoteReason as QuoteGateNoQuoteReason, QuoteDecision as QuoteGateDecision, QuoteGate,

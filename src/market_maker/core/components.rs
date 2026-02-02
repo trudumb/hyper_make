@@ -11,6 +11,7 @@ use crate::market_maker::{
         QuoteGate, StochasticController, StochasticControllerConfig,
         TheoreticalEdgeEstimator,
     },
+    stochastic::{StochasticControlBuilder, StochasticControlConfig},
     estimator::{
         CalibrationController, CalibrationControllerConfig, RegimeHMM,
         EnhancedFlowConfig, EnhancedFlowEstimator,
@@ -448,6 +449,12 @@ pub struct StochasticComponents {
     /// Competitor model for rival MM inference.
     /// Tracks snipe probability and queue competition.
     pub competitor_model: crate::market_maker::learning::CompetitorModel,
+
+    // === First-Principles Stochastic Control ===
+    /// Bayesian belief system and HJB solver for first-principles quoting.
+    /// Derives quotes from posteriors over (μ, σ², κ), not heuristics.
+    /// β_t = E[μ | data] provides predictive bias from NIG posterior.
+    pub beliefs_builder: StochasticControlBuilder,
 }
 
 impl StochasticComponents {
@@ -539,6 +546,8 @@ impl StochasticComponents {
             // Phase 8: RL and Competitor Modeling
             rl_agent: crate::market_maker::learning::QLearningAgent::default(),
             competitor_model: crate::market_maker::learning::CompetitorModel::default(),
+            // First-Principles Stochastic Control
+            beliefs_builder: StochasticControlBuilder::new(StochasticControlConfig::default()),
         }
     }
     

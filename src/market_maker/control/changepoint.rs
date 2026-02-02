@@ -3,6 +3,95 @@
 //! Implements Adams & MacKay (2007) for detecting regime changes in market data.
 //! When a changepoint is detected, we should distrust the learning module
 //! (which was trained on old regime data).
+//!
+//! # Regime-Aware Detection
+//!
+//! The detector supports regime-specific thresholds to reduce false positives
+//! in different market environments:
+//! - **ThinDex** (HIP-3): High threshold (0.85) for noise tolerance
+//! - **LiquidCex**: Standard threshold (0.5) for responsive detection
+//! - **Cascade**: Low threshold (0.3) for high sensitivity during stress
+//!
+//! Additionally, the detector supports confirmation requirements where
+//! multiple consecutive high-probability signals are needed before declaring
+//! a confirmed changepoint.
+
+// ============================================================================
+// Regime-Aware Changepoint Detection Types
+// ============================================================================
+
+/// Market regime for changepoint threshold selection.
+///
+/// Different market environments require different detection sensitivity:
+/// - Thin DEX books have more noise, need higher thresholds
+/// - Liquid CEX books have cleaner signals, use standard thresholds
+/// - Cascade conditions need high sensitivity (low thresholds)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarketRegime {
+    /// Thin order book DEX (e.g., HIP-3)
+    /// High threshold (0.85) to reduce false positives from noise
+    ThinDex,
+    /// Liquid CEX environment
+    /// Standard threshold (0.5) for balanced detection
+    #[default]
+    LiquidCex,
+    /// Liquidation cascade or stress conditions
+    /// Low threshold (0.3) for high sensitivity
+    Cascade,
+}
+
+impl MarketRegime {
+    /// Get the changepoint detection threshold for this regime.
+    pub fn changepoint_threshold(&self) -> f64 {
+        match self {
+            MarketRegime::ThinDex => 0.85,   // High tolerance for noise
+            MarketRegime::LiquidCex => 0.50, // Standard sensitivity
+            MarketRegime::Cascade => 0.30,   // High sensitivity
+        }
+    }
+
+    /// Get the number of confirmations required for this regime.
+    pub fn confirmation_count(&self) -> usize {
+        match self {
+            MarketRegime::ThinDex => 2,   // Require 2 consecutive signals
+            MarketRegime::LiquidCex => 1, // Single signal sufficient
+            MarketRegime::Cascade => 1,   // Single signal (fast response)
+        }
+    }
+}
+
+/// Result of regime-aware changepoint detection.
+///
+/// Provides graduated response rather than binary detection:
+/// - None: No changepoint detected
+/// - Pending: Threshold exceeded but awaiting confirmation
+/// - Confirmed: Multiple consecutive signals confirm changepoint
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangePointResult {
+    /// No changepoint detected - normal operation
+    None,
+    /// Threshold exceeded, awaiting confirmation
+    /// Contains number of consecutive high-probability observations
+    Pending(usize),
+    /// Changepoint confirmed after required confirmations
+    Confirmed,
+}
+
+impl ChangePointResult {
+    /// Check if any change was detected (pending or confirmed).
+    pub fn is_detected(&self) -> bool {
+        !matches!(self, ChangePointResult::None)
+    }
+
+    /// Check if changepoint is confirmed (not just pending).
+    pub fn is_confirmed(&self) -> bool {
+        matches!(self, ChangePointResult::Confirmed)
+    }
+}
+
+// ============================================================================
+// Run Length Statistics
+// ============================================================================
 
 /// Run length statistics for BOCD.
 #[derive(Debug, Clone)]
@@ -64,6 +153,11 @@ impl RunStatistics {
 ///
 /// Maintains a distribution over run lengths (time since last changepoint).
 /// When P(r_t = 0 | data) is high, a changepoint has occurred.
+///
+/// Supports regime-aware detection with:
+/// - Configurable thresholds per market regime
+/// - Confirmation requirements (multiple consecutive signals)
+/// - Graceful degradation (pending vs confirmed states)
 #[derive(Debug, Clone)]
 pub struct ChangepointDetector {
     /// Run length probabilities P(r_t = k | x_{1:t})
@@ -76,7 +170,7 @@ pub struct ChangepointDetector {
     hazard: f64,
     /// Maximum run length to track
     max_run_length: usize,
-    /// Changepoint threshold
+    /// Changepoint threshold (default, can be overridden by regime)
     threshold: f64,
     /// Recent observations for diagnostics
     recent_obs: Vec<f64>,
@@ -88,6 +182,14 @@ pub struct ChangepointDetector {
     observation_count: usize,
     /// Entropy threshold for warmup (primary mechanism)
     warmup_entropy_threshold: f64,
+
+    // Regime-aware detection state
+    /// Current market regime (affects threshold and confirmation)
+    current_regime: MarketRegime,
+    /// Count of consecutive observations exceeding threshold
+    consecutive_high_prob: usize,
+    /// Required confirmations before declaring changepoint (regime-dependent)
+    confirmation_required: usize,
 }
 
 impl Default for ChangepointDetector {
@@ -152,6 +254,9 @@ impl ChangepointDetector {
             sum_sq: config.prior_mean.powi(2) + config.prior_var,
         };
 
+        // Default to LiquidCex regime
+        let default_regime = MarketRegime::LiquidCex;
+
         Self {
             run_length_probs,
             run_statistics: vec![RunStatistics::default()],
@@ -164,7 +269,36 @@ impl ChangepointDetector {
             warmup_observations: config.warmup_observations,
             observation_count: 0,
             warmup_entropy_threshold: config.warmup_entropy_threshold,
+            // Regime-aware detection
+            current_regime: default_regime,
+            consecutive_high_prob: 0,
+            confirmation_required: default_regime.confirmation_count(),
         }
+    }
+
+    /// Set the market regime for threshold and confirmation settings.
+    ///
+    /// Different market environments need different detection sensitivity:
+    /// - ThinDex: High threshold (0.85), 2 confirmations
+    /// - LiquidCex: Standard threshold (0.5), 1 confirmation
+    /// - Cascade: Low threshold (0.3), 1 confirmation
+    pub fn set_regime(&mut self, regime: MarketRegime) {
+        self.current_regime = regime;
+        self.confirmation_required = regime.confirmation_count();
+        // Reset consecutive count when regime changes
+        self.consecutive_high_prob = 0;
+    }
+
+    /// Get the current market regime.
+    pub fn current_regime(&self) -> MarketRegime {
+        self.current_regime
+    }
+
+    /// Get the effective threshold for the current regime.
+    ///
+    /// Uses regime-specific threshold if set, otherwise falls back to config threshold.
+    pub fn effective_threshold(&self) -> f64 {
+        self.current_regime.changepoint_threshold()
     }
 
     /// Check if the detector has completed warmup.
@@ -265,6 +399,15 @@ impl ChangepointDetector {
         self.run_length_probs = new_probs;
         self.run_statistics = new_stats;
         self.observation_count += 1;
+
+        // Update consecutive high-probability counter for confirmation logic
+        let cp_prob = self.changepoint_probability(5);
+        let threshold = self.effective_threshold();
+        if cp_prob > threshold {
+            self.consecutive_high_prob += 1;
+        } else {
+            self.consecutive_high_prob = 0;
+        }
     }
 
     /// Get probability that a changepoint occurred in the last k observations.
@@ -274,14 +417,71 @@ impl ChangepointDetector {
         sum.min(1.0)
     }
 
-    /// Check if a recent changepoint was detected.
+    /// Check if a recent changepoint was detected (legacy method).
     ///
     /// Returns false during warmup period to prevent false positives at startup.
+    ///
+    /// Note: For regime-aware detection with confirmation, use `detect_with_confirmation()`.
     pub fn changepoint_detected(&self) -> bool {
         if !self.is_warmed_up() {
             return false;
         }
         self.changepoint_probability(5) > self.threshold
+    }
+
+    /// Regime-aware changepoint detection with confirmation.
+    ///
+    /// This is the PREFERRED method for thin DEX environments (HIP-3).
+    ///
+    /// Unlike `changepoint_detected()`, this method:
+    /// 1. Uses regime-specific thresholds (ThinDex=0.85, LiquidCex=0.5, Cascade=0.3)
+    /// 2. Requires confirmation (consecutive high-probability observations)
+    /// 3. Returns graduated result (None/Pending/Confirmed)
+    ///
+    /// # Returns
+    /// - `ChangePointResult::None` - No changepoint detected
+    /// - `ChangePointResult::Pending(n)` - Threshold exceeded, n consecutive signals
+    /// - `ChangePointResult::Confirmed` - Required confirmations reached
+    ///
+    /// # Example
+    /// ```ignore
+    /// match detector.detect_with_confirmation() {
+    ///     ChangePointResult::None => { /* Normal operation */ }
+    ///     ChangePointResult::Pending(n) => {
+    ///         // Consider widening spreads slightly
+    ///         log::debug!("Changepoint pending: {} consecutive signals", n);
+    ///     }
+    ///     ChangePointResult::Confirmed => {
+    ///         // Pull quotes, reset beliefs
+    ///         log::warn!("Changepoint confirmed, pulling quotes");
+    ///     }
+    /// }
+    /// ```
+    pub fn detect_with_confirmation(&self) -> ChangePointResult {
+        if !self.is_warmed_up() {
+            return ChangePointResult::None;
+        }
+
+        let cp_prob = self.changepoint_probability(5);
+        let threshold = self.effective_threshold();
+
+        if cp_prob <= threshold {
+            ChangePointResult::None
+        } else if self.consecutive_high_prob >= self.confirmation_required {
+            ChangePointResult::Confirmed
+        } else {
+            ChangePointResult::Pending(self.consecutive_high_prob)
+        }
+    }
+
+    /// Get the number of consecutive high-probability observations.
+    pub fn consecutive_count(&self) -> usize {
+        self.consecutive_high_prob
+    }
+
+    /// Get the number of confirmations required for the current regime.
+    pub fn confirmations_required(&self) -> usize {
+        self.confirmation_required
     }
 
     /// Get probability that a changepoint occurred just now.
@@ -326,6 +526,8 @@ impl ChangepointDetector {
         self.run_statistics = vec![RunStatistics::default()];
         self.recent_obs.clear();
         self.observation_count = 0;
+        self.consecutive_high_prob = 0;
+        // Note: current_regime is preserved across reset
     }
 
     /// Get summary for diagnostics.
@@ -339,6 +541,12 @@ impl ChangepointDetector {
             detected: self.changepoint_detected(),
             warmed_up: self.is_warmed_up(),
             observation_count: self.observation_count,
+            // Regime-aware fields
+            regime: self.current_regime,
+            effective_threshold: self.effective_threshold(),
+            consecutive_high_prob: self.consecutive_high_prob,
+            confirmation_required: self.confirmation_required,
+            detection_result: self.detect_with_confirmation(),
         }
     }
 }
@@ -356,12 +564,22 @@ pub struct ChangepointSummary {
     pub most_likely_run: usize,
     /// Entropy of run length distribution
     pub entropy: f64,
-    /// Whether changepoint was detected
+    /// Whether changepoint was detected (legacy)
     pub detected: bool,
     /// Whether the detector has completed warmup
     pub warmed_up: bool,
     /// Total observations received
     pub observation_count: usize,
+    /// Current market regime
+    pub regime: MarketRegime,
+    /// Effective threshold for current regime
+    pub effective_threshold: f64,
+    /// Consecutive high-probability observations
+    pub consecutive_high_prob: usize,
+    /// Confirmations required for current regime
+    pub confirmation_required: usize,
+    /// Regime-aware detection result
+    pub detection_result: ChangePointResult,
 }
 
 /// Student's t PDF for predictive probability.

@@ -221,6 +221,9 @@ impl CoefficientEstimator {
                 beta_hawkes: (beta[3] * as_to_log_gamma_scale).clamp(-1.0, 2.0),
                 beta_book_depth: (beta[4] * as_to_log_gamma_scale).clamp(-0.5, 1.5),
                 beta_uncertainty: (beta[5] * as_to_log_gamma_scale).clamp(-0.5, 1.0),
+                // Keep default for confidence - not learned from AS data
+                // (position direction confidence is orthogonal to AS risk)
+                beta_confidence: -0.4,
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),

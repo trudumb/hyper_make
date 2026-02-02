@@ -31,6 +31,7 @@ pub mod latent;
 pub mod learning;
 pub mod monitoring;
 pub mod simulation;
+pub mod stochastic;
 
 mod orchestrator;
 
@@ -187,6 +188,19 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Stores (size, is_buy, timestamp_ms). Updated by handle_trades().
     /// Bounded to MAX_CACHED_TRADES entries.
     cached_trades: std::collections::VecDeque<(f64, bool, u64)>,
+
+    // === Event-Driven Churn Reduction (Phase 3) ===
+    /// Event accumulator for event-driven quote updates.
+    /// Reduces order churn by only reconciling when meaningful events occur.
+    #[allow(dead_code)] // WIP: Will be used when event handlers are wired
+    event_accumulator: orchestrator::EventAccumulator,
+
+    // === First-Principles Belief System (Bayesian Posterior Updates) ===
+    /// Previous mid price for computing returns fed to beliefs_builder.
+    /// Used to calculate price_return = (current_mid - prev_mid) / prev_mid.
+    prev_mid_for_beliefs: f64,
+    /// Last time beliefs were updated (for computing dt).
+    last_beliefs_update: Option<std::time::Instant>,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -310,6 +324,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             cached_bid_sizes: Vec::with_capacity(5),
             cached_ask_sizes: Vec::with_capacity(5),
             cached_trades: std::collections::VecDeque::with_capacity(500),
+            // Event-driven churn reduction
+            event_accumulator: orchestrator::EventAccumulator::default_config(),
+            // First-principles belief system
+            prev_mid_for_beliefs: 0.0,
+            last_beliefs_update: None,
         }
     }
 

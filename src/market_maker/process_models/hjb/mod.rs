@@ -287,7 +287,17 @@ mod tests {
 
     #[test]
     fn test_hjb_drift_warmup() {
-        let mut ctrl = make_controller();
+        // Use EWMA mode for deterministic testing (OU requires actual time passing)
+        let config = HJBConfig {
+            session_duration_secs: 100.0,
+            terminal_penalty: 0.001,
+            gamma_base: 0.3,
+            use_ou_drift: false, // Disable OU for deterministic test
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001);
 
         // Initially not warmed up
         assert!(!ctrl.is_drift_warmed_up());
@@ -349,8 +359,17 @@ mod tests {
 
     #[test]
     fn test_hjb_drift_adjusted_skew_uses_smoothed() {
-        let mut ctrl = make_controller();
+        // Use EWMA mode for deterministic testing (OU requires actual time passing)
+        let config = HJBConfig {
+            session_duration_secs: 100.0,
+            terminal_penalty: 0.001,
+            gamma_base: 0.3,
+            use_ou_drift: false, // Disable OU for deterministic test
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
         ctrl.start_session();
+        ctrl.update_sigma(0.0001);
 
         // Warm up with consistent momentum
         for _ in 0..30 {

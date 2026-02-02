@@ -1032,10 +1032,37 @@ impl ParameterEstimator {
 
     // === Microprice Accessors ===
 
-    /// Get microprice (data-driven fair price).
-    /// Incorporates book imbalance and flow imbalance predictions.
-    /// Falls back to raw mid if not warmed up.
+    /// Get microprice (data-driven fair price) with depth gating.
+    ///
+    /// This is the PRIMARY method to use for HIP-3 and other thin DEX environments.
+    /// Incorporates book imbalance and flow imbalance predictions, but falls back
+    /// to mid price when order book depth is insufficient for reliable signals.
+    ///
+    /// The depth gate prevents microprice noise amplification in thin books that
+    /// causes bids to cross mid when one large order dominates.
+    ///
+    /// Falls back to raw mid if:
+    /// - Not warmed up
+    /// - Book depth < min_depth_usd threshold
+    /// - R² too low (model has no predictive power)
     pub fn microprice(&self) -> f64 {
+        // Use depth-gated microprice for thin book protection
+        let depth_usd = self.near_touch_depth_usd();
+        self.microprice_estimator.microprice_depth_gated(
+            self.current_mid,
+            self.book_structure.imbalance(),
+            self.flow.imbalance(),
+            depth_usd,
+        )
+    }
+
+    /// Get microprice without depth gating (original behavior).
+    ///
+    /// Use this only when you explicitly want microprice adjustment regardless
+    /// of book depth. For most use cases, prefer `microprice()` which includes
+    /// depth gating for thin book protection.
+    #[allow(dead_code)]
+    pub fn microprice_ungated(&self) -> f64 {
         self.microprice_estimator.microprice(
             self.current_mid,
             self.book_structure.imbalance(),

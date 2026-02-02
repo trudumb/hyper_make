@@ -19,6 +19,7 @@
 //! - **ExecutionBudget**: Token-based budget for statistical impulse control
 
 mod arena;
+pub mod binance_feed;
 pub mod capacity;
 mod connection_supervisor;
 pub mod dashboard_ws;
@@ -34,9 +35,11 @@ mod rate_limit;
 mod reconciliation;
 mod reconnection;
 mod recovery;
+mod sync_health;
 mod ws_executor;
 
 pub use arena::*;
+pub use binance_feed::*;
 pub use connection_supervisor::*;
 pub use dashboard_ws::*;
 pub use data_quality::*;
@@ -51,4 +54,5 @@ pub use rate_limit::*;
 pub use reconciliation::*;
 pub use reconnection::*;
 pub use recovery::*;
+pub use sync_health::*;
 pub use ws_executor::*;

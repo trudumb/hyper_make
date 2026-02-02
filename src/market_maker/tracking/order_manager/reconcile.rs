@@ -52,10 +52,13 @@ impl Default for ReconcileConfig {
             // NOTE: On Hyperliquid, price modifications always reset queue position (new OID).
             // Only SIZE-only modifications preserve queue. Therefore, these tolerances
             // primarily affect API call frequency, not queue preservation.
+            //
+            // FIX: Increased tolerances to reduce 81.6% cancellation rate
+            // The goal is to reduce API churn by being more tolerant of small price movements
             max_modify_price_bps: 50, // Modify if price ≤ 50 bps change (was 10)
             max_modify_size_pct: 0.50, // Modify if size ≤ 50% change
-            skip_price_tolerance_bps: 10, // Skip if price ≤ 10 bps (was 1 - reduces churn ~50%)
-            skip_size_tolerance_pct: 0.05, // Skip if size ≤ 5% (unchanged)
+            skip_price_tolerance_bps: 20, // FIX: Increased from 10 to 20 bps to reduce churn
+            skip_size_tolerance_pct: 0.10, // FIX: Increased from 5% to 10% to reduce churn
             use_queue_aware: true,    // Enabled by default (verified)
             queue_horizon_seconds: 1.0, // 1-second fill horizon
             use_impulse_filter: false, // Disabled - superseded by queue value comparison
@@ -178,6 +181,33 @@ impl DynamicReconcileConfig {
             self.best_level_tolerance_bps
         } else {
             self.outer_level_tolerance_bps
+        }
+    }
+
+    /// Get regime-adjusted skip tolerance.
+    ///
+    /// Higher volatility or cascade conditions warrant tighter tolerances (more updates)
+    /// because prices are moving faster and stale quotes are more dangerous.
+    /// Quiet markets warrant looser tolerances (fewer updates) to conserve API budget.
+    ///
+    /// # Arguments
+    /// * `cascade_factor` - Cascade size factor [0, 1]. 1.0 = no cascade, <0.3 = cascade
+    /// * `base_skip_bps` - Base skip tolerance from ReconcileConfig
+    ///
+    /// # Returns
+    /// Adjusted skip tolerance in bps
+    pub fn regime_adjusted_skip_tolerance(&self, cascade_factor: f64, base_skip_bps: f64) -> f64 {
+        // During cascade (low cascade_factor), use tighter tolerance
+        // In quiet markets (cascade_factor near 1.0), use looser tolerance
+        if cascade_factor < 0.3 {
+            // Cascade: tighter tolerance (prices moving fast)
+            (base_skip_bps * 0.5).max(2.0)
+        } else if cascade_factor < 0.7 {
+            // Moderate volatility: normal tolerance
+            base_skip_bps
+        } else {
+            // Quiet market: looser tolerance to conserve API budget
+            (base_skip_bps * 1.5).min(30.0)
         }
     }
 }
@@ -651,8 +681,15 @@ pub fn priority_based_matching(
                     1.0
                 };
 
-                // Case 1: Perfect match - no action needed
-                if price_diff_bps <= 2.0 && size_diff_pct <= 0.05 {
+                // Case 1: Quote latching - preserve queue for tiny changes (2.5 bps / 10%)
+                // This reduces the 86% cancellation rate by avoiding churn on small drifts
+                if price_diff_bps <= 2.5 && size_diff_pct <= 0.10 {
+                    debug!(
+                        oid = order.oid,
+                        price_diff_bps = %format!("{:.2}", price_diff_bps),
+                        size_diff_pct = %format!("{:.1}%", size_diff_pct * 100.0),
+                        "Quote latched: preserving queue position"
+                    );
                     continue;
                 }
 

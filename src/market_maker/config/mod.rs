@@ -9,10 +9,12 @@
 //! - `stochastic`: Stochastic module integration settings
 //! - `impulse`: Statistical impulse control configuration
 //! - `multi_asset`: Multi-asset market making configuration
+//! - `regime_profile`: Thin DEX vs liquid CEX regime profiles
 
 mod core;
 mod impulse;
 mod multi_asset;
+mod regime_profile;
 mod risk;
 mod runtime;
 mod spread_profile;
@@ -22,6 +24,7 @@ mod stochastic;
 pub use core::*;
 pub use impulse::*;
 pub use multi_asset::*;
+pub use regime_profile::*;
 pub use risk::*;
 pub use runtime::*;
 pub use spread_profile::*;

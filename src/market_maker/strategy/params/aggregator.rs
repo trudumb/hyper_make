@@ -9,6 +9,7 @@ use crate::market_maker::process_models::{
     DriftAdjustedSkew, FundingRateEstimator, HJBInventoryController, HawkesOrderFlowEstimator,
     LiquidationCascadeDetector, SpreadProcessEstimator,
 };
+use crate::market_maker::stochastic::StochasticControlBuilder;
 
 use super::super::MarketParams;
 
@@ -83,6 +84,11 @@ pub struct ParameterSources<'a> {
     pub use_dynamic_kappa_floor: bool,
     /// Whether to use dynamic spread ceiling (true if no CLI override).
     pub use_dynamic_spread_ceiling: bool,
+
+    // First-principles belief system
+    /// Reference to beliefs_builder for Bayesian posterior-derived values.
+    /// Provides E[μ | data] (predictive_bias) and E[σ | data] for HJB optimization.
+    pub beliefs_builder: &'a StochasticControlBuilder,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -183,6 +189,9 @@ impl ParameterAggregator {
             // === Directional flow ===
             momentum_bps: est.momentum_bps(),
             flow_imbalance: est.flow_imbalance(),
+            // Lead-lag signal (wired in quote_engine.rs when lag model is warmed up)
+            lead_lag_signal_bps: 0.0,
+            lead_lag_confidence: 0.0,
             falling_knife_score: est.falling_knife_score(),
             rising_knife_score: est.rising_knife_score(),
 
@@ -502,6 +511,38 @@ impl ParameterAggregator {
 
             // === Phase 9: Rate Limit Death Spiral Prevention ===
             rate_limit_headroom_pct: 1.0, // Full budget available by default, updated by caller
+
+            // === Predictive Bias (A-S Extension) ===
+            changepoint_prob: 0.0,        // Populated from stochastic controller in quote_engine
+            spread_widening_mult: 1.0,    // Populated from QuoteGate when pending confirmation
+
+            // === First-Principles Stochastic Control (Belief System) ===
+            // Read from Bayesian posterior over (μ, σ², κ) instead of hardcoding
+            belief_predictive_bias: sources.beliefs_builder.predictive_bias(),
+            belief_expected_sigma: {
+                let belief_sigma = sources.beliefs_builder.expected_sigma();
+                // Use belief sigma if warmed up, else fall back to estimator
+                if sources.beliefs_builder.is_warmed_up() && belief_sigma > 0.0 {
+                    belief_sigma
+                } else {
+                    est.sigma_clean()
+                }
+            },
+            belief_expected_kappa: {
+                let belief_kappa = sources.beliefs_builder.expected_kappa();
+                // Use belief kappa if warmed up, else fall back to estimator
+                if sources.beliefs_builder.is_warmed_up() && belief_kappa > 0.0 {
+                    belief_kappa
+                } else {
+                    est.kappa()
+                }
+            },
+            belief_confidence: sources.beliefs_builder.beliefs().overall_confidence(),
+            use_belief_system: sources.beliefs_builder.config().enable_belief_system,
+            // Position direction confidence - will be computed in RiskFeatures::from_params
+            // using the fields above (belief_predictive_bias, belief_confidence, flow_imbalance)
+            position_direction_confidence: 0.5, // Default neutral, computed at use site
+            time_since_adverse_move: 0.0,       // Tracked externally in orchestrator state
         }
     }
 }

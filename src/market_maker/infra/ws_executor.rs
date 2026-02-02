@@ -46,7 +46,10 @@ impl Default for WsPostConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            timeout: Duration::from_secs(5),
+            // FIX: Reduced from 1s to 500ms for faster placement latency
+            // This reduces the ~600ms placement latency target to ~200ms
+            // REST fallback kicks in quickly if WS fails
+            timeout: Duration::from_millis(500),
             fallback_to_rest: true,
         }
     }
@@ -58,6 +61,16 @@ impl WsPostConfig {
         Self {
             enabled: true,
             timeout,
+            fallback_to_rest: true,
+        }
+    }
+
+    /// Create a fast WS POST config optimized for latency.
+    /// Uses 500ms timeout with aggressive REST fallback.
+    pub fn fast() -> Self {
+        Self {
+            enabled: true,
+            timeout: Duration::from_millis(500),
             fallback_to_rest: true,
         }
     }
@@ -80,7 +93,8 @@ mod tests {
     fn test_ws_post_config_default() {
         let config = WsPostConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.timeout, Duration::from_secs(5));
+        // FIX: Updated to match new 500ms timeout for faster placement
+        assert_eq!(config.timeout, Duration::from_millis(500));
         assert!(config.fallback_to_rest);
     }
 

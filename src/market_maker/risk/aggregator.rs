@@ -21,6 +21,12 @@ pub struct AggregatedRisk {
     pub pull_quotes: bool,
     /// Spread widening factor (max across monitors)
     pub spread_factor: f64,
+    /// Accumulated skew in basis points (positive = skew toward selling)
+    pub skew_bps: f64,
+    /// Should pull buy-side quotes?
+    pub pull_buys: bool,
+    /// Should pull sell-side quotes?
+    pub pull_sells: bool,
 }
 
 impl Default for AggregatedRisk {
@@ -33,6 +39,9 @@ impl Default for AggregatedRisk {
             reduce_only: false,
             pull_quotes: false,
             spread_factor: 1.0,
+            skew_bps: 0.0,
+            pull_buys: false,
+            pull_sells: false,
         }
     }
 }
@@ -48,6 +57,27 @@ impl AggregatedRisk {
         self.assessments.iter().filter(|a| a.is_actionable())
     }
 
+    /// Should any side be pulled (either specific side or all quotes)?
+    pub fn should_pull_any(&self) -> bool {
+        self.pull_quotes || self.pull_buys || self.pull_sells
+    }
+
+    /// Get the net skew adjustment in basis points.
+    /// Positive = skew toward selling (widen asks, tighten bids).
+    pub fn net_skew_bps(&self) -> f64 {
+        self.skew_bps
+    }
+
+    /// Check if buy-side should be pulled (either specifically or all quotes).
+    pub fn should_pull_buys(&self) -> bool {
+        self.pull_quotes || self.pull_buys
+    }
+
+    /// Check if sell-side should be pulled (either specifically or all quotes).
+    pub fn should_pull_sells(&self) -> bool {
+        self.pull_quotes || self.pull_sells
+    }
+
     /// Get summary string for logging.
     pub fn summary(&self) -> String {
         if self.should_kill() {
@@ -58,14 +88,17 @@ impl AggregatedRisk {
             )
         } else if self.max_severity >= RiskSeverity::High {
             format!(
-                "HIGH RISK: {} actionable, reduce_only={}, pull_quotes={}, spread_factor={:.2}",
+                "HIGH RISK: {} actionable, reduce_only={}, pull_quotes={}, spread_factor={:.2}, skew_bps={:.1}, pull_buys={}, pull_sells={}",
                 self.assessments
                     .iter()
                     .filter(|a| a.is_actionable())
                     .count(),
                 self.reduce_only,
                 self.pull_quotes,
-                self.spread_factor
+                self.spread_factor,
+                self.skew_bps,
+                self.pull_buys,
+                self.pull_sells
             )
         } else {
             format!("OK: max_severity={:?}", self.max_severity)
@@ -147,6 +180,18 @@ impl RiskAggregator {
                 }
                 RiskAction::WidenSpreads(factor) => {
                     result.spread_factor = result.spread_factor.max(*factor);
+                }
+                RiskAction::SkewAway(skew_bps) => {
+                    // Accumulate skew (signed)
+                    result.skew_bps += skew_bps;
+                }
+                RiskAction::PullSide(pull_buys) => {
+                    // Track which side to pull
+                    if *pull_buys {
+                        result.pull_buys = true;
+                    } else {
+                        result.pull_sells = true;
+                    }
                 }
                 RiskAction::PullQuotes => {
                     result.pull_quotes = true;

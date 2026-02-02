@@ -136,6 +136,16 @@ pub(crate) struct MicropriceEstimator {
     ema_microprice_bits: AtomicU64,
     /// Minimum change in bps to update EMA (noise filter)
     ema_min_change_bps: f64,
+
+    // Depth gating for thin book environments
+    /// Minimum USD depth required to apply imbalance adjustment.
+    /// Below this threshold, microprice falls back to mid.
+    /// Default: $1000 (suitable for thin DEX environments like HIP-3)
+    min_depth_usd: f64,
+    /// Dampening threshold for moderate depth.
+    /// When depth is between min_depth_usd and full_depth_usd, dampen imbalance adjustment.
+    /// Default: $5000 (full confidence above this)
+    full_depth_usd: f64,
 }
 
 impl MicropriceEstimator {
@@ -182,6 +192,49 @@ impl MicropriceEstimator {
             ema_alpha: 0.2,                                // 5-update half-life
             ema_microprice_bits: AtomicU64::new(EMA_NONE), // No smoothed value until first update
             ema_min_change_bps: 2.0,                       // 2 bps noise filter
+            // Depth gating defaults (thin DEX environment)
+            min_depth_usd: 1000.0,  // Minimum $1000 depth to use imbalance
+            full_depth_usd: 5000.0, // Full confidence above $5000
+        }
+    }
+
+    /// Configure depth gating thresholds for thin book environments.
+    ///
+    /// When order book depth is below `min_depth_usd`, microprice falls back to mid
+    /// to avoid noise amplification from thin book imbalance calculations.
+    ///
+    /// When depth is between `min_depth_usd` and `full_depth_usd`, the imbalance
+    /// adjustment is dampened proportionally.
+    ///
+    /// # Arguments
+    /// * `min_depth_usd` - Below this, fall back to mid (default: $1000)
+    /// * `full_depth_usd` - Above this, full imbalance adjustment (default: $5000)
+    #[allow(dead_code)] // Used by regime profile configuration
+    pub(crate) fn set_depth_gate_config(&mut self, min_depth_usd: f64, full_depth_usd: f64) {
+        self.min_depth_usd = min_depth_usd.max(0.0);
+        self.full_depth_usd = full_depth_usd.max(min_depth_usd);
+    }
+
+    /// Get the minimum depth threshold in USD.
+    #[allow(dead_code)] // Used by regime profile configuration
+    pub(crate) fn min_depth_usd(&self) -> f64 {
+        self.min_depth_usd
+    }
+
+    /// Calculate depth dampening factor based on current book depth.
+    ///
+    /// Returns:
+    /// - 0.0 if depth < min_depth_usd (use mid only)
+    /// - 0.0-1.0 if depth between min and full (dampened adjustment)
+    /// - 1.0 if depth >= full_depth_usd (full adjustment)
+    fn depth_dampening_factor(&self, depth_usd: f64) -> f64 {
+        if depth_usd < self.min_depth_usd {
+            0.0
+        } else if depth_usd >= self.full_depth_usd {
+            1.0
+        } else {
+            // Linear interpolation between min and full
+            (depth_usd - self.min_depth_usd) / (self.full_depth_usd - self.min_depth_usd)
         }
     }
 
@@ -651,6 +704,122 @@ impl MicropriceEstimator {
             }
         } else {
             // No smoothing - return raw microprice
+            raw_microprice
+        }
+    }
+
+    /// Get depth-gated microprice adjusted for thin book environments.
+    ///
+    /// This is the PRIMARY METHOD to use for HIP-3 and other thin DEX environments.
+    ///
+    /// Unlike the standard `microprice()` method, this:
+    /// 1. Checks if book depth is sufficient for reliable imbalance signals
+    /// 2. Falls back to mid price if depth < min_depth_usd
+    /// 3. Dampens imbalance adjustment if depth is moderate (between min and full)
+    ///
+    /// This prevents microprice noise amplification that causes bids to cross mid
+    /// when one large order dominates the thin order book.
+    ///
+    /// # Arguments
+    /// * `mid` - Current mid price
+    /// * `book_imbalance` - Book imbalance signal [-1, 1]
+    /// * `flow_imbalance` - Flow imbalance signal [-1, 1]
+    /// * `depth_usd` - Total near-touch book depth in USD (bid + ask within ~10 bps)
+    ///
+    /// # Returns
+    /// Microprice with depth-appropriate adjustment, or mid if depth too thin.
+    pub(crate) fn microprice_depth_gated(
+        &self,
+        mid: f64,
+        book_imbalance: f64,
+        flow_imbalance: f64,
+        depth_usd: f64,
+    ) -> f64 {
+        if !self.is_warmed_up() {
+            return mid;
+        }
+
+        // Check depth gate - fall back to mid if book is too thin
+        let dampening = self.depth_dampening_factor(depth_usd);
+        if dampening <= 0.0 {
+            debug!(
+                depth_usd = %format!("{:.0}", depth_usd),
+                min_depth = %format!("{:.0}", self.min_depth_usd),
+                "Microprice depth gate: falling back to mid (thin book)"
+            );
+            return mid;
+        }
+
+        // If R² is too low, the model has no predictive power - use mid
+        if self.r_squared < self.min_r_squared {
+            return mid;
+        }
+
+        // Mode-based adjustment (same as standard microprice)
+        let adjustment = match self.correlation_mode {
+            CorrelationMode::Combined => {
+                let net_pressure = book_imbalance - flow_imbalance;
+                self.beta_net * net_pressure
+            }
+            CorrelationMode::Orthogonalized | CorrelationMode::Independent => {
+                self.beta_book * book_imbalance + self.beta_flow * flow_imbalance
+            }
+        };
+
+        // Apply depth dampening: thin books get reduced adjustment
+        let dampened_adjustment = adjustment * dampening;
+
+        // Clamp adjustment to ±50 bps for safety
+        let adjustment_clamped = dampened_adjustment.clamp(-0.005, 0.005);
+
+        let raw_microprice = mid * (1.0 + adjustment_clamped);
+
+        // Log dampening when significant
+        if dampening < 1.0 && self.n % 100 == 0 {
+            debug!(
+                depth_usd = %format!("{:.0}", depth_usd),
+                dampening = %format!("{:.2}", dampening),
+                raw_adj_bps = %format!("{:.2}", adjustment * 10000.0),
+                dampened_adj_bps = %format!("{:.2}", adjustment_clamped * 10000.0),
+                "Microprice depth dampening applied"
+            );
+        }
+
+        // Apply EMA smoothing if enabled (same logic as standard microprice)
+        if self.ema_alpha > 0.0 {
+            let prev_bits = self.ema_microprice_bits.load(Ordering::Relaxed);
+
+            if prev_bits == EMA_NONE {
+                self.ema_microprice_bits
+                    .store(mid.to_bits(), Ordering::Relaxed);
+                raw_microprice
+            } else {
+                let prev = f64::from_bits(prev_bits);
+
+                let ema_divergence_bps = ((prev - mid) / mid).abs() * 10_000.0;
+                if ema_divergence_bps > 100.0 {
+                    warn!(
+                        prev_ema = %format!("{:.2}", prev),
+                        mid = %format!("{:.2}", mid),
+                        divergence_bps = %format!("{:.1}", ema_divergence_bps),
+                        "Microprice EMA diverged too far from mid - resetting"
+                    );
+                    self.ema_microprice_bits
+                        .store(mid.to_bits(), Ordering::Relaxed);
+                    return raw_microprice;
+                }
+
+                let change_bps = ((raw_microprice - prev) / prev).abs() * 10_000.0;
+                if change_bps < self.ema_min_change_bps {
+                    return prev;
+                }
+
+                let smoothed = self.ema_alpha * raw_microprice + (1.0 - self.ema_alpha) * prev;
+                self.ema_microprice_bits
+                    .store(smoothed.to_bits(), Ordering::Relaxed);
+                smoothed
+            }
+        } else {
             raw_microprice
         }
     }

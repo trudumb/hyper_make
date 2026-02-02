@@ -738,6 +738,11 @@ impl LadderStrategy {
             // 365.25 * 24 * 60 * 60 = 31,557,600 seconds/year
             funding_rate: market_params.funding_rate / 31_557_600.0,
             use_funding_skew: true,
+            // RL policy adjustments from Q-learning agent
+            rl_spread_delta_bps: market_params.rl_spread_delta_bps,
+            rl_bid_skew_bps: market_params.rl_bid_skew_bps,
+            rl_ask_skew_bps: market_params.rl_ask_skew_bps,
+            rl_confidence: market_params.rl_confidence,
         };
 
         // === SPREAD FLOOR: Adaptive vs Static ===
@@ -1058,6 +1063,47 @@ impl LadderStrategy {
 
             // Log reduce-only mode detection
             let over_limit = position.abs() > effective_max_position;
+
+            // === REDUCE-ONLY SIZE CAP (Prevent Overshooting) ===
+            // When in reduce-only mode, cap sizes to exactly match current position
+            // to prevent overshooting from long to short (or short to long) in one fill.
+            //
+            // Example from logs: Position was +1.35 HYPE but asks totaled 2.0+ HYPE,
+            // causing position to go from +1.35 to -0.61 in one fill (oversold).
+            //
+            // Fix: If we're long and in reduce-only mode (bids blocked), cap total ask
+            // sizes to exactly the current position to reach zero, not overshoot.
+            let (available_for_bids, available_for_asks) = if over_limit {
+                if position > 0.0 {
+                    // Long and over limit: reduce-only mode for asks
+                    // Cap ask sizes to exactly the position (to reach zero, not go short)
+                    let capped_asks = available_for_asks.min(position);
+                    tracing::info!(
+                        position = %format!("{:.6}", position),
+                        effective_max_position = %format!("{:.6}", effective_max_position),
+                        raw_available_asks = %format!("{:.6}", available_for_asks),
+                        capped_asks = %format!("{:.6}", capped_asks),
+                        "REDUCE-ONLY (LONG): Capping ask sizes to position to prevent overshoot"
+                    );
+                    (available_for_bids, capped_asks)
+                } else {
+                    // Short and over limit: reduce-only mode for bids
+                    // Cap bid sizes to exactly the abs(position) (to reach zero, not go long)
+                    let capped_bids = available_for_bids.min(position.abs());
+                    tracing::info!(
+                        position = %format!("{:.6}", position),
+                        effective_max_position = %format!("{:.6}", effective_max_position),
+                        raw_available_bids = %format!("{:.6}", available_for_bids),
+                        capped_bids = %format!("{:.6}", capped_bids),
+                        "REDUCE-ONLY (SHORT): Capping bid sizes to position to prevent overshoot"
+                    );
+                    (capped_bids, available_for_asks)
+                }
+            } else {
+                // Not in reduce-only mode, use original values
+                (available_for_bids, available_for_asks)
+            };
+
             if over_limit {
                 if position > 0.0 {
                     tracing::debug!(
@@ -1065,7 +1111,7 @@ impl LadderStrategy {
                         effective_max_position = %format!("{:.6}", effective_max_position),
                         available_bids = %format!("{:.6}", available_for_bids),
                         available_asks = %format!("{:.6}", available_for_asks),
-                        "Over max position (LONG) - bids blocked, asks allowed for reducing"
+                        "Over max position (LONG) - bids blocked, asks capped to position"
                     );
                 } else {
                     tracing::debug!(
@@ -1073,7 +1119,7 @@ impl LadderStrategy {
                         effective_max_position = %format!("{:.6}", effective_max_position),
                         available_bids = %format!("{:.6}", available_for_bids),
                         available_asks = %format!("{:.6}", available_for_asks),
-                        "Over max position (SHORT) - asks blocked, bids allowed for reducing"
+                        "Over max position (SHORT) - asks blocked, bids capped to position"
                     );
                 }
             }

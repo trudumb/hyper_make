@@ -47,7 +47,12 @@
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:www.quantbeckman.com)",
       "Bash(__NEW_LINE_f271302b2f8bb747__ echo \"\")",
-      "mcp__serena__create_text_file"
+      "mcp__serena__create_text_file",
+      "Bash(python3:*)",
+      "Bash(/usr/bin/python3:*)",
+      "Bash(LOG=\"logs/mm_hip3_hyna_HYPE_hip3_2026-02-01_10-33-12.log\" echo \"=== Recent log entries \\(last 50 lines\\) ===\" tail -50 \"$LOG\")",
+      "Bash(./scripts/test_hip3.sh:*)",
+      "Bash(# Kill any existing processes pkill -f market_maker || true sleep 2 # Start fresh 1-hour test cd /home/jcritch22/projects/hyper_make nohup ./scripts/test_hip3.sh HYPE hyna 3600 hip3 2>&1 & echo \"\"Started new test. PID: $!\"\" sleep 10 echo \"\"\"\" echo \"\"=== Initial output ===\"\" head -60 /tmp/hip3_hourtest_output.log)"
     ]
   }
 }

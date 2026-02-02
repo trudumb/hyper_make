@@ -301,10 +301,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 Ok(payload) => {
                     debug!("[SafetySync] Sending WS POST info request for OpenOrders verification");
 
-                    // Step 2: Send via WS POST
+                    // Step 2: Send via WS POST with faster timeout
+                    // FIX: Reduced from 5s to 1s to reduce state sync lag
+                    // On timeout, SafetySync will skip verification (conservative fallback)
                     match self
                         .info_client
-                        .ws_post_info(payload, std::time::Duration::from_secs(5))
+                        .ws_post_info(payload, std::time::Duration::from_secs(1))
                         .await
                     {
                         Ok(response_data) => {

@@ -124,6 +124,17 @@ pub struct MarketParams {
     /// Negative = sell pressure, Positive = buy pressure
     pub flow_imbalance: f64,
 
+    /// Lead-lag signal from cross-exchange analysis (in bps).
+    /// Binance → Hyperliquid: when Binance moves, Hyperliquid follows.
+    /// Positive = predicted upward move, Negative = predicted downward move.
+    /// Confidence-weighted: signal * (mutual_info / 0.1).min(1.0)
+    pub lead_lag_signal_bps: f64,
+
+    /// Lead-lag signal confidence [0, 1].
+    /// Based on mutual information between signal and target.
+    /// > 0.02 bits is considered informative.
+    pub lead_lag_confidence: f64,
+
     /// Falling knife score [0, 3]
     /// > 0.5 = some downward momentum, > 1.0 = severe (protect bids!)
     pub falling_knife_score: f64,
@@ -687,6 +698,53 @@ pub struct MarketParams {
     /// Pre-computed in orchestrator: bayesian_gamma_mult = trend_discount × bootstrap_discount × uncertainty_premium × regime_mult
     /// Range: [0.7, 1.5] typically.
     pub bayesian_gamma_mult: f64,
+
+    // ==================== Predictive Bias (A-S Extension) ====================
+    /// Changepoint probability from BOCD detector [0, 1].
+    /// High values indicate imminent regime change.
+    /// Used to compute predictive bias β_t for preemptive quote skewing.
+    pub changepoint_prob: f64,
+
+    /// Spread widening multiplier from changepoint detection.
+    /// Applied when changepoint is pending confirmation (< required confirmations).
+    /// Range: [1.0, 2.0] typically.
+    pub spread_widening_mult: f64,
+
+    // ==================== First-Principles Stochastic Control ====================
+    /// Belief-derived predictive bias β_t = E[μ | data].
+    /// This is the posterior mean of drift from Normal-Inverse-Gamma update.
+    /// NOT a heuristic - it's the mathematically correct signal.
+    /// Positive = bullish drift, Negative = bearish drift.
+    pub belief_predictive_bias: f64,
+
+    /// Belief-derived expected volatility E[σ | data].
+    /// From the NIG posterior over (μ, σ²).
+    pub belief_expected_sigma: f64,
+
+    /// Belief-derived expected fill intensity E[κ | fills].
+    /// From Gamma posterior over fill intensity.
+    pub belief_expected_kappa: f64,
+
+    /// Confidence in belief system [0, 1].
+    /// Low values → blend toward legacy behavior.
+    pub belief_confidence: f64,
+
+    /// Whether to use belief-derived parameters instead of heuristics.
+    /// Feature flag for gradual rollout.
+    pub use_belief_system: bool,
+
+    // ==================== Position Direction Confidence ====================
+    /// Position direction confidence [0, 1].
+    /// High confidence (>0.5) = position likely from informed flow.
+    /// Based on: belief alignment, fill alignment, time held without adverse move.
+    /// Used by CalibratedRiskModel to modulate gamma via beta_confidence (NEGATIVE).
+    /// High confidence → lower gamma → more two-sided quoting.
+    pub position_direction_confidence: f64,
+
+    /// Time in seconds since last adverse price move against position.
+    /// Longer time without adverse move → higher confidence in position.
+    /// Updated when price moves against position direction.
+    pub time_since_adverse_move: f64,
 }
 
 impl Default for MarketParams {
@@ -718,6 +776,8 @@ impl Default for MarketParams {
             jump_ratio: 1.0,           // Default: normal diffusion
             momentum_bps: 0.0,         // Default: no momentum
             flow_imbalance: 0.0,       // Default: balanced flow
+            lead_lag_signal_bps: 0.0,  // Default: no cross-exchange signal
+            lead_lag_confidence: 0.0,  // Default: no confidence
             falling_knife_score: 0.0,  // Default: no falling knife
             rising_knife_score: 0.0,   // Default: no rising knife
             book_imbalance: 0.0,       // Default: balanced book
@@ -898,6 +958,18 @@ impl Default for MarketParams {
             adverse_uncertainty: 0.1,     // Moderate uncertainty (10% std)
             adverse_regime: 1,            // Normal regime initially
             bayesian_gamma_mult: 1.0,     // No adjustment until computed
+            // Predictive Bias (A-S Extension)
+            changepoint_prob: 0.0,        // No changepoint detected initially
+            spread_widening_mult: 1.0,    // No widening initially
+            // First-Principles Stochastic Control
+            belief_predictive_bias: 0.0,  // No drift bias until beliefs updated
+            belief_expected_sigma: 0.0001, // Default sigma
+            belief_expected_kappa: 200.0, // Conservative default for thin DEX
+            belief_confidence: 0.0,       // Not confident until warmed up
+            use_belief_system: true,      // Use first-principles belief system
+            // Position Direction Confidence
+            position_direction_confidence: 0.5, // Neutral confidence initially
+            time_since_adverse_move: 0.0,       // No history initially
         }
     }
 }
@@ -1430,5 +1502,88 @@ impl MarketParams {
         params.dynamic_limit_valid = true;
 
         params
+    }
+}
+
+impl MarketParams {
+    /// Compute confidence that current position is from informed flow.
+    ///
+    /// Returns [0, 1] where:
+    ///   0.0 = no confidence (position likely adverse)
+    ///   0.5 = neutral (flat position or uncertain)
+    ///   1.0 = high confidence (position from informed fills, beliefs aligned)
+    ///
+    /// This confidence is used by CalibratedRiskModel.beta_confidence (NEGATIVE)
+    /// to REDUCE gamma when we're confident, enabling more two-sided quoting.
+    ///
+    /// # Arguments
+    /// * `position` - Current position (signed, positive = long)
+    /// * `max_position` - Maximum allowed position for normalization
+    ///
+    /// # Components
+    /// 1. **Belief alignment**: Do beliefs support our position direction?
+    ///    - belief_predictive_bias aligns with position sign → high confidence
+    /// 2. **Time stability**: How long held without adverse move?
+    ///    - Longer hold → higher confidence (max at 60s)
+    /// 3. **Flow alignment**: Is recent flow supporting our position?
+    ///    - flow_imbalance aligns with position → higher confidence
+    pub fn compute_position_direction_confidence(&self, position: f64, max_position: f64) -> f64 {
+        const EPSILON: f64 = 1e-9;
+
+        // Flat position → neutral confidence
+        if max_position < EPSILON || (position.abs() / max_position) < 0.01 {
+            return 0.5;
+        }
+
+        let position_sign = position.signum();
+
+        // === Factor 1: Belief alignment ===
+        // Do beliefs (predictive_bias from particle filter) support our position?
+        // If we're long and drift is positive, or short and drift is negative
+        let belief_alignment = if self.belief_confidence > 0.1 {
+            let bias = self.belief_predictive_bias;
+            let aligned = (position_sign > 0.0 && bias > 0.0)
+                || (position_sign < 0.0 && bias < 0.0);
+            if aligned {
+                // Confidence-weighted alignment: stronger beliefs = more confidence
+                // bias magnitude is typically small (e.g., 0.0001), so we normalize
+                let bias_strength = (bias.abs() * 10000.0).min(1.0); // in bps, cap at 100bps
+                self.belief_confidence * bias_strength
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // === Factor 2: Time stability ===
+        // How long have we held this position without adverse price move?
+        // Longer hold without adverse move → more confident
+        let time_factor = (self.time_since_adverse_move / 60.0).min(1.0); // Max out at 1 min
+
+        // === Factor 3: Flow alignment ===
+        // Is recent flow (order flow imbalance) supporting our position?
+        // Positive flow_imbalance = buying pressure → good for long
+        // Negative flow_imbalance = selling pressure → good for short
+        let flow_alignment = {
+            let flow_aligned = (position_sign > 0.0 && self.flow_imbalance > 0.0)
+                || (position_sign < 0.0 && self.flow_imbalance < 0.0);
+            if flow_aligned {
+                self.flow_imbalance.abs().min(1.0)
+            } else {
+                0.0
+            }
+        };
+
+        // === Combine factors ===
+        // Weighted combination with belief alignment being most important
+        // since it's the most forward-looking signal
+        let raw_confidence = 0.5 * belief_alignment + 0.25 * time_factor + 0.25 * flow_alignment;
+
+        // Scale from [0, 1] raw to [0.2, 0.9] output range
+        // This prevents extreme confidence values
+        let scaled = 0.2 + raw_confidence * 0.7;
+
+        scaled.clamp(0.0, 1.0)
     }
 }

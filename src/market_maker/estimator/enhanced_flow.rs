@@ -534,7 +534,7 @@ mod tests {
         // First computation
         let mut ctx = make_context();
         ctx.book_imbalance = 0.8;
-        let result1 = estimator.compute(&ctx);
+        let _result1 = estimator.compute(&ctx);
 
         // Second computation with different input
         ctx.book_imbalance = -0.8;

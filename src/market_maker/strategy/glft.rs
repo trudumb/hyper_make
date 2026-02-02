@@ -366,6 +366,11 @@ impl GLFTStrategy {
     /// This is the OPPOSITE of inventory skew - we WANT to get filled WITH momentum
     /// to BUILD position in a profitable direction.
     ///
+    /// # Lead-Lag Enhancement
+    /// When lead-lag signal is available (Binance → Hyperliquid), it provides
+    /// predictive edge: we know where price is likely to move before it moves.
+    /// This allows more aggressive positioning in the predicted direction.
+    ///
     /// Returns skew in fractional terms (divide by 10000 to get bps).
     fn proactive_directional_skew(&self, market_params: &MarketParams) -> f64 {
         // Check if proactive skew is enabled
@@ -376,21 +381,34 @@ impl GLFTStrategy {
         let momentum_bps = market_params.momentum_bps;
         let p_continuation = market_params.p_momentum_continue;
 
+        // === Lead-Lag Signal Enhancement ===
+        // When cross-exchange lead-lag is available and confident, use it as
+        // additional directional signal. This provides predictive edge.
+        let lead_lag_signal = market_params.lead_lag_signal_bps;
+        let lead_lag_conf = market_params.lead_lag_confidence;
+
+        // Combine momentum with lead-lag signal (additive, scaled by confidence)
+        // Lead-lag signal is already confidence-weighted in quote_engine
+        let effective_momentum = momentum_bps + lead_lag_signal;
+
         // Normalize momentum strength to [0, 1]
         // 20 bps is considered "strong" momentum
-        let momentum_strength = (momentum_bps.abs() / 20.0).min(1.0);
+        let momentum_strength = (effective_momentum.abs() / 20.0).min(1.0);
 
-        // Check thresholds
+        // Check thresholds (use effective momentum)
         if p_continuation < market_params.proactive_min_momentum_confidence {
-            return 0.0; // Not confident enough
+            // Allow bypass when lead-lag confidence is high
+            if lead_lag_conf < 0.5 {
+                return 0.0; // Not confident enough
+            }
         }
-        if momentum_bps.abs() < market_params.proactive_min_momentum_bps {
+        if effective_momentum.abs() < market_params.proactive_min_momentum_bps {
             return 0.0; // Too weak
         }
 
         // Direction: OPPOSITE of momentum to BUILD position WITH momentum
         // Positive momentum → we want to get filled on bids → negative skew (tighter bids)
-        let direction = -momentum_bps.signum();
+        let direction = -effective_momentum.signum();
 
         // Soft HMM regime blending (replaces hard switch)
         // [p_low, p_normal, p_high, p_extreme] → weighted multiplier
@@ -401,12 +419,29 @@ impl GLFTStrategy {
             + market_params.regime_probs[2] * 0.5              // High: cautious
             + market_params.regime_probs[3] * 0.2;             // Extreme: very cautious
 
+        // Lead-lag confidence boost: when we have predictive edge, be more aggressive
+        let lead_lag_boost = 1.0 + (lead_lag_conf * 0.5); // Up to 1.5x with full confidence
+
         // Calculate proactive skew in bps
         let proactive_skew_bps = direction
             * momentum_strength
             * p_continuation
             * regime_mult
+            * lead_lag_boost
             * market_params.proactive_skew_sensitivity;
+
+        // Log when lead-lag is contributing
+        if lead_lag_signal.abs() > 0.5 {
+            tracing::debug!(
+                momentum_bps = %format!("{:.2}", momentum_bps),
+                lead_lag_signal_bps = %format!("{:.2}", lead_lag_signal),
+                lead_lag_conf = %format!("{:.2}", lead_lag_conf),
+                effective_momentum_bps = %format!("{:.2}", effective_momentum),
+                lead_lag_boost = %format!("{:.2}", lead_lag_boost),
+                proactive_skew_bps = %format!("{:.2}", proactive_skew_bps),
+                "Lead-lag signal contributing to proactive skew"
+            );
+        }
 
         // Convert to fractional (divide by 10000)
         proactive_skew_bps / 10000.0
@@ -752,6 +787,11 @@ impl QuotingStrategy for GLFTStrategy {
                 market_params.sigma_leverage_adjusted
             };
 
+        // FIX: Meaningful sigma floor to prevent zero skew during warmup
+        // Without this floor, sigma=0 during warmup causes skew=0 always
+        // 0.0001 = 1 bp/sec baseline - provides meaningful skew even with small positions
+        let sigma_for_skew = sigma_for_skew.max(0.0001);
+
         // Calculate inventory ratio: q / Q_max (normalized to [-1, 1])
         let inventory_ratio = if effective_max_position > EPSILON {
             (position / effective_max_position).clamp(-1.0, 1.0)
@@ -773,18 +813,46 @@ impl QuotingStrategy for GLFTStrategy {
                     "HJB TERMINAL ZONE: Aggressive inventory reduction"
                 );
             }
-            market_params.hjb_optimal_skew
+
+            // FIX: When position is small but non-zero, amplify skew signal
+            // The HJB formula multiplies by q (normalized position), so small q → tiny skew
+            // This amplifier ensures meaningful skew even with small positions
+            let hjb_skew = market_params.hjb_optimal_skew;
+            let position_amplifier = if inventory_ratio.abs() < 0.1 && inventory_ratio.abs() > 0.01 {
+                // 10x amplification for small positions (1-10% of max)
+                // This compensates for the q multiplication in the HJB formula
+                10.0
+            } else if inventory_ratio.abs() <= 0.01 && inventory_ratio.abs() > 0.001 {
+                // 5x amplification for very small positions (0.1-1% of max)
+                5.0
+            } else {
+                1.0
+            };
+            hjb_skew * position_amplifier
         } else {
             // Flow-dampened inventory skew: base_skew × exp(-β × flow_alignment)
             // Uses flow_imbalance to dampen skew when aligned with flow (don't fight momentum)
             // and amplify skew when opposed to flow (reduce risk faster)
-            self.inventory_skew_with_flow(
+            let raw_skew = self.inventory_skew_with_flow(
                 inventory_ratio,
                 sigma_for_skew,
                 gamma,
                 time_horizon,
                 market_params.flow_imbalance,
-            )
+            );
+
+            // FIX: Position amplifier for small positions (matches HJB path behavior)
+            // The base skew formula multiplies by q (inventory_ratio), so small q → tiny skew
+            // This amplifier ensures meaningful skew even with small positions to enable balanced fills
+            let position_amplifier = if inventory_ratio.abs() < 0.1 && inventory_ratio.abs() > 0.01 {
+                10.0 // 10x amplification for small positions (1-10% of max)
+            } else if inventory_ratio.abs() <= 0.01 && inventory_ratio.abs() > 0.001 {
+                5.0 // 5x amplification for very small positions (0.1-1% of max)
+            } else {
+                1.0
+            };
+
+            raw_skew * position_amplifier
         };
 
         // === 3a. HAWKES FLOW SKEWING (Tier 2) - DISABLED UNTIL CALIBRATED ===
@@ -970,12 +1038,147 @@ impl QuotingStrategy for GLFTStrategy {
         let flow_alignment = inventory_ratio.signum() * market_params.flow_imbalance;
         let flow_modifier = (-self.risk_config.flow_sensitivity * flow_alignment).exp();
 
+        // FIX: Enhanced debug logging to trace skew calculation
+        // Log whenever there's a meaningful position to help diagnose balanced fills
+        if position.abs() > 0.001 {
+            debug!(
+                position = %format!("{:.6}", position),
+                inventory_ratio = %format!("{:.4}", inventory_ratio),
+                sigma_for_skew = %format!("{:.8}", sigma_for_skew),
+                skew_bps = %format!("{:.2}", base_skew * 10000.0),
+                hjb_optimal_skew = %format!("{:.8}", market_params.hjb_optimal_skew),
+                use_hjb_skew = market_params.use_hjb_skew,
+                gamma = %format!("{:.4}", gamma),
+                time_horizon = %format!("{:.2}", time_horizon),
+                flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
+                "Skew calculation (position amplification applied)"
+            );
+            if skew.abs() < 1e-8 {
+                debug!(
+                    base_skew_raw = %format!("{:.8}", base_skew),
+                    "SKEW ZERO WARNING: Non-zero position but zero skew - check inputs"
+                );
+            }
+        }
+
         // === 6a. ASYMMETRIC BID/ASK DELTAS ===
         // Use directional half-spreads: κ_bid ≠ κ_ask when flow is directional
         // - Bid delta uses half_spread_bid (wider when sell pressure = low κ_bid)
         // - Ask delta uses half_spread_ask (wider when buy pressure = low κ_ask)
-        let bid_delta = half_spread_bid + skew;
-        let ask_delta = (half_spread_ask - skew).max(0.0);
+        //
+        // === 6a'. PREDICTIVE BIAS (Avellaneda-Stoikov Extension) ===
+        // When using first-principles belief system:
+        //   β_t = E[μ | data] from Normal-Inverse-Gamma posterior
+        // Legacy fallback (changepoint-based heuristic):
+        //   β_t = -sensitivity × prob_excess × σ
+        //
+        // Negative β → expect price to fall → widen bids (+β/2), tighten asks (+β/2)
+        //
+        // The bias shifts BOTH sides in the same direction:
+        //   - bid_delta = half_spread + skew - β/2 (widen when β < 0)
+        //   - ask_delta = half_spread - skew + β/2 (tighten when β < 0)
+        let predictive_bias = if market_params.use_belief_system
+            && market_params.belief_confidence > 0.3
+        {
+            // First-principles: Use β_t = E[μ | data] from NIG posterior
+            // This is mathematically derived, not a heuristic
+            let bias = market_params.belief_predictive_bias;
+
+            if bias.abs() > 0.0001 {
+                debug!(
+                    belief_bias_bps = %format!("{:.2}", bias * 10000.0),
+                    belief_confidence = %format!("{:.3}", market_params.belief_confidence),
+                    belief_sigma = %format!("{:.6}", market_params.belief_expected_sigma),
+                    belief_kappa = %format!("{:.0}", market_params.belief_expected_kappa),
+                    "Predictive bias from first-principles beliefs (NIG posterior)"
+                );
+            }
+            bias
+        } else if market_params.changepoint_prob > 0.3 {
+            // Legacy fallback: Compute predictive bias from changepoint probability
+            // Sensitivity: 2.0 means expect 2σ move on confirmed changepoint
+            let sensitivity = 2.0; // Could be made configurable via StochasticConfig
+            let threshold = 0.3;
+            let prob_excess = (market_params.changepoint_prob - threshold) / (1.0 - threshold);
+
+            // Negative bias = expect price to fall = widen bids, tighten asks
+            let bias = -sensitivity * prob_excess * sigma;
+
+            if bias.abs() > 0.0001 {
+                debug!(
+                    changepoint_prob = %format!("{:.3}", market_params.changepoint_prob),
+                    prob_excess = %format!("{:.3}", prob_excess),
+                    sigma = %format!("{:.6}", sigma),
+                    predictive_bias_bps = %format!("{:.2}", bias * 10000.0),
+                    "Predictive bias applied (legacy changepoint heuristic)"
+                );
+            }
+            bias
+        } else {
+            0.0
+        };
+
+        // Apply spread widening multiplier from quote gate (pending changepoint confirmation)
+        let half_spread_bid_widened = half_spread_bid * market_params.spread_widening_mult;
+        let half_spread_ask_widened = half_spread_ask * market_params.spread_widening_mult;
+
+        // Compute asymmetric deltas with predictive bias
+        // Note: predictive_bias is typically negative when changepoint imminent (expect price drop)
+        //   - Subtracting negative β/2 from bid_delta → WIDENS bids (less aggressive buying)
+        //   - Adding negative β/2 to ask_delta → TIGHTENS asks (more aggressive selling)
+        let bid_delta_raw = half_spread_bid_widened + skew - predictive_bias / 2.0;
+        let ask_delta_raw = (half_spread_ask_widened - skew + predictive_bias / 2.0).max(0.0);
+
+        // FIX: Cap total spread asymmetry to prevent one side from being uncompetitive
+        // When skew causes extreme asymmetry (e.g., 15 bps vs 60 bps), rebalance
+        let max_asymmetry_ratio = 3.0; // Maximum bid/ask spread ratio (3:1)
+        let max_asymmetry_bps = 0.0020; // 20 bps max absolute asymmetry
+        let total_spread = bid_delta_raw + ask_delta_raw;
+        let asymmetry = (bid_delta_raw - ask_delta_raw).abs();
+
+        let (bid_delta, ask_delta) = if asymmetry > max_asymmetry_bps && total_spread > 0.0 {
+            // Asymmetry too high - redistribute while preserving total spread
+            let target_bid = if bid_delta_raw > ask_delta_raw {
+                // Bid side wider - cap it
+                let capped_bid = (total_spread / 2.0) + (max_asymmetry_bps / 2.0);
+                capped_bid.min(bid_delta_raw) // Don't widen if already within cap
+            } else {
+                bid_delta_raw
+            };
+            let target_ask = if ask_delta_raw > bid_delta_raw {
+                // Ask side wider - cap it
+                let capped_ask = (total_spread / 2.0) + (max_asymmetry_bps / 2.0);
+                capped_ask.min(ask_delta_raw)
+            } else {
+                ask_delta_raw
+            };
+
+            // Log when capping occurs
+            if (bid_delta_raw - target_bid).abs() > 1e-6 || (ask_delta_raw - target_ask).abs() > 1e-6 {
+                debug!(
+                    asymmetry_bps = %format!("{:.1}", asymmetry * 10000.0),
+                    bid_raw_bps = %format!("{:.1}", bid_delta_raw * 10000.0),
+                    ask_raw_bps = %format!("{:.1}", ask_delta_raw * 10000.0),
+                    bid_capped_bps = %format!("{:.1}", target_bid * 10000.0),
+                    ask_capped_bps = %format!("{:.1}", target_ask * 10000.0),
+                    "Spread asymmetry capped to prevent uncompetitive side"
+                );
+            }
+            (target_bid, target_ask.max(0.0))
+        } else if bid_delta_raw.max(ask_delta_raw) / bid_delta_raw.min(ask_delta_raw).max(1e-8) > max_asymmetry_ratio {
+            // Ratio asymmetry too high - use geometric mean and redistribute
+            let geo_mean = (bid_delta_raw * ask_delta_raw).sqrt().max(effective_floor);
+            let rebalanced_bid = geo_mean + (skew / 2.0);
+            let rebalanced_ask = (geo_mean - skew / 2.0).max(0.0);
+            debug!(
+                ratio = %format!("{:.1}", bid_delta_raw.max(ask_delta_raw) / bid_delta_raw.min(ask_delta_raw).max(1e-8)),
+                geo_mean_bps = %format!("{:.1}", geo_mean * 10000.0),
+                "Spread ratio asymmetry capped via geometric rebalancing"
+            );
+            (rebalanced_bid, rebalanced_ask)
+        } else {
+            (bid_delta_raw, ask_delta_raw)
+        };
 
         debug!(
             inv_ratio = %format!("{:.4}", inventory_ratio),
@@ -1011,6 +1214,8 @@ impl QuotingStrategy for GLFTStrategy {
             is_toxic = market_params.is_toxic_regime,
             heavy_tail = market_params.is_heavy_tailed,
             tight_quoting = market_params.tight_quoting_allowed,
+            belief_system = market_params.use_belief_system,
+            belief_bias_bps = %format!("{:.2}", market_params.belief_predictive_bias * 10000.0),
             "GLFT spread components with asymmetric kappa"
         );
 

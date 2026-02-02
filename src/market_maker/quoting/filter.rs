@@ -30,6 +30,9 @@ pub enum ReduceOnlyReason {
     OverValueLimit,
     /// Position exceeds max_position limit (fallback/override).
     OverPositionLimit,
+    /// Position exceeds limit but is underwater - widen spreads instead of forcing exit.
+    /// This prevents selling at a loss when not at liquidation risk.
+    UnderwaterWidenOnly,
 }
 
 /// Result of reduce-only filtering.
@@ -145,6 +148,11 @@ pub struct ReduceOnlyConfig {
     /// Threshold below which reduce-only triggers (default 0.5).
     /// Higher = more conservative (triggers earlier).
     pub liquidation_trigger_threshold: f64,
+
+    // === Underwater Position Protection ===
+    /// Unrealized P&L (USD). Negative = underwater.
+    /// Used to prevent forcing sales at a loss when not at liquidation risk.
+    pub unrealized_pnl: f64,
 }
 
 /// Quote filtering utilities.
@@ -161,9 +169,16 @@ impl QuoteFilter {
     ///
     /// Priority (highest to lowest):
     /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    ///    → ALWAYS force reduce, even at a loss (survival > P&L)
     /// 2. Margin utilization > 80% (capital constraint)
     /// 3. Position value exceeds max_position_value
     /// 4. Position exceeds max_position (fallback/override)
+    ///
+    /// Special case: Underwater position protection
+    /// When position exceeds limits but is underwater (unrealized_pnl < 0) AND
+    /// not approaching liquidation, we only clear the side that would ADD to
+    /// the position (don't buy more when long underwater), but keep the reducing
+    /// side passive to wait for better exit prices. This is the UnderwaterWidenOnly mode.
     pub fn apply_reduce_only_ladder(
         bids: &mut Vec<Quote>,
         asks: &mut Vec<Quote>,
@@ -200,6 +215,64 @@ impl QuoteFilter {
             return ReduceOnlyResult::no_filtering();
         }
 
+        // Check if position is underwater (unrealized P&L is negative)
+        let is_underwater = config.unrealized_pnl < 0.0;
+
+        // === UNDERWATER POSITION PROTECTION ===
+        // When position exceeds limit but is underwater AND not at liquidation risk,
+        // DON'T force reduce (which would realize a loss).
+        // Instead: clear the side that would ADD to the losing position,
+        // but keep the reducing side passive to wait for better exit prices.
+        //
+        // Priority 1 (liquidation) always overrides this - survival > P&L.
+        if is_underwater && !approaching_liquidation && !over_margin_limit {
+            if position > 0.0 {
+                // Long and underwater: clear bids (don't add to losing position)
+                // Keep asks for potential exit at better prices
+                bids.clear();
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    position_value = %format!("${:.2}", position_value),
+                    max_position_value = %format!("${:.2}", config.max_position_value),
+                    "Position over limit but UNDERWATER - filtering bids only, not forcing exit"
+                );
+                return ReduceOnlyResult {
+                    was_filtered: true,
+                    reason: Some(ReduceOnlyReason::UnderwaterWidenOnly),
+                    filtered_bids: true,
+                    filtered_asks: false,
+                    needs_escalation: false,
+                };
+            } else {
+                // Short and underwater: clear asks (don't add to losing position)
+                // Keep bids for potential exit at better prices
+                asks.clear();
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    position_value = %format!("${:.2}", position_value),
+                    max_position_value = %format!("${:.2}", config.max_position_value),
+                    "Position over limit but UNDERWATER - filtering asks only, not forcing exit"
+                );
+                return ReduceOnlyResult {
+                    was_filtered: true,
+                    reason: Some(ReduceOnlyReason::UnderwaterWidenOnly),
+                    filtered_bids: false,
+                    filtered_asks: true,
+                    needs_escalation: false,
+                };
+            }
+        }
+
+        // === STANDARD REDUCE-ONLY BEHAVIOR ===
+        // Position is over limit and either:
+        // - Approaching liquidation (force reduce regardless of P&L)
+        // - Over margin limit (capital constraint)
+        // - Not underwater (can reduce at profit or break-even)
+
         // Determine primary reason (priority order)
         let reason = if approaching_liquidation {
             ReduceOnlyReason::ApproachingLiquidation
@@ -232,9 +305,12 @@ impl QuoteFilter {
     ///
     /// Priority (highest to lowest):
     /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    ///    → ALWAYS force reduce, even at a loss (survival > P&L)
     /// 2. Margin utilization > 80% (capital constraint)
     /// 3. Position value exceeds max_position_value
     /// 4. Position exceeds max_position (fallback/override)
+    ///
+    /// Special case: Underwater position protection (same as ladder version)
     pub fn apply_reduce_only_single(
         bid: &mut Option<Quote>,
         ask: &mut Option<Quote>,
@@ -267,6 +343,45 @@ impl QuoteFilter {
             && !over_value_limit
         {
             return ReduceOnlyResult::no_filtering();
+        }
+
+        // Check if position is underwater (unrealized P&L is negative)
+        let is_underwater = config.unrealized_pnl < 0.0;
+
+        // === UNDERWATER POSITION PROTECTION ===
+        // Same logic as apply_reduce_only_ladder
+        if is_underwater && !approaching_liquidation && !over_margin_limit {
+            if position > 0.0 {
+                *bid = None;
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    "Position over limit but UNDERWATER (single) - filtering bid only"
+                );
+                return ReduceOnlyResult {
+                    was_filtered: true,
+                    reason: Some(ReduceOnlyReason::UnderwaterWidenOnly),
+                    filtered_bids: true,
+                    filtered_asks: false,
+                    needs_escalation: false,
+                };
+            } else {
+                *ask = None;
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    "Position over limit but UNDERWATER (single) - filtering ask only"
+                );
+                return ReduceOnlyResult {
+                    was_filtered: true,
+                    reason: Some(ReduceOnlyReason::UnderwaterWidenOnly),
+                    filtered_bids: false,
+                    filtered_asks: true,
+                    needs_escalation: false,
+                };
+            }
         }
 
         // Determine primary reason (priority order)
@@ -338,9 +453,12 @@ impl QuoteFilter {
     ///
     /// Priority (highest to lowest):
     /// 1. Approaching liquidation (buffer_ratio < threshold) - DYNAMIC, exchange-derived
+    ///    → ALWAYS force reduce, even at a loss (survival > P&L)
     /// 2. Margin utilization > 80% (capital constraint)
     /// 3. Position value exceeds max_position_value
     /// 4. Position exceeds max_position (fallback/override)
+    ///
+    /// Special case: Underwater position protection (same as ladder version)
     ///
     /// # Arguments
     /// - `bids`: Mutable bid quotes to filter
@@ -383,6 +501,45 @@ impl QuoteFilter {
             && !over_value_limit
         {
             return ReduceOnlyResult::no_filtering();
+        }
+
+        // Check if position is underwater (unrealized P&L is negative)
+        let is_underwater = config.unrealized_pnl < 0.0;
+
+        // === UNDERWATER POSITION PROTECTION ===
+        // Same logic as apply_reduce_only_ladder
+        if is_underwater && !approaching_liquidation && !over_margin_limit {
+            if position > 0.0 {
+                bids.clear();
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    "Position over limit but UNDERWATER (exchange limits) - filtering bids only"
+                );
+                return ReduceOnlyResult {
+                    was_filtered: true,
+                    reason: Some(ReduceOnlyReason::UnderwaterWidenOnly),
+                    filtered_bids: true,
+                    filtered_asks: false,
+                    needs_escalation: false,
+                };
+            } else {
+                asks.clear();
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    "Position over limit but UNDERWATER (exchange limits) - filtering asks only"
+                );
+                return ReduceOnlyResult {
+                    was_filtered: true,
+                    reason: Some(ReduceOnlyReason::UnderwaterWidenOnly),
+                    filtered_bids: false,
+                    filtered_asks: true,
+                    needs_escalation: false,
+                };
+            }
         }
 
         // Determine primary reason (priority order)
@@ -494,6 +651,16 @@ impl QuoteFilter {
                     side_name
                 );
             }
+            ReduceOnlyReason::UnderwaterWidenOnly => {
+                // This case is handled inline in the apply_* methods with more detailed logging
+                // This branch should not be reached from log_reduce_only
+                warn!(
+                    asset = %config.asset,
+                    position = %format!("{:.6}", position),
+                    unrealized_pnl = %format!("${:.2}", config.unrealized_pnl),
+                    "Position over limit but UNDERWATER - widening spreads, not forcing exit"
+                );
+            }
         }
     }
 }
@@ -518,6 +685,8 @@ mod tests {
             liquidation_price: None,
             liquidation_buffer_ratio: None,
             liquidation_trigger_threshold: DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
+            // Unrealized P&L - default to positive (not underwater)
+            unrealized_pnl: 1000.0, // $1000 profit by default
         }
     }
 
@@ -605,5 +774,102 @@ mod tests {
             QuoteFilter::is_reduce_only(&over_position),
             Some(ReduceOnlyReason::OverPositionLimit)
         );
+    }
+
+    #[test]
+    fn test_underwater_protection_long() {
+        // Position over limit AND underwater (unrealized P&L negative)
+        let mut config = make_config(15.0); // Over max_position of 10
+        config.unrealized_pnl = -500.0; // $500 loss (underwater)
+
+        let mut bids = vec![Quote::new(49000.0, 0.1)];
+        let mut asks = vec![Quote::new(51000.0, 0.1)];
+
+        let result = QuoteFilter::apply_reduce_only_ladder(&mut bids, &mut asks, &config);
+
+        // Should filter bids (don't add to losing long) but keep asks passive
+        assert!(result.was_filtered);
+        assert_eq!(result.reason, Some(ReduceOnlyReason::UnderwaterWidenOnly));
+        assert!(result.filtered_bids);
+        assert!(!result.filtered_asks);
+        assert!(bids.is_empty()); // Bids cleared
+        assert_eq!(asks.len(), 1); // Asks kept for potential exit
+    }
+
+    #[test]
+    fn test_underwater_protection_short() {
+        // Short position over limit AND underwater
+        let mut config = make_config(-15.0); // Short over max_position of 10
+        config.unrealized_pnl = -500.0; // $500 loss (underwater)
+
+        let mut bids = vec![Quote::new(49000.0, 0.1)];
+        let mut asks = vec![Quote::new(51000.0, 0.1)];
+
+        let result = QuoteFilter::apply_reduce_only_ladder(&mut bids, &mut asks, &config);
+
+        // Should filter asks (don't add to losing short) but keep bids passive
+        assert!(result.was_filtered);
+        assert_eq!(result.reason, Some(ReduceOnlyReason::UnderwaterWidenOnly));
+        assert!(!result.filtered_bids);
+        assert!(result.filtered_asks);
+        assert_eq!(bids.len(), 1); // Bids kept for potential exit
+        assert!(asks.is_empty()); // Asks cleared
+    }
+
+    #[test]
+    fn test_underwater_but_approaching_liquidation_forces_exit() {
+        // Underwater but approaching liquidation - survival > P&L
+        let mut config = make_config(15.0);
+        config.unrealized_pnl = -500.0; // Underwater
+        config.liquidation_buffer_ratio = Some(0.1); // Below threshold (0.3)
+        config.liquidation_trigger_threshold = DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD;
+
+        let mut bids = vec![Quote::new(49000.0, 0.1)];
+        let mut asks = vec![Quote::new(51000.0, 0.1)];
+
+        let result = QuoteFilter::apply_reduce_only_ladder(&mut bids, &mut asks, &config);
+
+        // Should force reduce (survival > P&L), NOT underwater protection
+        assert!(result.was_filtered);
+        assert_eq!(result.reason, Some(ReduceOnlyReason::ApproachingLiquidation));
+        assert!(result.filtered_bids);
+        assert!(!result.filtered_asks);
+    }
+
+    #[test]
+    fn test_underwater_but_over_margin_forces_exit() {
+        // Underwater but over margin limit - capital constraint > P&L optimization
+        let mut config = make_config(15.0);
+        config.unrealized_pnl = -500.0; // Underwater
+        config.margin_used = 9000.0; // 90% utilization (above 80% threshold)
+
+        let mut bids = vec![Quote::new(49000.0, 0.1)];
+        let mut asks = vec![Quote::new(51000.0, 0.1)];
+
+        let result = QuoteFilter::apply_reduce_only_ladder(&mut bids, &mut asks, &config);
+
+        // Should force reduce due to margin, NOT underwater protection
+        assert!(result.was_filtered);
+        assert_eq!(result.reason, Some(ReduceOnlyReason::OverMarginUtilization));
+        assert!(result.filtered_bids);
+        assert!(!result.filtered_asks);
+    }
+
+    #[test]
+    fn test_not_underwater_forces_exit() {
+        // Over position limit but profitable - can reduce at profit
+        let mut config = make_config(15.0);
+        config.unrealized_pnl = 1000.0; // $1000 profit (not underwater)
+
+        let mut bids = vec![Quote::new(49000.0, 0.1)];
+        let mut asks = vec![Quote::new(51000.0, 0.1)];
+
+        let result = QuoteFilter::apply_reduce_only_ladder(&mut bids, &mut asks, &config);
+
+        // Should force reduce since we can exit profitably
+        assert!(result.was_filtered);
+        assert_eq!(result.reason, Some(ReduceOnlyReason::OverPositionLimit));
+        assert!(result.filtered_bids);
+        assert!(!result.filtered_asks);
     }
 }

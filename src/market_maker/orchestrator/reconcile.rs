@@ -19,6 +19,11 @@ use super::{partition_ladder_actions, side_str};
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
+/// Quote latch threshold in bps - orders within this threshold are preserved
+/// to reduce cancellation churn and maintain queue position.
+/// Set to 2.5 bps to significantly reduce the 86% cancellation rate.
+const QUOTE_LATCH_THRESHOLD_BPS: f64 = 2.5;
+
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Reconcile a single order per side (legacy single-order mode).
     pub(crate) async fn reconcile_side(
@@ -536,6 +541,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         for (order, quote) in sorted_current.iter().zip(new_quotes.iter()) {
             // Price change check
             let price_diff_bps = ((order.price - quote.price) / order.price).abs() * 10000.0;
+
+            // QUOTE LATCHING: Skip tiny changes to preserve queue position
+            // This reduces the 86% cancellation rate by avoiding cancel-replace for small drifts
+            if price_diff_bps <= QUOTE_LATCH_THRESHOLD_BPS {
+                // Size change within latch window - also check size tolerance
+                if order.size > 0.0 {
+                    let size_diff_pct = ((order.size - quote.size) / order.size).abs();
+                    if size_diff_pct <= 0.10 {
+                        // Both price and size within latch threshold - preserve this order
+                        continue;
+                    }
+                } else {
+                    continue; // Price within threshold, skip
+                }
+            }
+
             if price_diff_bps > self.config.max_bps_diff as f64 {
                 return true;
             }
@@ -1478,6 +1499,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Execute places (new orders)
+        // NOTE: True parallel execution (tokio::join!) requires refactoring place_bulk_ladder_orders
+        // to separate order building from mutable state updates. Currently sequential ~100ms each.
+        // TODO: Refactor to enable parallel bid/ask placement for additional ~100ms latency reduction.
         let bid_place_count = bid_places.len();
         let ask_place_count = ask_places.len();
         if !bid_places.is_empty() {

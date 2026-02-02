@@ -20,7 +20,7 @@ mod recovery;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use event_accumulator::{AffectedTracker, EventAccumulator, EventAccumulatorStats};
+pub(crate) use event_accumulator::EventAccumulator;
 
 use super::*;
 
