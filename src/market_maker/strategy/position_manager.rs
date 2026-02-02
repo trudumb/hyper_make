@@ -19,7 +19,7 @@
 //!
 //! | Action | inventory_ratio | When |
 //! |--------|-----------------|------|
-//! | HOLD | 0.0 | p_cont > 0.55, aligned, conf > 0.5 |
+//! | HOLD | 0.0 | p_cont > 0.50, aligned, conf > 0.6 |
 //! | ADD | -kelly × sign | p_cont > 0.65, aligned, conf > 0.7, edge > 2×costs |
 //! | REDUCE | +urgency × sign | Default (current behavior) |
 
@@ -76,11 +76,11 @@ impl PositionAction {
 /// Configuration for PositionDecisionEngine.
 #[derive(Debug, Clone)]
 pub struct PositionDecisionConfig {
-    /// P(continuation) threshold for HOLD action (default: 0.55)
+    /// P(continuation) threshold for HOLD action (default: 0.50)
     pub hold_threshold: f64,
     /// P(continuation) threshold for ADD action (default: 0.65)
     pub add_threshold: f64,
-    /// Minimum confidence for HOLD action (default: 0.5)
+    /// Minimum confidence for HOLD action (default: 0.60)
     pub conf_hold: f64,
     /// Minimum confidence for ADD action (default: 0.7)
     pub conf_add: f64,
@@ -103,9 +103,13 @@ pub struct PositionDecisionConfig {
 impl Default for PositionDecisionConfig {
     fn default() -> Self {
         Self {
-            hold_threshold: 0.55,
+            // P0 FIX (2026-02-02): Lower hold_threshold to reduce premature REDUCE actions
+            // Analysis showed 10.84 bps adverse selection from exiting trends too early
+            hold_threshold: 0.50, // was 0.55 - allows more HOLD during aligned trends
             add_threshold: 0.65,
-            conf_hold: 0.5,
+            // P0 FIX (2026-02-02): Raise conf_hold to require more signal confidence
+            // This prevents flipping on noisy belief updates
+            conf_hold: 0.60, // was 0.50 - requires higher confidence for HOLD
             conf_add: 0.7,
             cost_bps: 3.0,
             max_kelly: 0.3,

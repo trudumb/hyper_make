@@ -8,6 +8,7 @@
 
 pub mod adaptive;
 mod adverse_selection;
+pub mod belief;
 pub mod calibration;
 mod config;
 pub mod core;

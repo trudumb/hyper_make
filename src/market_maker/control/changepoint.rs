@@ -244,9 +244,27 @@ impl Default for ChangepointConfig {
 impl ChangepointDetector {
     /// Create a new changepoint detector.
     pub fn new(config: ChangepointConfig) -> Self {
-        // Initialize with run length 0
-        let mut run_length_probs = vec![0.0; 1];
-        run_length_probs[0] = 1.0;
+        // P0 FIX (2026-02-02): Initialize with uncertainty, not certainty
+        // Previously: run_length_probs[0] = 1.0 → cp_prob = 100% at startup
+        // This caused downstream systems to see high changepoint probability during warmup.
+        //
+        // New: Initialize with spread distribution expressing startup uncertainty:
+        // - 50% on r=0..5 (recent changepoint / uncertain state)
+        // - 50% on r=5..20 (moderate run length / stable state)
+        // This makes cp_prob(5) ≈ 0.5 at startup instead of 1.0
+        let init_spread = 20.min(config.max_run_length);
+        let mut run_length_probs = vec![0.0; init_spread];
+
+        // Spread probability: higher mass on r=0 decaying geometrically
+        // This represents "uncertain, probably early in a regime"
+        for i in 0..init_spread {
+            run_length_probs[i] = (0.8_f64).powi(i as i32);
+        }
+        // Normalize
+        let sum: f64 = run_length_probs.iter().sum();
+        for p in &mut run_length_probs {
+            *p /= sum;
+        }
 
         let prior = RunStatistics {
             n: 1.0,
@@ -257,9 +275,13 @@ impl ChangepointDetector {
         // Default to LiquidCex regime
         let default_regime = MarketRegime::LiquidCex;
 
+        // Initialize run_statistics to match run_length_probs length
+        let run_statistics: Vec<RunStatistics> =
+            (0..init_spread).map(|_| RunStatistics::default()).collect();
+
         Self {
             run_length_probs,
-            run_statistics: vec![RunStatistics::default()],
+            run_statistics,
             prior,
             hazard: config.hazard,
             max_run_length: config.max_run_length,
@@ -521,9 +543,23 @@ impl ChangepointDetector {
     }
 
     /// Reset the detector.
+    ///
+    /// Uses the same spread initialization as new() for consistent behavior.
     pub fn reset(&mut self) {
-        self.run_length_probs = vec![1.0];
-        self.run_statistics = vec![RunStatistics::default()];
+        // P0 FIX (2026-02-02): Reset with uncertainty, not certainty
+        // Use same spread initialization as new()
+        let init_spread = 20.min(self.max_run_length);
+        self.run_length_probs = vec![0.0; init_spread];
+
+        for i in 0..init_spread {
+            self.run_length_probs[i] = (0.8_f64).powi(i as i32);
+        }
+        let sum: f64 = self.run_length_probs.iter().sum();
+        for p in &mut self.run_length_probs {
+            *p /= sum;
+        }
+
+        self.run_statistics = (0..init_spread).map(|_| RunStatistics::default()).collect();
         self.recent_obs.clear();
         self.observation_count = 0;
         self.consecutive_high_prob = 0;
@@ -627,8 +663,22 @@ mod tests {
     #[test]
     fn test_changepoint_detector_creation() {
         let detector = ChangepointDetector::default();
-        assert_eq!(detector.run_length_probs.len(), 1);
-        assert!((detector.run_length_probs[0] - 1.0).abs() < 1e-10);
+
+        // P0 FIX: Now initializes with spread distribution for cleaner warmup
+        // Instead of 100% on r=0 (cp_prob=1.0), spreads across r=0..20
+        assert_eq!(detector.run_length_probs.len(), 20);
+
+        // Probabilities should sum to 1.0
+        let sum: f64 = detector.run_length_probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10, "Probabilities should sum to 1.0");
+
+        // cp_prob(5) should be around 0.5, not 1.0
+        let cp_prob_5 = detector.changepoint_probability(5);
+        assert!(
+            cp_prob_5 < 0.8,
+            "Initial cp_prob(5) should be <0.8 with spread init, got {}",
+            cp_prob_5
+        );
     }
 
     #[test]
@@ -678,8 +728,14 @@ mod tests {
 
         detector.reset();
 
-        assert_eq!(detector.run_length_probs.len(), 1);
+        // P0 FIX: Reset now uses spread distribution same as new()
+        assert_eq!(detector.run_length_probs.len(), 20);
         assert!(detector.recent_obs.is_empty());
+        assert_eq!(detector.observation_count, 0);
+
+        // Probabilities should sum to 1.0
+        let sum: f64 = detector.run_length_probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10, "Probabilities should sum to 1.0");
     }
 
     #[test]
@@ -734,23 +790,25 @@ mod tests {
             ..Default::default()
         });
 
-        // At startup: entropy should be 0 (all mass on r=0)
+        // P0 FIX: At startup, entropy is now positive (spread initialization)
+        // Previously entropy was 0 (all mass on r=0), now spread across r=0..20
         assert!(!detector.is_warmed_up());
         let initial_entropy = detector.run_length_entropy();
+        // With geometric decay 0.8^i over 20 states, entropy is moderate
         assert!(
-            initial_entropy < 0.01,
-            "Initial entropy should be ~0, got {}",
+            initial_entropy > 0.5 && initial_entropy < 3.0,
+            "Initial entropy should be moderate with spread init, got {}",
             initial_entropy
         );
 
-        // Feed stable observations to let distribution spread and concentrate
+        // Feed stable observations to let distribution concentrate
         for i in 0..100 {
             detector.update((i as f64 * 0.01).sin()); // Oscillating but stable
         }
 
         // After sufficient observations, entropy should be meaningful
         let final_entropy = detector.run_length_entropy();
-        // The distribution should have spread (entropy > 0) but eventually concentrate
+        // The distribution should have concentrated (lower entropy typically)
         assert!(
             final_entropy > 0.0,
             "Entropy should be > 0 after data, got {}",

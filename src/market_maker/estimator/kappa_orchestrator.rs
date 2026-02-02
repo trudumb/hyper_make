@@ -25,7 +25,7 @@
 use super::book_kappa::BookKappaEstimator;
 use super::kappa::BayesianKappaEstimator;
 use super::robust_kappa::RobustKappaEstimator;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Minimum weight for prior (always contributes some regularization)
 const PRIOR_MIN_WEIGHT: f64 = 0.05;
@@ -115,6 +115,9 @@ impl KappaOrchestratorConfig {
     }
 }
 
+/// EWMA smoothing factor for kappa_effective (0.9 = 90% previous, 10% new)
+const KAPPA_EWMA_ALPHA: f64 = 0.9;
+
 /// Orchestrates multiple kappa estimators with confidence-weighted blending.
 ///
 /// # Architecture
@@ -131,6 +134,12 @@ impl KappaOrchestratorConfig {
 ///             ┌────────────────────────┐
 ///             │ Confidence-Weighted    │
 ///             │ Blending + Prior       │
+///             └────────────────────────┘
+///                          │
+///                          ▼
+///             ┌────────────────────────┐
+///             │ EWMA Smoothing         │
+///             │ κ = 0.9×κ_prev + 0.1×κ │
 ///             └────────────────────────┘
 ///                          │
 ///                          ▼
@@ -155,11 +164,18 @@ pub(crate) struct KappaOrchestrator {
 
     /// Update counter for logging
     update_count: u64,
+
+    /// EWMA-smoothed kappa value (reduces 2x swings)
+    smoothed_kappa: f64,
+
+    /// Whether smoothed_kappa has been initialized
+    smoothed_kappa_initialized: bool,
 }
 
 impl KappaOrchestrator {
     /// Create a new kappa orchestrator with the given configuration.
     pub(crate) fn new(config: KappaOrchestratorConfig) -> Self {
+        let prior_kappa = config.prior_kappa;
         Self {
             book_kappa: BookKappaEstimator::new(config.prior_kappa),
             robust_kappa: RobustKappaEstimator::new(
@@ -173,9 +189,12 @@ impl KappaOrchestrator {
                 config.prior_strength,
                 config.own_fill_window_ms,
             ),
-            prior_kappa: config.prior_kappa,
+            prior_kappa,
             config,
             update_count: 0,
+            // Initialize smoothed_kappa to prior - will be overwritten on first call
+            smoothed_kappa: prior_kappa,
+            smoothed_kappa_initialized: false,
         }
     }
 
@@ -191,18 +210,39 @@ impl KappaOrchestrator {
         Self::new(KappaOrchestratorConfig::illiquid())
     }
 
-    /// Get effective κ using confidence-weighted blending.
+    /// Get effective κ using confidence-weighted blending with EWMA smoothing.
+    ///
+    /// Returns the EWMA-smoothed kappa value to reduce high-frequency variance.
+    /// The smoothed value is updated via `update_smoothed_kappa()` which is called
+    /// from the update paths (on_market_trade, on_own_fill, on_l2_book).
+    ///
+    /// # EWMA Formula
+    /// κ_smoothed = α × κ_prev + (1-α) × κ_raw, where α = 0.9
+    ///
+    /// This reduces 2x swings in kappa that cause spread variance.
+    ///
+    /// Before first update, returns the raw kappa (prior-based).
+    pub(crate) fn kappa_effective(&self) -> f64 {
+        if self.smoothed_kappa_initialized {
+            self.smoothed_kappa
+        } else {
+            // Before any updates, return raw kappa (prior-based)
+            self.kappa_raw()
+        }
+    }
+
+    /// Compute raw (unsmoothed) kappa using confidence-weighted blending.
     ///
     /// # Blending Formula (Warmup-Aware)
     ///
-    /// During warmup (no own fills): Use ONLY prior.
-    /// - Book and robust estimators are disabled to prevent unstable estimates
-    /// - This ensures κ stays at prior (500) until we have real fill data
+    /// During warmup (no own fills): Blend market signals with prior.
+    /// - Book kappa: from L2 depth decay regression (direct market structure)
+    /// - Robust kappa: from market trades with outlier resistance
+    /// - This is Bayesian-correct: use available information, express uncertainty through γ
     ///
-    /// Post-warmup: Blend own-fill κ, book κ, robust κ, and prior.
-    ///
+    /// Post-warmup: Full confidence-weighted blending of all sources.
     /// As own-fill confidence grows, it dominates the estimate.
-    pub(crate) fn kappa_effective(&self) -> f64 {
+    fn kappa_raw(&self) -> f64 {
         // CRITICAL: Warmup detection uses observation count, NOT posterior confidence
         // own_kappa.confidence() returns 93% just from tight prior, NOT from data
         let min_own_fills = 5;
@@ -213,11 +253,8 @@ impl KappaOrchestrator {
         let robust_kappa = self.robust_kappa.kappa();
 
         // During warmup: Blend market kappa with prior instead of ignoring market data
-        // This is Bayesian-correct: use available information, express uncertainty through γ
         if !has_own_fills {
             // Trust market signal (book/robust) but hedge with prior
-            // Book kappa: from L2 depth decay regression (direct market structure)
-            // Robust kappa: from market trades with outlier resistance
             let book_valid = book_kappa > 100.0 && self.config.use_book_kappa;
             let robust_valid = robust_kappa > 100.0 && self.config.use_robust_kappa;
 
@@ -232,18 +269,6 @@ impl KappaOrchestrator {
             let blended = book_weight * book_kappa
                 + robust_weight * robust_kappa
                 + prior_weight * self.config.prior_kappa;
-
-            debug!(
-                warmup = true,
-                book_kappa = %format!("{:.0}", book_kappa),
-                book_weight = %format!("{:.0}%", book_weight * 100.0),
-                robust_kappa = %format!("{:.0}", robust_kappa),
-                robust_weight = %format!("{:.0}%", robust_weight * 100.0),
-                prior_kappa = self.config.prior_kappa,
-                prior_weight = %format!("{:.0}%", prior_weight * 100.0),
-                blended_kappa = %format!("{:.0}", blended),
-                "Warmup kappa: using market signal with prior blend"
-            );
 
             return blended.clamp(50.0, 10000.0);
         }
@@ -277,6 +302,24 @@ impl KappaOrchestrator {
             + w_prior * self.prior_kappa;
 
         kappa.clamp(50.0, 10000.0)
+    }
+
+    /// Update the EWMA-smoothed kappa value.
+    ///
+    /// Called from update paths to maintain smoothed estimate.
+    /// Uses α=0.9: κ_smoothed = 0.9 × κ_prev + 0.1 × κ_raw
+    fn update_smoothed_kappa(&mut self) {
+        let kappa_raw = self.kappa_raw();
+
+        if !self.smoothed_kappa_initialized {
+            // First update: initialize to raw value
+            self.smoothed_kappa = kappa_raw;
+            self.smoothed_kappa_initialized = true;
+        } else {
+            // EWMA update: 90% previous, 10% new
+            self.smoothed_kappa =
+                KAPPA_EWMA_ALPHA * self.smoothed_kappa + (1.0 - KAPPA_EWMA_ALPHA) * kappa_raw;
+        }
     }
 
     /// Get individual component κ values and weights for diagnostics.
@@ -346,6 +389,8 @@ impl KappaOrchestrator {
         if self.config.use_book_kappa {
             self.book_kappa.on_l2_book(bids, asks, mid);
         }
+        // Update smoothed kappa after book update
+        self.update_smoothed_kappa();
     }
 
     /// Feed market trade to robust estimator.
@@ -359,6 +404,9 @@ impl KappaOrchestrator {
 
         let distance = ((price - mid) / mid).abs();
         self.robust_kappa.on_trade(timestamp_ms, distance);
+
+        // Update smoothed kappa after trade
+        self.update_smoothed_kappa();
 
         self.update_count += 1;
 
@@ -374,6 +422,7 @@ impl KappaOrchestrator {
 
             info!(
                 kappa_effective = %format!("{:.0}", self.kappa_effective()),
+                kappa_raw = %format!("{:.0}", self.kappa_raw()),
                 own = %format!("{:.0} ({:.0}%)", k_own, w_own * 100.0),
                 book = %format!("{:.0} ({:.0}%)", k_book, w_book * 100.0),
                 robust = %format!("{:.0} ({:.0}%)", k_robust, w_robust * 100.0),
@@ -397,6 +446,9 @@ impl KappaOrchestrator {
 
         // Feed to own-fill Bayesian estimator
         self.own_kappa.on_trade(timestamp_ms, price, size, mid);
+
+        // Update smoothed kappa after fill (most important signal)
+        self.update_smoothed_kappa();
     }
 
     /// Record fill distance directly (when we know the distance already).
@@ -608,5 +660,40 @@ mod tests {
 
         // Illiquid should have lower nu (heavier tails)
         assert!(liquid.robust_kappa.nu() > illiquid.robust_kappa.nu());
+    }
+
+    #[test]
+    fn test_ewma_smoothing_reduces_variance() {
+        let mut orch = KappaOrchestrator::default_liquid();
+
+        let mid = 100.0;
+
+        // First, provide enough fills to exit warmup
+        for i in 0..10 {
+            let fill_price = mid * (1.0 + 0.001);
+            orch.on_own_fill(i * 1000, fill_price, 1.0, mid);
+        }
+
+        let kappa_before = orch.kappa_effective();
+
+        // Now add a trade at a very different distance (simulating jump)
+        // This should cause raw kappa to jump, but smoothed should resist
+        let extreme_price = mid * (1.0 + 0.01); // 100 bps - much wider
+        orch.on_market_trade(11 * 1000, extreme_price, mid);
+
+        let kappa_raw = orch.kappa_raw();
+        let kappa_smoothed = orch.kappa_effective();
+
+        // Smoothed should have moved less than raw
+        let raw_change = (kappa_raw - kappa_before).abs();
+        let smoothed_change = (kappa_smoothed - kappa_before).abs();
+
+        // EWMA with α=0.9 means smoothed changes by only 10% of delta
+        assert!(
+            smoothed_change < raw_change,
+            "Smoothed kappa should change less than raw: smoothed_change={:.1}, raw_change={:.1}",
+            smoothed_change,
+            raw_change
+        );
     }
 }
