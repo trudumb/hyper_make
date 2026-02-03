@@ -96,6 +96,33 @@ pub struct ParameterSources<'a> {
     /// Centralized belief snapshot for unified parameter access.
     /// When Some, these values are preferred over scattered sources.
     pub beliefs: Option<&'a BeliefSnapshot>,
+
+    // === Bayesian Learned Parameters (Phase 6) ===
+    /// Learned parameters from Bayesian online learning.
+    /// When calibrated and enabled, these replace static config values.
+    pub learned_params: Option<LearnedParameterValues>,
+}
+
+/// Learned parameter values for use in quoting calculations.
+///
+/// These are extracted from `LearnedParameters` in `StochasticComponents`
+/// and passed to the aggregator to avoid circular dependencies.
+#[derive(Debug, Clone, Copy)]
+pub struct LearnedParameterValues {
+    /// Whether to use learned parameters (from StochasticConfig.use_learned_parameters)
+    pub enabled: bool,
+    /// Whether Tier 1 parameters are calibrated (enough observations, low CV)
+    pub calibrated: bool,
+    /// Learned alpha_touch (informed probability at touch) [0, 1]
+    pub alpha_touch: f64,
+    /// Learned kappa (fill intensity)
+    pub kappa: f64,
+    /// Learned spread floor in bps
+    pub spread_floor_bps: f64,
+    /// Number of observations for alpha_touch
+    pub alpha_touch_n: usize,
+    /// Number of observations for kappa
+    pub kappa_n: usize,
 }
 
 /// Calculate Kelly time horizon based on config method.
@@ -329,7 +356,24 @@ impl ParameterAggregator {
             leverage: sources.margin_sizer.summary().max_leverage,
 
             // === Stochastic Module: Kelly-Stochastic Allocation ===
-            kelly_alpha_touch: sources.stochastic_config.kelly_alpha_touch,
+            // Use learned alpha_touch when calibrated and enabled, else fall back to config
+            kelly_alpha_touch: {
+                if let Some(learned) = &sources.learned_params {
+                    if learned.enabled && learned.calibrated {
+                        tracing::debug!(
+                            learned_alpha = %format!("{:.3}", learned.alpha_touch),
+                            config_alpha = %format!("{:.3}", sources.stochastic_config.kelly_alpha_touch),
+                            n_observations = learned.alpha_touch_n,
+                            "Using LEARNED alpha_touch for Kelly sizing"
+                        );
+                        learned.alpha_touch
+                    } else {
+                        sources.stochastic_config.kelly_alpha_touch
+                    }
+                } else {
+                    sources.stochastic_config.kelly_alpha_touch
+                }
+            },
             kelly_alpha_decay_bps: sources.stochastic_config.kelly_alpha_decay_bps,
             kelly_fraction: sources.stochastic_config.kelly_fraction,
             kelly_time_horizon: calculate_kelly_time_horizon(
@@ -623,6 +667,16 @@ impl ParameterAggregator {
                 0.0 // Default no confidence (will be computed)
             },
             effective_inventory_ratio: 0.0, // Default no transformation (computed from position_action)
+
+            // === Bayesian Learned Parameters (Phase 6) ===
+            // Use learned values when calibrated and enabled
+            use_learned_parameters: sources
+                .learned_params
+                .map_or(false, |l| l.enabled && l.calibrated),
+            learned_kappa: sources.learned_params.map_or(2000.0, |l| l.kappa),
+            learned_alpha_touch: sources.learned_params.map_or(0.25, |l| l.alpha_touch),
+            learned_spread_floor_bps: sources.learned_params.map_or(5.0, |l| l.spread_floor_bps),
+            learned_params_calibrated: sources.learned_params.map_or(false, |l| l.calibrated),
         }
     }
 }

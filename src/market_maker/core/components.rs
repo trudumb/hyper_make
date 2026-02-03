@@ -23,7 +23,7 @@ use crate::market_maker::{
         BOCPDKappaConfig, BOCPDKappaPredictor,
         ThresholdKappa, ThresholdKappaConfig,
     },
-    calibration::SignalDecayTracker,
+    calibration::{LearnedParameters, SignalDecayTracker},
     quoting::{KappaSpreadConfig, KappaSpreadController},
     simulation::{QuickMCConfig, QuickMCSimulator},
     execution::{FillTracker, OrderLifecycleTracker},
@@ -515,6 +515,24 @@ pub struct StochasticComponents {
     /// Implements TAR model where κ decays when price deviates beyond threshold.
     /// Used to widen spreads during momentum regimes (large moves).
     pub threshold_kappa: ThresholdKappa,
+
+    // === Bayesian Learned Parameters (Magic Number Elimination) ===
+    /// Learned parameters: Bayesian-regularized replacements for magic numbers.
+    ///
+    /// Every parameter has:
+    /// 1. A prior based on domain knowledge (the old magic number)
+    /// 2. Online learning from observed data
+    /// 3. Uncertainty quantification (credible intervals)
+    ///
+    /// Parameters shrink toward their priors when data is scarce, preventing
+    /// overfitting. As fills accumulate, estimates converge toward MLE.
+    ///
+    /// Categories:
+    /// - Tier 1 (P&L Critical): alpha_touch, gamma_base, spread_floor
+    /// - Tier 2 (Risk): max_daily_loss, max_drawdown, cascade_threshold
+    /// - Tier 3 (Calibration): kappa, hawkes params, decay rates
+    /// - Tier 4 (Microstructure): kalman noise, momentum normalizer
+    pub learned_params: LearnedParameters,
 }
 
 impl StochasticComponents {
@@ -622,6 +640,8 @@ impl StochasticComponents {
             bocpd_kappa_features: None,
             // First-Principles Gap 2: Threshold-Dependent Kappa (TAR Model)
             threshold_kappa: ThresholdKappa::new(ThresholdKappaConfig::default()),
+            // Bayesian Learned Parameters (Magic Number Elimination)
+            learned_params: LearnedParameters::default(),
         }
     }
     
@@ -650,6 +670,74 @@ impl StochasticComponents {
             all_regimes = all_regimes,
             "Changepoint detected - decayed Bayesian alpha"
         );
+    }
+
+
+    // ==================== Learned Parameters Methods ====================
+
+    /// Update alpha_touch from a fill event.
+    ///
+    /// Call this after each fill with information about whether the fill
+    /// was "informed" (adverse move > 5 bps within 1 second).
+    ///
+    /// # Arguments
+    /// * `is_informed` - True if fill was followed by adverse price move
+    pub fn update_alpha_touch(&mut self, is_informed: bool) {
+        if is_informed {
+            self.learned_params.alpha_touch.observe_beta(1, 0);
+        } else {
+            self.learned_params.alpha_touch.observe_beta(0, 1);
+        }
+        self.learned_params.total_fills_observed += 1;
+    }
+
+    /// Update kappa from observed fill rate.
+    ///
+    /// Call this periodically with fill count and observation time.
+    ///
+    /// # Arguments
+    /// * `fills` - Number of fills observed
+    /// * `exposure_seconds` - Time period in seconds
+    /// * `avg_spread_bps` - Average spread during observation
+    pub fn update_kappa_from_fills(&mut self, fills: usize, exposure_seconds: f64, avg_spread_bps: f64) {
+        if exposure_seconds > 0.0 && avg_spread_bps > 0.0 {
+            let fill_rate = fills as f64 / exposure_seconds;
+            let kappa_obs = fill_rate / (avg_spread_bps / 10_000.0);
+            if kappa_obs > 100.0 && kappa_obs < 100_000.0 {
+                // Observe as Poisson count
+                self.learned_params.kappa.observe_gamma_poisson(fills, exposure_seconds * (avg_spread_bps / 10_000.0));
+            }
+        }
+    }
+
+    /// Get the learned alpha_touch estimate (Bayesian posterior mean).
+    ///
+    /// With few fills, this shrinks toward prior (0.25).
+    /// With many fills, this converges to observed rate.
+    pub fn learned_alpha_touch(&self) -> f64 {
+        self.learned_params.alpha_touch.estimate()
+    }
+
+    /// Get the learned kappa estimate.
+    pub fn learned_kappa(&self) -> f64 {
+        self.learned_params.kappa.estimate()
+    }
+
+    /// Get the learned spread floor in bps.
+    pub fn learned_spread_floor_bps(&self) -> f64 {
+        self.learned_params.spread_floor_bps.estimate()
+    }
+
+    /// Check if learned parameters have enough data to be trusted.
+    ///
+    /// Returns true if Tier 1 parameters (P&L critical) are calibrated.
+    pub fn learned_params_calibrated(&self) -> bool {
+        self.learned_params.calibration_status().tier1_ready
+    }
+
+    /// Get a summary of learned parameter estimates for logging.
+    pub fn learned_params_summary(&self) -> Vec<(&str, f64, f64, usize)> {
+        self.learned_params.summary()
     }
 }
 

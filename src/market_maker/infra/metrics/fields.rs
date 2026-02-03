@@ -197,6 +197,18 @@ pub(super) struct MetricsInner {
     /// Whether calibration is complete (1 = yes, 0 = no)
     pub calibration_complete: AtomicU64,
 
+    // === Learned Parameters Metrics ===
+    /// Learned alpha_touch (informed trader probability at touch) [0, 1]
+    pub learned_alpha_touch: AtomicF64,
+    /// Learned kappa (fill intensity)
+    pub learned_kappa: AtomicF64,
+    /// Learned spread floor in bps
+    pub learned_spread_floor_bps: AtomicF64,
+    /// Total observations for learned parameters
+    pub learned_params_observations: AtomicU64,
+    /// Whether learned parameters are calibrated (tier1_ready) (1 = yes, 0 = no)
+    pub learned_params_calibrated: AtomicU64,
+
     // === Impulse Control Metrics ===
     /// Whether impulse control is enabled (1 = enabled, 0 = disabled)
     pub impulse_control_enabled: AtomicU64,
@@ -307,6 +319,12 @@ impl MetricsInner {
             calibration_progress: AtomicF64::new(0.0),
             calibration_fill_count: AtomicU64::new(0),
             calibration_complete: AtomicU64::new(0),
+            // Learned Parameters defaults
+            learned_alpha_touch: AtomicF64::new(0.25), // Default prior
+            learned_kappa: AtomicF64::new(2000.0),     // Default prior
+            learned_spread_floor_bps: AtomicF64::new(5.0), // Default prior
+            learned_params_observations: AtomicU64::new(0),
+            learned_params_calibrated: AtomicU64::new(0),
             // Impulse Control defaults
             impulse_control_enabled: AtomicU64::new(0),
             impulse_budget_available: AtomicF64::new(0.0),

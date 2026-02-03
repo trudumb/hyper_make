@@ -65,6 +65,53 @@ impl Default for KillSwitchConfig {
 }
 
 impl KillSwitchConfig {
+    /// Create config derived from account value using Kelly-scaled risk limits.
+    ///
+    /// DERIVATION: Instead of arbitrary magic numbers, limits are derived from:
+    /// 1. **max_daily_loss**: account_value × kelly_fraction × daily_vol × 2 (covers 95% of days)
+    /// 2. **max_drawdown**: VaR_99(daily) × sqrt(horizon) for multi-day accumulation
+    /// 3. **max_position_value**: account_value × max_leverage
+    ///
+    /// # Arguments
+    /// * `account_value` - Current account equity in USD
+    /// * `kelly_fraction` - Fraction of full Kelly (typically 0.25 for quarter Kelly)
+    /// * `daily_volatility` - Expected daily volatility (fraction, e.g., 0.02 for 2%)
+    /// * `max_leverage` - Maximum leverage allowed by exchange
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // $10k account, quarter Kelly, 2% daily vol, 10x max leverage
+    /// let config = KillSwitchConfig::from_account_kelly(10_000.0, 0.25, 0.02, 10.0);
+    /// // max_daily_loss ≈ $100 (10k × 0.25 × 0.02 × 2)
+    /// // max_position_value ≈ $100k (10k × 10)
+    /// ```
+    pub fn from_account_kelly(
+        account_value: f64,
+        kelly_fraction: f64,
+        daily_volatility: f64,
+        max_leverage: f64,
+    ) -> Self {
+        // Max daily loss = account × f × 2σ (2σ covers 95% of days)
+        let max_daily_loss = account_value * kelly_fraction * daily_volatility * 2.0;
+
+        // Max drawdown = VaR_99 × sqrt(horizon)
+        // VaR_99 ≈ 2.33σ for normal distribution
+        // Assume 5-day recovery horizon, but with mean reversion use T^0.4
+        let z_99 = 2.33;
+        let horizon_factor = 5.0_f64.powf(0.4); // ~1.9
+        let max_drawdown = (z_99 * daily_volatility * horizon_factor).clamp(0.02, 0.20);
+
+        // Max position from leverage
+        let max_position_value = account_value * max_leverage;
+
+        Self {
+            max_daily_loss,
+            max_drawdown,
+            max_position_value,
+            ..Default::default()
+        }
+    }
+
     /// Create config appropriate for margin mode.
     ///
     /// HIP-3 assets use isolated margin which is more dangerous because:

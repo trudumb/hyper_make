@@ -566,6 +566,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.stochastic.calibration_controller.is_calibrated(),
                     );
 
+                    // Update learned parameters metrics for Prometheus
+                    let learned_status = self.stochastic.learned_params.calibration_status();
+                    self.infra.prometheus.update_learned_params(
+                        self.stochastic.learned_params.alpha_touch.estimate(),
+                        self.stochastic.learned_params.kappa.estimate(),
+                        self.stochastic.learned_params.spread_floor_bps.estimate(),
+                        self.stochastic.learned_params.total_fills_observed,
+                        learned_status.tier1_ready,
+                    );
+
                     // Check if supervisor recommends reconnection and act on it
                     if self.infra.connection_supervisor.is_reconnect_recommended() {
                         let attempt = self.infra.connection_health.current_attempt() + 1;
@@ -610,6 +620,83 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // === Update P&L inventory snapshot for carry calculation ===
                     if self.latest_mid > 0.0 {
                         self.tier2.pnl_tracker.record_inventory_snapshot(self.latest_mid);
+                    }
+
+                    // === Update Learned Parameters from Adverse Selection ===
+                    // Transfer informed/uninformed fill classifications from AS estimator
+                    // to the Bayesian learned parameters for alpha_touch estimation.
+                    if self.stochastic.stochastic_config.use_learned_parameters {
+                        let (informed, uninformed) = self.tier1.adverse_selection.take_informed_counts();
+                        if informed > 0 || uninformed > 0 {
+                            // Batch update the Bayesian alpha_touch parameter
+                            self.stochastic.learned_params.alpha_touch.observe_beta(informed, uninformed);
+
+                            // Log the update for monitoring
+                            let alpha = self.stochastic.learned_params.alpha_touch.estimate();
+                            let n = self.stochastic.learned_params.alpha_touch.n_observations;
+                            debug!(
+                                informed = informed,
+                                uninformed = uninformed,
+                                total_obs = n,
+                                alpha_touch = %format!("{:.4}", alpha),
+                                "Updated learned alpha_touch from AS classifier"
+                            );
+                        }
+
+                        // === Update Learned Kappa from Fill Rate ===
+                        // Every sync interval, update kappa using observed fills and spreads.
+                        // Kappa = fill_rate / spread, so we need: fills, time, average spread.
+                        let total_fills = self.tier2.pnl_tracker.fill_count();
+                        let session_duration_s = self.session_start_time.elapsed().as_secs_f64();
+                        let avg_spread_bps = self.tier2.spread_tracker.current_spread_bps();
+
+                        // Only update if we have meaningful data (at least 10 fills, 60 seconds)
+                        if total_fills >= 10 && session_duration_s > 60.0 && avg_spread_bps > 0.0 {
+                            // kappa = (fills / time) / spread
+                            // We pass raw values and let the method handle the Bayesian update
+                            self.stochastic.update_kappa_from_fills(
+                                total_fills,
+                                session_duration_s,
+                                avg_spread_bps,
+                            );
+
+                            // Log every 100 fills
+                            if total_fills % 100 == 0 {
+                                let kappa = self.stochastic.learned_params.kappa.estimate();
+                                let kappa_n = self.stochastic.learned_params.kappa.n_observations;
+                                debug!(
+                                    total_fills = total_fills,
+                                    duration_s = session_duration_s,
+                                    avg_spread_bps = %format!("{:.2}", avg_spread_bps),
+                                    learned_kappa = %format!("{:.0}", kappa),
+                                    kappa_obs = kappa_n,
+                                    "Updated learned kappa from fill rate"
+                                );
+                            }
+                        }
+
+                        // Periodic INFO-level summary of learned parameters (every 100 fills)
+                        let total_obs = self.stochastic.learned_params.total_fills_observed;
+                        if total_obs > 0 && total_obs % 100 == 0 {
+                            let status = self.stochastic.learned_params.calibration_status();
+                            let alpha = self.stochastic.learned_params.alpha_touch.estimate();
+                            let alpha_cv = self.stochastic.learned_params.alpha_touch.cv();
+                            let kappa = self.stochastic.learned_params.kappa.estimate();
+                            let kappa_cv = self.stochastic.learned_params.kappa.cv();
+                            let spread_floor = self.stochastic.learned_params.spread_floor_bps.estimate();
+
+                            info!(
+                                total_observations = total_obs,
+                                alpha_touch = %format!("{:.4}", alpha),
+                                alpha_cv = %format!("{:.2}", alpha_cv),
+                                kappa = %format!("{:.0}", kappa),
+                                kappa_cv = %format!("{:.2}", kappa_cv),
+                                spread_floor_bps = %format!("{:.2}", spread_floor),
+                                tier1_calibrated = status.tier1_ready,
+                                warmup_complete = status.warmup_complete,
+                                "Learned parameters summary"
+                            );
+                        }
                     }
 
                     // Log Prometheus output (for scraping or debugging)

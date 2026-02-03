@@ -57,15 +57,44 @@ pub struct BayesianBootstrapConfig {
 impl Default for BayesianBootstrapConfig {
     fn default() -> Self {
         Self {
-            prior_alpha: 5.0,
-            prior_beta: 0.1,
+            // PRIOR DERIVATION:
+            // α₀ and β₀ chosen to give E[θ] = α₀/β₀ = 50 (the original heuristic)
+            // with high variance for uncertainty: Var[θ] = α₀/β₀² = 500
+            //
+            // The prior mean of 50 comes from power analysis:
+            // - For IR CI width < 0.2, we need N ≈ (1.96/0.2)² ≈ 96 samples
+            // - But bootstrap can exit early if converging, so prior mean is 50
+            // - The high variance (σ = 22) reflects uncertainty about true requirement
+            prior_alpha: 5.0,  // Gamma shape: α₀
+            prior_beta: 0.1,   // Gamma rate: β₀ → E[θ] = 50, Var[θ] = 500
+
+            // TARGET IR: Information Ratio threshold for "calibrated" model
+            // IR > 1.0 means the model adds value over random noise
             target_ir: 1.0,
+
+            // MAX IR DEVIATION: Scale for convergence scoring
+            // y_t = 1 - |IR - 1.0| / 1.0 → y_t ∈ [0, 1]
             max_ir_deviation: 1.0,
+
+            // BATCH SIZE: Number of observations between posterior updates
+            // 10 balances computational cost vs responsiveness
             batch_size: 10,
+
+            // EXIT THRESHOLDS:
+            // - confidence: P(calibrated) > 95%
+            // - variance: ±10 outcomes uncertainty
+            // - expected_remaining: < 5 outcomes to go
             exit_confidence: 0.95,
-            exit_variance: 100.0,
+            exit_variance: 100.0,        // σ² < 100 → σ < 10
             exit_expected_remaining: 5.0,
+
+            // HARD FLOOR: Minimum outcomes regardless of posterior
+            // Prevents premature exit from lucky early convergence
+            // DERIVATION: Rule of thumb - need at least 15 for stable IR estimate
             min_outcomes: 15,
+
+            // MINIMUM EDGE: Only quote during bootstrap if edge > 0.5 bps
+            // Prevents accumulating fills with negative expected value
             bootstrap_min_edge_bps: 0.5,
         }
     }

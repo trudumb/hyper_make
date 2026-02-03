@@ -245,6 +245,85 @@ impl RiskConfig {
         let scaling_factor = 10.0;
         (1.0 + kappa_ci_width / scaling_factor).clamp(1.0, self.max_warmup_gamma_mult)
     }
+
+    /// Derive optimal gamma from GLFT first principles.
+    ///
+    /// DERIVATION: From the GLFT formula δ* = (1/γ) × ln(1 + γ/κ)
+    ///
+    /// For a target spread δ_target:
+    /// γ = κ × (exp(δ × κ) - 1) / exp(δ × κ)
+    ///
+    /// Adjusted for volatility: higher vol → higher risk aversion
+    /// Adjusted for time horizon: longer horizon → more time to offset losses
+    ///
+    /// # Arguments
+    /// * `target_half_spread_bps` - Desired half-spread in bps
+    /// * `kappa` - Fill intensity (fills per unit spread)
+    /// * `sigma` - Current volatility (per-second)
+    /// * `time_horizon` - Expected holding time (seconds)
+    ///
+    /// # Returns
+    /// Optimal gamma for achieving target spread, clamped to [gamma_min, gamma_max]
+    pub fn derive_gamma_from_glft(
+        &self,
+        target_half_spread_bps: f64,
+        kappa: f64,
+        sigma: f64,
+        time_horizon: f64,
+    ) -> f64 {
+        let target_spread = target_half_spread_bps / 10_000.0;
+
+        if kappa <= 0.0 || target_spread <= 0.0 {
+            return self.gamma_base; // Fallback to default
+        }
+
+        let exp_term = (target_spread * kappa).exp();
+        let gamma_raw = kappa * (exp_term - 1.0) / exp_term;
+
+        // Volatility adjustment: higher vol → higher risk aversion
+        let vol_adjustment = 1.0 + (sigma / self.sigma_baseline - 1.0).max(0.0) * self.volatility_weight;
+
+        // Time horizon adjustment: longer horizon → more time to offset losses
+        let time_adjustment = (time_horizon / 60.0).sqrt().clamp(0.5, 2.0);
+
+        (gamma_raw * vol_adjustment / time_adjustment).clamp(self.gamma_min, self.gamma_max)
+    }
+
+    /// Derive spread floor from first principles.
+    ///
+    /// DERIVATION: Minimum profitable spread must cover:
+    /// 1. Maker fee (1.5 bps on Hyperliquid)
+    /// 2. Expected adverse selection
+    /// 3. Execution slippage from latency
+    ///
+    /// δ_min = f_maker + E[AS] + σ × √(τ_update) + buffer
+    ///
+    /// # Arguments
+    /// * `expected_as_bps` - Expected adverse selection in bps
+    /// * `sigma` - Current volatility (per-second)
+    /// * `update_latency_ms` - Quote update latency in milliseconds
+    ///
+    /// # Returns
+    /// Minimum spread floor in fraction (e.g., 0.0005 for 5 bps)
+    pub fn derive_spread_floor(
+        &self,
+        expected_as_bps: f64,
+        sigma: f64,
+        update_latency_ms: f64,
+    ) -> f64 {
+        let maker_fee_bps = self.maker_fee_rate * 10_000.0;
+        let latency_s = update_latency_ms / 1000.0;
+
+        // Slippage from latency: price can move σ×√τ during quote update cycle
+        let latency_slippage_bps = sigma * latency_s.sqrt() * 10_000.0;
+
+        // Total spread floor (with 10% buffer)
+        let floor_bps = (maker_fee_bps + expected_as_bps.abs() + latency_slippage_bps) * 1.1;
+
+        // Convert to fraction and clamp
+        let floor = floor_bps / 10_000.0;
+        floor.clamp(self.min_spread_floor, 0.01) // Max 100 bps
+    }
 }
 
 impl Default for RiskConfig {

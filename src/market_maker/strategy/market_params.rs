@@ -773,6 +773,30 @@ pub struct MarketParams {
     /// - ADD: negative (reverse skew to build position)
     /// - REDUCE: positive (normal mean-reversion)
     pub effective_inventory_ratio: f64,
+
+    // ==================== Bayesian Learned Parameters (Phase 6) ====================
+    /// Whether using Bayesian learned parameters instead of static config values.
+    /// When true, learned_kappa, learned_alpha_touch, etc. are being used.
+    pub use_learned_parameters: bool,
+
+    /// Learned kappa (fill intensity) from Bayesian parameter learner.
+    /// Used in GLFT calculations when calibrated and enabled.
+    /// Falls back to adaptive_kappa or estimator kappa when not calibrated.
+    pub learned_kappa: f64,
+
+    /// Learned alpha_touch (informed probability at touch) from Bayesian parameter learner.
+    /// Used in Kelly sizing when calibrated and enabled.
+    /// Falls back to config kelly_alpha_touch when not calibrated.
+    pub learned_alpha_touch: f64,
+
+    /// Learned spread floor in bps from Bayesian parameter learner.
+    /// Used for minimum spread enforcement when calibrated and enabled.
+    /// Falls back to config min_spread_floor when not calibrated.
+    pub learned_spread_floor_bps: f64,
+
+    /// Whether learned parameters are calibrated (Tier 1 ready).
+    /// True when alpha_touch has 50+ obs with CV < 0.5, etc.
+    pub learned_params_calibrated: bool,
 }
 
 impl Default for MarketParams {
@@ -1004,6 +1028,12 @@ impl Default for MarketParams {
             continuation_p: 0.5,                // Neutral prior
             continuation_confidence: 0.0,       // No confidence until fills observed
             effective_inventory_ratio: 0.0,     // Will be computed from position_action
+            // Bayesian Learned Parameters (Phase 6)
+            use_learned_parameters: false,      // Off until calibrated
+            learned_kappa: 2000.0,              // Prior mean
+            learned_alpha_touch: 0.25,          // Prior mean (25% informed)
+            learned_spread_floor_bps: 5.0,      // Prior mean (5 bps)
+            learned_params_calibrated: false,   // Not calibrated initially
         }
     }
 }

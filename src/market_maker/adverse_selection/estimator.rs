@@ -92,6 +92,16 @@ pub struct AdverseSelectionEstimator {
 
     /// Latest jump ratio (RV/BV)
     cached_jump_ratio: f64,
+
+    // === Informed Fill Tracking for Parameter Learning ===
+    /// Count of fills classified as "informed" (adverse move > threshold at 500ms)
+    informed_fills_count: usize,
+
+    /// Count of fills classified as "uninformed" (adverse move <= threshold at 500ms)
+    uninformed_fills_count: usize,
+
+    /// Threshold in bps for classifying a fill as "informed"
+    informed_threshold_bps: f64,
 }
 
 impl AdverseSelectionEstimator {
@@ -111,6 +121,9 @@ impl AdverseSelectionEstimator {
             cached_vol_surprise: 0.0,
             cached_flow_magnitude: 0.0,
             cached_jump_ratio: 1.0,
+            informed_fills_count: 0,
+            uninformed_fills_count: 0,
+            informed_threshold_bps: 5.0, // Default: 5 bps = "informed"
         }
     }
 
@@ -219,6 +232,15 @@ impl AdverseSelectionEstimator {
             self.realized_as_total =
                 alpha * signed_as.abs() + (1.0 - alpha) * self.realized_as_total;
             self.fills_measured += 1;
+
+            // Classify fill as informed/uninformed for parameter learning
+            // signed_as is in fractional form, threshold is in bps (1 bp = 0.0001)
+            let adverse_move_bps = signed_as.abs() * 10000.0;
+            if adverse_move_bps > self.informed_threshold_bps {
+                self.informed_fills_count += 1;
+            } else {
+                self.uninformed_fills_count += 1;
+            }
         }
 
         // Periodically update best horizon selection
@@ -446,6 +468,57 @@ impl AdverseSelectionEstimator {
     pub fn best_horizon_as_bps(&self) -> f64 {
         self.horizon_stats[self.best_horizon_idx].as_ewma * 10000.0
     }
+
+
+    // === Informed Fill Classification for Parameter Learning ===
+
+    /// Get the count of fills classified as "informed" (adverse move > threshold).
+    pub fn informed_fills_count(&self) -> usize {
+        self.informed_fills_count
+    }
+
+    /// Get the count of fills classified as "uninformed" (adverse move <= threshold).
+    pub fn uninformed_fills_count(&self) -> usize {
+        self.uninformed_fills_count
+    }
+
+    /// Get the total fills classified (informed + uninformed).
+    pub fn total_classified_fills(&self) -> usize {
+        self.informed_fills_count + self.uninformed_fills_count
+    }
+
+    /// Get the empirical alpha_touch = P(informed | fill).
+    /// Returns None if no fills have been classified yet.
+    pub fn empirical_alpha_touch(&self) -> Option<f64> {
+        let total = self.total_classified_fills();
+        if total == 0 {
+            None
+        } else {
+            Some(self.informed_fills_count as f64 / total as f64)
+        }
+    }
+
+    /// Consume the informed/uninformed counts for parameter learning.
+    /// Returns (informed_count, uninformed_count) and resets both to zero.
+    /// This allows periodic batch updates to the Bayesian parameter.
+    pub fn take_informed_counts(&mut self) -> (usize, usize) {
+        let informed = self.informed_fills_count;
+        let uninformed = self.uninformed_fills_count;
+        self.informed_fills_count = 0;
+        self.uninformed_fills_count = 0;
+        (informed, uninformed)
+    }
+
+    /// Set the threshold (in bps) for classifying fills as "informed".
+    /// Default is 5 bps.
+    pub fn set_informed_threshold_bps(&mut self, threshold_bps: f64) {
+        self.informed_threshold_bps = threshold_bps;
+    }
+
+    /// Get the current informed threshold in bps.
+    pub fn informed_threshold_bps(&self) -> f64 {
+        self.informed_threshold_bps
+    }
 }
 
 /// Summary of adverse selection state for logging.
@@ -591,5 +664,64 @@ mod tests {
 
         // Should be capped at max
         assert_eq!(est.pending_count(), 5);
+    }
+
+    #[test]
+    fn test_informed_fill_classification() {
+        let mut est = make_estimator();
+        
+        // Set threshold to 5 bps (default)
+        assert_eq!(est.informed_threshold_bps(), 5.0);
+        
+        // Initially no fills classified
+        assert_eq!(est.informed_fills_count(), 0);
+        assert_eq!(est.uninformed_fills_count(), 0);
+        assert_eq!(est.empirical_alpha_touch(), None);
+        
+        // Add an informed fill (adverse move > 5 bps = 0.05%)
+        est.record_fill(1, 1.0, true, 100.0);
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        // Price drops 0.1% = 10 bps adverse (> 5 bps threshold)
+        est.update(99.9);
+        
+        assert_eq!(est.informed_fills_count(), 1);
+        assert_eq!(est.uninformed_fills_count(), 0);
+        
+        // Add an uninformed fill (adverse move < 5 bps)
+        est.record_fill(2, 1.0, true, 100.0);
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        // Price drops 0.02% = 2 bps adverse (< 5 bps threshold)
+        est.update(99.98);
+        
+        assert_eq!(est.informed_fills_count(), 1);
+        assert_eq!(est.uninformed_fills_count(), 1);
+        
+        // Check empirical alpha_touch = 1/2 = 0.5
+        assert!((est.empirical_alpha_touch().unwrap() - 0.5).abs() < 0.01);
+        
+        // Take counts resets them
+        let (informed, uninformed) = est.take_informed_counts();
+        assert_eq!(informed, 1);
+        assert_eq!(uninformed, 1);
+        assert_eq!(est.informed_fills_count(), 0);
+        assert_eq!(est.uninformed_fills_count(), 0);
+    }
+
+    #[test]
+    fn test_informed_threshold_adjustment() {
+        let mut est = make_estimator();
+        
+        // Can adjust threshold
+        est.set_informed_threshold_bps(10.0);
+        assert_eq!(est.informed_threshold_bps(), 10.0);
+        
+        // With higher threshold, same fill becomes uninformed
+        est.record_fill(1, 1.0, true, 100.0);
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        // Price drops 0.08% = 8 bps adverse (< 10 bps threshold now)
+        est.update(99.92);
+        
+        assert_eq!(est.informed_fills_count(), 0);
+        assert_eq!(est.uninformed_fills_count(), 1);
     }
 }

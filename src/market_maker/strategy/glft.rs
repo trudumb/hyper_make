@@ -565,15 +565,30 @@ impl QuotingStrategy for GLFTStrategy {
             gamma_with_liq * market_params.tail_risk_multiplier
         };
 
-        // === 1a. KAPPA: Adaptive vs Legacy ===
-        // When adaptive spreads enabled: use blended book/own-fill kappa
-        // When disabled: use book-only kappa with AS adjustment
+        // === 1a. KAPPA: Learned vs Adaptive vs Legacy ===
+        // Priority:
+        // 1. Learned kappa (when calibrated and enabled) - from Bayesian parameter learner
+        // 2. Adaptive kappa (when enabled) - blended book/own-fill
+        // 3. Legacy book-based kappa with AS adjustment
         //
         // KEY FIX: Use `adaptive_can_estimate` - our Bayesian priors give reasonable
         // kappa estimates immediately (κ=2500 prior for liquid markets).
-        let (kappa, kappa_bid, kappa_ask) = if market_params.use_adaptive_spreads
-            && market_params.adaptive_can_estimate
+        let (kappa, kappa_bid, kappa_ask) = if market_params.use_learned_parameters
+            && market_params.learned_params_calibrated
         {
+            // Learned kappa: from Bayesian parameter learner with conjugate prior
+            // This is the most statistically principled approach - shrinkage toward prior
+            // with increasing data weight as observations accumulate.
+            let k = market_params.learned_kappa;
+            debug!(
+                learned_kappa = %format!("{:.0}", k),
+                book_kappa = %format!("{:.0}", market_params.kappa),
+                adaptive_kappa = %format!("{:.0}", market_params.adaptive_kappa),
+                "Using LEARNED kappa (Bayesian parameter learner)"
+            );
+            // For now, use symmetric kappa (directional can be added later)
+            (k, k, k)
+        } else if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
             // Adaptive kappa: blended from book depth + own fill experience
             // Already incorporates fill rate information via Bayesian update
             let k = market_params.adaptive_kappa;
@@ -704,15 +719,29 @@ impl QuotingStrategy for GLFTStrategy {
         // The regime multipliers (1.3, 1.1, 0.95, 0.9) were ad-hoc and lacked derivation.
         // Removing them trusts the GLFT model to handle spread dynamics correctly.
 
-        // === 2d. SPREAD FLOOR: Adaptive vs Static ===
-        // When adaptive spreads enabled: use learned floor from Bayesian AS estimation
-        // When disabled: use static RiskConfig floor + latency/tick constraints
+        // === 2d. SPREAD FLOOR: Learned vs Adaptive vs Static ===
+        // Priority:
+        // 1. Learned spread floor (when calibrated and enabled) - from Bayesian parameter learner
+        // 2. Adaptive spread floor (when enabled) - from Bayesian AS estimation
+        // 3. Static RiskConfig floor + latency/tick constraints
         //
         // KEY FIX: Use `adaptive_can_estimate` - our Bayesian prior gives reasonable
         // floor estimates immediately (fees + 3bps AS prior + safety margin ≈ 8-10 bps).
-        let effective_floor = if market_params.use_adaptive_spreads
-            && market_params.adaptive_can_estimate
+        let effective_floor = if market_params.use_learned_parameters
+            && market_params.learned_params_calibrated
         {
+            // Learned floor: from Bayesian parameter learner with conjugate prior
+            // Convert from bps to fraction: divide by 10000
+            let floor_bps = market_params.learned_spread_floor_bps;
+            let floor = floor_bps / 10000.0;
+            debug!(
+                learned_floor_bps = %format!("{:.2}", floor_bps),
+                adaptive_floor_bps = %format!("{:.2}", market_params.adaptive_spread_floor * 10000.0),
+                static_floor_bps = %format!("{:.2}", self.risk_config.min_spread_floor * 10000.0),
+                "Using LEARNED spread floor (Bayesian parameter learner)"
+            );
+            floor
+        } else if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
             // Adaptive floor: learned from actual fill AS + fees + safety buffer
             // During warmup, the prior-based floor is already conservative (fees + 3bps + 1.5σ)
             let floor = market_params.adaptive_spread_floor;

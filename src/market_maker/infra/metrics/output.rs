@@ -644,6 +644,48 @@ impl PrometheusMetrics {
             self.inner.impulse_budget_skipped.load(Ordering::Relaxed)
         ));
 
+        // Learned Parameters metrics
+        output.push_str(&format!(
+            "# HELP mm_learned_alpha_touch Learned informed trader probability at touch [0,1]\n\
+             # TYPE mm_learned_alpha_touch gauge\n\
+             mm_learned_alpha_touch{{{}}} {:.4}\n",
+            labels,
+            self.inner.learned_alpha_touch.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_learned_kappa Learned fill intensity\n\
+             # TYPE mm_learned_kappa gauge\n\
+             mm_learned_kappa{{{}}} {:.2}\n",
+            labels,
+            self.inner.learned_kappa.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_learned_spread_floor_bps Learned spread floor in bps\n\
+             # TYPE mm_learned_spread_floor_bps gauge\n\
+             mm_learned_spread_floor_bps{{{}}} {:.2}\n",
+            labels,
+            self.inner.learned_spread_floor_bps.load()
+        ));
+
+        output.push_str(&format!(
+            "# HELP mm_learned_params_observations Total observations for learned parameters\n\
+             # TYPE mm_learned_params_observations counter\n\
+             mm_learned_params_observations{{{}}} {}\n",
+            labels,
+            self.inner.learned_params_observations.load(Ordering::Relaxed)
+        ));
+
+        let learned_calibrated = self.inner.learned_params_calibrated.load(Ordering::Relaxed) == 1;
+        output.push_str(&format!(
+            "# HELP mm_learned_params_calibrated Whether learned params tier1 is calibrated (1=yes, 0=no)\n\
+             # TYPE mm_learned_params_calibrated gauge\n\
+             mm_learned_params_calibrated{{{}}} {}\n",
+            labels,
+            if learned_calibrated { 1 } else { 0 }
+        ));
+
         output
     }
 
@@ -754,6 +796,28 @@ impl PrometheusMetrics {
         map.insert(
             "impulse_queue_locked".to_string(),
             self.inner.impulse_queue_locked.load(Ordering::Relaxed) as f64,
+        );
+
+        // Learned Parameters metrics
+        map.insert(
+            "learned_alpha_touch".to_string(),
+            self.inner.learned_alpha_touch.load(),
+        );
+        map.insert(
+            "learned_kappa".to_string(),
+            self.inner.learned_kappa.load(),
+        );
+        map.insert(
+            "learned_spread_floor_bps".to_string(),
+            self.inner.learned_spread_floor_bps.load(),
+        );
+        map.insert(
+            "learned_params_observations".to_string(),
+            self.inner.learned_params_observations.load(Ordering::Relaxed) as f64,
+        );
+        map.insert(
+            "learned_params_calibrated".to_string(),
+            self.inner.learned_params_calibrated.load(Ordering::Relaxed) as f64,
         );
 
         map

@@ -423,6 +423,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // true when no CLI override is active (kappa_floor/max_spread_ceiling_bps = None)
             use_dynamic_kappa_floor: !self.estimator.has_static_kappa_floor(),
             use_dynamic_spread_ceiling: !self.estimator.has_static_max_spread_ceiling(),
+            // Bayesian learned parameters
+            learned_params: if self.stochastic.stochastic_config.use_learned_parameters {
+                let status = self.stochastic.learned_params.calibration_status();
+                Some(super::super::LearnedParameterValues {
+                    enabled: true,
+                    calibrated: status.tier1_ready,
+                    alpha_touch: self.stochastic.learned_params.alpha_touch.estimate(),
+                    kappa: self.stochastic.learned_params.kappa.estimate(),
+                    spread_floor_bps: self.stochastic.learned_params.spread_floor_bps.estimate(),
+                    alpha_touch_n: self.stochastic.learned_params.alpha_touch.n_observations,
+                    kappa_n: self.stochastic.learned_params.kappa.n_observations,
+                })
+            } else {
+                None
+            },
         };
         let mut market_params = ParameterAggregator::build(&sources);
 

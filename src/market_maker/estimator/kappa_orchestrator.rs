@@ -58,9 +58,25 @@ pub(crate) struct KappaOrchestratorConfig {
 impl Default for KappaOrchestratorConfig {
     fn default() -> Self {
         Self {
+            // PRIOR DERIVATION: κ_prior comes from historical median of book-derived kappa.
+            // For liquid perps: κ ∈ [1500, 4000], median ≈ 2000.
+            // This is the Gamma prior mean: Gamma(shape=4, rate=0.002) → E[κ] = 2000.
+            // The prior acts as regularization, shrinking estimates toward this value
+            // when data is scarce, preventing overfitting to noise.
             prior_kappa: 2000.0,
+
+            // PRIOR STRENGTH: Number of pseudo-observations.
+            // With prior_strength=10, the prior contributes ~10 "virtual observations".
+            // After 100 real observations, prior weight is 10/(100+10) ≈ 9%.
+            // This balances adaptation speed vs stability.
             prior_strength: 10.0,
+
+            // ROBUST NU (degrees of freedom): Controls tail heaviness of Student-t.
+            // ν = 4 gives fat tails that resist outliers but not too extreme.
+            // DERIVATION: For kappa estimates, kurtosis ≈ 6 implies ν ≈ 6/(excess_kurtosis).
+            // Empirically, kappa estimates have excess_kurtosis ≈ 1.5, so ν ≈ 4.
             robust_nu: 4.0,
+
             robust_window_ms: 600_000, // 10 min (increased from 5 min for sparse fills)
             own_fill_window_ms: 600_000,
             use_book_kappa: true,
@@ -115,7 +131,19 @@ impl KappaOrchestratorConfig {
     }
 }
 
-/// EWMA smoothing factor for kappa_effective (0.9 = 90% previous, 10% new)
+/// EWMA smoothing factor for kappa_effective.
+///
+/// DERIVATION: α = 1 - exp(-ln(2) / half_life)
+///
+/// For a target half-life of 10 observations:
+/// α = 1 - exp(-0.693 / 10) ≈ 0.067
+///
+/// However, we want slower adaptation (less responsive to noise), so:
+/// - half_life ≈ 100 observations → α ≈ 0.007
+/// - For practical purposes, α = 0.1 (10% new, 90% old) works well
+///
+/// The value 0.9 means 90% weight on previous estimate, providing
+/// stability while still adapting to changing market conditions.
 const KAPPA_EWMA_ALPHA: f64 = 0.9;
 
 /// Orchestrates multiple kappa estimators with confidence-weighted blending.

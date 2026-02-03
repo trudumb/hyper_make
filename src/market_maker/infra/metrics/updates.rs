@@ -447,4 +447,33 @@ impl PrometheusMetrics {
             .impulse_budget_skipped
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    // === Learned Parameters Updates ===
+
+    /// Update learned parameters metrics.
+    ///
+    /// # Arguments
+    /// * `alpha_touch` - Learned informed trader probability at touch [0, 1]
+    /// * `kappa` - Learned fill intensity
+    /// * `spread_floor_bps` - Learned spread floor in bps
+    /// * `observations` - Total observations for learned parameters
+    /// * `calibrated` - Whether tier1 parameters are calibrated
+    pub fn update_learned_params(
+        &self,
+        alpha_touch: f64,
+        kappa: f64,
+        spread_floor_bps: f64,
+        observations: usize,
+        calibrated: bool,
+    ) {
+        self.inner.learned_alpha_touch.store(alpha_touch);
+        self.inner.learned_kappa.store(kappa);
+        self.inner.learned_spread_floor_bps.store(spread_floor_bps);
+        self.inner
+            .learned_params_observations
+            .store(observations as u64, Ordering::Relaxed);
+        self.inner
+            .learned_params_calibrated
+            .store(if calibrated { 1 } else { 0 }, Ordering::Relaxed);
+    }
 }
