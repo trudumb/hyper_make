@@ -209,6 +209,12 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Replaces fragmented belief modules with unified state management.
     /// Consumers read via snapshot() for consistent point-in-time views.
     central_beliefs: CentralBeliefState,
+
+    // === Signal Diagnostics Cache (Phase 1) ===
+    /// Cached market params from last quote cycle.
+    /// Used by fill handler to capture signal state at fill time.
+    /// Updated at end of each update_quotes() cycle.
+    cached_market_params: Option<strategy::MarketParams>,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -339,6 +345,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_beliefs_update: None,
             // Centralized belief state (single source of truth)
             central_beliefs: CentralBeliefState::new(CentralBeliefConfig::default()),
+            // Signal diagnostics cache (updated each quote cycle)
+            cached_market_params: None,
         }
     }
 
@@ -396,6 +404,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Get mutable centralized belief state reference for updates.
     pub fn central_beliefs_mut(&mut self) -> &mut CentralBeliefState {
         &mut self.central_beliefs
+    }
+
+    /// Configure signal diagnostics export path.
+    /// Call this at startup to enable fill signal export to JSON.
+    pub fn with_signal_export_path(mut self, path: String) -> Self {
+        self.safety.signal_store.set_export_path(path);
+        self
+    }
+
+    /// Get signal store stats (total_recorded, total_exported, in_memory, pending_markouts).
+    pub fn signal_store_stats(&self) -> (u64, u64, usize, usize) {
+        self.safety.signal_store.stats()
     }
 
     // =========================================================================

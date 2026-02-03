@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     use crate::market_maker::config::MetricsRecorder;
     use crate::market_maker::control::{PositionPnLTracker, StochasticController};
+    use crate::market_maker::fills::FillSignalStore;
     use crate::market_maker::{
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EstimatorConfig,
         ParameterEstimator, PnLConfig, PnLTracker, PositionTracker, PrometheusMetrics, QueueConfig,
@@ -199,6 +200,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -219,6 +221,8 @@ mod tests {
             position_pnl: &mut position_pnl,
             fee_bps: 1.5,
             theoretical_edge: &mut theoretical_edge,
+            signal_store: &mut signal_store,
+            market_params: None,
         };
 
         // Create fill for wrong asset
@@ -273,6 +277,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -293,6 +298,8 @@ mod tests {
             position_pnl: &mut position_pnl,
             fee_bps: 1.5,
             theoretical_edge: &mut theoretical_edge,
+            signal_store: &mut signal_store,
+            market_params: None,
         };
 
         let user_fills = UserFills {

@@ -198,6 +198,19 @@ pub(crate) struct KappaOrchestrator {
 
     /// Whether smoothed_kappa has been initialized
     smoothed_kappa_initialized: bool,
+
+    /// Whether we've ever exited warmup mode (prevents re-entry).
+    ///
+    /// # The Re-entry Bug
+    /// Without this flag, when old fills expire from the 600ms window,
+    /// `observation_count()` can drop below 5 and the orchestrator re-enters
+    /// warmup mode. This causes kappa to swing 2-3x as the blending formula
+    /// changes discontinuously from own-fill-weighted to market-signal-weighted.
+    ///
+    /// Once we have 5+ own fills, we "graduate" from warmup permanently.
+    /// The own-fill posterior still decays naturally as observations expire,
+    /// but we don't revert to the warmup blending formula.
+    has_exited_warmup: bool,
 }
 
 impl KappaOrchestrator {
@@ -223,6 +236,8 @@ impl KappaOrchestrator {
             // Initialize smoothed_kappa to prior - will be overwritten on first call
             smoothed_kappa: prior_kappa,
             smoothed_kappa_initialized: false,
+            // Start in warmup mode - will graduate permanently after 5 fills
+            has_exited_warmup: false,
         }
     }
 
@@ -281,7 +296,9 @@ impl KappaOrchestrator {
         let robust_kappa = self.robust_kappa.kappa();
 
         // During warmup: Blend market kappa with prior instead of ignoring market data
-        if !has_own_fills {
+        // CRITICAL: Once we exit warmup, NEVER re-enter (prevents 2x kappa swings when fills expire)
+        let is_warmup = !has_own_fills && !self.has_exited_warmup;
+        if is_warmup {
             // Trust market signal (book/robust) but hedge with prior
             let book_valid = book_kappa > 100.0 && self.config.use_book_kappa;
             let robust_valid = robust_kappa > 100.0 && self.config.use_robust_kappa;
@@ -362,10 +379,11 @@ impl KappaOrchestrator {
         (f64, f64), // (kappa, weight) for own, book, robust, prior
         bool,       // is_warmup (market signal used with prior blend)
     ) {
-        // Mirror the warmup logic from kappa_effective exactly
+        // Mirror the warmup logic from kappa_raw exactly
         let min_own_fills = 5;
         let has_own_fills = self.own_kappa.observation_count() >= min_own_fills;
-        let is_warmup = !has_own_fills;
+        // CRITICAL: Use has_exited_warmup to match kappa_raw() logic
+        let is_warmup = !has_own_fills && !self.has_exited_warmup;
 
         let book_kappa = self.book_kappa.kappa();
         let robust_kappa = self.robust_kappa.kappa();
@@ -474,6 +492,21 @@ impl KappaOrchestrator {
 
         // Feed to own-fill Bayesian estimator
         self.own_kappa.on_trade(timestamp_ms, price, size, mid);
+
+        // Check for warmup exit transition (prevents re-entry bug)
+        // Once we have 5+ own fills, we "graduate" from warmup PERMANENTLY.
+        // This prevents kappa from swinging 2-3x when old fills expire.
+        const MIN_OWN_FILLS_FOR_WARMUP_EXIT: usize = 5;
+        if !self.has_exited_warmup
+            && self.own_kappa.observation_count() >= MIN_OWN_FILLS_FOR_WARMUP_EXIT
+        {
+            self.has_exited_warmup = true;
+            tracing::info!(
+                own_fills = self.own_kappa.observation_count(),
+                kappa = %format!("{:.0}", self.kappa_raw()),
+                "Kappa orchestrator graduated from warmup (will not re-enter)"
+            );
+        }
 
         // Update smoothed kappa after fill (most important signal)
         self.update_smoothed_kappa();

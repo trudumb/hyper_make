@@ -24,11 +24,24 @@ struct PendingFill {
     /// True if this was a buy fill (we got lifted on our ask)
     is_buy: bool,
     /// Horizons already measured (to avoid double-counting)
-    horizons_measured: [bool; 3],
+    horizons_measured: [bool; NUM_HORIZONS],
 }
 
+/// Number of AS measurement horizons
+const NUM_HORIZONS: usize = 6;
+
 /// Multi-horizon AS measurement horizons (milliseconds)
-const HORIZONS_MS: [u64; 3] = [500, 1000, 2000];
+///
+/// Extended from [500, 1000, 2000] to cover actual hold times (80s-10min observed).
+/// The longer horizons (60s-10min) match measured fill→close durations.
+const HORIZONS_MS: [u64; NUM_HORIZONS] = [
+    500,     // 0.5s - microstructure noise
+    2_000,   // 2s - immediate adverse selection
+    10_000,  // 10s - short-term price discovery
+    60_000,  // 60s (1 min) - matches observed hold times
+    180_000, // 180s (3 min) - medium-term adverse selection
+    600_000, // 600s (10 min) - longest typical hold time
+];
 
 /// Tracks AS statistics for a single horizon
 #[derive(Debug, Clone, Default)]
@@ -77,10 +90,10 @@ pub struct AdverseSelectionEstimator {
     sell_fills_measured: usize,
 
     // === Multi-Horizon AS Tracking ===
-    /// Stats for each horizon (500ms, 1000ms, 2000ms)
-    horizon_stats: [HorizonStats; 3],
+    /// Stats for each horizon (500ms to 10min)
+    horizon_stats: [HorizonStats; NUM_HORIZONS],
 
-    /// Index of currently selected best horizon (0, 1, or 2)
+    /// Index of currently selected best horizon (0 to NUM_HORIZONS-1)
     best_horizon_idx: usize,
 
     // === Signal Cache for Alpha Prediction ===
@@ -117,7 +130,7 @@ impl AdverseSelectionEstimator {
             buy_fills_measured: 0,
             sell_fills_measured: 0,
             horizon_stats: Default::default(),
-            best_horizon_idx: 1, // Default to 1000ms (middle horizon)
+            best_horizon_idx: 3, // Default to 60s (60000ms) - matches observed hold times
             cached_vol_surprise: 0.0,
             cached_flow_magnitude: 0.0,
             cached_jump_ratio: 1.0,
@@ -147,7 +160,7 @@ impl AdverseSelectionEstimator {
             fill_mid: current_mid,
             size,
             is_buy,
-            horizons_measured: [false; 3],
+            horizons_measured: [false; NUM_HORIZONS],
         });
 
         debug!(
@@ -286,11 +299,14 @@ impl AdverseSelectionEstimator {
     }
 
     /// Get AS estimates at all horizons (for diagnostics).
-    pub fn horizon_as_bps(&self) -> [(u64, f64); 3] {
+    pub fn horizon_as_bps(&self) -> [(u64, f64); NUM_HORIZONS] {
         [
             (HORIZONS_MS[0], self.horizon_stats[0].as_ewma * 10000.0),
             (HORIZONS_MS[1], self.horizon_stats[1].as_ewma * 10000.0),
             (HORIZONS_MS[2], self.horizon_stats[2].as_ewma * 10000.0),
+            (HORIZONS_MS[3], self.horizon_stats[3].as_ewma * 10000.0),
+            (HORIZONS_MS[4], self.horizon_stats[4].as_ewma * 10000.0),
+            (HORIZONS_MS[5], self.horizon_stats[5].as_ewma * 10000.0),
         ]
     }
 

@@ -376,10 +376,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
+        // === Phase 3: Pre-Fill AS Classifier Updates ===
+        // Update classifier with latest signals before building market params
+        {
+            // Trade flow update: convert flow_imbalance [-1, 1] to buy/sell volumes
+            // flow_imbalance = (buy - sell) / (buy + sell) => solve for volumes
+            let flow_imb = self.estimator.flow_imbalance();
+            // Assume normalized volumes: total = 1, then buy = (1 + imb) / 2
+            let buy_volume = (1.0 + flow_imb) / 2.0;
+            let sell_volume = 1.0 - buy_volume;
+            self.tier1.pre_fill_classifier.update_trade_flow(buy_volume, sell_volume);
+
+            // Regime update: use HMM confidence and changepoint probability from beliefs
+            let hmm_confidence = belief_snapshot.regime.confidence;
+            // Use prob_5 as a smoothed changepoint indicator (recent window)
+            let changepoint_prob = belief_snapshot.changepoint.prob_5;
+            self.tier1.pre_fill_classifier.update_regime(hmm_confidence, changepoint_prob);
+
+            // Funding rate update
+            let funding_rate_8h = self.tier2.funding.current_rate();
+            self.tier1.pre_fill_classifier.update_funding(funding_rate_8h);
+        }
+
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
             depth_decay_as: &self.tier1.depth_decay_as,
+            pre_fill_classifier: &self.tier1.pre_fill_classifier,
             liquidation_detector: &self.tier1.liquidation_detector,
             hawkes: &self.tier2.hawkes,
             funding: &self.tier2.funding,
@@ -1867,6 +1890,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.infra
             .dashboard
             .update_position(position, position_value);
+
+        // Cache market params for signal diagnostics (fill handler uses this)
+        self.cached_market_params = Some(market_params);
 
         Ok(())
     }

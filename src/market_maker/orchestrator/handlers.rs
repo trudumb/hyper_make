@@ -76,6 +76,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Update learning module with current mid for prediction scoring
             self.learning.update_mid(self.latest_mid);
 
+            // === Signal Diagnostic: Update markouts with latest mid ===
+            // This updates pending markouts at 500ms, 2s, 10s horizons.
+            let current_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.safety.signal_store.update_markouts(self.latest_mid, current_time_ms);
+            
+            // Check if export is due (every 5 min or 100 fills)
+            if self.safety.signal_store.should_export() {
+                if let Some(path) = self.safety.signal_store.export_path() {
+                    let path = path.to_string();
+                    if let Err(e) = self.safety.signal_store.export_to_json(&path) {
+                        tracing::warn!(error = %e, path = %path, "Failed to export fill signals");
+                    }
+                }
+            }
+
             // === First-Principles Gap 2: Update ThresholdKappa with return observation ===
             // Feed return_bps to ThresholdKappa for TAR model regime detection.
             // This determines whether we're in mean-reversion or momentum regime.
@@ -327,6 +345,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position_pnl: &mut self.stochastic.position_pnl,
             fee_bps: self.config.fee_bps,
             theoretical_edge: &mut self.stochastic.theoretical_edge,
+            signal_store: &mut self.safety.signal_store,
+            market_params: self.cached_market_params.as_ref(),
         };
 
         let result = messages::process_user_fills(
@@ -735,6 +755,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.stochastic
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
+            }
+
+            // === Phase 3: Pre-Fill AS Classifier - Orderbook Imbalance Update ===
+            // Feed bid/ask depth to pre-fill classifier for toxicity prediction
+            {
+                let bid_depth: f64 = bids.iter().take(5).map(|(_, sz)| sz).sum();
+                let ask_depth: f64 = asks.iter().take(5).map(|(_, sz)| sz).sum();
+                self.tier1.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
             }
 
             // === Phase 1: Microstructure Signals - Liquidity Evaporation ===
@@ -1258,49 +1286,56 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// This method performs periodic maintenance tasks that don't need to happen
     /// on every market data tick but should run regularly.
     ///
-    /// # Phase 2/3 Integration
+    /// # Calibration Logging (Phase 0)
     ///
-    /// TODO: Once ensemble, model_calibration, and alerter are added to tiers:
-    /// - Recompute ensemble weights based on recent model performance
-    /// - Update model calibration metrics
-    /// - Check for degraded models and trigger alerts
+    /// Updates model calibration metrics and logs Brier scores / IR for monitoring.
+    /// This enables visibility into prediction quality without changing quoting logic.
     pub fn periodic_component_update(&mut self) {
-        // === Phase 2/3 Component Updates ===
-        //
-        // TODO: Uncomment and wire once components are added to StochasticComponents/InfraComponents:
-        //
-        // // Recompute ensemble weights based on recent performance
-        // self.stochastic.ensemble.compute_weights();
-        //
-        // // Update model calibration tracking
-        // let now = std::time::SystemTime::now()
-        //     .duration_since(std::time::UNIX_EPOCH)
-        //     .unwrap()
-        //     .as_millis() as u64;
-        // self.stochastic.model_calibration.update_all(now);
-        //
-        // // Check for degraded models and create alerts
-        // if self.stochastic.model_calibration.is_any_degraded() {
-        //     let degraded_models = self.stochastic.model_calibration.degraded_models();
-        //     for model_name in degraded_models {
-        //         let ir = self.stochastic.model_calibration.get_ir(&model_name).unwrap_or(0.0);
-        //         if let Some(alert) = self.infra.alerter.check_calibration(ir, &model_name, now) {
-        //             warn!(
-        //                 model = %model_name,
-        //                 ir = %format!("{:.2}", ir),
-        //                 "Model calibration degraded"
-        //             );
-        //             self.infra.alerter.add_alert(alert);
-        //         }
-        //     }
-        // }
+        // === Calibration Metric Updates ===
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Update model calibration tracking
+        self.stochastic.model_calibration.update_all(now);
+
+        // Log calibration metrics periodically (every ~60 calls ≈ 1 minute at 1s interval)
+        static PERIODIC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = PERIODIC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if count % 60 == 0 {
+            let summary = self.stochastic.model_calibration.summary();
+
+            // Log calibration summary
+            info!(
+                fill_ir = %format!("{:.3}", summary.fill_ir),
+                fill_samples = summary.fill_model.n_samples,
+                fill_brier = %format!("{:.4}", summary.fill_model.brier_score),
+                as_ir = %format!("{:.3}", summary.as_ir),
+                as_samples = summary.as_model.n_samples,
+                lag_ir = %format!("{:.3}", summary.lag_ir),
+                lag_mi_decay = %format!("{:.5}/day", summary.lag_mi_decay_rate),
+                any_degraded = summary.any_degraded,
+                "Calibration metrics"
+            );
+
+            // Warn if any model is degraded
+            if summary.any_degraded {
+                let degraded = self.stochastic.model_calibration.degraded_models();
+                warn!(
+                    models = ?degraded,
+                    "Model calibration degraded - IR < 1.0 or MI decaying"
+                );
+            }
+        }
 
         // Log current state for debugging
         trace!(
             sigma = %format!("{:.6}", self.estimator.sigma()),
             kappa = %format!("{:.3}", self.estimator.kappa()),
             position = %format!("{:.4}", self.position.position()),
-            "Periodic component update (Phase 2/3 components not yet wired)"
+            "Periodic component update"
         );
     }
 

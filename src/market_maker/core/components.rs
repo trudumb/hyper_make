@@ -4,7 +4,9 @@
 
 use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
-    adverse_selection::{AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS},
+    adverse_selection::{
+        AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier,
+    },
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{
         CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
@@ -27,7 +29,7 @@ use crate::market_maker::{
     quoting::{KappaSpreadConfig, KappaSpreadController},
     simulation::{QuickMCConfig, QuickMCSimulator},
     execution::{FillTracker, OrderLifecycleTracker},
-    fills::FillProcessor,
+    fills::{FillProcessor, FillSignalStore},
     infra::{
         ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
         ExchangePositionLimits, ExecutionBudget, MarginAwareSizer, MarginConfig, OrphanTracker,
@@ -57,14 +59,17 @@ use crate::market_maker::{
 ///
 /// These modules are critical for production trading:
 /// - Adverse selection measurement
+/// - Pre-fill toxicity prediction
 /// - Queue position tracking
 /// - Liquidation cascade detection
 /// - Circuit breaker monitoring
 pub struct Tier1Components {
-    /// Adverse selection estimator
+    /// Adverse selection estimator (post-fill measurement)
     pub adverse_selection: AdverseSelectionEstimator,
     /// Depth-dependent AS model
     pub depth_decay_as: DepthDecayAS,
+    /// Pre-fill AS classifier (toxicity prediction BEFORE fills)
+    pub pre_fill_classifier: PreFillASClassifier,
     /// Queue position tracker
     pub queue_tracker: QueuePositionTracker,
     /// Liquidation cascade detector
@@ -98,6 +103,7 @@ impl Tier1Components {
         Self {
             adverse_selection: AdverseSelectionEstimator::new(as_config),
             depth_decay_as: DepthDecayAS::default(),
+            pre_fill_classifier: PreFillASClassifier::default(),
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
             circuit_breaker: CircuitBreakerMonitor::new(circuit_breaker_config),
@@ -152,6 +158,8 @@ pub struct SafetyComponents {
     pub risk_checker: RiskChecker,
     /// Equity drawdown tracker
     pub drawdown_tracker: DrawdownTracker,
+    /// Signal diagnostic store for fill analysis
+    pub signal_store: FillSignalStore,
 }
 
 impl SafetyComponents {
@@ -179,6 +187,7 @@ impl SafetyComponents {
             risk_checker: RiskChecker::new(risk_limits),
             // Initial equity of 10,000 is a placeholder; updated on first margin refresh
             drawdown_tracker: DrawdownTracker::new(drawdown_config, 10_000.0),
+            signal_store: FillSignalStore::new(),
         }
     }
 }

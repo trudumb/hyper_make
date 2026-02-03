@@ -195,6 +195,23 @@ pub struct MarketParams {
     /// E[AS | fill] ≠ E[AS] unconditional. None during warmup.
     pub conditional_as_posterior_mean_bps: Option<f64>,
 
+    // === Tier 1: Pre-Fill AS Classifier (Phase 3) ===
+    /// Pre-fill toxicity score for bid side [0, 1].
+    /// Predicts how toxic a bid fill would be BEFORE it happens.
+    /// 0 = safe, 1 = highly toxic. Used for proactive spread widening.
+    pub pre_fill_toxicity_bid: f64,
+
+    /// Pre-fill toxicity score for ask side [0, 1].
+    /// Predicts how toxic an ask fill would be BEFORE it happens.
+    pub pre_fill_toxicity_ask: f64,
+
+    /// Pre-fill spread multiplier for bid side [1.0, 3.0].
+    /// Multiply base spread by this to widen when toxic flow expected.
+    pub pre_fill_spread_mult_bid: f64,
+
+    /// Pre-fill spread multiplier for ask side [1.0, 3.0].
+    pub pre_fill_spread_mult_ask: f64,
+
     // === Tier 1: Liquidation Cascade ===
     /// Tail risk multiplier for gamma [1.0, 5.0].
     /// Multiply gamma by this during cascade conditions.
@@ -844,6 +861,11 @@ impl Default for MarketParams {
             as_warmed_up: false,       // Starts not warmed up
             depth_decay_as: None,      // No calibrated model initially
             conditional_as_posterior_mean_bps: None, // Learned from fill AS data, not magic number
+            // Tier 1: Pre-Fill AS Classifier (Phase 3)
+            pre_fill_toxicity_bid: 0.0,      // No toxicity initially
+            pre_fill_toxicity_ask: 0.0,      // No toxicity initially
+            pre_fill_spread_mult_bid: 1.0,   // No multiplier initially
+            pre_fill_spread_mult_ask: 1.0,   // No multiplier initially
             // Tier 1: Liquidation Cascade
             tail_risk_multiplier: 1.0, // Default: no tail risk scaling
             should_pull_quotes: false, // Default: don't pull quotes

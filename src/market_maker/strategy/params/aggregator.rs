@@ -1,7 +1,7 @@
 //! Parameter aggregation from multiple sources.
 
 use crate::market_maker::adaptive::AdaptiveSpreadCalculator;
-use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
+use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier};
 use crate::market_maker::config::{KellyTimeHorizonMethod, StochasticConfig};
 use crate::market_maker::estimator::{MarketEstimator, ParameterEstimator};
 use crate::market_maker::infra::MarginAwareSizer;
@@ -25,6 +25,7 @@ pub struct ParameterSources<'a> {
     // Tier 1: Adverse selection
     pub adverse_selection: &'a AdverseSelectionEstimator,
     pub depth_decay_as: &'a DepthDecayAS,
+    pub pre_fill_classifier: &'a PreFillASClassifier,
     pub liquidation_detector: &'a LiquidationCascadeDetector,
 
     // Tier 2: Process models
@@ -251,6 +252,12 @@ impl ParameterAggregator {
             } else {
                 None // Use 0 buffer during warmup (don't penalize before measuring)
             },
+
+            // === Tier 1: Pre-Fill AS Classifier (Phase 3) ===
+            pre_fill_toxicity_bid: sources.pre_fill_classifier.predict_toxicity(true),
+            pre_fill_toxicity_ask: sources.pre_fill_classifier.predict_toxicity(false),
+            pre_fill_spread_mult_bid: sources.pre_fill_classifier.spread_multiplier(true),
+            pre_fill_spread_mult_ask: sources.pre_fill_classifier.spread_multiplier(false),
 
             // === Tier 1: Liquidation Cascade ===
             tail_risk_multiplier: sources.liquidation_detector.tail_risk_multiplier(),

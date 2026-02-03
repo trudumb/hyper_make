@@ -240,11 +240,20 @@ impl GLFTStrategy {
         };
 
         // === TOXICITY SCALING ===
-        let toxicity_scalar = if market_params.jump_ratio <= cfg.toxicity_threshold {
+        // Combine backward-looking (jump_ratio) and forward-looking (pre-fill classifier) signals
+        let legacy_toxicity = if market_params.jump_ratio <= cfg.toxicity_threshold {
             1.0
         } else {
             1.0 + cfg.toxicity_sensitivity * (market_params.jump_ratio - 1.0)
         };
+
+        // Pre-fill classifier provides forward-looking toxicity prediction [0, 1]
+        // Use the symmetric (max of bid/ask) for overall gamma scaling
+        let pre_fill_mult = market_params.pre_fill_spread_mult_bid.max(market_params.pre_fill_spread_mult_ask);
+
+        // Blend legacy and pre-fill: take the max (conservative approach)
+        // This ensures we widen spreads if EITHER signal indicates toxicity
+        let toxicity_scalar = legacy_toxicity.max(pre_fill_mult);
 
         // === INVENTORY SCALING ===
         let utilization = if max_position > EPSILON {
@@ -648,6 +657,41 @@ impl QuotingStrategy for GLFTStrategy {
                 predicted_alpha = %format!("{:.3}", market_params.predicted_alpha),
                 "AS spread adjustment applied"
             );
+        }
+
+        // === 2a''. PRE-FILL TOXICITY ASYMMETRIC WIDENING (Phase 3) ===
+        // Apply asymmetric spread widening based on pre-fill classifier predictions.
+        // Each side is widened independently based on its predicted toxicity.
+        // This is PROACTIVE protection before fills, complementing the reactive AS adjustment.
+        //
+        // The pre-fill multipliers are [1.0, 3.0] where 1.0 = no additional widening.
+        // We scale widening by current half-spread to maintain proportionality.
+        {
+            let bid_mult = market_params.pre_fill_spread_mult_bid;
+            let ask_mult = market_params.pre_fill_spread_mult_ask;
+
+            // Only apply if either side needs widening (mult > 1.0)
+            if bid_mult > 1.01 || ask_mult > 1.01 {
+                // Use current half-spreads as base - this maintains proportionality
+                // The multiplier widens the already-computed spread from GLFT
+                let bid_add = half_spread_bid * (bid_mult - 1.0);
+                let ask_add = half_spread_ask * (ask_mult - 1.0);
+
+                half_spread_bid += bid_add;
+                half_spread_ask += ask_add;
+                // Symmetric spread uses average widening
+                half_spread += (bid_add + ask_add) / 2.0;
+
+                debug!(
+                    bid_tox = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
+                    ask_tox = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
+                    bid_mult = %format!("{:.2}", bid_mult),
+                    ask_mult = %format!("{:.2}", ask_mult),
+                    bid_add_bps = %format!("{:.2}", bid_add * 10000.0),
+                    ask_add_bps = %format!("{:.2}", ask_add * 10000.0),
+                    "Pre-fill toxicity asymmetric widening applied"
+                );
+            }
         }
 
         // === 2a'. KALMAN UNCERTAINTY SPREAD WIDENING (Stochastic Module) ===

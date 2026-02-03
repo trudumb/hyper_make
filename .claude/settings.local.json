@@ -54,7 +54,9 @@
       "Bash(./scripts/test_hip3.sh:*)",
       "Bash(# Kill any existing processes pkill -f market_maker || true sleep 2 # Start fresh 1-hour test cd /home/jcritch22/projects/hyper_make nohup ./scripts/test_hip3.sh HYPE hyna 3600 hip3 2>&1 & echo \"\"Started new test. PID: $!\"\" sleep 10 echo \"\"\"\" echo \"\"=== Initial output ===\"\" head -60 /tmp/hip3_hourtest_output.log)",
       "mcp__serena__execute_shell_command",
-      "mcp__serena__edit_memory"
+      "mcp__serena__edit_memory",
+      "Bash(xargs:*)",
+      "mcp__serena__think_about_whether_you_are_done"
     ]
   }
 }

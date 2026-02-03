@@ -28,7 +28,452 @@ use crate::market_maker::strategy::MarketParams;
 use crate::market_maker::tracking::{
     OrderManager, PnLTracker, PositionTracker, QueuePositionTracker, Side,
 };
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::time::Instant;
 use tracing::{debug, info, warn};
+
+// ============================================================================
+// Signal Diagnostic Infrastructure (Phase 1)
+// ============================================================================
+
+/// Snapshot of all signals at the moment of a fill.
+///
+/// This struct captures the complete signal state when a fill occurs,
+/// enabling post-hoc analysis of which signals predicted toxic fills.
+/// Exported to JSON for Python analysis scripts.
+#[derive(Debug, Clone, Serialize)]
+pub struct FillSignalSnapshot {
+    // === Fill Metadata ===
+    /// Trade ID (unique identifier)
+    pub tid: u64,
+    /// Order ID
+    pub oid: u64,
+    /// Fill timestamp (milliseconds since epoch)
+    pub timestamp_ms: u64,
+    /// Fill side ("bid" = we bought, "ask" = we sold)
+    pub side: String,
+    /// Fill price
+    pub price: f64,
+    /// Fill size
+    pub size: f64,
+    /// Asset being traded
+    pub asset: String,
+
+    // === Pre-Fill Classifier Signals ===
+    /// Pre-fill toxicity score for this side [0, 1]
+    pub pre_fill_toxicity: f64,
+    /// Orderbook imbalance at fill time [-1, 1]
+    pub orderbook_imbalance: f64,
+    /// Trade flow imbalance at fill time [-1, 1]
+    pub trade_flow_imbalance: f64,
+
+    // === Regime Signals ===
+    /// HMM regime (0=quiet, 1=trending, 2=volatile)
+    pub hmm_regime: u8,
+    /// HMM regime confidence [0, 1]
+    pub hmm_confidence: f64,
+    /// Changepoint probability [0, 1]
+    pub cp_prob: f64,
+    /// Is toxic regime active?
+    pub is_toxic_regime: bool,
+    /// Jump ratio (RV/BV)
+    pub jump_ratio: f64,
+
+    // === Directional Signals ===
+    /// Continuation probability [0, 1]
+    pub continuation_p: f64,
+    /// Drift probability bearish [0, 1]
+    pub drift_prob_bearish: f64,
+    /// Momentum signal (bps)
+    pub momentum_bps: f64,
+    /// Falling knife score [0, 3]
+    pub falling_knife_score: f64,
+    /// Rising knife score [0, 3]
+    pub rising_knife_score: f64,
+
+    // === Market State ===
+    /// Mid price at fill time
+    pub mid_price: f64,
+    /// Market spread (bps)
+    pub spread_bps: f64,
+    /// Volatility (per-second)
+    pub volatility: f64,
+    /// Funding rate (8h)
+    pub funding_rate_8h: f64,
+    /// Current position
+    pub position: f64,
+
+    // === Hawkes/Flow Signals ===
+    /// Hawkes flow imbalance [-1, 1]
+    pub hawkes_imbalance: f64,
+    /// Hawkes cluster probability [0, 1]
+    pub hawkes_p_cluster: f64,
+    /// Hawkes excitation penalty [0.5, 1.0]
+    pub hawkes_excitation_penalty: f64,
+
+    // === Kappa/Fill Rate ===
+    /// Estimated kappa (fill intensity)
+    pub kappa: f64,
+    /// Kappa uncertainty (std dev)
+    pub kappa_uncertainty: f64,
+    /// Adaptive kappa from Bayesian system
+    pub adaptive_kappa: f64,
+
+    // === Markout Outcomes (filled asynchronously) ===
+    /// Price move 500ms after fill (bps, from fill side perspective)
+    /// Negative = adverse selection (price moved against us)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markout_500ms_bps: Option<f64>,
+    /// Price move 2s after fill (bps)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markout_2s_bps: Option<f64>,
+    /// Price move 10s after fill (bps)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markout_10s_bps: Option<f64>,
+}
+
+impl FillSignalSnapshot {
+    /// Create a new snapshot from a fill event and market params.
+    pub fn from_fill_and_params(
+        fill: &FillEvent,
+        params: &MarketParams,
+        asset: &str,
+    ) -> Self {
+        let side = if fill.is_buy { "bid" } else { "ask" };
+        
+        // Get pre-fill toxicity for the correct side
+        let pre_fill_toxicity = if fill.is_buy {
+            params.pre_fill_toxicity_bid
+        } else {
+            params.pre_fill_toxicity_ask
+        };
+
+        Self {
+            // Fill metadata
+            tid: fill.tid,
+            oid: fill.oid,
+            timestamp_ms: fill.timestamp_ms(),
+            side: side.to_string(),
+            price: fill.price,
+            size: fill.size,
+            asset: asset.to_string(),
+
+            // Pre-fill classifier signals
+            pre_fill_toxicity,
+            orderbook_imbalance: params.book_imbalance,
+            trade_flow_imbalance: params.flow_imbalance,
+
+            // Regime signals
+            hmm_regime: match params.volatility_regime {
+                crate::market_maker::estimator::VolatilityRegime::Low => 0,
+                crate::market_maker::estimator::VolatilityRegime::Normal => 0,
+                crate::market_maker::estimator::VolatilityRegime::High => 1,
+                crate::market_maker::estimator::VolatilityRegime::Extreme => 2,
+            },
+            hmm_confidence: 0.8, // TODO: wire up actual HMM confidence
+            cp_prob: 0.0, // Will be filled from stochastic controller
+            is_toxic_regime: params.is_toxic_regime,
+            jump_ratio: params.jump_ratio,
+
+            // Directional signals
+            continuation_p: params.p_momentum_continue,
+            drift_prob_bearish: if params.momentum_bps < 0.0 {
+                params.p_momentum_continue
+            } else {
+                1.0 - params.p_momentum_continue
+            },
+            momentum_bps: params.momentum_bps,
+            falling_knife_score: params.falling_knife_score,
+            rising_knife_score: params.rising_knife_score,
+
+            // Market state
+            mid_price: fill.mid_at_fill,
+            spread_bps: params.market_spread_bps,
+            volatility: params.sigma,
+            funding_rate_8h: params.funding_rate,
+            position: 0.0, // Will be filled from FillState
+
+            // Hawkes/flow signals
+            hawkes_imbalance: params.hawkes_imbalance,
+            hawkes_p_cluster: params.hawkes_p_cluster,
+            hawkes_excitation_penalty: params.hawkes_excitation_penalty,
+
+            // Kappa
+            kappa: params.kappa,
+            kappa_uncertainty: params.kappa_uncertainty,
+            adaptive_kappa: params.adaptive_kappa,
+
+            // Markouts (filled later)
+            markout_500ms_bps: None,
+            markout_2s_bps: None,
+            markout_10s_bps: None,
+        }
+    }
+
+    /// Set the position at fill time.
+    pub fn with_position(mut self, position: f64) -> Self {
+        self.position = position;
+        self
+    }
+
+    /// Set the changepoint probability.
+    pub fn with_cp_prob(mut self, cp_prob: f64) -> Self {
+        self.cp_prob = cp_prob;
+        self
+    }
+}
+
+/// Pending markout tracking for a fill.
+#[derive(Debug, Clone)]
+pub struct PendingMarkout {
+    /// Trade ID for matching
+    pub tid: u64,
+    /// Fill price for markout calculation
+    pub fill_price: f64,
+    /// Fill side (true = buy/bid, false = sell/ask)
+    pub is_buy: bool,
+    /// Fill timestamp
+    pub fill_time: Instant,
+    /// Timestamp in ms for horizon calculations
+    pub fill_time_ms: u64,
+    /// 500ms markout (filled when available)
+    pub markout_500ms_bps: Option<f64>,
+    /// 2s markout (filled when available)
+    pub markout_2s_bps: Option<f64>,
+    /// 10s markout (filled when available)
+    pub markout_10s_bps: Option<f64>,
+}
+
+impl PendingMarkout {
+    /// Create a new pending markout.
+    pub fn new(tid: u64, fill_price: f64, is_buy: bool, fill_time_ms: u64) -> Self {
+        Self {
+            tid,
+            fill_price,
+            is_buy,
+            fill_time: Instant::now(),
+            fill_time_ms,
+            markout_500ms_bps: None,
+            markout_2s_bps: None,
+            markout_10s_bps: None,
+        }
+    }
+
+    /// Update markouts based on current mid price and elapsed time.
+    /// Returns true if all markouts are now filled.
+    pub fn update(&mut self, current_mid: f64, current_time_ms: u64) -> bool {
+        let elapsed_ms = current_time_ms.saturating_sub(self.fill_time_ms);
+        
+        // Calculate markout: (current_mid - fill_price) / fill_price * 10000
+        // For buys: positive markout = price went up = good
+        // For sells: positive markout = price went down = good
+        // We want: negative = adverse selection (price moved against us)
+        let raw_markout_bps = (current_mid - self.fill_price) / self.fill_price * 10000.0;
+        
+        // Adjust sign: for sells, flip sign so negative = AS
+        let markout_bps = if self.is_buy {
+            raw_markout_bps  // Buy: price up = good (+), price down = bad (-)
+        } else {
+            -raw_markout_bps // Sell: price down = good (+), price up = bad (-)
+        };
+
+        // Fill markouts at appropriate horizons
+        if self.markout_500ms_bps.is_none() && elapsed_ms >= 500 {
+            self.markout_500ms_bps = Some(markout_bps);
+        }
+        if self.markout_2s_bps.is_none() && elapsed_ms >= 2000 {
+            self.markout_2s_bps = Some(markout_bps);
+        }
+        if self.markout_10s_bps.is_none() && elapsed_ms >= 10000 {
+            self.markout_10s_bps = Some(markout_bps);
+        }
+
+        // Return true if all markouts filled
+        self.markout_500ms_bps.is_some()
+            && self.markout_2s_bps.is_some()
+            && self.markout_10s_bps.is_some()
+    }
+
+    /// Check if this markout is stale (>30s old with no complete data).
+    pub fn is_stale(&self) -> bool {
+        self.fill_time.elapsed().as_secs() > 30 && self.markout_10s_bps.is_none()
+    }
+}
+
+/// Store for fill signal snapshots with export capability.
+#[derive(Debug)]
+pub struct FillSignalStore {
+    /// Completed snapshots ready for export
+    snapshots: VecDeque<FillSignalSnapshot>,
+    /// Pending markouts waiting for price updates
+    pending_markouts: VecDeque<PendingMarkout>,
+    /// Maximum snapshots to keep in memory
+    capacity: usize,
+    /// Total fills recorded (for stats)
+    total_recorded: u64,
+    /// Total fills exported
+    total_exported: u64,
+    /// Export path (if configured)
+    export_path: Option<String>,
+    /// Last export time
+    last_export: Instant,
+}
+
+impl FillSignalStore {
+    /// Create a new store with default capacity.
+    pub fn new() -> Self {
+        Self {
+            snapshots: VecDeque::with_capacity(1000),
+            pending_markouts: VecDeque::with_capacity(100),
+            capacity: 1000,
+            total_recorded: 0,
+            total_exported: 0,
+            export_path: None,
+            last_export: Instant::now(),
+        }
+    }
+
+    /// Create with custom capacity and export path.
+    pub fn with_config(capacity: usize, export_path: Option<String>) -> Self {
+        Self {
+            snapshots: VecDeque::with_capacity(capacity),
+            pending_markouts: VecDeque::with_capacity(100),
+            capacity,
+            total_recorded: 0,
+            total_exported: 0,
+            export_path,
+            last_export: Instant::now(),
+        }
+    }
+
+    /// Record a new fill snapshot and start markout tracking.
+    pub fn record(&mut self, snapshot: FillSignalSnapshot) {
+        // Start tracking markout for this fill
+        let pending = PendingMarkout::new(
+            snapshot.tid,
+            snapshot.price,
+            snapshot.side == "bid",
+            snapshot.timestamp_ms,
+        );
+        self.pending_markouts.push_back(pending);
+
+        // Store snapshot (markouts will be filled later)
+        self.snapshots.push_back(snapshot);
+        self.total_recorded += 1;
+
+        // Evict oldest if over capacity
+        while self.snapshots.len() > self.capacity {
+            self.snapshots.pop_front();
+        }
+    }
+
+    /// Update markouts with new mid price.
+    /// Call this on every AllMids update.
+    pub fn update_markouts(&mut self, current_mid: f64, current_time_ms: u64) {
+        // Update all pending markouts
+        let mut completed_tids = Vec::new();
+        
+        for pending in self.pending_markouts.iter_mut() {
+            if pending.update(current_mid, current_time_ms) {
+                completed_tids.push((
+                    pending.tid,
+                    pending.markout_500ms_bps,
+                    pending.markout_2s_bps,
+                    pending.markout_10s_bps,
+                ));
+            }
+        }
+
+        // Remove completed and stale markouts
+        self.pending_markouts.retain(|p| !p.is_stale() && p.markout_10s_bps.is_none());
+
+        // Update snapshots with completed markouts
+        for (tid, m500, m2s, m10s) in completed_tids {
+            if let Some(snapshot) = self.snapshots.iter_mut().find(|s| s.tid == tid) {
+                snapshot.markout_500ms_bps = m500;
+                snapshot.markout_2s_bps = m2s;
+                snapshot.markout_10s_bps = m10s;
+            }
+        }
+    }
+
+    /// Export snapshots to JSON file.
+    pub fn export_to_json(&mut self, path: &str) -> std::io::Result<usize> {
+        // Only export snapshots with complete markouts
+        let complete: Vec<_> = self.snapshots
+            .iter()
+            .filter(|s| s.markout_10s_bps.is_some())
+            .cloned()
+            .collect();
+
+        if complete.is_empty() {
+            return Ok(0);
+        }
+
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        
+        // Write as JSON array
+        serde_json::to_writer_pretty(&mut writer, &complete)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        writer.flush()?;
+
+        let count = complete.len();
+        self.total_exported += count as u64;
+        self.last_export = Instant::now();
+
+        info!(
+            exported = count,
+            total_recorded = self.total_recorded,
+            total_exported = self.total_exported,
+            path = %path,
+            "Exported fill signal snapshots"
+        );
+
+        Ok(count)
+    }
+
+    /// Check if export is due (every 5 minutes or 100 fills).
+    pub fn should_export(&self) -> bool {
+        let fills_since_export = self.total_recorded - self.total_exported;
+        let time_since_export = self.last_export.elapsed().as_secs();
+        
+        fills_since_export >= 100 || time_since_export >= 300
+    }
+
+    /// Get the configured export path.
+    pub fn export_path(&self) -> Option<&str> {
+        self.export_path.as_deref()
+    }
+
+    /// Set export path.
+    pub fn set_export_path(&mut self, path: String) {
+        self.export_path = Some(path);
+    }
+
+    /// Get stats for logging.
+    pub fn stats(&self) -> (u64, u64, usize, usize) {
+        (
+            self.total_recorded,
+            self.total_exported,
+            self.snapshots.len(),
+            self.pending_markouts.len(),
+        )
+    }
+}
+
+impl Default for FillSignalStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Original Fill Processing Infrastructure
+// ============================================================================
 
 /// Fill processing result with additional context.
 #[derive(Debug, Clone)]
@@ -121,6 +566,12 @@ pub struct FillState<'a> {
     // Bayesian learning
     /// Theoretical edge estimator for Bayesian alpha updates
     pub theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
+
+    // Signal diagnostics (Phase 1)
+    /// Fill signal store for diagnostic export
+    pub signal_store: &'a mut FillSignalStore,
+    /// Current market params for signal capture (set before process() call)
+    pub market_params: Option<&'a MarketParams>,
 }
 
 /// Fill processor - coordinates fill handling across modules.
@@ -578,6 +1029,30 @@ impl FillProcessor {
             m.record_fill(fill.size, fill.is_buy);
             m.update_position(state.position.position());
         }
+
+        // === Signal Diagnostic Capture (Phase 1) ===
+        // Record fill signal snapshot for calibration analysis.
+        // Uses provided market_params if available, otherwise builds from estimator.
+        let snapshot_params = state.market_params.cloned().unwrap_or(params);
+        let cp_prob = state.stochastic_controller.changepoint_summary().cp_prob_5;
+        
+        let snapshot = FillSignalSnapshot::from_fill_and_params(fill, &snapshot_params, state.asset)
+            .with_position(state.position.position())
+            .with_cp_prob(cp_prob);
+        
+        state.signal_store.record(snapshot);
+        
+        // Log diagnostic capture
+        let (recorded, exported, stored, pending) = state.signal_store.stats();
+        if recorded % 10 == 0 {
+            debug!(
+                total_recorded = recorded,
+                total_exported = exported,
+                in_memory = stored,
+                pending_markouts = pending,
+                "Signal diagnostic store stats"
+            );
+        }
     }
 
     /// Update queue tracking based on fill completeness.
@@ -656,6 +1131,7 @@ mod tests {
         stochastic_controller: &'a mut StochasticController,
         position_pnl: &'a mut PositionPnLTracker,
         theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
+        signal_store: &'a mut FillSignalStore,
     ) -> FillState<'a> {
         FillState {
             position,
@@ -676,6 +1152,8 @@ mod tests {
             position_pnl,
             fee_bps: 1.5,
             theoretical_edge,
+            signal_store,
+            market_params: None,
         }
     }
 
@@ -696,6 +1174,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         let mut state = make_test_state(
             &mut position,
@@ -711,6 +1190,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut signal_store,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -738,6 +1218,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         let mut state = make_test_state(
             &mut position,
@@ -753,6 +1234,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut signal_store,
         );
 
         let fill1 = make_fill(1, 100, 1.0, 50000.0, true);
@@ -834,6 +1316,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -852,6 +1335,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut signal_store,
         );
 
         // Now WebSocket fill arrives for OID 100
@@ -890,6 +1374,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         // No pre-registration - this is a normal fill
 
@@ -907,6 +1392,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut signal_store,
         );
 
         let fill = make_fill(1, 100, 1.0, 50000.0, true);
@@ -942,6 +1428,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -963,6 +1450,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut signal_store,
             );
             processor.process(&fill1, &mut state)
         };
@@ -988,6 +1476,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut signal_store,
             );
             processor.process(&fill2, &mut state)
         };
@@ -1022,6 +1511,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut signal_store = FillSignalStore::new();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -1044,6 +1534,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut signal_store,
             );
             processor.process(&fill1, &mut state)
         };
@@ -1075,6 +1566,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut signal_store,
             );
             processor.process(&fill2, &mut state)
         };
@@ -1107,6 +1599,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut signal_store,
             );
             processor.process(&fill3, &mut state)
         };

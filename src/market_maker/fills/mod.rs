@@ -41,7 +41,10 @@ mod processor;
 
 pub use consumer::{FillConsumer, FillConsumerBox};
 pub use dedup::FillDeduplicator;
-pub use processor::{FillProcessingResult, FillProcessor, FillState};
+pub use processor::{
+    FillProcessingResult, FillProcessor, FillSignalSnapshot, FillSignalStore, FillState,
+    PendingMarkout,
+};
 
 use std::time::Instant;
 

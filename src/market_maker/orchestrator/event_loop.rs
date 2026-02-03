@@ -576,6 +576,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         learned_status.tier1_ready,
                     );
 
+                    // === Periodic Component Update (Phase 0: Calibration Logging) ===
+                    // Updates model calibration metrics and logs Brier scores / IR
+                    self.periodic_component_update();
+
                     // Check if supervisor recommends reconnection and act on it
                     if self.infra.connection_supervisor.is_reconnect_recommended() {
                         let attempt = self.infra.connection_health.current_attempt() + 1;

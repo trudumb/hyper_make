@@ -10,17 +10,21 @@
 //! - Spread adjustment: Recommended spread widening based on realized AS
 //! - **Depth-Dependent AS**: Exponential decay model AS(δ) = AS₀ × exp(-δ/δ_char)
 //!   calibrated from fill history by depth bucket
+//! - **Pre-Fill Classifier**: Predicts toxicity BEFORE fills using microstructure signals
 //!
 //! # Module Structure
 //!
 //! - `depth_decay`: Depth-dependent adverse selection model
-//! - `estimator`: Main adverse selection estimator
+//! - `estimator`: Main adverse selection estimator (post-fill measurement)
+//! - `pre_fill_classifier`: Pre-fill toxicity prediction
 
 mod depth_decay;
 mod estimator;
+mod pre_fill_classifier;
 
 pub use depth_decay::{DepthDecayAS, DepthDecayASSummary, FillWithDepth};
 pub use estimator::{AdverseSelectionEstimator, AdverseSelectionSummary};
+pub use pre_fill_classifier::{PreFillASClassifier, PreFillClassifierConfig, PreFillSummary};
 
 /// Configuration for adverse selection estimation.
 #[derive(Debug, Clone)]
@@ -71,7 +75,9 @@ impl Default for AdverseSelectionConfig {
             // MAINNET OPTIMIZED: Faster adaptation to changing AS patterns
             ewma_alpha: 0.12, // Increased from 0.05 - faster adaptation
             min_fills_warmup: 20,
-            max_pending_fills: 1000,
+            // Increased from 1000 to handle 10-minute tracking window.
+            // At ~2 fills/sec peak, 10 min = ~1200 fills. Use 5000 for safety margin.
+            max_pending_fills: 5000,
             spread_adjustment_multiplier: 2.0,
             max_spread_adjustment: 0.005,
             min_spread_adjustment: 0.0,

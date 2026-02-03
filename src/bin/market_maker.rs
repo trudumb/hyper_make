@@ -278,6 +278,14 @@ struct Cli {
     #[arg(long)]
     quote_gate_min_edge_confidence: Option<f64>,
 
+    // === Signal Diagnostics Flags ===
+    /// Path to export fill signal snapshots for calibration analysis.
+    /// Enables diagnostic infrastructure that captures all signal values at fill time
+    /// and tracks markouts at 500ms, 2s, 10s horizons.
+    /// Example: --signal-export-path fills_with_signals.json
+    #[arg(long)]
+    signal_export_path: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1643,6 +1651,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_dynamic_risk_config(dynamic_risk_config)
     .with_microprice_ema(microprice_ema_alpha, microprice_ema_min_change_bps);
+
+    // Wire signal export path for diagnostic infrastructure
+    if let Some(ref path) = cli.signal_export_path {
+        market_maker = market_maker.with_signal_export_path(path.clone());
+        tracing::info!(
+            export_path = %path,
+            "Signal diagnostic infrastructure enabled - fills will be exported with all signal values"
+        );
+    }
 
     // Sync open orders
     market_maker
