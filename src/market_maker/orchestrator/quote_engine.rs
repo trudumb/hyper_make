@@ -94,7 +94,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Phase 7: Removed dual-write - centralized beliefs are now the single source of truth.
         // This feeds price returns to the Bayesian posterior over (μ, σ²).
         // The resulting E[μ | data] becomes belief_predictive_bias in MarketParams.
-        let n_obs_before = self.central_beliefs.snapshot().drift_vol.n_observations;
+
+        // Bootstrap: Seed prev_mid on first valid mid price to enable belief observations
+        if self.prev_mid_for_beliefs == 0.0 && self.latest_mid > 0.0 {
+            self.prev_mid_for_beliefs = self.latest_mid;
+            self.last_beliefs_update = Some(std::time::Instant::now());
+            info!(
+                seeded_mid = %format!("{:.4}", self.latest_mid),
+                "Belief system: seeded prev_mid_for_beliefs for bootstrap"
+            );
+        }
+
         let can_observe = self.latest_mid > 0.0 && self.prev_mid_for_beliefs > 0.0;
 
         if can_observe {
@@ -133,17 +143,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "Beliefs updated with price observation"
                 );
             }
-        }
-
-        // DEBUG: Log belief state every 5 cycles during initial debugging
-        if n_obs_before % 5 == 0 || !can_observe {
-            info!(
-                latest_mid = %format!("{:.4}", self.latest_mid),
-                prev_mid = %format!("{:.4}", self.prev_mid_for_beliefs),
-                can_observe = can_observe,
-                n_price_obs = n_obs_before,
-                "Belief observation check"
-            );
         }
 
         // Update tracking for next iteration

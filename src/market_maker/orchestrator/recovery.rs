@@ -216,7 +216,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let orphan_count = exchange_oids.difference(&local_oids).count();
         let lagging_count = local_oids.difference(&exchange_oids).count();
 
-        info!(
+        debug!(
             local_count = local_oids.len(),
             snapshot_count = exchange_oids.len(),
             snapshot_age_ms = snapshot_age.as_millis(),
