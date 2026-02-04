@@ -753,6 +753,9 @@ impl StochasticConfig {
             bootstrap_config: crate::market_maker::control::BayesianBootstrapConfig::default(),
             // Default to ThinDex for conservative changepoint thresholds
             market_regime: crate::market_maker::control::MarketRegime::ThinDex,
+            // Pre-fill AS toxicity gating - enabled by default
+            toxicity_gate_threshold: 0.75, // 75% toxicity = skip quoting
+            enable_toxicity_gate: true,
         }
     }
 }

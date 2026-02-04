@@ -76,11 +76,30 @@ impl EdgeModel for GLFTEdgeModel {
         let edge_mean = half_spread_bps - state.predicted_as_bps - self.fee_bps;
 
         // Uncertainty from multiple sources
-        let sigma_uncertainty = state.sigma_effective * 10000.0 * 0.5; // Half of vol in bps
-        let as_uncertainty = state.predicted_as_bps * 0.3; // 30% AS uncertainty
-        let edge_std = (sigma_uncertainty.powi(2) + as_uncertainty.powi(2)).sqrt();
+        // 1. Volatility uncertainty: per-second vol converted to bps, scaled by typical fill duration
+        //    For a ~1 second fill window, uncertainty ~ sigma * sqrt(1) * 10000
+        //    We use full sigma (not half) to be conservative
+        let sigma_bps = state.sigma_effective * 10000.0;
+        let sigma_uncertainty = sigma_bps.max(0.5); // Floor at 0.5 bps
 
-        (edge_mean, edge_std.max(0.5))
+        // 2. AS uncertainty: 30% of predicted AS
+        let as_uncertainty = state.predicted_as_bps.abs() * 0.3;
+
+        // 3. Kappa uncertainty: higher when kappa is uncertain (low kappa = more uncertainty)
+        let kappa_uncertainty = if state.kappa > 100.0 {
+            0.5 // Low uncertainty when kappa is high
+        } else {
+            2.0 / (state.kappa.max(10.0) / 100.0) // Higher uncertainty when kappa is low
+        };
+
+        // Combined uncertainty (sum of variances, capped at reasonable bounds)
+        let edge_std = (sigma_uncertainty.powi(2) + as_uncertainty.powi(2) + kappa_uncertainty.powi(2)).sqrt();
+
+        // Cap at reasonable bounds: min 1 bps, max 50 bps
+        // Edge predictions with >50 bps uncertainty are essentially uninformative
+        let edge_std_bounded = edge_std.clamp(1.0, 50.0);
+
+        (edge_mean, edge_std_bounded)
     }
 
     fn name(&self) -> &str {

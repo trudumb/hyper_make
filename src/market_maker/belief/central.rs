@@ -1074,7 +1074,14 @@ impl CentralBeliefState {
         let n = state.edge_n.max(1.0);
         let mean = state.edge_sum / n;
         let variance = (state.edge_sum_sq / n - mean * mean).max(0.0);
-        let std = variance.sqrt();
+        let raw_std = variance.sqrt();
+
+        // Bound the uncertainty to reasonable ranges:
+        // - Min 0.5 bps: even with perfect data, there's inherent market uncertainty
+        // - Max 20 bps: beyond this, the estimate is essentially uninformative
+        // - Scale by 1/sqrt(n) to reflect sample size (shrink uncertainty with more data)
+        let sample_factor = (10.0 / n.max(1.0)).sqrt().min(3.0); // Converges to ~1 at n=10
+        let std = (raw_std * sample_factor).clamp(0.5, 20.0);
 
         // P(positive edge)
         let z = mean / std.max(0.1);

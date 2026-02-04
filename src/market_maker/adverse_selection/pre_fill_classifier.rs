@@ -92,6 +92,15 @@ pub struct PreFillASClassifier {
 
     /// Update count for statistics
     update_count: u64,
+
+    /// Timestamp of last orderbook update (ms since epoch)
+    orderbook_updated_at_ms: u64,
+
+    /// Timestamp of last trade flow update (ms since epoch)
+    trade_flow_updated_at_ms: u64,
+
+    /// Timestamp of last regime update (ms since epoch)
+    regime_updated_at_ms: u64,
 }
 
 impl PreFillASClassifier {
@@ -111,6 +120,9 @@ impl PreFillASClassifier {
             funding_rate: 0.0, // Neutral funding
             cached_toxicity: 0.0,
             update_count: 0,
+            orderbook_updated_at_ms: 0,
+            trade_flow_updated_at_ms: 0,
+            regime_updated_at_ms: 0,
         }
     }
 
@@ -125,6 +137,10 @@ impl PreFillASClassifier {
         } else {
             self.orderbook_imbalance = if bid_depth > 0.0 { 10.0 } else { 1.0 };
         }
+        self.orderbook_updated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         self.update_cached_toxicity();
     }
 
@@ -140,6 +156,10 @@ impl PreFillASClassifier {
         } else {
             self.recent_trade_direction = 0.0;
         }
+        self.trade_flow_updated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         self.update_cached_toxicity();
     }
 
@@ -151,6 +171,10 @@ impl PreFillASClassifier {
     pub fn update_regime(&mut self, hmm_confidence: f64, changepoint_prob: f64) {
         self.regime_trust = hmm_confidence.clamp(0.0, 1.0);
         self.changepoint_prob = changepoint_prob.clamp(0.0, 1.0);
+        self.regime_updated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         self.update_cached_toxicity();
     }
 
@@ -250,6 +274,70 @@ impl PreFillASClassifier {
         self.update_count += 1;
     }
 
+    /// Check if orderbook signal is stale.
+    ///
+    /// # Arguments
+    /// * `max_age_ms` - Maximum age in milliseconds before considered stale
+    pub fn is_orderbook_stale(&self, max_age_ms: u64) -> bool {
+        if self.orderbook_updated_at_ms == 0 {
+            return true; // Never updated
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now_ms.saturating_sub(self.orderbook_updated_at_ms) > max_age_ms
+    }
+
+    /// Check if trade flow signal is stale.
+    pub fn is_trade_flow_stale(&self, max_age_ms: u64) -> bool {
+        if self.trade_flow_updated_at_ms == 0 {
+            return true;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now_ms.saturating_sub(self.trade_flow_updated_at_ms) > max_age_ms
+    }
+
+    /// Check if regime signal is stale.
+    pub fn is_regime_stale(&self, max_age_ms: u64) -> bool {
+        if self.regime_updated_at_ms == 0 {
+            return true;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now_ms.saturating_sub(self.regime_updated_at_ms) > max_age_ms
+    }
+
+    /// Check if any critical signal is stale.
+    ///
+    /// Returns true if orderbook or trade flow signals are stale.
+    /// These are the highest-weight signals in toxicity prediction.
+    pub fn has_stale_signals(&self, max_age_ms: u64) -> bool {
+        self.is_orderbook_stale(max_age_ms) || self.is_trade_flow_stale(max_age_ms)
+    }
+
+    /// Get staleness summary for all signals.
+    pub fn staleness_summary(&self, max_age_ms: u64) -> SignalStaleness {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        SignalStaleness {
+            orderbook_age_ms: now_ms.saturating_sub(self.orderbook_updated_at_ms),
+            trade_flow_age_ms: now_ms.saturating_sub(self.trade_flow_updated_at_ms),
+            regime_age_ms: now_ms.saturating_sub(self.regime_updated_at_ms),
+            orderbook_stale: self.is_orderbook_stale(max_age_ms),
+            trade_flow_stale: self.is_trade_flow_stale(max_age_ms),
+            regime_stale: self.is_regime_stale(max_age_ms),
+        }
+    }
+
     /// Get summary for diagnostics.
     pub fn summary(&self) -> PreFillSummary {
         PreFillSummary {
@@ -263,6 +351,9 @@ impl PreFillASClassifier {
             bid_spread_mult: self.spread_multiplier(true),
             ask_spread_mult: self.spread_multiplier(false),
             update_count: self.update_count,
+            orderbook_updated_at_ms: self.orderbook_updated_at_ms,
+            trade_flow_updated_at_ms: self.trade_flow_updated_at_ms,
+            regime_updated_at_ms: self.regime_updated_at_ms,
         }
     }
 }
@@ -286,6 +377,23 @@ pub struct PreFillSummary {
     pub bid_spread_mult: f64,
     pub ask_spread_mult: f64,
     pub update_count: u64,
+    /// Timestamp of last orderbook update (ms since epoch)
+    pub orderbook_updated_at_ms: u64,
+    /// Timestamp of last trade flow update (ms since epoch)
+    pub trade_flow_updated_at_ms: u64,
+    /// Timestamp of last regime update (ms since epoch)
+    pub regime_updated_at_ms: u64,
+}
+
+/// Signal staleness information.
+#[derive(Debug, Clone)]
+pub struct SignalStaleness {
+    pub orderbook_age_ms: u64,
+    pub trade_flow_age_ms: u64,
+    pub regime_age_ms: u64,
+    pub orderbook_stale: bool,
+    pub trade_flow_stale: bool,
+    pub regime_stale: bool,
 }
 
 #[cfg(test)]

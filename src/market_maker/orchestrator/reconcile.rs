@@ -262,12 +262,54 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Pre-register orders as pending with CLOIDs BEFORE the API call (Phase 1 Fix).
             // CLOID lookup is deterministic - eliminates timing race between REST and WebSocket.
+            // Phase 5: Also make calibration predictions (fill + AS) for each order.
             let mut cloids_for_tracker: Vec<String> = Vec::with_capacity(order_specs.len());
+            let regime_str = format!("{:?}", self.estimator.volatility_regime());
+            let mid_price = self.latest_mid;
+
             for spec in &order_specs {
+                // Calculate depth from mid in bps (needed for fill prediction)
+                let depth_bps = if mid_price > 0.0 {
+                    ((spec.price - mid_price).abs() / mid_price) * 10000.0
+                } else {
+                    0.0
+                };
+
+                // Make calibration predictions for this order
+                let (fill_prob, fill_pred_id) = self
+                    .stochastic
+                    .model_calibration
+                    .fill_model
+                    .predict_with_regime(depth_bps, &regime_str);
+                let (_as_alpha, as_pred_id) = self
+                    .stochastic
+                    .model_calibration
+                    .as_model
+                    .predict_with_regime(&regime_str);
+
                 if let Some(ref cloid) = spec.cloid {
-                    self.orders
-                        .add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+                    // Use calibration-aware registration
+                    self.orders.add_pending_with_calibration(
+                        side,
+                        spec.price,
+                        spec.size,
+                        cloid.clone(),
+                        Some(fill_pred_id),
+                        Some(as_pred_id),
+                        Some(depth_bps),
+                    );
                     cloids_for_tracker.push(cloid.clone());
+
+                    debug!(
+                        cloid = %cloid,
+                        side = ?side,
+                        price = spec.price,
+                        fill_prob = %format!("{:.3}", fill_prob),
+                        fill_pred_id = fill_pred_id,
+                        as_pred_id = as_pred_id,
+                        depth_bps = %format!("{:.2}", depth_bps),
+                        "Registered pending order with calibration predictions"
+                    );
                 } else {
                     // Fallback (shouldn't happen with new code)
                     self.orders.add_pending(side, spec.price, spec.size);
@@ -1345,12 +1387,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         let side = if spec.is_buy { Side::Buy } else { Side::Sell };
                         let cloid = uuid::Uuid::new_v4().to_string();
 
-                        // Pre-register as pending BEFORE API call (consistent with bulk order flow)
-                        self.orders.add_pending_with_cloid(
+                        // Calculate depth and make calibration predictions
+                        let mid_price = self.latest_mid;
+                        let depth_bps = if mid_price > 0.0 {
+                            ((spec.new_price - mid_price).abs() / mid_price) * 10000.0
+                        } else {
+                            0.0
+                        };
+                        let regime_str = format!("{:?}", self.estimator.volatility_regime());
+                        let (_, fill_pred_id) = self
+                            .stochastic
+                            .model_calibration
+                            .fill_model
+                            .predict_with_regime(depth_bps, &regime_str);
+                        let (_, as_pred_id) = self
+                            .stochastic
+                            .model_calibration
+                            .as_model
+                            .predict_with_regime(&regime_str);
+
+                        // Pre-register as pending BEFORE API call with calibration predictions
+                        self.orders.add_pending_with_calibration(
                             side,
                             spec.new_price,
                             spec.new_size,
                             cloid.clone(),
+                            Some(fill_pred_id),
+                            Some(as_pred_id),
+                            Some(depth_bps),
                         );
 
                         // Phase 7: Register expected CLOID with orphan tracker BEFORE API call
@@ -1689,12 +1753,39 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
-        // Pre-register as pending
+        // Pre-register as pending with calibration predictions
         let mut cloids_for_tracker: Vec<String> = Vec::with_capacity(order_specs.len());
+        let regime_str = format!("{:?}", self.estimator.volatility_regime());
+        let mid_price = self.latest_mid;
+
         for spec in &order_specs {
             if let Some(ref cloid) = spec.cloid {
-                self.orders
-                    .add_pending_with_cloid(side, spec.price, spec.size, cloid.clone());
+                // Calculate depth and make calibration predictions
+                let depth_bps = if mid_price > 0.0 {
+                    ((spec.price - mid_price).abs() / mid_price) * 10000.0
+                } else {
+                    0.0
+                };
+                let (_, fill_pred_id) = self
+                    .stochastic
+                    .model_calibration
+                    .fill_model
+                    .predict_with_regime(depth_bps, &regime_str);
+                let (_, as_pred_id) = self
+                    .stochastic
+                    .model_calibration
+                    .as_model
+                    .predict_with_regime(&regime_str);
+
+                self.orders.add_pending_with_calibration(
+                    side,
+                    spec.price,
+                    spec.size,
+                    cloid.clone(),
+                    Some(fill_pred_id),
+                    Some(as_pred_id),
+                    Some(depth_bps),
+                );
                 cloids_for_tracker.push(cloid.clone());
             }
         }

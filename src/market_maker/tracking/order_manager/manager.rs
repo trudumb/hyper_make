@@ -232,6 +232,48 @@ impl OrderManager {
         self.pending.insert(key, pending);
     }
 
+    /// Register a pending order with full calibration tracking.
+    ///
+    /// Use this method when making predictions at quote time. The prediction IDs
+    /// will be preserved through to the TrackedOrder and used when recording
+    /// calibration outcomes on fill.
+    ///
+    /// # Arguments
+    /// - `side`: Buy or Sell
+    /// - `price`: Limit price
+    /// - `size`: Order size
+    /// - `cloid`: Client Order ID (UUID string, generated before placement)
+    /// - `fill_prediction_id`: Prediction ID from CalibratedFillModel::predict()
+    /// - `as_prediction_id`: Prediction ID from CalibratedASModel::predict()
+    /// - `depth_bps`: Depth from mid in basis points (for calibration context)
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_pending_with_calibration(
+        &mut self,
+        side: Side,
+        price: f64,
+        size: f64,
+        cloid: String,
+        fill_prediction_id: Option<u64>,
+        as_prediction_id: Option<u64>,
+        depth_bps: Option<f64>,
+    ) {
+        // Use the with_calibration constructor to include all tracking data
+        let pending = PendingOrder::with_calibration(
+            side,
+            price,
+            size,
+            cloid.clone(),
+            fill_prediction_id,
+            as_prediction_id,
+            depth_bps,
+        );
+        self.pending_by_cloid.insert(cloid, pending.clone());
+
+        // Also store by price (fallback lookup)
+        let key = (side, price_to_key(price));
+        self.pending.insert(key, pending);
+    }
+
     /// Finalize a pending order by assigning it a real OID (legacy, price-based).
     ///
     /// Call this when the bulk order API returns with the assigned OID.
@@ -244,9 +286,9 @@ impl OrderManager {
             if let Some(ref cloid) = pending.cloid {
                 self.pending_by_cloid.remove(cloid);
             }
-            // Create tracked order with the real OID and resting size from exchange
-            let mut order = TrackedOrder::new(oid, side, price, resting_size);
-            order.cloid = pending.cloid; // Preserve CLOID for future lookup
+            // Create tracked order from pending - preserves prediction IDs for calibration
+            let mut order = TrackedOrder::from_pending(oid, &pending);
+            order.size = resting_size; // Use resting size from exchange
             self.add_order(order);
         }
         // Note: If pending not found, order may have been cleaned up or never registered.
@@ -266,14 +308,9 @@ impl OrderManager {
             let key = (pending.side, price_to_key(pending.price));
             self.pending.remove(&key);
 
-            // Create tracked order with the real OID, preserving CLOID
-            let order = TrackedOrder::with_cloid(
-                oid,
-                cloid.to_string(),
-                pending.side,
-                pending.price,
-                resting_size,
-            );
+            // Create tracked order from pending - preserves prediction IDs for calibration
+            let mut order = TrackedOrder::from_pending(oid, &pending);
+            order.size = resting_size; // Use resting size from exchange
             self.add_order(order);
             true
         } else {

@@ -86,6 +86,8 @@ pub enum NoQuoteReason {
     Manual,
     /// Rate limit quota exhausted (shadow price too high)
     QuotaExhausted,
+    /// Pre-fill AS classifier predicts toxic flow - skip quoting
+    ToxicFlow,
 }
 
 impl std::fmt::Display for NoQuoteReason {
@@ -96,6 +98,7 @@ impl std::fmt::Display for NoQuoteReason {
             NoQuoteReason::Cascade => write!(f, "cascade"),
             NoQuoteReason::Manual => write!(f, "manual"),
             NoQuoteReason::QuotaExhausted => write!(f, "quota_exhausted"),
+            NoQuoteReason::ToxicFlow => write!(f, "toxic_flow"),
         }
     }
 }
@@ -170,6 +173,16 @@ pub struct QuoteGateConfig {
     /// Cascade: Low threshold (0.3), requires 1 confirmation
     /// Default: ThinDex (conservative for DEX environments)
     pub market_regime: MarketRegime,
+
+    /// Pre-fill toxicity threshold to completely skip quoting.
+    /// When max(bid_toxicity, ask_toxicity) exceeds this, pull all quotes.
+    /// Default: 0.75 (75% toxicity = very likely toxic)
+    pub toxicity_gate_threshold: f64,
+
+    /// Enable pre-fill toxicity gating.
+    /// When true, toxic flow prediction can stop quoting entirely.
+    /// Default: true
+    pub enable_toxicity_gate: bool,
 }
 
 /// Configuration for active probing to generate learning data.
@@ -223,6 +236,8 @@ impl Default for QuoteGateConfig {
             probe_config: ProbeConfig::default(),
             bootstrap_config: BayesianBootstrapConfig::default(),
             market_regime: MarketRegime::ThinDex, // Conservative default for DEX
+            toxicity_gate_threshold: 0.75,        // 75% toxicity = skip quoting
+            enable_toxicity_gate: true,           // Enable toxicity gating by default
         }
     }
 }
@@ -407,6 +422,23 @@ pub struct QuoteGateInput {
     /// Higher regimes → faster quota recharge via fills → lower shadow price.
     /// Default: 1 (normal)
     pub vol_regime: u8,
+
+    // === Pre-Fill Adverse Selection (Phase 10) ===
+
+    /// Pre-fill toxicity prediction for bid side [0, 1].
+    /// Higher = more likely to be adversely selected if filled.
+    /// Default: 0.0
+    pub pre_fill_toxicity_bid: f64,
+
+    /// Pre-fill toxicity prediction for ask side [0, 1].
+    /// Higher = more likely to be adversely selected if filled.
+    /// Default: 0.0
+    pub pre_fill_toxicity_ask: f64,
+
+    /// Whether pre-fill signals are stale and should be treated conservatively.
+    /// When true, toxicity predictions may be unreliable.
+    /// Default: false
+    pub pre_fill_signals_stale: bool,
 
     // === Phase 6: Centralized Belief Snapshot ===
     /// Direct access to centralized belief state for unified decision making.
@@ -619,6 +651,10 @@ impl Default for QuoteGateInput {
             // Phase 9: Rate Limit Shadow Price defaults
             rate_limit_headroom_pct: 1.0,     // Full budget available
             vol_regime: 1,                    // Normal volatility
+            // Phase 10: Pre-Fill AS Toxicity defaults
+            pre_fill_toxicity_bid: 0.0,       // No toxicity initially
+            pre_fill_toxicity_ask: 0.0,       // No toxicity initially
+            pre_fill_signals_stale: false,    // Signals fresh initially
             // Phase 6: Centralized Belief Snapshot
             beliefs: None,
         }
@@ -1098,6 +1134,31 @@ impl QuoteGate {
             return QuoteDecision::NoQuote {
                 reason: NoQuoteReason::Cascade,
             };
+        }
+
+        // 2a. Pre-fill toxicity gating
+        // If either side has toxicity above threshold, pull all quotes to avoid AS
+        // When signals are stale, use a lower threshold (be more conservative)
+        if self.config.enable_toxicity_gate {
+            let effective_threshold = if input.pre_fill_signals_stale {
+                // 30% lower threshold when signals are stale (defense-first)
+                self.config.toxicity_gate_threshold * 0.7
+            } else {
+                self.config.toxicity_gate_threshold
+            };
+            let max_toxicity = input.pre_fill_toxicity_bid.max(input.pre_fill_toxicity_ask);
+            if max_toxicity >= effective_threshold {
+                info!(
+                    bid_toxicity = %format!("{:.3}", input.pre_fill_toxicity_bid),
+                    ask_toxicity = %format!("{:.3}", input.pre_fill_toxicity_ask),
+                    threshold = %format!("{:.2}", effective_threshold),
+                    signals_stale = input.pre_fill_signals_stale,
+                    "Quote gate: toxic flow predicted, pulling quotes"
+                );
+                return QuoteDecision::NoQuote {
+                    reason: NoQuoteReason::ToxicFlow,
+                };
+            }
         }
 
         // 2b. Hawkes excitation protection (Phase 7: Bayesian Fusion)
@@ -1856,30 +1917,44 @@ impl QuoteGate {
         // Check quota-aware overrides FIRST, before any other logic
         // =======================================================================
 
-        // 1. Shadow price check: veto all quoting when quota exhausted
-        //    This internalizes request cost and prevents burning budget on low-edge situations
+        // Compute shadow price for later use
         let shadow_price = Self::compute_request_shadow_price(
             input.rate_limit_headroom_pct,
             input.vol_regime,
         );
+
+        // 1. Inventory forcing: when quota is critically low AND we have position,
+        //    use remaining quota ONLY for reduce-only orders.
+        //    CRITICAL: This runs BEFORE shadow price veto because:
+        //    - Holding position with no orders is strictly worse than reduce-only orders
+        //    - Reduce-only orders help portfolio risk regardless of quota
+        //    - Each fill contributes to quota recharge, helping escape death spiral
+        //    - Defense-first: reducing exposure takes priority over quota conservation
+        if let Some(forcing_decision) = self.inventory_forcing_decision(input) {
+            info!(
+                headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
+                shadow_price_bps = %format!("{:.1}", shadow_price),
+                position = %format!("{:.4}", input.position),
+                "Inventory forcing overrides quota exhaustion - placing reduce-only orders"
+            );
+            self.record_quote_placed();
+            return forcing_decision;
+        }
+
+        // 2. Shadow price check: veto all quoting when quota exhausted
+        //    This internalizes request cost and prevents burning budget on low-edge situations
+        //    Only blocks new position-building; inventory forcing already handled above
         if shadow_price >= 100.0 {
-            // Quota essentially exhausted - don't quote at all
             warn!(
                 headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
                 shadow_price_bps = %format!("{:.1}", shadow_price),
-                "Rate limit shadow price infinite - quota exhausted"
+                position = %format!("{:.4}", input.position),
+                "Rate limit shadow price infinite - quota exhausted (no position to unwind)"
             );
             self.record_no_quote_cycle();
             return QuoteDecision::NoQuote {
                 reason: NoQuoteReason::QuotaExhausted,
             };
-        }
-
-        // 2. Inventory forcing: when quota is critically low AND we have position,
-        //    use remaining quota ONLY for reduce-only orders
-        if let Some(forcing_decision) = self.inventory_forcing_decision(input) {
-            self.record_quote_placed();
-            return forcing_decision;
         }
 
         // === BAYESIAN BOOTSTRAP MODE ===
@@ -2954,5 +3029,79 @@ mod tests {
         // Total ≈ 2.0
         assert!(recommendation > 0.0);
         assert!(recommendation < 5.0);
+    }
+
+    #[test]
+    fn test_inventory_forcing_overrides_quota_exhaustion() {
+        // Regression test: inventory-forcing mode MUST work even when shadow price
+        // would normally veto all quoting. This prevents the death spiral where:
+        // 1. Bot holds position
+        // 2. Quota exhausted (headroom <= 5%)
+        // 3. Shadow price veto blocks ALL quoting
+        // 4. Bot sits with position and 0 open orders, unable to unwind
+        let gate = QuoteGate::default();
+
+        // Scenario: 3% headroom (shadow price would be >= 100.0) with meaningful position
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.03, // 3% - shadow price is prohibitive
+            position: 5.0,                  // Long position (5% of max)
+            max_position: 100.0,
+            vol_regime: 1,                  // Normal volatility
+            ..default_input()
+        };
+
+        // Inventory forcing should activate and return reduce-only decision
+        let decision = gate.inventory_forcing_decision(&input);
+        assert!(
+            decision.is_some(),
+            "Inventory forcing should activate at 3% headroom with position"
+        );
+        assert!(
+            matches!(decision.unwrap(), QuoteDecision::QuoteOnlyAsks { urgency } if urgency == 1.0),
+            "Long position should trigger QuoteOnlyAsks with urgency 1.0"
+        );
+    }
+
+    #[test]
+    fn test_quota_exhausted_no_position_returns_no_quote() {
+        // When quota is exhausted AND no position to unwind, should return NoQuote
+        let gate = QuoteGate::default();
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.03, // 3% - shadow price is prohibitive
+            position: 0.0,                  // No position
+            max_position: 100.0,
+            vol_regime: 1,
+            ..default_input()
+        };
+
+        // Inventory forcing should NOT activate (no position to unwind)
+        let decision = gate.inventory_forcing_decision(&input);
+        assert!(
+            decision.is_none(),
+            "Inventory forcing should not activate with no position"
+        );
+
+        // Shadow price check would then return QuotaExhausted in decide_with_theoretical_fallback
+    }
+
+    #[test]
+    fn test_inventory_forcing_short_position() {
+        // Test inventory forcing with short position returns QuoteOnlyBids
+        let gate = QuoteGate::default();
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.05, // 5% headroom
+            position: -10.0,                // Short position
+            max_position: 100.0,
+            vol_regime: 1,
+            ..default_input()
+        };
+
+        let decision = gate.inventory_forcing_decision(&input);
+        assert!(
+            matches!(decision, Some(QuoteDecision::QuoteOnlyBids { urgency }) if urgency == 1.0),
+            "Short position should trigger QuoteOnlyBids with urgency 1.0"
+        );
     }
 }

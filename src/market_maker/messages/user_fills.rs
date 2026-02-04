@@ -168,6 +168,7 @@ mod tests {
     use crate::market_maker::config::MetricsRecorder;
     use crate::market_maker::control::{PositionPnLTracker, StochasticController};
     use crate::market_maker::fills::FillSignalStore;
+    use crate::market_maker::tracking::calibration_wiring::ModelCalibrationOrchestrator;
     use crate::market_maker::{
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EstimatorConfig,
         ParameterEstimator, PnLConfig, PnLTracker, PositionTracker, PrometheusMetrics, QueueConfig,
@@ -200,6 +201,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         let mut fill_state = FillState {
@@ -221,6 +223,7 @@ mod tests {
             position_pnl: &mut position_pnl,
             fee_bps: 1.5,
             theoretical_edge: &mut theoretical_edge,
+            model_calibration: &mut model_calibration,
             signal_store: &mut signal_store,
             market_params: None,
         };
@@ -277,6 +280,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         let mut fill_state = FillState {
@@ -298,6 +302,7 @@ mod tests {
             position_pnl: &mut position_pnl,
             fee_bps: 1.5,
             theoretical_edge: &mut theoretical_edge,
+            model_calibration: &mut model_calibration,
             signal_store: &mut signal_store,
             market_params: None,
         };

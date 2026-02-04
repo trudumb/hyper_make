@@ -21,6 +21,7 @@ use super::{FillEvent, FillResult};
 use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
 use crate::market_maker::config::MetricsRecorder;
 use crate::market_maker::control::{PositionPnLTracker, StochasticController};
+use crate::market_maker::tracking::calibration_wiring::ModelCalibrationOrchestrator;
 use crate::market_maker::estimator::ParameterEstimator;
 use crate::market_maker::infra::PrometheusMetrics;
 use crate::market_maker::messages;
@@ -567,6 +568,10 @@ pub struct FillState<'a> {
     /// Theoretical edge estimator for Bayesian alpha updates
     pub theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
 
+    // Calibration
+    /// Model calibration orchestrator for fill probability and AS predictions
+    pub model_calibration: &'a mut ModelCalibrationOrchestrator,
+
     // Signal diagnostics (Phase 1)
     /// Fill signal store for diagnostic export
     pub signal_store: &'a mut FillSignalStore,
@@ -910,6 +915,31 @@ impl FillProcessor {
                 drawdown = %format!("{:.2}", drawdown),
                 "Layer 3: Updated beliefs from fill"
             );
+
+            // Record calibration outcomes for fill probability and AS predictions.
+            // The prediction IDs are stored on the TrackedOrder when the quote was placed.
+            if let Some(order) = state.orders.get_order(fill.oid) {
+                // Record fill probability outcome (prediction was made at quote time)
+                if let Some(fill_pred_id) = order.fill_prediction_id {
+                    state.model_calibration.fill_model.record_outcome(fill_pred_id, true);
+                    debug!(
+                        oid = fill.oid,
+                        prediction_id = fill_pred_id,
+                        "Recorded fill probability outcome: filled=true"
+                    );
+                }
+
+                // Record adverse selection outcome with realized AS bps
+                if let Some(as_pred_id) = order.as_prediction_id {
+                    state.model_calibration.as_model.record_outcome(as_pred_id, realized_as_bps);
+                    debug!(
+                        oid = fill.oid,
+                        prediction_id = as_pred_id,
+                        realized_as_bps = %format!("{:.2}", realized_as_bps),
+                        "Recorded AS prediction outcome"
+                    );
+                }
+            }
         }
 
         // === Calibrated P&L Tracking (IR-Based Thresholds) ===
@@ -1131,6 +1161,7 @@ mod tests {
         stochastic_controller: &'a mut StochasticController,
         position_pnl: &'a mut PositionPnLTracker,
         theoretical_edge: &'a mut crate::market_maker::control::TheoreticalEdgeEstimator,
+        model_calibration: &'a mut ModelCalibrationOrchestrator,
         signal_store: &'a mut FillSignalStore,
     ) -> FillState<'a> {
         FillState {
@@ -1152,6 +1183,7 @@ mod tests {
             position_pnl,
             fee_bps: 1.5,
             theoretical_edge,
+            model_calibration,
             signal_store,
             market_params: None,
         }
@@ -1174,6 +1206,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         let mut state = make_test_state(
@@ -1190,6 +1223,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut model_calibration,
             &mut signal_store,
         );
 
@@ -1218,6 +1252,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         let mut state = make_test_state(
@@ -1234,6 +1269,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut model_calibration,
             &mut signal_store,
         );
 
@@ -1316,6 +1352,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
@@ -1335,6 +1372,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut model_calibration,
             &mut signal_store,
         );
 
@@ -1374,6 +1412,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         // No pre-registration - this is a normal fill
@@ -1392,6 +1431,7 @@ mod tests {
             &mut stochastic_controller,
             &mut position_pnl,
             &mut theoretical_edge,
+            &mut model_calibration,
             &mut signal_store,
         );
 
@@ -1428,6 +1468,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
@@ -1450,6 +1491,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut model_calibration,
                 &mut signal_store,
             );
             processor.process(&fill1, &mut state)
@@ -1476,6 +1518,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut model_calibration,
                 &mut signal_store,
             );
             processor.process(&fill2, &mut state)
@@ -1511,6 +1554,7 @@ mod tests {
         let mut stochastic_controller = StochasticController::default();
         let mut position_pnl = PositionPnLTracker::default();
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
@@ -1534,6 +1578,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut model_calibration,
                 &mut signal_store,
             );
             processor.process(&fill1, &mut state)
@@ -1566,6 +1611,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut model_calibration,
                 &mut signal_store,
             );
             processor.process(&fill2, &mut state)
@@ -1599,6 +1645,7 @@ mod tests {
                 &mut stochastic_controller,
                 &mut position_pnl,
                 &mut theoretical_edge,
+                &mut model_calibration,
                 &mut signal_store,
             );
             processor.process(&fill3, &mut state)

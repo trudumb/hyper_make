@@ -345,6 +345,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position_pnl: &mut self.stochastic.position_pnl,
             fee_bps: self.config.fee_bps,
             theoretical_edge: &mut self.stochastic.theoretical_edge,
+            model_calibration: &mut self.stochastic.model_calibration,
             signal_store: &mut self.safety.signal_store,
             market_params: self.cached_market_params.as_ref(),
         };

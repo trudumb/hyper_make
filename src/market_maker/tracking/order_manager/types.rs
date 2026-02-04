@@ -130,6 +130,12 @@ pub struct PendingOrder {
     pub placed_at: Instant,
     /// Client Order ID (UUID) - generated before placement for deterministic tracking
     pub cloid: Option<String>,
+    /// Calibration prediction ID for fill probability model
+    pub fill_prediction_id: Option<u64>,
+    /// Calibration prediction ID for adverse selection model
+    pub as_prediction_id: Option<u64>,
+    /// Depth from mid in basis points (for calibration)
+    pub depth_bps: Option<f64>,
 }
 
 impl PendingOrder {
@@ -141,6 +147,9 @@ impl PendingOrder {
             size,
             placed_at: Instant::now(),
             cloid: None,
+            fill_prediction_id: None,
+            as_prediction_id: None,
+            depth_bps: None,
         }
     }
 
@@ -152,6 +161,31 @@ impl PendingOrder {
             size,
             placed_at: Instant::now(),
             cloid: Some(cloid),
+            fill_prediction_id: None,
+            as_prediction_id: None,
+            depth_bps: None,
+        }
+    }
+
+    /// Create a new pending order with full calibration tracking.
+    pub fn with_calibration(
+        side: Side,
+        price: f64,
+        size: f64,
+        cloid: String,
+        fill_prediction_id: Option<u64>,
+        as_prediction_id: Option<u64>,
+        depth_bps: Option<f64>,
+    ) -> Self {
+        Self {
+            side,
+            price,
+            size,
+            placed_at: Instant::now(),
+            cloid: Some(cloid),
+            fill_prediction_id,
+            as_prediction_id,
+            depth_bps,
         }
     }
 }
@@ -192,6 +226,12 @@ pub struct TrackedOrder {
     /// Trade IDs of fills processed for this order (for dedup at order level).
     /// Uses SmallVec to avoid heap allocation for typical 1-4 fills per order.
     pub fill_tids: SmallVec<[u64; FILL_TID_INLINE_CAPACITY]>,
+    /// Calibration prediction ID for fill probability model
+    pub fill_prediction_id: Option<u64>,
+    /// Calibration prediction ID for adverse selection model
+    pub as_prediction_id: Option<u64>,
+    /// Depth from mid in basis points (for calibration outcome recording)
+    pub depth_bps: Option<f64>,
 }
 
 impl TrackedOrder {
@@ -211,6 +251,9 @@ impl TrackedOrder {
             state_changed_at: now,
             last_fill_at: None,
             fill_tids: SmallVec::new(),
+            fill_prediction_id: None,
+            as_prediction_id: None,
+            depth_bps: None,
         }
     }
 
@@ -219,6 +262,29 @@ impl TrackedOrder {
         let mut order = Self::new(oid, side, price, size);
         order.cloid = Some(cloid);
         order
+    }
+
+    /// Create a tracked order from a pending order when OID is assigned.
+    /// Preserves calibration prediction IDs for outcome recording.
+    pub fn from_pending(oid: u64, pending: &PendingOrder) -> Self {
+        let now = Instant::now();
+        Self {
+            oid,
+            cloid: pending.cloid.clone(),
+            side: pending.side,
+            price: pending.price,
+            size: pending.size,
+            filled: 0.0,
+            fill_value: 0.0,
+            state: OrderState::Resting,
+            placed_at: pending.placed_at,
+            state_changed_at: now,
+            last_fill_at: None,
+            fill_tids: SmallVec::new(),
+            fill_prediction_id: pending.fill_prediction_id,
+            as_prediction_id: pending.as_prediction_id,
+            depth_bps: pending.depth_bps,
+        }
     }
 
     /// Get remaining size (unfilled).

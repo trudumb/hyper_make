@@ -1534,6 +1534,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     3 // Extreme
                 }
             },
+            // Phase 10: Pre-Fill AS Toxicity from MarketParams
+            pre_fill_toxicity_bid: market_params.pre_fill_toxicity_bid,
+            pre_fill_toxicity_ask: market_params.pre_fill_toxicity_ask,
+            // Check if pre-fill signals are stale (using 5 second threshold for critical signals)
+            pre_fill_signals_stale: self.tier1.pre_fill_classifier.has_stale_signals(5000),
             // Phase 6: Pass centralized belief snapshot for unified decision making
             beliefs: Some(belief_snapshot.clone()),
         };
