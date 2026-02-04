@@ -18,7 +18,9 @@
 
 use super::dedup::FillDeduplicator;
 use super::{FillEvent, FillResult};
-use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier};
+use crate::market_maker::adverse_selection::{
+    AdverseSelectionEstimator, DepthDecayAS, EnhancedASClassifier, PreFillASClassifier,
+};
 use crate::market_maker::config::MetricsRecorder;
 use crate::market_maker::control::{PositionPnLTracker, StochasticController};
 use crate::market_maker::tracking::calibration_wiring::ModelCalibrationOrchestrator;
@@ -527,6 +529,8 @@ pub struct FillState<'a> {
     pub queue_tracker: &'a mut QueuePositionTracker,
     /// Pre-fill adverse selection classifier (online learning)
     pub pre_fill_classifier: &'a mut PreFillASClassifier,
+    /// Enhanced AS classifier with microstructure features
+    pub enhanced_classifier: &'a mut EnhancedASClassifier,
 
     // Tier 2 modules
     /// Parameter estimator
@@ -959,6 +963,20 @@ impl FillProcessor {
                 realized_as_bps = %format!("{:.2}", realized_as_bps),
                 "Recorded pre-fill classifier outcome for online learning"
             );
+
+            // === EnhancedASClassifier Online Learning ===
+            // Record outcome for microstructure-based classifier with z-score features
+            state.enhanced_classifier.record_outcome(
+                is_bid,
+                was_adverse,
+                Some(realized_as_bps),
+            );
+            debug!(
+                is_bid = is_bid,
+                was_adverse = was_adverse,
+                realized_as_bps = %format!("{:.2}", realized_as_bps),
+                "Recorded enhanced classifier outcome for online learning"
+            );
         }
 
         // === Calibrated P&L Tracking (IR-Based Thresholds) ===
@@ -1173,6 +1191,7 @@ mod tests {
         depth_decay_as: &'a mut DepthDecayAS,
         queue_tracker: &'a mut QueuePositionTracker,
         pre_fill_classifier: &'a mut PreFillASClassifier,
+        enhanced_classifier: &'a mut EnhancedASClassifier,
         estimator: &'a mut ParameterEstimator,
         pnl_tracker: &'a mut PnLTracker,
         prometheus: &'a mut PrometheusMetrics,
@@ -1191,6 +1210,7 @@ mod tests {
             depth_decay_as,
             queue_tracker,
             pre_fill_classifier,
+            enhanced_classifier,
             estimator,
             pnl_tracker,
             prometheus,
@@ -1230,6 +1250,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         let mut state = make_test_state(
             &mut position,
@@ -1238,6 +1259,7 @@ mod tests {
             &mut depth_decay_as,
             &mut queue_tracker,
             &mut pre_fill_classifier,
+            &mut enhanced_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1278,6 +1300,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         let mut state = make_test_state(
             &mut position,
@@ -1286,6 +1309,7 @@ mod tests {
             &mut depth_decay_as,
             &mut queue_tracker,
             &mut pre_fill_classifier,
+            &mut enhanced_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1380,6 +1404,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -1391,6 +1416,7 @@ mod tests {
             &mut depth_decay_as,
             &mut queue_tracker,
             &mut pre_fill_classifier,
+            &mut enhanced_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1442,6 +1468,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         // No pre-registration - this is a normal fill
 
@@ -1452,6 +1479,7 @@ mod tests {
             &mut depth_decay_as,
             &mut queue_tracker,
             &mut pre_fill_classifier,
+            &mut enhanced_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1500,6 +1528,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -1514,6 +1543,7 @@ mod tests {
                 &mut depth_decay_as,
                 &mut queue_tracker,
                 &mut pre_fill_classifier,
+                &mut enhanced_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1542,6 +1572,7 @@ mod tests {
                 &mut depth_decay_as,
                 &mut queue_tracker,
                 &mut pre_fill_classifier,
+                &mut enhanced_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1589,6 +1620,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -1604,6 +1636,7 @@ mod tests {
                 &mut depth_decay_as,
                 &mut queue_tracker,
                 &mut pre_fill_classifier,
+                &mut enhanced_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1638,6 +1671,7 @@ mod tests {
                 &mut depth_decay_as,
                 &mut queue_tracker,
                 &mut pre_fill_classifier,
+                &mut enhanced_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1673,6 +1707,7 @@ mod tests {
                 &mut depth_decay_as,
                 &mut queue_tracker,
                 &mut pre_fill_classifier,
+                &mut enhanced_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,

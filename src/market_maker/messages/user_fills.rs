@@ -173,7 +173,7 @@ mod tests {
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EstimatorConfig,
         ParameterEstimator, PnLConfig, PnLTracker, PositionTracker, PrometheusMetrics, QueueConfig,
     };
-    use crate::market_maker::adverse_selection::PreFillASClassifier;
+    use crate::market_maker::adverse_selection::{EnhancedASClassifier, PreFillASClassifier};
     use std::sync::Arc;
 
     #[test]
@@ -205,6 +205,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -213,6 +214,7 @@ mod tests {
             depth_decay_as: &mut depth_decay_as,
             queue_tracker: &mut queue_tracker,
             pre_fill_classifier: &mut pre_fill_classifier,
+            enhanced_classifier: &mut enhanced_classifier,
             estimator: &mut estimator,
             pnl_tracker: &mut pnl_tracker,
             prometheus: &mut prometheus,
@@ -286,6 +288,7 @@ mod tests {
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
         let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
 
         let mut fill_state = FillState {
             position: &mut position,
@@ -294,6 +297,7 @@ mod tests {
             depth_decay_as: &mut depth_decay_as,
             queue_tracker: &mut queue_tracker,
             pre_fill_classifier: &mut pre_fill_classifier,
+            enhanced_classifier: &mut enhanced_classifier,
             estimator: &mut estimator,
             pnl_tracker: &mut pnl_tracker,
             prometheus: &mut prometheus,

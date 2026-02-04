@@ -5,7 +5,8 @@
 use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{
-        AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier,
+        AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EnhancedASClassifier,
+        PreFillASClassifier,
     },
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{
@@ -70,6 +71,9 @@ pub struct Tier1Components {
     pub depth_decay_as: DepthDecayAS,
     /// Pre-fill AS classifier (toxicity prediction BEFORE fills)
     pub pre_fill_classifier: PreFillASClassifier,
+    /// Enhanced AS classifier with microstructure features
+    /// Uses z-score normalized features and online learning
+    pub enhanced_classifier: EnhancedASClassifier,
     /// Queue position tracker
     pub queue_tracker: QueuePositionTracker,
     /// Liquidation cascade detector
@@ -104,6 +108,7 @@ impl Tier1Components {
             adverse_selection: AdverseSelectionEstimator::new(as_config),
             depth_decay_as: DepthDecayAS::default(),
             pre_fill_classifier: PreFillASClassifier::default(),
+            enhanced_classifier: EnhancedASClassifier::default_config(),
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
             circuit_breaker: CircuitBreakerMonitor::new(circuit_breaker_config),

@@ -19,11 +19,20 @@
 //! - `pre_fill_classifier`: Pre-fill toxicity prediction
 
 mod depth_decay;
+mod enhanced_classifier;
 mod estimator;
+pub mod microstructure_features;
 mod pre_fill_classifier;
 
 pub use depth_decay::{DepthDecayAS, DepthDecayASSummary, FillWithDepth};
+pub use enhanced_classifier::{
+    EnhancedASClassifier, EnhancedClassifierConfig, EnhancedClassifierDiagnostics,
+};
 pub use estimator::{AdverseSelectionEstimator, AdverseSelectionSummary};
+pub use microstructure_features::{
+    MicrostructureConfig, MicrostructureDiagnostics, MicrostructureExtractor,
+    MicrostructureFeatures, TradeObservation,
+};
 pub use pre_fill_classifier::{PreFillASClassifier, PreFillClassifierConfig, PreFillSummary};
 
 /// Configuration for adverse selection estimation.

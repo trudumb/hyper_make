@@ -44,7 +44,8 @@ use hyperliquid_rust_sdk::market_maker::{BrierScoreTracker, InformationRatioTrac
 
 // Import estimator components
 use hyperliquid_rust_sdk::market_maker::{
-    InformedFlowEstimator, PreFillASClassifier, TradeFeatures, VolFilterConfig, VolatilityFilter,
+    EnhancedASClassifier, InformedFlowEstimator, PreFillASClassifier, TradeFeatures,
+    TradeObservation as MicroTradeObs, VolFilterConfig, VolatilityFilter,
 };
 
 // Import regime HMM
@@ -136,8 +137,10 @@ struct Cli {
 pub enum ValidatorPredictionType {
     /// P(informed trade) from InformedFlowEstimator
     InformedFlow,
-    /// P(toxic fill) from PreFillASClassifier  
+    /// P(toxic fill) from PreFillASClassifier
     PreFillToxicity,
+    /// P(toxic fill) from EnhancedASClassifier (microstructure features)
+    EnhancedToxicity,
     /// P(high volatility) from RegimeHMM
     RegimeHighVol,
     /// P(price continues direction) - momentum signal
@@ -151,6 +154,7 @@ impl ValidatorPredictionType {
         &[
             ValidatorPredictionType::InformedFlow,
             ValidatorPredictionType::PreFillToxicity,
+            ValidatorPredictionType::EnhancedToxicity,
             ValidatorPredictionType::RegimeHighVol,
             ValidatorPredictionType::Momentum,
             ValidatorPredictionType::BuyPressure,
@@ -161,6 +165,7 @@ impl ValidatorPredictionType {
         match self {
             ValidatorPredictionType::InformedFlow => "InformedFlow",
             ValidatorPredictionType::PreFillToxicity => "PreFillToxicity",
+            ValidatorPredictionType::EnhancedToxicity => "EnhancedTox",
             ValidatorPredictionType::RegimeHighVol => "RegimeHighVol",
             ValidatorPredictionType::Momentum => "Momentum",
             ValidatorPredictionType::BuyPressure => "BuyPressure",
@@ -171,6 +176,7 @@ impl ValidatorPredictionType {
         match self {
             ValidatorPredictionType::InformedFlow => 1000,      // 1s
             ValidatorPredictionType::PreFillToxicity => 1000,   // 1s
+            ValidatorPredictionType::EnhancedToxicity => 1000,  // 1s
             ValidatorPredictionType::RegimeHighVol => 30000,    // 30s
             ValidatorPredictionType::Momentum => 5000,          // 5s
             ValidatorPredictionType::BuyPressure => 0,          // Next trade (special case)
@@ -513,6 +519,7 @@ pub struct PredictionValidator {
     pub flow_estimator: InformedFlowEstimator,
     pub regime_hmm: RegimeHMM,
     pub pre_fill_classifier: PreFillASClassifier,
+    pub enhanced_classifier: EnhancedASClassifier,
 
     // State
     pub last_price: Option<f64>,
@@ -556,6 +563,7 @@ impl PredictionValidator {
             flow_estimator: InformedFlowEstimator::default_config(),
             regime_hmm: RegimeHMM::default(),
             pre_fill_classifier: PreFillASClassifier::default(),
+            enhanced_classifier: EnhancedASClassifier::default_config(),
             last_price: None,
             last_trade_time_ms: 0,
             total_observations: 0,
@@ -621,6 +629,14 @@ impl PredictionValidator {
         // Update pre-fill classifier with trade flow
         let buy_ratio = self.buffers.buy_ratio(20);
         self.pre_fill_classifier.update_trade_flow(buy_ratio, 1.0 - buy_ratio);
+
+        // Update enhanced microstructure classifier
+        self.enhanced_classifier.on_trade(MicroTradeObs {
+            timestamp_ms,
+            price,
+            size,
+            is_buy,
+        });
 
         // Resolve any BuyPressure predictions (next trade resolution)
         self.resolve_buy_pressure_predictions(is_buy, timestamp_ms);
@@ -706,6 +722,9 @@ impl PredictionValidator {
         // Update pre-fill classifier
         self.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
 
+        // Update enhanced microstructure classifier
+        self.enhanced_classifier.on_book_update(best_bid, best_ask, bid_depth, ask_depth, timestamp_ms);
+
         // Update regime HMM
         let sigma = self.volatility_filter.sigma_bps_per_sqrt_s();
         let flow_imbalance = self.buffers.flow_imbalance();
@@ -786,7 +805,7 @@ impl PredictionValidator {
             regime,
         );
 
-        // 2. PreFillToxicity prediction
+        // 2. PreFillToxicity prediction (old classifier)
         let p_toxic = match fill.side {
             Side::Bid => self.pre_fill_classifier.predict_toxicity(true),
             Side::Ask => self.pre_fill_classifier.predict_toxicity(false),
@@ -801,7 +820,22 @@ impl PredictionValidator {
             regime,
         );
 
-        // 3. RegimeHighVol prediction
+        // 3. EnhancedToxicity prediction (microstructure features)
+        let p_enhanced_toxic = match fill.side {
+            Side::Bid => self.enhanced_classifier.predict_toxicity(true),
+            Side::Ask => self.enhanced_classifier.predict_toxicity(false),
+        };
+        self.record_pending_outcome(
+            ValidatorPredictionType::EnhancedToxicity,
+            p_enhanced_toxic,
+            Some(fill.side),
+            mid,
+            timestamp_ms,
+            self.markout_ms.max(ValidatorPredictionType::EnhancedToxicity.markout_ms()),
+            regime,
+        );
+
+        // 4. RegimeHighVol prediction
         let regime_probs = self.regime_hmm.regime_probabilities();
         // P(high vol) = P(volatile) + P(cascade) - assuming regime indices 2 and 3 are volatile/extreme
         let p_high_vol = regime_probs.get(2).copied().unwrap_or(0.0) 
@@ -842,7 +876,7 @@ impl PredictionValidator {
             regime,
         );
 
-        self.stats.predictions_made += 5;
+        self.stats.predictions_made += 6;
     }
 
     /// Record a pending outcome
@@ -931,7 +965,9 @@ impl PredictionValidator {
 
             // Determine outcome based on prediction type
             let outcome = match pending.prediction_type {
-                ValidatorPredictionType::InformedFlow | ValidatorPredictionType::PreFillToxicity => {
+                ValidatorPredictionType::InformedFlow
+                | ValidatorPredictionType::PreFillToxicity
+                | ValidatorPredictionType::EnhancedToxicity => {
                     // Outcome: did price move against our fill?
                     match pending.fill_side {
                         Some(Side::Bid) => price_move_bps < -threshold_bps, // Bought, price dropped
@@ -972,6 +1008,21 @@ impl PredictionValidator {
                     let is_bid = matches!(side, Side::Bid);
                     let adverse_magnitude = price_move_bps.abs();
                     self.pre_fill_classifier.record_outcome(
+                        is_bid,
+                        outcome, // was_adverse
+                        Some(adverse_magnitude),
+                    );
+                }
+            }
+
+            // === Online Learning for EnhancedASClassifier ===
+            // When we resolve an EnhancedToxicity prediction, feed the outcome back
+            // to the classifier so it can learn optimal feature weights via SGD.
+            if pending.prediction_type == ValidatorPredictionType::EnhancedToxicity {
+                if let Some(side) = pending.fill_side {
+                    let is_bid = matches!(side, Side::Bid);
+                    let adverse_magnitude = price_move_bps.abs();
+                    self.enhanced_classifier.record_outcome(
                         is_bid,
                         outcome, // was_adverse
                         Some(adverse_magnitude),
@@ -1174,6 +1225,16 @@ impl PredictionValidator {
             learning_diag.min_samples,
             weights[0], weights[1], weights[2], weights[3], weights[4],
             if learning_diag.is_using_learned { " (LEARNED)" } else { " (default)" }
+        );
+
+        // Print EnhancedASClassifier diagnostics
+        let enhanced_diag = self.enhanced_classifier.diagnostics();
+        println!("Enhanced Learning: {}/{} samples | acc={:.1}% | top features: {}{}",
+            enhanced_diag.learning_samples,
+            500,
+            enhanced_diag.accuracy * 100.0,
+            enhanced_diag.feature_summary(),
+            if enhanced_diag.is_using_learned { " (LEARNED)" } else { " (default)" }
         );
 
         // Print stats

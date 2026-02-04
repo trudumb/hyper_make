@@ -8,6 +8,7 @@ use crate::prelude::Result;
 use crate::Message;
 
 use super::super::{
+    adverse_selection::TradeObservation as MicroTradeObs,
     belief::BeliefUpdate,
     estimator::HmmObservation,
     fills, messages, tracking::ws_order_state::WsFillEvent,
@@ -184,6 +185,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Phase 1A: Feed trade to size distribution tracker
             self.stochastic.trade_size_dist.on_trade(size);
 
+            // === Enhanced Microstructure Classifier: Trade Update ===
+            // Feed trade to z-score normalized feature extractor
+            self.tier1.enhanced_classifier.on_trade(MicroTradeObs {
+                timestamp_ms,
+                price: trade_price,
+                size,
+                is_buy,
+            });
+
             if let Some(_vpin_value) = self.stochastic.vpin.on_trade(size, trade_price, self.latest_mid, timestamp_ms) {
                 // Bucket completed - publish microstructure update to central beliefs
                 let vpin = self.stochastic.vpin.vpin();
@@ -333,6 +343,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             depth_decay_as: &mut self.tier1.depth_decay_as,
             queue_tracker: &mut self.tier1.queue_tracker,
             pre_fill_classifier: &mut self.tier1.pre_fill_classifier,
+            enhanced_classifier: &mut self.tier1.enhanced_classifier,
             estimator: &mut self.estimator,
             pnl_tracker: &mut self.tier2.pnl_tracker,
             prometheus: &mut self.infra.prometheus,
@@ -765,6 +776,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 let bid_depth: f64 = bids.iter().take(5).map(|(_, sz)| sz).sum();
                 let ask_depth: f64 = asks.iter().take(5).map(|(_, sz)| sz).sum();
                 self.tier1.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
+
+                // === Enhanced Microstructure Classifier: Book Update ===
+                // Feed BBO and depth to z-score normalized feature extractor
+                if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
+                    let timestamp_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    self.tier1.enhanced_classifier.on_book_update(
+                        best_bid, best_ask, bid_depth, ask_depth, timestamp_ms,
+                    );
+                }
             }
 
             // === Phase 1: Microstructure Signals - Liquidity Evaporation ===
