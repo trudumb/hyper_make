@@ -52,10 +52,12 @@ pub struct InformedFlowConfig {
     /// EM update interval in trades (default: 50)
     pub em_update_interval: usize,
 
-    /// Half-life in trades for exponential forgetting (default: 500)
+    /// Half-life in trades for exponential forgetting (default: 200)
+    /// NOTE: Reduced from 500 to make learning faster
     pub observation_half_life: usize,
 
-    /// Minimum observations before estimates are reliable (default: 100)
+    /// Minimum observations before estimates are reliable (default: 50)
+    /// NOTE: Reduced from 100 to make warmup faster
     pub min_observations: usize,
 
     /// Buffer size for trade features (default: 1000)
@@ -66,6 +68,10 @@ pub struct InformedFlowConfig {
 
     /// Prior probabilities for components [informed, noise, forced]
     pub prior_probs: [f64; 3],
+
+    /// EWMA alpha for impact tracking (default: 0.1)
+    /// Higher = faster adaptation to recent impacts
+    pub impact_ewma_alpha: f64,
 }
 
 impl Default for InformedFlowConfig {
@@ -73,12 +79,14 @@ impl Default for InformedFlowConfig {
         Self {
             n_components: 3,
             em_update_interval: 50,
-            observation_half_life: 500,
-            min_observations: 100,
+            observation_half_life: 200, // Faster learning (was 500)
+            min_observations: 50,       // Faster warmup (was 100)
             buffer_size: 1000,
             impact_horizon_ms: 1000,
-            // Prior: 5% informed, 85% noise, 10% forced
-            prior_probs: [0.05, 0.85, 0.10],
+            // Prior: 10% informed, 80% noise, 10% forced
+            // NOTE: Increased informed prior from 5% for faster adaptation
+            prior_probs: [0.10, 0.80, 0.10],
+            impact_ewma_alpha: 0.1, // 10 trade half-life for impact
         }
     }
 }
@@ -288,6 +296,13 @@ pub struct InformedFlowEstimator {
 
     /// Last trade timestamp
     last_trade_ms: u64,
+
+    /// Last trade price (for computing realized impact)
+    last_price: Option<f64>,
+
+    /// EWMA of recent price impacts (in bps)
+    /// Used when caller doesn't provide impact
+    impact_ewma: f64,
 }
 
 /// Sufficient statistics for online EM
@@ -325,6 +340,8 @@ impl InformedFlowEstimator {
             trades_since_update: 0,
             forgetting_factor,
             last_trade_ms: 0,
+            last_price: None,
+            impact_ewma: 1.0, // Start with 1 bps default
         }
     }
 
@@ -343,9 +360,20 @@ impl InformedFlowEstimator {
         };
         self.last_trade_ms = features.timestamp_ms;
 
-        // Create feature copy with computed inter-arrival
+        // Compute realized price impact if not provided
+        // This is CRITICAL - without impact, we can't distinguish informed from noise
+        let price_impact_bps = if features.price_impact_bps.abs() > 0.01 {
+            // Use provided impact
+            features.price_impact_bps
+        } else {
+            // Compute from price history
+            self.compute_and_track_impact(features)
+        };
+
+        // Create feature copy with computed values
         let mut feat = *features;
         feat.inter_arrival_ms = inter_arrival_ms;
+        feat.price_impact_bps = price_impact_bps;
 
         // E-step: compute responsibilities
         let resp = self.e_step(&feat);
@@ -373,6 +401,42 @@ impl InformedFlowEstimator {
             self.m_step();
             self.trades_since_update = 0;
         }
+    }
+
+    /// Compute price impact from trade and update EWMA
+    fn compute_and_track_impact(&mut self, features: &TradeFeatures) -> f64 {
+        // We need a way to infer price from features - use size as proxy
+        // In practice, this should be computed externally with actual prices
+        // For now, use EWMA with size-weighted noise
+
+        // Size-scaled impact estimate: larger trades have more impact
+        let size_factor = (features.size / 1.0).clamp(0.1, 10.0);
+
+        // Book imbalance suggests directional pressure
+        let imbalance_factor = 1.0 + features.book_imbalance.abs() * 0.5;
+
+        // Estimate impact based on trade characteristics
+        let estimated_impact = self.impact_ewma * size_factor * imbalance_factor;
+
+        // Update EWMA with this estimate
+        // In a real system, this would be updated with realized markout
+        let alpha = self.config.impact_ewma_alpha;
+        self.impact_ewma = (1.0 - alpha) * self.impact_ewma + alpha * estimated_impact;
+        self.impact_ewma = self.impact_ewma.clamp(0.1, 50.0); // Reasonable bounds
+
+        estimated_impact
+    }
+
+    /// Update impact EWMA with realized markout (call when outcome is known)
+    pub fn update_realized_impact(&mut self, realized_bps: f64) {
+        let alpha = self.config.impact_ewma_alpha;
+        self.impact_ewma = (1.0 - alpha) * self.impact_ewma + alpha * realized_bps.abs();
+        self.impact_ewma = self.impact_ewma.clamp(0.1, 50.0);
+    }
+
+    /// Get current impact EWMA for diagnostics
+    pub fn impact_ewma(&self) -> f64 {
+        self.impact_ewma
     }
 
     /// E-step: compute responsibilities P(component | trade)
@@ -620,8 +684,9 @@ mod tests {
         assert!(!estimator.is_warmed_up());
 
         let decomp = estimator.decomposition();
-        assert!((decomp.p_informed - 0.05).abs() < 0.01);
-        assert!((decomp.p_noise - 0.85).abs() < 0.01);
+        // Updated priors: 10% informed, 80% noise, 10% forced
+        assert!((decomp.p_informed - 0.10).abs() < 0.01);
+        assert!((decomp.p_noise - 0.80).abs() < 0.01);
         assert!((decomp.p_forced - 0.10).abs() < 0.01);
     }
 

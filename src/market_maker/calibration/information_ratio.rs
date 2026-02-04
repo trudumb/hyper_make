@@ -82,9 +82,12 @@ impl InformationRatioTracker {
     }
 
     /// Get the overall base rate (fraction of positive outcomes).
+    ///
+    /// NOTE: Returns 0.5 when no data. This is a neutral default but can
+    /// bias early IR calculations. Wait for 100+ samples before trusting IR.
     pub fn base_rate(&self) -> f64 {
         if self.total_count == 0 {
-            0.5 // Default to 0.5 when no data
+            0.5 // Default to 0.5 when no data - neutral but can bias early IR
         } else {
             self.total_outcomes as f64 / self.total_count as f64
         }
@@ -148,8 +151,90 @@ impl InformationRatioTracker {
     }
 
     /// Check if there are enough samples for reliable metrics.
+    ///
+    /// NOTE: For robust IR estimation, need at least 500 samples with
+    /// reasonable bin coverage. With 10 bins, that's ~50 samples per bin.
     pub fn is_reliable(&self, min_samples: usize) -> bool {
         self.total_count >= min_samples
+    }
+
+    /// Minimum recommended samples for reliable IR (500)
+    pub const MIN_RELIABLE_SAMPLES: usize = 500;
+
+    /// Check if the distribution is dangerously concentrated in few bins.
+    ///
+    /// Returns true if >80% of samples are in a single bin, which means
+    /// the model is making nearly constant predictions and IR is meaningless.
+    pub fn is_bin_concentrated(&self) -> bool {
+        if self.total_count == 0 {
+            return false;
+        }
+        let max_bin_count = self.bin_counts.iter().max().copied().unwrap_or(0);
+        (max_bin_count as f64 / self.total_count as f64) > 0.8
+    }
+
+    /// Get diagnostic information about the IR calculation.
+    ///
+    /// Returns a struct with details useful for debugging IR issues.
+    pub fn diagnostics(&self) -> IrDiagnostics {
+        let base_rate = self.base_rate();
+        let resolution = self.resolution();
+        let uncertainty = self.uncertainty();
+        let ir = self.information_ratio();
+
+        // Count non-empty bins
+        let non_empty_bins = self.bin_counts.iter().filter(|&&c| c > 0).count();
+
+        // Find max bin concentration
+        let max_bin_count = self.bin_counts.iter().max().copied().unwrap_or(0);
+        let concentration = if self.total_count > 0 {
+            max_bin_count as f64 / self.total_count as f64
+        } else {
+            0.0
+        };
+
+        // Identify issues
+        let mut warnings = Vec::new();
+
+        if self.total_count < Self::MIN_RELIABLE_SAMPLES {
+            warnings.push(format!(
+                "Insufficient samples: {} < {} recommended",
+                self.total_count,
+                Self::MIN_RELIABLE_SAMPLES
+            ));
+        }
+
+        if concentration > 0.8 {
+            warnings.push(format!(
+                "Predictions concentrated: {:.0}% in one bin (model outputs near-constant)",
+                concentration * 100.0
+            ));
+        }
+
+        if non_empty_bins < 3 && self.total_count > 100 {
+            warnings.push(format!(
+                "Low bin coverage: only {} of {} bins used",
+                non_empty_bins, self.n_bins
+            ));
+        }
+
+        if base_rate < 0.05 || base_rate > 0.95 {
+            warnings.push(format!(
+                "Extreme base rate: {:.1}% (outcomes heavily imbalanced)",
+                base_rate * 100.0
+            ));
+        }
+
+        IrDiagnostics {
+            base_rate,
+            resolution,
+            uncertainty,
+            ir,
+            total_samples: self.total_count,
+            non_empty_bins,
+            max_bin_concentration: concentration,
+            warnings,
+        }
     }
 
     /// Get the number of bins.
@@ -548,6 +633,58 @@ pub struct BinStats {
     pub positive_outcomes: usize,
     /// Conditional outcome rate (positive / total)
     pub outcome_rate: f64,
+}
+
+/// Diagnostic information about IR calculation.
+///
+/// Use this to understand WHY IR is low - is it insufficient data,
+/// concentrated predictions, or genuinely no edge?
+#[derive(Debug, Clone)]
+pub struct IrDiagnostics {
+    /// Base rate of positive outcomes
+    pub base_rate: f64,
+    /// Resolution component of IR
+    pub resolution: f64,
+    /// Uncertainty component of IR
+    pub uncertainty: f64,
+    /// Computed Information Ratio
+    pub ir: f64,
+    /// Total number of samples
+    pub total_samples: usize,
+    /// Number of bins with at least one sample
+    pub non_empty_bins: usize,
+    /// Fraction of samples in the most populated bin (>0.8 is concerning)
+    pub max_bin_concentration: f64,
+    /// Human-readable warnings about the IR calculation
+    pub warnings: Vec<String>,
+}
+
+impl IrDiagnostics {
+    /// Check if IR is likely reliable (no major warnings)
+    pub fn is_reliable(&self) -> bool {
+        self.warnings.is_empty()
+    }
+
+    /// Get a summary string for logging
+    pub fn summary(&self) -> String {
+        let warning_str = if self.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" [WARNINGS: {}]", self.warnings.join("; "))
+        };
+
+        format!(
+            "IR={:.3} (base={:.3}, res={:.4}, unc={:.4}, n={}, bins={}, conc={:.0}%){}",
+            self.ir,
+            self.base_rate,
+            self.resolution,
+            self.uncertainty,
+            self.total_samples,
+            self.non_empty_bins,
+            self.max_bin_concentration * 100.0,
+            warning_str
+        )
+    }
 }
 
 // InformationRatioTracker is Send + Sync because it only contains owned data

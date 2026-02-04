@@ -1,0 +1,1590 @@
+//! Prediction Validator Binary
+//!
+//! A diagnostic tool for validating model predictive power WITHOUT placing orders.
+//! Streams market data, makes predictions in real-time, resolves outcomes from price
+//! movements, and reports calibration metrics.
+//!
+//! ## Purpose
+//!
+//! After implementing model calibration fixes, we need a way to validate if models
+//! actually have predictive power without:
+//! 1. Requiring real money at risk
+//! 2. Relying on sparse fill data
+//! 3. Confusing model performance with execution quality
+//!
+//! ## What it measures
+//!
+//! | Model | Prediction | Outcome | Markout |
+//! |-------|------------|---------|---------|
+//! | InformedFlow | P(informed trade) | Price moves against fill direction | 1s |
+//! | PreFillToxicity | P(toxic fill) | Price moves against > threshold | 1s |
+//! | RegimeHMM | P(high volatility) | Realized vol > threshold | 30s |
+//! | Momentum | P(price continues) | Sign of price change matches | 5s |
+//!
+//! ## Usage
+//!
+//! ```bash
+//! cargo run --bin prediction_validator -- --asset BTC
+//! cargo run --bin prediction_validator -- --asset BTC --report-interval 30 --markout 1000
+//! ```
+
+use clap::Parser;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::unbounded_channel;
+use tracing::{debug, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+
+use hyperliquid_rust_sdk::{BaseUrl, InfoClient, Message, Subscription};
+
+// Import calibration infrastructure
+use hyperliquid_rust_sdk::market_maker::{BrierScoreTracker, InformationRatioTracker};
+
+// Import estimator components
+use hyperliquid_rust_sdk::market_maker::{
+    InformedFlowEstimator, PreFillASClassifier, TradeFeatures, VolFilterConfig, VolatilityFilter,
+};
+
+// Import regime HMM
+use hyperliquid_rust_sdk::market_maker::regime_hmm::{Observation as RegimeObservation, RegimeHMM};
+
+// Import logging infrastructure
+use hyperliquid_rust_sdk::{init_logging, LogConfig, LogFormat};
+
+// Global log guards to keep logging alive
+static LOG_GUARDS: std::sync::OnceLock<Vec<WorkerGuard>> = std::sync::OnceLock::new();
+
+// ============================================================================
+// CLI Arguments
+// ============================================================================
+
+#[derive(Parser)]
+#[command(name = "prediction_validator")]
+#[command(version, about = "Validate model predictive power without placing orders", long_about = None)]
+struct Cli {
+    /// Asset to analyze (e.g., BTC, ETH, SOL)
+    #[arg(short, long)]
+    asset: String,
+
+    /// Duration to run (e.g., "1h", "4h", "24h")
+    #[arg(long, default_value = "24h")]
+    duration: String,
+
+    /// Report interval in seconds
+    #[arg(long, default_value = "30")]
+    report_interval: u64,
+
+    /// Markout window in milliseconds (default: 1000 = 1s)
+    #[arg(long, default_value = "1000")]
+    markout: u64,
+
+    /// Network: mainnet, testnet
+    #[arg(long, default_value = "mainnet")]
+    network: String,
+
+    /// HIP-3 DEX name (optional)
+    #[arg(long)]
+    dex: Option<String>,
+
+    /// Log level: trace, debug, info, warn, error
+    #[arg(long, default_value = "info")]
+    log_level: String,
+
+    /// Show per-regime metrics breakdown
+    #[arg(long)]
+    regime_breakdown: bool,
+
+    /// Verbose output (print every message)
+    #[arg(long)]
+    verbose: bool,
+
+    /// Threshold in bps for adverse movement detection (default: 8.0)
+    /// NOTE: 2 bps is below noise floor; 8 bps is more realistic for BTC
+    #[arg(long, default_value = "8.0")]
+    adverse_threshold_bps: f64,
+
+    /// Warmup period - number of samples before recording predictions (default: 100)
+    /// Models need time to converge from priors before predictions are meaningful
+    #[arg(long, default_value = "100")]
+    warmup_samples: usize,
+
+    /// Directory for log files
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+
+    /// Single log file path (legacy mode)
+    #[arg(long)]
+    log_file: Option<String>,
+
+    /// Enable multi-stream logging (operational/diagnostic/errors)
+    #[arg(long, default_value = "true")]
+    multi_stream: bool,
+
+    /// Log format: json or pretty
+    #[arg(long, default_value = "pretty")]
+    log_format: String,
+}
+
+// ============================================================================
+// Prediction Types for Validation
+// ============================================================================
+
+/// Extended prediction types for this validator
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValidatorPredictionType {
+    /// P(informed trade) from InformedFlowEstimator
+    InformedFlow,
+    /// P(toxic fill) from PreFillASClassifier  
+    PreFillToxicity,
+    /// P(high volatility) from RegimeHMM
+    RegimeHighVol,
+    /// P(price continues direction) - momentum signal
+    Momentum,
+    /// P(buy pressure) - next trade direction
+    BuyPressure,
+}
+
+impl ValidatorPredictionType {
+    pub fn all() -> &'static [ValidatorPredictionType] {
+        &[
+            ValidatorPredictionType::InformedFlow,
+            ValidatorPredictionType::PreFillToxicity,
+            ValidatorPredictionType::RegimeHighVol,
+            ValidatorPredictionType::Momentum,
+            ValidatorPredictionType::BuyPressure,
+        ]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            ValidatorPredictionType::InformedFlow => "InformedFlow",
+            ValidatorPredictionType::PreFillToxicity => "PreFillToxicity",
+            ValidatorPredictionType::RegimeHighVol => "RegimeHighVol",
+            ValidatorPredictionType::Momentum => "Momentum",
+            ValidatorPredictionType::BuyPressure => "BuyPressure",
+        }
+    }
+
+    pub fn markout_ms(&self) -> u64 {
+        match self {
+            ValidatorPredictionType::InformedFlow => 1000,      // 1s
+            ValidatorPredictionType::PreFillToxicity => 1000,   // 1s
+            ValidatorPredictionType::RegimeHighVol => 30000,    // 30s
+            ValidatorPredictionType::Momentum => 5000,          // 5s
+            ValidatorPredictionType::BuyPressure => 0,          // Next trade (special case)
+        }
+    }
+}
+
+// ============================================================================
+// Synthetic Fill Detection
+// ============================================================================
+
+/// Represents a "synthetic" fill - when a trade would have filled our theoretical quote
+#[derive(Debug, Clone)]
+pub struct SyntheticFill {
+    pub timestamp_ms: u64,
+    pub side: Side,
+    pub price: f64,
+    pub trade_size: f64,
+    pub spread_bps: f64,
+    pub regime: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Side {
+    Bid, // We would buy
+    Ask, // We would sell
+}
+
+// ============================================================================
+// Pending Outcome Tracking
+// ============================================================================
+
+/// A prediction awaiting outcome resolution
+#[derive(Debug, Clone)]
+pub struct PendingOutcome {
+    pub prediction_id: u64,
+    pub prediction_type: ValidatorPredictionType,
+    pub predicted_prob: f64,
+    pub fill_side: Option<Side>,
+    /// Reference price - should be MID PRICE at prediction time, not trade price
+    pub reference_price: f64,
+    pub timestamp_ms: u64,
+    pub markout_ms: u64,
+    pub regime: usize,
+}
+
+// ============================================================================
+// Regime Statistics
+// ============================================================================
+
+/// Calibration metrics by regime
+#[derive(Debug, Clone)]
+pub struct RegimeMetrics {
+    pub brier: BrierScoreTracker,
+    pub ir: InformationRatioTracker,
+    pub n_samples: usize,
+}
+
+impl Default for RegimeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RegimeMetrics {
+    pub fn new() -> Self {
+        Self {
+            brier: BrierScoreTracker::new(10000),
+            ir: InformationRatioTracker::new(10),
+            n_samples: 0,
+        }
+    }
+
+    pub fn update(&mut self, predicted: f64, outcome: bool) {
+        self.brier.update(predicted, outcome);
+        self.ir.update(predicted, outcome);
+        self.n_samples += 1;
+    }
+}
+
+// ============================================================================
+// Model Tracker
+// ============================================================================
+
+/// Tracks calibration metrics for a single prediction type
+#[derive(Debug)]
+pub struct ModelTracker {
+    pub name: ValidatorPredictionType,
+    pub brier: BrierScoreTracker,
+    pub ir: InformationRatioTracker,
+    pub by_regime: [RegimeMetrics; 4], // Calm, Normal, Volatile, Cascade
+}
+
+impl ModelTracker {
+    pub fn new(name: ValidatorPredictionType) -> Self {
+        Self {
+            name,
+            brier: BrierScoreTracker::new(10000),
+            ir: InformationRatioTracker::new(10),
+            by_regime: [
+                RegimeMetrics::new(),
+                RegimeMetrics::new(),
+                RegimeMetrics::new(),
+                RegimeMetrics::new(),
+            ],
+        }
+    }
+
+    pub fn update(&mut self, predicted: f64, outcome: bool, regime: usize) {
+        self.brier.update(predicted, outcome);
+        self.ir.update(predicted, outcome);
+        
+        let regime_idx = regime.min(3);
+        self.by_regime[regime_idx].update(predicted, outcome);
+    }
+
+    pub fn n_samples(&self) -> usize {
+        self.brier.n_samples()
+    }
+
+    pub fn bias(&self) -> f64 {
+        // Bias = average predicted - base rate
+        // Approximate: if we predicted perfectly calibrated, avg_predicted ≈ base_rate
+        // Positive bias means we over-predict, negative means under-predict
+        // This is a simplification - proper bias needs prediction mean tracking
+        let _base_rate = self.ir.base_rate();
+        0.0 // For now, return 0; can be enhanced later
+    }
+
+    pub fn health_status(&self) -> &'static str {
+        let ir = self.ir.information_ratio();
+        let n = self.n_samples();
+        
+        if n < 50 {
+            "WARMING"
+        } else if ir > 1.2 {
+            "✓ GOOD"
+        } else if ir > 1.0 {
+            "~ OK"
+        } else if ir > 0.8 {
+            "✗ MARGINAL"
+        } else {
+            "✗ REMOVE"
+        }
+    }
+}
+
+// ============================================================================
+// Observation Buffers
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct TradeObservation {
+    pub timestamp_ms: u64,
+    pub price: f64,
+    pub size: f64,
+    pub is_buy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BookSnapshot {
+    pub timestamp_ms: u64,
+    pub mid: f64,
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub bid_depth: f64,
+    pub ask_depth: f64,
+}
+
+#[derive(Debug, Default)]
+pub struct ObservationBuffers {
+    pub trades: VecDeque<TradeObservation>,
+    pub books: VecDeque<BookSnapshot>,
+    pub mids: VecDeque<(u64, f64)>,
+    pub max_buffer_size: usize,
+}
+
+impl ObservationBuffers {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            trades: VecDeque::with_capacity(max_size),
+            books: VecDeque::with_capacity(max_size),
+            mids: VecDeque::with_capacity(max_size),
+            max_buffer_size: max_size,
+        }
+    }
+
+    pub fn add_trade(&mut self, obs: TradeObservation) {
+        if self.trades.len() >= self.max_buffer_size {
+            self.trades.pop_front();
+        }
+        self.trades.push_back(obs);
+    }
+
+    pub fn add_book(&mut self, snapshot: BookSnapshot) {
+        if self.books.len() >= self.max_buffer_size {
+            self.books.pop_front();
+        }
+        self.books.push_back(snapshot);
+    }
+
+    pub fn add_mid(&mut self, timestamp_ms: u64, mid: f64) {
+        if self.mids.len() >= self.max_buffer_size {
+            self.mids.pop_front();
+        }
+        self.mids.push_back((timestamp_ms, mid));
+    }
+
+    /// Calculate book imbalance from last snapshot
+    pub fn book_imbalance(&self) -> f64 {
+        if let Some(book) = self.books.back() {
+            let total = book.bid_depth + book.ask_depth;
+            if total > 0.0 {
+                (book.bid_depth - book.ask_depth) / total
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Calculate flow imbalance from recent trades
+    pub fn flow_imbalance(&self) -> f64 {
+        if self.trades.is_empty() {
+            return 0.0;
+        }
+
+        let (buy_vol, sell_vol) = self.trades.iter().fold((0.0, 0.0), |(b, s), t| {
+            if t.is_buy {
+                (b + t.size, s)
+            } else {
+                (b, s + t.size)
+            }
+        });
+
+        let total = buy_vol + sell_vol;
+        if total > 0.0 {
+            (buy_vol - sell_vol) / total
+        } else {
+            0.0
+        }
+    }
+
+    /// Get recent price momentum (signed)
+    pub fn momentum(&self, window: usize) -> f64 {
+        if self.mids.len() < 2 {
+            return 0.0;
+        }
+        
+        let recent: Vec<_> = self.mids.iter().rev().take(window.max(2)).collect();
+        if recent.len() < 2 {
+            return 0.0;
+        }
+        
+        let latest = recent[0].1;
+        let oldest = recent[recent.len() - 1].1;
+        
+        if oldest > 0.0 {
+            (latest - oldest) / oldest * 10_000.0 // Return in bps
+        } else {
+            0.0
+        }
+    }
+
+    /// Get buy ratio from recent trades
+    pub fn buy_ratio(&self, window: usize) -> f64 {
+        if self.trades.is_empty() {
+            return 0.5;
+        }
+        
+        let recent: Vec<_> = self.trades.iter().rev().take(window).collect();
+        let buys = recent.iter().filter(|t| t.is_buy).count();
+        
+        buys as f64 / recent.len() as f64
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+#[derive(Debug, Default)]
+pub struct ValidatorStats {
+    pub trades_processed: u64,
+    pub books_processed: u64,
+    pub mids_processed: u64,
+    pub synthetic_fills: u64,
+    pub predictions_made: u64,
+    pub predictions_resolved: u64,
+    pub start_time: Option<Instant>,
+    pub last_report_time: Option<Instant>,
+    pub last_mid: Option<f64>,
+    pub last_spread_bps: Option<f64>,
+}
+
+impl ValidatorStats {
+    pub fn new() -> Self {
+        Self {
+            start_time: Some(Instant::now()),
+            last_report_time: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    pub fn uptime_secs(&self) -> f64 {
+        self.start_time
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+    
+    pub fn uptime_formatted(&self) -> String {
+        let secs = self.uptime_secs() as u64;
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        let secs = secs % 60;
+        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+    }
+}
+
+// ============================================================================
+// Main Validator
+// ============================================================================
+
+pub struct PredictionValidator {
+    // Configuration
+    pub asset: String,
+    pub markout_ms: u64,
+    pub adverse_threshold_bps: f64,
+    pub show_regime_breakdown: bool,
+    pub report_interval_secs: u64,
+    pub warmup_samples: usize,
+
+    // Observation buffers
+    pub buffers: ObservationBuffers,
+    pub stats: ValidatorStats,
+
+    // Estimators
+    pub volatility_filter: VolatilityFilter,
+    pub flow_estimator: InformedFlowEstimator,
+    pub regime_hmm: RegimeHMM,
+    pub pre_fill_classifier: PreFillASClassifier,
+
+    // State
+    pub last_price: Option<f64>,
+    pub last_trade_time_ms: u64,
+    /// Tracks total observations for warmup detection
+    pub total_observations: usize,
+
+    // Pending predictions awaiting outcome
+    pub pending_outcomes: VecDeque<PendingOutcome>,
+    pub next_prediction_id: u64,
+
+    // Model trackers
+    pub trackers: HashMap<ValidatorPredictionType, ModelTracker>,
+}
+
+impl PredictionValidator {
+    pub fn new(
+        asset: String,
+        markout_ms: u64,
+        adverse_threshold_bps: f64,
+        show_regime_breakdown: bool,
+        report_interval_secs: u64,
+        warmup_samples: usize,
+    ) -> Self {
+        // Initialize trackers for each prediction type
+        let mut trackers = HashMap::new();
+        for &pred_type in ValidatorPredictionType::all() {
+            trackers.insert(pred_type, ModelTracker::new(pred_type));
+        }
+
+        Self {
+            asset,
+            markout_ms,
+            adverse_threshold_bps,
+            show_regime_breakdown,
+            report_interval_secs,
+            warmup_samples,
+            buffers: ObservationBuffers::new(1000),
+            stats: ValidatorStats::new(),
+            volatility_filter: VolatilityFilter::new(VolFilterConfig::default()),
+            flow_estimator: InformedFlowEstimator::default_config(),
+            regime_hmm: RegimeHMM::default(),
+            pre_fill_classifier: PreFillASClassifier::default(),
+            last_price: None,
+            last_trade_time_ms: 0,
+            total_observations: 0,
+            pending_outcomes: VecDeque::with_capacity(10000),
+            next_prediction_id: 0,
+            trackers,
+        }
+    }
+
+    /// Check if models have warmed up enough to record predictions
+    pub fn is_warmed_up(&self) -> bool {
+        self.total_observations >= self.warmup_samples
+    }
+
+    /// Process a trade message
+    pub fn on_trade(&mut self, timestamp_ms: u64, price: f64, size: f64, is_buy: bool) {
+        let obs = TradeObservation {
+            timestamp_ms,
+            price,
+            size,
+            is_buy,
+        };
+        self.buffers.add_trade(obs);
+        self.stats.trades_processed += 1;
+        self.total_observations += 1;
+
+        // Update volatility filter
+        if let Some(last_price) = self.last_price {
+            if last_price > 0.0 {
+                let ret = (price / last_price).ln();
+                let dt = if self.last_trade_time_ms > 0 {
+                    ((timestamp_ms - self.last_trade_time_ms) as f64 / 1000.0).max(0.001)
+                } else {
+                    1.0
+                };
+                self.volatility_filter.on_return(ret, dt);
+            }
+        }
+        self.last_price = Some(price);
+
+        // Calculate inter-arrival time
+        let inter_arrival_ms = if self.last_trade_time_ms > 0 {
+            timestamp_ms.saturating_sub(self.last_trade_time_ms)
+        } else {
+            1000
+        };
+        self.last_trade_time_ms = timestamp_ms;
+
+        // Compute realized price impact from recent trades for the flow estimator
+        let price_impact_bps = self.compute_realized_impact_bps();
+
+        // Update flow estimator with computed impact
+        let features = TradeFeatures {
+            size,
+            inter_arrival_ms,
+            price_impact_bps,
+            book_imbalance: self.buffers.book_imbalance(),
+            is_buy,
+            timestamp_ms,
+        };
+        self.flow_estimator.on_trade(&features);
+
+        // Update pre-fill classifier with trade flow
+        let buy_ratio = self.buffers.buy_ratio(20);
+        self.pre_fill_classifier.update_trade_flow(buy_ratio, 1.0 - buy_ratio);
+
+        // Resolve any BuyPressure predictions (next trade resolution)
+        self.resolve_buy_pressure_predictions(is_buy, timestamp_ms);
+
+        // Only record predictions after warmup period
+        // This gives models time to converge from priors
+        if self.is_warmed_up() {
+            // Check for synthetic fill opportunity
+            if let Some(fill) = self.detect_fill_opportunity(timestamp_ms, price, size, is_buy) {
+                self.stats.synthetic_fills += 1;
+                self.record_predictions(&fill, timestamp_ms);
+            }
+        }
+
+        // Resolve pending outcomes using MID price, not trade price
+        // This avoids bid-ask bounce bias
+        if let Some(mid) = self.stats.last_mid {
+            self.resolve_pending_outcomes(mid, timestamp_ms);
+        }
+    }
+
+    /// Compute realized price impact from recent trade history
+    /// Returns the average absolute price impact in bps of recent trades
+    fn compute_realized_impact_bps(&self) -> f64 {
+        if self.buffers.trades.len() < 2 {
+            return 0.0;
+        }
+
+        // Look at last 10 trades and compute average absolute impact
+        let recent: Vec<_> = self.buffers.trades.iter().rev().take(11).collect();
+        if recent.len() < 2 {
+            return 0.0;
+        }
+
+        let mut total_impact = 0.0;
+        let mut count = 0;
+
+        for window in recent.windows(2) {
+            let curr = window[0];
+            let prev = window[1];
+            if prev.price > 0.0 {
+                let impact_bps = ((curr.price - prev.price) / prev.price * 10_000.0).abs();
+                total_impact += impact_bps;
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            total_impact / count as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Process a book update
+    pub fn on_book(
+        &mut self,
+        timestamp_ms: u64,
+        mid: f64,
+        best_bid: f64,
+        best_ask: f64,
+        bid_depth: f64,
+        ask_depth: f64,
+    ) {
+        let spread_bps = if mid > 0.0 {
+            (best_ask - best_bid) / mid * 10_000.0
+        } else {
+            0.0
+        };
+
+        let snapshot = BookSnapshot {
+            timestamp_ms,
+            mid,
+            best_bid,
+            best_ask,
+            bid_depth,
+            ask_depth,
+        };
+        self.buffers.add_book(snapshot);
+        self.stats.books_processed += 1;
+        self.stats.last_spread_bps = Some(spread_bps);
+
+        // Update pre-fill classifier
+        self.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
+
+        // Update regime HMM
+        let sigma = self.volatility_filter.sigma_bps_per_sqrt_s();
+        let flow_imbalance = self.buffers.flow_imbalance();
+        let regime_obs = RegimeObservation::new(sigma, spread_bps, flow_imbalance);
+        self.regime_hmm.forward_update(&regime_obs);
+    }
+
+    /// Process a mid price update
+    pub fn on_mid(&mut self, timestamp_ms: u64, mid: f64) {
+        self.buffers.add_mid(timestamp_ms, mid);
+        self.stats.mids_processed += 1;
+        self.stats.last_mid = Some(mid);
+    }
+
+    /// Detect synthetic fill opportunity
+    fn detect_fill_opportunity(
+        &self,
+        timestamp_ms: u64,
+        trade_price: f64,
+        trade_size: f64,
+        trade_is_buy: bool,
+    ) -> Option<SyntheticFill> {
+        let book = self.buffers.books.back()?;
+        let spread_bps = self.stats.last_spread_bps?;
+        
+        // Compute theoretical quotes based on current mid and typical spread
+        let theoretical_half_spread_bps = spread_bps / 2.0 + 1.5; // +1.5 bps for maker rebate
+        let mid = book.mid;
+        let theoretical_bid = mid * (1.0 - theoretical_half_spread_bps / 10_000.0);
+        let theoretical_ask = mid * (1.0 + theoretical_half_spread_bps / 10_000.0);
+
+        // Determine regime
+        let regime = self.regime_hmm.most_likely_regime();
+
+        // Trade executed at or through our theoretical bid (we would buy)
+        if trade_price <= theoretical_bid && !trade_is_buy {
+            // Aggressive sell hit our bid
+            return Some(SyntheticFill {
+                timestamp_ms,
+                side: Side::Bid,
+                price: theoretical_bid,
+                trade_size,
+                spread_bps,
+                regime,
+            });
+        }
+
+        // Trade executed at or through our theoretical ask (we would sell)
+        if trade_price >= theoretical_ask && trade_is_buy {
+            // Aggressive buy lifted our ask
+            return Some(SyntheticFill {
+                timestamp_ms,
+                side: Side::Ask,
+                price: theoretical_ask,
+                trade_size,
+                spread_bps,
+                regime,
+            });
+        }
+
+        None
+    }
+
+    /// Record predictions for a synthetic fill
+    fn record_predictions(&mut self, fill: &SyntheticFill, timestamp_ms: u64) {
+        let regime = fill.regime;
+        let mid = self.stats.last_mid.unwrap_or(fill.price);
+
+        // 1. InformedFlow prediction
+        let p_informed = self.flow_estimator.decomposition().p_informed;
+        self.record_pending_outcome(
+            ValidatorPredictionType::InformedFlow,
+            p_informed,
+            Some(fill.side),
+            mid,
+            timestamp_ms,
+            self.markout_ms.max(ValidatorPredictionType::InformedFlow.markout_ms()),
+            regime,
+        );
+
+        // 2. PreFillToxicity prediction
+        let p_toxic = match fill.side {
+            Side::Bid => self.pre_fill_classifier.predict_toxicity(true),
+            Side::Ask => self.pre_fill_classifier.predict_toxicity(false),
+        };
+        self.record_pending_outcome(
+            ValidatorPredictionType::PreFillToxicity,
+            p_toxic,
+            Some(fill.side),
+            mid,
+            timestamp_ms,
+            self.markout_ms.max(ValidatorPredictionType::PreFillToxicity.markout_ms()),
+            regime,
+        );
+
+        // 3. RegimeHighVol prediction
+        let regime_probs = self.regime_hmm.regime_probabilities();
+        // P(high vol) = P(volatile) + P(cascade) - assuming regime indices 2 and 3 are volatile/extreme
+        let p_high_vol = regime_probs.get(2).copied().unwrap_or(0.0) 
+                       + regime_probs.get(3).copied().unwrap_or(0.0);
+        self.record_pending_outcome(
+            ValidatorPredictionType::RegimeHighVol,
+            p_high_vol,
+            None,
+            mid,
+            timestamp_ms,
+            ValidatorPredictionType::RegimeHighVol.markout_ms(),
+            regime,
+        );
+
+        // 4. Momentum prediction
+        let momentum_bps = self.buffers.momentum(10);
+        // P(price continues) = sigmoid of momentum
+        let p_continues = 1.0 / (1.0 + (-momentum_bps / 5.0).exp()); // Scale by 5 bps
+        self.record_pending_outcome(
+            ValidatorPredictionType::Momentum,
+            p_continues,
+            if momentum_bps >= 0.0 { Some(Side::Ask) } else { Some(Side::Bid) },
+            mid,
+            timestamp_ms,
+            ValidatorPredictionType::Momentum.markout_ms(),
+            regime,
+        );
+
+        // 5. BuyPressure prediction
+        let buy_ratio = self.buffers.buy_ratio(20);
+        self.record_pending_outcome(
+            ValidatorPredictionType::BuyPressure,
+            buy_ratio,
+            None, // Resolved on next trade
+            mid,
+            timestamp_ms,
+            0, // Special: resolved on next trade
+            regime,
+        );
+
+        self.stats.predictions_made += 5;
+    }
+
+    /// Record a pending outcome
+    fn record_pending_outcome(
+        &mut self,
+        prediction_type: ValidatorPredictionType,
+        predicted_prob: f64,
+        fill_side: Option<Side>,
+        reference_price: f64,
+        timestamp_ms: u64,
+        markout_ms: u64,
+        regime: usize,
+    ) {
+        let id = self.next_prediction_id;
+        self.next_prediction_id += 1;
+
+        self.pending_outcomes.push_back(PendingOutcome {
+            prediction_id: id,
+            prediction_type,
+            predicted_prob: predicted_prob.clamp(0.0, 1.0),
+            fill_side,
+            reference_price,
+            timestamp_ms,
+            markout_ms,
+            regime,
+        });
+    }
+
+    /// Resolve BuyPressure predictions (special case - next trade)
+    fn resolve_buy_pressure_predictions(&mut self, trade_is_buy: bool, now_ms: u64) {
+        // Find and resolve BuyPressure predictions
+        let mut to_resolve = Vec::new();
+        
+        for (idx, pending) in self.pending_outcomes.iter().enumerate() {
+            if pending.prediction_type == ValidatorPredictionType::BuyPressure 
+               && pending.markout_ms == 0 
+               && now_ms > pending.timestamp_ms {
+                to_resolve.push((idx, pending.predicted_prob, pending.regime));
+            }
+        }
+
+        // Process in reverse order to maintain indices
+        for (idx, predicted_prob, regime) in to_resolve.into_iter().rev() {
+            self.pending_outcomes.remove(idx);
+            
+            // Outcome: was next trade a buy?
+            let outcome = trade_is_buy;
+            
+            if let Some(tracker) = self.trackers.get_mut(&ValidatorPredictionType::BuyPressure) {
+                tracker.update(predicted_prob, outcome, regime);
+            }
+            self.stats.predictions_resolved += 1;
+        }
+    }
+
+    /// Resolve pending outcomes based on price movement
+    /// Uses MID PRICE for outcome resolution to avoid bid-ask bounce bias
+    fn resolve_pending_outcomes(&mut self, current_mid: f64, now_ms: u64) {
+        // Use regime-dependent threshold: base threshold scaled by volatility
+        // In high vol regimes, price needs to move more to be "adverse"
+        let vol_scale = (self.volatility_filter.sigma_bps_per_sqrt_s() / 10.0).clamp(0.5, 3.0);
+        let threshold_bps = self.adverse_threshold_bps * vol_scale;
+        let vol_threshold = self.volatility_filter.sigma_bps_per_sqrt_s() * 2.0;
+
+        while let Some(pending) = self.pending_outcomes.front() {
+            // Skip BuyPressure (handled separately)
+            if pending.prediction_type == ValidatorPredictionType::BuyPressure {
+                self.pending_outcomes.pop_front();
+                continue;
+            }
+
+            // Check if markout window has elapsed
+            if now_ms < pending.timestamp_ms + pending.markout_ms {
+                break; // Pending outcomes are in chronological order
+            }
+
+            let pending = self.pending_outcomes.pop_front().unwrap();
+            
+            // Calculate price movement using mid price (not trade price)
+            // This avoids bid-ask bounce bias in outcome measurement
+            let price_move_bps = if pending.reference_price > 0.0 {
+                (current_mid - pending.reference_price) / pending.reference_price * 10_000.0
+            } else {
+                0.0
+            };
+
+            // Determine outcome based on prediction type
+            let outcome = match pending.prediction_type {
+                ValidatorPredictionType::InformedFlow | ValidatorPredictionType::PreFillToxicity => {
+                    // Outcome: did price move against our fill?
+                    match pending.fill_side {
+                        Some(Side::Bid) => price_move_bps < -threshold_bps, // Bought, price dropped
+                        Some(Side::Ask) => price_move_bps > threshold_bps,  // Sold, price rose
+                        None => false,
+                    }
+                }
+                ValidatorPredictionType::RegimeHighVol => {
+                    // Outcome: was realized vol high?
+                    // Use recent volatility measurement
+                    let realized_vol = self.volatility_filter.sigma_bps_per_sqrt_s();
+                    realized_vol > vol_threshold
+                }
+                ValidatorPredictionType::Momentum => {
+                    // Outcome: did price continue in predicted direction?
+                    match pending.fill_side {
+                        Some(Side::Ask) => price_move_bps > 0.0, // Predicted up, went up
+                        Some(Side::Bid) => price_move_bps < 0.0, // Predicted down, went down
+                        None => false,
+                    }
+                }
+                ValidatorPredictionType::BuyPressure => {
+                    // Already handled separately
+                    false
+                }
+            };
+
+            // Update tracker
+            if let Some(tracker) = self.trackers.get_mut(&pending.prediction_type) {
+                tracker.update(pending.predicted_prob, outcome, pending.regime);
+            }
+
+            // === Online Learning for PreFillASClassifier ===
+            // When we resolve a PreFillToxicity prediction, feed the outcome back
+            // to the classifier so it can learn optimal signal weights via SGD.
+            if pending.prediction_type == ValidatorPredictionType::PreFillToxicity {
+                if let Some(side) = pending.fill_side {
+                    let is_bid = matches!(side, Side::Bid);
+                    let adverse_magnitude = price_move_bps.abs();
+                    self.pre_fill_classifier.record_outcome(
+                        is_bid,
+                        outcome, // was_adverse
+                        Some(adverse_magnitude),
+                    );
+                }
+            }
+
+            self.stats.predictions_resolved += 1;
+        }
+    }
+
+    /// Check if it's time to print a report
+    pub fn should_report(&mut self) -> bool {
+        if let Some(last) = self.stats.last_report_time {
+            if last.elapsed().as_secs() >= self.report_interval_secs {
+                self.stats.last_report_time = Some(Instant::now());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Print the validation report
+    pub fn print_report(&self) {
+        println!();
+        println!("┌─────────────────────────────────────────────────────────────────┐");
+        println!("│             PREDICTION VALIDATOR - {:<10}                   │", self.asset);
+        println!("│             Runtime: {} | Samples: {:>7}                   │",
+            self.stats.uptime_formatted(),
+            self.stats.predictions_resolved
+        );
+        if !self.is_warmed_up() {
+            println!("│  ⏳ WARMUP: {}/{} observations (predictions not recorded)   │",
+                self.total_observations,
+                self.warmup_samples
+            );
+        }
+        println!("├─────────────────────────────────────────────────────────────────┤");
+        println!("│                                                                 │");
+        println!("│  Model                Brier   IR      Bias    N      Health     │");
+        println!("│  ─────────────────────────────────────────────────────────────  │");
+
+        for pred_type in ValidatorPredictionType::all() {
+            if let Some(tracker) = self.trackers.get(pred_type) {
+                let brier = tracker.brier.score();
+                let ir = tracker.ir.information_ratio();
+                let bias = tracker.bias();
+                let n = tracker.n_samples();
+                let health = tracker.health_status();
+
+                println!(
+                    "│  {:20} {:.3}   {:.2}    {:+.1}%   {:>5}  {:10} │",
+                    pred_type.name(),
+                    brier,
+                    ir,
+                    bias * 100.0,
+                    n,
+                    health
+                );
+            }
+        }
+
+        println!("│                                                                 │");
+
+        if self.show_regime_breakdown {
+            self.print_regime_breakdown();
+        }
+
+        println!("└─────────────────────────────────────────────────────────────────┘");
+        println!();
+
+        // Print interpretation guide
+        self.print_interpretation();
+    }
+
+    fn print_regime_breakdown(&self) {
+        let regime_names = ["Calm", "Normal", "Volatile", "Cascade"];
+        
+        println!("├─────────────────────────────────────────────────────────────────┤");
+        println!("│  BY REGIME:                                                     │");
+        println!("│                                                                 │");
+
+        // Aggregate across all models by regime
+        let mut regime_brier = [0.0f64; 4];
+        let mut regime_ir = [0.0f64; 4];
+        let mut regime_n = [0usize; 4];
+
+        for tracker in self.trackers.values() {
+            for (i, regime_metrics) in tracker.by_regime.iter().enumerate() {
+                if regime_metrics.n_samples > 0 {
+                    regime_brier[i] += regime_metrics.brier.score();
+                    regime_ir[i] += regime_metrics.ir.information_ratio();
+                    regime_n[i] += regime_metrics.n_samples;
+                }
+            }
+        }
+
+        // Average across models
+        let n_models = self.trackers.len() as f64;
+        for i in 0..4 {
+            if regime_n[i] > 0 {
+                regime_brier[i] /= n_models;
+                regime_ir[i] /= n_models;
+            }
+        }
+
+        for i in 0..4 {
+            let indicator = if regime_ir[i] > 1.0 { "✓" } else { "✗" };
+            let note = match i {
+                0 if regime_ir[i] > 1.2 => "← Models work best here",
+                3 if regime_ir[i] < 0.9 => "← Expected degradation",
+                _ => "",
+            };
+            println!(
+                "│  {:8} (n={:>5})    │ Brier: {:.3}  IR: {:.2}  {} {:20} │",
+                regime_names[i],
+                regime_n[i],
+                regime_brier[i],
+                regime_ir[i],
+                indicator,
+                note
+            );
+        }
+
+        println!("│                                                                 │");
+    }
+
+    fn print_interpretation(&self) {
+        // Count models by health status
+        let mut good = 0;
+        let mut _marginal = 0;
+        let mut bad = 0;
+        let mut warming = 0;
+
+        for tracker in self.trackers.values() {
+            match tracker.health_status() {
+                "✓ GOOD" | "~ OK" => good += 1,
+                "✗ MARGINAL" => _marginal += 1,
+                "✗ REMOVE" => bad += 1,
+                _ => warming += 1,
+            }
+        }
+
+        if warming == self.trackers.len() {
+            println!("⏳ Collecting predictions... Need more samples for reliable metrics.");
+        } else if bad > 2 {
+            println!("⚠️  Multiple models showing IR < 1.0. Review model assumptions.");
+        } else if good >= 3 {
+            println!("✅ Models showing predictive power. Consider live validation.");
+        } else {
+            println!("📊 Mixed results. Continue monitoring.");
+        }
+
+        // Print IR diagnostic information
+        println!();
+        println!("IR Diagnostics:");
+        for pred_type in ValidatorPredictionType::all() {
+            if let Some(tracker) = self.trackers.get(pred_type) {
+                let n = tracker.n_samples();
+                if n >= 50 {
+                    let base_rate = tracker.ir.base_rate();
+                    let resolution = tracker.ir.resolution();
+                    let uncertainty = tracker.ir.uncertainty();
+                    let bin_counts = tracker.ir.bin_counts();
+
+                    // Check for bin concentration (>80% in one bin is suspicious)
+                    let max_bin = *bin_counts.iter().max().unwrap_or(&0);
+                    let concentration = if n > 0 { max_bin as f64 / n as f64 } else { 0.0 };
+
+                    let warning = if n < 500 {
+                        " ⚠️ <500 samples"
+                    } else if concentration > 0.8 {
+                        " ⚠️ concentrated"
+                    } else {
+                        ""
+                    };
+
+                    println!("  {:16} base={:.3} res={:.4} unc={:.4} conc={:.0}%{}",
+                        pred_type.name(),
+                        base_rate,
+                        resolution,
+                        uncertainty,
+                        concentration * 100.0,
+                        warning
+                    );
+                }
+            }
+        }
+
+        // Print PreFillASClassifier learning diagnostics
+        let learning_diag = self.pre_fill_classifier.learning_diagnostics();
+        let weights = if learning_diag.is_using_learned {
+            &learning_diag.learned_weights
+        } else {
+            &learning_diag.default_weights
+        };
+        println!();
+        println!("PreFill Learning: {}/{} samples | weights: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}]{}",
+            learning_diag.samples,
+            learning_diag.min_samples,
+            weights[0], weights[1], weights[2], weights[3], weights[4],
+            if learning_diag.is_using_learned { " (LEARNED)" } else { " (default)" }
+        );
+
+        // Print stats
+        println!();
+        println!("Stats: {} trades | {} L2 updates | {} synthetic fills | {} pending",
+            self.stats.trades_processed,
+            self.stats.books_processed,
+            self.stats.synthetic_fills,
+            self.pending_outcomes.len()
+        );
+        println!("Config: threshold={:.1}bps (vol-scaled) | warmup={}/{}",
+            self.adverse_threshold_bps,
+            self.total_observations.min(self.warmup_samples),
+            self.warmup_samples
+        );
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim().to_lowercase();
+    if let Some(hours) = s.strip_suffix('h') {
+        let h: u64 = hours.parse().map_err(|_| format!("Invalid hours: {}", hours))?;
+        Ok(Duration::from_secs(h * 3600))
+    } else if let Some(mins) = s.strip_suffix('m') {
+        let m: u64 = mins.parse().map_err(|_| format!("Invalid minutes: {}", mins))?;
+        Ok(Duration::from_secs(m * 60))
+    } else if let Some(secs) = s.strip_suffix('s') {
+        let sec: u64 = secs.parse().map_err(|_| format!("Invalid seconds: {}", secs))?;
+        Ok(Duration::from_secs(sec))
+    } else {
+        let sec: u64 = s.parse().map_err(|_| format!("Invalid duration: {}", s))?;
+        Ok(Duration::from_secs(sec))
+    }
+}
+
+fn get_current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn print_startup_banner(asset: &str, network: &str, duration: &Duration, dex: &Option<String>) {
+    eprintln!();
+    eprintln!("╔═══════════════════════════════════════════════════════════╗");
+    eprintln!("║          Prediction Validator v{}                    ║", env!("CARGO_PKG_VERSION"));
+    eprintln!("╠═══════════════════════════════════════════════════════════╣");
+    eprintln!("║  Asset: {:<15}  Network: {:<17} ║", asset, network);
+    if let Some(d) = dex {
+        eprintln!(
+            "║  DEX: {:<17}  Duration: {:<14} ║",
+            d,
+            format!("{}h", duration.as_secs() / 3600)
+        );
+    } else {
+        eprintln!(
+            "║  DEX: Validator Perps     Duration: {:<14} ║",
+            format!("{}h", duration.as_secs() / 3600)
+        );
+    }
+    eprintln!("╚═══════════════════════════════════════════════════════════╝");
+    eprintln!();
+}
+
+// ============================================================================
+// Logging Setup
+// ============================================================================
+
+fn setup_logging(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Determine log level
+    let level = match cli.log_level.as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" => "info",
+        "warn" => "warn",
+        "error" => "error",
+        _ => "info",
+    };
+
+    // Determine log directory
+    let log_dir = cli.log_dir.clone().unwrap_or_else(|| {
+        let mut dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        dir.push("logs");
+        dir.push("prediction_validator");
+        dir
+    });
+
+    // Determine stdout format
+    let stdout_format = match cli.log_format.as_str() {
+        "json" => LogFormat::Json,
+        _ => LogFormat::Pretty,
+    };
+
+    // Build LogConfig
+    let log_config = LogConfig {
+        log_dir,
+        enable_multi_stream: cli.multi_stream,
+        operational_level: "info".to_string(),
+        diagnostic_level: "debug".to_string(),
+        error_level: "warn".to_string(),
+        enable_stdout: true,
+        stdout_format,
+        log_file: cli.log_file.clone(),
+    };
+
+    // Initialize logging
+    let guards = init_logging(&log_config, Some(level))?;
+
+    // Store guards to keep them alive
+    let _ = LOG_GUARDS.set(guards);
+
+    Ok(())
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env if present
+    dotenvy::dotenv().ok();
+
+    // Parse CLI arguments
+    let cli = Cli::parse();
+
+    // Setup logging
+    setup_logging(&cli)?;
+
+    // Parse duration
+    let duration = parse_duration(&cli.duration)?;
+
+    // Determine network
+    let base_url = match cli.network.to_lowercase().as_str() {
+        "mainnet" => BaseUrl::Mainnet,
+        "testnet" => BaseUrl::Testnet,
+        _ => {
+            warn!("Unknown network '{}', defaulting to testnet", cli.network);
+            BaseUrl::Testnet
+        }
+    };
+
+    // Print startup banner
+    print_startup_banner(&cli.asset, &cli.network, &duration, &cli.dex);
+
+    // Create validator
+    let mut validator = PredictionValidator::new(
+        cli.asset.clone(),
+        cli.markout,
+        cli.adverse_threshold_bps,
+        cli.regime_breakdown,
+        cli.report_interval,
+        cli.warmup_samples,
+    );
+
+    // Create InfoClient for WebSocket
+    info!("Connecting to {} WebSocket...", cli.network);
+    let mut info_client = InfoClient::new(None, Some(base_url)).await?;
+
+    // Create message channel
+    let (sender, mut receiver) = unbounded_channel::<Arc<Message>>();
+
+    // Determine asset name
+    let coin = if let Some(ref dex) = cli.dex {
+        format!("{}:{}", dex, cli.asset)
+    } else {
+        cli.asset.clone()
+    };
+
+    // Subscribe to channels
+    info!("Subscribing to market data for {}...", coin);
+
+    let dex_param = cli.dex.clone();
+
+    // AllMids subscription
+    info_client
+        .subscribe(
+            Subscription::AllMids {
+                dex: dex_param.clone(),
+            },
+            sender.clone(),
+        )
+        .await?;
+
+    // Trades subscription
+    info_client
+        .subscribe(
+            Subscription::Trades {
+                coin: coin.clone(),
+                dex: dex_param.clone(),
+            },
+            sender.clone(),
+        )
+        .await?;
+
+    // L2Book subscription
+    info_client
+        .subscribe(
+            Subscription::L2Book {
+                coin: coin.clone(),
+                dex: dex_param.clone(),
+            },
+            sender.clone(),
+        )
+        .await?;
+
+    info!("Subscriptions active. Starting validation...");
+
+    // Track start time
+    let start_time = Instant::now();
+
+    // Main event loop
+    loop {
+        // Check duration limit
+        if start_time.elapsed() >= duration {
+            info!("Duration limit reached. Shutting down...");
+            break;
+        }
+
+        tokio::select! {
+            Some(arc_msg) = receiver.recv() => {
+                let msg = Arc::try_unwrap(arc_msg).unwrap_or_else(|arc| (*arc).clone());
+
+                match msg {
+                    Message::AllMids(all_mids) => {
+                        if let Some(mid_str) = all_mids.data.mids.get(&cli.asset) {
+                            if let Ok(mid) = mid_str.parse::<f64>() {
+                                let ts = get_current_timestamp_ms();
+                                validator.on_mid(ts, mid);
+
+                                if cli.verbose {
+                                    debug!("AllMids: {} = ${:.2}", cli.asset, mid);
+                                }
+                            }
+                        }
+                    }
+
+                    Message::Trades(trades) => {
+                        for trade in &trades.data {
+                            if let (Ok(price), Ok(size)) = (
+                                trade.px.parse::<f64>(),
+                                trade.sz.parse::<f64>(),
+                            ) {
+                                let is_buy = trade.side == "B";
+                                validator.on_trade(trade.time, price, size, is_buy);
+
+                                if cli.verbose {
+                                    debug!(
+                                        "Trade: {} {} @ ${:.2}",
+                                        size,
+                                        if is_buy { "BUY" } else { "SELL" },
+                                        price
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    Message::L2Book(book) => {
+                        let ts = book.data.time;
+
+                        if book.data.levels.len() >= 2 {
+                            let bids = &book.data.levels[0];
+                            let asks = &book.data.levels[1];
+
+                            if !bids.is_empty() && !asks.is_empty() {
+                                let best_bid: f64 = bids[0].px.parse().unwrap_or(0.0);
+                                let best_ask: f64 = asks[0].px.parse().unwrap_or(0.0);
+
+                                if best_bid > 0.0 && best_ask > 0.0 {
+                                    let mid = (best_bid + best_ask) / 2.0;
+
+                                    let bid_depth: f64 = bids.iter()
+                                        .take(5)
+                                        .filter_map(|l| l.sz.parse::<f64>().ok())
+                                        .sum();
+                                    let ask_depth: f64 = asks.iter()
+                                        .take(5)
+                                        .filter_map(|l| l.sz.parse::<f64>().ok())
+                                        .sum();
+
+                                    validator.on_book(ts, mid, best_bid, best_ask, bid_depth, ask_depth);
+
+                                    if cli.verbose {
+                                        debug!(
+                                            "L2Book: bid=${:.2} / ask=${:.2}",
+                                            best_bid, best_ask
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+
+                // Check if we should print a report
+                if validator.should_report() {
+                    validator.print_report();
+                }
+            }
+
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received Ctrl+C. Shutting down...");
+                break;
+            }
+        }
+    }
+
+    // Final report
+    info!("Generating final report...");
+    validator.print_report();
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("120").unwrap(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_validator_creation() {
+        let validator = PredictionValidator::new(
+            "BTC".to_string(),
+            1000,
+            8.0,  // Updated default threshold
+            false,
+            30,
+            100,  // warmup_samples
+        );
+
+        assert_eq!(validator.asset, "BTC");
+        assert_eq!(validator.markout_ms, 1000);
+        assert_eq!(validator.trackers.len(), 5);
+        assert!(!validator.is_warmed_up());
+    }
+
+    #[test]
+    fn test_model_tracker_health_status() {
+        let mut tracker = ModelTracker::new(ValidatorPredictionType::InformedFlow);
+        
+        // Warming up
+        assert_eq!(tracker.health_status(), "WARMING");
+        
+        // Add some samples
+        for i in 0..100 {
+            let predicted = (i as f64) / 100.0;
+            let outcome = i % 2 == 0;
+            tracker.update(predicted, outcome, 0);
+        }
+        
+        // Should have a status now
+        assert_ne!(tracker.health_status(), "WARMING");
+    }
+
+    #[test]
+    fn test_observation_buffers() {
+        let mut buffers = ObservationBuffers::new(100);
+        
+        // Add trades
+        buffers.add_trade(TradeObservation {
+            timestamp_ms: 1000,
+            price: 100.0,
+            size: 1.0,
+            is_buy: true,
+        });
+        buffers.add_trade(TradeObservation {
+            timestamp_ms: 2000,
+            price: 101.0,
+            size: 1.0,
+            is_buy: false,
+        });
+        
+        assert_eq!(buffers.trades.len(), 2);
+        
+        // Buy ratio should be 0.5
+        let ratio = buffers.buy_ratio(10);
+        assert!((ratio - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_prediction_type_markout() {
+        assert_eq!(ValidatorPredictionType::InformedFlow.markout_ms(), 1000);
+        assert_eq!(ValidatorPredictionType::RegimeHighVol.markout_ms(), 30000);
+        assert_eq!(ValidatorPredictionType::BuyPressure.markout_ms(), 0);
+    }
+}

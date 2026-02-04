@@ -45,6 +45,8 @@ pub mod regime_idx {
 /// Observation vector for the HMM.
 ///
 /// Each observation contains multiple features that help distinguish regimes.
+/// Key insight: volatility and spread are LAGGING indicators. We add OI and
+/// liquidation pressure as LEADING indicators that can predict cascades.
 #[derive(Debug, Clone, Copy)]
 pub struct Observation {
     /// Realized volatility (per-second, e.g., 0.0002 for typical BTC)
@@ -53,6 +55,20 @@ pub struct Observation {
     pub spread_bps: f64,
     /// Order flow imbalance [-1, 1] where positive = buy pressure
     pub flow_imbalance: f64,
+
+    // === LEADING INDICATORS ===
+
+    /// Open Interest level relative to recent average (ratio, 1.0 = average)
+    /// Low OI can signal reduced liquidity/increased fragility
+    pub oi_level: f64,
+
+    /// Open Interest velocity: rate of change in OI
+    /// Negative velocity (OI dropping) signals liquidations
+    pub oi_velocity: f64,
+
+    /// Liquidation pressure indicator: combines OI drop + extreme funding
+    /// High values indicate forced selling pressure
+    pub liquidation_pressure: f64,
 }
 
 impl Default for Observation {
@@ -61,25 +77,55 @@ impl Default for Observation {
             volatility: 0.00025,
             spread_bps: 5.0,
             flow_imbalance: 0.0,
+            oi_level: 1.0,       // Average
+            oi_velocity: 0.0,    // No change
+            liquidation_pressure: 0.0, // No pressure
         }
     }
 }
 
 impl Observation {
-    /// Create a new observation.
+    /// Create a new observation (basic version for backward compatibility).
     pub fn new(volatility: f64, spread_bps: f64, flow_imbalance: f64) -> Self {
         Self {
             volatility,
             spread_bps,
             flow_imbalance: flow_imbalance.clamp(-1.0, 1.0),
+            oi_level: 1.0,
+            oi_velocity: 0.0,
+            liquidation_pressure: 0.0,
         }
+    }
+
+    /// Create a full observation with all leading indicators.
+    pub fn new_full(
+        volatility: f64,
+        spread_bps: f64,
+        flow_imbalance: f64,
+        oi_level: f64,
+        oi_velocity: f64,
+        liquidation_pressure: f64,
+    ) -> Self {
+        Self {
+            volatility,
+            spread_bps,
+            flow_imbalance: flow_imbalance.clamp(-1.0, 1.0),
+            oi_level: oi_level.max(0.0),
+            oi_velocity,
+            liquidation_pressure: liquidation_pressure.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Check if this observation has leading indicator data
+    pub fn has_leading_indicators(&self) -> bool {
+        self.oi_level != 1.0 || self.oi_velocity != 0.0 || self.liquidation_pressure != 0.0
     }
 }
 
 /// Emission distribution parameters for a single regime.
 ///
-/// Uses Gaussian distributions for volatility and spread, with flow imbalance
-/// contributing through its absolute value (extreme regimes have higher |imbalance|).
+/// Uses Gaussian distributions for volatility and spread, with additional
+/// parameters for leading indicators (OI and liquidation pressure).
 #[derive(Debug, Clone, Copy)]
 pub struct EmissionParams {
     /// Mean volatility for this regime (per-second)
@@ -90,16 +136,65 @@ pub struct EmissionParams {
     pub mean_spread: f64,
     /// Standard deviation of spread
     pub std_spread: f64,
+
+    // === Leading indicator parameters ===
+
+    /// Expected OI level for this regime (1.0 = average)
+    /// Lower OI suggests cascade regime
+    pub mean_oi_level: f64,
+    /// Std of OI level
+    pub std_oi_level: f64,
+
+    /// Expected OI velocity for this regime
+    /// Negative velocity suggests cascade (forced selling)
+    pub mean_oi_velocity: f64,
+    /// Std of OI velocity
+    pub std_oi_velocity: f64,
+
+    /// Weight for liquidation pressure signal (0-1)
+    /// Higher weight in cascade regime
+    pub liquidation_weight: f64,
 }
 
 impl EmissionParams {
-    /// Create new emission parameters.
+    /// Create new emission parameters (basic version).
     pub fn new(mean_vol: f64, std_vol: f64, mean_spread: f64, std_spread: f64) -> Self {
         Self {
             mean_volatility: mean_vol.max(1e-9),
             std_volatility: std_vol.max(1e-9),
             mean_spread: mean_spread.max(0.1),
             std_spread: std_spread.max(0.1),
+            // Defaults for leading indicators
+            mean_oi_level: 1.0,
+            std_oi_level: 0.2,
+            mean_oi_velocity: 0.0,
+            std_oi_velocity: 0.05,
+            liquidation_weight: 0.0,
+        }
+    }
+
+    /// Create full emission parameters with leading indicators.
+    pub fn new_full(
+        mean_vol: f64,
+        std_vol: f64,
+        mean_spread: f64,
+        std_spread: f64,
+        mean_oi_level: f64,
+        std_oi_level: f64,
+        mean_oi_velocity: f64,
+        std_oi_velocity: f64,
+        liquidation_weight: f64,
+    ) -> Self {
+        Self {
+            mean_volatility: mean_vol.max(1e-9),
+            std_volatility: std_vol.max(1e-9),
+            mean_spread: mean_spread.max(0.1),
+            std_spread: std_spread.max(0.1),
+            mean_oi_level: mean_oi_level.max(0.1),
+            std_oi_level: std_oi_level.max(0.01),
+            mean_oi_velocity,
+            std_oi_velocity: std_oi_velocity.max(0.01),
+            liquidation_weight: liquidation_weight.clamp(0.0, 1.0),
         }
     }
 
@@ -113,8 +208,33 @@ impl EmissionParams {
         let spread_z = (obs.spread_bps - self.mean_spread) / self.std_spread;
         let ll_spread = -0.5 * spread_z * spread_z - self.std_spread.ln();
 
+        // Log-likelihood of OI level (Gaussian) - only if data provided
+        let ll_oi = if obs.oi_level != 1.0 {
+            let oi_z = (obs.oi_level - self.mean_oi_level) / self.std_oi_level;
+            -0.5 * oi_z * oi_z - self.std_oi_level.ln()
+        } else {
+            0.0 // No contribution if no data
+        };
+
+        // Log-likelihood of OI velocity (Gaussian) - only if data provided
+        let ll_oi_vel = if obs.oi_velocity != 0.0 {
+            let vel_z = (obs.oi_velocity - self.mean_oi_velocity) / self.std_oi_velocity;
+            -0.5 * vel_z * vel_z - self.std_oi_velocity.ln()
+        } else {
+            0.0
+        };
+
+        // Liquidation pressure contribution
+        // High pressure boosts cascade regime likelihood
+        let ll_liq = if obs.liquidation_pressure > 0.0 {
+            // Log-odds style: positive contribution if pressure matches regime expectation
+            self.liquidation_weight * obs.liquidation_pressure.ln().max(-10.0)
+        } else {
+            0.0
+        };
+
         // Combine (treating as independent features)
-        ll_vol + ll_spread
+        ll_vol + ll_spread + ll_oi * 0.5 + ll_oi_vel * 0.5 + ll_liq
     }
 
     /// Compute likelihood (not log) of observation.
@@ -129,17 +249,62 @@ impl EmissionParams {
 /// - Low: Very quiet, vol ~0.1%, tight spreads ~3 bps
 /// - Normal: Standard, vol ~0.25%, moderate spreads ~5 bps
 /// - High: Elevated, vol ~1%, wider spreads ~10 bps
-/// - Extreme: Crisis, vol ~5%, very wide spreads ~25+ bps
+/// - Extreme: Crisis/cascade, vol ~5%, very wide spreads ~25+ bps
+///
+/// Leading indicators for cascade detection:
+/// - OI level: Cascade shows OI dropping (< 1.0)
+/// - OI velocity: Cascade shows negative velocity (forced liquidations)
+/// - Liquidation pressure: High in cascade, low otherwise
 fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
     [
-        // Low regime
-        EmissionParams::new(0.001, 0.0005, 3.0, 1.5),
-        // Normal regime
-        EmissionParams::new(0.0025, 0.001, 5.0, 2.0),
-        // High regime
-        EmissionParams::new(0.01, 0.005, 10.0, 5.0),
-        // Extreme regime
-        EmissionParams::new(0.05, 0.025, 25.0, 15.0),
+        // Low regime: quiet market, stable OI
+        EmissionParams::new_full(
+            0.001,   // vol
+            0.0005,  // vol std
+            3.0,     // spread
+            1.5,     // spread std
+            1.05,    // OI slightly above average
+            0.1,     // OI std
+            0.0,     // OI velocity (stable)
+            0.02,    // velocity std
+            0.0,     // no liquidation pressure
+        ),
+        // Normal regime: standard conditions
+        EmissionParams::new_full(
+            0.0025,  // vol
+            0.001,   // vol std
+            5.0,     // spread
+            2.0,     // spread std
+            1.0,     // average OI
+            0.15,    // OI std
+            0.0,     // OI velocity (stable)
+            0.03,    // velocity std
+            0.0,     // no liquidation pressure
+        ),
+        // High regime: elevated vol, OI starting to drop
+        EmissionParams::new_full(
+            0.01,    // vol
+            0.005,   // vol std
+            10.0,    // spread
+            5.0,     // spread std
+            0.95,    // OI slightly below average (stress)
+            0.2,     // OI std (higher variance)
+            -0.02,   // OI velocity slightly negative
+            0.05,    // velocity std
+            0.2,     // some liquidation pressure
+        ),
+        // Extreme/Cascade regime: crisis conditions, OI dropping fast
+        EmissionParams::new_full(
+            0.05,    // vol (very high)
+            0.025,   // vol std
+            25.0,    // spread (very wide)
+            15.0,    // spread std
+            0.8,     // OI significantly below average (cascades)
+            0.25,    // OI std (high variance)
+            -0.1,    // OI velocity negative (forced liquidations)
+            0.08,    // velocity std
+            0.8,     // high liquidation pressure
+        ),
     ]
 }
 

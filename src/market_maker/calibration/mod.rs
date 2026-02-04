@@ -43,7 +43,7 @@ pub use derived_constants::{
 pub use historical_calibrator::{
     CalibrationSummary, FillRecord, HistoricalCalibrator, MarketSnapshot, PowerAnalysis, TradeRecord,
 };
-pub use information_ratio::InformationRatioTracker;
+pub use information_ratio::{BinStats, InformationRatioTracker, IrDiagnostics};
 pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
 pub use parameter_learner::{BayesianParam, CalibrationStatus, LearnedParameters, PriorFamily};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};

@@ -332,6 +332,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             adverse_selection: &mut self.tier1.adverse_selection,
             depth_decay_as: &mut self.tier1.depth_decay_as,
             queue_tracker: &mut self.tier1.queue_tracker,
+            pre_fill_classifier: &mut self.tier1.pre_fill_classifier,
             estimator: &mut self.estimator,
             pnl_tracker: &mut self.tier2.pnl_tracker,
             prometheus: &mut self.infra.prometheus,

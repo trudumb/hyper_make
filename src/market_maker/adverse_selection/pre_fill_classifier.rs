@@ -43,6 +43,19 @@ pub struct PreFillClassifierConfig {
 
     /// Funding rate threshold for full toxicity (annualized rate)
     pub funding_threshold: f64,
+
+    /// Enable online weight learning (default: true)
+    pub enable_learning: bool,
+
+    /// Learning rate for weight updates (default: 0.01)
+    pub learning_rate: f64,
+
+    /// Minimum samples before using learned weights (default: 500)
+    pub min_samples_for_learning: usize,
+
+    /// Regularization strength for weight learning (default: 0.1)
+    /// Prevents weights from going to extremes
+    pub regularization: f64,
 }
 
 impl Default for PreFillClassifierConfig {
@@ -59,6 +72,11 @@ impl Default for PreFillClassifierConfig {
             imbalance_threshold: 2.0,   // 2:1 bid/ask ratio
             flow_threshold: 0.7,        // 70% one-sided flow
             funding_threshold: 0.001,   // 0.1% per 8h (annualized ~110%)
+
+            enable_learning: true,
+            learning_rate: 0.01,
+            min_samples_for_learning: 500,
+            regularization: 0.1,
         }
     }
 }
@@ -101,6 +119,19 @@ pub struct PreFillASClassifier {
 
     /// Timestamp of last regime update (ms since epoch)
     regime_updated_at_ms: u64,
+
+    // === Online Learning State ===
+    /// Learned weights [imbalance, flow, regime, funding, changepoint]
+    learned_weights: [f64; 5],
+
+    /// Running sum of (signal_i * outcome) for each signal
+    signal_outcome_sum: [f64; 5],
+
+    /// Running sum of signal_i^2 for each signal
+    signal_sq_sum: [f64; 5],
+
+    /// Number of learning samples processed
+    learning_samples: usize,
 }
 
 impl PreFillASClassifier {
@@ -111,6 +142,15 @@ impl PreFillASClassifier {
 
     /// Create with custom configuration.
     pub fn with_config(config: PreFillClassifierConfig) -> Self {
+        // Initialize learned weights with config defaults
+        let learned_weights = [
+            config.imbalance_weight,
+            config.flow_weight,
+            config.regime_weight,
+            config.funding_weight,
+            config.changepoint_weight,
+        ];
+
         Self {
             config,
             orderbook_imbalance: 1.0, // Neutral
@@ -123,6 +163,10 @@ impl PreFillASClassifier {
             orderbook_updated_at_ms: 0,
             trade_flow_updated_at_ms: 0,
             regime_updated_at_ms: 0,
+            learned_weights,
+            signal_outcome_sum: [0.0; 5],
+            signal_sq_sum: [0.0; 5],
+            learning_samples: 0,
         }
     }
 
@@ -208,81 +252,183 @@ impl PreFillASClassifier {
     /// # Arguments
     /// * `is_bid` - True if predicting toxicity for bid (buy) side
     pub fn predict_toxicity(&self, is_bid: bool) -> f64 {
-        let mut toxicity = 0.0;
+        // Get weights - use learned if enough samples, else config defaults
+        let weights = self.effective_weights();
 
+        // Compute individual signals (normalized to [0, 1])
+        let signals = self.compute_signals(is_bid);
+
+        // Weighted sum
+        let mut toxicity = 0.0;
+        for (weight, signal) in weights.iter().zip(signals.iter()) {
+            toxicity += weight * signal;
+        }
+
+        toxicity.clamp(0.0, 1.0)
+    }
+
+    /// Get the effective weights (learned or default)
+    fn effective_weights(&self) -> [f64; 5] {
+        if self.config.enable_learning
+            && self.learning_samples >= self.config.min_samples_for_learning
+        {
+            self.learned_weights
+        } else {
+            [
+                self.config.imbalance_weight,
+                self.config.flow_weight,
+                self.config.regime_weight,
+                self.config.funding_weight,
+                self.config.changepoint_weight,
+            ]
+        }
+    }
+
+    /// Compute individual signal values for a given side
+    /// Returns [imbalance, flow, regime, funding, changepoint] signals
+    pub fn compute_signals(&self, is_bid: bool) -> [f64; 5] {
         // === Orderbook Imbalance ===
-        // Symmetric logic: measure how much the book pressure opposes our intended fill
-        //
-        // orderbook_imbalance = bid_depth / ask_depth
-        // > 1 means more bids than asks (buying pressure)
-        // < 1 means more asks than bids (selling pressure)
         let imbalance_signal = if is_bid {
-            // Bid side: imbalance > 1 means bid pressure, toxic for our buy
-            // We're competing with other buyers who may be informed
             let raw = (self.orderbook_imbalance - 1.0) / (self.config.imbalance_threshold - 1.0);
             raw.clamp(0.0, 1.0)
         } else {
-            // Ask side: imbalance < 1 means ask pressure, toxic for our sell
-            // We're competing with other sellers who may be informed
-            // Use reciprocal so < 1 becomes > 1 after inversion
             let inverted = 1.0 / self.orderbook_imbalance.max(0.01);
             let raw = (inverted - 1.0) / (self.config.imbalance_threshold - 1.0);
             raw.clamp(0.0, 1.0)
         };
-        toxicity += self.config.imbalance_weight * imbalance_signal;
 
         // === Trade Flow Momentum ===
-        // recent_trade_direction: [-1, 1] where positive = net buying, negative = net selling
-        //
-        // SYMMETRIC LOGIC:
-        // - For bids: positive flow (buying) = we're WITH the crowd = TOXIC
-        // - For asks: negative flow (selling) = we're WITH the crowd = TOXIC
-        //
-        // Being "with the crowd" means price has already moved in the direction that
-        // favors the filled side, so our fill is at a worse price than it will be.
         let flow_signal = if is_bid {
-            // Bid toxicity from positive (buy) flow
-            // Positive trade_direction means buyers dominate, toxic for our bid
             let raw = self.recent_trade_direction / self.config.flow_threshold;
             raw.clamp(0.0, 1.0)
         } else {
-            // Ask toxicity from negative (sell) flow
-            // Negative trade_direction means sellers dominate, toxic for our ask
-            // Use absolute value of negative direction
             let raw = (-self.recent_trade_direction) / self.config.flow_threshold;
             raw.clamp(0.0, 1.0)
         };
-        toxicity += self.config.flow_weight * flow_signal;
 
         // === Regime Distrust ===
-        // Low regime trust = uncertain market = higher toxicity for both sides
         let regime_signal = 1.0 - self.regime_trust;
-        toxicity += self.config.regime_weight * regime_signal;
 
         // === Changepoint Probability ===
-        // High changepoint prob = regime shift in progress = higher toxicity
-        // Symmetric for both sides: regime shifts are dangerous regardless of direction
-        toxicity += self.config.changepoint_weight * self.changepoint_prob;
+        let changepoint_signal = self.changepoint_prob;
 
         // === Funding Rate ===
-        // Extreme funding = crowd positioned one way = potential reversal = toxic
-        //
-        // DIRECTIONAL: Funding affects sides differently!
-        // Positive funding = longs pay shorts = crowd is long = price may drop
-        // Negative funding = shorts pay longs = crowd is short = price may rise
-        //
-        // For bids: positive funding is MORE toxic (crowd is long, may dump)
-        // For asks: negative funding is MORE toxic (crowd is short, may squeeze)
         let funding_signal = if is_bid {
-            // Bid toxicity: high positive funding (crowd long) is dangerous for buyers
             (self.funding_rate / self.config.funding_threshold).clamp(0.0, 1.0)
         } else {
-            // Ask toxicity: high negative funding (crowd short) is dangerous for sellers
             (-self.funding_rate / self.config.funding_threshold).clamp(0.0, 1.0)
         };
-        toxicity += self.config.funding_weight * funding_signal;
 
-        toxicity.clamp(0.0, 1.0)
+        [
+            imbalance_signal,
+            flow_signal,
+            regime_signal,
+            funding_signal,
+            changepoint_signal,
+        ]
+    }
+
+    /// Update learned weights with a (prediction, outcome) pair.
+    ///
+    /// This implements online linear regression via stochastic gradient descent:
+    /// - `is_bid`: The side for which toxicity was predicted
+    /// - `was_adverse`: True if the fill was adverse (price moved against us)
+    /// - `adverse_magnitude_bps`: Optional magnitude of adverse movement (for weighted learning)
+    ///
+    /// Call this after each fill is resolved with its markout outcome.
+    pub fn record_outcome(&mut self, is_bid: bool, was_adverse: bool, adverse_magnitude_bps: Option<f64>) {
+        if !self.config.enable_learning {
+            return;
+        }
+
+        let signals = self.compute_signals(is_bid);
+
+        // Convert outcome to target (0.0 = not adverse, 1.0 = adverse)
+        let target = if was_adverse { 1.0 } else { 0.0 };
+
+        // Weight by magnitude if provided (larger adverse moves count more)
+        let sample_weight = adverse_magnitude_bps
+            .map(|m| (m.abs() / 10.0).clamp(0.1, 5.0))
+            .unwrap_or(1.0);
+
+        // Update running statistics for each signal
+        for i in 0..5 {
+            self.signal_outcome_sum[i] += signals[i] * target * sample_weight;
+            self.signal_sq_sum[i] += signals[i] * signals[i] * sample_weight;
+        }
+        self.learning_samples += 1;
+
+        // Every 50 samples, update weights using regularized regression
+        if self.learning_samples % 50 == 0 {
+            self.update_weights();
+        }
+    }
+
+    /// Update weights using accumulated statistics
+    fn update_weights(&mut self) {
+        if self.learning_samples < self.config.min_samples_for_learning {
+            return;
+        }
+
+        let lr = self.config.learning_rate;
+        let reg = self.config.regularization;
+        let n = self.learning_samples as f64;
+
+        for i in 0..5 {
+            // Compute gradient: E[signal * (target - prediction)]
+            // Simplified: proportional to signal-outcome correlation
+            let correlation = if self.signal_sq_sum[i] > 1e-9 {
+                self.signal_outcome_sum[i] / self.signal_sq_sum[i].sqrt() / n.sqrt()
+            } else {
+                0.0
+            };
+
+            // Get prior weight (from config)
+            let prior = match i {
+                0 => self.config.imbalance_weight,
+                1 => self.config.flow_weight,
+                2 => self.config.regime_weight,
+                3 => self.config.funding_weight,
+                4 => self.config.changepoint_weight,
+                _ => 0.2,
+            };
+
+            // Update with regularization toward prior
+            let target_weight = correlation.clamp(0.0, 1.0);
+            let update = lr * (target_weight - self.learned_weights[i])
+                - reg * (self.learned_weights[i] - prior);
+
+            self.learned_weights[i] += update;
+            self.learned_weights[i] = self.learned_weights[i].clamp(0.01, 0.8);
+        }
+
+        // Normalize weights to sum to 1
+        let sum: f64 = self.learned_weights.iter().sum();
+        if sum > 0.01 {
+            for w in &mut self.learned_weights {
+                *w /= sum;
+            }
+        }
+    }
+
+    /// Get learning diagnostics
+    pub fn learning_diagnostics(&self) -> LearningDiagnostics {
+        let default_weights = [
+            self.config.imbalance_weight,
+            self.config.flow_weight,
+            self.config.regime_weight,
+            self.config.funding_weight,
+            self.config.changepoint_weight,
+        ];
+
+        LearningDiagnostics {
+            samples: self.learning_samples,
+            min_samples: self.config.min_samples_for_learning,
+            is_using_learned: self.learning_samples >= self.config.min_samples_for_learning,
+            default_weights,
+            learned_weights: self.learned_weights,
+            signal_names: ["imbalance", "flow", "regime", "funding", "changepoint"],
+        }
     }
 
     /// Get spread multiplier for a given side.
@@ -399,6 +545,8 @@ impl PreFillASClassifier {
             orderbook_updated_at_ms: self.orderbook_updated_at_ms,
             trade_flow_updated_at_ms: self.trade_flow_updated_at_ms,
             regime_updated_at_ms: self.regime_updated_at_ms,
+            learning_samples: self.learning_samples,
+            using_learned_weights: self.learning_samples >= self.config.min_samples_for_learning,
         }
     }
 }
@@ -428,6 +576,10 @@ pub struct PreFillSummary {
     pub trade_flow_updated_at_ms: u64,
     /// Timestamp of last regime update (ms since epoch)
     pub regime_updated_at_ms: u64,
+    /// Number of learning samples processed
+    pub learning_samples: usize,
+    /// Whether learned weights are being used
+    pub using_learned_weights: bool,
 }
 
 /// Signal staleness information.
@@ -439,6 +591,62 @@ pub struct SignalStaleness {
     pub orderbook_stale: bool,
     pub trade_flow_stale: bool,
     pub regime_stale: bool,
+}
+
+/// Diagnostics for online weight learning.
+#[derive(Debug, Clone)]
+pub struct LearningDiagnostics {
+    /// Number of samples used for learning
+    pub samples: usize,
+    /// Minimum samples required to use learned weights
+    pub min_samples: usize,
+    /// Whether learned weights are currently being used
+    pub is_using_learned: bool,
+    /// Default weights from config
+    pub default_weights: [f64; 5],
+    /// Learned weights (may not be in use yet)
+    pub learned_weights: [f64; 5],
+    /// Signal names for display
+    pub signal_names: [&'static str; 5],
+}
+
+impl LearningDiagnostics {
+    /// Get a formatted summary string
+    pub fn summary(&self) -> String {
+        let status = if self.is_using_learned {
+            "LEARNED"
+        } else {
+            "DEFAULT"
+        };
+
+        let mut s = format!(
+            "PreFillAS [{} n={}]\n",
+            status, self.samples
+        );
+
+        let weights = if self.is_using_learned {
+            &self.learned_weights
+        } else {
+            &self.default_weights
+        };
+
+        for (i, name) in self.signal_names.iter().enumerate() {
+            let learned = self.learned_weights[i];
+            let default = self.default_weights[i];
+            let diff = if (learned - default).abs() > 0.05 {
+                if learned > default { "↑" } else { "↓" }
+            } else {
+                "="
+            };
+
+            s.push_str(&format!(
+                "  {:12} w={:.2} (def={:.2}) {}\n",
+                name, weights[i], default, diff
+            ));
+        }
+
+        s
+    }
 }
 
 #[cfg(test)]

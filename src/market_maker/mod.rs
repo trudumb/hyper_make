@@ -50,6 +50,7 @@ pub use edge::{
     SignalHealth, SignalHealthMonitor, SignalHealthSummary,
 };
 pub use estimator::*;
+pub use estimator::regime_hmm;
 pub use execution::{
     CancelAnalysis, FillMetrics, FillRecord, FillStatistics, FillTracker, OrderEvent,
     OrderLifecycle, OrderLifecycleTracker, OrderState as ExecutionOrderState,

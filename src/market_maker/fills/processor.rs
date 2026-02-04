@@ -18,7 +18,7 @@
 
 use super::dedup::FillDeduplicator;
 use super::{FillEvent, FillResult};
-use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS};
+use crate::market_maker::adverse_selection::{AdverseSelectionEstimator, DepthDecayAS, PreFillASClassifier};
 use crate::market_maker::config::MetricsRecorder;
 use crate::market_maker::control::{PositionPnLTracker, StochasticController};
 use crate::market_maker::tracking::calibration_wiring::ModelCalibrationOrchestrator;
@@ -525,6 +525,8 @@ pub struct FillState<'a> {
     pub depth_decay_as: &'a mut DepthDecayAS,
     /// Queue position tracker
     pub queue_tracker: &'a mut QueuePositionTracker,
+    /// Pre-fill adverse selection classifier (online learning)
+    pub pre_fill_classifier: &'a mut PreFillASClassifier,
 
     // Tier 2 modules
     /// Parameter estimator
@@ -940,6 +942,23 @@ impl FillProcessor {
                     );
                 }
             }
+
+            // === PreFillASClassifier Online Learning ===
+            // Record outcome for online weight learning. This allows the classifier
+            // to adapt its signal weights based on actual fill outcomes.
+            let is_bid = fill.is_buy;
+            let was_adverse = realized_as_bps > 3.0; // Same threshold as adverse_threshold_default
+            state.pre_fill_classifier.record_outcome(
+                is_bid,
+                was_adverse,
+                Some(realized_as_bps),
+            );
+            debug!(
+                is_bid = is_bid,
+                was_adverse = was_adverse,
+                realized_as_bps = %format!("{:.2}", realized_as_bps),
+                "Recorded pre-fill classifier outcome for online learning"
+            );
         }
 
         // === Calibrated P&L Tracking (IR-Based Thresholds) ===
@@ -1153,6 +1172,7 @@ mod tests {
         adverse_selection: &'a mut AdverseSelectionEstimator,
         depth_decay_as: &'a mut DepthDecayAS,
         queue_tracker: &'a mut QueuePositionTracker,
+        pre_fill_classifier: &'a mut PreFillASClassifier,
         estimator: &'a mut ParameterEstimator,
         pnl_tracker: &'a mut PnLTracker,
         prometheus: &'a mut PrometheusMetrics,
@@ -1170,6 +1190,7 @@ mod tests {
             adverse_selection,
             depth_decay_as,
             queue_tracker,
+            pre_fill_classifier,
             estimator,
             pnl_tracker,
             prometheus,
@@ -1208,6 +1229,7 @@ mod tests {
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -1215,6 +1237,7 @@ mod tests {
             &mut adverse_selection,
             &mut depth_decay_as,
             &mut queue_tracker,
+            &mut pre_fill_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1254,6 +1277,7 @@ mod tests {
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
 
         let mut state = make_test_state(
             &mut position,
@@ -1261,6 +1285,7 @@ mod tests {
             &mut adverse_selection,
             &mut depth_decay_as,
             &mut queue_tracker,
+            &mut pre_fill_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1354,6 +1379,7 @@ mod tests {
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
 
         // Pre-register OID 100 as immediate fill with amount 1.0 (simulating API returned filled=true)
         processor.pre_register_immediate_fill(100, 1.0);
@@ -1364,6 +1390,7 @@ mod tests {
             &mut adverse_selection,
             &mut depth_decay_as,
             &mut queue_tracker,
+            &mut pre_fill_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1414,6 +1441,7 @@ mod tests {
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
 
         // No pre-registration - this is a normal fill
 
@@ -1423,6 +1451,7 @@ mod tests {
             &mut adverse_selection,
             &mut depth_decay_as,
             &mut queue_tracker,
+            &mut pre_fill_classifier,
             &mut estimator,
             &mut pnl_tracker,
             &mut prometheus,
@@ -1470,6 +1499,7 @@ mod tests {
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.5)
         processor.pre_register_immediate_fill(100, 0.5);
@@ -1483,6 +1513,7 @@ mod tests {
                 &mut adverse_selection,
                 &mut depth_decay_as,
                 &mut queue_tracker,
+                &mut pre_fill_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1510,6 +1541,7 @@ mod tests {
                 &mut adverse_selection,
                 &mut depth_decay_as,
                 &mut queue_tracker,
+                &mut pre_fill_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1556,6 +1588,7 @@ mod tests {
         let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
         let mut model_calibration = ModelCalibrationOrchestrator::default();
         let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
 
         // Pre-register OID 100 with the AMOUNT that was filled immediately (0.6)
         processor.pre_register_immediate_fill(100, 0.6);
@@ -1570,6 +1603,7 @@ mod tests {
                 &mut adverse_selection,
                 &mut depth_decay_as,
                 &mut queue_tracker,
+                &mut pre_fill_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1603,6 +1637,7 @@ mod tests {
                 &mut adverse_selection,
                 &mut depth_decay_as,
                 &mut queue_tracker,
+                &mut pre_fill_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,
@@ -1637,6 +1672,7 @@ mod tests {
                 &mut adverse_selection,
                 &mut depth_decay_as,
                 &mut queue_tracker,
+                &mut pre_fill_classifier,
                 &mut estimator,
                 &mut pnl_tracker,
                 &mut prometheus,

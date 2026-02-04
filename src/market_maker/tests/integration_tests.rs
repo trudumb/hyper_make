@@ -106,11 +106,7 @@ mod tests {
 
         // Normal observations to establish baseline
         for _ in 0..20 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.002,
-                spread_bps: 5.0,
-                flow_imbalance: 0.0,
-            });
+            hmm.forward_update(&HmmObservation::new(0.002, 5.0, 0.0));
         }
 
         let belief_before = hmm.regime_probabilities();
@@ -118,11 +114,7 @@ mod tests {
 
         // Volatility spike
         for _ in 0..10 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.05,
-                spread_bps: 25.0,
-                flow_imbalance: 0.5,
-            });
+            hmm.forward_update(&HmmObservation::new(0.05, 25.0, 0.5));
         }
 
         let belief_after = hmm.regime_probabilities();
@@ -143,11 +135,7 @@ mod tests {
 
         // Feed very low volatility observations
         for _ in 0..30 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.0005,
-                spread_bps: 2.0,
-                flow_imbalance: 0.0,
-            });
+            hmm.forward_update(&HmmObservation::new(0.0005, 2.0, 0.0));
         }
 
         let belief = hmm.regime_probabilities();
@@ -165,11 +153,7 @@ mod tests {
         let mut hmm = RegimeHMM::new();
 
         for _ in 0..10 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.003,
-                spread_bps: 7.0,
-                flow_imbalance: 0.1,
-            });
+            hmm.forward_update(&HmmObservation::new(0.003, 7.0, 0.1));
         }
 
         let belief = hmm.regime_probabilities();
@@ -514,11 +498,7 @@ mod tests {
         // 3. Simulate market update
         let base_time = 1_000_000u64;
         circuit_breaker.update_oi(base_time, 1000.0);
-        hmm.forward_update(&HmmObservation {
-            volatility: 0.002,
-            spread_bps: 5.0,
-            flow_imbalance: 0.1,
-        });
+        hmm.forward_update(&HmmObservation::new(0.002, 5.0, 0.1));
         drawdown.update_equity(100_000.0);
 
         // 4. Pre-quote checks
@@ -583,11 +563,7 @@ mod tests {
 
         // Feed volatile observations to HMM
         for _ in 0..10 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.05,
-                spread_bps: 30.0,
-                flow_imbalance: 0.6,
-            });
+            hmm.forward_update(&HmmObservation::new(0.05, 30.0, 0.6));
         }
 
         // Simulate drawdown
@@ -650,11 +626,7 @@ mod tests {
 
         // Initially in normal regime
         for _ in 0..10 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.002,
-                spread_bps: 5.0,
-                flow_imbalance: 0.0,
-            });
+            hmm.forward_update(&HmmObservation::new(0.002, 5.0, 0.0));
         }
 
         let normal_regime_weight = ensemble.get_weight("normal_regime_model");
@@ -665,11 +637,7 @@ mod tests {
 
         // Simulate regime transition
         for _ in 0..15 {
-            hmm.forward_update(&HmmObservation {
-                volatility: 0.03,
-                spread_bps: 20.0,
-                flow_imbalance: 0.4,
-            });
+            hmm.forward_update(&HmmObservation::new(0.03, 20.0, 0.4));
         }
 
         // Regime should shift toward High/Extreme
