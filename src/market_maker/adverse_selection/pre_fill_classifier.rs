@@ -193,48 +193,93 @@ impl PreFillASClassifier {
     /// - 0 = no expected adverse selection
     /// - 1 = maximum expected adverse selection
     ///
+    /// # Toxicity Logic
+    ///
+    /// Key insight: Fills are toxic when we're "with the informed flow".
+    ///
+    /// For **bids** (we want to buy):
+    /// - Heavy BID pressure (book imbalance > 1) = others buying = we get run over on buys
+    /// - Strong BUY flow (trade_direction > 0) = momentum against us after fill
+    ///
+    /// For **asks** (we want to sell):
+    /// - Heavy ASK pressure (book imbalance < 1) = others selling = we get run over on sells
+    /// - Strong SELL flow (trade_direction < 0) = momentum against us after fill
+    ///
     /// # Arguments
     /// * `is_bid` - True if predicting toxicity for bid (buy) side
     pub fn predict_toxicity(&self, is_bid: bool) -> f64 {
         let mut toxicity = 0.0;
 
         // === Orderbook Imbalance ===
-        // If we're bidding, heavy bid pressure = others know something = toxic
-        // If we're asking, heavy ask pressure = others know something = toxic
+        // Symmetric logic: measure how much the book pressure opposes our intended fill
+        //
+        // orderbook_imbalance = bid_depth / ask_depth
+        // > 1 means more bids than asks (buying pressure)
+        // < 1 means more asks than bids (selling pressure)
         let imbalance_signal = if is_bid {
-            // Bid side: imbalance > 1 means bid pressure, toxic for buyers
-            ((self.orderbook_imbalance - 1.0) / (self.config.imbalance_threshold - 1.0))
-                .clamp(0.0, 1.0)
+            // Bid side: imbalance > 1 means bid pressure, toxic for our buy
+            // We're competing with other buyers who may be informed
+            let raw = (self.orderbook_imbalance - 1.0) / (self.config.imbalance_threshold - 1.0);
+            raw.clamp(0.0, 1.0)
         } else {
-            // Ask side: imbalance < 1 means ask pressure, toxic for sellers
-            ((1.0 / self.orderbook_imbalance - 1.0) / (self.config.imbalance_threshold - 1.0))
-                .clamp(0.0, 1.0)
+            // Ask side: imbalance < 1 means ask pressure, toxic for our sell
+            // We're competing with other sellers who may be informed
+            // Use reciprocal so < 1 becomes > 1 after inversion
+            let inverted = 1.0 / self.orderbook_imbalance.max(0.01);
+            let raw = (inverted - 1.0) / (self.config.imbalance_threshold - 1.0);
+            raw.clamp(0.0, 1.0)
         };
         toxicity += self.config.imbalance_weight * imbalance_signal;
 
         // === Trade Flow Momentum ===
-        // If we're bidding and flow is buying, we're with the crowd = toxic
-        // If we're asking and flow is selling, we're with the crowd = toxic
+        // recent_trade_direction: [-1, 1] where positive = net buying, negative = net selling
+        //
+        // SYMMETRIC LOGIC:
+        // - For bids: positive flow (buying) = we're WITH the crowd = TOXIC
+        // - For asks: negative flow (selling) = we're WITH the crowd = TOXIC
+        //
+        // Being "with the crowd" means price has already moved in the direction that
+        // favors the filled side, so our fill is at a worse price than it will be.
         let flow_signal = if is_bid {
-            (self.recent_trade_direction / self.config.flow_threshold).clamp(0.0, 1.0)
+            // Bid toxicity from positive (buy) flow
+            // Positive trade_direction means buyers dominate, toxic for our bid
+            let raw = self.recent_trade_direction / self.config.flow_threshold;
+            raw.clamp(0.0, 1.0)
         } else {
-            (-self.recent_trade_direction / self.config.flow_threshold).clamp(0.0, 1.0)
+            // Ask toxicity from negative (sell) flow
+            // Negative trade_direction means sellers dominate, toxic for our ask
+            // Use absolute value of negative direction
+            let raw = (-self.recent_trade_direction) / self.config.flow_threshold;
+            raw.clamp(0.0, 1.0)
         };
         toxicity += self.config.flow_weight * flow_signal;
 
         // === Regime Distrust ===
-        // Low regime trust = uncertain market = higher toxicity
+        // Low regime trust = uncertain market = higher toxicity for both sides
         let regime_signal = 1.0 - self.regime_trust;
         toxicity += self.config.regime_weight * regime_signal;
 
         // === Changepoint Probability ===
         // High changepoint prob = regime shift in progress = higher toxicity
+        // Symmetric for both sides: regime shifts are dangerous regardless of direction
         toxicity += self.config.changepoint_weight * self.changepoint_prob;
 
         // === Funding Rate ===
-        // Extreme funding = crowd positioning = potential reversal = toxic
-        let funding_signal =
-            (self.funding_rate.abs() / self.config.funding_threshold).clamp(0.0, 1.0);
+        // Extreme funding = crowd positioned one way = potential reversal = toxic
+        //
+        // DIRECTIONAL: Funding affects sides differently!
+        // Positive funding = longs pay shorts = crowd is long = price may drop
+        // Negative funding = shorts pay longs = crowd is short = price may rise
+        //
+        // For bids: positive funding is MORE toxic (crowd is long, may dump)
+        // For asks: negative funding is MORE toxic (crowd is short, may squeeze)
+        let funding_signal = if is_bid {
+            // Bid toxicity: high positive funding (crowd long) is dangerous for buyers
+            (self.funding_rate / self.config.funding_threshold).clamp(0.0, 1.0)
+        } else {
+            // Ask toxicity: high negative funding (crowd short) is dangerous for sellers
+            (-self.funding_rate / self.config.funding_threshold).clamp(0.0, 1.0)
+        };
         toxicity += self.config.funding_weight * funding_signal;
 
         toxicity.clamp(0.0, 1.0)
@@ -437,6 +482,58 @@ mod tests {
         // Both should be elevated
         assert!(bid_tox > 0.1);
         assert!(ask_tox > 0.1);
+    }
+
+    #[test]
+    fn test_trade_flow_symmetric() {
+        let mut classifier = PreFillASClassifier::new();
+
+        // SYMMETRIC TEST: Buy flow should only affect bids, not asks
+        classifier.update_trade_flow(80.0, 20.0); // Strong buy flow (trade_direction ≈ +0.6)
+        let bid_tox_with_buy_flow = classifier.predict_toxicity(true);
+        let ask_tox_with_buy_flow = classifier.predict_toxicity(false);
+
+        // Bids should be toxic (we're buying with the crowd)
+        assert!(bid_tox_with_buy_flow > 0.1, "Buy flow should make bids toxic");
+        // Asks should NOT be elevated from buy flow alone
+        // (only from regime/changepoint which are symmetric)
+
+        // SYMMETRIC TEST: Sell flow should only affect asks, not bids
+        classifier.update_trade_flow(20.0, 80.0); // Strong sell flow (trade_direction ≈ -0.6)
+        let bid_tox_with_sell_flow = classifier.predict_toxicity(true);
+        let ask_tox_with_sell_flow = classifier.predict_toxicity(false);
+
+        // Asks should be toxic (we're selling with the crowd)
+        assert!(ask_tox_with_sell_flow > 0.1, "Sell flow should make asks toxic");
+        // Buy flow contribution to bid should be gone now
+        assert!(bid_tox_with_sell_flow < bid_tox_with_buy_flow,
+            "Sell flow should reduce bid toxicity vs buy flow");
+    }
+
+    #[test]
+    fn test_funding_directional() {
+        let mut classifier = PreFillASClassifier::new();
+
+        // Positive funding = longs pay shorts = crowd is long
+        classifier.update_funding(0.001); // High positive funding
+
+        let bid_tox_pos_funding = classifier.predict_toxicity(true);
+        let ask_tox_pos_funding = classifier.predict_toxicity(false);
+
+        // Positive funding should make bids more toxic (crowd is long, may dump)
+        // Asks should be less affected (or safe - crowd is long, not short)
+        assert!(bid_tox_pos_funding > ask_tox_pos_funding,
+            "Positive funding should make bids more toxic than asks");
+
+        // Negative funding = shorts pay longs = crowd is short
+        classifier.update_funding(-0.001); // High negative funding
+
+        let bid_tox_neg_funding = classifier.predict_toxicity(true);
+        let ask_tox_neg_funding = classifier.predict_toxicity(false);
+
+        // Negative funding should make asks more toxic (crowd is short, may squeeze)
+        assert!(ask_tox_neg_funding > bid_tox_neg_funding,
+            "Negative funding should make asks more toxic than bids");
     }
 
     #[test]

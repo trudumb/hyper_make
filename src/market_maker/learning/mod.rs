@@ -36,7 +36,7 @@ pub mod types;
 
 // Re-export key types
 pub use adaptive_ensemble::{AdaptiveEnsemble, EnsembleSummary, ModelPerformance};
-pub use confidence::{AggregateConfidence, ModelConfidenceTracker};
+pub use confidence::{AggregateConfidence, EdgeBiasSummary, EdgeBiasTracker, ModelConfidenceTracker};
 pub use decision::DecisionEngine;
 pub use ensemble::{EdgeModel, ModelEnsemble};
 pub use execution::ExecutionOptimizer;

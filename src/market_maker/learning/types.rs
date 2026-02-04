@@ -229,6 +229,19 @@ impl ModelHealth {
             Health::Good
         };
     }
+
+    /// Convert overall health to a score [0.0, 1.0].
+    ///
+    /// - Good: 1.0 (full trust)
+    /// - Warning: 0.5 (partial trust)
+    /// - Degraded: 0.0 (no trust)
+    pub fn to_score(&self) -> f64 {
+        match self.overall {
+            Health::Good => 1.0,
+            Health::Warning => 0.5,
+            Health::Degraded => 0.0,
+        }
+    }
 }
 
 /// Calibration score for model predictions.

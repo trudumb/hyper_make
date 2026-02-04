@@ -1465,6 +1465,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         market_params.competitor_spread_factor = competitor_summary.competition_spread_factor;
         market_params.competitor_count = competitor_summary.n_competitors;
 
+        // === L2 WIRING: Get learning module output for Quote Gate ===
+        // This provides p_positive_edge and model_health for hierarchical fusion.
+        // Previously this was only computed inside the controller block, but Quote Gate
+        // needs it for better decision making.
+        let l2_output = if self.learning.is_enabled() {
+            // Calculate drawdown from PnL summary
+            let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+            let current_drawdown = if pnl_summary.peak_pnl > 0.0 {
+                (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
+            } else {
+                0.0
+            };
+            Some(self.learning.output(
+                &market_params,
+                self.position.position(),
+                current_drawdown,
+            ))
+        } else {
+            None
+        };
+
+        // Extract L2 values for Quote Gate, with safety net check
+        let (l2_p_positive, l2_health_score) = if let Some(ref output) = l2_output {
+            // Check edge bias safety net - if bias is critical, don't trust L2
+            let bias_summary = self.learning.confidence_tracker().edge_bias_summary();
+            if bias_summary.should_halt {
+                warn!(
+                    mean_bias_bps = %format!("{:.2}", bias_summary.mean_bias_bps),
+                    "L2 edge bias critical - setting l2_model_health to 0"
+                );
+                (Some(output.p_positive_edge), 0.0) // Keep p_positive but zero health
+            } else {
+                (Some(output.p_positive_edge), output.model_health.to_score())
+            }
+        } else {
+            (None, 0.0)
+        };
+
         let quote_gate_input = QuoteGateInput {
             flow_imbalance: market_params.flow_imbalance,
             momentum_confidence: market_params.p_momentum_continue,
@@ -1483,9 +1521,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             enhanced_flow,
             mc_ev_bps,
             // Hierarchical Edge Belief (L2/L3 Fusion)
-            // L2 inputs from learning module - TODO: wire from decision_engine
-            l2_p_positive_edge: None, // Will be populated when L2 is integrated
-            l2_model_health: 0.0,     // Default unhealthy until wired
+            // L2 inputs from learning module - NOW WIRED!
+            l2_p_positive_edge: l2_p_positive,
+            l2_model_health: l2_health_score,
             // L3 inputs from stochastic controller
             l3_trust: market_params.bootstrap_confidence.min(1.0),
             l3_belief: if market_params.should_quote_edge {
@@ -1542,6 +1580,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Phase 6: Pass centralized belief snapshot for unified decision making
             beliefs: Some(belief_snapshot.clone()),
         };
+
+        // Log L2 wiring status periodically (every 100 cycles or when p_positive is significant)
+        if let Some(l2_p) = l2_p_positive {
+            if (l2_p - 0.5).abs() > 0.05 || self.learning.pending_predictions_count() % 100 == 0 {
+                debug!(
+                    l2_p_positive_edge = %format!("{:.3}", l2_p),
+                    l2_model_health = %format!("{:.2}", l2_health_score),
+                    "L2 learning module wired to quote gate"
+                );
+            }
+        }
 
         // Use calibrated decision with theoretical fallback if enabled, otherwise use legacy thresholds
         // IMPORTANT: Only use changepoint probability after BOCD warmup to avoid

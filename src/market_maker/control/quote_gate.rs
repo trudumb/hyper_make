@@ -1245,16 +1245,33 @@ impl QuoteGate {
                 } else {
                     QuoteDecision::QuoteOnlyBids { urgency }
                 }
-            } else if self.config.quote_flat_without_edge || has_significant_position {
-                // MARKET MAKING MODE OR moderate position: Quote both sides.
-                // Let gamma modulation via position_direction_confidence handle the risk.
-                // - Informed positions get tight two-sided quotes
-                // - Adverse positions get wide quotes with natural inventory skew
+            } else if has_significant_position {
+                // Moderate position: Quote both sides, let gamma modulation handle risk.
                 debug!(
                     flow_imbalance = %format!("{:.3}", input.flow_imbalance),
                     momentum_conf = %format!("{:.2}", input.momentum_confidence),
                     has_significant_position = has_significant_position,
-                    "Quote gate: quoting both (gamma modulation handles risk)"
+                    "Quote gate: quoting both (has position, gamma handles risk)"
+                );
+                QuoteDecision::QuoteBoth
+            } else if self.should_use_directional_mode(input) {
+                // REGIME-AWARE: Strong trending market detected via L2 confirmation.
+                // Switch to directional mode even if quote_flat_without_edge is true.
+                info!(
+                    flow_imbalance = %format!("{:.3}", input.flow_imbalance),
+                    l2_p_positive = input.l2_p_positive_edge.map_or("N/A".to_string(), |p| format!("{:.3}", p)),
+                    "Quote gate: DIRECTIONAL MODE (strong trend confirmed by L2)"
+                );
+                QuoteDecision::NoQuote {
+                    reason: NoQuoteReason::NoEdgeFlat,
+                }
+            } else if self.config.quote_flat_without_edge {
+                // MARKET MAKING MODE: Quote both sides.
+                // Let gamma modulation via position_direction_confidence handle the risk.
+                debug!(
+                    flow_imbalance = %format!("{:.3}", input.flow_imbalance),
+                    momentum_conf = %format!("{:.2}", input.momentum_confidence),
+                    "Quote gate: quoting both (market making mode)"
                 );
                 QuoteDecision::QuoteBoth
             } else {
@@ -1314,6 +1331,63 @@ impl QuoteGate {
         }
 
         decision
+    }
+
+    // =========================================================================
+    // Regime-Aware Mode Detection
+    // =========================================================================
+
+    /// Check if we should switch to directional mode even when quote_flat_without_edge is true.
+    ///
+    /// This triggers when:
+    /// 1. Flow imbalance is strong (|flow_imbalance| > 0.5)
+    /// 2. L2 confirms the trend (p_positive_edge far from 0.5)
+    ///
+    /// The insight: when both L1 (flow imbalance) and L2 (learning module) agree
+    /// on a strong directional bias, we're likely in a trending market where
+    /// market-making will be picked off. Better to wait for signal than get run over.
+    fn should_use_directional_mode(&self, input: &QuoteGateInput) -> bool {
+        // Threshold for strong flow imbalance
+        const STRONG_FLOW_THRESHOLD: f64 = 0.5;
+        // Threshold for L2 confirmation (how far p_positive must be from 0.5)
+        const L2_CONFIRMATION_THRESHOLD: f64 = 0.15; // |p - 0.5| > 0.15
+        // Minimum L2 health to trust its signal
+        const MIN_L2_HEALTH: f64 = 0.5;
+
+        // Check if flow imbalance is strong
+        let strong_flow = input.flow_imbalance.abs() > STRONG_FLOW_THRESHOLD;
+        if !strong_flow {
+            return false;
+        }
+
+        // Check if L2 is healthy enough to trust
+        if input.l2_model_health < MIN_L2_HEALTH {
+            return false;
+        }
+
+        // Check if L2 confirms the trend direction
+        if let Some(l2_p) = input.l2_p_positive_edge {
+            let l2_directional_strength = (l2_p - 0.5).abs();
+            let l2_confirms = l2_directional_strength > L2_CONFIRMATION_THRESHOLD;
+
+            // L2 direction should match flow direction
+            let l2_bullish = l2_p > 0.5;
+            let flow_bullish = input.flow_imbalance > 0.0;
+            let direction_match = l2_bullish == flow_bullish;
+
+            if l2_confirms && direction_match {
+                debug!(
+                    flow_imbalance = %format!("{:.3}", input.flow_imbalance),
+                    l2_p_positive = %format!("{:.3}", l2_p),
+                    l2_directional_strength = %format!("{:.3}", l2_directional_strength),
+                    l2_model_health = %format!("{:.2}", input.l2_model_health),
+                    "Regime detection: L2 confirms strong trend → directional mode"
+                );
+                return true;
+            }
+        }
+
+        false
     }
 
     // =========================================================================

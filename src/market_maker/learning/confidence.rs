@@ -3,7 +3,162 @@
 //! Tracks prediction accuracy over time for each model component.
 //! Detects when the model is breaking down based on calibration scores.
 
+use std::collections::VecDeque;
+
 use super::types::{CalibrationScore, Health, ModelHealth, RingBuffer};
+
+// =============================================================================
+// Edge Bias Tracker (Safety Net for Systematic Edge Miscalibration)
+// =============================================================================
+
+/// Tracks edge prediction bias to detect systematic miscalibration.
+///
+/// This is a SAFETY NET: when the system is consistently losing money
+/// (predicted edge - realized edge < -2 bps on average), halt quoting.
+///
+/// # Why This Matters
+/// IR can be > 1.0 (directionally correct) while still losing money if
+/// the magnitude calibration is wrong. This tracker catches that case.
+///
+/// # Example
+/// - Predicted: +0.02 bps edge
+/// - Realized: -16.78 bps edge
+/// - Bias: 0.02 - (-16.78) = 16.8 bps overestimate (dangerous!)
+#[derive(Debug, Clone)]
+pub struct EdgeBiasTracker {
+    /// Recent bias values (predicted - realized)
+    recent_bias: VecDeque<f64>,
+    /// Window size for tracking
+    window_size: usize,
+    /// Minimum samples before halting can be triggered
+    min_samples_for_halt: usize,
+    /// Bias threshold in bps (more negative = worse)
+    halt_threshold_bps: f64,
+}
+
+impl Default for EdgeBiasTracker {
+    fn default() -> Self {
+        Self::new(50, 20, -2.0)
+    }
+}
+
+impl EdgeBiasTracker {
+    /// Create a new edge bias tracker.
+    ///
+    /// # Arguments
+    /// * `window_size` - Number of recent fills to track
+    /// * `min_samples_for_halt` - Minimum samples before halt can trigger
+    /// * `halt_threshold_bps` - Mean bias threshold for halting (negative = losing)
+    pub fn new(window_size: usize, min_samples_for_halt: usize, halt_threshold_bps: f64) -> Self {
+        Self {
+            recent_bias: VecDeque::with_capacity(window_size),
+            window_size,
+            min_samples_for_halt,
+            halt_threshold_bps,
+        }
+    }
+
+    /// Record a new edge prediction/realization pair.
+    ///
+    /// # Arguments
+    /// * `predicted_edge_bps` - The predicted edge at fill time
+    /// * `realized_edge_bps` - The realized edge after measurement horizon
+    pub fn record(&mut self, predicted_edge_bps: f64, realized_edge_bps: f64) {
+        let bias = predicted_edge_bps - realized_edge_bps;
+
+        if self.recent_bias.len() >= self.window_size {
+            self.recent_bias.pop_front();
+        }
+        self.recent_bias.push_back(bias);
+    }
+
+    /// Get the mean bias over the recent window.
+    ///
+    /// Positive bias = overestimating edge (predicting better than realized)
+    /// Negative bias = underestimating edge (predicting worse than realized, actually good!)
+    pub fn mean_bias(&self) -> f64 {
+        if self.recent_bias.is_empty() {
+            return 0.0;
+        }
+        self.recent_bias.iter().sum::<f64>() / self.recent_bias.len() as f64
+    }
+
+    /// Get the standard deviation of bias.
+    pub fn bias_std(&self) -> f64 {
+        if self.recent_bias.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.mean_bias();
+        let variance = self.recent_bias.iter()
+            .map(|b| (b - mean).powi(2))
+            .sum::<f64>() / (self.recent_bias.len() - 1) as f64;
+        variance.sqrt()
+    }
+
+    /// Check if quoting should be halted due to systematic edge overestimation.
+    ///
+    /// Returns true if:
+    /// 1. We have enough samples (>= min_samples_for_halt)
+    /// 2. Mean bias > -halt_threshold_bps (i.e., we're overestimating edge)
+    ///
+    /// Note: Large POSITIVE bias means we predict higher edge than realized,
+    /// which means we're systematically losing money.
+    pub fn should_halt_quoting(&self) -> bool {
+        if self.recent_bias.len() < self.min_samples_for_halt {
+            return false;
+        }
+
+        // Positive mean_bias means: predicted > realized, so we're overestimating
+        // We halt when overestimate is severe (mean_bias > |halt_threshold_bps|)
+        // Since halt_threshold_bps is negative (-2.0), we check if bias > 2.0
+        self.mean_bias() > -self.halt_threshold_bps
+    }
+
+    /// Check if the edge bias is in warning territory (close to halt).
+    pub fn is_warning(&self) -> bool {
+        if self.recent_bias.len() < self.min_samples_for_halt / 2 {
+            return false;
+        }
+        // Warning at 50% of halt threshold
+        self.mean_bias() > -self.halt_threshold_bps * 0.5
+    }
+
+    /// Get the number of samples tracked.
+    pub fn sample_count(&self) -> usize {
+        self.recent_bias.len()
+    }
+
+    /// Get summary for logging.
+    pub fn summary(&self) -> EdgeBiasSummary {
+        EdgeBiasSummary {
+            mean_bias_bps: self.mean_bias(),
+            bias_std_bps: self.bias_std(),
+            sample_count: self.recent_bias.len(),
+            should_halt: self.should_halt_quoting(),
+            is_warning: self.is_warning(),
+        }
+    }
+
+    /// Clear all tracked bias data.
+    pub fn clear(&mut self) {
+        self.recent_bias.clear();
+    }
+}
+
+/// Summary of edge bias tracker state.
+#[derive(Debug, Clone)]
+pub struct EdgeBiasSummary {
+    /// Mean bias in bps (positive = overestimating edge)
+    pub mean_bias_bps: f64,
+    /// Standard deviation of bias
+    pub bias_std_bps: f64,
+    /// Number of samples in window
+    pub sample_count: usize,
+    /// Whether halt condition is triggered
+    pub should_halt: bool,
+    /// Whether in warning territory
+    pub is_warning: bool,
+}
 
 // =============================================================================
 // Aggregate Confidence for Proactive Position Management
@@ -213,6 +368,7 @@ pub struct EdgePrediction {
 /// - `vol_rmse`: Should be < 2× predicted uncertainty
 /// - `as_bias`: Positive = underestimating AS (dangerous)
 /// - `edge_calibration.error`: Should be < 0.5 bps
+/// - `edge_bias_tracker`: Safety net for systematic edge miscalibration
 pub struct ModelConfidenceTracker {
     // === Volatility predictions ===
     vol_predictions: RingBuffer<VolPrediction>,
@@ -231,6 +387,10 @@ pub struct ModelConfidenceTracker {
     // === Edge predictions ===
     edge_predictions: RingBuffer<EdgePrediction>,
     edge_calibration: CalibrationScore,
+
+    // === Edge Bias Safety Net ===
+    /// Tracks edge prediction bias for halt decisions
+    edge_bias_tracker: EdgeBiasTracker,
 
     // === Configuration ===
     /// Maximum AS bias before warning (bps)
@@ -261,6 +421,8 @@ impl ModelConfidenceTracker {
             as_bias: 0.0,
             edge_predictions: RingBuffer::new(1000),
             edge_calibration: CalibrationScore::default(),
+            // Edge bias safety net: 50 samples, 20 min for halt, -2 bps threshold
+            edge_bias_tracker: EdgeBiasTracker::new(50, 20, -2.0),
             max_as_bias_warning: 0.5,  // 0.5 bps
             max_as_bias_degraded: 1.0, // 1.0 bps
             max_edge_error: 0.5,       // 0.5 bps
@@ -308,6 +470,25 @@ impl ModelConfidenceTracker {
         };
         self.edge_predictions.push(pred);
         self.update_edge_metrics();
+
+        // Update edge bias safety net tracker
+        self.edge_bias_tracker.record(predicted_edge_bps, realized_pnl_bps);
+
+        // Log warning if bias is getting bad
+        let bias_summary = self.edge_bias_tracker.summary();
+        if bias_summary.should_halt {
+            tracing::error!(
+                mean_bias_bps = %format!("{:.2}", bias_summary.mean_bias_bps),
+                sample_count = bias_summary.sample_count,
+                "EDGE BIAS CRITICAL: Systematic edge overestimation - halting quotes recommended"
+            );
+        } else if bias_summary.is_warning {
+            tracing::warn!(
+                mean_bias_bps = %format!("{:.2}", bias_summary.mean_bias_bps),
+                sample_count = bias_summary.sample_count,
+                "Edge bias warning: Approaching halt threshold"
+            );
+        }
     }
 
     /// Update volatility metrics.
@@ -518,6 +699,31 @@ impl ModelConfidenceTracker {
     pub fn n_edge_observations(&self) -> usize {
         self.edge_predictions.len()
     }
+
+    // === Edge Bias Safety Net ===
+
+    /// Check if quoting should be halted due to systematic edge overestimation.
+    ///
+    /// This is a SAFETY NET: returns true when the system is consistently
+    /// losing money (predicted - realized > 2 bps on average).
+    pub fn should_halt_quoting(&self) -> bool {
+        self.edge_bias_tracker.should_halt_quoting()
+    }
+
+    /// Check if edge bias is in warning territory.
+    pub fn edge_bias_warning(&self) -> bool {
+        self.edge_bias_tracker.is_warning()
+    }
+
+    /// Get edge bias tracker summary for diagnostics.
+    pub fn edge_bias_summary(&self) -> EdgeBiasSummary {
+        self.edge_bias_tracker.summary()
+    }
+
+    /// Get the edge bias tracker for direct access.
+    pub fn edge_bias_tracker(&self) -> &EdgeBiasTracker {
+        &self.edge_bias_tracker
+    }
 }
 
 #[cfg(test)]
@@ -660,5 +866,113 @@ mod tests {
         let health = tracker.model_health();
         // Well-calibrated high-probability predictions should be good
         assert_eq!(health.fill_rate, Health::Good);
+    }
+
+    // =============================================================================
+    // EdgeBiasTracker Tests
+    // =============================================================================
+
+    #[test]
+    fn test_edge_bias_tracker_empty() {
+        let tracker = EdgeBiasTracker::default();
+        assert_eq!(tracker.mean_bias(), 0.0);
+        assert!(!tracker.should_halt_quoting());
+        assert!(!tracker.is_warning());
+    }
+
+    #[test]
+    fn test_edge_bias_tracker_no_halt_insufficient_samples() {
+        let mut tracker = EdgeBiasTracker::new(50, 20, -2.0);
+
+        // Add only 10 samples with bad bias
+        for _ in 0..10 {
+            tracker.record(5.0, -10.0); // Predicted +5, realized -10, bias = +15
+        }
+
+        // Should not halt because not enough samples
+        assert!(!tracker.should_halt_quoting());
+        assert_eq!(tracker.sample_count(), 10);
+    }
+
+    #[test]
+    fn test_edge_bias_tracker_halt_on_overestimation() {
+        let mut tracker = EdgeBiasTracker::new(50, 20, -2.0);
+
+        // Add 25 samples with consistent overestimation
+        // Predicted +5 bps, realized -10 bps → bias = +15 bps (bad!)
+        for _ in 0..25 {
+            tracker.record(5.0, -10.0);
+        }
+
+        // Mean bias = +15, which exceeds threshold of +2 (abs of -2)
+        assert!(tracker.mean_bias() > 2.0);
+        assert!(tracker.should_halt_quoting());
+    }
+
+    #[test]
+    fn test_edge_bias_tracker_no_halt_good_calibration() {
+        let mut tracker = EdgeBiasTracker::new(50, 20, -2.0);
+
+        // Add 25 samples with good calibration (small bias)
+        for i in 0..25 {
+            let noise = ((i % 3) as f64 - 1.0) * 0.5; // -0.5, 0, 0.5
+            tracker.record(2.0 + noise, 2.0); // Nearly perfect prediction
+        }
+
+        // Mean bias should be close to 0
+        assert!(tracker.mean_bias().abs() < 1.0);
+        assert!(!tracker.should_halt_quoting());
+    }
+
+    #[test]
+    fn test_edge_bias_tracker_warning_threshold() {
+        let mut tracker = EdgeBiasTracker::new(50, 20, -2.0);
+
+        // Add samples with moderate overestimation (warning but not halt)
+        // Bias of ~1.5 bps (above 50% of 2.0 threshold but below 2.0)
+        for _ in 0..15 {
+            tracker.record(3.0, 1.5); // Bias = 1.5
+        }
+
+        // Should be in warning (>= 10 samples, bias > 1.0)
+        assert!(tracker.is_warning());
+        assert!(!tracker.should_halt_quoting()); // Not enough samples for halt
+    }
+
+    #[test]
+    fn test_edge_bias_tracker_sliding_window() {
+        let mut tracker = EdgeBiasTracker::new(10, 5, -2.0);
+
+        // Fill with bad predictions first
+        for _ in 0..10 {
+            tracker.record(10.0, 0.0); // Bias = +10
+        }
+        assert!(tracker.should_halt_quoting());
+
+        // Now add good predictions to push out bad ones
+        for _ in 0..10 {
+            tracker.record(1.0, 1.0); // Bias = 0
+        }
+
+        // Window should now only have good predictions
+        assert!(tracker.mean_bias().abs() < 1.0);
+        assert!(!tracker.should_halt_quoting());
+    }
+
+    #[test]
+    fn test_edge_bias_integrated_with_confidence_tracker() {
+        let mut tracker = ModelConfidenceTracker::new();
+
+        // Record many fills with consistent overestimation
+        for _ in 0..25 {
+            tracker.record_edge_prediction(5.0, 1.0, -10.0); // Big overestimate
+        }
+
+        // Should trigger halt
+        assert!(tracker.should_halt_quoting());
+
+        let summary = tracker.edge_bias_summary();
+        assert!(summary.mean_bias_bps > 10.0); // +15 bps bias
+        assert!(summary.should_halt);
     }
 }
