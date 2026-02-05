@@ -46,6 +46,9 @@ pub struct VpinConfig {
     /// Smaller buckets = more responsive, noisier.
     /// Larger buckets = smoother, slower to react.
     /// Default: 1.0 (1 BTC or equivalent)
+    ///
+    /// NOTE: If adaptive_enabled is true, this becomes the initial bucket volume
+    /// which is then dynamically adjusted based on observed trading activity.
     pub bucket_volume: f64,
 
     /// Number of buckets in rolling window.
@@ -66,6 +69,38 @@ pub struct VpinConfig {
     /// If false, uses bulk volume classification (price vs mid).
     /// Default: false (use bulk classification)
     pub use_tick_rule: bool,
+
+    /// Enable adaptive bucket sizing based on trading volume.
+    /// When enabled, bucket_volume is dynamically adjusted to target
+    /// approximately equal-time buckets (per Easley, Lopez de Prado, O'Hara).
+    /// Default: false
+    pub adaptive_enabled: bool,
+
+    /// Target average time per bucket in seconds.
+    /// The algorithm adjusts bucket_volume to achieve this target.
+    /// Academic default: 30-60 seconds per bucket.
+    /// Default: 30.0
+    pub target_bucket_seconds: f64,
+
+    /// EWMA alpha for volume rate estimation.
+    /// Lower = smoother adaptation, higher = faster response.
+    /// Default: 0.1
+    pub volume_rate_alpha: f64,
+
+    /// Minimum bucket volume as fraction of initial.
+    /// Prevents buckets from becoming too small (noisy).
+    /// Default: 0.05 (5% of initial)
+    pub min_bucket_multiplier: f64,
+
+    /// Maximum bucket volume as fraction of initial.
+    /// Prevents buckets from becoming too large (unresponsive).
+    /// Default: 20.0 (20x initial)
+    pub max_bucket_multiplier: f64,
+
+    /// Minimum buckets before adaptive sizing kicks in.
+    /// Allows warm-up period with initial bucket size.
+    /// Default: 10
+    pub adaptive_warmup_buckets: usize,
 }
 
 impl Default for VpinConfig {
@@ -76,6 +111,13 @@ impl Default for VpinConfig {
             velocity_alpha: 0.1,
             min_trades_per_bucket: 5,
             use_tick_rule: false,
+            // Adaptive bucket sizing (disabled by default for backward compatibility)
+            adaptive_enabled: false,
+            target_bucket_seconds: 30.0,
+            volume_rate_alpha: 0.1,
+            min_bucket_multiplier: 0.05,
+            max_bucket_multiplier: 20.0,
+            adaptive_warmup_buckets: 10,
         }
     }
 }
@@ -109,6 +151,30 @@ impl VpinConfig {
             velocity_alpha: 0.2,
             min_trades_per_bucket: 2,
             ..Default::default()
+        }
+    }
+
+    /// Config with adaptive bucket sizing enabled.
+    ///
+    /// This is the recommended config for production use as it
+    /// automatically calibrates bucket size to market conditions.
+    ///
+    /// # Arguments
+    /// * `initial_bucket_volume` - Starting bucket size (will be adapted)
+    /// * `target_bucket_seconds` - Target time per bucket (30-60s recommended)
+    pub fn adaptive(initial_bucket_volume: f64, target_bucket_seconds: f64) -> Self {
+        Self {
+            bucket_volume: initial_bucket_volume,
+            n_buckets: 50,
+            min_trades_per_bucket: 3,
+            velocity_alpha: 0.1,
+            use_tick_rule: false,
+            adaptive_enabled: true,
+            target_bucket_seconds,
+            volume_rate_alpha: 0.1,
+            min_bucket_multiplier: 0.05,
+            max_bucket_multiplier: 20.0,
+            adaptive_warmup_buckets: 10,
         }
     }
 }
@@ -176,11 +242,25 @@ pub struct VpinEstimator {
 
     /// Last trade price (for tick rule)
     last_price: Option<f64>,
+
+    // === Adaptive bucket sizing state ===
+    /// Initial bucket volume (used for clamping)
+    initial_bucket_volume: f64,
+
+    /// EWMA of volume rate (volume per second)
+    volume_rate_ewma: f64,
+
+    /// Start timestamp of current bucket (for duration calculation)
+    current_bucket_start_ms: u64,
+
+    /// Current effective bucket volume (may be adapted)
+    effective_bucket_volume: f64,
 }
 
 impl VpinEstimator {
     /// Create a new VPIN estimator.
     pub fn new(config: VpinConfig) -> Self {
+        let initial_bucket_volume = config.bucket_volume;
         Self {
             buckets: VecDeque::with_capacity(config.n_buckets + 1),
             current_buy_volume: 0.0,
@@ -192,6 +272,11 @@ impl VpinEstimator {
             total_buckets: 0,
             last_trade_ms: 0,
             last_price: None,
+            // Adaptive state
+            initial_bucket_volume,
+            volume_rate_ewma: 0.0,
+            current_bucket_start_ms: 0,
+            effective_bucket_volume: initial_bucket_volume,
             config,
         }
     }
@@ -216,6 +301,11 @@ impl VpinEstimator {
             return None;
         }
 
+        // Track bucket start time for adaptive sizing
+        if self.current_bucket_start_ms == 0 {
+            self.current_bucket_start_ms = timestamp_ms;
+        }
+
         // Classify as buy or sell
         let is_buy = self.classify_trade(price, mid);
 
@@ -229,24 +319,34 @@ impl VpinEstimator {
         self.last_trade_ms = timestamp_ms;
         self.last_price = Some(price);
 
+        // Use effective bucket volume (may be adapted)
+        let bucket_volume = self.effective_bucket_volume;
+
         // Check if bucket is complete
         let mut bucket_completed = false;
-        while self.current_total_volume >= self.config.bucket_volume {
+        while self.current_total_volume >= bucket_volume {
             // How much volume goes into this bucket?
-            let overflow = self.current_total_volume - self.config.bucket_volume;
+            let overflow = self.current_total_volume - bucket_volume;
 
             // Proportionally split buy volume if there's overflow
             let bucket_buy = if overflow > 1e-12 {
-                let bucket_frac = self.config.bucket_volume / self.current_total_volume;
+                let bucket_frac = bucket_volume / self.current_total_volume;
                 self.current_buy_volume * bucket_frac
             } else {
                 self.current_buy_volume
             };
 
+            // Calculate bucket duration for adaptive sizing
+            let bucket_duration_ms = if self.current_bucket_start_ms > 0 {
+                timestamp_ms.saturating_sub(self.current_bucket_start_ms)
+            } else {
+                0
+            };
+
             // Complete the bucket
             let bucket = Bucket {
                 buy_volume: bucket_buy,
-                total_volume: self.config.bucket_volume,
+                total_volume: bucket_volume,
                 n_trades: self.current_n_trades,
                 completed_at_ms: timestamp_ms,
             };
@@ -259,6 +359,11 @@ impl VpinEstimator {
             self.total_buckets += 1;
             bucket_completed = true;
 
+            // Update adaptive bucket sizing
+            if self.config.adaptive_enabled && bucket_duration_ms > 0 {
+                self.update_adaptive_bucket_size(bucket_duration_ms, bucket_volume);
+            }
+
             // Carry over excess to next bucket
             if overflow > 1e-12 {
                 let overflow_frac = overflow / self.current_total_volume;
@@ -270,6 +375,9 @@ impl VpinEstimator {
                 self.current_total_volume = 0.0;
                 self.current_n_trades = 0;
             }
+
+            // Reset bucket start time for next bucket
+            self.current_bucket_start_ms = timestamp_ms;
         }
 
         if bucket_completed {
@@ -285,6 +393,46 @@ impl VpinEstimator {
         } else {
             None
         }
+    }
+
+    /// Update adaptive bucket size based on observed bucket duration.
+    ///
+    /// The goal is to maintain approximately equal-time buckets by adjusting
+    /// volume to match the target duration.
+    fn update_adaptive_bucket_size(&mut self, bucket_duration_ms: u64, bucket_volume: f64) {
+        // Convert to seconds
+        let duration_secs = bucket_duration_ms as f64 / 1000.0;
+
+        // Estimate volume rate (volume per second)
+        let volume_rate = if duration_secs > 0.001 {
+            bucket_volume / duration_secs
+        } else {
+            return; // Skip pathologically short buckets
+        };
+
+        // Update EWMA of volume rate
+        let alpha = self.config.volume_rate_alpha;
+        if self.volume_rate_ewma <= 0.0 {
+            // First update - initialize directly
+            self.volume_rate_ewma = volume_rate;
+        } else {
+            self.volume_rate_ewma = alpha * volume_rate + (1.0 - alpha) * self.volume_rate_ewma;
+        }
+
+        // Only adapt after warmup period
+        if self.total_buckets < self.config.adaptive_warmup_buckets as u64 {
+            return;
+        }
+
+        // Calculate target bucket volume to achieve target duration
+        // bucket_volume = volume_rate × target_seconds
+        let target_bucket_volume = self.volume_rate_ewma * self.config.target_bucket_seconds;
+
+        // Clamp to min/max multipliers of initial bucket volume
+        let min_volume = self.initial_bucket_volume * self.config.min_bucket_multiplier;
+        let max_volume = self.initial_bucket_volume * self.config.max_bucket_multiplier;
+
+        self.effective_bucket_volume = target_bucket_volume.clamp(min_volume, max_volume);
     }
 
     /// Classify trade as buy or sell.
@@ -397,7 +545,7 @@ impl VpinEstimator {
 
     /// Get current bucket fill percentage [0, 1].
     pub fn current_bucket_fill(&self) -> f64 {
-        self.current_total_volume / self.config.bucket_volume
+        self.current_total_volume / self.effective_bucket_volume
     }
 
     /// Get configuration.
@@ -417,6 +565,10 @@ impl VpinEstimator {
         self.total_buckets = 0;
         self.last_trade_ms = 0;
         self.last_price = None;
+        // Reset adaptive state
+        self.volume_rate_ewma = 0.0;
+        self.current_bucket_start_ms = 0;
+        self.effective_bucket_volume = self.initial_bucket_volume;
     }
 
     /// Get recent bucket imbalances for diagnostics.
@@ -430,9 +582,44 @@ impl VpinEstimator {
     }
 
     /// Update bucket volume (for adaptive sizing).
+    /// Note: This updates the base/initial bucket volume.
+    /// If adaptive sizing is enabled, the effective volume will be adjusted
+    /// based on trading activity.
     pub fn set_bucket_volume(&mut self, bucket_volume: f64) {
         if bucket_volume > 0.0 {
             self.config.bucket_volume = bucket_volume;
+            self.initial_bucket_volume = bucket_volume;
+            self.effective_bucket_volume = bucket_volume;
+        }
+    }
+
+    // === Adaptive sizing diagnostics ===
+
+    /// Get current effective bucket volume.
+    /// This may differ from config.bucket_volume if adaptive sizing is enabled.
+    pub fn effective_bucket_volume(&self) -> f64 {
+        self.effective_bucket_volume
+    }
+
+    /// Get estimated volume rate (volume per second).
+    /// Returns 0.0 if not enough data.
+    pub fn volume_rate(&self) -> f64 {
+        self.volume_rate_ewma
+    }
+
+    /// Check if adaptive sizing is enabled and active.
+    pub fn is_adaptive_active(&self) -> bool {
+        self.config.adaptive_enabled
+            && self.total_buckets >= self.config.adaptive_warmup_buckets as u64
+    }
+
+    /// Get the adaptation ratio: effective_bucket_volume / initial_bucket_volume.
+    /// Values > 1.0 mean buckets have grown (high volume), < 1.0 means shrunk.
+    pub fn adaptation_ratio(&self) -> f64 {
+        if self.initial_bucket_volume > 0.0 {
+            self.effective_bucket_volume / self.initial_bucket_volume
+        } else {
+            1.0
         }
     }
 }

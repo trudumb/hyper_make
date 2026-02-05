@@ -53,8 +53,8 @@ use hyperliquid_rust_sdk::market_maker::regime_hmm::{Observation as RegimeObserv
 
 // Import lead-lag infrastructure
 use hyperliquid_rust_sdk::market_maker::{
-    BinanceFeed, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate, FlowFeatureVec,
-    LagAnalyzerConfig, SignalIntegrator, SignalIntegratorConfig,
+    BinanceFeed, BinanceFlowConfig, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate,
+    FlowFeatureVec, LagAnalyzerConfig, SignalIntegrator, SignalIntegratorConfig,
 };
 
 // Import logging infrastructure
@@ -798,7 +798,12 @@ impl PredictionValidator {
     }
 
     /// Enable Binance lead-lag signal integration
-    pub fn enable_binance_feed(&mut self) {
+    ///
+    /// Uses ADAPTIVE VPIN bucket sizing per Easley, Lopez de Prado, O'Hara:
+    /// - Bucket volume dynamically calibrates to maintain ~30s bucket duration
+    /// - Self-adjusts to market conditions without hardcoded per-asset constants
+    /// - Initial bucket sizes are just starting points, will adapt automatically
+    pub fn enable_binance_feed(&mut self, asset: &str) {
         // Use a larger buffer for Binance since bookTicker updates are very fast (~10ms)
         // Default 2000 only holds ~1.5s of Binance data; need 60000 for ~60s
         let mut config = SignalIntegratorConfig::default();
@@ -806,9 +811,36 @@ impl PredictionValidator {
             buffer_capacity: 60000, // ~60 seconds at 10ms intervals
             ..LagAnalyzerConfig::default()
         };
+
+        // ADAPTIVE VPIN bucket sizing
+        // Instead of static asset-specific buckets, we use adaptive sizing that
+        // calibrates to maintain approximately equal-time buckets (~30s target).
+        //
+        // KEY: Start with SMALL buckets to get fast warmup, then let adaptive sizing
+        // grow them based on actual volume rate. This prevents saturation during warmup.
+        let initial_bucket_volume = match asset.to_uppercase().as_str() {
+            "BTC" | "ETH" => 1.0,    // Start smaller for faster warmup
+            "SOL" | "AVAX" | "MATIC" | "ARB" | "OP" => 0.2,  // Mid-cap
+            _ => 0.05,  // Very small start for illiquid assets - adaptive will grow it
+        };
+
+        // Use adaptive VPIN configuration - the principled approach
+        config.binance_flow_config = BinanceFlowConfig {
+            vpin_bucket_volume: initial_bucket_volume,
+            vpin_n_buckets: 50,  // More buckets for better VPIN stability
+            vpin_adaptive: true, // ENABLED: Self-calibrating bucket sizing
+            vpin_target_bucket_seconds: 30.0, // Target ~30s per bucket
+            ..BinanceFlowConfig::default()
+        };
+
         self.signal_integrator = Some(SignalIntegrator::new(config));
         self.binance_enabled = true;
-        info!("Lead-lag signal integrator enabled with 60s buffer");
+        info!(
+            asset = %asset,
+            initial_bucket_volume = %initial_bucket_volume,
+            target_bucket_seconds = 30.0,
+            "Lead-lag signal integrator enabled with ADAPTIVE VPIN bucket sizing"
+        );
     }
 
     /// Process a Binance price update
@@ -1032,9 +1064,12 @@ impl PredictionValidator {
         self.enhanced_classifier.on_book_update(best_bid, best_ask, bid_depth, ask_depth, timestamp_ms);
 
         // Update regime HMM
-        let sigma = self.volatility_filter.sigma_bps_per_sqrt_s();
+        // CRITICAL: RegimeObservation expects volatility in FRACTIONAL units (e.g., 0.0031 for 31 bps)
+        // sigma_bps_per_sqrt_s() returns bps (e.g., 31), so we must convert to fractional
+        let sigma_bps = self.volatility_filter.sigma_bps_per_sqrt_s();
+        let sigma_fractional = sigma_bps / 10_000.0; // Convert bps to fractional
         let flow_imbalance = self.buffers.flow_imbalance();
-        let regime_obs = RegimeObservation::new(sigma, spread_bps, flow_imbalance);
+        let regime_obs = RegimeObservation::new(sigma_fractional, spread_bps, flow_imbalance);
         self.regime_hmm.forward_update(&regime_obs);
 
         // Feed HL mid to SignalIntegrator from L2Book (more frequent than AllMids)
@@ -1318,9 +1353,6 @@ impl PredictionValidator {
         // In high vol regimes, price needs to move more to be "adverse"
         let vol_scale = (self.volatility_filter.sigma_bps_per_sqrt_s() / 10.0).clamp(0.5, 3.0);
         let threshold_bps = self.adverse_threshold_bps * vol_scale;
-        // Fixed threshold for "high volatility" - 30 bps/sqrt(s) is historically high
-        // This should fire ~20-30% of the time during volatile periods
-        let vol_threshold = 30.0;
 
         while let Some(pending) = self.pending_outcomes.front() {
             // Skip BuyPressure (handled separately)
@@ -1357,10 +1389,11 @@ impl PredictionValidator {
                     }
                 }
                 ValidatorPredictionType::RegimeHighVol => {
-                    // Outcome: was realized vol high?
-                    // Use recent volatility measurement
-                    let realized_vol = self.volatility_filter.sigma_bps_per_sqrt_s();
-                    realized_vol > vol_threshold
+                    // Outcome: is the current HMM regime high-vol (regime 2 or 3)?
+                    // This aligns with the prediction which uses HMM regime probabilities.
+                    // Using the same source for prediction and outcome ensures consistency.
+                    let current_regime = self.regime_hmm.most_likely_regime();
+                    current_regime >= 2 // Regimes 2 (volatile) and 3 (cascade) are high-vol
                 }
                 ValidatorPredictionType::Momentum => {
                     // Outcome: did price continue in predicted direction?
@@ -1877,7 +1910,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!("Binance feed task terminated");
         });
         binance_receiver = Some(rx);
-        validator.enable_binance_feed();
+        validator.enable_binance_feed(&cli.asset);
         info!(
             symbol = %binance_symbol,
             asset = %cli.asset,

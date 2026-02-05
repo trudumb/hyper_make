@@ -41,11 +41,26 @@ pub struct BinanceFlowConfig {
     /// VPIN bucket volume (in BTC equivalents).
     /// Binance has more liquidity, so larger buckets are appropriate.
     /// Default: 5.0 BTC
+    ///
+    /// NOTE: If vpin_adaptive is true, this becomes the initial bucket volume
+    /// which is then dynamically adjusted based on observed trading activity.
     pub vpin_bucket_volume: f64,
 
     /// Number of VPIN buckets in rolling window.
     /// Default: 50
     pub vpin_n_buckets: usize,
+
+    /// Enable adaptive VPIN bucket sizing.
+    /// When enabled, bucket volume is dynamically adjusted to maintain
+    /// approximately equal-time buckets (per Easley, Lopez de Prado, O'Hara).
+    /// Default: false (for backward compatibility)
+    #[serde(default)]
+    pub vpin_adaptive: bool,
+
+    /// Target average time per bucket in seconds (when adaptive is enabled).
+    /// Default: 30.0 seconds
+    #[serde(default = "default_vpin_target_seconds")]
+    pub vpin_target_bucket_seconds: f64,
 
     /// Rolling window sizes for volume imbalance (milliseconds).
     /// Default: [1000, 5000, 30000, 300000] (1s, 5s, 30s, 5m)
@@ -65,11 +80,17 @@ pub struct BinanceFlowConfig {
     pub max_trade_history: usize,
 }
 
+fn default_vpin_target_seconds() -> f64 {
+    30.0
+}
+
 impl Default for BinanceFlowConfig {
     fn default() -> Self {
         Self {
             vpin_bucket_volume: 5.0,
             vpin_n_buckets: 50,
+            vpin_adaptive: false,
+            vpin_target_bucket_seconds: 30.0,
             imbalance_windows_ms: [1000, 5000, 30000, 300_000],
             intensity_decay_rate: 2.0,
             size_ema_alpha: 0.05,
@@ -89,6 +110,24 @@ impl BinanceFlowConfig {
         Self {
             vpin_bucket_volume: 1.0,
             vpin_n_buckets: 30,
+            ..Default::default()
+        }
+    }
+
+    /// Config with adaptive VPIN bucket sizing.
+    ///
+    /// This is the recommended config for production as it
+    /// automatically calibrates bucket size to market conditions.
+    ///
+    /// # Arguments
+    /// * `initial_bucket_volume` - Starting bucket size (will be adapted)
+    /// * `target_bucket_seconds` - Target time per bucket (30-60s recommended)
+    pub fn adaptive(initial_bucket_volume: f64, target_bucket_seconds: f64) -> Self {
+        Self {
+            vpin_bucket_volume: initial_bucket_volume,
+            vpin_n_buckets: 50,
+            vpin_adaptive: true,
+            vpin_target_bucket_seconds: target_bucket_seconds,
             ..Default::default()
         }
     }
@@ -286,12 +325,31 @@ pub struct BinanceFlowAnalyzer {
 impl BinanceFlowAnalyzer {
     /// Create a new Binance flow analyzer.
     pub fn new(config: BinanceFlowConfig) -> Self {
-        let vpin_config = VpinConfig {
-            bucket_volume: config.vpin_bucket_volume,
-            n_buckets: config.vpin_n_buckets,
-            velocity_alpha: 0.1,
-            min_trades_per_bucket: 5,
-            use_tick_rule: false, // Use bulk classification
+        let vpin_config = if config.vpin_adaptive {
+            // Use adaptive VPIN configuration
+            VpinConfig {
+                bucket_volume: config.vpin_bucket_volume,
+                n_buckets: config.vpin_n_buckets,
+                velocity_alpha: 0.1,
+                min_trades_per_bucket: 3, // Lower threshold for adaptive
+                use_tick_rule: false,
+                adaptive_enabled: true,
+                target_bucket_seconds: config.vpin_target_bucket_seconds,
+                volume_rate_alpha: 0.1,
+                min_bucket_multiplier: 0.05,
+                max_bucket_multiplier: 20.0,
+                adaptive_warmup_buckets: 10,
+            }
+        } else {
+            // Static bucket sizing
+            VpinConfig {
+                bucket_volume: config.vpin_bucket_volume,
+                n_buckets: config.vpin_n_buckets,
+                velocity_alpha: 0.1,
+                min_trades_per_bucket: 5,
+                use_tick_rule: false,
+                ..VpinConfig::default()
+            }
         };
 
         Self {
