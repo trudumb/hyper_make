@@ -1736,6 +1736,42 @@ impl PredictionValidator {
             } else {
                 println!("CrossVenue: valid=false (warming up or no Binance trades)");
             }
+
+            // === New Signal Integration Diagnostics (post-degenerate-fix) ===
+            println!();
+            println!("Signal Fix Diagnostics:");
+            println!("  VPIN: value={:.3} velocity={:.3} (blended into toxicity={:.3})",
+                signals.hl_vpin,
+                signals.hl_vpin_velocity,
+                signals.toxicity_score,
+            );
+            println!("  BuyPressure: z={:.2} | skew_contribution={:.2}bps",
+                signals.buy_pressure_z,
+                signals.combined_skew_bps - if signals.lead_lag_actionable {
+                    signals.lead_lag_skew_bps * signals.skew_direction as f64
+                } else {
+                    0.0
+                },
+            );
+            println!("  Gating: lead_lag_w={:.2} informed_flow_w={:.2} | model_conf={:.2}",
+                signals.lead_lag_gating_weight,
+                signals.informed_flow_gating_weight,
+                signals.model_confidence,
+            );
+            println!("  LeadLag MI: significant={} null_p95={:.4}",
+                signals.lead_lag_significant,
+                signals.lead_lag_null_p95,
+            );
+        }
+
+        // Print HMM calibration status
+        {
+            let regime_probs = self.regime_hmm.regime_probabilities();
+            println!("RegimeHMM: calibrated={} recalibrations={} | belief=[{:.2},{:.2},{:.2},{:.2}]",
+                self.regime_hmm.is_calibrated(),
+                self.regime_hmm.recalibration_count(),
+                regime_probs[0], regime_probs[1], regime_probs[2], regime_probs[3],
+            );
         }
 
         // Print stats

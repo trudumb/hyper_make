@@ -204,10 +204,20 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 is_buy,
             });
 
+            // Wire trade to buy pressure tracker in SignalIntegrator
+            self.stochastic.signal_integrator.on_trade_for_pressure(size, is_buy);
+
             if let Some(_vpin_value) = self.stochastic.vpin.on_trade(size, trade_price, self.latest_mid, timestamp_ms) {
                 // Bucket completed - publish microstructure update to central beliefs
                 let vpin = self.stochastic.vpin.vpin();
                 let vpin_velocity = self.stochastic.vpin.vpin_velocity();
+
+                // Wire VPIN into SignalIntegrator for toxicity blending
+                self.stochastic.signal_integrator.set_vpin(
+                    vpin,
+                    vpin_velocity,
+                    self.stochastic.vpin.is_valid(),
+                );
                 let order_flow_direction = self.stochastic.vpin.order_flow_direction();
                 let vpin_buckets = self.stochastic.vpin.bucket_count();
 

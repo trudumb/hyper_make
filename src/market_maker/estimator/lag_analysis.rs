@@ -41,6 +41,16 @@ pub struct LagAnalyzerConfig {
     pub mi_k: usize,
     /// Interpolation tolerance (ms) - observations within this window are matched
     pub interpolation_tolerance_ms: i64,
+
+    /// Whether to use MI significance test (shuffle-based null distribution).
+    /// When true, MI must exceed the 95th percentile of shuffled null to be actionable.
+    /// This filters spurious MI from the KSG estimator's positive bias with small samples.
+    pub use_mi_significance_test: bool,
+    /// Number of shuffles for null distribution estimation.
+    pub n_shuffles: usize,
+    /// Significance level (percentile of null distribution MI must exceed).
+    /// 0.95 means MI must be above the 95th percentile of the shuffled null.
+    pub significance_level: f64,
 }
 
 impl Default for LagAnalyzerConfig {
@@ -56,6 +66,9 @@ impl Default for LagAnalyzerConfig {
             min_observations: 100,
             mi_k: 5,
             interpolation_tolerance_ms: 100,
+            use_mi_significance_test: true,
+            n_shuffles: 50,
+            significance_level: 0.95,
         }
     }
 }
@@ -65,6 +78,22 @@ impl Default for LagAnalyzerConfig {
 struct TimedValue {
     timestamp_ms: i64,
     value: f64,
+}
+
+/// Cached null MI distribution from shuffle test.
+///
+/// Used to determine whether observed MI is statistically significant
+/// or just an artifact of the KSG estimator's positive bias.
+#[derive(Debug, Clone)]
+struct NullMIDistribution {
+    /// 95th percentile of null MI values.
+    p95: f64,
+    /// 99th percentile of null MI values.
+    p99: f64,
+    /// Mean of null MI values.
+    mean: f64,
+    /// Number of shuffles used.
+    _n_shuffles: usize,
 }
 
 /// Lag analyzer for cross-exchange signals.
@@ -86,6 +115,15 @@ pub struct LagAnalyzer {
     observations_since_update: usize,
     /// Update frequency (recompute optimal lag every N observations)
     update_frequency: usize,
+    /// Cached null MI distribution (from shuffle test)
+    null_mi_dist: Option<NullMIDistribution>,
+    /// Total target observations received (monotonically increasing)
+    total_target_observations: usize,
+    /// Next observation count at which to recompute null distribution.
+    /// Follows logarithmic schedule: 200, 400, 800, 1600, ...
+    /// Since null MI is a property of sample size (not data content),
+    /// there's no need to recompute at fixed intervals.
+    next_null_update_at: usize,
 }
 
 impl LagAnalyzer {
@@ -93,13 +131,16 @@ impl LagAnalyzer {
     pub fn new(config: LagAnalyzerConfig) -> Self {
         let mi_estimator = MutualInfoEstimator::new(config.mi_k);
         Self {
-            config,
             signal_buffer: VecDeque::with_capacity(2000),
             target_buffer: VecDeque::with_capacity(2000),
             mi_estimator,
             cached_optimal_lag: None,
             observations_since_update: 0,
             update_frequency: 50, // Recompute every 50 observations
+            null_mi_dist: None,
+            total_target_observations: 0,
+            next_null_update_at: 200,
+            config,
         }
     }
 
@@ -141,6 +182,19 @@ impl LagAnalyzer {
             self.target_buffer.pop_front();
         }
 
+        // Recompute null MI distribution on logarithmic schedule (200, 400, 800, 1600...)
+        // Null MI depends on sample size, not data content, so exponential spacing is optimal.
+        self.total_target_observations += 1;
+        if self.config.use_mi_significance_test
+            && self.total_target_observations >= self.next_null_update_at
+            && self.target_buffer.len() >= self.config.min_observations
+            && self.signal_buffer.len() >= self.config.min_observations
+        {
+            self.null_mi_dist = self.compute_null_distribution(self.config.n_shuffles);
+            // Double the interval for next recomputation (logarithmic schedule)
+            self.next_null_update_at = self.total_target_observations.saturating_mul(2);
+        }
+
         // Periodically update cached lag
         self.observations_since_update += 1;
         if self.observations_since_update >= self.update_frequency {
@@ -173,6 +227,10 @@ impl LagAnalyzer {
     }
 
     /// Compute optimal lag (expensive, called periodically).
+    ///
+    /// When MI significance testing is enabled, the best MI must exceed
+    /// the null distribution's significance percentile (default p95).
+    /// This filters spurious MI from the KSG estimator's positive bias.
     fn compute_optimal_lag(&self) -> Option<(i64, f64)> {
         if self.signal_buffer.len() < self.config.min_observations
             || self.target_buffer.len() < self.config.min_observations
@@ -191,11 +249,79 @@ impl LagAnalyzer {
             }
         }
 
-        if best_mi > 0.0 {
-            Some((best_lag, best_mi))
-        } else {
-            None
+        if best_mi <= 0.0 {
+            return None;
         }
+
+        // Apply MI significance test: check if best MI exceeds null distribution
+        if self.config.use_mi_significance_test {
+            if let Some(ref null_dist) = self.null_mi_dist {
+                // Use the configured significance level to pick threshold
+                let threshold = if self.config.significance_level >= 0.99 {
+                    null_dist.p99
+                } else {
+                    null_dist.p95
+                };
+                if best_mi <= threshold {
+                    return None; // Not significant — MI is within noise range
+                }
+            }
+            // If null_dist hasn't been computed yet, allow the signal through
+            // (it will be filtered once enough data accumulates)
+        }
+
+        Some((best_lag, best_mi))
+    }
+
+    /// Compute null MI distribution by shuffling target values.
+    ///
+    /// Uses Fisher-Yates shuffle with a fast xorshift PRNG to generate
+    /// a null distribution of MI values where any mutual information
+    /// is due to estimator bias rather than genuine dependence.
+    fn compute_null_distribution(&self, n_shuffles: usize) -> Option<NullMIDistribution> {
+        // Build lagged pairs at lag=0 for the null test
+        let (x, y) = self.build_lagged_pairs(0);
+        if x.len() < self.config.min_observations / 2 {
+            return None;
+        }
+
+        let mut null_mis = Vec::with_capacity(n_shuffles);
+        let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_1234; // xorshift seed
+
+        for _ in 0..n_shuffles {
+            // Shuffle y using Fisher-Yates with xorshift64
+            let mut y_shuffled = y.clone();
+            for i in (1..y_shuffled.len()).rev() {
+                // xorshift64 step
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 7;
+                rng_state ^= rng_state << 17;
+                let j = (rng_state as usize) % (i + 1);
+                y_shuffled.swap(i, j);
+            }
+
+            let mi = self.mi_estimator.estimate_bits(&x, &y_shuffled);
+            null_mis.push(mi);
+        }
+
+        // Sort for percentile computation
+        null_mis.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let n = null_mis.len();
+        if n == 0 {
+            return None;
+        }
+
+        let mean = null_mis.iter().sum::<f64>() / n as f64;
+        let p95_idx = ((n as f64 - 1.0) * 0.95) as usize;
+        let p99_idx = ((n as f64 - 1.0) * 0.99) as usize;
+
+        Some(NullMIDistribution {
+            p95: null_mis[p95_idx.min(n - 1)],
+            p99: null_mis[p99_idx.min(n - 1)],
+            mean,
+            _n_shuffles: n_shuffles,
+        })
     }
 
     /// Compute MI at a specific lag.
@@ -317,12 +443,39 @@ impl LagAnalyzer {
         ((signal_first, signal_last), (target_first, target_last))
     }
 
+    /// Check whether the last computed optimal lag was significant against the null.
+    ///
+    /// Returns `true` if significance testing is disabled or if MI exceeds null p95.
+    /// Returns `false` if MI failed the significance test (lag was filtered).
+    pub fn is_lag_significant(&self) -> bool {
+        if !self.config.use_mi_significance_test {
+            return true;
+        }
+        // If we have a cached lag, it passed the test
+        self.cached_optimal_lag.is_some()
+    }
+
+    /// Get the null distribution p95 threshold (for diagnostics).
+    ///
+    /// Returns 0.0 if null distribution hasn't been computed yet.
+    pub fn null_mi_p95(&self) -> f64 {
+        self.null_mi_dist.as_ref().map(|d| d.p95).unwrap_or(0.0)
+    }
+
+    /// Get the null distribution mean (for diagnostics).
+    pub fn null_mi_mean(&self) -> f64 {
+        self.null_mi_dist.as_ref().map(|d| d.mean).unwrap_or(0.0)
+    }
+
     /// Clear all buffers and reset state.
     pub fn reset(&mut self) {
         self.signal_buffer.clear();
         self.target_buffer.clear();
         self.cached_optimal_lag = None;
         self.observations_since_update = 0;
+        self.null_mi_dist = None;
+        self.total_target_observations = 0;
+        self.next_null_update_at = 200;
     }
 }
 

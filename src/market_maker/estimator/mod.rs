@@ -91,8 +91,8 @@ pub use fill_rate_model::{
     MarketState as FillRateMarketState,
 };
 pub use enhanced_flow::{
-    BookLevel, CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig, EnhancedFlowContext,
-    EnhancedFlowEstimator, EnhancedFlowResult, LiquidityEvaporationConfig,
+    BookLevel, BuyPressureTracker, CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig,
+    EnhancedFlowContext, EnhancedFlowEstimator, EnhancedFlowResult, LiquidityEvaporationConfig,
     LiquidityEvaporationDetector, TradeData, TradeSizeDistribution, TradeSizeDistributionConfig,
     TradeSizeStats,
 };

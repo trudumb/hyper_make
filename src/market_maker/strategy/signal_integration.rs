@@ -49,8 +49,8 @@
 
 use crate::market_maker::calibration::{InformedFlowAdjustment, ModelGating, ModelGatingConfig};
 use crate::market_maker::estimator::{
-    BinanceFlowAnalyzer, BinanceFlowConfig, CrossVenueAnalyzer, CrossVenueConfig,
-    CrossVenueFeatures, FlowDecomposition, FlowFeatureVec, InformedFlowConfig,
+    BinanceFlowAnalyzer, BinanceFlowConfig, BuyPressureTracker, CrossVenueAnalyzer,
+    CrossVenueConfig, CrossVenueFeatures, FlowDecomposition, FlowFeatureVec, InformedFlowConfig,
     InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, LeadLagStabilityGate,
     RegimeKappaConfig, RegimeKappaEstimator, TradeFeatures, VolatilityRegime,
 };
@@ -101,6 +101,43 @@ pub struct SignalIntegratorConfig {
 
     /// Whether to use cross-venue analysis.
     pub use_cross_venue: bool,
+
+    /// Whether to apply per-signal model gating (multiply each signal by its IR weight).
+    /// When true, signals from low-confidence models are attenuated individually.
+    /// When false, only the aggregate gating_spread_mult is applied (legacy behavior).
+    pub use_per_signal_gating: bool,
+
+    /// Minimum model weight for soft scaling (only used when hard gate passes).
+    /// With two-tier gating: hard gate (should_use_model → zero if false),
+    /// then soft scaling by model_weight() if above this floor.
+    /// Set to 0.0 to use raw model_weight with no floor after hard gate.
+    pub signal_gating_floor: f64,
+
+    /// Whether to blend VPIN toxicity with EM-based informed flow.
+    /// VPIN varies naturally (volume-synchronized), fixing the EM concentration problem.
+    pub use_vpin_toxicity: bool,
+
+    /// VPIN threshold above which spreads should be widened.
+    pub vpin_widen_threshold: f64,
+
+    /// Blend weight for VPIN vs EM toxicity [0=pure EM, 1=pure VPIN].
+    /// Default 0.7 (favor VPIN since it has natural variation).
+    pub vpin_blend_weight: f64,
+
+    /// Whether to use buy pressure z-score signal.
+    pub use_buy_pressure: bool,
+
+    /// Z-score threshold beyond which buy pressure contributes to skew.
+    pub buy_pressure_z_threshold: f64,
+
+    /// Buy pressure skew as fraction of max_lead_lag_skew_bps per unit z.
+    /// At z=threshold+1, skew = this * max_lead_lag_skew_bps.
+    /// Default 0.1 means buy pressure can contribute up to ~30% of max skew.
+    pub buy_pressure_skew_fraction: f64,
+
+    /// Maximum fraction of max_lead_lag_skew_bps that buy pressure can contribute.
+    /// Default 0.3 → in a 5 bps max skew context, cap at 1.5 bps.
+    pub buy_pressure_max_fraction: f64,
 }
 
 impl Default for SignalIntegratorConfig {
@@ -120,6 +157,15 @@ impl Default for SignalIntegratorConfig {
             use_regime_kappa: true,
             use_model_gating: true,
             use_cross_venue: true,
+            use_per_signal_gating: true,
+            signal_gating_floor: 0.0,
+            use_vpin_toxicity: true,
+            vpin_widen_threshold: 0.6,
+            vpin_blend_weight: 0.7,
+            use_buy_pressure: true,
+            buy_pressure_z_threshold: 1.5,
+            buy_pressure_skew_fraction: 0.1,
+            buy_pressure_max_fraction: 0.3,
         }
     }
 }
@@ -152,6 +198,9 @@ impl SignalIntegratorConfig {
             use_regime_kappa: false,
             use_model_gating: false,
             use_cross_venue: false,
+            use_per_signal_gating: false,
+            use_vpin_toxicity: false,
+            use_buy_pressure: false,
             ..Default::default()
         }
     }
@@ -218,6 +267,28 @@ pub struct IntegratedSignals {
     /// Whether cross-venue signals are valid.
     pub cross_venue_valid: bool,
 
+    // === VPIN Blend ===
+    /// Hyperliquid VPIN value [0, 1] (volume-synchronized toxicity).
+    pub hl_vpin: f64,
+    /// VPIN velocity (rate of change, positive = rising toxicity).
+    pub hl_vpin_velocity: f64,
+
+    // === Buy Pressure ===
+    /// Buy pressure z-score (deviation of buy_ratio from rolling mean).
+    pub buy_pressure_z: f64,
+
+    // === Per-Signal Gating Diagnostics ===
+    /// Model gating weight applied to lead-lag signal [0, 1].
+    pub lead_lag_gating_weight: f64,
+    /// Model gating weight applied to informed flow signal [0, 1].
+    pub informed_flow_gating_weight: f64,
+
+    // === Lead-Lag Significance Diagnostics ===
+    /// Whether the lead-lag MI passed the significance test against the null distribution.
+    pub lead_lag_significant: bool,
+    /// 95th percentile of the null MI distribution (for diagnostics).
+    pub lead_lag_null_p95: f64,
+
     // === Combined ===
     /// Total spread multiplier (product of all adjustments).
     pub total_spread_mult: f64,
@@ -281,6 +352,16 @@ pub struct SignalIntegrator {
     /// Latest HL flow features (from existing estimators).
     latest_hl_flow: FlowFeatureVec,
 
+    /// Latest VPIN value from HL VPIN estimator.
+    latest_hl_vpin: f64,
+    /// Latest VPIN velocity.
+    latest_hl_vpin_velocity: f64,
+    /// Whether VPIN has enough data to be valid.
+    vpin_valid: bool,
+
+    /// Buy pressure z-score tracker.
+    buy_pressure: BuyPressureTracker,
+
     /// Update counter for logging.
     update_count: u64,
 }
@@ -303,6 +384,10 @@ impl SignalIntegrator {
             last_flow_decomp: FlowDecomposition::default(),
             last_cross_venue_features: CrossVenueFeatures::default(),
             latest_hl_flow: FlowFeatureVec::default(),
+            latest_hl_vpin: 0.0,
+            latest_hl_vpin_velocity: 0.0,
+            vpin_valid: false,
+            buy_pressure: BuyPressureTracker::new(),
             update_count: 0,
         }
     }
@@ -454,6 +539,25 @@ impl SignalIntegrator {
         }
     }
 
+    /// Update with VPIN values from the Hyperliquid VPIN estimator.
+    ///
+    /// Called after each VPIN bucket completes in the trade handler.
+    pub fn set_vpin(&mut self, vpin: f64, velocity: f64, valid: bool) {
+        self.latest_hl_vpin = vpin;
+        self.latest_hl_vpin_velocity = velocity;
+        self.vpin_valid = valid;
+    }
+
+    /// Update buy pressure tracker with a trade observation.
+    ///
+    /// Should be called alongside existing trade handlers to maintain
+    /// a rolling z-score of buy/sell ratio.
+    pub fn on_trade_for_pressure(&mut self, size: f64, is_buy: bool) {
+        if self.config.use_buy_pressure {
+            self.buy_pressure.on_trade(size, is_buy);
+        }
+    }
+
     /// Update cross-venue features using both Binance and HL flow.
     fn update_cross_venue_features(&mut self) {
         let binance_flow = self.binance_flow.flow_features();
@@ -489,27 +593,98 @@ impl SignalIntegrator {
     pub fn get_signals(&self) -> IntegratedSignals {
         let mut signals = IntegratedSignals::default();
 
+        // === Lead-Lag Significance Diagnostics ===
+        signals.lead_lag_significant = self.lag_analyzer.is_lag_significant();
+        signals.lead_lag_null_p95 = self.lag_analyzer.null_mi_p95();
+
         // === Lead-Lag Signal ===
         if self.config.use_lead_lag && self.last_lead_lag_signal.is_actionable {
+            // Two-tier per-signal gating:
+            // Tier 1 (hard gate): should_use_model() → zero if false (weight ≤ 0.3)
+            // Tier 2 (soft scale): model_weight() → attenuate proportionally
+            let ll_weight = if self.config.use_per_signal_gating && self.config.use_model_gating {
+                if !self.model_gating.should_use_model("lead_lag") {
+                    signals.lead_lag_gating_weight = 0.0;
+                    0.0 // Hard gate: model fails significance → zero
+                } else {
+                    let w = self.model_gating.model_weight("lead_lag");
+                    signals.lead_lag_gating_weight = w;
+                    // Soft scale: floor prevents near-zero leakage after hard gate passes
+                    if w < self.config.signal_gating_floor {
+                        self.config.signal_gating_floor
+                    } else {
+                        w
+                    }
+                }
+            } else {
+                signals.lead_lag_gating_weight = 1.0;
+                1.0
+            };
+
             signals.skew_direction = self.last_lead_lag_signal.skew_direction;
             signals.lead_lag_skew_bps = self
                 .last_lead_lag_signal
                 .skew_magnitude_bps
-                .min(self.config.max_lead_lag_skew_bps);
-            signals.lead_lag_actionable = true;
+                .min(self.config.max_lead_lag_skew_bps)
+                * ll_weight;
+            signals.lead_lag_actionable = ll_weight > 0.0;
             signals.binance_hl_diff_bps = self.last_lead_lag_signal.diff_bps;
         }
 
         // === Informed Flow ===
         if self.config.use_informed_flow {
-            signals.p_informed = self.last_flow_decomp.p_informed;
+            // Two-tier per-signal gating (same pattern as lead-lag)
+            let if_weight = if self.config.use_per_signal_gating && self.config.use_model_gating {
+                if !self.model_gating.should_use_model("informed_flow") {
+                    signals.informed_flow_gating_weight = 0.0;
+                    0.0 // Hard gate: model fails significance → zero
+                } else {
+                    let w = self.model_gating.model_weight("informed_flow");
+                    signals.informed_flow_gating_weight = w;
+                    if w < self.config.signal_gating_floor {
+                        self.config.signal_gating_floor
+                    } else {
+                        w
+                    }
+                }
+            } else {
+                signals.informed_flow_gating_weight = 1.0;
+                1.0
+            };
+
+            let raw_p_informed = self.last_flow_decomp.p_informed;
+            let em_toxicity = self.last_flow_decomp.toxicity_score();
+
+            // Blend VPIN with EM toxicity when VPIN is available and enabled
+            let blended_toxicity = if self.config.use_vpin_toxicity && self.vpin_valid {
+                let w = self.config.vpin_blend_weight;
+                w * self.latest_hl_vpin + (1.0 - w) * em_toxicity
+            } else {
+                em_toxicity
+            };
+
+            // Store VPIN diagnostics
+            signals.hl_vpin = self.latest_hl_vpin;
+            signals.hl_vpin_velocity = self.latest_hl_vpin_velocity;
+
+            signals.p_informed = raw_p_informed * if_weight;
             signals.p_noise = self.last_flow_decomp.p_noise;
             signals.p_forced = self.last_flow_decomp.p_forced;
-            signals.toxicity_score = self.last_flow_decomp.toxicity_score();
-            signals.informed_flow_spread_mult = self
-                .config
-                .informed_flow_adjustment
-                .spread_multiplier(signals.p_informed);
+            signals.toxicity_score = blended_toxicity * if_weight;
+            signals.informed_flow_spread_mult = if if_weight > 0.0 {
+                // Use blended toxicity for spread adjustment instead of raw p_informed
+                // This ensures VPIN-driven toxicity also widens spreads
+                let effective_p = if self.config.use_vpin_toxicity && self.vpin_valid {
+                    blended_toxicity.max(signals.p_informed)
+                } else {
+                    signals.p_informed
+                };
+                self.config
+                    .informed_flow_adjustment
+                    .spread_multiplier(effective_p)
+            } else {
+                1.0 // No spread adjustment when gated out
+            };
         } else {
             signals.informed_flow_spread_mult = 1.0;
         }
@@ -567,18 +742,47 @@ impl SignalIntegrator {
             0.0
         };
 
-        // Add cross-venue skew contribution (scaled by confidence)
+        // Add cross-venue skew contribution (scaled by confidence and model gating)
         let cross_venue_skew_bps = if signals.cross_venue_valid {
+            // Per-signal gating: scale by average model weight
+            let cv_gate = if self.config.use_per_signal_gating && self.config.use_model_gating {
+                let avg_w = (signals.lead_lag_gating_weight + signals.informed_flow_gating_weight) / 2.0;
+                if avg_w < self.config.signal_gating_floor { 0.0 } else { avg_w }
+            } else {
+                1.0
+            };
             // Scale cross-venue skew ([-1, 1]) to bps
             // Use half of max_lead_lag_skew_bps as max cross-venue contribution
             signals.cross_venue_skew
                 * signals.cross_venue_confidence
                 * (self.config.max_lead_lag_skew_bps / 2.0)
+                * cv_gate
         } else {
             0.0
         };
 
-        signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps;
+        // === Buy Pressure Z-Score Contribution ===
+        // Skew scales proportionally to max_lead_lag_skew_bps so it adapts to asset spread.
+        // In a 2 bps spread asset (max_skew=3), 0.1 fraction → 0.3 bps/z, cap 0.9 bps.
+        // In a 10 bps spread asset (max_skew=5), 0.1 fraction → 0.5 bps/z, cap 1.5 bps.
+        let buy_pressure_skew_bps = if self.config.use_buy_pressure && self.buy_pressure.is_warmed_up() {
+            let z = self.buy_pressure.z_score();
+            signals.buy_pressure_z = z;
+            let threshold = self.config.buy_pressure_z_threshold;
+            if z.abs() > threshold {
+                let excess = z.abs() - threshold;
+                let bps_per_z = self.config.buy_pressure_skew_fraction * self.config.max_lead_lag_skew_bps;
+                let cap = self.config.buy_pressure_max_fraction * self.config.max_lead_lag_skew_bps;
+                let raw = excess * bps_per_z;
+                raw.min(cap) * z.signum()
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps;
 
         // Log periodically
         if self.update_count % 100 == 0 && self.update_count > 0 {
@@ -691,6 +895,10 @@ impl SignalIntegrator {
         self.last_flow_decomp = FlowDecomposition::default();
         self.last_cross_venue_features = CrossVenueFeatures::default();
         self.latest_hl_flow = FlowFeatureVec::default();
+        self.latest_hl_vpin = 0.0;
+        self.latest_hl_vpin_velocity = 0.0;
+        self.vpin_valid = false;
+        self.buy_pressure = BuyPressureTracker::new();
         self.update_count = 0;
     }
 }

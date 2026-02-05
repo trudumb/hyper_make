@@ -1210,6 +1210,177 @@ impl Default for TradeSizeDistribution {
     }
 }
 
+// =============================================================================
+// Buy Pressure Z-Score Tracker
+// =============================================================================
+
+/// Tracks rolling buy/sell ratio with EWMA normalization.
+///
+/// Raw buy_ratio (buy_volume / total_volume) always clusters near 0.5,
+/// providing zero predictive information. This tracker normalizes the
+/// ratio to a z-score relative to its rolling EWMA mean and variance,
+/// producing a Gaussian-distributed feature with natural variation.
+///
+/// # Algorithm
+///
+/// 1. Accumulate volume-weighted buy_ratio over micro-windows (N trades)
+/// 2. Update EWMA mean and variance of buy_ratio
+/// 3. Compute z-score: (buy_ratio - ewma_mean) / ewma_std
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut tracker = BuyPressureTracker::new();
+/// for trade in trades {
+///     if let Some(z) = tracker.on_trade(trade.size, trade.is_buy) {
+///         println!("Buy pressure z-score: {:.2}", z);
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct BuyPressureTracker {
+    /// Buy volume accumulated in current micro-window.
+    window_buy_volume: f64,
+    /// Total volume accumulated in current micro-window.
+    window_total_volume: f64,
+    /// Number of trades in current micro-window.
+    window_trade_count: usize,
+    /// Micro-window size (trades per window).
+    micro_window_size: usize,
+
+    /// EWMA of buy_ratio mean.
+    ewma_mean: f64,
+    /// EWMA of buy_ratio variance.
+    ewma_var: f64,
+    /// EWMA alpha (controls decay rate).
+    alpha: f64,
+    /// Whether EWMA has been initialized.
+    initialized: bool,
+
+    /// Total windows observed.
+    total_windows: usize,
+    /// Minimum windows before z-score is valid.
+    min_windows: usize,
+
+    /// Cached z-score (updated each window completion).
+    cached_z_score: f64,
+}
+
+impl BuyPressureTracker {
+    /// Create a new buy pressure tracker with default parameters.
+    pub fn new() -> Self {
+        Self {
+            window_buy_volume: 0.0,
+            window_total_volume: 0.0,
+            window_trade_count: 0,
+            micro_window_size: 20,
+            ewma_mean: 0.5, // Prior: balanced
+            ewma_var: 0.01, // Prior: moderate variance
+            alpha: 0.1,
+            initialized: false,
+            total_windows: 0,
+            min_windows: 10,
+            cached_z_score: 0.0,
+        }
+    }
+
+    /// Create with custom parameters.
+    pub fn with_params(micro_window_size: usize, alpha: f64, min_windows: usize) -> Self {
+        Self {
+            micro_window_size: micro_window_size.max(5),
+            alpha: alpha.clamp(0.01, 0.5),
+            min_windows,
+            ..Self::new()
+        }
+    }
+
+    /// Process a single trade.
+    ///
+    /// Returns `Some(z_score)` when a micro-window completes, `None` otherwise.
+    pub fn on_trade(&mut self, size: f64, is_buy: bool) -> Option<f64> {
+        if size <= 0.0 || !size.is_finite() {
+            return None;
+        }
+
+        self.window_total_volume += size;
+        if is_buy {
+            self.window_buy_volume += size;
+        }
+        self.window_trade_count += 1;
+
+        // Check if micro-window is complete
+        if self.window_trade_count >= self.micro_window_size {
+            let buy_ratio = if self.window_total_volume > 1e-12 {
+                self.window_buy_volume / self.window_total_volume
+            } else {
+                0.5
+            };
+
+            // Update EWMA
+            if !self.initialized {
+                self.ewma_mean = buy_ratio;
+                self.ewma_var = 0.01; // Initial variance
+                self.initialized = true;
+            } else {
+                let diff = buy_ratio - self.ewma_mean;
+                self.ewma_mean += self.alpha * diff;
+                // Welford-style incremental variance with EMA weighting
+                self.ewma_var = (1.0 - self.alpha) * (self.ewma_var + self.alpha * diff * diff);
+            }
+
+            // Compute z-score
+            let std = self.ewma_var.sqrt().max(1e-6);
+            self.cached_z_score = (buy_ratio - self.ewma_mean) / std;
+
+            // Reset window
+            self.window_buy_volume = 0.0;
+            self.window_total_volume = 0.0;
+            self.window_trade_count = 0;
+            self.total_windows += 1;
+
+            Some(self.cached_z_score)
+        } else {
+            None
+        }
+    }
+
+    /// Get the current z-score (cached from last completed window).
+    pub fn z_score(&self) -> f64 {
+        self.cached_z_score
+    }
+
+    /// Check if tracker has enough data for valid z-scores.
+    pub fn is_warmed_up(&self) -> bool {
+        self.total_windows >= self.min_windows
+    }
+
+    /// Get total completed micro-windows.
+    pub fn total_windows(&self) -> usize {
+        self.total_windows
+    }
+
+    /// Get current EWMA mean of buy ratio.
+    pub fn ewma_mean(&self) -> f64 {
+        self.ewma_mean
+    }
+
+    /// Get current EWMA standard deviation of buy ratio.
+    pub fn ewma_std(&self) -> f64 {
+        self.ewma_var.sqrt()
+    }
+
+    /// Reset all state.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+impl Default for BuyPressureTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

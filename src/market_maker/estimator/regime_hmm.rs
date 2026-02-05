@@ -29,6 +29,8 @@
 //! - Dirichlet priors on transition probabilities for online learning
 //! - Sticky diagonal transitions to prevent rapid switching
 
+use std::collections::VecDeque;
+
 use crate::market_maker::estimator::volatility::RegimeBeliefState;
 
 /// Number of regimes in the HMM.
@@ -395,6 +397,24 @@ pub struct RegimeHMM {
 
     /// Learning rate for emission parameter updates
     emission_learning_rate: f64,
+
+    // === Auto-calibration state ===
+    /// Rolling volatility buffer for calibration (decaying window).
+    vol_buffer: VecDeque<f64>,
+    /// Rolling spread buffer for calibration (decaying window).
+    spread_buffer: VecDeque<f64>,
+    /// Number of observations needed before initial auto-calibration triggers.
+    calibration_buffer_size: usize,
+    /// Whether initial auto-calibration has been performed.
+    initial_calibration_done: bool,
+    /// Maximum window size for rolling recalibration buffers.
+    recalibration_window: usize,
+    /// Number of new observations between periodic recalibrations.
+    recalibration_interval: usize,
+    /// Observations accumulated since last recalibration.
+    observations_since_recalibration: usize,
+    /// Total recalibrations performed (for diagnostics).
+    recalibration_count: usize,
 }
 
 impl Default for RegimeHMM {
@@ -419,6 +439,14 @@ impl RegimeHMM {
             transition_counts: [[0.0; NUM_REGIMES]; NUM_REGIMES],
             observation_count: 0,
             emission_learning_rate: 0.01,
+            vol_buffer: VecDeque::with_capacity(2000),
+            spread_buffer: VecDeque::with_capacity(2000),
+            calibration_buffer_size: 200,
+            initial_calibration_done: false,
+            recalibration_window: 2000,
+            recalibration_interval: 500,
+            observations_since_recalibration: 0,
+            recalibration_count: 0,
         }
     }
 
@@ -447,6 +475,73 @@ impl RegimeHMM {
         self
     }
 
+    /// Create HMM with emission params scaled relative to a baseline volatility.
+    ///
+    /// Instead of using hardcoded absolute thresholds (which may be unreachable
+    /// for many assets), this scales emission parameters as multiples of the
+    /// asset's baseline volatility and spread:
+    /// - Low: 0.3x baseline
+    /// - Normal: 1.0x baseline
+    /// - High: 3.0x baseline
+    /// - Extreme: 10.0x baseline
+    ///
+    /// This makes the HMM immediately usable for any asset without warmup.
+    pub fn with_baseline_volatility(mut self, baseline_vol: f64, baseline_spread_bps: f64) -> Self {
+        let bv = baseline_vol.max(1e-6);
+        let bs = baseline_spread_bps.max(0.5);
+
+        self.emission_params[regime_idx::LOW] = EmissionParams::new(
+            bv * 0.3,
+            bv * 0.15,
+            bs * 0.6,
+            bs * 0.3,
+        );
+        self.emission_params[regime_idx::NORMAL] = EmissionParams::new(
+            bv,
+            bv * 0.4,
+            bs,
+            bs * 0.4,
+        );
+        self.emission_params[regime_idx::HIGH] = EmissionParams::new(
+            bv * 3.0,
+            bv * 1.5,
+            bs * 2.0,
+            bs * 1.0,
+        );
+        self.emission_params[regime_idx::EXTREME] = EmissionParams::new(
+            bv * 10.0,
+            bv * 5.0,
+            bs * 5.0,
+            bs * 3.0,
+        );
+
+        // Mark as pre-calibrated so auto-calibration doesn't override
+        self.initial_calibration_done = true;
+
+        self
+    }
+
+    /// Set the calibration buffer size (number of observations before auto-calibration).
+    pub fn with_calibration_buffer_size(mut self, size: usize) -> Self {
+        self.calibration_buffer_size = size.max(50);
+        self
+    }
+
+    /// Configure periodic recalibration from rolling window.
+    ///
+    /// - `window`: max observations kept in rolling buffer (default 2000)
+    /// - `interval`: recalibrate every N new observations after initial (default 500)
+    pub fn with_recalibration(mut self, window: usize, interval: usize) -> Self {
+        self.recalibration_window = window.max(200);
+        self.recalibration_interval = interval.max(50);
+        self
+    }
+
+    /// Get number of recalibrations performed so far.
+    pub fn recalibration_count(&self) -> usize {
+        self.recalibration_count
+    }
+
     /// Perform one step of the forward algorithm to update belief state.
     ///
     /// This is the core online filtering operation:
@@ -455,6 +550,67 @@ impl RegimeHMM {
     ///
     /// Returns the updated belief state.
     pub fn forward_update(&mut self, observation: &Observation) -> [f64; NUM_REGIMES] {
+        // Always accumulate into rolling buffers for both initial and periodic recalibration
+        if observation.volatility.is_finite() && observation.volatility > 0.0 {
+            self.vol_buffer.push_back(observation.volatility);
+            while self.vol_buffer.len() > self.recalibration_window {
+                self.vol_buffer.pop_front();
+            }
+        }
+        if observation.spread_bps.is_finite() && observation.spread_bps > 0.0 {
+            self.spread_buffer.push_back(observation.spread_bps);
+            while self.spread_buffer.len() > self.recalibration_window {
+                self.spread_buffer.pop_front();
+            }
+        }
+
+        // Initial auto-calibration: trigger once we have enough observations
+        if !self.initial_calibration_done
+            && self.vol_buffer.len() >= self.calibration_buffer_size
+            && self.spread_buffer.len() >= self.calibration_buffer_size
+        {
+            let vols: Vec<f64> = self.vol_buffer.iter().copied().collect();
+            let spreads: Vec<f64> = self.spread_buffer.iter().copied().collect();
+            self.calibrate_from_observations(&vols, &spreads);
+            self.initial_calibration_done = true;
+            self.observations_since_recalibration = 0;
+            self.recalibration_count = 1;
+
+            tracing::info!(
+                n_vol = vols.len(),
+                n_spread = spreads.len(),
+                low_vol = %format!("{:.6}", self.emission_params[regime_idx::LOW].mean_volatility),
+                normal_vol = %format!("{:.6}", self.emission_params[regime_idx::NORMAL].mean_volatility),
+                high_vol = %format!("{:.6}", self.emission_params[regime_idx::HIGH].mean_volatility),
+                extreme_vol = %format!("{:.6}", self.emission_params[regime_idx::EXTREME].mean_volatility),
+                "HMM auto-calibrated emission thresholds from observed data"
+            );
+        }
+
+        // Periodic recalibration: every recalibration_interval observations after initial
+        if self.initial_calibration_done {
+            self.observations_since_recalibration += 1;
+            if self.observations_since_recalibration >= self.recalibration_interval
+                && self.vol_buffer.len() >= self.calibration_buffer_size
+            {
+                let vols: Vec<f64> = self.vol_buffer.iter().copied().collect();
+                let spreads: Vec<f64> = self.spread_buffer.iter().copied().collect();
+                self.calibrate_from_observations(&vols, &spreads);
+                self.observations_since_recalibration = 0;
+                self.recalibration_count += 1;
+
+                tracing::debug!(
+                    recalibration_count = self.recalibration_count,
+                    window_size = vols.len(),
+                    low_vol = %format!("{:.6}", self.emission_params[regime_idx::LOW].mean_volatility),
+                    normal_vol = %format!("{:.6}", self.emission_params[regime_idx::NORMAL].mean_volatility),
+                    high_vol = %format!("{:.6}", self.emission_params[regime_idx::HIGH].mean_volatility),
+                    extreme_vol = %format!("{:.6}", self.emission_params[regime_idx::EXTREME].mean_volatility),
+                    "HMM periodic recalibration from rolling window"
+                );
+            }
+        }
+
         // Step 1: Prediction (time update)
         // predicted[j] = sum_i transition_matrix[i][j] * belief[i]
         let mut predicted = [0.0; NUM_REGIMES];
@@ -638,6 +794,16 @@ impl RegimeHMM {
         self.prior_counts = default_prior_counts();
         self.transition_counts = [[0.0; NUM_REGIMES]; NUM_REGIMES];
         self.observation_count = 0;
+        self.vol_buffer = VecDeque::with_capacity(self.recalibration_window);
+        self.spread_buffer = VecDeque::with_capacity(self.recalibration_window);
+        self.initial_calibration_done = false;
+        self.observations_since_recalibration = 0;
+        self.recalibration_count = 0;
+    }
+
+    /// Check if auto-calibration has been performed.
+    pub fn is_calibrated(&self) -> bool {
+        self.initial_calibration_done
     }
 
     /// Calibrate emission parameters from observed data.
