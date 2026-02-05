@@ -118,8 +118,8 @@ impl EnhancedASClassifier {
     pub fn predict_toxicity(&mut self, is_bid: bool) -> f64 {
         let features = self.extractor.extract();
 
-        if features.confidence < 0.5 {
-            // Not enough data, return neutral
+        if features.confidence < 0.2 {
+            // Not enough data, return neutral (lowered from 0.5 to allow more learning)
             return 0.5;
         }
 
@@ -162,14 +162,12 @@ impl EnhancedASClassifier {
         self.total_predictions += 1;
         self.outcome_sum += if was_adverse { 1.0 } else { 0.0 };
 
-        // Get the features that were used for prediction
-        let (features, _predicted_is_bid) = match &self.last_features {
-            Some((f, b)) if *b == is_bid => (f.clone(), *b),
-            _ => return, // No matching prediction
-        };
+        // Recompute features fresh (like PreFill does) instead of relying on last_features
+        // This ensures every outcome gets counted, not just the first one
+        let features = self.extractor.extract();
 
-        if features.confidence < 0.5 {
-            return; // Don't learn from low-confidence predictions
+        if features.confidence < 0.2 {
+            return; // Don't learn from very low-confidence predictions (lowered from 0.5)
         }
 
         let weights = self.effective_weights();
@@ -225,7 +223,8 @@ impl EnhancedASClassifier {
             self.normalize_weights();
         }
 
-        self.last_features = None;
+        // Note: last_features is still set by predict_toxicity for potential future use,
+        // but record_outcome now recomputes features fresh to ensure all outcomes count
     }
 
     /// Normalize weights to sum to 1 and be non-negative

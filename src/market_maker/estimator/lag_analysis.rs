@@ -47,7 +47,7 @@ impl Default for LagAnalyzerConfig {
     fn default() -> Self {
         Self {
             // Test lags from -500ms to +500ms in 50ms increments
-            // Negative = signal leads target, Positive = signal lags target
+            // Positive = signal leads target (look at past signal), Negative = target leads signal
             candidate_lags_ms: vec![
                 -500, -400, -300, -250, -200, -150, -100, -75, -50, -25, 0, 25, 50, 75, 100, 150,
                 200, 250, 300, 400, 500,
@@ -167,7 +167,7 @@ impl LagAnalyzer {
     ///
     /// Returns (lag_ms, mutual_information_bits) or None if insufficient data.
     ///
-    /// Negative lag means signal leads target (the expected case for Binance → Hyperliquid).
+    /// Positive lag means signal leads target (the expected case for Binance → Hyperliquid).
     pub fn optimal_lag(&self) -> Option<(i64, f64)> {
         self.cached_optimal_lag
     }
@@ -201,7 +201,7 @@ impl LagAnalyzer {
     /// Compute MI at a specific lag.
     ///
     /// # Arguments
-    /// * `lag_ms` - Lag in milliseconds. Negative = signal leads target.
+    /// * `lag_ms` - Lag in milliseconds. Positive = signal leads target.
     fn mi_at_lag(&self, lag_ms: i64) -> f64 {
         // Build paired observations at this lag
         let (x, y) = self.build_lagged_pairs(lag_ms);
@@ -306,6 +306,15 @@ impl LagAnalyzer {
     /// Get the MI at the best lag (0 if unknown).
     pub fn best_lag_mi(&self) -> f64 {
         self.cached_optimal_lag.map(|(_, mi)| mi).unwrap_or(0.0)
+    }
+
+    /// Get sample timestamps for debugging (first, last from each buffer).
+    pub fn sample_timestamps(&self) -> ((Option<i64>, Option<i64>), (Option<i64>, Option<i64>)) {
+        let signal_first = self.signal_buffer.front().map(|o| o.timestamp_ms);
+        let signal_last = self.signal_buffer.back().map(|o| o.timestamp_ms);
+        let target_first = self.target_buffer.front().map(|o| o.timestamp_ms);
+        let target_last = self.target_buffer.back().map(|o| o.timestamp_ms);
+        ((signal_first, signal_last), (target_first, target_last))
     }
 
     /// Clear all buffers and reset state.

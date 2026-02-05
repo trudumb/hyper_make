@@ -51,6 +51,12 @@ use hyperliquid_rust_sdk::market_maker::{
 // Import regime HMM
 use hyperliquid_rust_sdk::market_maker::regime_hmm::{Observation as RegimeObservation, RegimeHMM};
 
+// Import lead-lag infrastructure
+use hyperliquid_rust_sdk::market_maker::{
+    BinanceFeed, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate, LagAnalyzerConfig,
+    SignalIntegrator, SignalIntegratorConfig,
+};
+
 // Import logging infrastructure
 use hyperliquid_rust_sdk::{init_logging, LogConfig, LogFormat};
 
@@ -126,6 +132,16 @@ struct Cli {
     /// Log format: json or pretty
     #[arg(long, default_value = "pretty")]
     log_format: String,
+
+    // === Cross-Exchange Lead-Lag (Binance Feed) ===
+    /// Disable Binance price feed for cross-exchange lead-lag validation.
+    /// The feed is enabled by default to validate lead-lag signal quality.
+    #[arg(long)]
+    disable_binance_feed: bool,
+
+    /// Binance symbol to subscribe to for lead-lag validation (default: btcusdt).
+    #[arg(long, default_value = "btcusdt")]
+    binance_symbol: String,
 }
 
 // ============================================================================
@@ -147,6 +163,15 @@ pub enum ValidatorPredictionType {
     Momentum,
     /// P(buy pressure) - next trade direction
     BuyPressure,
+    /// P(HL price moves in direction of Binance move) - cross-exchange lead-lag
+    LeadLag,
+    // === Cross-Venue Features ===
+    /// P(price moves in direction of cross-venue agreement) - when both venues agree
+    CrossVenueAgreement,
+    /// P(adverse fill) when cross-venue toxicity is high
+    CrossVenueToxicity,
+    /// P(price moves in direction predicted by cross-venue direction signal)
+    CrossVenueDirection,
 }
 
 impl ValidatorPredictionType {
@@ -158,6 +183,11 @@ impl ValidatorPredictionType {
             ValidatorPredictionType::RegimeHighVol,
             ValidatorPredictionType::Momentum,
             ValidatorPredictionType::BuyPressure,
+            ValidatorPredictionType::LeadLag,
+            // Cross-venue features
+            ValidatorPredictionType::CrossVenueAgreement,
+            ValidatorPredictionType::CrossVenueToxicity,
+            ValidatorPredictionType::CrossVenueDirection,
         ]
     }
 
@@ -169,6 +199,10 @@ impl ValidatorPredictionType {
             ValidatorPredictionType::RegimeHighVol => "RegimeHighVol",
             ValidatorPredictionType::Momentum => "Momentum",
             ValidatorPredictionType::BuyPressure => "BuyPressure",
+            ValidatorPredictionType::LeadLag => "LeadLag",
+            ValidatorPredictionType::CrossVenueAgreement => "CV_Agreement",
+            ValidatorPredictionType::CrossVenueToxicity => "CV_Toxicity",
+            ValidatorPredictionType::CrossVenueDirection => "CV_Direction",
         }
     }
 
@@ -180,6 +214,11 @@ impl ValidatorPredictionType {
             ValidatorPredictionType::RegimeHighVol => 30000,    // 30s
             ValidatorPredictionType::Momentum => 5000,          // 5s
             ValidatorPredictionType::BuyPressure => 0,          // Next trade (special case)
+            ValidatorPredictionType::LeadLag => 500,            // 500ms - typical lead-lag window
+            // Cross-venue: 1s markout to measure prediction quality
+            ValidatorPredictionType::CrossVenueAgreement => 1000,
+            ValidatorPredictionType::CrossVenueToxicity => 1000,
+            ValidatorPredictionType::CrossVenueDirection => 1000,
         }
     }
 }
@@ -521,6 +560,11 @@ pub struct PredictionValidator {
     pub pre_fill_classifier: PreFillASClassifier,
     pub enhanced_classifier: EnhancedASClassifier,
 
+    // Lead-lag signal integrator (optional - only when Binance feed enabled)
+    pub signal_integrator: Option<SignalIntegrator>,
+    /// Whether Binance feed is active
+    pub binance_enabled: bool,
+
     // State
     pub last_price: Option<f64>,
     pub last_trade_time_ms: u64,
@@ -564,6 +608,8 @@ impl PredictionValidator {
             regime_hmm: RegimeHMM::default(),
             pre_fill_classifier: PreFillASClassifier::default(),
             enhanced_classifier: EnhancedASClassifier::default_config(),
+            signal_integrator: None,
+            binance_enabled: false,
             last_price: None,
             last_trade_time_ms: 0,
             total_observations: 0,
@@ -576,6 +622,86 @@ impl PredictionValidator {
     /// Check if models have warmed up enough to record predictions
     pub fn is_warmed_up(&self) -> bool {
         self.total_observations >= self.warmup_samples
+    }
+
+    /// Enable Binance lead-lag signal integration
+    pub fn enable_binance_feed(&mut self) {
+        // Use a larger buffer for Binance since bookTicker updates are very fast (~10ms)
+        // Default 2000 only holds ~1.5s of Binance data; need 60000 for ~60s
+        let mut config = SignalIntegratorConfig::default();
+        config.lag_config = LagAnalyzerConfig {
+            buffer_capacity: 60000, // ~60 seconds at 10ms intervals
+            ..LagAnalyzerConfig::default()
+        };
+        self.signal_integrator = Some(SignalIntegrator::new(config));
+        self.binance_enabled = true;
+        info!("Lead-lag signal integrator enabled with 60s buffer");
+    }
+
+    /// Process a Binance price update
+    pub fn on_binance_price(&mut self, update: &BinancePriceUpdate) {
+        // Extract signal info first to avoid borrow issues
+        let signal_info = if let Some(ref mut integrator) = self.signal_integrator {
+            integrator.on_binance_price(update.mid_price, update.timestamp_ms);
+            let signals = integrator.get_signals();
+            if signals.lead_lag_actionable {
+                Some(signals.combined_skew_bps)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Record prediction outside the borrow
+        if let Some(skew_bps) = signal_info {
+            if self.is_warmed_up() {
+                let timestamp_u64 = update.timestamp_ms.max(0) as u64;
+                self.record_lead_lag_prediction(skew_bps, timestamp_u64);
+            }
+        }
+    }
+
+    /// Process a Binance trade update for cross-venue analysis
+    pub fn on_binance_trade(&mut self, update: &BinanceTradeUpdate) {
+        if let Some(ref mut integrator) = self.signal_integrator {
+            integrator.on_binance_trade(update);
+        }
+    }
+
+    /// Record a lead-lag prediction when Binance signal is actionable
+    fn record_lead_lag_prediction(&mut self, skew_bps: f64, timestamp_ms: u64) {
+        // Only record if we have a reference mid price
+        let mid = match self.stats.last_mid {
+            Some(m) => m,
+            None => return,
+        };
+
+        let regime = self.regime_hmm.most_likely_regime();
+
+        // Convert skew to probability and direction
+        // Positive skew = expect HL to go up, negative = expect down
+        // Map skew magnitude to confidence (sigmoid)
+        let p_direction = 1.0 / (1.0 + (-skew_bps.abs() / 5.0).exp());
+
+        // Direction: Ask = up (positive skew), Bid = down (negative skew)
+        let predicted_direction = if skew_bps >= 0.0 {
+            Some(Side::Ask)
+        } else {
+            Some(Side::Bid)
+        };
+
+        self.record_pending_outcome(
+            ValidatorPredictionType::LeadLag,
+            p_direction,
+            predicted_direction,
+            mid,
+            timestamp_ms,
+            ValidatorPredictionType::LeadLag.markout_ms(),
+            regime,
+        );
+
+        self.stats.predictions_made += 1;
     }
 
     /// Process a trade message
@@ -595,7 +721,7 @@ impl PredictionValidator {
             if last_price > 0.0 {
                 let ret = (price / last_price).ln();
                 let dt = if self.last_trade_time_ms > 0 {
-                    ((timestamp_ms - self.last_trade_time_ms) as f64 / 1000.0).max(0.001)
+                    (timestamp_ms.saturating_sub(self.last_trade_time_ms) as f64 / 1000.0).max(0.001)
                 } else {
                     1.0
                 };
@@ -730,6 +856,11 @@ impl PredictionValidator {
         let flow_imbalance = self.buffers.flow_imbalance();
         let regime_obs = RegimeObservation::new(sigma, spread_bps, flow_imbalance);
         self.regime_hmm.forward_update(&regime_obs);
+
+        // Feed HL mid to SignalIntegrator from L2Book (more frequent than AllMids)
+        if let Some(ref mut integrator) = self.signal_integrator {
+            integrator.on_hl_price(mid, timestamp_ms as i64);
+        }
     }
 
     /// Process a mid price update
@@ -737,6 +868,11 @@ impl PredictionValidator {
         self.buffers.add_mid(timestamp_ms, mid);
         self.stats.mids_processed += 1;
         self.stats.last_mid = Some(mid);
+
+        // Feed Hyperliquid price to SignalIntegrator for lead-lag calculation
+        if let Some(ref mut integrator) = self.signal_integrator {
+            integrator.on_hl_price(mid, timestamp_ms as i64);
+        }
     }
 
     /// Detect synthetic fill opportunity
@@ -876,7 +1012,67 @@ impl PredictionValidator {
             regime,
         );
 
-        self.stats.predictions_made += 6;
+        let mut prediction_count = 6;
+
+        // 6-8. Cross-Venue predictions (if enabled and valid)
+        if let Some(ref integrator) = self.signal_integrator {
+            let signals = integrator.get_signals();
+
+            if signals.cross_venue_valid {
+                // CrossVenueAgreement: When venues agree, predict price moves in that direction
+                // High agreement (>0.5) = high confidence in direction
+                let p_agreement = (signals.cross_venue_agreement.abs() + 1.0) / 2.0; // map [-1,1] to [0,1]
+                let agreement_direction = if signals.cross_venue_direction >= 0.0 {
+                    Some(Side::Ask) // Bullish
+                } else {
+                    Some(Side::Bid) // Bearish
+                };
+                self.record_pending_outcome(
+                    ValidatorPredictionType::CrossVenueAgreement,
+                    p_agreement * signals.cross_venue_confidence,
+                    agreement_direction,
+                    mid,
+                    timestamp_ms,
+                    ValidatorPredictionType::CrossVenueAgreement.markout_ms(),
+                    regime,
+                );
+                prediction_count += 1;
+
+                // CrossVenueToxicity: When cross-venue toxicity is high, predict adverse fill
+                // Use max toxicity as the probability of adverse fill
+                self.record_pending_outcome(
+                    ValidatorPredictionType::CrossVenueToxicity,
+                    signals.cross_venue_max_toxicity,
+                    Some(fill.side), // Same side as the synthetic fill
+                    mid,
+                    timestamp_ms,
+                    ValidatorPredictionType::CrossVenueToxicity.markout_ms(),
+                    regime,
+                );
+                prediction_count += 1;
+
+                // CrossVenueDirection: Predict price moves in direction of cross-venue signal
+                // Convert direction [-1,1] to probability and direction
+                let p_direction = (signals.cross_venue_direction.abs() + 1.0) / 2.0;
+                let predicted_direction = if signals.cross_venue_direction >= 0.0 {
+                    Some(Side::Ask) // Bullish
+                } else {
+                    Some(Side::Bid) // Bearish
+                };
+                self.record_pending_outcome(
+                    ValidatorPredictionType::CrossVenueDirection,
+                    p_direction * signals.cross_venue_confidence,
+                    predicted_direction,
+                    mid,
+                    timestamp_ms,
+                    ValidatorPredictionType::CrossVenueDirection.markout_ms(),
+                    regime,
+                );
+                prediction_count += 1;
+            }
+        }
+
+        self.stats.predictions_made += prediction_count;
     }
 
     /// Record a pending outcome
@@ -992,6 +1188,42 @@ impl PredictionValidator {
                 ValidatorPredictionType::BuyPressure => {
                     // Already handled separately
                     false
+                }
+                ValidatorPredictionType::LeadLag => {
+                    // Outcome: did HL price move in predicted direction (from Binance signal)?
+                    // fill_side encodes the predicted direction: Ask = up, Bid = down
+                    match pending.fill_side {
+                        Some(Side::Ask) => price_move_bps > 0.0, // Predicted up, went up
+                        Some(Side::Bid) => price_move_bps < 0.0, // Predicted down, went down
+                        None => false,
+                    }
+                }
+                // === Cross-Venue Predictions ===
+                ValidatorPredictionType::CrossVenueAgreement => {
+                    // Outcome: when venues agreed, did price move in the predicted direction?
+                    // fill_side encodes predicted direction: Ask = up, Bid = down
+                    match pending.fill_side {
+                        Some(Side::Ask) => price_move_bps > 0.0,
+                        Some(Side::Bid) => price_move_bps < 0.0,
+                        None => false,
+                    }
+                }
+                ValidatorPredictionType::CrossVenueToxicity => {
+                    // Outcome: did high cross-venue toxicity predict adverse fill?
+                    // Same as other toxicity predictors - price moved against fill side
+                    match pending.fill_side {
+                        Some(Side::Bid) => price_move_bps < -threshold_bps,
+                        Some(Side::Ask) => price_move_bps > threshold_bps,
+                        None => false,
+                    }
+                }
+                ValidatorPredictionType::CrossVenueDirection => {
+                    // Outcome: did price move in the direction predicted by cross-venue signal?
+                    match pending.fill_side {
+                        Some(Side::Ask) => price_move_bps > 0.0,
+                        Some(Side::Bid) => price_move_bps < 0.0,
+                        None => false,
+                    }
                 }
             };
 
@@ -1237,6 +1469,57 @@ impl PredictionValidator {
             if enhanced_diag.is_using_learned { " (LEARNED)" } else { " (default)" }
         );
 
+        // Print lead-lag diagnostics if enabled
+        if let Some(ref integrator) = self.signal_integrator {
+            let signals = integrator.get_signals();
+            let (ready, obs_counts, opt_lag, opt_mi, last_signal, timestamps) =
+                integrator.lag_analyzer_status();
+            let ((sig_first, sig_last), (tgt_first, tgt_last)) = timestamps;
+            println!();
+            println!("LeadLag: ready={} | signal_obs={} target_obs={} | lag={:?}ms mi={:.3?}",
+                ready,
+                obs_counts.0,
+                obs_counts.1,
+                opt_lag,
+                opt_mi,
+            );
+            println!("  timestamps: signal=[{:?}..{:?}] target=[{:?}..{:?}]",
+                sig_first, sig_last, tgt_first, tgt_last,
+            );
+            if let (Some(sf), Some(sl), Some(tf), Some(tl)) = (sig_first, sig_last, tgt_first, tgt_last) {
+                let overlap = sl >= tf && tl >= sf;
+                println!("  overlap={} | signal_range={}ms target_range={}ms gap={}ms",
+                    overlap,
+                    sl - sf,
+                    tl - tf,
+                    if tf > sl { tf - sl } else if sf > tl { sf - tl } else { 0 },
+                );
+            }
+            println!("  last_signal: actionable={} diff={:.1}bps skew_dir={} skew_mag={:.1}bps",
+                last_signal.is_actionable,
+                last_signal.diff_bps,
+                last_signal.skew_direction,
+                last_signal.skew_magnitude_bps,
+            );
+
+            // Print cross-venue diagnostics
+            if signals.cross_venue_valid {
+                println!("CrossVenue: valid=true | dir={:.2} conf={:.2} agree={:.2}",
+                    signals.cross_venue_direction,
+                    signals.cross_venue_confidence,
+                    signals.cross_venue_agreement,
+                );
+                println!("  toxicity: max={:.2} avg={:.2} | intensity_ratio={:.2} divergence={:.2}",
+                    signals.cross_venue_max_toxicity,
+                    signals.cross_venue_avg_toxicity,
+                    signals.cross_venue_intensity_ratio,
+                    signals.cross_venue_divergence,
+                );
+            } else {
+                println!("CrossVenue: valid=false (warming up or no Binance trades)");
+            }
+        }
+
         // Print stats
         println!();
         println!("Stats: {} trades | {} L2 updates | {} synthetic fills | {} pending",
@@ -1394,6 +1677,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.warmup_samples,
     );
 
+    // Spawn Binance feed for lead-lag validation (enabled by default)
+    let mut binance_receiver: Option<tokio::sync::mpsc::Receiver<BinanceUpdate>> = None;
+    if !cli.disable_binance_feed {
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+        let feed = BinanceFeed::for_symbol(&cli.binance_symbol, tx);
+        tokio::spawn(async move {
+            feed.run().await;
+            tracing::warn!("Binance feed task terminated");
+        });
+        binance_receiver = Some(rx);
+        validator.enable_binance_feed();
+        info!(
+            symbol = %cli.binance_symbol,
+            "Binance lead-lag feed active for validation"
+        );
+    } else {
+        warn!("Binance lead-lag feed DISABLED - LeadLag model will not be validated");
+    }
+
     // Create InfoClient for WebSocket
     info!("Connecting to {} WebSocket...", cli.network);
     let mut info_client = InfoClient::new(None, Some(base_url)).await?;
@@ -1459,6 +1761,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         tokio::select! {
+            // Binance lead-lag price feed (optional)
+            // Process both price and trade updates for cross-venue analysis
+            Some(update) = async {
+                match binance_receiver.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match update {
+                    BinanceUpdate::Price(price_update) => {
+                        validator.on_binance_price(&price_update);
+                        if cli.verbose {
+                            debug!("Binance: {} mid=${:.2}", cli.binance_symbol, price_update.mid_price);
+                        }
+                    }
+                    BinanceUpdate::Trade(trade_update) => {
+                        // Feed Binance trades for cross-venue flow analysis
+                        validator.on_binance_trade(&trade_update);
+                        if cli.verbose {
+                            debug!("Binance trade: {} {} @ ${:.2}",
+                                trade_update.quantity,
+                                if trade_update.is_buyer_maker { "SELL" } else { "BUY" },
+                                trade_update.price
+                            );
+                        }
+                    }
+                }
+            }
+
             Some(arc_msg) = receiver.recv() => {
                 let msg = Arc::try_unwrap(arc_msg).unwrap_or_else(|arc| (*arc).clone());
 
@@ -1595,7 +1926,7 @@ mod tests {
 
         assert_eq!(validator.asset, "BTC");
         assert_eq!(validator.markout_ms, 1000);
-        assert_eq!(validator.trackers.len(), 5);
+        assert_eq!(validator.trackers.len(), 10); // 6 original + LeadLag + 3 cross-venue
         assert!(!validator.is_warmed_up());
     }
 

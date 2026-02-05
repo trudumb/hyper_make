@@ -15,7 +15,7 @@ use crate::market_maker::{
         TheoreticalEdgeEstimator,
     },
     stochastic::{StochasticControlBuilder, StochasticControlConfig},
-    strategy::{PositionDecisionConfig, PositionDecisionEngine},
+    strategy::{PositionDecisionConfig, PositionDecisionEngine, SignalIntegrator, SignalIntegratorConfig},
     estimator::{
         CalibrationController, CalibrationControllerConfig, RegimeHMM,
         EnhancedFlowConfig, EnhancedFlowEstimator,
@@ -547,6 +547,11 @@ pub struct StochasticComponents {
     /// - Tier 3 (Calibration): kappa, hawkes params, decay rates
     /// - Tier 4 (Microstructure): kalman noise, momentum normalizer
     pub learned_params: LearnedParameters,
+
+    // === Cross-Exchange Signal Integration ===
+    /// Signal integrator: combines lead-lag, informed flow, regime kappa signals.
+    /// Receives Binance prices via channel, computes optimal skew for quote engine.
+    pub signal_integrator: SignalIntegrator,
 }
 
 impl StochasticComponents {
@@ -656,9 +661,11 @@ impl StochasticComponents {
             threshold_kappa: ThresholdKappa::new(ThresholdKappaConfig::default()),
             // Bayesian Learned Parameters (Magic Number Elimination)
             learned_params: LearnedParameters::default(),
+            // Cross-Exchange Signal Integration (Binance → Hyperliquid lead-lag)
+            signal_integrator: SignalIntegrator::new(SignalIntegratorConfig::default()),
         }
     }
-    
+
     /// Synchronize volatility regime across all components.
     ///
     /// Call this periodically (e.g., each quote cycle) with the current regime

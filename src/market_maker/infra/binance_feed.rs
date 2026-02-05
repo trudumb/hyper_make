@@ -38,9 +38,9 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-/// Price update from Binance.
+/// Price update from Binance (from @bookTicker stream).
 #[derive(Debug, Clone, Copy)]
 pub struct BinancePriceUpdate {
     /// Timestamp in milliseconds (exchange time).
@@ -53,6 +53,34 @@ pub struct BinancePriceUpdate {
     pub best_ask: f64,
     /// Spread in basis points.
     pub spread_bps: f64,
+}
+
+/// Trade update from Binance (from @aggTrade stream).
+///
+/// Aggregate trades are compressed trades that have the same price and were
+/// within 100ms of each other.
+#[derive(Debug, Clone, Copy)]
+pub struct BinanceTradeUpdate {
+    /// Timestamp in milliseconds (trade time, not event time).
+    pub timestamp_ms: i64,
+    /// Trade price.
+    pub price: f64,
+    /// Trade quantity (always positive).
+    pub quantity: f64,
+    /// True if the trade was a sell aggressor (buyer is maker).
+    /// Note: Binance "m" field means "is buyer maker", so true = sell aggressor.
+    pub is_buyer_maker: bool,
+    /// Aggregate trade ID.
+    pub trade_id: u64,
+}
+
+/// Combined update from Binance feed - either price or trade.
+#[derive(Debug, Clone)]
+pub enum BinanceUpdate {
+    /// Price update from @bookTicker.
+    Price(BinancePriceUpdate),
+    /// Trade update from @aggTrade.
+    Trade(BinanceTradeUpdate),
 }
 
 /// Binance book ticker message (best bid/ask).
@@ -79,6 +107,37 @@ struct BookTickerMessage {
     _ask_qty: String,
 }
 
+/// Binance aggregate trade message.
+#[derive(Debug, Deserialize)]
+struct AggTradeMessage {
+    /// Event type.
+    #[allow(dead_code)]
+    e: String,
+    /// Event time (ms).
+    #[serde(rename = "E")]
+    _event_time: i64,
+    /// Symbol.
+    #[allow(dead_code)]
+    s: String,
+    /// Aggregate trade ID.
+    a: u64,
+    /// Price.
+    p: String,
+    /// Quantity.
+    q: String,
+    /// First trade ID.
+    #[allow(dead_code)]
+    f: u64,
+    /// Last trade ID.
+    #[allow(dead_code)]
+    l: u64,
+    /// Trade time (ms).
+    #[serde(rename = "T")]
+    trade_time: i64,
+    /// Is buyer maker (true = sell aggressor).
+    m: bool,
+}
+
 /// Configuration for Binance feed.
 #[derive(Debug, Clone)]
 pub struct BinanceFeedConfig {
@@ -92,6 +151,8 @@ pub struct BinanceFeedConfig {
     pub max_reconnect_attempts: u32,
     /// Stale threshold - if no update for this long, consider feed stale.
     pub stale_threshold: Duration,
+    /// Whether to subscribe to @aggTrade stream (for flow analysis).
+    pub enable_trades: bool,
 }
 
 impl Default for BinanceFeedConfig {
@@ -102,6 +163,7 @@ impl Default for BinanceFeedConfig {
             reconnect_delay: Duration::from_secs(1),
             max_reconnect_attempts: 10,
             stale_threshold: Duration::from_secs(5),
+            enable_trades: true, // Enable trade stream by default
         }
     }
 }
@@ -115,22 +177,43 @@ impl BinanceFeedConfig {
         }
     }
 
+    /// Create config for price-only mode (no trades).
+    pub fn price_only(symbol: &str) -> Self {
+        Self {
+            symbol: symbol.to_lowercase(),
+            enable_trades: false,
+            ..Default::default()
+        }
+    }
+
     /// Get the full WebSocket URL with stream subscription.
+    /// Uses combined stream endpoint when trades are enabled.
     pub fn stream_url(&self) -> String {
-        format!("{}/{}@bookTicker", self.ws_url, self.symbol)
+        if self.enable_trades {
+            // Combined streams endpoint
+            format!(
+                "{}/stream?streams={}@bookTicker/{}@aggTrade",
+                self.ws_url.trim_end_matches("/ws"),
+                self.symbol,
+                self.symbol
+            )
+        } else {
+            // Single stream endpoint (legacy behavior)
+            format!("{}/{}@bookTicker", self.ws_url, self.symbol)
+        }
     }
 }
 
 /// Binance price feed for lead-lag signal.
 pub struct BinanceFeed {
     config: BinanceFeedConfig,
-    tx: mpsc::Sender<BinancePriceUpdate>,
+    tx: mpsc::Sender<BinanceUpdate>,
     reconnect_attempts: u32,
 }
 
 impl BinanceFeed {
-    /// Create a new Binance feed.
-    pub fn new(config: BinanceFeedConfig, tx: mpsc::Sender<BinancePriceUpdate>) -> Self {
+    /// Create a new Binance feed with combined updates.
+    pub fn new(config: BinanceFeedConfig, tx: mpsc::Sender<BinanceUpdate>) -> Self {
         Self {
             config,
             tx,
@@ -138,9 +221,14 @@ impl BinanceFeed {
         }
     }
 
-    /// Create with default config for a symbol.
-    pub fn for_symbol(symbol: &str, tx: mpsc::Sender<BinancePriceUpdate>) -> Self {
+    /// Create with default config for a symbol (includes trades).
+    pub fn for_symbol(symbol: &str, tx: mpsc::Sender<BinanceUpdate>) -> Self {
         Self::new(BinanceFeedConfig::for_symbol(symbol), tx)
+    }
+
+    /// Create with price-only config for a symbol.
+    pub fn for_symbol_price_only(symbol: &str, tx: mpsc::Sender<BinanceUpdate>) -> Self {
+        Self::new(BinanceFeedConfig::price_only(symbol), tx)
     }
 
     /// Run the feed (blocking, should be spawned).
@@ -222,7 +310,26 @@ impl BinanceFeed {
         &self,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let msg: BookTickerMessage = serde_json::from_str(text)?;
+        // Try to detect message type from the JSON
+        // Combined streams wrap messages in {"stream": "...", "data": {...}}
+        if let Ok(wrapper) = serde_json::from_str::<CombinedStreamWrapper>(text) {
+            // Combined stream format
+            if wrapper.stream.ends_with("@bookTicker") {
+                self.process_book_ticker(&wrapper.data)?;
+            } else if wrapper.stream.ends_with("@aggTrade") {
+                self.process_agg_trade(&wrapper.data)?;
+            }
+        } else {
+            // Single stream format (legacy - direct bookTicker)
+            self.process_book_ticker(text)?;
+        }
+
+        Ok(())
+    }
+
+    /// Process a book ticker message.
+    fn process_book_ticker(&self, data: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg: BookTickerMessage = serde_json::from_str(data)?;
 
         // Parse prices
         let best_bid: f64 = msg.b.parse()?;
@@ -235,21 +342,68 @@ impl BinanceFeed {
         let mid_price = (best_bid + best_ask) / 2.0;
         let spread_bps = (best_ask - best_bid) / mid_price * 10_000.0;
 
-        let update = BinancePriceUpdate {
+        let update = BinanceUpdate::Price(BinancePriceUpdate {
             timestamp_ms: msg.event_time,
             mid_price,
             best_bid,
             best_ask,
             spread_bps,
-        };
+        });
 
         // Send to channel (non-blocking, drop if full)
         if self.tx.try_send(update).is_err() {
-            debug!("Binance price channel full, dropping update");
+            debug!("Binance update channel full, dropping price update");
         }
 
         Ok(())
     }
+
+    /// Process an aggregate trade message.
+    fn process_agg_trade(&self, data: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg: AggTradeMessage = serde_json::from_str(data)?;
+
+        // Parse trade data
+        let price: f64 = msg.p.parse()?;
+        let quantity: f64 = msg.q.parse()?;
+
+        if price <= 0.0 || quantity <= 0.0 {
+            return Ok(()); // Invalid data
+        }
+
+        let update = BinanceUpdate::Trade(BinanceTradeUpdate {
+            timestamp_ms: msg.trade_time,
+            price,
+            quantity,
+            is_buyer_maker: msg.m,
+            trade_id: msg.a,
+        });
+
+        // Send to channel (non-blocking, drop if full)
+        if self.tx.try_send(update).is_err() {
+            trace!("Binance update channel full, dropping trade update");
+        }
+
+        Ok(())
+    }
+}
+
+/// Wrapper for combined stream messages.
+#[derive(Debug, Deserialize)]
+struct CombinedStreamWrapper {
+    /// Stream name (e.g., "btcusdt@bookTicker" or "btcusdt@aggTrade").
+    stream: String,
+    /// Raw JSON data for the stream-specific message.
+    #[serde(deserialize_with = "deserialize_raw_value")]
+    data: String,
+}
+
+/// Deserialize raw JSON value as a string for later parsing.
+fn deserialize_raw_value<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.to_string())
 }
 
 /// Lead-lag signal derived from Binance feed.
@@ -264,7 +418,7 @@ pub struct LeadLagSignal {
     pub hl_mid: f64,
     /// Price difference (Binance - HL) in basis points.
     pub diff_bps: f64,
-    /// Optimal lag in milliseconds (negative = Binance leads).
+    /// Optimal lag in milliseconds (positive = Binance leads).
     pub optimal_lag_ms: i64,
     /// Mutual information at optimal lag (higher = stronger signal).
     pub mi_bits: f64,
@@ -292,10 +446,11 @@ impl LeadLagSignal {
         let diff_bps = (binance_mid - hl_mid) / hl_mid * 10_000.0;
 
         // Signal is actionable if:
-        // 1. Binance leads (negative lag)
+        // 1. Binance leads (positive lag - implementation note: positive lag means
+        //    we look at past signal to predict current target, i.e., signal leads)
         // 2. MI is above threshold
         // 3. Price difference is significant (> 1 bps)
-        let is_actionable = optimal_lag_ms < -25 // Binance leads by at least 25ms
+        let is_actionable = optimal_lag_ms > 25 // Binance leads by at least 25ms
             && mi_bits > min_mi_threshold
             && diff_bps.abs() > 1.0;
 
@@ -348,10 +503,60 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_url() {
+    fn test_stream_url_combined() {
         let config = BinanceFeedConfig::for_symbol("btcusdt");
         let url = config.stream_url();
+        // Combined stream endpoint with both bookTicker and aggTrade
         assert!(url.contains("btcusdt@bookTicker"));
+        assert!(url.contains("btcusdt@aggTrade"));
+        assert!(url.contains("/stream?streams="));
+    }
+
+    #[test]
+    fn test_stream_url_price_only() {
+        let config = BinanceFeedConfig::price_only("btcusdt");
+        let url = config.stream_url();
+        // Single stream endpoint (legacy)
+        assert!(url.contains("btcusdt@bookTicker"));
+        assert!(!url.contains("aggTrade"));
+    }
+
+    #[test]
+    fn test_binance_trade_update_parsing() {
+        // Verify BinanceTradeUpdate struct fields
+        let trade = BinanceTradeUpdate {
+            timestamp_ms: 1704067200000,
+            price: 50000.0,
+            quantity: 0.5,
+            is_buyer_maker: true, // sell aggressor
+            trade_id: 12345,
+        };
+        assert_eq!(trade.timestamp_ms, 1704067200000);
+        assert_eq!(trade.price, 50000.0);
+        assert!(trade.is_buyer_maker); // true = sell aggressor
+    }
+
+    #[test]
+    fn test_binance_update_enum() {
+        // Price update
+        let price_update = BinanceUpdate::Price(BinancePriceUpdate {
+            timestamp_ms: 1704067200000,
+            mid_price: 50000.0,
+            best_bid: 49999.0,
+            best_ask: 50001.0,
+            spread_bps: 0.4,
+        });
+        assert!(matches!(price_update, BinanceUpdate::Price(_)));
+
+        // Trade update
+        let trade_update = BinanceUpdate::Trade(BinanceTradeUpdate {
+            timestamp_ms: 1704067200000,
+            price: 50000.0,
+            quantity: 0.5,
+            is_buyer_maker: false, // buy aggressor
+            trade_id: 12345,
+        });
+        assert!(matches!(trade_update, BinanceUpdate::Trade(_)));
     }
 
     #[test]

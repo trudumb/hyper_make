@@ -722,35 +722,121 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // === Lead-Lag Signal Integration ===
-        // Wire cross-exchange lead-lag signal for predictive skew
-        // Uses Binance → Hyperliquid price discovery when lag analyzer is warmed up
-        let lag_model = &self.stochastic.model_calibration.lag_model;
-        if lag_model.is_warmed_up() {
-            let analyzer = lag_model.analyzer();
-            let mi = analyzer.best_lag_mi();
-            let lag_ms = analyzer.best_lag_ms();
+        // Wire cross-exchange lead-lag signal for predictive skew.
+        // Uses SignalIntegrator which combines:
+        // - Binance → Hyperliquid price discovery (when Binance feed enabled)
+        // - Informed flow decomposition
+        // - Regime-conditioned kappa
+        // - Model gating (IR-based confidence)
+        let signals = self.stochastic.signal_integrator.get_signals();
 
-            // Confidence based on mutual information (0.02 bits = threshold, 0.1 bits = full)
-            let confidence = ((mi - 0.02) / 0.08).clamp(0.0, 1.0);
-            market_params.lead_lag_confidence = confidence;
+        if signals.lead_lag_actionable {
+            // Real cross-exchange signal from Binance feed
+            market_params.lead_lag_signal_bps = signals.combined_skew_bps;
+            market_params.lead_lag_confidence = signals.model_confidence;
 
-            // Signal: use momentum_bps scaled by lag confidence as proxy
-            // TODO: Replace with actual Binance return when external feed is available
-            // For now, momentum serves as directional signal amplified by lead-lag confidence
-            if lag_ms < 0 && confidence > 0.3 {
-                // Negative lag = signal leads target (Binance leads Hyperliquid)
-                // Amplify momentum signal by confidence
-                market_params.lead_lag_signal_bps = market_params.momentum_bps * confidence * 0.5;
+            if signals.combined_skew_bps.abs() > 1.0 {
+                debug!(
+                    diff_bps = %format!("{:.1}", signals.binance_hl_diff_bps),
+                    skew_direction = signals.skew_direction,
+                    skew_bps = %format!("{:.2}", signals.combined_skew_bps),
+                    model_confidence = %format!("{:.2}", signals.model_confidence),
+                    "Lead-lag signal ACTIVE (Binance feed)"
+                );
+            }
+        } else {
+            // Fallback: use legacy momentum-based proxy when Binance feed not available
+            let lag_model = &self.stochastic.model_calibration.lag_model;
+            if lag_model.is_warmed_up() {
+                let analyzer = lag_model.analyzer();
+                let mi = analyzer.best_lag_mi();
+                let lag_ms = analyzer.best_lag_ms();
 
-                if market_params.lead_lag_signal_bps.abs() > 1.0 {
-                    debug!(
-                        lag_ms = lag_ms,
-                        mi = %format!("{:.4}", mi),
-                        confidence = %format!("{:.2}", confidence),
-                        signal_bps = %format!("{:.2}", market_params.lead_lag_signal_bps),
-                        "Lead-lag signal active"
-                    );
+                // Confidence based on mutual information (0.02 bits = threshold, 0.1 bits = full)
+                let confidence = ((mi - 0.02) / 0.08).clamp(0.0, 1.0);
+                market_params.lead_lag_confidence = confidence;
+
+                if lag_ms < 0 && confidence > 0.3 {
+                    // Negative lag = signal leads target
+                    // Amplify momentum signal by confidence (fallback mode)
+                    market_params.lead_lag_signal_bps = market_params.momentum_bps * confidence * 0.5;
+
+                    if market_params.lead_lag_signal_bps.abs() > 1.0 {
+                        trace!(
+                            lag_ms = lag_ms,
+                            mi = %format!("{:.4}", mi),
+                            confidence = %format!("{:.2}", confidence),
+                            signal_bps = %format!("{:.2}", market_params.lead_lag_signal_bps),
+                            "Lead-lag signal active (momentum fallback)"
+                        );
+                    }
                 }
+            }
+        }
+
+        // Apply informed flow spread multiplier from SignalIntegrator
+        // This widens spreads when high P(informed) is detected
+        if signals.informed_flow_spread_mult > 1.01 {
+            trace!(
+                p_informed = %format!("{:.2}", signals.p_informed),
+                spread_mult = %format!("{:.2}x", signals.informed_flow_spread_mult),
+                "Informed flow spread widening"
+            );
+        }
+
+        // === Cross-Venue Beliefs Integration (Bivariate Flow Model) ===
+        // Use cross-venue signals from joint Binance + Hyperliquid analysis.
+        // When venues agree, boost confidence in direction. When they disagree, widen spreads.
+        if signals.cross_venue_valid {
+            // Apply cross-venue spread multiplier (widens when venues disagree or high toxicity)
+            market_params.spread_widening_mult *= signals.cross_venue_spread_mult;
+
+            // Add cross-venue skew to lead-lag signal (directional boost from agreement)
+            // Scale by agreement: high agreement = strong signal, disagreement = muted
+            let cv_skew_contribution = signals.cross_venue_skew
+                * signals.cross_venue_confidence
+                * 5.0; // Convert [-1,1] direction to bps (max ±5 bps contribution)
+
+            if signals.cross_venue_agreement > 0.5 {
+                // Venues agree - boost directional signal
+                market_params.lead_lag_signal_bps += cv_skew_contribution;
+            }
+
+            // Update central belief state with cross-venue observations
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            self.central_beliefs.update(BeliefUpdate::CrossVenueUpdate {
+                direction: signals.cross_venue_direction,
+                confidence: signals.cross_venue_confidence,
+                discovery_venue: signals.cross_venue_intensity_ratio, // 0=HL, 1=Binance
+                max_toxicity: signals.cross_venue_max_toxicity,
+                avg_toxicity: signals.cross_venue_avg_toxicity,
+                agreement: signals.cross_venue_agreement,
+                divergence: signals.cross_venue_divergence,
+                intensity_ratio: signals.cross_venue_intensity_ratio,
+                imbalance_correlation: signals.cross_venue_imbalance_correlation,
+                toxicity_alert: signals.cross_venue_max_toxicity > 0.7,
+                divergence_alert: signals.cross_venue_divergence > 0.4,
+                timestamp_ms,
+            });
+
+            // Log cross-venue diagnostics when actionable
+            if signals.cross_venue_spread_mult > 1.05
+                || signals.cross_venue_direction.abs() > 0.3
+                || signals.cross_venue_max_toxicity > 0.5
+            {
+                debug!(
+                    direction = %format!("{:.2}", signals.cross_venue_direction),
+                    confidence = %format!("{:.2}", signals.cross_venue_confidence),
+                    agreement = %format!("{:.2}", signals.cross_venue_agreement),
+                    max_toxicity = %format!("{:.2}", signals.cross_venue_max_toxicity),
+                    spread_mult = %format!("{:.2}x", signals.cross_venue_spread_mult),
+                    skew_contribution_bps = %format!("{:.2}", cv_skew_contribution),
+                    "Cross-venue signal ACTIVE"
+                );
             }
         }
 

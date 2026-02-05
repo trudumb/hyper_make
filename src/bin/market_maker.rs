@@ -27,7 +27,7 @@ use hyperliquid_rust_sdk::{
     MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
     QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
     RejectionRateLimitConfig, RiskConfig, SpreadConfig, SpreadProfile, StochasticConfig,
-    SymmetricStrategy,
+    SymmetricStrategy, market_maker::BinanceFeed,
 };
 
 // ============================================================================
@@ -285,6 +285,16 @@ struct Cli {
     /// Example: --signal-export-path fills_with_signals.json
     #[arg(long)]
     signal_export_path: Option<String>,
+
+    // === Cross-Exchange Lead-Lag (Binance Feed) ===
+    /// Disable Binance price feed for cross-exchange lead-lag signal.
+    /// The feed is enabled by default as it's a core source of alpha.
+    #[arg(long)]
+    disable_binance_feed: bool,
+
+    /// Binance symbol to subscribe to for lead-lag signal (default: btcusdt).
+    #[arg(long, default_value = "btcusdt")]
+    binance_symbol: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1659,6 +1669,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             export_path = %path,
             "Signal diagnostic infrastructure enabled - fills will be exported with all signal values"
         );
+    }
+
+    // Wire Binance feed for cross-exchange lead-lag signal
+    // Binance feed is enabled by default (core alpha source)
+    if !cli.disable_binance_feed {
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+        let feed = BinanceFeed::for_symbol(&cli.binance_symbol, tx);
+        tokio::spawn(async move {
+            feed.run().await;
+            tracing::warn!("Binance feed task terminated");
+        });
+        market_maker = market_maker.with_binance_receiver(rx);
+        tracing::info!(
+            symbol = %cli.binance_symbol,
+            "Binance lead-lag feed active"
+        );
+    } else {
+        tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
     }
 
     // Sync open orders

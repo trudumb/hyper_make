@@ -185,6 +185,36 @@ pub enum BeliefUpdate {
         is_sustained_shift: bool,
     },
 
+    /// Cross-venue update from joint Binance + Hyperliquid analysis.
+    ///
+    /// Published by: CrossVenueAnalyzer
+    CrossVenueUpdate {
+        /// Joint direction belief [-1, +1]
+        direction: f64,
+        /// Confidence based on venue agreement [0, 1]
+        confidence: f64,
+        /// Where is price discovery? [0=HL, 1=Binance]
+        discovery_venue: f64,
+        /// Maximum VPIN across venues [0, 1]
+        max_toxicity: f64,
+        /// Average VPIN across venues [0, 1]
+        avg_toxicity: f64,
+        /// Agreement score [-1, 1]
+        agreement: f64,
+        /// Imbalance divergence (binance - hl) [-2, 2]
+        divergence: f64,
+        /// Intensity ratio λ_B / (λ_B + λ_H) [0, 1]
+        intensity_ratio: f64,
+        /// Rolling imbalance correlation [-1, 1]
+        imbalance_correlation: f64,
+        /// Toxicity alert active?
+        toxicity_alert: bool,
+        /// Divergence alert active?
+        divergence_alert: bool,
+        /// Timestamp (epoch ms)
+        timestamp_ms: u64,
+    },
+
     // =========================================================================
     // Control
     // =========================================================================

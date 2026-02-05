@@ -216,6 +216,12 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Used by fill handler to capture signal state at fill time.
     /// Updated at end of each update_quotes() cycle.
     cached_market_params: Option<strategy::MarketParams>,
+
+    // === Cross-Exchange Lead-Lag (Binance Feed) ===
+    /// Receiver for Binance updates (optional).
+    /// When enabled, feeds BinanceUpdate (price + trades) to SignalIntegrator
+    /// for lead-lag skew and cross-venue flow analysis.
+    binance_receiver: Option<tokio::sync::mpsc::Receiver<infra::BinanceUpdate>>,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -348,6 +354,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             central_beliefs: CentralBeliefState::new(CentralBeliefConfig::default()),
             // Signal diagnostics cache (updated each quote cycle)
             cached_market_params: None,
+            // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
+            binance_receiver: None,
         }
     }
 
@@ -360,6 +368,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Configure microprice EMA smoothing from StochasticConfig.
     pub fn with_microprice_ema(mut self, alpha: f64, min_change_bps: f64) -> Self {
         self.estimator.set_microprice_ema(alpha, min_change_bps);
+        self
+    }
+
+    /// Enable Binance feed for lead-lag signal and cross-venue flow analysis.
+    ///
+    /// When enabled, the event loop will receive BinanceUpdate messages
+    /// (both price and trade updates) and feed them to the SignalIntegrator
+    /// for cross-exchange skew calculation and bivariate flow analysis.
+    ///
+    /// # Arguments
+    /// * `receiver` - Channel receiver for BinanceUpdate messages
+    pub fn with_binance_receiver(
+        mut self,
+        receiver: tokio::sync::mpsc::Receiver<infra::BinanceUpdate>,
+    ) -> Self {
+        self.binance_receiver = Some(receiver);
+        info!("Binance lead-lag feed enabled (with cross-venue flow analysis)");
         self
     }
 

@@ -481,6 +481,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     }
                 }
 
+                // Binance feed (optional) - price updates and trades
+                // When enabled, updates SignalIntegrator for cross-exchange skew
+                // and cross-venue flow analysis
+                Some(update) = async {
+                    match self.binance_receiver.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_binance_update(update);
+                }
+
                 // Periodic safety sync
                 _ = sync_interval.tick() => {
                     if let Err(e) = self.safety_sync().await {

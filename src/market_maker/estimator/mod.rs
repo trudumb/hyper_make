@@ -28,10 +28,12 @@
 //! - `parameter_estimator`: Main orchestrator
 
 pub mod as_decomposition;
+pub mod binance_flow;
 pub mod bocpd_kappa;
 mod book_kappa;
 mod calibration_controller;
 mod covariance;
+pub mod cross_venue;
 mod directional_risk;
 pub mod enhanced_flow;
 pub mod fill_rate_model;
@@ -140,6 +142,12 @@ pub use bocpd_kappa::{
 // First-Principles: Threshold-dependent kappa (TAR model)
 // κ depends on deviation from equilibrium: mean-reversion vs momentum regimes
 pub use threshold_kappa::{ThresholdKappa, ThresholdKappaConfig, ThresholdKappaRegime};
+
+// Binance flow analysis (cross-venue signals)
+pub use binance_flow::{BinanceFlowAnalyzer, BinanceFlowConfig, FlowFeatureVec};
+
+// Cross-venue analysis (joint Binance + Hyperliquid signals)
+pub use cross_venue::{CrossVenueAnalyzer, CrossVenueConfig, CrossVenueFeatures, BivariateFlowObservation};
 
 // ============================================================================
 // MarketEstimator Trait - Abstraction for Testability

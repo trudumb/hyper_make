@@ -49,10 +49,12 @@
 
 use crate::market_maker::calibration::{InformedFlowAdjustment, ModelGating, ModelGatingConfig};
 use crate::market_maker::estimator::{
-    FlowDecomposition, InformedFlowConfig, InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig,
-    RegimeKappaConfig, RegimeKappaEstimator, TradeFeatures, VolatilityRegime,
+    BinanceFlowAnalyzer, BinanceFlowConfig, CrossVenueAnalyzer, CrossVenueConfig,
+    CrossVenueFeatures, FlowDecomposition, FlowFeatureVec, InformedFlowConfig,
+    InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, RegimeKappaConfig, RegimeKappaEstimator,
+    TradeFeatures, VolatilityRegime,
 };
-use crate::market_maker::infra::LeadLagSignal;
+use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
 use tracing::{debug, info};
 
 /// Configuration for signal integrator.
@@ -73,6 +75,12 @@ pub struct SignalIntegratorConfig {
     /// Informed flow spread adjustment config.
     pub informed_flow_adjustment: InformedFlowAdjustment,
 
+    /// Binance flow analyzer configuration.
+    pub binance_flow_config: BinanceFlowConfig,
+
+    /// Cross-venue analyzer configuration.
+    pub cross_venue_config: CrossVenueConfig,
+
     /// Minimum MI for lead-lag signal to be actionable.
     pub min_mi_threshold: f64,
 
@@ -90,6 +98,9 @@ pub struct SignalIntegratorConfig {
 
     /// Whether to use model gating.
     pub use_model_gating: bool,
+
+    /// Whether to use cross-venue analysis.
+    pub use_cross_venue: bool,
 }
 
 impl Default for SignalIntegratorConfig {
@@ -100,12 +111,15 @@ impl Default for SignalIntegratorConfig {
             regime_kappa_config: RegimeKappaConfig::default(),
             model_gating_config: ModelGatingConfig::default(),
             informed_flow_adjustment: InformedFlowAdjustment::default(),
+            binance_flow_config: BinanceFlowConfig::default(),
+            cross_venue_config: CrossVenueConfig::default(),
             min_mi_threshold: 0.05,
             max_lead_lag_skew_bps: 5.0,
             use_lead_lag: true,
             use_informed_flow: true,
             use_regime_kappa: true,
             use_model_gating: true,
+            use_cross_venue: true,
         }
     }
 }
@@ -137,6 +151,7 @@ impl SignalIntegratorConfig {
             use_informed_flow: false,
             use_regime_kappa: false,
             use_model_gating: false,
+            use_cross_venue: false,
             ..Default::default()
         }
     }
@@ -179,6 +194,30 @@ pub struct IntegratedSignals {
     /// Spread multiplier from model gating (>= 1.0).
     pub gating_spread_mult: f64,
 
+    // === Cross-Venue (Bivariate Flow Model) ===
+    /// Cross-venue direction belief [-1, 1]. Positive = bullish consensus.
+    pub cross_venue_direction: f64,
+    /// Cross-venue confidence [0, 1]. High when venues agree.
+    pub cross_venue_confidence: f64,
+    /// Cross-venue agreement score [-1, 1].
+    pub cross_venue_agreement: f64,
+    /// Maximum toxicity across venues [0, 1].
+    pub cross_venue_max_toxicity: f64,
+    /// Average toxicity across venues [0, 1].
+    pub cross_venue_avg_toxicity: f64,
+    /// Spread multiplier from cross-venue analysis (>= 1.0).
+    pub cross_venue_spread_mult: f64,
+    /// Skew recommendation from cross-venue [-1, 1].
+    pub cross_venue_skew: f64,
+    /// Intensity ratio [0, 1] - 0=HL dominant, 1=Binance dominant.
+    pub cross_venue_intensity_ratio: f64,
+    /// Imbalance correlation [-1, 1] - rolling correlation of directional pressure.
+    pub cross_venue_imbalance_correlation: f64,
+    /// Divergence score [0, 1] - high when venues show opposite pressure.
+    pub cross_venue_divergence: f64,
+    /// Whether cross-venue signals are valid.
+    pub cross_venue_valid: bool,
+
     // === Combined ===
     /// Total spread multiplier (product of all adjustments).
     pub total_spread_mult: f64,
@@ -199,6 +238,7 @@ impl IntegratedSignals {
 }
 
 /// Signal integrator - combines all model signals.
+#[derive(Debug)]
 pub struct SignalIntegrator {
     config: SignalIntegratorConfig,
 
@@ -214,6 +254,12 @@ pub struct SignalIntegrator {
     /// Model gating system.
     model_gating: ModelGating,
 
+    /// Binance flow analyzer for cross-venue analysis.
+    binance_flow: BinanceFlowAnalyzer,
+
+    /// Cross-venue analyzer for joint Binance+HL analysis.
+    cross_venue: CrossVenueAnalyzer,
+
     /// Latest Binance mid price.
     latest_binance_mid: f64,
 
@@ -225,6 +271,12 @@ pub struct SignalIntegrator {
 
     /// Last computed flow decomposition.
     last_flow_decomp: FlowDecomposition,
+
+    /// Last computed cross-venue features.
+    last_cross_venue_features: CrossVenueFeatures,
+
+    /// Latest HL flow features (from existing estimators).
+    latest_hl_flow: FlowFeatureVec,
 
     /// Update counter for logging.
     update_count: u64,
@@ -238,11 +290,15 @@ impl SignalIntegrator {
             informed_flow: InformedFlowEstimator::new(config.informed_flow_config.clone()),
             regime_kappa: RegimeKappaEstimator::new(config.regime_kappa_config.clone()),
             model_gating: ModelGating::new(config.model_gating_config.clone()),
+            binance_flow: BinanceFlowAnalyzer::new(config.binance_flow_config.clone()),
+            cross_venue: CrossVenueAnalyzer::new(config.cross_venue_config.clone()),
             config,
             latest_binance_mid: 0.0,
             latest_hl_mid: 0.0,
             last_lead_lag_signal: LeadLagSignal::default(),
             last_flow_decomp: FlowDecomposition::default(),
+            last_cross_venue_features: CrossVenueFeatures::default(),
+            latest_hl_flow: FlowFeatureVec::default(),
             update_count: 0,
         }
     }
@@ -358,6 +414,62 @@ impl SignalIntegrator {
         }
     }
 
+    /// Update with Binance trade for cross-venue flow analysis.
+    ///
+    /// This feeds the BinanceFlowAnalyzer which computes VPIN, volume imbalance,
+    /// and intensity metrics for Binance. Combined with HL flow features, this
+    /// enables bivariate cross-venue analysis.
+    pub fn on_binance_trade(&mut self, trade: &BinanceTradeUpdate) {
+        if !self.config.use_cross_venue {
+            return;
+        }
+
+        // Update Binance flow analyzer
+        self.binance_flow.on_trade(trade);
+
+        // Update cross-venue features if we have both venues
+        self.update_cross_venue_features();
+    }
+
+    /// Update HL flow features from existing estimators.
+    ///
+    /// This should be called when the HL flow estimators produce new features.
+    /// The features are used for cross-venue comparison with Binance.
+    pub fn set_hl_flow_features(&mut self, features: FlowFeatureVec) {
+        self.latest_hl_flow = features;
+
+        if self.config.use_cross_venue {
+            self.update_cross_venue_features();
+        }
+    }
+
+    /// Update cross-venue features using both Binance and HL flow.
+    fn update_cross_venue_features(&mut self) {
+        let binance_flow = self.binance_flow.flow_features();
+        let hl_flow = &self.latest_hl_flow;
+
+        // Update the cross-venue analyzer with both flow feature vectors
+        self.cross_venue.update(&binance_flow, hl_flow);
+
+        // Cache the latest cross-venue features
+        self.last_cross_venue_features = self.cross_venue.features();
+    }
+
+    /// Get the current cross-venue features.
+    pub fn cross_venue_features(&self) -> &CrossVenueFeatures {
+        &self.last_cross_venue_features
+    }
+
+    /// Get the Binance flow analyzer for direct access.
+    pub fn binance_flow(&self) -> &BinanceFlowAnalyzer {
+        &self.binance_flow
+    }
+
+    /// Get the cross-venue analyzer for direct access.
+    pub fn cross_venue_analyzer(&self) -> &CrossVenueAnalyzer {
+        &self.cross_venue
+    }
+
     // =========================================================================
     // Signal Output
     // =========================================================================
@@ -410,16 +522,52 @@ impl SignalIntegrator {
             signals.gating_spread_mult = 1.0;
         }
 
-        // === Combined Signals ===
-        signals.total_spread_mult =
-            signals.informed_flow_spread_mult * signals.gating_spread_mult;
+        // === Cross-Venue (Bivariate Flow Model) ===
+        if self.config.use_cross_venue {
+            let cv = &self.last_cross_venue_features;
+            signals.cross_venue_direction = cv.combined_direction;
+            signals.cross_venue_confidence = cv.confidence;
+            signals.cross_venue_agreement = cv.agreement;
+            signals.cross_venue_max_toxicity = cv.max_toxicity;
+            signals.cross_venue_avg_toxicity = cv.avg_toxicity;
+            signals.cross_venue_spread_mult = cv.spread_multiplier();
+            // skew_recommendation returns (direction, magnitude_bps)
+            let (skew_dir, _skew_mag) = cv.skew_recommendation();
+            signals.cross_venue_skew = skew_dir as f64 * cv.combined_direction.abs();
+            signals.cross_venue_intensity_ratio = cv.intensity_ratio;
+            signals.cross_venue_imbalance_correlation = cv.imbalance_correlation;
+            signals.cross_venue_divergence = cv.divergence;
+            signals.cross_venue_valid = cv.sample_count >= 20; // min_samples threshold
+        } else {
+            signals.cross_venue_spread_mult = 1.0;
+            signals.cross_venue_valid = false;
+        }
 
-        // Combine skews (lead-lag is primary, informed flow modulates)
-        signals.combined_skew_bps = if signals.lead_lag_actionable {
+        // === Combined Signals ===
+        // Include cross-venue spread multiplier in total
+        signals.total_spread_mult = signals.informed_flow_spread_mult
+            * signals.gating_spread_mult
+            * signals.cross_venue_spread_mult;
+
+        // Combine skews: lead-lag is primary, cross-venue provides additional signal
+        let base_skew_bps = if signals.lead_lag_actionable {
             signals.lead_lag_skew_bps * signals.skew_direction as f64
         } else {
             0.0
         };
+
+        // Add cross-venue skew contribution (scaled by confidence)
+        let cross_venue_skew_bps = if signals.cross_venue_valid {
+            // Scale cross-venue skew ([-1, 1]) to bps
+            // Use half of max_lead_lag_skew_bps as max cross-venue contribution
+            signals.cross_venue_skew
+                * signals.cross_venue_confidence
+                * (self.config.max_lead_lag_skew_bps / 2.0)
+        } else {
+            0.0
+        };
+
+        signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps;
 
         // Log periodically
         if self.update_count % 100 == 0 && self.update_count > 0 {
@@ -454,8 +602,37 @@ impl SignalIntegrator {
         let lag_ready = !self.config.use_lead_lag || self.lag_analyzer.is_ready();
         let flow_ready = !self.config.use_informed_flow || self.informed_flow.is_warmed_up();
         let kappa_ready = !self.config.use_regime_kappa || self.regime_kappa.is_warmed_up();
+        let cross_venue_ready =
+            !self.config.use_cross_venue || self.binance_flow.is_warmed_up();
 
-        lag_ready || flow_ready || kappa_ready
+        lag_ready || flow_ready || kappa_ready || cross_venue_ready
+    }
+
+    /// Get lag analyzer status for diagnostics.
+    /// Returns (is_ready, (signal_count, target_count), optimal_lag_ms, mi_bits, last_signal, sample_timestamps)
+    #[allow(clippy::type_complexity)]
+    pub fn lag_analyzer_status(
+        &self,
+    ) -> (
+        bool,
+        (usize, usize),
+        Option<i64>,
+        Option<f64>,
+        &LeadLagSignal,
+        ((Option<i64>, Option<i64>), (Option<i64>, Option<i64>)),
+    ) {
+        let (lag, mi) = self
+            .lag_analyzer
+            .optimal_lag()
+            .map_or((None, None), |(l, m)| (Some(l), Some(m)));
+        (
+            self.lag_analyzer.is_ready(),
+            self.lag_analyzer.observation_counts(),
+            lag,
+            mi,
+            &self.last_lead_lag_signal,
+            self.lag_analyzer.sample_timestamps(),
+        )
     }
 
     /// Log current status.
@@ -494,10 +671,14 @@ impl SignalIntegrator {
         self.informed_flow.reset();
         self.regime_kappa.reset();
         self.model_gating.reset();
+        self.binance_flow.reset();
+        self.cross_venue.reset();
         self.latest_binance_mid = 0.0;
         self.latest_hl_mid = 0.0;
         self.last_lead_lag_signal = LeadLagSignal::default();
         self.last_flow_decomp = FlowDecomposition::default();
+        self.last_cross_venue_features = CrossVenueFeatures::default();
+        self.latest_hl_flow = FlowFeatureVec::default();
         self.update_count = 0;
     }
 }

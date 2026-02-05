@@ -48,6 +48,10 @@ pub struct BeliefSnapshot {
     /// Microstructure-based toxicity signals
     pub microstructure: MicrostructureBeliefs,
 
+    // === Cross-Venue (Bivariate Flow Model) ===
+    /// Cross-venue beliefs from joint Binance + Hyperliquid analysis
+    pub cross_venue: CrossVenueBeliefs,
+
     // === Calibration ===
     /// Model calibration metrics
     pub calibration: CalibrationState,
@@ -67,6 +71,7 @@ impl Default for BeliefSnapshot {
             changepoint: ChangepointBeliefs::default(),
             edge: EdgeBeliefs::default(),
             microstructure: MicrostructureBeliefs::default(),
+            cross_venue: CrossVenueBeliefs::default(),
             calibration: CalibrationState::default(),
             stats: BeliefStats::default(),
         }
@@ -863,6 +868,233 @@ impl MicrostructureBeliefs {
     /// Get effective VPIN with toxicity acceleration.
     pub fn effective_vpin(&self) -> f64 {
         (self.vpin * self.toxicity_acceleration).min(1.0)
+    }
+}
+
+// =============================================================================
+// Cross-Venue Beliefs (Bivariate Flow Model)
+// =============================================================================
+
+/// Cross-venue beliefs from joint Binance + Hyperliquid flow analysis.
+///
+/// The key insight is that neither exchange is definitively the leader -
+/// the signal comes from the **joint relationship**:
+/// - Agreement (both show same pressure) → high confidence
+/// - Divergence → uncertainty, market dislocation
+/// - Intensity ratio → where is price discovery happening?
+///
+/// ## Signal Interpretation
+///
+/// | State | Interpretation | Action |
+/// |-------|----------------|--------|
+/// | Both buying, high agreement | Strong bullish | Lean long, aggressive bids |
+/// | Both selling, high agreement | Strong bearish | Lean short, aggressive asks |
+/// | Binance buying, HL selling | Dislocation | Widen spreads, reduce size |
+/// | High intensity on Binance | Price discovery there | Weight Binance signal more |
+/// | Both VPIN > 0.6 | Informed traders active | Widen significantly |
+///
+/// ## Usage
+///
+/// ```ignore
+/// let beliefs = belief_state.snapshot();
+/// let cv = &beliefs.cross_venue;
+///
+/// // Use agreement for confidence boost
+/// if cv.agreement > 0.7 {
+///     // High confidence in direction
+///     let direction_adjustment = cv.direction * cv.confidence * max_bias_bps;
+/// }
+///
+/// // Widen when venues disagree
+/// let uncertainty_mult = 1.0 + (1.0 - cv.confidence) * 0.5;
+///
+/// // Widen when either venue shows toxicity
+/// let toxicity_mult = 1.0 + cv.max_toxicity * toxicity_sensitivity;
+/// ```
+#[derive(Debug, Clone)]
+pub struct CrossVenueBeliefs {
+    /// Joint direction belief from bivariate analysis [-1, +1].
+    ///
+    /// Positive = bullish (both venues buying), Negative = bearish.
+    /// When venues agree, this reflects the consensus direction.
+    /// When venues disagree, this decays toward neutral.
+    pub direction: f64,
+
+    /// Confidence in direction based on venue agreement [0, 1].
+    ///
+    /// High when both venues show same direction (agreement > 0.5).
+    /// Low when venues diverge (uncertainty, market dislocation).
+    pub confidence: f64,
+
+    /// Where is price discovery happening? [0, 1].
+    ///
+    /// 0 = all activity on Hyperliquid
+    /// 0.5 = balanced activity
+    /// 1 = all activity on Binance
+    ///
+    /// When discovery_venue > 0.6, weight Binance signals more heavily.
+    pub discovery_venue: f64,
+
+    /// Maximum toxicity across both venues [0, 1].
+    ///
+    /// max(vpin_binance, vpin_hl).
+    /// Use for spread widening - when either venue is toxic, widen.
+    pub max_toxicity: f64,
+
+    /// Average toxicity across venues [0, 1].
+    ///
+    /// (vpin_binance + vpin_hl) / 2.
+    /// Use for baseline toxicity assessment.
+    pub avg_toxicity: f64,
+
+    /// Agreement score between venues [-1, 1].
+    ///
+    /// +1 = perfect agreement (same direction, same magnitude)
+    /// 0 = uncorrelated
+    /// -1 = perfect disagreement (opposite directions)
+    pub agreement: f64,
+
+    /// Imbalance divergence (binance - hl) [-2, 2].
+    ///
+    /// Measures the difference in directional pressure between venues.
+    /// Large positive = Binance more bullish than HL.
+    /// Large negative = HL more bullish than Binance.
+    pub divergence: f64,
+
+    /// Intensity ratio: λ_B / (λ_B + λ_H) [0, 1].
+    ///
+    /// Where is the trading activity concentrated?
+    /// > 0.6 = Binance is the action (follow Binance signals)
+    /// < 0.4 = HL is the action (rely on local flow)
+    pub intensity_ratio: f64,
+
+    /// Rolling correlation of imbalances [-1, 1].
+    ///
+    /// Measures how correlated the imbalance signals are over time.
+    /// High correlation = stable relationship, use cross-venue signals.
+    /// Low correlation = regime change, rely on venue-specific signals.
+    pub imbalance_correlation: f64,
+
+    /// Whether a toxicity alert is active (either venue VPIN > 0.7).
+    pub toxicity_alert: bool,
+
+    /// Whether a divergence alert is active (large venue disagreement).
+    pub divergence_alert: bool,
+
+    /// Whether cross-venue beliefs are valid (have data from both venues).
+    pub is_valid: bool,
+
+    /// Number of cross-venue observations processed.
+    pub observation_count: u64,
+
+    /// Timestamp of last cross-venue update (epoch ms).
+    pub last_update_ms: u64,
+}
+
+impl Default for CrossVenueBeliefs {
+    fn default() -> Self {
+        Self {
+            direction: 0.0,
+            confidence: 0.0,
+            discovery_venue: 0.5,
+            max_toxicity: 0.0,
+            avg_toxicity: 0.0,
+            agreement: 0.0,
+            divergence: 0.0,
+            intensity_ratio: 0.5,
+            imbalance_correlation: 0.0,
+            toxicity_alert: false,
+            divergence_alert: false,
+            is_valid: false,
+            observation_count: 0,
+            last_update_ms: 0,
+        }
+    }
+}
+
+impl CrossVenueBeliefs {
+    /// Get spread multiplier based on cross-venue state [1.0, 2.5].
+    ///
+    /// Widens spreads when:
+    /// - Venues disagree (low confidence)
+    /// - Either venue shows toxicity
+    /// - Correlation is low (unstable relationship)
+    pub fn spread_multiplier(&self) -> f64 {
+        if !self.is_valid {
+            return 1.0; // No adjustment without data
+        }
+
+        // Base multiplier from uncertainty (low confidence = wider spreads)
+        let uncertainty_mult = 1.0 + (1.0 - self.confidence) * 0.3;
+
+        // Toxicity multiplier
+        let toxicity_mult = 1.0 + self.max_toxicity * 0.5;
+
+        // Correlation multiplier (low correlation = unstable, widen)
+        let corr_mult = 1.0 + (1.0 - self.imbalance_correlation.abs()) * 0.2;
+
+        (uncertainty_mult * toxicity_mult * corr_mult).min(2.5)
+    }
+
+    /// Get skew recommendation based on cross-venue direction [-1, 1].
+    ///
+    /// Returns a directional skew multiplier:
+    /// - Positive: lean long (tighter bids, wider asks)
+    /// - Negative: lean short (wider bids, tighter asks)
+    ///
+    /// The magnitude is scaled by confidence and reduced by toxicity.
+    pub fn skew_recommendation(&self) -> f64 {
+        if !self.is_valid {
+            return 0.0;
+        }
+
+        // Direction scaled by confidence, reduced by toxicity
+        let toxicity_discount = 1.0 - self.max_toxicity;
+        self.direction * self.confidence * toxicity_discount
+    }
+
+    /// Check if cross-venue signals suggest caution.
+    ///
+    /// True when any of:
+    /// - Toxicity alert is active
+    /// - Divergence alert is active
+    /// - Confidence is very low (< 0.3)
+    pub fn requires_caution(&self) -> bool {
+        self.toxicity_alert || self.divergence_alert || self.confidence < 0.3
+    }
+
+    /// Get the dominant venue for signal weighting.
+    ///
+    /// Returns:
+    /// - Some(true) if Binance is dominant (discovery_venue > 0.6)
+    /// - Some(false) if HL is dominant (discovery_venue < 0.4)
+    /// - None if balanced
+    pub fn dominant_venue(&self) -> Option<bool> {
+        if self.discovery_venue > 0.6 {
+            Some(true) // Binance dominant
+        } else if self.discovery_venue < 0.4 {
+            Some(false) // HL dominant
+        } else {
+            None // Balanced
+        }
+    }
+
+    /// Get signal quality score [0, 1].
+    ///
+    /// High when:
+    /// - Venues agree (high confidence)
+    /// - Correlation is strong
+    /// - Toxicity is low
+    pub fn signal_quality(&self) -> f64 {
+        if !self.is_valid {
+            return 0.0;
+        }
+
+        let agreement_score = (self.agreement + 1.0) / 2.0; // Map [-1,1] to [0,1]
+        let corr_score = self.imbalance_correlation.abs();
+        let toxicity_score = 1.0 - self.max_toxicity;
+
+        (0.4 * agreement_score + 0.3 * corr_score + 0.3 * toxicity_score).clamp(0.0, 1.0)
     }
 }
 

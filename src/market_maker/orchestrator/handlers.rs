@@ -11,7 +11,9 @@ use super::super::{
     adverse_selection::TradeObservation as MicroTradeObs,
     belief::BeliefUpdate,
     estimator::HmmObservation,
-    fills, messages, tracking::ws_order_state::WsFillEvent,
+    fills,
+    infra::{BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate},
+    messages, tracking::ws_order_state::WsFillEvent,
     tracking::ws_order_state::WsOrderUpdateEvent, MarketMaker, OrderExecutor, OrderState,
     QuotingStrategy, Side, TrackedOrder,
 };
@@ -102,6 +104,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 let return_bps = (self.latest_mid - prev_mid) / prev_mid * 10_000.0;
                 self.stochastic.threshold_kappa.update(return_bps);
             }
+
+            // === Cross-Exchange Signal Integration: Feed HL price ===
+            // Update SignalIntegrator with Hyperliquid mid price for lead-lag calculation.
+            // This pairs with Binance prices from handle_binance_price_update().
+            self.stochastic.signal_integrator.on_hl_price(
+                self.latest_mid,
+                current_time_ms as i64,
+            );
 
             // === Phase 3: Event-Driven Quote Updates ===
             // Instead of calling update_quotes() on every AllMids, record the event
@@ -1427,5 +1437,87 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         Ok(())
+    }
+
+    /// Handle Binance price update for lead-lag signal.
+    ///
+    /// This feeds Binance mid prices to the SignalIntegrator, which computes
+    /// optimal skew based on cross-exchange price discovery (Binance leads Hyperliquid).
+    ///
+    /// Called from the event loop when Binance feed is enabled.
+    pub(crate) fn handle_binance_price_update(&mut self, update: BinancePriceUpdate) {
+        // Feed Binance price to SignalIntegrator
+        self.stochastic.signal_integrator.on_binance_price(
+            update.mid_price,
+            update.timestamp_ms,
+        );
+
+        // Log periodically (every 1000 updates ≈ every 10 seconds at 100 updates/sec)
+        static BINANCE_UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = BINANCE_UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if count % 1000 == 0 {
+            let signal = self.stochastic.signal_integrator.lead_lag_signal();
+            if signal.is_actionable {
+                info!(
+                    binance_mid = %format!("{:.2}", update.mid_price),
+                    hl_mid = %format!("{:.2}", self.latest_mid),
+                    diff_bps = %format!("{:.1}", signal.diff_bps),
+                    skew_direction = signal.skew_direction,
+                    skew_bps = %format!("{:.1}", signal.skew_magnitude_bps),
+                    "Lead-lag signal ACTIVE"
+                );
+            } else {
+                trace!(
+                    binance_mid = %format!("{:.2}", update.mid_price),
+                    spread_bps = %format!("{:.2}", update.spread_bps),
+                    "Binance price update"
+                );
+            }
+        }
+    }
+
+    /// Handle Binance trade update for cross-venue flow analysis.
+    ///
+    /// This feeds Binance trades to the SignalIntegrator for bivariate flow analysis.
+    /// The BinanceFlowAnalyzer computes VPIN, volume imbalance, and trade intensity
+    /// which are combined with HL flow features for cross-venue agreement/divergence detection.
+    ///
+    /// Called from the event loop when Binance feed with trades is enabled.
+    pub(crate) fn handle_binance_trade(&mut self, trade: BinanceTradeUpdate) {
+        // Feed Binance trade to SignalIntegrator (cross-venue flow analysis)
+        self.stochastic.signal_integrator.on_binance_trade(&trade);
+
+        // Log periodically (every 500 trades)
+        static BINANCE_TRADE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = BINANCE_TRADE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if count % 500 == 0 {
+            let cv_features = self.stochastic.signal_integrator.cross_venue_features();
+            if cv_features.sample_count >= 20 {
+                trace!(
+                    agreement = %format!("{:.2}", cv_features.agreement),
+                    direction = %format!("{:.2}", cv_features.combined_direction),
+                    max_toxicity = %format!("{:.2}", cv_features.max_toxicity),
+                    intensity_ratio = %format!("{:.2}", cv_features.intensity_ratio),
+                    "Cross-venue features"
+                );
+            }
+        }
+    }
+
+    /// Handle a unified Binance update (price or trade).
+    ///
+    /// This is the main entry point for all Binance feed updates.
+    /// Routes to the appropriate handler based on update type.
+    pub(crate) fn handle_binance_update(&mut self, update: BinanceUpdate) {
+        match update {
+            BinanceUpdate::Price(price_update) => {
+                self.handle_binance_price_update(price_update);
+            }
+            BinanceUpdate::Trade(trade_update) => {
+                self.handle_binance_trade(trade_update);
+            }
+        }
     }
 }

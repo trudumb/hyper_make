@@ -41,9 +41,9 @@ use std::time::Instant;
 use super::messages::{BeliefUpdate, PredictionLog, PredictionType};
 use super::snapshot::{
     BeliefSnapshot, BeliefStats, CalibrationMetrics, CalibrationState, ChangepointBeliefs,
-    ChangepointResult, ContinuationBeliefs, ContinuationSignals, DriftVolatilityBeliefs,
-    EdgeBeliefs, KappaBeliefs, KappaComponents, LatencyCalibration, MicrostructureBeliefs,
-    RegimeBeliefs,
+    ChangepointResult, ContinuationBeliefs, ContinuationSignals, CrossVenueBeliefs,
+    DriftVolatilityBeliefs, EdgeBeliefs, KappaBeliefs, KappaComponents, LatencyCalibration,
+    MicrostructureBeliefs, RegimeBeliefs,
 };
 use super::Regime;
 
@@ -207,6 +207,36 @@ struct InternalState {
     /// Tracked sigma skewness for asymmetric spread adjustment
     sigma_skewness: f64,
 
+    // === Cross-Venue (Bivariate Flow Model) ===
+    /// Joint direction belief from bivariate analysis [-1, +1]
+    cv_direction: f64,
+    /// Confidence in direction based on venue agreement [0, 1]
+    cv_confidence: f64,
+    /// Where is price discovery happening? [0=HL, 1=Binance]
+    cv_discovery_venue: f64,
+    /// Maximum toxicity across venues [0, 1]
+    cv_max_toxicity: f64,
+    /// Average toxicity across venues [0, 1]
+    cv_avg_toxicity: f64,
+    /// Agreement score between venues [-1, 1]
+    cv_agreement: f64,
+    /// Imbalance divergence (binance - hl) [-2, 2]
+    cv_divergence: f64,
+    /// Intensity ratio λ_B / (λ_B + λ_H) [0, 1]
+    cv_intensity_ratio: f64,
+    /// Rolling imbalance correlation [-1, 1]
+    cv_imbalance_correlation: f64,
+    /// Toxicity alert active?
+    cv_toxicity_alert: bool,
+    /// Divergence alert active?
+    cv_divergence_alert: bool,
+    /// Whether cross-venue beliefs are valid
+    cv_is_valid: bool,
+    /// Number of cross-venue observations
+    cv_observation_count: u64,
+    /// Last cross-venue update timestamp
+    cv_last_update_ms: u64,
+
     // === Statistics ===
     n_price_obs: u64,
     n_fills: u64,
@@ -312,6 +342,22 @@ impl Default for InternalState {
 
             // Phase 2A: Skewness tracking
             sigma_skewness: 0.5, // Slight positive (typical for vol)
+
+            // Cross-venue (bivariate flow model)
+            cv_direction: 0.0,
+            cv_confidence: 0.0,
+            cv_discovery_venue: 0.5,
+            cv_max_toxicity: 0.0,
+            cv_avg_toxicity: 0.0,
+            cv_agreement: 0.0,
+            cv_divergence: 0.0,
+            cv_intensity_ratio: 0.5,
+            cv_imbalance_correlation: 0.0,
+            cv_toxicity_alert: false,
+            cv_divergence_alert: false,
+            cv_is_valid: false,
+            cv_observation_count: 0,
+            cv_last_update_ms: 0,
 
             // Stats
             n_price_obs: 0,
@@ -506,6 +552,37 @@ impl CentralBeliefState {
                 state.cofi = cofi;
                 state.cofi_velocity = cofi_velocity;
                 state.is_sustained_shift = is_sustained_shift;
+            }
+
+            BeliefUpdate::CrossVenueUpdate {
+                direction,
+                confidence,
+                discovery_venue,
+                max_toxicity,
+                avg_toxicity,
+                agreement,
+                divergence,
+                intensity_ratio,
+                imbalance_correlation,
+                toxicity_alert,
+                divergence_alert,
+                timestamp_ms,
+            } => {
+                self.process_cross_venue_update(
+                    state,
+                    direction,
+                    confidence,
+                    discovery_venue,
+                    max_toxicity,
+                    avg_toxicity,
+                    agreement,
+                    divergence,
+                    intensity_ratio,
+                    imbalance_correlation,
+                    toxicity_alert,
+                    divergence_alert,
+                    timestamp_ms,
+                );
             }
 
             BeliefUpdate::SoftReset { retention } => {
@@ -730,6 +807,62 @@ impl CentralBeliefState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn process_cross_venue_update(
+        &self,
+        state: &mut InternalState,
+        direction: f64,
+        confidence: f64,
+        discovery_venue: f64,
+        max_toxicity: f64,
+        avg_toxicity: f64,
+        agreement: f64,
+        divergence: f64,
+        intensity_ratio: f64,
+        imbalance_correlation: f64,
+        toxicity_alert: bool,
+        divergence_alert: bool,
+        timestamp_ms: u64,
+    ) {
+        // Update cross-venue state with smoothing
+        // Use EMA smoothing for continuous values to reduce noise
+        let alpha = 0.3; // Smoothing factor
+
+        if state.cv_is_valid {
+            // Smooth updates for continuous values
+            state.cv_direction = (1.0 - alpha) * state.cv_direction + alpha * direction;
+            state.cv_confidence = (1.0 - alpha) * state.cv_confidence + alpha * confidence;
+            state.cv_discovery_venue =
+                (1.0 - alpha) * state.cv_discovery_venue + alpha * discovery_venue;
+            state.cv_max_toxicity = (1.0 - alpha) * state.cv_max_toxicity + alpha * max_toxicity;
+            state.cv_avg_toxicity = (1.0 - alpha) * state.cv_avg_toxicity + alpha * avg_toxicity;
+            state.cv_agreement = (1.0 - alpha) * state.cv_agreement + alpha * agreement;
+            state.cv_divergence = (1.0 - alpha) * state.cv_divergence + alpha * divergence;
+            state.cv_intensity_ratio =
+                (1.0 - alpha) * state.cv_intensity_ratio + alpha * intensity_ratio;
+            state.cv_imbalance_correlation =
+                (1.0 - alpha) * state.cv_imbalance_correlation + alpha * imbalance_correlation;
+        } else {
+            // First update - initialize directly
+            state.cv_direction = direction;
+            state.cv_confidence = confidence;
+            state.cv_discovery_venue = discovery_venue;
+            state.cv_max_toxicity = max_toxicity;
+            state.cv_avg_toxicity = avg_toxicity;
+            state.cv_agreement = agreement;
+            state.cv_divergence = divergence;
+            state.cv_intensity_ratio = intensity_ratio;
+            state.cv_imbalance_correlation = imbalance_correlation;
+        }
+
+        // Boolean alerts are not smoothed
+        state.cv_toxicity_alert = toxicity_alert;
+        state.cv_divergence_alert = divergence_alert;
+        state.cv_is_valid = true;
+        state.cv_observation_count += 1;
+        state.cv_last_update_ms = timestamp_ms;
+    }
+
     fn soft_reset(&self, state: &mut InternalState, retention: f64) {
         // Decay all posteriors toward prior
         let r = retention.clamp(0.0, 1.0);
@@ -777,6 +910,7 @@ impl CentralBeliefState {
             changepoint: self.build_changepoint_beliefs(state),
             edge: self.build_edge_beliefs(state),
             microstructure: self.build_microstructure_beliefs(state),
+            cross_venue: self.build_cross_venue_beliefs(state),
             calibration: self.build_calibration_state(state),
             stats: BeliefStats {
                 n_price_obs: state.n_price_obs,
@@ -1141,6 +1275,25 @@ impl CentralBeliefState {
             cofi: state.cofi,
             cofi_velocity: state.cofi_velocity,
             is_sustained_shift: state.is_sustained_shift,
+        }
+    }
+
+    fn build_cross_venue_beliefs(&self, state: &InternalState) -> CrossVenueBeliefs {
+        CrossVenueBeliefs {
+            direction: state.cv_direction,
+            confidence: state.cv_confidence,
+            discovery_venue: state.cv_discovery_venue,
+            max_toxicity: state.cv_max_toxicity,
+            avg_toxicity: state.cv_avg_toxicity,
+            agreement: state.cv_agreement,
+            divergence: state.cv_divergence,
+            intensity_ratio: state.cv_intensity_ratio,
+            imbalance_correlation: state.cv_imbalance_correlation,
+            toxicity_alert: state.cv_toxicity_alert,
+            divergence_alert: state.cv_divergence_alert,
+            is_valid: state.cv_is_valid,
+            observation_count: state.cv_observation_count,
+            last_update_ms: state.cv_last_update_ms,
         }
     }
 
