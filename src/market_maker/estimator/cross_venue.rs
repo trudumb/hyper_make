@@ -372,9 +372,30 @@ impl CrossVenueAnalyzer {
         // Correlation
         let imbalance_correlation = self.imbalance_correlation.correlation();
 
-        // Toxicity
-        let max_toxicity = binance.vpin.max(hl.vpin);
+        // Toxicity: Replace saturating max() with divergence-based signals
+        // Key insight: max(vpin_A, vpin_B) saturates at 1.0 on low-volume assets
+        // because VPIN hits extremes. Instead, use signals with natural variance:
+        //
+        // 1. VPIN divergence: |vpin_B - vpin_H| measures information asymmetry
+        //    Has variance even in calm markets because it's a *difference*
+        // 2. VPIN agreement: min(vpin_B, vpin_H) when both venues show toxicity
+        //
+        let vpin_divergence = (binance.vpin - hl.vpin).abs();
         let avg_toxicity = (binance.vpin + hl.vpin) / 2.0;
+
+        // Asymmetry signal: when venues disagree, scale by activity balance
+        // intensity_balance peaks at 0.5 (both venues equally active)
+        let intensity_balance = 4.0 * intensity_ratio * (1.0 - intensity_ratio);
+        let asymmetry_signal = vpin_divergence * (0.5 + 0.5 * intensity_balance);
+
+        // Agreement signal: when both venues show elevated toxicity
+        // Uses min() so it's only high when BOTH venues see toxicity
+        let min_vpin = binance.vpin.min(hl.vpin);
+        let agreement_signal = min_vpin * (1.0 - vpin_divergence); // High when both high & similar
+
+        // Combined: asymmetry OR agreement can indicate toxicity
+        // This has natural variance unlike max() which saturates
+        let max_toxicity = asymmetry_signal.max(agreement_signal).clamp(0.0, 1.0);
 
         // Combined direction (weighted by intensity)
         let combined_direction = if total_intensity > 1e-12 {
