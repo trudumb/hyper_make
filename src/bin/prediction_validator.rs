@@ -53,8 +53,8 @@ use hyperliquid_rust_sdk::market_maker::regime_hmm::{Observation as RegimeObserv
 
 // Import lead-lag infrastructure
 use hyperliquid_rust_sdk::market_maker::{
-    BinanceFeed, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate, LagAnalyzerConfig,
-    SignalIntegrator, SignalIntegratorConfig,
+    BinanceFeed, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate, FlowFeatureVec,
+    LagAnalyzerConfig, SignalIntegrator, SignalIntegratorConfig,
 };
 
 // Import logging infrastructure
@@ -139,9 +139,10 @@ struct Cli {
     #[arg(long)]
     disable_binance_feed: bool,
 
-    /// Binance symbol to subscribe to for lead-lag validation (default: btcusdt).
-    #[arg(long, default_value = "btcusdt")]
-    binance_symbol: String,
+    /// Binance symbol to subscribe to for lead-lag validation.
+    /// If not specified, auto-derived from asset (e.g., HYPE -> hypeusdt, BTC -> btcusdt).
+    #[arg(long)]
+    binance_symbol: Option<String>,
 }
 
 // ============================================================================
@@ -559,6 +560,111 @@ impl ObservationBuffers {
 
         (vw_ratio, clustering_boost)
     }
+
+    /// Compute HL flow features for cross-venue analysis.
+    ///
+    /// This creates a FlowFeatureVec from HL trade data that can be
+    /// compared with Binance flow features for cross-venue signals.
+    pub fn compute_hl_flow_features(&self, timestamp_ms: u64) -> FlowFeatureVec {
+        if self.trades.is_empty() {
+            return FlowFeatureVec::default();
+        }
+
+        // Compute time-windowed imbalances
+        let imbalance_1s = self.imbalance_in_window(timestamp_ms, 1000);
+        let imbalance_5s = self.imbalance_in_window(timestamp_ms, 5000);
+        let imbalance_30s = self.imbalance_in_window(timestamp_ms, 30000);
+        let imbalance_5m = self.imbalance_in_window(timestamp_ms, 300_000);
+
+        // Compute trade intensity (trades per second, last 5s)
+        let intensity = self.intensity_in_window(timestamp_ms, 5000);
+
+        // Compute size metrics
+        let (avg_buy_size, avg_sell_size) = self.avg_trade_sizes(20);
+        let size_ratio = if avg_sell_size > 1e-12 {
+            avg_buy_size / avg_sell_size
+        } else {
+            1.0
+        };
+
+        // Confidence based on data sufficiency
+        let confidence = (self.trades.len().min(100) as f64 / 100.0).min(1.0);
+
+        FlowFeatureVec {
+            vpin: 0.0, // HL doesn't have VPIN computed here
+            vpin_velocity: 0.0,
+            imbalance_1s,
+            imbalance_5s,
+            imbalance_30s,
+            imbalance_5m,
+            intensity,
+            avg_buy_size,
+            avg_sell_size,
+            size_ratio,
+            order_flow_direction: imbalance_5s, // Use 5s imbalance as direction
+            timestamp_ms: timestamp_ms as i64,
+            trade_count: self.trades.len() as u64,
+            confidence,
+        }
+    }
+
+    /// Compute imbalance in a specific time window.
+    fn imbalance_in_window(&self, now_ms: u64, window_ms: u64) -> f64 {
+        let cutoff = now_ms.saturating_sub(window_ms);
+        let mut buy_vol = 0.0;
+        let mut sell_vol = 0.0;
+
+        for trade in self.trades.iter().rev() {
+            if trade.timestamp_ms < cutoff {
+                break;
+            }
+            if trade.is_buy {
+                buy_vol += trade.size;
+            } else {
+                sell_vol += trade.size;
+            }
+        }
+
+        let total = buy_vol + sell_vol;
+        if total > 1e-12 {
+            (buy_vol - sell_vol) / total
+        } else {
+            0.0
+        }
+    }
+
+    /// Compute trade intensity (trades per second) in a window.
+    fn intensity_in_window(&self, now_ms: u64, window_ms: u64) -> f64 {
+        let cutoff = now_ms.saturating_sub(window_ms);
+        let count = self.trades.iter().rev()
+            .take_while(|t| t.timestamp_ms >= cutoff)
+            .count();
+
+        count as f64 / (window_ms as f64 / 1000.0)
+    }
+
+    /// Compute average buy and sell trade sizes.
+    fn avg_trade_sizes(&self, window: usize) -> (f64, f64) {
+        let mut buy_sum = 0.0;
+        let mut buy_count = 0;
+        let mut sell_sum = 0.0;
+        let mut sell_count = 0;
+
+        for trade in self.trades.iter().rev().take(window) {
+            if trade.is_buy {
+                buy_sum += trade.size;
+                buy_count += 1;
+            } else {
+                sell_sum += trade.size;
+                sell_count += 1;
+            }
+        }
+
+        let avg_buy = if buy_count > 0 { buy_sum / buy_count as f64 } else { 0.0 };
+        let avg_sell = if sell_count > 0 { sell_sum / sell_count as f64 } else { 0.0 };
+
+        (avg_buy, avg_sell)
+    }
 }
 
 // ============================================================================
@@ -830,6 +936,13 @@ impl PredictionValidator {
             size,
             is_buy,
         });
+
+        // Feed HL flow features to SignalIntegrator for cross-venue analysis
+        // This is critical - without this, CV_Agreement is always 0 because HL imbalances are empty
+        if let Some(ref mut integrator) = self.signal_integrator {
+            let hl_flow = self.buffers.compute_hl_flow_features(timestamp_ms);
+            integrator.set_hl_flow_features(hl_flow);
+        }
 
         // Resolve any BuyPressure predictions (next trade resolution)
         self.resolve_buy_pressure_predictions(is_buy, timestamp_ms);
@@ -1205,7 +1318,9 @@ impl PredictionValidator {
         // In high vol regimes, price needs to move more to be "adverse"
         let vol_scale = (self.volatility_filter.sigma_bps_per_sqrt_s() / 10.0).clamp(0.5, 3.0);
         let threshold_bps = self.adverse_threshold_bps * vol_scale;
-        let vol_threshold = self.volatility_filter.sigma_bps_per_sqrt_s() * 2.0;
+        // Fixed threshold for "high volatility" - 30 bps/sqrt(s) is historically high
+        // This should fire ~20-30% of the time during volatile periods
+        let vol_threshold = 30.0;
 
         while let Some(pending) = self.pending_outcomes.front() {
             // Skip BuyPressure (handled separately)
@@ -1747,11 +1862,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.warmup_samples,
     );
 
+    // Auto-derive Binance symbol from asset if not explicitly provided
+    let binance_symbol = cli.binance_symbol.clone().unwrap_or_else(|| {
+        format!("{}usdt", cli.asset.to_lowercase())
+    });
+
     // Spawn Binance feed for lead-lag validation (enabled by default)
     let mut binance_receiver: Option<tokio::sync::mpsc::Receiver<BinanceUpdate>> = None;
     if !cli.disable_binance_feed {
         let (tx, rx) = tokio::sync::mpsc::channel(1000);
-        let feed = BinanceFeed::for_symbol(&cli.binance_symbol, tx);
+        let feed = BinanceFeed::for_symbol(&binance_symbol, tx);
         tokio::spawn(async move {
             feed.run().await;
             tracing::warn!("Binance feed task terminated");
@@ -1759,8 +1879,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         binance_receiver = Some(rx);
         validator.enable_binance_feed();
         info!(
-            symbol = %cli.binance_symbol,
-            "Binance lead-lag feed active for validation"
+            symbol = %binance_symbol,
+            asset = %cli.asset,
+            "Binance lead-lag feed active (auto-derived from asset)"
         );
     } else {
         warn!("Binance lead-lag feed DISABLED - LeadLag model will not be validated");
@@ -1843,7 +1964,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     BinanceUpdate::Price(price_update) => {
                         validator.on_binance_price(&price_update);
                         if cli.verbose {
-                            debug!("Binance: {} mid=${:.2}", cli.binance_symbol, price_update.mid_price);
+                            debug!("Binance: {} mid=${:.2}", binance_symbol, price_update.mid_price);
                         }
                     }
                     BinanceUpdate::Trade(trade_update) => {
