@@ -303,6 +303,27 @@ pub struct InformedFlowEstimator {
     /// EWMA of recent price impacts (in bps)
     /// Used when caller doesn't provide impact
     impact_ewma: f64,
+
+    // === NEW FIELDS FOR ENHANCED FEATURES ===
+
+    /// Kyle's lambda: rolling estimate of price impact per unit size
+    /// Computed via exponentially-weighted regression of impact ~ size
+    kyle_lambda: f64,
+
+    /// Numerator for Kyle's lambda EWMA regression: sum(size * impact)
+    kyle_sum_size_impact: f64,
+
+    /// Denominator for Kyle's lambda EWMA regression: sum(size^2)
+    kyle_sum_size_sq: f64,
+
+    /// Clustering indicator: consecutive high-informed-prob trades
+    informed_cluster_count: usize,
+
+    /// Recent p_informed values for clustering detection
+    recent_p_informed: VecDeque<f64>,
+
+    /// Maximum cluster size seen (for normalization)
+    max_cluster_size: usize,
 }
 
 /// Sufficient statistics for online EM
@@ -342,6 +363,13 @@ impl InformedFlowEstimator {
             last_trade_ms: 0,
             last_price: None,
             impact_ewma: 1.0, // Start with 1 bps default
+            // New fields
+            kyle_lambda: 0.5, // Initial estimate: 0.5 bps per unit
+            kyle_sum_size_impact: 0.0,
+            kyle_sum_size_sq: 0.0,
+            informed_cluster_count: 0,
+            recent_p_informed: VecDeque::with_capacity(20),
+            max_cluster_size: 1,
         }
     }
 
@@ -377,6 +405,12 @@ impl InformedFlowEstimator {
 
         // E-step: compute responsibilities
         let resp = self.e_step(&feat);
+
+        // === NEW: Update Kyle's lambda (rolling EWMA regression) ===
+        self.update_kyle_lambda(features.size, price_impact_bps);
+
+        // === NEW: Update clustering detection ===
+        self.update_clustering(resp[0]); // p_informed
 
         // Store for tracking
         if self.responsibilities.len() >= self.config.buffer_size {
@@ -437,6 +471,115 @@ impl InformedFlowEstimator {
     /// Get current impact EWMA for diagnostics
     pub fn impact_ewma(&self) -> f64 {
         self.impact_ewma
+    }
+
+
+    /// Update Kyle's lambda using EWMA regression.
+    ///
+    /// Kyle's lambda measures market impact per unit size:
+    /// ΔP = λ * signed_size + noise
+    ///
+    /// We estimate λ using exponentially-weighted OLS:
+    /// λ = Σ(size * impact) / Σ(size²)
+    fn update_kyle_lambda(&mut self, size: f64, impact_bps: f64) {
+        let alpha = self.config.impact_ewma_alpha;
+
+        // EWMA update for regression statistics
+        self.kyle_sum_size_impact =
+            alpha * (size * impact_bps.abs()) + (1.0 - alpha) * self.kyle_sum_size_impact;
+        self.kyle_sum_size_sq = alpha * (size * size) + (1.0 - alpha) * self.kyle_sum_size_sq;
+
+        // Update lambda estimate
+        if self.kyle_sum_size_sq > 1e-12 {
+            self.kyle_lambda = (self.kyle_sum_size_impact / self.kyle_sum_size_sq).clamp(0.0, 10.0);
+        }
+    }
+
+    /// Get Kyle's lambda (price impact coefficient).
+    ///
+    /// Higher lambda = more price impact per unit size = more informed flow.
+    /// Typical values: 0.1-2.0 bps per unit.
+    pub fn kyle_lambda(&self) -> f64 {
+        self.kyle_lambda
+    }
+
+    /// Update clustering detection for informed flow.
+    ///
+    /// Informed traders tend to execute in bursts - if we see several
+    /// consecutive high-p_informed trades, it's a strong signal.
+    fn update_clustering(&mut self, p_informed: f64) {
+        // Store recent p_informed values
+        if self.recent_p_informed.len() >= 20 {
+            self.recent_p_informed.pop_front();
+        }
+        self.recent_p_informed.push_back(p_informed);
+
+        // Count consecutive high-informed trades
+        // High = p_informed > 0.4 (above base rate for informed)
+        let threshold = 0.4;
+        if p_informed > threshold {
+            self.informed_cluster_count += 1;
+            if self.informed_cluster_count > self.max_cluster_size {
+                self.max_cluster_size = self.informed_cluster_count;
+            }
+        } else {
+            self.informed_cluster_count = 0;
+        }
+    }
+
+    /// Get current informed cluster size.
+    ///
+    /// Higher values indicate sustained informed trading activity.
+    /// Returns 0 when last trade was not informed.
+    pub fn informed_cluster_size(&self) -> usize {
+        self.informed_cluster_count
+    }
+
+    /// Get normalized clustering intensity [0, 1].
+    ///
+    /// 1.0 = at historical maximum cluster size.
+    /// Useful for boosting p_informed when clustering is detected.
+    pub fn clustering_intensity(&self) -> f64 {
+        if self.max_cluster_size <= 1 {
+            return 0.0;
+        }
+        (self.informed_cluster_count as f64 / self.max_cluster_size as f64).min(1.0)
+    }
+
+    /// Get enhanced flow decomposition with clustering and Kyle's lambda boost.
+    ///
+    /// This provides a more sophisticated p_informed that accounts for:
+    /// 1. Base GMM decomposition
+    /// 2. Trade clustering (informed trades cluster in time)
+    /// 3. Kyle's lambda (high lambda = high information content)
+    pub fn enhanced_decomposition(&self) -> FlowDecomposition {
+        let base = self.decomposition();
+
+        // Clustering boost: if seeing a cluster of informed trades, boost p_informed
+        let cluster_boost = self.clustering_intensity() * 0.2; // Up to +20%
+
+        // Kyle's lambda boost: high lambda suggests informed flow
+        let lambda_normalized = (self.kyle_lambda / 2.0).min(1.0); // Normalize to [0,1]
+        let lambda_boost = lambda_normalized * 0.1; // Up to +10%
+
+        // Combined boost (additive, then renormalize)
+        let raw_p_informed = (base.p_informed + cluster_boost + lambda_boost).min(0.95);
+
+        // Renormalize to sum to 1
+        let remaining = 1.0 - raw_p_informed;
+        let noise_ratio = if base.p_noise + base.p_forced > 1e-9 {
+            base.p_noise / (base.p_noise + base.p_forced)
+        } else {
+            0.5
+        };
+
+        FlowDecomposition {
+            p_informed: raw_p_informed,
+            p_noise: remaining * noise_ratio,
+            p_forced: remaining * (1.0 - noise_ratio),
+            confidence: base.confidence,
+            n_observations: base.n_observations,
+        }
     }
 
     /// E-step: compute responsibilities P(component | trade)

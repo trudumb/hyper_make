@@ -132,6 +132,13 @@ pub struct PreFillASClassifier {
 
     /// Number of learning samples processed
     learning_samples: usize,
+
+    // === Regime-Conditional State ===
+    /// Current detected regime (0=Low, 1=Normal, 2=High, 3=Extreme)
+    current_regime: usize,
+
+    /// Regime probabilities for soft blending
+    regime_probs: [f64; 4],
 }
 
 impl PreFillASClassifier {
@@ -167,6 +174,9 @@ impl PreFillASClassifier {
             signal_outcome_sum: [0.0; 5],
             signal_sq_sum: [0.0; 5],
             learning_samples: 0,
+            // Regime-conditional state
+            current_regime: 1, // Start with Normal
+            regime_probs: [0.1, 0.7, 0.15, 0.05], // Default prior
         }
     }
 
@@ -222,6 +232,63 @@ impl PreFillASClassifier {
         self.update_cached_toxicity();
     }
 
+
+    /// Update full regime probabilities for regime-conditional weighting.
+    ///
+    /// This enables regime-conditional signal weights:
+    /// - In Calm regimes: imbalance signal is more predictive
+    /// - In High/Extreme regimes: flow and changepoint signals are more predictive
+    ///
+    /// # Arguments
+    /// * `regime_probs` - [P(Low), P(Normal), P(High), P(Extreme)]
+    pub fn set_regime_probs(&mut self, regime_probs: [f64; 4]) {
+        self.regime_probs = regime_probs;
+        // Find most likely regime
+        let mut max_prob = 0.0;
+        let mut max_regime = 1;
+        for (i, &p) in regime_probs.iter().enumerate() {
+            if p > max_prob {
+                max_prob = p;
+                max_regime = i;
+            }
+        }
+        self.current_regime = max_regime;
+        self.update_cached_toxicity();
+    }
+
+    /// Get regime-conditional weight multipliers.
+    ///
+    /// Different regimes have different signal importance:
+    /// - Low/Calm: imbalance is more predictive (slow market, queue position matters)
+    /// - Normal: balanced weights
+    /// - High: flow and changepoint matter more (momentum-driven)
+    /// - Extreme/Cascade: changepoint and flow dominate (information asymmetry)
+    fn regime_weight_multipliers(&self) -> [f64; 5] {
+        // Weight multipliers for [imbalance, flow, regime, funding, changepoint]
+        // Soft-blend based on regime probabilities
+        
+        let regime_weights: [[f64; 5]; 4] = [
+            // Low/Calm: imbalance matters, others matter less
+            [1.5, 0.8, 0.7, 1.0, 0.5],
+            // Normal: balanced
+            [1.0, 1.0, 1.0, 1.0, 1.0],
+            // High: flow and changepoint matter more
+            [0.8, 1.3, 1.2, 0.9, 1.4],
+            // Extreme/Cascade: changepoint and flow dominate
+            [0.6, 1.5, 1.3, 0.8, 1.8],
+        ];
+
+        // Soft blend across regimes
+        let mut multipliers = [0.0; 5];
+        for (regime_idx, &prob) in self.regime_probs.iter().enumerate() {
+            for (signal_idx, mult) in multipliers.iter_mut().enumerate() {
+                *mult += prob * regime_weights[regime_idx][signal_idx];
+            }
+        }
+
+        multipliers
+    }
+
     /// Update funding rate signal.
     ///
     /// # Arguments
@@ -267,9 +334,9 @@ impl PreFillASClassifier {
         toxicity.clamp(0.0, 1.0)
     }
 
-    /// Get the effective weights (learned or default)
+    /// Get the effective weights (learned or default, with regime conditioning)
     fn effective_weights(&self) -> [f64; 5] {
-        if self.config.enable_learning
+        let base_weights = if self.config.enable_learning
             && self.learning_samples >= self.config.min_samples_for_learning
         {
             self.learned_weights
@@ -281,7 +348,24 @@ impl PreFillASClassifier {
                 self.config.funding_weight,
                 self.config.changepoint_weight,
             ]
+        };
+
+        // Apply regime-conditional multipliers
+        let multipliers = self.regime_weight_multipliers();
+        let mut weights = [0.0; 5];
+        for i in 0..5 {
+            weights[i] = base_weights[i] * multipliers[i];
         }
+
+        // Normalize to sum to 1
+        let sum: f64 = weights.iter().sum();
+        if sum > 1e-9 {
+            for w in &mut weights {
+                *w /= sum;
+            }
+        }
+
+        weights
     }
 
     /// Compute individual signal values for a given side

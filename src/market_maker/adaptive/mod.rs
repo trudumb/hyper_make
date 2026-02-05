@@ -25,4 +25,7 @@ pub use config::AdaptiveBayesianConfig;
 pub use fill_controller::FillRateController;
 pub use learned_floor::LearnedSpreadFloor;
 pub use shrinkage_gamma::ShrinkageGamma;
-pub use standardizer::SignalStandardizer;
+pub use standardizer::{
+    MultiFeatureStandardizer, MultiFeatureStandardizerDiagnostics, PredictionStandardizer,
+    PredictionStandardizerDiagnostics, SignalStandardizer,
+};

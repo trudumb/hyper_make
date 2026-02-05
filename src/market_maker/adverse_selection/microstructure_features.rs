@@ -213,11 +213,25 @@ pub struct MicrostructureFeatures {
 
     /// Confidence in the features (0 = no data, 1 = fully warmed up)
     pub confidence: f64,
+
+    // === NEW ENTROPY FEATURES ===
+
+    /// Trade size entropy [0, 1]
+    /// Low entropy = concentrated sizes (potential informed trading)
+    /// High entropy = diverse sizes (noise trading)
+    /// We invert this: higher value = more toxic (less entropy = more informed)
+    pub size_concentration: f64,
+
+    /// Direction entropy [0, 1]
+    /// Low entropy = one-sided flow (informed)
+    /// High entropy = balanced flow (noise)
+    /// We invert this: higher value = more toxic (less entropy = more informed)
+    pub direction_concentration: f64,
 }
 
 impl MicrostructureFeatures {
     /// Get feature vector for ML/learning
-    pub fn as_vector(&self) -> [f64; 8] {
+    pub fn as_vector(&self) -> [f64; 10] {
         [
             self.intensity_zscore,
             self.price_impact_zscore,
@@ -227,11 +241,13 @@ impl MicrostructureFeatures {
             self.book_velocity_zscore,
             self.arrival_speed_zscore,
             self.size_zscore,
+            self.size_concentration,
+            self.direction_concentration,
         ]
     }
 
     /// Feature names for logging/display
-    pub fn feature_names() -> [&'static str; 8] {
+    pub fn feature_names() -> [&'static str; 10] {
         [
             "intensity",
             "impact",
@@ -241,6 +257,8 @@ impl MicrostructureFeatures {
             "book_vel",
             "arrival_spd",
             "size",
+            "size_conc",
+            "dir_conc",
         ]
     }
 }
@@ -290,6 +308,12 @@ pub struct MicrostructureExtractor {
     // Trade size
     size_stats: RollingStats,
 
+    // === Entropy tracking ===
+    // Size buckets for entropy calculation (log-spaced)
+    size_bucket_counts: [usize; 8],
+    direction_counts: [usize; 2], // [sell, buy]
+    entropy_window_count: usize,
+
     // Warmup tracking
     trade_count: usize,
 }
@@ -324,6 +348,11 @@ impl MicrostructureExtractor {
 
             arrival_time_stats: RollingStats::new(config.intensity_window),
             size_stats: RollingStats::new(config.intensity_window),
+
+            // Entropy tracking
+            size_bucket_counts: [0; 8],
+            direction_counts: [0; 2],
+            entropy_window_count: 0,
 
             trade_count: 0,
             config,
@@ -399,6 +428,34 @@ impl MicrostructureExtractor {
 
         // === Trade size ===
         self.size_stats.push(trade.size);
+
+        // === Entropy tracking ===
+        // Size bucket: log-spaced buckets for trade sizes
+        // Bucket i covers sizes from 10^(i/2) to 10^((i+1)/2) roughly
+        let size_bucket = if trade.size < 0.1 {
+            0
+        } else {
+            let log_size = trade.size.log10();
+            ((log_size + 1.0) * 2.0).floor().clamp(0.0, 7.0) as usize
+        };
+        self.size_bucket_counts[size_bucket] += 1;
+
+        // Direction count
+        let dir_idx = if trade.is_buy { 1 } else { 0 };
+        self.direction_counts[dir_idx] += 1;
+
+        self.entropy_window_count += 1;
+
+        // Decay entropy counts to keep them recent (every 200 trades)
+        if self.entropy_window_count >= 200 {
+            for count in &mut self.size_bucket_counts {
+                *count = *count / 2;
+            }
+            for count in &mut self.direction_counts {
+                *count = *count / 2;
+            }
+            self.entropy_window_count = self.entropy_window_count / 2;
+        }
     }
 
     /// Update with new book state
@@ -435,6 +492,35 @@ impl MicrostructureExtractor {
                 }
             }
             self.book_imbalance_history.push_back((timestamp_ms, imbalance));
+        }
+    }
+
+    /// Compute normalized entropy of count distribution, returns [0, 1]
+    /// 0 = concentrated (one bucket dominates), 1 = uniform
+    fn compute_entropy(&self, counts: &[usize]) -> f64 {
+        let total: usize = counts.iter().sum();
+        if total == 0 {
+            return 0.5; // No data, neutral
+        }
+
+        let total_f = total as f64;
+        let mut entropy = 0.0;
+        let mut non_zero_buckets = 0;
+
+        for &count in counts {
+            if count > 0 {
+                let p = count as f64 / total_f;
+                entropy -= p * p.ln();
+                non_zero_buckets += 1;
+            }
+        }
+
+        // Normalize by max possible entropy (uniform distribution)
+        let max_entropy = (non_zero_buckets.max(1) as f64).ln();
+        if max_entropy > 0.0 {
+            (entropy / max_entropy).clamp(0.0, 1.0)
+        } else {
+            0.5
         }
     }
 
@@ -507,6 +593,17 @@ impl MicrostructureExtractor {
         let avg_size = self.size_stats.mean();
         let size_zscore = self.size_stats.zscore(avg_size).clamp(-cap, cap);
 
+        // === Entropy features ===
+        // Size concentration: low entropy = concentrated = more informed
+        // We invert so higher value = more toxic (less entropy)
+        let size_entropy = self.compute_entropy(&self.size_bucket_counts);
+        let size_concentration = (1.0 - size_entropy).clamp(0.0, 1.0);
+
+        // Direction concentration: low entropy = one-sided = more informed
+        // We invert so higher value = more toxic (less entropy)
+        let direction_entropy = self.compute_entropy(&self.direction_counts);
+        let direction_concentration = (1.0 - direction_entropy).clamp(0.0, 1.0);
+
         // === Combined toxicity score ===
         // Weighted combination emphasizing strong signals
         let toxicity_score = self.compute_toxicity_score(
@@ -517,6 +614,8 @@ impl MicrostructureExtractor {
             spread_widening,
             arrival_speed_zscore,
             size_zscore,
+            size_concentration,
+            direction_concentration,
         );
 
         MicrostructureFeatures {
@@ -530,6 +629,8 @@ impl MicrostructureExtractor {
             size_zscore,
             toxicity_score,
             confidence: warmup_ratio,
+            size_concentration,
+            direction_concentration,
         }
     }
 
@@ -543,6 +644,8 @@ impl MicrostructureExtractor {
         spread_widen: f64,
         arrival_speed: f64,
         size: f64,
+        size_concentration: f64,
+        direction_concentration: f64,
     ) -> f64 {
         // Weights based on microstructure theory importance:
         // - Price impact (Kyle's λ) is the gold standard for information
@@ -550,14 +653,17 @@ impl MicrostructureExtractor {
         // - Intensity and arrival speed indicate information events
         // - Spread widening is MM's response to detected info
         // - Volume imbalance and size are supporting signals
+        // - Entropy features indicate informed vs noise trading
 
-        const W_IMPACT: f64 = 0.25;      // Kyle's lambda - most theoretically grounded
-        const W_RUN: f64 = 0.20;         // Run length - strong clustering signal
-        const W_INTENSITY: f64 = 0.15;   // Trade bursts
-        const W_ARRIVAL: f64 = 0.15;     // Fast arrivals
-        const W_SPREAD: f64 = 0.10;      // MM response
-        const W_IMBALANCE: f64 = 0.10;   // Directional pressure
+        const W_IMPACT: f64 = 0.22;      // Kyle's lambda - most theoretically grounded
+        const W_RUN: f64 = 0.18;         // Run length - strong clustering signal
+        const W_INTENSITY: f64 = 0.12;   // Trade bursts
+        const W_ARRIVAL: f64 = 0.12;     // Fast arrivals
+        const W_SPREAD: f64 = 0.08;      // MM response
+        const W_IMBALANCE: f64 = 0.08;   // Directional pressure
         const W_SIZE: f64 = 0.05;        // Large trades
+        const W_SIZE_CONC: f64 = 0.08;   // Size concentration (informed = concentrated)
+        const W_DIR_CONC: f64 = 0.07;    // Direction concentration (informed = one-sided)
 
         // Convert z-scores to [0, 1] probabilities using sigmoid
         let sigmoid = |z: f64| 1.0 / (1.0 + (-z).exp());
@@ -568,7 +674,9 @@ impl MicrostructureExtractor {
             + W_ARRIVAL * sigmoid(arrival_speed)
             + W_SPREAD * sigmoid(spread_widen * 2.0) // Scale spread signal
             + W_IMBALANCE * sigmoid(vol_imbalance.abs() * 2.0)
-            + W_SIZE * sigmoid(size);
+            + W_SIZE * sigmoid(size)
+            + W_SIZE_CONC * size_concentration  // Already [0, 1]
+            + W_DIR_CONC * direction_concentration; // Already [0, 1]
 
         score.clamp(0.0, 1.0)
     }

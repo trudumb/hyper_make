@@ -384,14 +384,44 @@ impl CrossVenueAnalyzer {
             (binance.imbalance_5s + hl.imbalance_5s) / 2.0
         };
 
-        // Confidence: based on data sufficiency, agreement, and correlation
+        // Confidence calculation (FIXED: use additive approach instead of multiplicative)
+        // This prevents a single 0 from zeroing out the entire confidence
+        
+        // Data sufficiency factor [0, 1]
         let data_conf = (self.sample_count as f64 / self.config.min_samples as f64).min(1.0);
-        let agree_conf = agreement.abs() * 0.5 + 0.5; // Higher when agreeing
-        let corr_conf = (imbalance_correlation + 1.0) / 2.0; // Map [-1,1] to [0,1]
-        let binance_conf = binance.confidence;
-        let hl_conf = hl.confidence;
-
-        let confidence = (data_conf * agree_conf * corr_conf * binance_conf * hl_conf).sqrt();
+        
+        // Agreement factor: higher when venues agree
+        let agree_conf = agreement.abs() * 0.5 + 0.5; // Maps [-1,1] agreement to [0.5, 1.0]
+        
+        // Correlation factor: higher when correlation is positive
+        let corr_conf = (imbalance_correlation * 0.5 + 0.5).max(0.1); // Map [-1,1] to [0.1,1]
+        
+        // Individual venue confidences with floor
+        // Use a floor of 0.3 to prevent complete gating when one venue has sparse data
+        let binance_conf_adj = binance.confidence.max(0.3);
+        let hl_conf_adj = hl.confidence.max(0.3);
+        
+        // Weighted average of venue confidences (trade count weighted)
+        let venue_weight = if binance.trade_count + hl.trade_count > 0 {
+            let total_trades = (binance.trade_count + hl.trade_count) as f64;
+            let binance_weight = binance.trade_count as f64 / total_trades;
+            let hl_weight = hl.trade_count as f64 / total_trades;
+            binance_weight * binance_conf_adj + hl_weight * hl_conf_adj
+        } else {
+            // Fallback: arithmetic mean with floor
+            (binance_conf_adj + hl_conf_adj) / 2.0
+        };
+        
+        // Combine factors using geometric mean (less punishing than full multiplication)
+        // Factors: data_conf, agree_conf, corr_conf, venue_weight
+        let confidence = (data_conf * agree_conf * corr_conf * venue_weight).powf(0.25);
+        
+        // Ensure minimum confidence when we have some data
+        let confidence = if self.sample_count >= 5 {
+            confidence.max(0.1)
+        } else {
+            confidence
+        };
 
         // Alerts
         let toxicity_alert = max_toxicity > self.config.toxicity_threshold;

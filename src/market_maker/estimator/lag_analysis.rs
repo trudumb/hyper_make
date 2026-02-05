@@ -483,6 +483,253 @@ impl LagDecayTracker {
     pub fn history_len(&self) -> usize {
         self.history.len()
     }
+
+}
+
+/// Lead-lag stability gate.
+///
+/// Requires lag to be stable and causal before allowing signals.
+/// This addresses the oscillating lag problem (-500ms, +150ms, -300ms)
+/// by requiring consistent positive lag over a window.
+///
+/// # Algorithm
+/// 1. Track lag history over a sliding window
+/// 2. Compute mean and variance of lag
+/// 3. Require: variance < threshold AND mean > min_lag_ms
+/// 4. Also track MI confidence decay
+#[derive(Debug, Clone)]
+pub struct LeadLagStabilityGate {
+    /// Recent lag observations
+    lag_history: VecDeque<i64>,
+    /// Recent MI observations
+    mi_history: VecDeque<f64>,
+    /// Window size for stability check
+    window_size: usize,
+    /// Maximum allowed lag variance (ms²)
+    max_variance_ms2: f64,
+    /// Minimum mean lag required (ms) - must be positive/causal
+    min_mean_lag_ms: f64,
+    /// Minimum MI threshold
+    min_mi: f64,
+    /// Number of consecutive stable observations required
+    min_stable_count: usize,
+    /// Current consecutive stable count
+    stable_count: usize,
+    /// Total observations
+    total_observations: u64,
+}
+
+impl Default for LeadLagStabilityGate {
+    fn default() -> Self {
+        Self {
+            lag_history: VecDeque::with_capacity(50),
+            mi_history: VecDeque::with_capacity(50),
+            window_size: 20,
+            max_variance_ms2: 10000.0, // 100ms std dev max
+            min_mean_lag_ms: 25.0,      // At least 25ms lead
+            min_mi: 0.02,               // Minimum 0.02 bits MI
+            min_stable_count: 10,       // 10 consecutive stable readings
+            stable_count: 0,
+            total_observations: 0,
+        }
+    }
+}
+
+impl LeadLagStabilityGate {
+    /// Create with custom parameters.
+    pub fn new(
+        window_size: usize,
+        max_variance_ms2: f64,
+        min_mean_lag_ms: f64,
+        min_mi: f64,
+        min_stable_count: usize,
+    ) -> Self {
+        Self {
+            lag_history: VecDeque::with_capacity(window_size),
+            mi_history: VecDeque::with_capacity(window_size),
+            window_size,
+            max_variance_ms2,
+            min_mean_lag_ms,
+            min_mi,
+            min_stable_count,
+            stable_count: 0,
+            total_observations: 0,
+        }
+    }
+
+    /// Record a new lag observation.
+    pub fn record(&mut self, lag_ms: i64, mi: f64) {
+        self.lag_history.push_back(lag_ms);
+        self.mi_history.push_back(mi);
+        self.total_observations += 1;
+
+        while self.lag_history.len() > self.window_size {
+            self.lag_history.pop_front();
+        }
+        while self.mi_history.len() > self.window_size {
+            self.mi_history.pop_front();
+        }
+
+        // Update stable count
+        if self.check_instant_stability() {
+            self.stable_count += 1;
+        } else {
+            self.stable_count = 0;
+        }
+    }
+
+    /// Check if lag is currently stable (instant check without consecutive requirement).
+    fn check_instant_stability(&self) -> bool {
+        if self.lag_history.len() < 5 {
+            return false;
+        }
+
+        let (mean, var) = self.lag_stats();
+        let avg_mi = self.mi_stats().0;
+
+        mean > self.min_mean_lag_ms && var < self.max_variance_ms2 && avg_mi > self.min_mi
+    }
+
+    /// Check if lag is stable (requires consecutive stable observations).
+    pub fn is_stable(&self) -> bool {
+        self.stable_count >= self.min_stable_count
+    }
+
+    /// Compute lag statistics (mean, variance).
+    fn lag_stats(&self) -> (f64, f64) {
+        if self.lag_history.is_empty() {
+            return (0.0, f64::MAX);
+        }
+
+        let n = self.lag_history.len() as f64;
+        let mean = self.lag_history.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let variance = if n > 1.0 {
+            self.lag_history
+                .iter()
+                .map(|&x| {
+                    let diff = x as f64 - mean;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / (n - 1.0)
+        } else {
+            f64::MAX
+        };
+
+        (mean, variance)
+    }
+
+    /// Compute MI statistics (mean, variance).
+    fn mi_stats(&self) -> (f64, f64) {
+        if self.mi_history.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        let n = self.mi_history.len() as f64;
+        let mean = self.mi_history.iter().sum::<f64>() / n;
+        let variance = if n > 1.0 {
+            self.mi_history
+                .iter()
+                .map(|&x| {
+                    let diff = x - mean;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / (n - 1.0)
+        } else {
+            0.0
+        };
+
+        (mean, variance)
+    }
+
+    /// Get stability confidence [0, 1].
+    ///
+    /// Higher confidence when:
+    /// - Lag variance is low
+    /// - Mean lag is positive
+    /// - MI is high and stable
+    pub fn stability_confidence(&self) -> f64 {
+        if self.lag_history.len() < 5 {
+            return 0.0;
+        }
+
+        let (mean_lag, var_lag) = self.lag_stats();
+        let (mean_mi, _var_mi) = self.mi_stats();
+
+        // Causality component: requires mean lag > threshold
+        let causality = if mean_lag > self.min_mean_lag_ms {
+            (mean_lag / (self.min_mean_lag_ms * 4.0)).min(1.0)
+        } else {
+            0.0
+        };
+
+        // Stability component: lower variance = higher confidence
+        let stability = if var_lag < self.max_variance_ms2 {
+            1.0 - (var_lag / self.max_variance_ms2).sqrt()
+        } else {
+            0.0
+        };
+
+        // MI component: higher MI = higher confidence
+        let mi_conf = (mean_mi / 0.1).min(1.0); // Saturates at 0.1 bits
+
+        // Combined: geometric mean to require all components
+        (causality * stability * mi_conf).powf(1.0 / 3.0)
+    }
+
+    /// Get diagnostics for logging.
+    pub fn diagnostics(&self) -> LeadLagStabilityDiagnostics {
+        let (mean_lag, var_lag) = self.lag_stats();
+        let (mean_mi, var_mi) = self.mi_stats();
+
+        LeadLagStabilityDiagnostics {
+            mean_lag_ms: mean_lag,
+            lag_std_ms: var_lag.sqrt(),
+            mean_mi,
+            mi_std: var_mi.sqrt(),
+            is_stable: self.is_stable(),
+            confidence: self.stability_confidence(),
+            stable_count: self.stable_count,
+            total_observations: self.total_observations,
+        }
+    }
+
+    /// Reset state.
+    pub fn reset(&mut self) {
+        self.lag_history.clear();
+        self.mi_history.clear();
+        self.stable_count = 0;
+        self.total_observations = 0;
+    }
+}
+
+/// Diagnostics for lead-lag stability gate.
+#[derive(Debug, Clone)]
+pub struct LeadLagStabilityDiagnostics {
+    pub mean_lag_ms: f64,
+    pub lag_std_ms: f64,
+    pub mean_mi: f64,
+    pub mi_std: f64,
+    pub is_stable: bool,
+    pub confidence: f64,
+    pub stable_count: usize,
+    pub total_observations: u64,
+}
+
+impl LeadLagStabilityDiagnostics {
+    pub fn summary(&self) -> String {
+        format!(
+            "lag={:.0}±{:.0}ms mi={:.4}±{:.4} stable={} conf={:.2} n={}",
+            self.mean_lag_ms,
+            self.lag_std_ms,
+            self.mean_mi,
+            self.mi_std,
+            self.is_stable,
+            self.confidence,
+            self.total_observations
+        )
+    }
 }
 
 #[cfg(test)]

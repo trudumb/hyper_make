@@ -492,6 +492,73 @@ impl ObservationBuffers {
         
         buys as f64 / recent.len() as f64
     }
+
+    /// Get volume-weighted buy ratio from recent trades.
+    ///
+    /// This is more informative than simple buy count because large
+    /// trades carry more information than small ones.
+    pub fn buy_ratio_volume_weighted(&self, window: usize) -> f64 {
+        if self.trades.is_empty() {
+            return 0.5;
+        }
+
+        let recent: Vec<_> = self.trades.iter().rev().take(window).collect();
+        
+        let mut buy_volume = 0.0;
+        let mut total_volume = 0.0;
+        
+        for trade in &recent {
+            total_volume += trade.size;
+            if trade.is_buy {
+                buy_volume += trade.size;
+            }
+        }
+
+        if total_volume > 1e-12 {
+            buy_volume / total_volume
+        } else {
+            0.5
+        }
+    }
+
+    /// Get buy pressure with clustering detection.
+    ///
+    /// Returns (buy_ratio, clustering_boost) where clustering_boost [0, 1]
+    /// indicates how consecutive the buy/sell direction has been.
+    pub fn buy_pressure_with_clustering(&self, window: usize) -> (f64, f64) {
+        if self.trades.is_empty() {
+            return (0.5, 0.0);
+        }
+
+        let recent: Vec<_> = self.trades.iter().rev().take(window).collect();
+        
+        // Volume-weighted ratio
+        let vw_ratio = self.buy_ratio_volume_weighted(window);
+
+        // Clustering: count consecutive same-direction trades
+        let mut max_streak = 0;
+        let mut current_streak = 0;
+        let mut last_is_buy = None;
+
+        for trade in recent.iter().rev() {
+            if let Some(last) = last_is_buy {
+                if trade.is_buy == last {
+                    current_streak += 1;
+                    max_streak = max_streak.max(current_streak);
+                } else {
+                    current_streak = 1;
+                }
+            } else {
+                current_streak = 1;
+            }
+            last_is_buy = Some(trade.is_buy);
+        }
+
+        // Normalize clustering boost (streak of 5+ is considered strong)
+        let clustering_boost = (max_streak as f64 / 5.0).min(1.0);
+
+        (vw_ratio, clustering_boost)
+    }
 }
 
 // ============================================================================
@@ -1000,11 +1067,14 @@ impl PredictionValidator {
             regime,
         );
 
-        // 5. BuyPressure prediction
-        let buy_ratio = self.buffers.buy_ratio(20);
+        // 5. BuyPressure prediction (enhanced with volume-weighting and clustering)
+        let (vw_buy_ratio, clustering_boost) = self.buffers.buy_pressure_with_clustering(20);
+        // Boost prediction confidence when clustering is detected
+        let buy_pressure = vw_buy_ratio + (vw_buy_ratio - 0.5) * clustering_boost * 0.3;
+        let buy_pressure = buy_pressure.clamp(0.01, 0.99);
         self.record_pending_outcome(
             ValidatorPredictionType::BuyPressure,
-            buy_ratio,
+            buy_pressure,
             None, // Resolved on next trade
             mid,
             timestamp_ms,

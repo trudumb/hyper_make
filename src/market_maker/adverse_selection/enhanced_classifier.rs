@@ -46,15 +46,17 @@ impl Default for EnhancedClassifierConfig {
 
 /// Feature weights for toxicity prediction
 /// Based on market microstructure theory
-const THEORY_WEIGHTS: [f64; 8] = [
-    0.15,  // intensity_zscore - Hawkes/information events
-    0.25,  // price_impact_zscore - Kyle's lambda (most important)
-    0.20,  // run_length_zscore - informed trader clustering
-    0.10,  // volume_imbalance - directional pressure
-    0.10,  // spread_widening - MM response
-    0.05,  // book_velocity_zscore - order flow dynamics
-    0.10,  // arrival_speed_zscore - information processing
+const THEORY_WEIGHTS: [f64; 10] = [
+    0.12,  // intensity_zscore - Hawkes/information events
+    0.22,  // price_impact_zscore - Kyle's lambda (most important)
+    0.18,  // run_length_zscore - informed trader clustering
+    0.08,  // volume_imbalance - directional pressure
+    0.08,  // spread_widening - MM response
+    0.04,  // book_velocity_zscore - order flow dynamics
+    0.08,  // arrival_speed_zscore - information processing
     0.05,  // size_zscore - large trade indicator
+    0.08,  // size_concentration - entropy: concentrated sizes = informed
+    0.07,  // direction_concentration - entropy: one-sided flow = informed
 ];
 
 /// Enhanced adverse selection classifier
@@ -64,8 +66,8 @@ pub struct EnhancedASClassifier {
     extractor: MicrostructureExtractor,
 
     // Online learning state
-    learned_weights: [f64; 8],
-    weight_gradients: [f64; 8],
+    learned_weights: [f64; 10],
+    weight_gradients: [f64; 10],
     learning_samples: usize,
 
     // Performance tracking
@@ -83,7 +85,7 @@ impl EnhancedASClassifier {
         Self {
             extractor: MicrostructureExtractor::new(config.micro_config.clone()),
             learned_weights: THEORY_WEIGHTS,
-            weight_gradients: [0.0; 8],
+            weight_gradients: [0.0; 10],
             learning_samples: 0,
             prediction_sum: 0.0,
             outcome_sum: 0.0,
@@ -241,7 +243,7 @@ impl EnhancedASClassifier {
     }
 
     /// Get effective weights (learned or theory-driven)
-    pub fn effective_weights(&self) -> [f64; 8] {
+    pub fn effective_weights(&self) -> [f64; 10] {
         if self.config.enable_learning && self.learning_samples >= self.config.min_samples_for_learning {
             self.learned_weights
         } else {
@@ -304,7 +306,7 @@ impl EnhancedASClassifier {
     pub fn reset(&mut self) {
         self.extractor.reset();
         self.learned_weights = THEORY_WEIGHTS;
-        self.weight_gradients = [0.0; 8];
+        self.weight_gradients = [0.0; 10];
         self.learning_samples = 0;
         self.prediction_sum = 0.0;
         self.outcome_sum = 0.0;
@@ -323,7 +325,7 @@ pub struct EnhancedClassifierDiagnostics {
     pub base_rate: f64,
     pub avg_prediction: f64,
     pub calibration_gap: f64,
-    pub effective_weights: [f64; 8],
+    pub effective_weights: [f64; 10],
     pub is_using_learned: bool,
     pub micro_diagnostics: MicrostructureDiagnostics,
 }

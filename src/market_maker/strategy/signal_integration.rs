@@ -51,8 +51,8 @@ use crate::market_maker::calibration::{InformedFlowAdjustment, ModelGating, Mode
 use crate::market_maker::estimator::{
     BinanceFlowAnalyzer, BinanceFlowConfig, CrossVenueAnalyzer, CrossVenueConfig,
     CrossVenueFeatures, FlowDecomposition, FlowFeatureVec, InformedFlowConfig,
-    InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, RegimeKappaConfig, RegimeKappaEstimator,
-    TradeFeatures, VolatilityRegime,
+    InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, LeadLagStabilityGate,
+    RegimeKappaConfig, RegimeKappaEstimator, TradeFeatures, VolatilityRegime,
 };
 use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
 use tracing::{debug, info};
@@ -245,6 +245,9 @@ pub struct SignalIntegrator {
     /// Lead-lag analyzer.
     lag_analyzer: LagAnalyzer,
 
+    /// Lead-lag stability gate (requires consistent positive lag).
+    lead_lag_stability: LeadLagStabilityGate,
+
     /// Informed flow estimator.
     informed_flow: InformedFlowEstimator,
 
@@ -287,6 +290,7 @@ impl SignalIntegrator {
     pub fn new(config: SignalIntegratorConfig) -> Self {
         Self {
             lag_analyzer: LagAnalyzer::new(config.lag_config.clone()),
+            lead_lag_stability: LeadLagStabilityGate::default(),
             informed_flow: InformedFlowEstimator::new(config.informed_flow_config.clone()),
             regime_kappa: RegimeKappaEstimator::new(config.regime_kappa_config.clone()),
             model_gating: ModelGating::new(config.model_gating_config.clone()),
@@ -321,14 +325,21 @@ impl SignalIntegrator {
         self.latest_binance_mid = mid_price;
         self.lag_analyzer.add_signal(timestamp_ms, mid_price);
 
-        // Update lead-lag signal
+        // Update lead-lag signal with stability gate
         if let Some((lag_ms, mi)) = self.lag_analyzer.optimal_lag() {
+            // Record observation in stability gate
+            self.lead_lag_stability.record(lag_ms, mi);
+
+            // Compute signal with stability confidence
+            let stability_conf = self.lead_lag_stability.stability_confidence();
+
             self.last_lead_lag_signal = LeadLagSignal::compute(
                 self.latest_binance_mid,
                 self.latest_hl_mid,
                 lag_ms,
                 mi,
                 self.config.min_mi_threshold,
+                stability_conf,
             );
         }
     }
@@ -668,6 +679,7 @@ impl SignalIntegrator {
     /// Reset all components.
     pub fn reset(&mut self) {
         self.lag_analyzer.reset();
+        self.lead_lag_stability.reset();
         self.informed_flow.reset();
         self.regime_kappa.reset();
         self.model_gating.reset();

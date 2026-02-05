@@ -422,22 +422,29 @@ pub struct LeadLagSignal {
     pub optimal_lag_ms: i64,
     /// Mutual information at optimal lag (higher = stronger signal).
     pub mi_bits: f64,
-    /// Whether the signal is actionable (enough data, significant MI).
+    /// Whether the signal is actionable (enough data, significant MI, stable).
     pub is_actionable: bool,
     /// Suggested skew direction: +1 = skew asks wider (bullish signal), -1 = skew bids wider.
     pub skew_direction: i8,
     /// Suggested skew magnitude in basis points.
     pub skew_magnitude_bps: f64,
+    /// Stability confidence [0, 1] from LeadLagStabilityGate.
+    /// Higher = more consistent lag readings, more trustworthy signal.
+    pub stability_confidence: f64,
 }
 
 impl LeadLagSignal {
     /// Compute signal from current state.
+    ///
+    /// Now requires stability_confidence from LeadLagStabilityGate.
+    /// Signals are only actionable when lag is stable and causal.
     pub fn compute(
         binance_mid: f64,
         hl_mid: f64,
         optimal_lag_ms: i64,
         mi_bits: f64,
         min_mi_threshold: f64,
+        stability_confidence: f64,
     ) -> Self {
         if binance_mid <= 0.0 || hl_mid <= 0.0 {
             return Self::default();
@@ -450,9 +457,11 @@ impl LeadLagSignal {
         //    we look at past signal to predict current target, i.e., signal leads)
         // 2. MI is above threshold
         // 3. Price difference is significant (> 1 bps)
+        // 4. NEW: Stability confidence is high enough (> 0.3)
         let is_actionable = optimal_lag_ms > 25 // Binance leads by at least 25ms
             && mi_bits > min_mi_threshold
-            && diff_bps.abs() > 1.0;
+            && diff_bps.abs() > 1.0
+            && stability_confidence > 0.3; // NEW: require stability
 
         // Skew direction based on price difference
         // If Binance is higher, HL will likely move up -> skew asks wider (don't sell cheap)
@@ -464,10 +473,11 @@ impl LeadLagSignal {
             0 // Neutral
         };
 
-        // Skew magnitude scales with MI confidence and price difference
+        // Skew magnitude scales with MI confidence, price difference, AND stability
         // Capped at 5 bps to avoid over-skewing
         let skew_magnitude_bps = if is_actionable {
-            (diff_bps.abs() * mi_bits).min(5.0)
+            // Scale by stability confidence to reduce magnitude when unstable
+            (diff_bps.abs() * mi_bits * stability_confidence).min(5.0)
         } else {
             0.0
         };
@@ -481,7 +491,27 @@ impl LeadLagSignal {
             is_actionable,
             skew_direction,
             skew_magnitude_bps,
+            stability_confidence,
         }
+    }
+
+    /// Legacy compute without stability (for backward compatibility).
+    /// Assumes stability_confidence = 1.0 if not provided.
+    pub fn compute_legacy(
+        binance_mid: f64,
+        hl_mid: f64,
+        optimal_lag_ms: i64,
+        mi_bits: f64,
+        min_mi_threshold: f64,
+    ) -> Self {
+        Self::compute(
+            binance_mid,
+            hl_mid,
+            optimal_lag_ms,
+            mi_bits,
+            min_mi_threshold,
+            1.0, // Assume stable
+        )
     }
 }
 
@@ -561,10 +591,11 @@ mod tests {
 
     #[test]
     fn test_lead_lag_signal_compute_bullish() {
-        let signal = LeadLagSignal::compute(
+        // Use compute_legacy for backward-compatible tests (assumes stability=1.0)
+        let signal = LeadLagSignal::compute_legacy(
             50100.0, // Binance higher
             50000.0, // HL lower
-            -100,    // Binance leads by 100ms
+            100,     // Binance leads by 100ms (positive = signal leads)
             0.15,    // Strong MI
             0.05,    // MI threshold
         );
@@ -577,10 +608,10 @@ mod tests {
 
     #[test]
     fn test_lead_lag_signal_compute_bearish() {
-        let signal = LeadLagSignal::compute(
+        let signal = LeadLagSignal::compute_legacy(
             49900.0, // Binance lower
             50000.0, // HL higher
-            -100,    // Binance leads by 100ms
+            100,     // Binance leads by 100ms
             0.15,    // Strong MI
             0.05,    // MI threshold
         );
@@ -592,10 +623,10 @@ mod tests {
 
     #[test]
     fn test_lead_lag_signal_not_actionable_low_mi() {
-        let signal = LeadLagSignal::compute(
+        let signal = LeadLagSignal::compute_legacy(
             50100.0,
             50000.0,
-            -100,
+            100,
             0.01, // Low MI
             0.05, // Threshold
         );
@@ -606,14 +637,40 @@ mod tests {
 
     #[test]
     fn test_lead_lag_signal_not_actionable_hl_leads() {
-        let signal = LeadLagSignal::compute(
+        let signal = LeadLagSignal::compute_legacy(
             50100.0,
             50000.0,
-            100, // HL leads (positive lag)
+            -100, // HL leads (negative lag = target leads signal)
             0.15,
             0.05,
         );
 
         assert!(!signal.is_actionable);
+    }
+
+    #[test]
+    fn test_lead_lag_signal_with_stability() {
+        // Test with low stability - should not be actionable
+        let signal_low_stability = LeadLagSignal::compute(
+            50100.0,
+            50000.0,
+            100,  // Binance leads
+            0.15, // Strong MI
+            0.05, // Threshold
+            0.1,  // Low stability
+        );
+        assert!(!signal_low_stability.is_actionable);
+
+        // Test with high stability - should be actionable
+        let signal_high_stability = LeadLagSignal::compute(
+            50100.0,
+            50000.0,
+            100,  // Binance leads
+            0.15, // Strong MI
+            0.05, // Threshold
+            0.8,  // High stability
+        );
+        assert!(signal_high_stability.is_actionable);
+        assert!(signal_high_stability.stability_confidence > 0.5);
     }
 }

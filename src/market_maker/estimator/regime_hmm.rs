@@ -640,6 +640,117 @@ impl RegimeHMM {
         self.observation_count = 0;
     }
 
+    /// Calibrate emission parameters from observed data.
+    ///
+    /// This method uses empirical quantiles to set regime thresholds,
+    /// which fixes the problem where HMM never detects certain regimes
+    /// due to miscalibrated default thresholds.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Collect volatility and spread observations
+    /// 2. Compute percentiles (10th, 50th, 75th, 95th)
+    /// 3. Set regime emission means at these percentiles:
+    ///    - Low: 10th percentile (very quiet)
+    ///    - Normal: 50th percentile (median)
+    ///    - High: 75th percentile (elevated)
+    ///    - Extreme: 95th percentile (crisis)
+    ///
+    /// # Arguments
+    /// * `volatilities` - Observed volatility values
+    /// * `spreads` - Observed spread values (in bps)
+    pub fn calibrate_from_observations(&mut self, volatilities: &[f64], spreads: &[f64]) {
+        if volatilities.len() < 100 || spreads.len() < 100 {
+            return; // Not enough data
+        }
+
+        // Sort for percentile computation
+        let mut vol_sorted: Vec<f64> = volatilities.iter().copied().collect();
+        let mut spread_sorted: Vec<f64> = spreads.iter().copied().collect();
+        vol_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        spread_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Compute percentiles
+        let percentile = |sorted: &[f64], p: f64| -> f64 {
+            let idx = ((sorted.len() as f64 - 1.0) * p) as usize;
+            sorted[idx.min(sorted.len() - 1)]
+        };
+
+        let vol_p10 = percentile(&vol_sorted, 0.10);
+        let vol_p50 = percentile(&vol_sorted, 0.50);
+        let vol_p75 = percentile(&vol_sorted, 0.75);
+        let vol_p95 = percentile(&vol_sorted, 0.95);
+
+        let spread_p10 = percentile(&spread_sorted, 0.10);
+        let spread_p50 = percentile(&spread_sorted, 0.50);
+        let spread_p75 = percentile(&spread_sorted, 0.75);
+        let spread_p95 = percentile(&spread_sorted, 0.95);
+
+        // Compute IQR for std estimation
+        let vol_iqr = (vol_p75 - percentile(&vol_sorted, 0.25)).max(vol_p50 * 0.1);
+        let spread_iqr = (spread_p75 - percentile(&spread_sorted, 0.25)).max(spread_p50 * 0.1);
+
+        // Update emission parameters
+        // Low regime: 10th percentile
+        self.emission_params[regime_idx::LOW] = EmissionParams::new(
+            vol_p10,
+            vol_iqr * 0.3,
+            spread_p10,
+            spread_iqr * 0.3,
+        );
+
+        // Normal regime: 50th percentile (median)
+        self.emission_params[regime_idx::NORMAL] = EmissionParams::new(
+            vol_p50,
+            vol_iqr * 0.5,
+            spread_p50,
+            spread_iqr * 0.5,
+        );
+
+        // High regime: 75th percentile
+        self.emission_params[regime_idx::HIGH] = EmissionParams::new(
+            vol_p75,
+            vol_iqr * 0.7,
+            spread_p75,
+            spread_iqr * 0.7,
+        );
+
+        // Extreme regime: 95th percentile
+        self.emission_params[regime_idx::EXTREME] = EmissionParams::new(
+            vol_p95,
+            vol_iqr * 1.0,
+            spread_p95,
+            spread_iqr * 1.0,
+        );
+    }
+
+    /// Get calibration statistics for diagnostics.
+    pub fn calibration_stats(&self) -> RegimeCalibrationStats {
+        RegimeCalibrationStats {
+            observation_count: self.observation_count,
+            regime_probs: self.belief,
+            emission_means: [
+                (
+                    self.emission_params[0].mean_volatility,
+                    self.emission_params[0].mean_spread,
+                ),
+                (
+                    self.emission_params[1].mean_volatility,
+                    self.emission_params[1].mean_spread,
+                ),
+                (
+                    self.emission_params[2].mean_volatility,
+                    self.emission_params[2].mean_spread,
+                ),
+                (
+                    self.emission_params[3].mean_volatility,
+                    self.emission_params[3].mean_spread,
+                ),
+            ],
+        }
+    }
+
+
     /// Normalize belief state to sum to 1.
     fn normalize_belief(&mut self) {
         let sum: f64 = self.belief.iter().sum();
@@ -651,6 +762,32 @@ impl RegimeHMM {
             // Reset to default if all probabilities are zero
             self.belief = [0.1, 0.6, 0.25, 0.05];
         }
+    }
+}
+
+/// Calibration statistics for RegimeHMM diagnostics.
+#[derive(Debug, Clone)]
+pub struct RegimeCalibrationStats {
+    pub observation_count: u64,
+    pub regime_probs: [f64; NUM_REGIMES],
+    /// (mean_vol, mean_spread) for each regime
+    pub emission_means: [(f64, f64); NUM_REGIMES],
+}
+
+impl RegimeCalibrationStats {
+    pub fn summary(&self) -> String {
+        format!(
+            "n={} probs=[{:.2},{:.2},{:.2},{:.2}] thresholds=[{:.4}/{:.1}, {:.4}/{:.1}, {:.4}/{:.1}, {:.4}/{:.1}]",
+            self.observation_count,
+            self.regime_probs[0],
+            self.regime_probs[1],
+            self.regime_probs[2],
+            self.regime_probs[3],
+            self.emission_means[0].0, self.emission_means[0].1,
+            self.emission_means[1].0, self.emission_means[1].1,
+            self.emission_means[2].0, self.emission_means[2].1,
+            self.emission_means[3].0, self.emission_means[3].1,
+        )
     }
 }
 
