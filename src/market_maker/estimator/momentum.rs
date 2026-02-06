@@ -222,6 +222,27 @@ impl MomentumModel {
     pub(crate) fn is_calibrated(&self) -> bool {
         self.observations.len() >= self.min_observations * 3
     }
+
+    // === Checkpoint persistence ===
+
+    /// Extract learned state for checkpoint persistence.
+    ///
+    /// The observation VecDeque is NOT persisted — it's a rolling window.
+    /// The per-magnitude continuation probabilities are the valuable state.
+    pub(crate) fn to_checkpoint(&self) -> crate::market_maker::checkpoint::MomentumCheckpoint {
+        crate::market_maker::checkpoint::MomentumCheckpoint {
+            continuation_by_magnitude: self.continuation_by_magnitude,
+            counts_by_magnitude: self.counts_by_magnitude,
+            prior_continuation: self.prior_continuation,
+        }
+    }
+
+    /// Restore learned state from a checkpoint.
+    pub(crate) fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::MomentumCheckpoint) {
+        self.continuation_by_magnitude = cp.continuation_by_magnitude;
+        self.counts_by_magnitude = cp.counts_by_magnitude;
+        self.prior_continuation = cp.prior_continuation;
+    }
 }
 
 // ============================================================================

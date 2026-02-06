@@ -800,6 +800,24 @@ impl InformedFlowEstimator {
     pub fn reset(&mut self) {
         *self = Self::new(self.config.clone());
     }
+
+    // === Checkpoint persistence ===
+
+    /// Extract mixture model state for checkpoint persistence.
+    pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::InformedFlowCheckpoint {
+        crate::market_maker::checkpoint::InformedFlowCheckpoint {
+            component_params: self.components,
+            mixing_weights: self.mixing_weights,
+            observation_count: self.observation_count,
+        }
+    }
+
+    /// Restore mixture model state from a checkpoint.
+    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::InformedFlowCheckpoint) {
+        self.components = cp.component_params;
+        self.mixing_weights = cp.mixing_weights;
+        self.observation_count = cp.observation_count;
+    }
 }
 
 // ============================================================================

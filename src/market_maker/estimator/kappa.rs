@@ -479,6 +479,44 @@ impl BayesianKappaEstimator {
             "Own fill recorded for kappa estimation (V2)"
         );
     }
+
+    // === Checkpoint persistence ===
+
+    /// Extract sufficient statistics for checkpoint persistence.
+    ///
+    /// The rolling observation window (VecDeque) is NOT persisted — the sufficient
+    /// statistics fully determine the posterior.
+    pub(crate) fn to_checkpoint(&self) -> crate::market_maker::checkpoint::KappaCheckpoint {
+        crate::market_maker::checkpoint::KappaCheckpoint {
+            prior_alpha: self.prior_alpha,
+            prior_beta: self.prior_beta,
+            observation_count: self.observation_count,
+            sum_distances: self.sum_distances,
+            sum_sq_distances: self.sum_sq_distances,
+            kappa_posterior_mean: self.kappa_posterior_mean,
+        }
+    }
+
+    /// Restore sufficient statistics from a checkpoint.
+    ///
+    /// The VecDeque rolling window stays empty — it refills from live fills.
+    /// The posterior is recomputed from the restored sufficient statistics.
+    pub(crate) fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::KappaCheckpoint) {
+        self.prior_alpha = cp.prior_alpha;
+        self.prior_beta = cp.prior_beta;
+        self.observation_count = cp.observation_count;
+        self.sum_distances = cp.sum_distances;
+        self.sum_sq_distances = cp.sum_sq_distances;
+        self.kappa_posterior_mean = cp.kappa_posterior_mean;
+        // Recompute derived fields
+        let post_alpha = self.prior_alpha + self.observation_count as f64;
+        let post_beta = self.prior_beta + self.sum_distances;
+        self.kappa_posterior_var = post_alpha / (post_beta * post_beta);
+        self.kappa_posterior_std = self.kappa_posterior_var.sqrt();
+        if self.observation_count > 0 {
+            self.mean_distance = self.sum_distances / self.observation_count as f64;
+        }
+    }
 }
 
 // ============================================================================

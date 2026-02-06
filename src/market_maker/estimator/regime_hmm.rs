@@ -944,6 +944,29 @@ impl RegimeHMM {
             self.belief = [0.1, 0.6, 0.25, 0.05];
         }
     }
+
+    // === Checkpoint persistence ===
+
+    /// Extract learning state for checkpoint persistence.
+    ///
+    /// VecDeque buffers (vol_buffer, spread_buffer) are NOT persisted —
+    /// they're observation windows that refill from live data.
+    pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::RegimeHMMCheckpoint {
+        crate::market_maker::checkpoint::RegimeHMMCheckpoint {
+            belief: self.belief,
+            transition_counts: self.transition_counts,
+            observation_count: self.observation_count,
+            recalibration_count: self.recalibration_count,
+        }
+    }
+
+    /// Restore learning state from a checkpoint.
+    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::RegimeHMMCheckpoint) {
+        self.belief = cp.belief;
+        self.transition_counts = cp.transition_counts;
+        self.observation_count = cp.observation_count;
+        self.recalibration_count = cp.recalibration_count;
+    }
 }
 
 /// Calibration statistics for RegimeHMM diagnostics.

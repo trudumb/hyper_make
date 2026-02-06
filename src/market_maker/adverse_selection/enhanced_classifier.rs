@@ -100,6 +100,38 @@ impl EnhancedASClassifier {
         Self::new(EnhancedClassifierConfig::default())
     }
 
+    // === Checkpoint persistence ===
+
+    /// Extract learning state for checkpoint persistence.
+    ///
+    /// The nested MicrostructureExtractor is NOT checkpointed — it contains
+    /// private RollingStats/Ewma types that rebuild from live trades in ~30s.
+    pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::EnhancedCheckpoint {
+        crate::market_maker::checkpoint::EnhancedCheckpoint {
+            learned_weights: self.learned_weights,
+            weight_gradients: self.weight_gradients,
+            learning_samples: self.learning_samples,
+            prediction_sum: self.prediction_sum,
+            outcome_sum: self.outcome_sum,
+            correct_predictions: self.correct_predictions,
+            total_predictions: self.total_predictions,
+        }
+    }
+
+    /// Restore learning state from a checkpoint.
+    ///
+    /// The MicrostructureExtractor stays fresh — it rebuilds from live trades
+    /// within the warmup window (~100 trades, ~30 seconds).
+    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::EnhancedCheckpoint) {
+        self.learned_weights = cp.learned_weights;
+        self.weight_gradients = cp.weight_gradients;
+        self.learning_samples = cp.learning_samples;
+        self.prediction_sum = cp.prediction_sum;
+        self.outcome_sum = cp.outcome_sum;
+        self.correct_predictions = cp.correct_predictions;
+        self.total_predictions = cp.total_predictions;
+    }
+
     /// Process a new trade
     pub fn on_trade(&mut self, trade: TradeObservation) {
         self.extractor.on_trade(trade);

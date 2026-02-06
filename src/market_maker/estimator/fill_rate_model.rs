@@ -591,6 +591,32 @@ impl FillRateModel {
     pub fn reset(&mut self) {
         *self = Self::new(self.config.clone());
     }
+
+    // === Checkpoint persistence ===
+
+    /// Extract Bayesian posterior state for checkpoint persistence.
+    pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::FillRateCheckpoint {
+        crate::market_maker::checkpoint::FillRateCheckpoint {
+            lambda_0_mean: self.lambda_0.mean,
+            lambda_0_variance: self.lambda_0.variance,
+            lambda_0_n_obs: self.lambda_0.n_obs,
+            delta_char_mean: self.delta_char.mean,
+            delta_char_variance: self.delta_char.variance,
+            delta_char_n_obs: self.delta_char.n_obs,
+            observation_count: self.observation_count,
+        }
+    }
+
+    /// Restore Bayesian posterior state from a checkpoint.
+    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::FillRateCheckpoint) {
+        self.lambda_0.mean = cp.lambda_0_mean;
+        self.lambda_0.variance = cp.lambda_0_variance;
+        self.lambda_0.n_obs = cp.lambda_0_n_obs;
+        self.delta_char.mean = cp.delta_char_mean;
+        self.delta_char.variance = cp.delta_char_variance;
+        self.delta_char.n_obs = cp.delta_char_n_obs;
+        self.observation_count = cp.observation_count;
+    }
 }
 
 /// Summary statistics for fill rate model

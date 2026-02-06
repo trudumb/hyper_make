@@ -193,6 +193,31 @@ impl PreFillASClassifier {
         }
     }
 
+    // === Checkpoint persistence ===
+
+    /// Extract learning state for checkpoint persistence.
+    pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::PreFillCheckpoint {
+        crate::market_maker::checkpoint::PreFillCheckpoint {
+            learned_weights: self.learned_weights,
+            signal_outcome_sum: self.signal_outcome_sum,
+            signal_sq_sum: self.signal_sq_sum,
+            learning_samples: self.learning_samples,
+            regime_probs: self.regime_probs,
+        }
+    }
+
+    /// Restore learning state from a checkpoint.
+    ///
+    /// Ephemeral state (cached signals, timestamps) stays at defaults —
+    /// they repopulate within seconds from live data.
+    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::PreFillCheckpoint) {
+        self.learned_weights = cp.learned_weights;
+        self.signal_outcome_sum = cp.signal_outcome_sum;
+        self.signal_sq_sum = cp.signal_sq_sum;
+        self.learning_samples = cp.learning_samples;
+        self.regime_probs = cp.regime_probs;
+    }
+
     /// Update orderbook imbalance signal.
     ///
     /// # Arguments

@@ -34,6 +34,8 @@ pub mod monitoring;
 pub mod simulation;
 pub mod stochastic;
 
+pub mod checkpoint;
+
 mod orchestrator;
 
 #[cfg(test)]

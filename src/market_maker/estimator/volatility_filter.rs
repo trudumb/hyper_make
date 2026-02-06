@@ -551,6 +551,48 @@ impl VolatilityFilter {
     pub fn reset(&mut self) {
         *self = Self::new(self.config.clone());
     }
+
+    // === Checkpoint persistence ===
+
+    /// Extract sufficient statistics for checkpoint persistence.
+    ///
+    /// Saves summary statistics (200 bytes) instead of full particle cloud (20KB).
+    /// On restore, particles are reinitialized centered on saved sigma_mean.
+    pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::VolFilterCheckpoint {
+        crate::market_maker::checkpoint::VolFilterCheckpoint {
+            sigma_mean: self.cache.sigma_mean,
+            sigma_std: self.cache.sigma_std,
+            regime_probs: self.cache.regime_probs,
+            observation_count: self.observation_count,
+        }
+    }
+
+    /// Restore from checkpoint by reinitializing particles around saved state.
+    ///
+    /// Particles are centered on the saved sigma_mean with sigma_std spread.
+    /// SmallRng reinitializes fresh (deterministic seed fine for particle filter).
+    pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::VolFilterCheckpoint) {
+        // Reinitialize particles centered on saved posterior
+        let log_vol_mean = if cp.sigma_mean > 0.0 {
+            cp.sigma_mean.ln()
+        } else {
+            self.config.initial_log_vol_mean
+        };
+        let log_vol_std = if cp.sigma_std > 0.0 && cp.sigma_mean > 0.0 {
+            // Approximate log-space std from linear-space std
+            (cp.sigma_std / cp.sigma_mean).min(2.0).max(0.1)
+        } else {
+            self.config.initial_log_vol_std
+        };
+
+        for particle in &mut self.particles {
+            particle.regime = sample_regime_from_probs(&cp.regime_probs, &mut self.rng);
+            particle.log_vol = log_vol_mean + log_vol_std * sample_standard_normal(&mut self.rng);
+        }
+
+        self.observation_count = cp.observation_count;
+        self.update_cache();
+    }
 }
 
 // ============================================================================
