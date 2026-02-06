@@ -426,6 +426,9 @@ impl SignalIntegrator {
                 self.config.min_mi_threshold,
                 stability_conf,
             );
+        } else {
+            // MI insignificant or lag unavailable — mark signal stale
+            self.last_lead_lag_signal.is_actionable = false;
         }
     }
 
@@ -522,6 +525,12 @@ impl SignalIntegrator {
 
         // Update Binance flow analyzer
         self.binance_flow.on_trade(trade);
+
+        // Auto-wire Binance VPIN into toxicity blend
+        let vpin = self.binance_flow.vpin();
+        let velocity = self.binance_flow.vpin_velocity();
+        let valid = self.binance_flow.vpin_is_valid();
+        self.set_vpin(vpin, velocity, valid);
 
         // Update cross-venue features if we have both venues
         self.update_cross_venue_features();
@@ -657,8 +666,14 @@ impl SignalIntegrator {
 
             // Blend VPIN with EM toxicity when VPIN is available and enabled
             let blended_toxicity = if self.config.use_vpin_toxicity && self.vpin_valid {
-                let w = self.config.vpin_blend_weight;
-                w * self.latest_hl_vpin + (1.0 - w) * em_toxicity
+                let vpin = self.latest_hl_vpin;
+                // Guard against saturated VPIN (degenerate bucket composition)
+                if vpin >= 0.95 || vpin <= 0.05 {
+                    em_toxicity // Fall back to EM-only when VPIN is at extremes
+                } else {
+                    let w = self.config.vpin_blend_weight;
+                    w * vpin + (1.0 - w) * em_toxicity
+                }
             } else {
                 em_toxicity
             };

@@ -349,14 +349,16 @@ impl ModelTracker {
     pub fn health_status(&self) -> &'static str {
         let ir = self.ir.information_ratio();
         let n = self.n_samples();
-        
+
         if n < 50 {
             "WARMING"
-        } else if ir > 1.2 {
-            "✓ GOOD"
         } else if ir > 1.0 {
+            "★ STRONG"
+        } else if ir > 0.7 {
+            "✓ GOOD"
+        } else if ir > 0.5 {
             "~ OK"
-        } else if ir > 0.8 {
+        } else if ir > 0.3 {
             "✗ MARGINAL"
         } else {
             "✗ REMOVE"
@@ -816,12 +818,13 @@ impl PredictionValidator {
         // Instead of static asset-specific buckets, we use adaptive sizing that
         // calibrates to maintain approximately equal-time buckets (~30s target).
         //
-        // KEY: Start with SMALL buckets to get fast warmup, then let adaptive sizing
-        // grow them based on actual volume rate. This prevents saturation during warmup.
+        // KEY: Buckets must be large enough to contain multiple trades for meaningful
+        // imbalance. Adaptive sizing will adjust based on actual volume rate.
         let initial_bucket_volume = match asset.to_uppercase().as_str() {
-            "BTC" | "ETH" => 1.0,    // Start smaller for faster warmup
-            "SOL" | "AVAX" | "MATIC" | "ARB" | "OP" => 0.2,  // Mid-cap
-            _ => 0.05,  // Very small start for illiquid assets - adaptive will grow it
+            "BTC" => 1.0,            // BTC: ~$100k/bucket, ~20-60 trades per bucket
+            "ETH" => 5.0,            // ETH: similar trade density per bucket
+            "SOL" | "AVAX" | "MATIC" | "ARB" | "OP" => 2.0,  // Mid-cap
+            _ => 0.5,  // Small-cap - adaptive will adjust
         };
 
         // Use adaptive VPIN configuration - the principled approach
@@ -974,6 +977,8 @@ impl PredictionValidator {
         if let Some(ref mut integrator) = self.signal_integrator {
             let hl_flow = self.buffers.compute_hl_flow_features(timestamp_ms);
             integrator.set_hl_flow_features(hl_flow);
+            // Feed trades to SignalIntegrator's BuyPressure tracker
+            integrator.on_trade_for_pressure(size, is_buy);
         }
 
         // Resolve any BuyPressure predictions (next trade resolution)
@@ -1157,6 +1162,11 @@ impl PredictionValidator {
         );
 
         // 2. PreFillToxicity prediction (old classifier)
+        // Pipe blended toxicity from IntegratedSignals (includes VPIN when valid)
+        if let Some(ref integrator) = self.signal_integrator {
+            let signals = integrator.get_signals();
+            self.pre_fill_classifier.set_blended_toxicity(signals.toxicity_score);
+        }
         let p_toxic = match fill.side {
             Side::Bid => self.pre_fill_classifier.predict_toxicity(true),
             Side::Ask => self.pre_fill_classifier.predict_toxicity(false),
@@ -1580,10 +1590,10 @@ impl PredictionValidator {
         }
 
         for i in 0..4 {
-            let indicator = if regime_ir[i] > 1.0 { "✓" } else { "✗" };
+            let indicator = if regime_ir[i] > 0.5 { "✓" } else { "✗" };
             let note = match i {
-                0 if regime_ir[i] > 1.2 => "← Models work best here",
-                3 if regime_ir[i] < 0.9 => "← Expected degradation",
+                0 if regime_ir[i] > 0.7 => "← Models work best here",
+                3 if regime_ir[i] < 0.3 => "← Expected degradation",
                 _ => "",
             };
             println!(
@@ -1609,7 +1619,7 @@ impl PredictionValidator {
 
         for tracker in self.trackers.values() {
             match tracker.health_status() {
-                "✓ GOOD" | "~ OK" => good += 1,
+                "★ STRONG" | "✓ GOOD" | "~ OK" => good += 1,
                 "✗ MARGINAL" => _marginal += 1,
                 "✗ REMOVE" => bad += 1,
                 _ => warming += 1,
@@ -1619,7 +1629,7 @@ impl PredictionValidator {
         if warming == self.trackers.len() {
             println!("⏳ Collecting predictions... Need more samples for reliable metrics.");
         } else if bad > 2 {
-            println!("⚠️  Multiple models showing IR < 1.0. Review model assumptions.");
+            println!("⚠️  Multiple models showing IR < 0.3. Review model assumptions.");
         } else if good >= 3 {
             println!("✅ Models showing predictive power. Consider live validation.");
         } else {

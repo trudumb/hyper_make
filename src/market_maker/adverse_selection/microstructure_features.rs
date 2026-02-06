@@ -370,7 +370,7 @@ impl MicrostructureExtractor {
 
         // === Inter-arrival time ===
         if self.last_trade_time_ms > 0 {
-            let arrival_ms = (trade.timestamp_ms - self.last_trade_time_ms) as f64;
+            let arrival_ms = trade.timestamp_ms.saturating_sub(self.last_trade_time_ms) as f64;
             self.arrival_time_stats.push(arrival_ms);
         }
         self.last_trade_time_ms = trade.timestamp_ms;

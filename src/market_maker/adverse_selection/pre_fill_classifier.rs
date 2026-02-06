@@ -139,6 +139,16 @@ pub struct PreFillASClassifier {
 
     /// Regime probabilities for soft blending
     regime_probs: [f64; 4],
+
+    // === Blended Toxicity Override ===
+    /// When set, blends the classifier's own prediction with an external
+    /// toxicity signal (e.g., VPIN-blended toxicity from IntegratedSignals).
+    /// This prevents EM-style degeneration by injecting a varying signal.
+    blended_toxicity_override: Option<f64>,
+
+    /// Weight given to the external toxicity signal [0, 1].
+    /// 0.0 = pure classifier, 1.0 = pure override.
+    blend_weight: f64,
 }
 
 impl PreFillASClassifier {
@@ -177,6 +187,9 @@ impl PreFillASClassifier {
             // Regime-conditional state
             current_regime: 1, // Start with Normal
             regime_probs: [0.1, 0.7, 0.15, 0.05], // Default prior
+            // Blended toxicity override
+            blended_toxicity_override: None,
+            blend_weight: 0.5, // 50/50 blend by default
         }
     }
 
@@ -298,6 +311,21 @@ impl PreFillASClassifier {
         self.update_cached_toxicity();
     }
 
+    /// Set the blended toxicity from an external source (e.g., IntegratedSignals).
+    ///
+    /// When set, `predict_toxicity()` blends its own 5-signal classifier output
+    /// with this external value. This injects VPIN-based variation that prevents
+    /// the classifier from concentrating at a single value.
+    pub fn set_blended_toxicity(&mut self, toxicity: f64) {
+        self.blended_toxicity_override = Some(toxicity.clamp(0.0, 1.0));
+    }
+
+    /// Set the blend weight between classifier and external toxicity.
+    /// 0.0 = pure classifier, 1.0 = pure external.
+    pub fn set_blend_weight(&mut self, weight: f64) {
+        self.blend_weight = weight.clamp(0.0, 1.0);
+    }
+
     /// Predict fill toxicity for a given side.
     ///
     /// Returns toxicity probability [0, 1] where:
@@ -331,7 +359,15 @@ impl PreFillASClassifier {
             toxicity += weight * signal;
         }
 
-        toxicity.clamp(0.0, 1.0)
+        let classifier_tox = toxicity.clamp(0.0, 1.0);
+
+        // Blend with external toxicity if available (e.g., VPIN-blended from IntegratedSignals)
+        if let Some(override_tox) = self.blended_toxicity_override {
+            let w = self.blend_weight;
+            ((1.0 - w) * classifier_tox + w * override_tox).clamp(0.0, 1.0)
+        } else {
+            classifier_tox
+        }
     }
 
     /// Get the effective weights (learned or default, with regime conditioning)

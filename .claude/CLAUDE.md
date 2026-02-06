@@ -99,10 +99,12 @@ Before implementing any predictive component:
 A model is only as good as its calibration metrics say it is. Key metrics:
 
 - **Brier Score**: Mean squared error of probability predictions
-- **Information Ratio**: Resolution / Uncertainty (>1.0 means model adds value)
+- **Information Ratio**: Resolution / Uncertainty — measures how much a feature shifts beliefs
 - **Conditional Calibration**: Metrics sliced by regime, volatility, etc.
 
-If IR < 1.0, the model is adding noise. Remove it.
+Features inform Bayesian priors, not predict perfectly. IR 0.5–1.0 is useful for belief updates;
+IR > 1.0 is an exceptional standalone predictor. Only remove features with IR < 0.5 after 500+
+samples. Watch for inter-feature correlation inflating aggregate value.
 
 ### 3. Edge Decays
 

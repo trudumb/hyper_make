@@ -7,12 +7,13 @@
 //! # Key Concepts
 //!
 //! - **Information Ratio (IR)**: Measures model value-add over base rate
-//!   - IR > 1.0: Model adds value
-//!   - IR < 1.0: Model adds noise (should be disabled)
+//!   - IR > 1.0: Strong standalone predictor
+//!   - IR 0.5-1.0: Feature informs priors (useful for Bayesian updates)
+//!   - IR < 0.5: Insufficient signal (should be disabled)
 //!
-//! - **Model Confidence**: Probability that IR > threshold (typically 1.0)
-//!   - P(IR > 1.0) > 0.7: High confidence, use model fully
-//!   - P(IR > 1.0) < 0.3: Low confidence, disable model
+//! - **Model Confidence**: Probability that IR > threshold (default 0.5)
+//!   - P(IR > 0.5) > 0.7: High confidence, use model fully
+//!   - P(IR > 0.5) < 0.3: Low confidence, disable model
 //!
 //! # Usage
 //!
@@ -66,12 +67,12 @@ impl Default for ModelGatingConfig {
     fn default() -> Self {
         Self {
             min_samples: 100,
-            ir_threshold: 1.0,
+            ir_threshold: 0.5,
             high_confidence_threshold: 0.7,
             low_confidence_threshold: 0.3,
             low_confidence_spread_mult: 1.5,
             no_confidence_spread_mult: 2.0,
-            prior_mean: 0.9, // Slightly skeptical prior
+            prior_mean: 0.5, // Neutral prior; let data drive confidence
             prior_df: 10.0,  // Moderate prior strength
             n_bins: 10,
         }

@@ -856,37 +856,52 @@ impl RegimeHMM {
         let vol_iqr = (vol_p75 - percentile(&vol_sorted, 0.25)).max(vol_p50 * 0.1);
         let spread_iqr = (spread_p75 - percentile(&spread_sorted, 0.25)).max(spread_p50 * 0.1);
 
+        // === Minimum variance floors ===
+        // Prevent threshold compression during quiet periods: std must be at least
+        // 30% of the mean, so regimes always have meaningful overlap and don't
+        // collapse into degenerate point distributions.
+        let min_vol_std = vol_p50 * 0.3;
+        let min_spread_std = spread_p50 * 0.3;
+
+        // === Minimum regime separation ===
+        // Ensure HIGH mean >= 1.5x NORMAL, EXTREME >= 2.0x HIGH
+        // Prevents quiet-period calibrations from making normal activity look extreme.
+        let high_vol = vol_p75.max(vol_p50 * 1.5);
+        let high_spread = spread_p75.max(spread_p50 * 1.5);
+        let extreme_vol = vol_p95.max(high_vol * 2.0);
+        let extreme_spread = spread_p95.max(high_spread * 2.0);
+
         // Update emission parameters
         // Low regime: 10th percentile
         self.emission_params[regime_idx::LOW] = EmissionParams::new(
             vol_p10,
-            vol_iqr * 0.3,
+            (vol_iqr * 0.3).max(min_vol_std),
             spread_p10,
-            spread_iqr * 0.3,
+            (spread_iqr * 0.3).max(min_spread_std),
         );
 
         // Normal regime: 50th percentile (median)
         self.emission_params[regime_idx::NORMAL] = EmissionParams::new(
             vol_p50,
-            vol_iqr * 0.5,
+            (vol_iqr * 0.5).max(min_vol_std),
             spread_p50,
-            spread_iqr * 0.5,
+            (spread_iqr * 0.5).max(min_spread_std),
         );
 
-        // High regime: 75th percentile
+        // High regime: 75th percentile (with minimum separation)
         self.emission_params[regime_idx::HIGH] = EmissionParams::new(
-            vol_p75,
-            vol_iqr * 0.7,
-            spread_p75,
-            spread_iqr * 0.7,
+            high_vol,
+            (vol_iqr * 0.7).max(min_vol_std),
+            high_spread,
+            (spread_iqr * 0.7).max(min_spread_std),
         );
 
-        // Extreme regime: 95th percentile
+        // Extreme regime: 95th percentile (with minimum separation)
         self.emission_params[regime_idx::EXTREME] = EmissionParams::new(
-            vol_p95,
-            vol_iqr * 1.0,
-            spread_p95,
-            spread_iqr * 1.0,
+            extreme_vol,
+            (vol_iqr * 1.0).max(min_vol_std),
+            extreme_spread,
+            (spread_iqr * 1.0).max(min_spread_std),
         );
     }
 

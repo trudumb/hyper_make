@@ -13,11 +13,13 @@
 //!
 //! ## Interpretation
 //!
-//! - **IR > 1.0**: Model adds value (predictions are informative)
-//! - **IR = 1.0**: Model equals random noise
-//! - **IR < 1.0**: Model adds noise (worse than base rate)
+//! - **IR > 1.0**: Strong standalone predictor (exceptional)
+//! - **IR 0.5–1.0**: Feature informs Bayesian priors (useful for belief updates)
+//! - **IR < 0.5**: Insufficient signal to shift beliefs (remove with 500+ samples)
 //!
-//! A model with IR < 1.0 should be removed as it degrades performance.
+//! Note: Features that inform priors don't need to predict perfectly—even IR 0.3–0.8
+//! shifts beliefs in the right direction. Only remove features below 0.5 after 500+
+//! samples. Watch for inter-feature correlation inflating aggregate value.
 
 /// Tracks Information Ratio using binned probability calibration.
 ///
@@ -138,11 +140,13 @@ impl InformationRatioTracker {
         self.resolution() / uncertainty
     }
 
-    /// Check if the model is adding value (IR > 1.0).
+    /// Check if the model is adding value (IR > 0.5).
     ///
-    /// A model with IR <= 1.0 is adding noise rather than signal.
+    /// A model with IR <= 0.5 has insufficient signal to inform priors.
+    /// Features with IR 0.5–1.0 are useful for Bayesian belief updates
+    /// even though they aren't strong standalone predictors.
     pub fn is_adding_value(&self) -> bool {
-        self.information_ratio() > 1.0
+        self.information_ratio() > 0.5
     }
 
     /// Get the total number of samples.
@@ -832,7 +836,7 @@ mod tests {
         // Check if adding value depends on the IR
         // With this setup, model should be adding some value
         let ir = tracker.information_ratio();
-        assert_eq!(tracker.is_adding_value(), ir > 1.0);
+        assert_eq!(tracker.is_adding_value(), ir > 0.5);
     }
 
     #[test]

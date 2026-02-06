@@ -389,9 +389,14 @@ impl BinanceFlowAnalyzer {
         // is_buyer_maker = true means seller aggressed (sell trade)
         let is_buy = !trade.is_buyer_maker;
 
-        // Update mid price from trade if not set
+        // Update mid price from trade as rolling EWMA for BVC classification.
+        // Using trade price as mid proxy — with many trades per bucket, BVC
+        // will see prices oscillating around this rolling mid, producing
+        // meaningful buy/sell splits. Alpha=0.01 gives ~100-trade half-life.
         if self.latest_mid <= 0.0 {
             self.latest_mid = price;
+        } else {
+            self.latest_mid = 0.01 * price + 0.99 * self.latest_mid;
         }
 
         // Update VPIN
@@ -431,6 +436,11 @@ impl BinanceFlowAnalyzer {
     /// Get VPIN velocity (rate of change).
     pub fn vpin_velocity(&self) -> f64 {
         self.vpin.vpin_velocity()
+    }
+
+    /// Whether the VPIN estimator has enough completed buckets to be valid.
+    pub fn vpin_is_valid(&self) -> bool {
+        self.vpin.is_valid()
     }
 
     /// Get volume imbalance for a specific window.
