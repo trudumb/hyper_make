@@ -213,10 +213,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 let vpin_velocity = self.stochastic.vpin.vpin_velocity();
 
                 // Wire VPIN into SignalIntegrator for toxicity blending
+                let vpin_fresh = self.stochastic.vpin.is_valid() && !self.stochastic.vpin.is_stale(timestamp_ms);
                 self.stochastic.signal_integrator.set_vpin(
                     vpin,
                     vpin_velocity,
-                    self.stochastic.vpin.is_valid(),
+                    vpin_fresh,
                 );
                 let order_flow_direction = self.stochastic.vpin.order_flow_direction();
                 let vpin_buckets = self.stochastic.vpin.bucket_count();

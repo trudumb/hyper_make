@@ -575,6 +575,13 @@ pub struct MultiFeatureStandardizer {
     output_mean: f64,
     output_variance: f64,
     output_count: usize,
+
+    /// Base rate estimate from actual outcomes
+    base_rate: f64,
+    /// Outcome count for base rate estimation
+    outcome_count: usize,
+    /// Sum of positive outcomes
+    outcome_sum: f64,
 }
 
 impl MultiFeatureStandardizer {
@@ -598,6 +605,9 @@ impl MultiFeatureStandardizer {
             output_mean: 0.5,
             output_variance: 0.0625,
             output_count: 0,
+            base_rate: 0.5,
+            outcome_count: 0,
+            outcome_sum: 0.0,
         }
     }
 
@@ -641,18 +651,25 @@ impl MultiFeatureStandardizer {
 
     /// Record outcome for base rate calibration.
     pub fn record_outcome(&mut self, was_positive: bool) {
-        // Update output bias toward base rate
-        let outcome = if was_positive { 1.0 } else { 0.0 };
-        let alpha = 0.01;
+        self.outcome_count += 1;
+        if was_positive {
+            self.outcome_sum += 1.0;
+        }
 
-        // Estimate base rate
-        let base_rate = self.output_mean; // Use recent mean as proxy
+        // Update base rate with EWMA decay (recent outcomes weighted more)
+        if self.outcome_count > 100 {
+            let alpha = 0.01;
+            let outcome = if was_positive { 1.0 } else { 0.0 };
+            self.base_rate = (1.0 - alpha) * self.base_rate + alpha * outcome;
+        } else {
+            self.base_rate = self.outcome_sum / self.outcome_count as f64;
+        }
 
-        // Adjust bias if predictions drift from base rate
-        let target_bias = (base_rate / (1.0 - base_rate + 1e-9)).ln();
+        // Adjust output bias to match observed base rate
+        let target_bias = (self.base_rate / (1.0 - self.base_rate + 1e-9)).ln();
         self.output_bias = 0.99 * self.output_bias + 0.01 * target_bias.clamp(-3.0, 3.0);
 
-        // Also propagate to individual standardizers
+        // Propagate to individual standardizers
         for std in &mut self.feature_standardizers {
             std.record_outcome(was_positive);
         }
@@ -722,6 +739,9 @@ impl MultiFeatureStandardizer {
         self.output_mean = 0.5;
         self.output_variance = 0.0625;
         self.output_count = 0;
+        self.base_rate = 0.5;
+        self.outcome_count = 0;
+        self.outcome_sum = 0.0;
     }
 }
 

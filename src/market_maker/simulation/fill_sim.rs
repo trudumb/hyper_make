@@ -58,15 +58,25 @@ pub struct FillSimulatorConfig {
     pub max_order_age_s: f64,
     /// Minimum trade size to trigger fills
     pub min_triggering_trade_size: f64,
+    /// Simulated order placement latency in milliseconds
+    pub placement_latency_ms: u64,
+    /// Simulated order cancel latency in milliseconds
+    pub cancel_latency_ms: u64,
+    /// Skip L2 book depth for queue position (use flat model instead).
+    /// Set true for paper trading where orders don't exist in the real book.
+    pub ignore_book_depth: bool,
 }
 
 impl Default for FillSimulatorConfig {
     fn default() -> Self {
         Self {
-            touch_fill_probability: 0.3, // 30% chance when touched
-            queue_position_factor: 0.5,  // Assume middle of queue
-            max_order_age_s: 300.0,      // 5 minutes
+            touch_fill_probability: 0.3,
+            queue_position_factor: 0.5,
+            max_order_age_s: 300.0,
             min_triggering_trade_size: 0.0,
+            placement_latency_ms: 100,
+            cancel_latency_ms: 50,
+            ignore_book_depth: false,
         }
     }
 }
@@ -85,11 +95,18 @@ pub struct FillSimulator {
     total_fills: u64,
     /// Total size filled
     total_size_filled: f64,
+    /// L2 book bid depth by price level (price_ticks -> size)
+    book_bid_depth: std::collections::HashMap<i64, f64>,
+    /// L2 book ask depth by price level (price_ticks -> size)
+    book_ask_depth: std::collections::HashMap<i64, f64>,
+    /// Placement latency in nanoseconds
+    placement_latency_ns: u64,
 }
 
 impl FillSimulator {
     /// Create a new fill simulator
     pub fn new(executor: Arc<SimulationExecutor>, config: FillSimulatorConfig) -> Self {
+        let placement_latency_ns = config.placement_latency_ms * 1_000_000;
         Self {
             config,
             executor,
@@ -97,6 +114,33 @@ impl FillSimulator {
             max_recent_fills: 1000,
             total_fills: 0,
             total_size_filled: 0.0,
+            book_bid_depth: std::collections::HashMap::new(),
+            book_ask_depth: std::collections::HashMap::new(),
+            placement_latency_ns,
+        }
+    }
+
+    /// Update L2 book depth for queue-aware fill probability
+    pub fn update_book(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
+        self.book_bid_depth.clear();
+        self.book_ask_depth.clear();
+        for &(price, size) in bids {
+            let ticks = (price * 100.0) as i64; // 0.01 resolution
+            self.book_bid_depth.insert(ticks, size);
+        }
+        for &(price, size) in asks {
+            let ticks = (price * 100.0) as i64;
+            self.book_ask_depth.insert(ticks, size);
+        }
+    }
+
+    /// Get book depth at a price level
+    fn book_depth_at_price(&self, price: f64, is_buy: bool) -> f64 {
+        let ticks = (price * 100.0) as i64;
+        if is_buy {
+            self.book_bid_depth.get(&ticks).copied().unwrap_or(0.0)
+        } else {
+            self.book_ask_depth.get(&ticks).copied().unwrap_or(0.0)
         }
     }
 
@@ -143,6 +187,12 @@ impl FillSimulator {
     /// Check if a trade would fill an order
     fn check_fill(&self, order: &SimulatedOrder, trade: &MarketTrade) -> Option<SimulatedFill> {
         if order.status != SimulatedOrderStatus::Resting {
+            return None;
+        }
+
+        // Latency simulation: skip orders that haven't been resting long enough
+        let effective_resting_at = order.created_at_ns + self.placement_latency_ns;
+        if trade.timestamp_ns < effective_resting_at {
             return None;
         }
 
@@ -219,7 +269,7 @@ impl FillSimulator {
 
         // Factor 1: Price improvement - further through our level = higher prob
         let price_diff = if order.is_buy {
-            order.price - trade.price // Positive if trade went through
+            order.price - trade.price
         } else {
             trade.price - order.price
         };
@@ -232,28 +282,42 @@ impl FillSimulator {
         // Factor 2: Trade size relative to our order
         let size_factor = (trade.size / order.size).min(2.0).max(0.5);
 
-        // Factor 3: Order age (older orders have better queue position)
+        // Factor 3: Queue position
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let age_s = (now_ns - order.created_at_ns) as f64 / 1e9;
-        let age_factor = if age_s > 10.0 {
-            1.3 // Good queue position
+        let age_s = (now_ns.saturating_sub(order.created_at_ns)) as f64 / 1e9;
+        let age_bonus = if age_s > 10.0 {
+            1.3
         } else if age_s > 1.0 {
             1.0
         } else {
-            0.7 // Just placed, poor queue position
+            0.7
         };
 
-        let final_prob = base_prob * price_factor * size_factor * age_factor;
+        let queue_factor = if self.config.ignore_book_depth {
+            // Flat queue model: sim orders aren't in the real book
+            self.config.queue_position_factor * age_bonus
+        } else {
+            // L2 book-aware queue position
+            let volume_at_level = self.book_depth_at_price(order.price, order.is_buy);
+            if volume_at_level > 0.0 {
+                let our_share = order.size / (volume_at_level + order.size);
+                our_share * age_bonus
+            } else {
+                self.config.queue_position_factor * age_bonus
+            }
+        };
+
+        let final_prob = base_prob * price_factor * size_factor * queue_factor;
 
         debug!(
             oid = order.oid,
             base_prob,
             price_factor,
             size_factor,
-            age_factor,
+            queue_factor,
             final_prob,
             "Fill probability calculation"
         );
@@ -289,23 +353,10 @@ pub struct FillSimulatorStats {
     pub recent_fill_count: usize,
 }
 
-/// Probabilistic fill decision using simple random sampling
+/// Probabilistic fill decision using proper RNG
 fn should_fill_probabilistic(probability: f64) -> bool {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Use hash of timestamp for pseudo-random without extra dependencies
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-
-    let mut hasher = DefaultHasher::new();
-    now.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let random_value = (hash % 10000) as f64 / 10000.0;
-    random_value < probability
+    use rand::Rng;
+    rand::thread_rng().gen::<f64>() < probability
 }
 
 /// Aggressive fill simulator that fills based on trade flow

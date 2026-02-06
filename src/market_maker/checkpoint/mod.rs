@@ -32,7 +32,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Manages checkpoint persistence to disk.
 ///
@@ -215,6 +215,7 @@ mod tests {
                 signal_sq_sum: [10.0, 20.0, 30.0, 40.0, 50.0],
                 learning_samples: 1000,
                 regime_probs: [0.05, 0.60, 0.25, 0.10],
+                ..PreFillCheckpoint::default()
             },
             enhanced: EnhancedCheckpoint::default(),
             vol_filter: VolFilterCheckpoint::default(),

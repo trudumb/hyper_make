@@ -339,6 +339,7 @@ impl BinanceFlowAnalyzer {
                 min_bucket_multiplier: 0.05,
                 max_bucket_multiplier: 20.0,
                 adaptive_warmup_buckets: 10,
+                staleness_threshold_ms: 60_000,
             }
         } else {
             // Static bucket sizing

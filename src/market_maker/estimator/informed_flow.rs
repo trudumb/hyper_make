@@ -297,9 +297,6 @@ pub struct InformedFlowEstimator {
     /// Last trade timestamp
     last_trade_ms: u64,
 
-    /// Last trade price (for computing realized impact)
-    last_price: Option<f64>,
-
     /// EWMA of recent price impacts (in bps)
     /// Used when caller doesn't provide impact
     impact_ewma: f64,
@@ -361,7 +358,6 @@ impl InformedFlowEstimator {
             trades_since_update: 0,
             forgetting_factor,
             last_trade_ms: 0,
-            last_price: None,
             impact_ewma: 1.0, // Start with 1 bps default
             // New fields
             kyle_lambda: 0.5, // Initial estimate: 0.5 bps per unit

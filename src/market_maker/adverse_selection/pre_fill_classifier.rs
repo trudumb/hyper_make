@@ -56,6 +56,18 @@ pub struct PreFillClassifierConfig {
     /// Regularization strength for weight learning (default: 0.1)
     /// Prevents weights from going to extremes
     pub regularization: f64,
+
+    /// EWMA smoothing factor for z-score normalizer (default: 0.05, ~20-sample half-life)
+    pub normalizer_alpha: f64,
+
+    /// Minimum observations before using z-score normalization (default: 50)
+    pub normalizer_warmup: usize,
+
+    /// Z-score scaling factor to amplify compressed z-scores (default: 2.0).
+    /// EWMA z-scores are attenuated because the mean tracks current values closely.
+    /// Scaling by 2.0 maps ±1σ events to sigmoid(±2) = [0.12, 0.88], providing
+    /// good spread across the [0,1] range.
+    pub z_scale: f64,
 }
 
 impl Default for PreFillClassifierConfig {
@@ -77,6 +89,10 @@ impl Default for PreFillClassifierConfig {
             learning_rate: 0.01,
             min_samples_for_learning: 500,
             regularization: 0.1,
+
+            normalizer_alpha: 0.05,
+            normalizer_warmup: 50,
+            z_scale: 2.0,
         }
     }
 }
@@ -149,6 +165,47 @@ pub struct PreFillASClassifier {
     /// Weight given to the external toxicity signal [0, 1].
     /// 0.0 = pure classifier, 1.0 = pure override.
     blend_weight: f64,
+
+    // === EWMA Z-Score Normalizer State ===
+    /// EWMA mean for log(bid_depth/ask_depth)
+    imbalance_ewma_mean: f64,
+    /// EWMA variance for log(bid_depth/ask_depth)
+    imbalance_ewma_var: f64,
+    /// EWMA mean for trade_direction
+    flow_ewma_mean: f64,
+    /// EWMA variance for trade_direction
+    flow_ewma_var: f64,
+    /// EWMA mean for funding_rate
+    funding_ewma_mean: f64,
+    /// EWMA variance for funding_rate
+    funding_ewma_var: f64,
+    /// Previous regime trust (for delta computation)
+    regime_trust_prev: f64,
+    /// EWMA mean for regime instability (1.0 - trust)
+    regime_ewma_mean: f64,
+    /// EWMA variance for regime instability
+    regime_ewma_var: f64,
+    /// EWMA mean for changepoint probability
+    changepoint_ewma_mean: f64,
+    /// EWMA variance for changepoint probability
+    changepoint_ewma_var: f64,
+    /// Normalizer smoothing factor
+    normalizer_alpha: f64,
+    /// Minimum observations before using z-score normalization
+    normalizer_warmup: usize,
+    /// Number of normalizer observations
+    normalizer_obs_count: usize,
+    // === Pre-computed z-scores (computed BEFORE EWMA update for true N(0,1) distribution) ===
+    /// Z-score of log(bid/ask ratio) computed against pre-update EWMA
+    imbalance_z: f64,
+    /// Z-score of trade direction computed against pre-update EWMA
+    flow_z: f64,
+    /// Z-score of funding rate computed against pre-update EWMA
+    funding_z: f64,
+    /// Z-score of regime instability (1-trust) computed against pre-update EWMA
+    regime_z: f64,
+    /// Z-score of changepoint probability computed against pre-update EWMA
+    changepoint_z: f64,
 }
 
 impl PreFillASClassifier {
@@ -167,6 +224,9 @@ impl PreFillASClassifier {
             config.funding_weight,
             config.changepoint_weight,
         ];
+
+        let normalizer_alpha = config.normalizer_alpha;
+        let normalizer_warmup = config.normalizer_warmup;
 
         Self {
             config,
@@ -190,6 +250,27 @@ impl PreFillASClassifier {
             // Blended toxicity override
             blended_toxicity_override: None,
             blend_weight: 0.5, // 50/50 blend by default
+            // EWMA z-score normalizer
+            imbalance_ewma_mean: 0.0,
+            imbalance_ewma_var: 1.0,
+            flow_ewma_mean: 0.0,
+            flow_ewma_var: 1.0,
+            funding_ewma_mean: 0.0,
+            funding_ewma_var: 1.0,
+            regime_trust_prev: 1.0,
+            regime_ewma_mean: 0.0,
+            regime_ewma_var: 1.0,
+            changepoint_ewma_mean: 0.0,
+            changepoint_ewma_var: 1.0,
+            normalizer_alpha,
+            normalizer_warmup,
+            normalizer_obs_count: 0,
+            // Pre-computed z-scores (initially 0 = neutral)
+            imbalance_z: 0.0,
+            flow_z: 0.0,
+            funding_z: 0.0,
+            regime_z: 0.0,
+            changepoint_z: 0.0,
         }
     }
 
@@ -203,6 +284,19 @@ impl PreFillASClassifier {
             signal_sq_sum: self.signal_sq_sum,
             learning_samples: self.learning_samples,
             regime_probs: self.regime_probs,
+            // EWMA normalizer state
+            imbalance_ewma_mean: self.imbalance_ewma_mean,
+            imbalance_ewma_var: self.imbalance_ewma_var,
+            flow_ewma_mean: self.flow_ewma_mean,
+            flow_ewma_var: self.flow_ewma_var,
+            funding_ewma_mean: self.funding_ewma_mean,
+            funding_ewma_var: self.funding_ewma_var,
+            regime_trust_prev: self.regime_trust_prev,
+            regime_ewma_mean: self.regime_ewma_mean,
+            regime_ewma_var: self.regime_ewma_var,
+            changepoint_ewma_mean: self.changepoint_ewma_mean,
+            changepoint_ewma_var: self.changepoint_ewma_var,
+            normalizer_obs_count: self.normalizer_obs_count,
         }
     }
 
@@ -216,6 +310,38 @@ impl PreFillASClassifier {
         self.signal_sq_sum = cp.signal_sq_sum;
         self.learning_samples = cp.learning_samples;
         self.regime_probs = cp.regime_probs;
+        // EWMA normalizer state
+        self.imbalance_ewma_mean = cp.imbalance_ewma_mean;
+        self.imbalance_ewma_var = cp.imbalance_ewma_var;
+        self.flow_ewma_mean = cp.flow_ewma_mean;
+        self.flow_ewma_var = cp.flow_ewma_var;
+        self.funding_ewma_mean = cp.funding_ewma_mean;
+        self.funding_ewma_var = cp.funding_ewma_var;
+        self.regime_trust_prev = cp.regime_trust_prev;
+        self.regime_ewma_mean = cp.regime_ewma_mean;
+        self.regime_ewma_var = cp.regime_ewma_var;
+        self.changepoint_ewma_mean = cp.changepoint_ewma_mean;
+        self.changepoint_ewma_var = cp.changepoint_ewma_var;
+        self.normalizer_obs_count = cp.normalizer_obs_count;
+    }
+
+    // === EWMA Z-Score Helper Functions ===
+
+    /// Update EWMA mean and variance with a new observation.
+    /// Returns (new_mean, new_var).
+    fn ewma_update(mean: f64, var: f64, value: f64, alpha: f64) -> (f64, f64) {
+        let new_mean = (1.0 - alpha) * mean + alpha * value;
+        let diff = value - new_mean;
+        let new_var = (1.0 - alpha) * var + alpha * diff * diff;
+        // Floor variance to prevent division by zero
+        (new_mean, new_var.max(1e-12))
+    }
+
+    /// Standard sigmoid: maps z ∈ (-∞, +∞) to (0, 1), with 0→0.5, 2→0.88, -2→0.12.
+    /// Centers at 0.5 for neutral conditions. Positive z = more toxic, negative z = less toxic.
+    /// This provides natural spread across the full [0,1] range from Gaussian z-scores.
+    fn sigmoid(z: f64) -> f64 {
+        1.0 / (1.0 + (-z).exp())
     }
 
     /// Update orderbook imbalance signal.
@@ -229,6 +355,25 @@ impl PreFillASClassifier {
         } else {
             self.orderbook_imbalance = if bid_depth > 0.0 { 10.0 } else { 1.0 };
         }
+        let log_ratio = (self.orderbook_imbalance.max(0.01)).ln();
+        // Compute z-score BEFORE updating EWMA (against pre-update mean/var)
+        let std_imb = self.imbalance_ewma_var.sqrt();
+        self.imbalance_z = if std_imb > 1e-6 {
+            (log_ratio - self.imbalance_ewma_mean) / std_imb
+        } else {
+            0.0
+        };
+        // Now update EWMA for next iteration
+        let (m, v) = Self::ewma_update(
+            self.imbalance_ewma_mean,
+            self.imbalance_ewma_var,
+            log_ratio,
+            self.normalizer_alpha,
+        );
+        self.imbalance_ewma_mean = m;
+        self.imbalance_ewma_var = v;
+        self.normalizer_obs_count += 1;
+
         self.orderbook_updated_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -248,6 +393,23 @@ impl PreFillASClassifier {
         } else {
             self.recent_trade_direction = 0.0;
         }
+        // Compute z-score BEFORE updating EWMA
+        let std_flow = self.flow_ewma_var.sqrt();
+        self.flow_z = if std_flow > 1e-6 {
+            (self.recent_trade_direction - self.flow_ewma_mean) / std_flow
+        } else {
+            0.0
+        };
+        // Now update EWMA
+        let (m, v) = Self::ewma_update(
+            self.flow_ewma_mean,
+            self.flow_ewma_var,
+            self.recent_trade_direction,
+            self.normalizer_alpha,
+        );
+        self.flow_ewma_mean = m;
+        self.flow_ewma_var = v;
+
         self.trade_flow_updated_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -261,8 +423,46 @@ impl PreFillASClassifier {
     /// * `hmm_confidence` - HMM regime probability (max across regimes)
     /// * `changepoint_prob` - BOCD changepoint probability
     pub fn update_regime(&mut self, hmm_confidence: f64, changepoint_prob: f64) {
+        self.regime_trust_prev = self.regime_trust;
         self.regime_trust = hmm_confidence.clamp(0.0, 1.0);
         self.changepoint_prob = changepoint_prob.clamp(0.0, 1.0);
+
+        // Compute instability = 1 - trust (higher = less stable = more toxic)
+        let instability = 1.0 - self.regime_trust;
+
+        // Compute z-scores BEFORE EWMA update (against pre-update mean/var)
+        let std_regime = self.regime_ewma_var.sqrt();
+        self.regime_z = if std_regime > 1e-6 {
+            (instability - self.regime_ewma_mean) / std_regime
+        } else {
+            0.0
+        };
+        let std_cp = self.changepoint_ewma_var.sqrt();
+        self.changepoint_z = if std_cp > 1e-6 {
+            (self.changepoint_prob - self.changepoint_ewma_mean) / std_cp
+        } else {
+            0.0
+        };
+
+        // Now update EWMA for next iteration
+        let (m, v) = Self::ewma_update(
+            self.regime_ewma_mean,
+            self.regime_ewma_var,
+            instability,
+            self.normalizer_alpha,
+        );
+        self.regime_ewma_mean = m;
+        self.regime_ewma_var = v;
+
+        let (m2, v2) = Self::ewma_update(
+            self.changepoint_ewma_mean,
+            self.changepoint_ewma_var,
+            self.changepoint_prob,
+            self.normalizer_alpha,
+        );
+        self.changepoint_ewma_mean = m2;
+        self.changepoint_ewma_var = v2;
+
         self.regime_updated_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -333,6 +533,23 @@ impl PreFillASClassifier {
     /// * `funding_rate_8h` - 8-hour funding rate as fraction (e.g., 0.0001 = 1 bp)
     pub fn update_funding(&mut self, funding_rate_8h: f64) {
         self.funding_rate = funding_rate_8h;
+        // Compute z-score BEFORE updating EWMA
+        let std_fund = self.funding_ewma_var.sqrt();
+        self.funding_z = if std_fund > 1e-6 {
+            (funding_rate_8h - self.funding_ewma_mean) / std_fund
+        } else {
+            0.0
+        };
+        // Now update EWMA
+        let (m, v) = Self::ewma_update(
+            self.funding_ewma_mean,
+            self.funding_ewma_var,
+            funding_rate_8h,
+            self.normalizer_alpha,
+        );
+        self.funding_ewma_mean = m;
+        self.funding_ewma_var = v;
+
         self.update_cached_toxicity();
     }
 
@@ -429,9 +646,21 @@ impl PreFillASClassifier {
         weights
     }
 
-    /// Compute individual signal values for a given side
-    /// Returns [imbalance, flow, regime, funding, changepoint] signals
+    /// Compute individual signal values for a given side.
+    ///
+    /// When warmed up (normalizer_obs_count >= warmup), uses EWMA z-score
+    /// normalization through half_sigmoid for smooth [0,1] output distribution.
+    /// Falls back to legacy threshold-based normalization during warmup.
+    ///
+    /// Returns [imbalance, flow, regime, funding, changepoint] signals.
     pub fn compute_signals(&self, is_bid: bool) -> [f64; 5] {
+        // Use z-score normalization when warmed up
+        if self.normalizer_obs_count >= self.normalizer_warmup {
+            return self.compute_signals_zscore(is_bid);
+        }
+
+        // === Legacy signals (warmup fallback — preserves test compatibility) ===
+
         // === Orderbook Imbalance ===
         let imbalance_signal = if is_bid {
             let raw = (self.orderbook_imbalance - 1.0) / (self.config.imbalance_threshold - 1.0);
@@ -463,6 +692,46 @@ impl PreFillASClassifier {
         } else {
             (-self.funding_rate / self.config.funding_threshold).clamp(0.0, 1.0)
         };
+
+        [
+            imbalance_signal,
+            flow_signal,
+            regime_signal,
+            funding_signal,
+            changepoint_signal,
+        ]
+    }
+
+    /// Z-score normalized signal computation (post-warmup).
+    ///
+    /// Uses pre-computed z-scores (computed BEFORE EWMA update in update_* methods)
+    /// so they reflect true deviations from the historical mean. Scaled by z_scale
+    /// and passed through sigmoid for smooth (0,1) output centered at 0.5.
+    fn compute_signals_zscore(&self, is_bid: bool) -> [f64; 5] {
+        let scale = self.config.z_scale;
+
+        // === Orderbook Imbalance (pre-computed z-score) ===
+        // Directional: positive z (high bid pressure) is toxic for bids
+        let directional_z_imb = if is_bid { self.imbalance_z } else { -self.imbalance_z };
+        let imbalance_signal = Self::sigmoid(directional_z_imb * scale);
+
+        // === Trade Flow (pre-computed z-score) ===
+        // Directional: positive z (buy flow) is toxic for bids
+        let directional_z_flow = if is_bid { self.flow_z } else { -self.flow_z };
+        let flow_signal = Self::sigmoid(directional_z_flow * scale);
+
+        // === Regime (pre-computed z-score of instability) ===
+        // Non-directional: high instability is toxic for both sides
+        let regime_signal = Self::sigmoid(self.regime_z * scale);
+
+        // === Funding Rate (pre-computed z-score) ===
+        // Directional: positive z (high positive funding) is toxic for bids
+        let directional_z_fund = if is_bid { self.funding_z } else { -self.funding_z };
+        let funding_signal = Self::sigmoid(directional_z_fund * scale);
+
+        // === Changepoint (pre-computed z-score) ===
+        // Non-directional: high changepoint probability is toxic for both sides
+        let changepoint_signal = Self::sigmoid(self.changepoint_z * scale);
 
         [
             imbalance_signal,
@@ -585,8 +854,10 @@ impl PreFillASClassifier {
     /// * `is_bid` - True for bid side, false for ask side
     pub fn spread_multiplier(&self, is_bid: bool) -> f64 {
         let toxicity = self.predict_toxicity(is_bid);
-        // Linear scaling: 0 toxicity = 1x, max toxicity = max_multiplier
-        let multiplier = 1.0 + toxicity * (self.config.max_spread_multiplier - 1.0);
+        // Sigmoid-centered signals: toxicity 0.5 = neutral, only widen above neutral.
+        // Maps [0.5, 1.0] → [1.0, max_multiplier], below 0.5 → 1.0 (no widening).
+        let excess = (toxicity - 0.5).max(0.0) * 2.0; // [0.5,1.0] → [0.0,1.0]
+        let multiplier = 1.0 + excess * (self.config.max_spread_multiplier - 1.0);
         multiplier.clamp(1.0, self.config.max_spread_multiplier)
     }
 

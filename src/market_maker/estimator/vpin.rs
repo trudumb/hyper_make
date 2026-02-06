@@ -101,6 +101,10 @@ pub struct VpinConfig {
     /// Allows warm-up period with initial bucket size.
     /// Default: 10
     pub adaptive_warmup_buckets: usize,
+
+    /// Maximum age of most recent bucket before VPIN is considered stale (ms).
+    /// Default: 60_000 (60 seconds). Set to 0 to disable staleness check.
+    pub staleness_threshold_ms: u64,
 }
 
 impl Default for VpinConfig {
@@ -118,6 +122,7 @@ impl Default for VpinConfig {
             min_bucket_multiplier: 0.05,
             max_bucket_multiplier: 20.0,
             adaptive_warmup_buckets: 10,
+            staleness_threshold_ms: 60_000,
         }
     }
 }
@@ -175,6 +180,7 @@ impl VpinConfig {
             min_bucket_multiplier: 0.05,
             max_bucket_multiplier: 20.0,
             adaptive_warmup_buckets: 10,
+            staleness_threshold_ms: 60_000,
         }
     }
 }
@@ -507,6 +513,20 @@ impl VpinEstimator {
     /// Check if VPIN estimate is valid (enough buckets).
     pub fn is_valid(&self) -> bool {
         self.buckets.len() >= self.config.n_buckets / 2
+    }
+
+    /// Check if VPIN estimate is stale (most recent bucket too old).
+    pub fn is_stale(&self, current_time_ms: u64) -> bool {
+        if self.config.staleness_threshold_ms == 0 {
+            return false; // Staleness check disabled
+        }
+        match self.buckets.back() {
+            Some(bucket) => {
+                current_time_ms.saturating_sub(bucket.completed_at_ms)
+                    > self.config.staleness_threshold_ms
+            }
+            None => true, // No completed buckets = stale
+        }
     }
 
     /// Get confidence in VPIN estimate [0, 1].

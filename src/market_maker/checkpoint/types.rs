@@ -66,6 +66,49 @@ pub struct PreFillCheckpoint {
     pub learning_samples: usize,
     /// Regime probabilities for soft blending
     pub regime_probs: [f64; 4],
+
+    // === EWMA normalizer state (added for z-score normalization fix) ===
+    /// EWMA mean/variance for imbalance (log bid/ask ratio)
+    #[serde(default)]
+    pub imbalance_ewma_mean: f64,
+    #[serde(default = "default_ewma_var")]
+    pub imbalance_ewma_var: f64,
+    /// EWMA mean/variance for trade flow direction
+    #[serde(default)]
+    pub flow_ewma_mean: f64,
+    #[serde(default = "default_ewma_var")]
+    pub flow_ewma_var: f64,
+    /// EWMA mean/variance for funding rate
+    #[serde(default)]
+    pub funding_ewma_mean: f64,
+    #[serde(default = "default_ewma_var")]
+    pub funding_ewma_var: f64,
+    /// Previous regime trust (for delta computation)
+    #[serde(default = "default_regime_trust")]
+    pub regime_trust_prev: f64,
+    /// EWMA mean for regime instability (1 - trust)
+    #[serde(default)]
+    pub regime_ewma_mean: f64,
+    /// EWMA variance for regime instability
+    #[serde(default = "default_ewma_var")]
+    pub regime_ewma_var: f64,
+    /// EWMA mean for changepoint probability
+    #[serde(default)]
+    pub changepoint_ewma_mean: f64,
+    /// EWMA variance for changepoint probability
+    #[serde(default = "default_ewma_var")]
+    pub changepoint_ewma_var: f64,
+    /// Number of normalizer observations
+    #[serde(default)]
+    pub normalizer_obs_count: usize,
+}
+
+fn default_ewma_var() -> f64 {
+    1.0
+}
+
+fn default_regime_trust() -> f64 {
+    1.0
 }
 
 impl Default for PreFillCheckpoint {
@@ -76,6 +119,19 @@ impl Default for PreFillCheckpoint {
             signal_sq_sum: [0.0; 5],
             learning_samples: 0,
             regime_probs: [0.1, 0.7, 0.15, 0.05],
+            // EWMA normalizer state
+            imbalance_ewma_mean: 0.0,
+            imbalance_ewma_var: 1.0,
+            flow_ewma_mean: 0.0,
+            flow_ewma_var: 1.0,
+            funding_ewma_mean: 0.0,
+            funding_ewma_var: 1.0,
+            regime_trust_prev: 1.0,
+            regime_ewma_mean: 0.0,
+            regime_ewma_var: 1.0,
+            changepoint_ewma_mean: 0.0,
+            changepoint_ewma_var: 1.0,
+            normalizer_obs_count: 0,
         }
     }
 }
@@ -308,6 +364,7 @@ mod tests {
                 signal_sq_sum: [10.0, 20.0, 30.0, 40.0, 50.0],
                 learning_samples: 1000,
                 regime_probs: [0.05, 0.60, 0.25, 0.10],
+                ..PreFillCheckpoint::default()
             },
             enhanced: EnhancedCheckpoint::default(),
             vol_filter: VolFilterCheckpoint {

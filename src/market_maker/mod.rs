@@ -224,6 +224,13 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// When enabled, feeds BinanceUpdate (price + trades) to SignalIntegrator
     /// for lead-lag skew and cross-venue flow analysis.
     binance_receiver: Option<tokio::sync::mpsc::Receiver<infra::BinanceUpdate>>,
+
+    // === Checkpoint Persistence ===
+    /// Checkpoint manager for saving/loading learned state across sessions.
+    /// Enabled via `with_checkpoint_dir()`. Saves every 5 minutes + on shutdown.
+    checkpoint_manager: Option<checkpoint::CheckpointManager>,
+    /// Last time a checkpoint was saved (for periodic save interval).
+    last_checkpoint_save: std::time::Instant,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -358,6 +365,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             cached_market_params: None,
             // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
             binance_receiver: None,
+            // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
+            checkpoint_manager: None,
+            last_checkpoint_save: std::time::Instant::now(),
         }
     }
 
@@ -388,6 +398,109 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.binance_receiver = Some(receiver);
         info!("Binance lead-lag feed enabled (with cross-venue flow analysis)");
         self
+    }
+
+    /// Enable checkpoint persistence for warm-starting across sessions.
+    ///
+    /// When enabled:
+    /// - On startup: loads latest checkpoint and restores learned state
+    /// - Every 5 minutes: saves checkpoint to disk
+    /// - On shutdown: saves final checkpoint
+    ///
+    /// # Arguments
+    /// * `dir` - Directory for checkpoint files (e.g., `data/checkpoints/ETH`)
+    pub fn with_checkpoint_dir(mut self, dir: std::path::PathBuf) -> Self {
+        match checkpoint::CheckpointManager::new(dir.clone()) {
+            Ok(mgr) => {
+                // Try to load and restore latest checkpoint
+                match mgr.load_latest() {
+                    Ok(Some(bundle)) => {
+                        if bundle.metadata.asset == *self.config.asset {
+                            self.restore_from_bundle(&bundle);
+                            info!(
+                                asset = %bundle.metadata.asset,
+                                samples = bundle.pre_fill.learning_samples,
+                                session_duration_s = bundle.metadata.session_duration_s,
+                                "Restored from checkpoint"
+                            );
+                        } else {
+                            warn!(
+                                checkpoint_asset = %bundle.metadata.asset,
+                                our_asset = %self.config.asset,
+                                "Checkpoint asset mismatch, starting fresh"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        info!("No checkpoint found, starting fresh");
+                    }
+                    Err(e) => {
+                        warn!("Failed to load checkpoint: {e}, starting fresh");
+                    }
+                }
+                // Clean up old backups (keep 7 days)
+                if let Err(e) = mgr.cleanup_old(7) {
+                    warn!("Checkpoint cleanup failed: {e}");
+                }
+                self.checkpoint_manager = Some(mgr);
+            }
+            Err(e) => {
+                warn!("Checkpoint init failed: {e}");
+            }
+        }
+        self
+    }
+
+    /// Assemble a checkpoint bundle from current state.
+    fn assemble_checkpoint_bundle(&self) -> checkpoint::CheckpointBundle {
+        let (vol_filter, informed_flow, fill_rate, kappa_own, kappa_bid, kappa_ask, momentum) =
+            self.estimator.to_checkpoint();
+
+        checkpoint::CheckpointBundle {
+            metadata: checkpoint::CheckpointMetadata {
+                version: 1,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                asset: self.config.asset.to_string(),
+                session_duration_s: self.session_start_time.elapsed().as_secs_f64(),
+            },
+            learned_params: self.stochastic.learned_params.clone(),
+            pre_fill: self.tier1.pre_fill_classifier.to_checkpoint(),
+            enhanced: self.tier1.enhanced_classifier.to_checkpoint(),
+            vol_filter,
+            regime_hmm: self.stochastic.regime_hmm.to_checkpoint(),
+            informed_flow,
+            fill_rate,
+            kappa_own,
+            kappa_bid,
+            kappa_ask,
+            momentum,
+        }
+    }
+
+    /// Restore state from a checkpoint bundle.
+    fn restore_from_bundle(&mut self, bundle: &checkpoint::CheckpointBundle) {
+        self.tier1
+            .pre_fill_classifier
+            .restore_checkpoint(&bundle.pre_fill);
+        self.tier1
+            .enhanced_classifier
+            .restore_checkpoint(&bundle.enhanced);
+        self.estimator.restore_checkpoint(
+            &bundle.vol_filter,
+            &bundle.informed_flow,
+            &bundle.fill_rate,
+            &bundle.kappa_own,
+            &bundle.kappa_bid,
+            &bundle.kappa_ask,
+            &bundle.momentum,
+        );
+        self.stochastic
+            .regime_hmm
+            .restore_checkpoint(&bundle.regime_hmm);
+        self.stochastic.learned_params = bundle.learned_params.clone();
     }
 
     // =========================================================================

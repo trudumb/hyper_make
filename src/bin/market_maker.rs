@@ -1662,6 +1662,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_dynamic_risk_config(dynamic_risk_config)
     .with_microprice_ema(microprice_ema_alpha, microprice_ema_min_change_bps);
 
+    // Wire checkpoint persistence for warm-starting across sessions
+    let checkpoint_dir = PathBuf::from(format!("data/checkpoints/{}", asset));
+    market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
+
     // Wire signal export path for diagnostic infrastructure
     if let Some(ref path) = cli.signal_export_path {
         market_maker = market_maker.with_signal_export_path(path.clone());

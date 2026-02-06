@@ -18,6 +18,15 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("=== GRACEFUL SHUTDOWN INITIATED ===");
 
+        // Save final checkpoint before cancelling orders
+        if let Some(ref manager) = self.checkpoint_manager {
+            let bundle = self.assemble_checkpoint_bundle();
+            match manager.save_all(&bundle) {
+                Ok(()) => info!("Final checkpoint saved successfully"),
+                Err(e) => warn!("Final checkpoint save failed: {e}"),
+            }
+        }
+
         // Log final state before cancelling
         let final_position = self.position.position();
         let final_mid = self.latest_mid;

@@ -132,6 +132,7 @@ struct Ewma {
     initialized: bool,
 }
 
+#[allow(dead_code)]
 impl Ewma {
     fn new(half_life_samples: f64) -> Self {
         let alpha = 1.0 - (-2.0_f64.ln() / half_life_samples).exp();

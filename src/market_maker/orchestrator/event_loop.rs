@@ -592,6 +592,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // Updates model calibration metrics and logs Brier scores / IR
                     self.periodic_component_update();
 
+                    // === Periodic Checkpoint Save (every 5 minutes) ===
+                    if self.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {
+                        if let Some(ref manager) = self.checkpoint_manager {
+                            let bundle = self.assemble_checkpoint_bundle();
+                            if let Err(e) = manager.save_all(&bundle) {
+                                warn!("Checkpoint save failed: {e}");
+                            }
+                            self.last_checkpoint_save = std::time::Instant::now();
+                        }
+                    }
+
                     // Check if supervisor recommends reconnection and act on it
                     if self.infra.connection_supervisor.is_reconnect_recommended() {
                         let attempt = self.infra.connection_health.current_attempt() + 1;

@@ -36,33 +36,16 @@ use hyperliquid_rust_sdk::market_maker::infra::{
 };
 
 use hyperliquid_rust_sdk::{
-    BaseUrl, EstimatorConfig, InfoClient, Message, ParameterEstimator, Side, Subscription,
+    BaseUrl, EstimatorConfig, InfoClient, Ladder, LadderConfig, LadderStrategy, MarketParams,
+    Message, OrderExecutor, ParameterEstimator, QuoteConfig, RiskConfig, Side, Subscription,
 };
 use tokio::sync::mpsc::unbounded_channel;
 
 use hyperliquid_rust_sdk::market_maker::infra::metrics::dashboard::{
-    classify_regime,
-    compute_regime_probabilities,
-    BookLevel,
-    BookSnapshot,
-    CalibrationState,
-    DashboardState,
-    FeatureCorrelationState,
-    // Feature health visualization
-    FeatureHealthState,
-    FeatureValidationState,
-    FillRecord,
-    InteractionSignalState,
-    LagAnalysisState,
-    LiveQuotes,
-    PnLAttribution,
-    PricePoint,
-    QuoteFillStats,
-    QuoteSnapshot,
-    RegimeSnapshot,
-    RegimeState,
-    SignalDecayState,
-    SignalHealthInfo,
+    classify_regime, compute_regime_probabilities, BookLevel, BookSnapshot, CalibrationState,
+    DashboardState, FeatureCorrelationState, FeatureHealthState, FeatureValidationState,
+    FillRecord, InteractionSignalState, LagAnalysisState, LiveQuotes, PnLAttribution, PricePoint,
+    QuoteFillStats, QuoteSnapshot, RegimeSnapshot, RegimeState, SignalDecayState, SignalHealthInfo,
     SpreadBucket,
 };
 use hyperliquid_rust_sdk::market_maker::simulation::{
@@ -71,15 +54,44 @@ use hyperliquid_rust_sdk::market_maker::simulation::{
 };
 use std::collections::{HashMap, VecDeque};
 
-use hyperliquid_rust_sdk::{
-    Ladder, LadderConfig, LadderStrategy, MarketParams, OrderExecutor, QuoteConfig, RiskConfig,
-};
-
-// Adaptive GLFT components
+// Adaptive GLFT + Process models
 use hyperliquid_rust_sdk::market_maker::adaptive::{
     AdaptiveBayesianConfig, AdaptiveSpreadCalculator,
 };
-use hyperliquid_rust_sdk::market_maker::process_models::{HJBConfig, HJBInventoryController};
+use hyperliquid_rust_sdk::market_maker::process_models::{
+    FundingRateEstimator, HJBConfig, HJBInventoryController,
+    HawkesOrderFlowEstimator, LiquidationCascadeDetector, SpreadProcessEstimator,
+};
+
+// Full signal pipeline components
+use hyperliquid_rust_sdk::market_maker::{
+    // Tier 1: Adverse selection
+    AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EnhancedASClassifier,
+    PreFillASClassifier, TradeObservation as MicroTradeObs,
+    // Tier 2: Process model configs
+    FundingConfig, HawkesConfig, LiquidationConfig, SpreadConfig,
+    // Config
+    StochasticConfig,
+    // Estimator types
+    BookLevel as EstimatorBookLevel, CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig,
+    EnhancedFlowEstimator, HmmObservation, LiquidityEvaporationConfig,
+    LiquidityEvaporationDetector, RegimeHMM, ThresholdKappa, ThresholdKappaConfig,
+    TradeSizeDistribution, TradeSizeDistributionConfig, VpinConfig, VpinEstimator,
+    // Infra
+    MarginAwareSizer, MarginConfig,
+    // Strategy/params
+    ParameterAggregator, ParameterSources, SignalIntegrator, SignalIntegratorConfig,
+    PositionDecisionConfig, PositionDecisionEngine, action_to_inventory_ratio,
+};
+use hyperliquid_rust_sdk::market_maker::belief::{BeliefUpdate, CentralBeliefState};
+use hyperliquid_rust_sdk::market_maker::checkpoint::{
+    CheckpointBundle, CheckpointManager, CheckpointMetadata,
+};
+use hyperliquid_rust_sdk::market_maker::stochastic::{
+    StochasticControlBuilder, StochasticControlConfig,
+};
+use hyperliquid_rust_sdk::market_maker::calibration::LearnedParameters;
+use hyperliquid_rust_sdk::market_maker::{BinanceFeed, BinanceTradeUpdate, BinanceUpdate};
 
 // ============================================================================
 // CLI Arguments
@@ -144,6 +156,22 @@ struct Cli {
     /// Quote refresh interval in milliseconds (default 500)
     #[arg(long, default_value = "500")]
     quote_interval_ms: u64,
+
+    /// Disable Binance price feed for cross-exchange lead-lag signal
+    #[arg(long)]
+    disable_binance_feed: bool,
+
+    /// Binance symbol to subscribe to (default: btcusdt)
+    #[arg(long, default_value = "btcusdt")]
+    binance_symbol: String,
+
+    /// Checkpoint directory for warm-starting models (default: data/checkpoints/paper/{asset})
+    #[arg(long)]
+    checkpoint_dir: Option<String>,
+
+    /// Disable checkpoint persistence
+    #[arg(long)]
+    disable_checkpoint: bool,
 }
 
 // ============================================================================
@@ -250,6 +278,8 @@ struct SimulationState {
     asset: String,
     /// Current mid price
     mid_price: f64,
+    /// Previous mid price (for return computation)
+    prev_mid: f64,
     /// Best bid
     best_bid: f64,
     /// Best ask
@@ -266,6 +296,8 @@ struct SimulationState {
     inventory: f64,
     /// Quote cycle counter
     cycle_count: u64,
+    /// Risk aversion
+    gamma: f64,
 
     /// Configuration
     max_position: f64,
@@ -276,10 +308,53 @@ struct SimulationState {
     sz_decimals: u32,
 
     // === Adaptive GLFT Components ===
-    /// Adaptive Bayesian spread calculator (learned kappa, gamma, floor)
     adaptive_spreads: AdaptiveSpreadCalculator,
-    /// HJB inventory controller (optimal skew from HJB solution)
     hjb_controller: HJBInventoryController,
+
+    // === Tier 1: Adverse Selection ===
+    adverse_selection: AdverseSelectionEstimator,
+    depth_decay_as: DepthDecayAS,
+    pre_fill_classifier: PreFillASClassifier,
+    enhanced_classifier: EnhancedASClassifier,
+    liquidation_detector: LiquidationCascadeDetector,
+
+    // === Tier 2: Process Models ===
+    hawkes: HawkesOrderFlowEstimator,
+    funding: FundingRateEstimator,
+    spread_tracker: SpreadProcessEstimator,
+
+    // === Stochastic Signals ===
+    vpin: VpinEstimator,
+    regime_hmm: RegimeHMM,
+    signal_integrator: SignalIntegrator,
+    enhanced_flow: EnhancedFlowEstimator,
+    liquidity_evaporation: LiquidityEvaporationDetector,
+    cofi: CumulativeOFI,
+    trade_size_dist: TradeSizeDistribution,
+    position_decision: PositionDecisionEngine,
+    threshold_kappa: ThresholdKappa,
+
+    // === Central Belief System ===
+    central_beliefs: CentralBeliefState,
+
+    // === Deprecated but needed for ParameterSources ===
+    beliefs_builder: StochasticControlBuilder,
+    stochastic_config: StochasticConfig,
+    margin_sizer: MarginAwareSizer,
+
+    // === Cached state for signal processing ===
+    cached_bid_sizes: Vec<f64>,
+    cached_ask_sizes: Vec<f64>,
+    cached_trades: VecDeque<(f64, bool, u64)>,
+
+    // === Signal health logging ===
+    last_signal_log: Instant,
+
+    // === Checkpoint persistence ===
+    checkpoint_manager: Option<CheckpointManager>,
+    session_start: Instant,
+    last_checkpoint_save: Instant,
+    learned_params: LearnedParameters,
 }
 
 impl SimulationState {
@@ -293,7 +368,7 @@ impl SimulationState {
         // Create production-style RiskConfig
         let risk_config = RiskConfig {
             gamma_base: gamma.clamp(0.01, 10.0),
-            min_spread_floor: target_spread_bps / 10_000.0 / 2.0, // Convert bps to fraction, half-spread
+            min_spread_floor: target_spread_bps / 10_000.0 / 2.0,
             ..Default::default()
         };
 
@@ -308,20 +383,21 @@ impl SimulationState {
 
         // Determine decimals based on asset
         let (decimals, sz_decimals) = match asset.as_str() {
-            "BTC" => (1, 4), // $0.1 tick, 0.0001 BTC
-            "ETH" => (2, 3), // $0.01 tick, 0.001 ETH
-            "SOL" => (3, 2), // $0.001 tick, 0.01 SOL
-            _ => (2, 3),     // Default
+            "BTC" => (1, 4),
+            "ETH" => (2, 3),
+            "SOL" => (3, 2),
+            _ => (2, 3),
         };
 
         // Create adaptive components with defaults
         let adaptive_spreads = AdaptiveSpreadCalculator::new(AdaptiveBayesianConfig::default());
         let mut hjb_controller = HJBInventoryController::new(HJBConfig::default());
-        hjb_controller.start_session(); // Start HJB session timing
+        hjb_controller.start_session();
 
         Self {
             asset,
             mid_price: 0.0,
+            prev_mid: 0.0,
             best_bid: 0.0,
             best_ask: 0.0,
             bid_levels: Vec::new(),
@@ -330,24 +406,94 @@ impl SimulationState {
             strategy,
             inventory: 0.0,
             cycle_count: 0,
-            max_position: 1.0, // 1 BTC max position for simulation
+            gamma,
+            max_position: 1.0,
             target_liquidity,
             decimals,
             sz_decimals,
             // Adaptive components
             adaptive_spreads,
             hjb_controller,
+            // Tier 1: Adverse selection
+            adverse_selection: AdverseSelectionEstimator::new(AdverseSelectionConfig::default()),
+            depth_decay_as: DepthDecayAS::default(),
+            pre_fill_classifier: PreFillASClassifier::default(),
+            enhanced_classifier: EnhancedASClassifier::default_config(),
+            liquidation_detector: LiquidationCascadeDetector::new(LiquidationConfig::default()),
+            // Tier 2: Process models
+            hawkes: HawkesOrderFlowEstimator::new(HawkesConfig::default()),
+            funding: FundingRateEstimator::new(FundingConfig::default()),
+            spread_tracker: SpreadProcessEstimator::new(SpreadConfig::default()),
+            // Stochastic signals
+            vpin: VpinEstimator::new(VpinConfig::default()),
+            regime_hmm: RegimeHMM::new(),
+            signal_integrator: SignalIntegrator::new(SignalIntegratorConfig::default()),
+            enhanced_flow: EnhancedFlowEstimator::new(EnhancedFlowConfig::default()),
+            liquidity_evaporation: LiquidityEvaporationDetector::new(LiquidityEvaporationConfig::default()),
+            cofi: CumulativeOFI::new(CumulativeOFIConfig::default()),
+            trade_size_dist: TradeSizeDistribution::new(TradeSizeDistributionConfig::default()),
+            position_decision: PositionDecisionEngine::new(PositionDecisionConfig::default()),
+            threshold_kappa: ThresholdKappa::new(ThresholdKappaConfig::default()),
+            // Central belief system
+            central_beliefs: CentralBeliefState::default_config(),
+            // Needed for ParameterSources
+            beliefs_builder: StochasticControlBuilder::new(StochasticControlConfig::default()),
+            stochastic_config: StochasticConfig::default(),
+            margin_sizer: MarginAwareSizer::new(MarginConfig::default()),
+            // Cached state
+            cached_bid_sizes: Vec::new(),
+            cached_ask_sizes: Vec::new(),
+            cached_trades: VecDeque::new(),
+            // Signal health logging
+            last_signal_log: Instant::now(),
+            // Checkpoint persistence
+            checkpoint_manager: None,
+            session_start: Instant::now(),
+            last_checkpoint_save: Instant::now(),
+            learned_params: LearnedParameters::default(),
         }
     }
 
     /// Update state from all mids message
     fn update_mid(&mut self, mid: f64) {
         if mid > 0.0 {
+            self.prev_mid = self.mid_price;
             self.mid_price = mid;
+
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
 
             // Update HJB controller with current volatility estimate
             let sigma = self.estimator.sigma_clean().max(0.00001);
             self.hjb_controller.update_sigma(sigma);
+
+            // === Replicate live signal processing from handlers.rs ===
+
+            // Threshold kappa: compute return and update TAR model
+            if self.prev_mid > 0.0 {
+                let return_bps = (mid - self.prev_mid) / self.prev_mid * 10_000.0;
+                self.threshold_kappa.update(return_bps);
+            }
+
+            // Signal integrator: track HL price
+            self.signal_integrator.on_hl_price(mid, now_ms as i64);
+
+            // Central beliefs: price return update
+            if self.prev_mid > 0.0 {
+                let return_frac = (mid - self.prev_mid) / self.prev_mid;
+                // Estimate dt from mid update frequency (~100ms typical)
+                let dt_secs = 0.1;
+                self.central_beliefs.update(BeliefUpdate::PriceReturn {
+                    return_frac,
+                    dt_secs,
+                    timestamp_ms: now_ms,
+                });
+            }
+
+            // Liquidation detector: update internal state
+            self.liquidation_detector.update();
         }
     }
 
@@ -363,20 +509,175 @@ impl SimulationState {
             self.best_ask = *price;
         }
 
+        // Cache top 5 bid/ask sizes for depth imbalance
+        self.cached_bid_sizes = bids.iter().take(5).map(|(_, sz)| *sz).collect();
+        self.cached_ask_sizes = asks.iter().take(5).map(|(_, sz)| *sz).collect();
+
         // Update adaptive kappa from book depth
         if self.mid_price > 0.0 {
             self.adaptive_spreads
                 .on_l2_update(&bids, &asks, self.mid_price);
         }
+
+        // === Replicate live L2 signal processing from handlers.rs:793-860 ===
+
+        // Spread tracker: update from BBO + volatility
+        if self.best_bid > 0.0 && self.best_ask > self.best_bid {
+            self.spread_tracker
+                .update(self.best_bid, self.best_ask, self.estimator.sigma());
+        }
+
+        // Pre-fill classifier: orderbook imbalance
+        let bid_depth: f64 = bids.iter().take(5).map(|(_, sz)| sz).sum();
+        let ask_depth: f64 = asks.iter().take(5).map(|(_, sz)| sz).sum();
+        self.pre_fill_classifier.update_orderbook(bid_depth, ask_depth);
+
+        // Enhanced classifier: BBO + depth update
+        if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.enhanced_classifier.on_book_update(
+                best_bid, best_ask, bid_depth, ask_depth, timestamp_ms,
+            );
+        }
+
+        // Liquidity evaporation: near-touch depth
+        let near_bid_depth: f64 = bids.iter().take(3).map(|(_, sz)| sz).sum();
+        let near_ask_depth: f64 = asks.iter().take(3).map(|(_, sz)| sz).sum();
+        let near_touch_depth = near_bid_depth + near_ask_depth;
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.liquidity_evaporation.on_book(near_touch_depth, timestamp_ms);
+
+        // COFI delta update
+        let bid_delta = near_bid_depth * 0.1;
+        let ask_delta = near_ask_depth * 0.1;
+        self.cofi.on_book_update(bid_delta, ask_delta, timestamp_ms);
     }
 
-    /// Update from trade
+    /// Update from trade — full signal pipeline replicating live handlers.rs:135-328
     fn on_trade(&mut self, price: f64, size: f64, is_buy: bool) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+
+        // 1. Core estimator (existing)
         self.estimator.on_trade(now_ms, price, size, Some(is_buy));
+
+        // 2. Enhanced microstructure classifier
+        self.enhanced_classifier.on_trade(MicroTradeObs {
+            timestamp_ms: now_ms,
+            price,
+            size,
+            is_buy,
+        });
+
+        // 3. Signal integrator: buy pressure tracking
+        self.signal_integrator.on_trade_for_pressure(size, is_buy);
+
+        // 3b. Hawkes order flow (feeds flow_imbalance for HMM observations)
+        self.hawkes.record_trade(is_buy, size);
+
+        // 4. Trade size distribution
+        self.trade_size_dist.on_trade(size);
+
+        // 5. Central beliefs: market trade
+        if price > 0.0 {
+            self.central_beliefs.update(BeliefUpdate::MarketTrade {
+                price,
+                mid: self.mid_price,
+                timestamp_ms: now_ms,
+            });
+        }
+
+        // 6. VPIN bucket update
+        if let Some(_vpin_value) = self.vpin.on_trade(size, price, self.mid_price, now_ms) {
+            // Bucket completed - wire to signal integrator + central beliefs
+            let vpin = self.vpin.vpin();
+            let vpin_velocity = self.vpin.vpin_velocity();
+
+            let vpin_fresh = self.vpin.is_valid() && !self.vpin.is_stale(now_ms);
+            self.signal_integrator.set_vpin(
+                vpin,
+                vpin_velocity,
+                vpin_fresh,
+            );
+
+            let order_flow_direction = self.vpin.order_flow_direction();
+            let vpin_buckets = self.vpin.bucket_count();
+
+            // Depth-weighted imbalance from cached book
+            let bid_levels: Vec<EstimatorBookLevel> = self.cached_bid_sizes.iter()
+                .map(|&sz| EstimatorBookLevel { size: sz })
+                .collect();
+            let ask_levels: Vec<EstimatorBookLevel> = self.cached_ask_sizes.iter()
+                .map(|&sz| EstimatorBookLevel { size: sz })
+                .collect();
+            let depth_ofi = self.enhanced_flow.depth_weighted_imbalance(
+                &bid_levels,
+                &ask_levels,
+            );
+
+            let liquidity_evaporation = self.liquidity_evaporation.evaporation_score();
+            let confidence = (vpin_buckets as f64 / 50.0).min(1.0);
+
+            // Trade size anomaly + COFI
+            let trade_size_sigma = self.trade_size_dist.median_sigma();
+            let toxicity_acceleration = self.trade_size_dist.toxicity_acceleration(vpin);
+            let cofi = self.cofi.cofi();
+            let cofi_velocity = self.cofi.cofi_velocity();
+            let is_sustained_shift = self.cofi.is_sustained_shift();
+
+            self.central_beliefs.update(BeliefUpdate::MicrostructureUpdate {
+                vpin,
+                vpin_velocity,
+                depth_ofi,
+                liquidity_evaporation,
+                order_flow_direction,
+                confidence,
+                vpin_buckets,
+                trade_size_sigma,
+                toxicity_acceleration,
+                cofi,
+                cofi_velocity,
+                is_sustained_shift,
+            });
+        }
+
+        // 7. Cache trade
+        const MAX_CACHED_TRADES: usize = 500;
+        self.cached_trades.push_back((size, is_buy, now_ms));
+        while self.cached_trades.len() > MAX_CACHED_TRADES {
+            self.cached_trades.pop_front();
+        }
+
+        // 8. Regime HMM forward update
+        let obs = HmmObservation::new(
+            self.estimator.sigma(),
+            self.spread_tracker.current_spread_bps(),
+            self.hawkes.flow_imbalance(),
+        );
+        self.regime_hmm.forward_update(&obs);
+
+        // 9. Position continuation model: sync regime
+        let regime_probs = self.regime_hmm.regime_probabilities();
+        let continuation_regime = if regime_probs[3] > 0.3 {
+            "cascade"
+        } else if regime_probs[2] > 0.4 {
+            "bursty"
+        } else if regime_probs[0] > 0.5 {
+            "quiet"
+        } else {
+            "normal"
+        };
+        if self.position_decision.current_regime() != continuation_regime {
+            self.position_decision.reset_for_regime(continuation_regime);
+        }
     }
 
     /// Generate quotes using the REAL LadderStrategy (same as production)
@@ -415,79 +716,233 @@ impl SimulationState {
         Some(ladder)
     }
 
-    /// Build market params from estimator (populates all fields needed by strategy)
-    fn build_market_params(&self) -> MarketParams {
-        let mut params = MarketParams::default();
+    /// Build market params using ParameterAggregator — identical to live system.
+    fn build_market_params(&mut self) -> MarketParams {
+        // Update pre-fill classifier with latest flow and regime data (same as quote_engine.rs:380-399)
+        {
+            let flow_imb = self.estimator.flow_imbalance();
+            let buy_volume = (1.0 + flow_imb) / 2.0;
+            let sell_volume = 1.0 - buy_volume;
+            self.pre_fill_classifier.update_trade_flow(buy_volume, sell_volume);
 
-        // Core pricing
-        params.microprice = self.mid_price;
-        params.market_mid = self.mid_price;
+            let belief_snapshot = self.central_beliefs.snapshot();
+            let hmm_confidence = belief_snapshot.regime.confidence;
+            let changepoint_prob = belief_snapshot.changepoint.prob_5;
+            self.pre_fill_classifier.update_regime(hmm_confidence, changepoint_prob);
 
-        // Volatility from estimator
-        params.sigma = self.estimator.sigma_clean().max(0.00001);
-        params.sigma_total = self.estimator.sigma_total();
-        params.sigma_effective = self.estimator.sigma_effective();
+            let funding_rate_8h = self.funding.current_rate();
+            self.pre_fill_classifier.update_funding(funding_rate_8h);
+        }
 
-        // Kappa from estimator - use robust path
-        let kappa = self.estimator.kappa().max(100.0);
-        params.kappa = kappa;
-        params.kappa_robust = kappa;
-        params.kappa_bid = kappa;
-        params.kappa_ask = kappa;
-        params.use_kappa_robust = true; // Use robust path
+        // === Fix #2: Compute DriftAdjustedSkew from momentum/trend (replicate quote_engine.rs:324-376) ===
+        let momentum_bps = self.estimator.momentum_bps();
+        let p_continuation = self.estimator.momentum_continuation_probability();
+        let position = self.inventory;
 
-        // Jump/momentum
-        params.jump_ratio = self.estimator.jump_ratio();
-        params.momentum_bps = self.estimator.momentum_bps();
+        self.hjb_controller.update_momentum_signals(
+            momentum_bps,
+            p_continuation,
+            position,
+            self.max_position,
+        );
 
-        // Book state
-        params.book_imbalance = self.compute_book_imbalance();
-        params.market_spread_bps = if self.best_ask > 0.0 && self.best_bid > 0.0 {
-            (self.best_ask - self.best_bid) / self.mid_price * 10000.0
-        } else {
-            10.0 // Default 10 bps if no book
+        let position_value = (position.abs() * self.mid_price).max(1.0);
+        let trend_signal = self.estimator.trend_signal(position_value);
+
+        let drift_adjusted_skew = self.hjb_controller.optimal_skew_with_trend(
+            position,
+            self.max_position,
+            momentum_bps,
+            p_continuation,
+            &trend_signal,
+        );
+
+        let belief_snapshot = self.central_beliefs.snapshot();
+
+        // === Fix #4: Forward regime and changepoint to central beliefs (replicate quote_engine.rs:700-711) ===
+        let regime_probs = self.regime_hmm.regime_probabilities();
+        self.central_beliefs.update(BeliefUpdate::RegimeUpdate {
+            probs: regime_probs,
+            features: None,
+        });
+
+        let sigma = self.estimator.sigma();
+        if sigma > 0.0 {
+            self.central_beliefs
+                .update(BeliefUpdate::ChangepointObs { observation: sigma });
+        }
+
+        // Simulate margin state: assume enough capital for max_position at current leverage
+        // Live system gets this from WebData2 clearinghouse_state; paper trader must synthesize it.
+        {
+            let sim_account_value = self.max_position * self.mid_price; // Enough to fully utilize
+            let position_notional = self.inventory.abs() * self.mid_price;
+            let margin_used = position_notional / 3.0; // ~3x leverage
+            self.margin_sizer.update_state(sim_account_value, margin_used, position_notional);
+        }
+
+        let sources = ParameterSources {
+            estimator: &self.estimator,
+            adverse_selection: &self.adverse_selection,
+            depth_decay_as: &self.depth_decay_as,
+            pre_fill_classifier: &self.pre_fill_classifier,
+            liquidation_detector: &self.liquidation_detector,
+            hawkes: &self.hawkes,
+            funding: &self.funding,
+            spread_tracker: &self.spread_tracker,
+            hjb_controller: &self.hjb_controller,
+            margin_sizer: &self.margin_sizer,
+            stochastic_config: &self.stochastic_config,
+            drift_adjusted_skew,
+            adaptive_spreads: &self.adaptive_spreads,
+            beliefs_builder: &self.beliefs_builder,
+            beliefs: Some(&belief_snapshot),
+            position: self.inventory,
+            max_position: self.max_position,
+            latest_mid: self.mid_price,
+            risk_aversion: self.gamma,
+            // Paper mode — no real exchange limits
+            exchange_limits_valid: false,
+            exchange_effective_bid_limit: f64::MAX,
+            exchange_effective_ask_limit: f64::MAX,
+            exchange_limits_age_ms: 0,
+            pending_bid_exposure: 0.0,
+            pending_ask_exposure: 0.0,
+            dynamic_max_position_value: self.max_position * self.mid_price,
+            dynamic_limit_valid: false,
+            tick_size_bps: 10.0,
+            near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
+            calibration_gamma_mult: 1.0,
+            calibration_progress: 0.0,
+            calibration_complete: false,
+            use_dynamic_kappa_floor: true,
+            use_dynamic_spread_ceiling: true,
+            learned_params: None,
         };
+        let mut market_params = ParameterAggregator::build(&sources);
 
-        // Arrival intensity (for GLFT time horizon)
-        params.arrival_intensity = 0.5; // Conservative default
+        // === Fix #1: Wire lead-lag signal into market_params (replicate quote_engine.rs:724-841) ===
+        let signals = self.signal_integrator.get_signals();
 
-        // === ENABLE FULL ADAPTIVE GLFT ===
-        // This is the key change: enable adaptive features to use learned parameters
-        params.use_adaptive_spreads = true;
-        params.use_hjb_skew = true;
-        params.use_kalman_filter = false; // Not wired up yet
-        params.use_dynamic_bounds = false;
+        if signals.lead_lag_actionable {
+            market_params.lead_lag_signal_bps = signals.combined_skew_bps;
+            market_params.lead_lag_confidence = signals.model_confidence;
+        }
 
-        // Populate adaptive values from our components
-        params.adaptive_gamma = self.adaptive_spreads.current_gamma();
-        params.adaptive_kappa = self.adaptive_spreads.current_kappa();
-        params.adaptive_spread_floor = self.adaptive_spreads.current_floor();
-        params.adaptive_can_estimate = self.adaptive_spreads.can_provide_estimates();
-        params.adaptive_warmed_up = self.adaptive_spreads.is_warmed_up();
-        params.adaptive_warmup_progress = self.adaptive_spreads.warmup_progress();
+        // Apply cross-venue spread multiplier and skew when valid
+        if signals.cross_venue_valid {
+            market_params.spread_widening_mult *= signals.cross_venue_spread_mult;
 
-        // HJB optimal skew for inventory control
-        params.hjb_optimal_skew = self
-            .hjb_controller
-            .optimal_skew(self.inventory, self.max_position);
+            let cv_skew_contribution = signals.cross_venue_skew
+                * signals.cross_venue_confidence
+                * 5.0;
 
-        // No cascade protection in paper trading
-        params.should_pull_quotes = false;
-        params.cascade_size_factor = 1.0;
-        params.tail_risk_multiplier = 1.0;
+            if signals.cross_venue_agreement > 0.5 {
+                market_params.lead_lag_signal_bps += cv_skew_contribution;
+            }
 
-        params
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            self.central_beliefs.update(BeliefUpdate::CrossVenueUpdate {
+                direction: signals.cross_venue_direction,
+                confidence: signals.cross_venue_confidence,
+                discovery_venue: signals.cross_venue_intensity_ratio,
+                max_toxicity: signals.cross_venue_max_toxicity,
+                avg_toxicity: signals.cross_venue_avg_toxicity,
+                agreement: signals.cross_venue_agreement,
+                divergence: signals.cross_venue_divergence,
+                intensity_ratio: signals.cross_venue_intensity_ratio,
+                imbalance_correlation: signals.cross_venue_imbalance_correlation,
+                toxicity_alert: signals.cross_venue_max_toxicity > 0.7,
+                divergence_alert: signals.cross_venue_divergence > 0.4,
+                timestamp_ms,
+            });
+        }
+
+        // === Fix #3: Position continuation decision (replicate quote_engine.rs:581-682) ===
+        {
+            let changepoint_prob = if belief_snapshot.changepoint.is_warmed_up {
+                belief_snapshot.changepoint.prob_5
+            } else {
+                0.0
+            };
+            let changepoint_entropy = belief_snapshot.changepoint.entropy;
+            let momentum_p = self.estimator.momentum_continuation_probability();
+            let position_value = (position.abs() * self.mid_price).max(1.0);
+            let trend_signal = self.estimator.trend_signal(position_value);
+            let regime_probs = belief_snapshot.regime.probs;
+
+            self.position_decision.update_signals(
+                changepoint_prob,
+                changepoint_entropy,
+                momentum_p,
+                trend_signal.timeframe_agreement,
+                trend_signal.trend_confidence,
+                regime_probs,
+            );
+
+            let belief_drift = market_params.belief_predictive_bias;
+            let belief_confidence = market_params.belief_confidence;
+            let edge_bps = market_params.current_edge_bps;
+
+            let position_action = self.position_decision.decide(
+                position,
+                self.max_position,
+                belief_drift,
+                belief_confidence,
+                edge_bps,
+            );
+
+            let raw_inventory_ratio = if self.max_position > 1e-9 {
+                position / self.max_position
+            } else {
+                0.0
+            };
+
+            market_params.position_action = position_action;
+            market_params.continuation_p = self.position_decision.prob_continuation();
+            market_params.continuation_confidence = self.position_decision.confidence();
+            market_params.effective_inventory_ratio =
+                action_to_inventory_ratio(position_action, raw_inventory_ratio);
+        }
+
+        // === Fix #7: Apply ThresholdKappa spread multiplier (replicate quote_engine.rs:849-860) ===
+        let threshold_kappa_mult = self.threshold_kappa.regime().spread_multiplier();
+        if threshold_kappa_mult > 1.0 && self.threshold_kappa.is_warmed_up() {
+            market_params.spread_widening_mult *= threshold_kappa_mult;
+        }
+
+        market_params
     }
 
-    fn compute_book_imbalance(&self) -> f64 {
-        let bid_size: f64 = self.bid_levels.iter().take(3).map(|(_, s)| s).sum();
-        let ask_size: f64 = self.ask_levels.iter().take(3).map(|(_, s)| s).sum();
-        let total = bid_size + ask_size;
-        if total > 0.0 {
-            (bid_size - ask_size) / total
-        } else {
-            0.0
+    /// Log signal health periodically (every 60s)
+    fn log_signal_health(&mut self) {
+        if self.last_signal_log.elapsed() < Duration::from_secs(60) {
+            return;
         }
+        self.last_signal_log = Instant::now();
+
+        let regime_probs = self.regime_hmm.regime_probabilities();
+        let vpin = self.vpin.vpin();
+        let _pre_fill_tox = self.pre_fill_classifier.summary();
+        let hawkes_imb = self.hawkes.flow_imbalance();
+        let spread_bps = self.spread_tracker.current_spread_bps();
+        let liq_det = self.liquidation_detector.summary();
+
+        info!(
+            "[SIGNAL CHECK] vpin={:.3} regime=[{:.2},{:.2},{:.2},{:.2}] \
+             hawkes_imb={:.3} spread_bps={:.1} \
+             should_pull={} cascade_severity={:.2} tail_risk={:.2}",
+            vpin,
+            regime_probs[0], regime_probs[1], regime_probs[2], regime_probs[3],
+            hawkes_imb, spread_bps,
+            liq_det.should_pull_quotes,
+            liq_det.cascade_severity,
+            liq_det.tail_risk_multiplier,
+        );
     }
 
     /// Update inventory from simulated fill and record for Bayesian learning
@@ -512,6 +967,64 @@ impl SimulationState {
             let depth_bps = ((order_price - self.mid_price).abs() / self.mid_price) * 10_000.0;
             self.strategy.record_fill_observation(depth_bps, false);
         }
+    }
+
+    /// Handle Binance price update -> feed to lag analyzer
+    fn on_binance_price(&mut self, mid: f64, timestamp_ms: i64) {
+        self.signal_integrator.on_binance_price(mid, timestamp_ms);
+    }
+
+    /// Handle Binance trade update -> feed to cross-venue flow
+    fn on_binance_trade(&mut self, trade: &BinanceTradeUpdate) {
+        self.signal_integrator.on_binance_trade(trade);
+    }
+
+    /// Assemble checkpoint bundle from current state
+    fn assemble_checkpoint_bundle(&self) -> CheckpointBundle {
+        let (vol_filter, informed_flow, fill_rate, kappa_own, kappa_bid, kappa_ask, momentum) =
+            self.estimator.to_checkpoint();
+
+        CheckpointBundle {
+            metadata: CheckpointMetadata {
+                version: 1,
+                timestamp_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                asset: self.asset.clone(),
+                session_duration_s: self.session_start.elapsed().as_secs_f64(),
+            },
+            learned_params: self.learned_params.clone(),
+            pre_fill: self.pre_fill_classifier.to_checkpoint(),
+            enhanced: self.enhanced_classifier.to_checkpoint(),
+            vol_filter,
+            regime_hmm: self.regime_hmm.to_checkpoint(),
+            informed_flow,
+            fill_rate,
+            kappa_own,
+            kappa_bid,
+            kappa_ask,
+            momentum,
+        }
+    }
+
+    /// Restore learned state from checkpoint bundle
+    fn restore_from_bundle(&mut self, bundle: &CheckpointBundle) {
+        self.pre_fill_classifier
+            .restore_checkpoint(&bundle.pre_fill);
+        self.enhanced_classifier
+            .restore_checkpoint(&bundle.enhanced);
+        self.estimator.restore_checkpoint(
+            &bundle.vol_filter,
+            &bundle.informed_flow,
+            &bundle.fill_rate,
+            &bundle.kappa_own,
+            &bundle.kappa_bid,
+            &bundle.kappa_ask,
+            &bundle.momentum,
+        );
+        self.regime_hmm.restore_checkpoint(&bundle.regime_hmm);
+        self.learned_params = bundle.learned_params.clone();
     }
 }
 
@@ -691,8 +1204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fill_simulator = FillSimulator::new(
         executor.clone(),
         FillSimulatorConfig {
-            touch_fill_probability: 0.25,
+            touch_fill_probability: 0.3,
             queue_position_factor: 0.5,
+            ignore_book_depth: true, // Sim orders aren't in real book
             ..Default::default()
         },
     );
@@ -715,6 +1229,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.ladder_levels,
         cli.target_liquidity,
     );
+
+    // Restore from checkpoint if enabled
+    if !cli.disable_checkpoint {
+        let dir = cli
+            .checkpoint_dir
+            .clone()
+            .unwrap_or_else(|| format!("data/checkpoints/paper/{}", cli.asset));
+        let dir = PathBuf::from(dir);
+
+        match CheckpointManager::new(dir) {
+            Ok(mgr) => {
+                match mgr.load_latest() {
+                    Ok(Some(bundle)) => {
+                        if bundle.metadata.asset == cli.asset {
+                            state.restore_from_bundle(&bundle);
+                            info!(
+                                asset = %bundle.metadata.asset,
+                                samples = bundle.pre_fill.learning_samples,
+                                session_s = bundle.metadata.session_duration_s,
+                                "Restored from checkpoint"
+                            );
+                        } else {
+                            warn!(
+                                checkpoint_asset = %bundle.metadata.asset,
+                                our_asset = %cli.asset,
+                                "Checkpoint asset mismatch, starting fresh"
+                            );
+                        }
+                    }
+                    Ok(None) => info!("No checkpoint found, starting fresh"),
+                    Err(e) => warn!("Failed to load checkpoint: {e}, starting fresh"),
+                }
+                if let Err(e) = mgr.cleanup_old(7) {
+                    warn!("Checkpoint cleanup failed: {e}");
+                }
+                state.checkpoint_manager = Some(mgr);
+            }
+            Err(e) => warn!("Checkpoint init failed: {e}"),
+        }
+    }
 
     let mut stats = SimulationStats::default();
     let mut spread_samples: Vec<f64> = Vec::new();
@@ -746,6 +1300,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Trades subscription error: {}", e);
         }
     });
+
+    // Spawn Binance feed for cross-exchange lead-lag signal
+    let mut binance_rx: Option<tokio::sync::mpsc::Receiver<BinanceUpdate>> =
+        if !cli.disable_binance_feed {
+            let (btx, brx) = tokio::sync::mpsc::channel(1000);
+            let feed = BinanceFeed::for_symbol(&cli.binance_symbol, btx);
+            tokio::spawn(async move {
+                feed.run().await;
+                warn!("Binance feed task terminated");
+            });
+            info!(symbol = %cli.binance_symbol, "Binance lead-lag feed active");
+            Some(brx)
+        } else {
+            warn!("Binance feed DISABLED - no cross-exchange signal");
+            None
+        };
 
     // Run simulation loop
     let start_time = Instant::now();
@@ -887,6 +1457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     MarketDataMessage::Book { bids, asks } => {
                         state.update_book(bids.clone(), asks.clone());
+                        fill_simulator.update_book(&bids, &asks);
 
                         // Capture book history (every 1 second)
                         if last_book_snapshot.elapsed() >= Duration::from_secs(1) {
@@ -955,6 +1526,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            Some(update) = async {
+                match binance_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match update {
+                    BinanceUpdate::Price(p) => state.on_binance_price(p.mid_price, p.timestamp_ms),
+                    BinanceUpdate::Trade(t) => state.on_binance_trade(&t),
+                }
+                last_data_received = Instant::now();
+            }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
                 // Watchdog: check for stale market data
                 if last_data_received.elapsed() > stale_data_threshold && !stale_warning_logged {
@@ -968,6 +1551,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Generate quotes on interval
                 if last_quote_time.elapsed() >= quote_interval {
                     last_quote_time = Instant::now();
+
+                    // Periodic signal health check
+                    state.log_signal_health();
 
                     if let Some(ladder) = state.generate_quotes() {
                         stats.quote_cycles += 1;
@@ -1265,7 +1851,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos() as u64);
+
+                // Periodic checkpoint save (every 5 minutes)
+                if state.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {
+                    if let Some(ref mgr) = state.checkpoint_manager {
+                        let bundle = state.assemble_checkpoint_bundle();
+                        match mgr.save_all(&bundle) {
+                            Ok(()) => info!("Checkpoint saved"),
+                            Err(e) => warn!("Checkpoint save failed: {e}"),
+                        }
+                    }
+                    state.last_checkpoint_save = Instant::now();
+                }
             }
+        }
+    }
+
+    // Final checkpoint save on shutdown
+    if let Some(ref mgr) = state.checkpoint_manager {
+        let bundle = state.assemble_checkpoint_bundle();
+        match mgr.save_all(&bundle) {
+            Ok(()) => info!("Final checkpoint saved on shutdown"),
+            Err(e) => warn!("Final checkpoint save failed: {e}"),
         }
     }
 

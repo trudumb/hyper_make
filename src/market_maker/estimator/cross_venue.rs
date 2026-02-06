@@ -261,9 +261,6 @@ impl RollingCorrelation {
         }
     }
 
-    fn len(&self) -> usize {
-        self.x_values.len()
-    }
 }
 
 /// Cross-venue analyzer - computes joint features from both venues.
