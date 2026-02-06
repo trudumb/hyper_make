@@ -1,9 +1,9 @@
 {
   "metadata": {
     "version": 1,
-    "timestamp_ms": 1770421835634,
+    "timestamp_ms": 1770419935385,
     "asset": "HYPE",
-    "session_duration_s": 180.024693451
+    "session_duration_s": 60.051716448
   },
   "learned_params": {
     "alpha_touch": {
@@ -303,38 +303,38 @@
       0.1
     ],
     "signal_outcome_sum": [
-      0.9292630871911907,
-      0.8872933847608026,
-      0.8778542384706967,
-      0.5249181745199472,
-      0.3522714837050953
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
     ],
     "signal_sq_sum": [
-      0.8225376136059924,
-      0.7499164525597543,
-      0.7340458964920852,
-      0.2624590872599736,
-      0.11820432617452986
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
     ],
-    "learning_samples": 1,
+    "learning_samples": 0,
     "regime_probs": [
       0.1,
       0.7,
       0.15,
       0.05
     ],
-    "imbalance_ewma_mean": -0.6506759882843564,
-    "imbalance_ewma_var": 1.1108490507329143,
-    "flow_ewma_mean": -0.5470777193947548,
-    "flow_ewma_var": 0.16317678739102048,
+    "imbalance_ewma_mean": -0.7658007166554335,
+    "imbalance_ewma_var": 1.1156619482903414,
+    "flow_ewma_mean": -0.1923181040161686,
+    "flow_ewma_var": 0.20047783700537128,
     "funding_ewma_mean": 0.0,
     "funding_ewma_var": 1e-12,
-    "regime_trust_prev": 0.9994399150156252,
-    "regime_ewma_mean": 0.08603855650172403,
-    "regime_ewma_var": 0.01887458077926481,
-    "changepoint_ewma_mean": 0.019881778053464198,
-    "changepoint_ewma_var": 3.798303646782857e-11,
-    "normalizer_obs_count": 1386
+    "regime_trust_prev": 0.8863327182115492,
+    "regime_ewma_mean": 0.06579523948319531,
+    "regime_ewma_var": 0.007704024795509729,
+    "changepoint_ewma_mean": 0.019841958655776714,
+    "changepoint_ewma_var": 6.311310491468457e-7,
+    "normalizer_obs_count": 1846
   },
   "enhanced": {
     "learned_weights": [
@@ -368,22 +368,22 @@
     "total_predictions": 0
   },
   "vol_filter": {
-    "sigma_mean": 0.0001046665874136422,
-    "sigma_std": 0.00007878927740386451,
+    "sigma_mean": 0.0001521953725910292,
+    "sigma_std": 0.00005876110443710192,
     "regime_probs": [
-      0.043561506559211045,
-      0.21643765908965037,
-      0.5142490249028878,
-      0.22575180944825096
+      0.10724054072682697,
+      0.42936290910968467,
+      0.3617064336006627,
+      0.10169011656282648
     ],
-    "observation_count": 902
+    "observation_count": 1840
   },
   "regime_hmm": {
     "belief": [
-      3.887484458831768e-15,
-      0.000023539305861911383,
-      0.9999764594953175,
-      1.1988166773742174e-9
+      3.5490767280214793e-12,
+      0.11332513197852735,
+      0.8866748680175434,
+      3.8027872609802056e-13
     ],
     "transition_counts": [
       [
@@ -411,70 +411,70 @@
         0.0
       ]
     ],
-    "observation_count": 2416,
-    "recalibration_count": 3
+    "observation_count": 3954,
+    "recalibration_count": 1
   },
   "informed_flow": {
     "component_params": [
       {
-        "mu_size": 0.6521025802056483,
-        "sigma_size": 0.9411281768967892,
-        "lambda_0": 7.541724244954376,
+        "mu_size": -0.13933884667316035,
+        "sigma_size": 0.33636550702995466,
+        "lambda_0": 10.0,
         "alpha": 0.5,
         "beta": 2.0,
         "impact_per_unit": -10.0,
-        "impact_variance": 88.33134968138484
+        "impact_variance": 62.06671856270282
       },
       {
-        "mu_size": 3.1320646847530593,
-        "sigma_size": 1.9327235999225032,
-        "lambda_0": 5.9601899062669155,
+        "mu_size": 2.3171084112665343,
+        "sigma_size": 1.7412798214357055,
+        "lambda_0": 7.2407947394225145,
         "alpha": 0.1,
         "beta": 5.0,
-        "impact_per_unit": -0.3957832785537814,
+        "impact_per_unit": -0.4933665337015933,
         "impact_variance": 100.0
       },
       {
-        "mu_size": -0.17410332350932792,
-        "sigma_size": 0.2834934642679723,
-        "lambda_0": 10.0,
+        "mu_size": -0.4780358009429997,
+        "sigma_size": 0.1,
+        "lambda_0": 0.5200208008320333,
         "alpha": 0.8,
         "beta": 1.0,
-        "impact_per_unit": -10.0,
-        "impact_variance": 100.0
+        "impact_per_unit": -9.271281556372113,
+        "impact_variance": 0.1
       }
     ],
     "mixing_weights": [
-      0.18424485140574698,
-      0.3700001054345956,
-      0.44575504315965736
+      0.5985727662988432,
+      0.40055232393040924,
+      0.0008749097707476841
     ],
-    "observation_count": 2416
+    "observation_count": 3954
   },
   "fill_rate": {
-    "lambda_0_mean": 0.8087456250993099,
-    "lambda_0_variance": 0.06434529519008776,
-    "lambda_0_n_obs": 10.93092495437036,
+    "lambda_0_mean": 0.8,
+    "lambda_0_variance": 0.06400000000000002,
+    "lambda_0_n_obs": 10.0,
     "delta_char_mean": 10.0,
-    "delta_char_variance": 20.139111001134374,
-    "delta_char_n_obs": 4.96546247718518,
-    "observation_count": 1
+    "delta_char_variance": 20.0,
+    "delta_char_n_obs": 5.0,
+    "observation_count": 0
   },
   "kappa_own": {
     "prior_alpha": 5.0,
     "prior_beta": 0.002,
-    "observation_count": 1,
-    "sum_distances": 0.00001,
-    "sum_sq_distances": 1.0000000000000002e-10,
-    "kappa_posterior_mean": 2985.0746268656717
+    "observation_count": 0,
+    "sum_distances": 0.0,
+    "sum_sq_distances": 0.0,
+    "kappa_posterior_mean": 2500.0
   },
   "kappa_bid": {
     "prior_alpha": 5.0,
     "prior_beta": 0.002,
-    "observation_count": 1,
-    "sum_distances": 0.00001,
-    "sum_sq_distances": 1.0000000000000002e-10,
-    "kappa_posterior_mean": 2985.0746268656717
+    "observation_count": 0,
+    "sum_distances": 0.0,
+    "sum_sq_distances": 0.0,
+    "kappa_posterior_mean": 2500.0
   },
   "kappa_ask": {
     "prior_alpha": 5.0,
@@ -486,10 +486,10 @@
   },
   "momentum": {
     "continuation_by_magnitude": [
-      0.9029562106518395,
-      0.8442660584086947,
-      0.405,
-      0.5,
+      0.7997031623015718,
+      0.6242462389824199,
+      0.461949319010451,
+      0.4623897555,
       0.5,
       0.5,
       0.5,
@@ -498,10 +498,10 @@
       0.5
     ],
     "counts_by_magnitude": [
-      573,
-      72,
-      2,
-      0,
+      1236,
+      99,
+      59,
+      9,
       0,
       0,
       0,

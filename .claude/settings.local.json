@@ -57,7 +57,8 @@
       "mcp__serena__edit_memory",
       "Bash(xargs:*)",
       "mcp__serena__think_about_whether_you_are_done",
-      "Skill(sc:implement)"
+      "Skill(sc:implement)",
+      "Bash(tee:*)"
     ]
   }
 }

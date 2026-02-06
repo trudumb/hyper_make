@@ -91,6 +91,7 @@ use hyperliquid_rust_sdk::market_maker::stochastic::{
     StochasticControlBuilder, StochasticControlConfig,
 };
 use hyperliquid_rust_sdk::market_maker::calibration::LearnedParameters;
+use hyperliquid_rust_sdk::market_maker::{CalibrationController, CalibrationControllerConfig};
 use hyperliquid_rust_sdk::market_maker::{BinanceFeed, BinanceTradeUpdate, BinanceUpdate};
 
 // ============================================================================
@@ -271,6 +272,15 @@ fn generate_mock_feature_health(cycle_count: u64) -> FeatureHealthState {
 // Simulation State (using real LadderStrategy)
 // ============================================================================
 
+/// Pending fill for adverse selection outcome tracking
+struct PendingFillOutcome {
+    timestamp_ns: u64,
+    #[allow(dead_code)]
+    fill_price: f64,
+    is_buy: bool,
+    mid_at_fill: f64,
+}
+
 /// Complete simulation state using production LadderStrategy
 struct SimulationState {
     /// Asset being simulated
@@ -355,6 +365,11 @@ struct SimulationState {
     session_start: Instant,
     last_checkpoint_save: Instant,
     learned_params: LearnedParameters,
+
+    // === Learning feedback loops ===
+    calibration_controller: CalibrationController,
+    pending_fill_outcomes: VecDeque<PendingFillOutcome>,
+    total_fill_count: u64,
 }
 
 impl SimulationState {
@@ -451,6 +466,16 @@ impl SimulationState {
             session_start: Instant::now(),
             last_checkpoint_save: Instant::now(),
             learned_params: LearnedParameters::default(),
+
+            // Learning feedback loops
+            calibration_controller: CalibrationController::new(CalibrationControllerConfig {
+                enabled: true,
+                target_fill_rate_per_hour: 60.0,
+                min_gamma_mult: 0.3,
+                ..CalibrationControllerConfig::default()
+            }),
+            pending_fill_outcomes: VecDeque::with_capacity(64),
+            total_fill_count: 0,
         }
     }
 
@@ -459,6 +484,9 @@ impl SimulationState {
         if mid > 0.0 {
             self.prev_mid = self.mid_price;
             self.mid_price = mid;
+
+            // Check pending fill outcomes for adverse selection learning
+            self.check_adverse_selection_outcomes();
 
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -696,6 +724,11 @@ impl SimulationState {
             min_notional: 10.0, // $10 minimum
         };
 
+        // Update calibration controller with current estimator state
+        let as_fills = self.pre_fill_classifier.learning_diagnostics().samples as u64;
+        let kappa_conf = self.estimator.kappa_confidence();
+        self.calibration_controller.update_calibration_status(as_fills, kappa_conf);
+
         // Build MarketParams from estimator (same as production)
         let market_params = self.build_market_params();
 
@@ -812,9 +845,9 @@ impl SimulationState {
             dynamic_limit_valid: false,
             tick_size_bps: 10.0,
             near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
-            calibration_gamma_mult: 1.0,
-            calibration_progress: 0.0,
-            calibration_complete: false,
+            calibration_gamma_mult: self.calibration_controller.gamma_multiplier(),
+            calibration_progress: self.calibration_controller.calibration_progress(),
+            calibration_complete: self.calibration_controller.is_calibrated(),
             use_dynamic_kappa_floor: true,
             use_dynamic_spread_ceiling: true,
             learned_params: None,
@@ -932,6 +965,10 @@ impl SimulationState {
         let spread_bps = self.spread_tracker.current_spread_bps();
         let liq_det = self.liquidation_detector.summary();
 
+        let as_diag = self.pre_fill_classifier.learning_diagnostics();
+        let cal_progress = self.calibration_controller.calibration_progress();
+        let cal_gamma = self.calibration_controller.gamma_multiplier();
+
         info!(
             "[SIGNAL CHECK] vpin={:.3} regime=[{:.2},{:.2},{:.2},{:.2}] \
              hawkes_imb={:.3} spread_bps={:.1} \
@@ -943,21 +980,105 @@ impl SimulationState {
             liq_det.cascade_severity,
             liq_det.tail_risk_multiplier,
         );
+        info!(
+            "[LEARNING] fills={} kappa_conf={:.3} as_samples={} as_learned={} \
+             cal_progress={:.0}% cal_gamma={:.2} pending_as_outcomes={}",
+            self.total_fill_count,
+            self.estimator.kappa_confidence(),
+            as_diag.samples,
+            as_diag.is_using_learned,
+            cal_progress * 100.0,
+            cal_gamma,
+            self.pending_fill_outcomes.len(),
+        );
     }
 
     /// Update inventory from simulated fill and record for Bayesian learning
     fn on_simulated_fill(&mut self, fill: &SimulatedFill) {
         let direction = if fill.side == Side::Buy { 1.0 } else { -1.0 };
         self.inventory += direction * fill.fill_size;
+        self.total_fill_count += 1;
 
         // Record fill for Bayesian learning in the strategy
-        // Compute depth in bps from mid
         let depth_bps = if self.mid_price > 0.0 {
             ((fill.fill_price - self.mid_price).abs() / self.mid_price) * 10_000.0
         } else {
-            5.0 // Default 5 bps if no mid
+            5.0
         };
         self.strategy.record_fill_observation(depth_bps, true);
+
+        // === FIX: Wire kappa learning from own fills ===
+        let timestamp_ms = fill.timestamp_ns / 1_000_000;
+        let is_buy = fill.side == Side::Buy;
+        self.estimator.on_own_fill(
+            timestamp_ms,
+            fill.fill_price, // placement_price = fill_price for limit orders
+            fill.fill_price,
+            fill.fill_size,
+            is_buy,
+        );
+
+        // === FIX: Wire calibration controller fill tracking ===
+        self.calibration_controller.record_fill();
+
+        // === FIX: Queue fill for adverse selection outcome tracking ===
+        self.pending_fill_outcomes.push_back(PendingFillOutcome {
+            timestamp_ns: fill.timestamp_ns,
+            fill_price: fill.fill_price,
+            is_buy,
+            mid_at_fill: self.mid_price,
+        });
+
+        info!(
+            "[FILL FEEDBACK] oid={} side={:?} price={:.4} size={:.4} depth_bps={:.1} total_fills={} kappa_conf={:.3}",
+            fill.oid, fill.side, fill.fill_price, fill.fill_size, depth_bps,
+            self.total_fill_count, self.estimator.kappa_confidence(),
+        );
+    }
+
+    /// Check pending fills for adverse selection outcomes (call after mid updates)
+    fn check_adverse_selection_outcomes(&mut self) {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let outcome_delay_ns = 5_000_000_000u64; // 5 seconds
+
+        while let Some(front) = self.pending_fill_outcomes.front() {
+            if now_ns.saturating_sub(front.timestamp_ns) < outcome_delay_ns {
+                break; // Not old enough yet
+            }
+
+            let pending = self.pending_fill_outcomes.pop_front().unwrap();
+            if self.mid_price <= 0.0 || pending.mid_at_fill <= 0.0 {
+                continue;
+            }
+
+            // Compute adverse selection:
+            // Buy fill is adverse if mid dropped (we overpaid)
+            // Sell fill is adverse if mid rose (we undersold)
+            let mid_change_bps = ((self.mid_price - pending.mid_at_fill) / pending.mid_at_fill) * 10_000.0;
+            let was_adverse = if pending.is_buy {
+                mid_change_bps < -1.0 // Mid dropped > 1 bps after we bought
+            } else {
+                mid_change_bps > 1.0  // Mid rose > 1 bps after we sold
+            };
+            let magnitude_bps = mid_change_bps.abs();
+
+            self.pre_fill_classifier.record_outcome(
+                pending.is_buy, // is_bid = is_buy (our bid was filled)
+                was_adverse,
+                Some(magnitude_bps),
+            );
+
+            if was_adverse {
+                info!(
+                    "[AS OUTCOME] side={} adverse=true magnitude={:.1}bps mid_at_fill={:.4} mid_now={:.4}",
+                    if pending.is_buy { "Buy" } else { "Sell" },
+                    magnitude_bps, pending.mid_at_fill, self.mid_price,
+                );
+            }
+        }
     }
 
     /// Record cancelled (non-filled) order for Bayesian learning
@@ -1561,7 +1682,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Queue-aware order management:
                         // Only cancel/replace orders if price moved beyond threshold
                         // This preserves queue position for realistic fill simulation
-                        let price_threshold_bps = 2.0; // Only refresh if price moved 2+ bps
+                        let price_threshold_bps = 5.0; // Only refresh if price moved 5+ bps (preserves queue position)
                         let active_orders = executor.get_active_orders();
 
                         // Build set of desired prices from new ladder
