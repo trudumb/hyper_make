@@ -60,7 +60,8 @@
       "Skill(sc:implement)",
       "Bash(tee:*)",
       "mcp__serena__find_referencing_symbols",
-      "Bash(git diff:*)"
+      "Bash(git diff:*)",
+      "Bash(git status:*)"
     ]
   }
 }
