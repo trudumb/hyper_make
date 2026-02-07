@@ -58,7 +58,9 @@
       "Bash(xargs:*)",
       "mcp__serena__think_about_whether_you_are_done",
       "Skill(sc:implement)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "mcp__serena__find_referencing_symbols",
+      "Bash(git diff:*)"
     ]
   }
 }
