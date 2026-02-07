@@ -62,7 +62,8 @@
       "mcp__serena__find_referencing_symbols",
       "Bash(git diff:*)",
       "Bash(git status:*)",
-      "mcp__serena__find_file"
+      "mcp__serena__find_file",
+      "mcp__serena__insert_before_symbol"
     ]
   }
 }
