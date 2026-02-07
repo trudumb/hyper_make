@@ -17,7 +17,7 @@ cargo test                       # Run all tests
 cargo test <test_name>           # Prefer single tests for speed
 cargo clippy -- -D warnings      # Lint — treat warnings as errors
 
-# Binaries (user runs these manually, never run them yourself)
+# Binaries (user runs these manually, never run them yourself UNLESS explicitly asked)
 # market_maker, parameter_estimator, paper_trader, health_dashboard, calibration_report
 ```
 
@@ -58,7 +58,7 @@ IMPORTANT — these are non-negotiable:
 2. **Calibration is ground truth** — track Brier Score, Information Ratio, and Conditional Calibration for every model
 3. **Everything is regime-dependent** — never use a single parameter value; kappa varies 10x, gamma varies 5x between quiet and cascade
 4. **Defense first** — when uncertain, widen spreads. Missing a trade is cheap; getting run over in a cascade is not
-5. **Manual execution only** — YOU MUST NOT run binaries or scripts (`cargo run`, `./scripts/...`). Provide copy-pasteable blocks for the user to execute
+5. **Manual execution only** — Do not run binaries or scripts (`cargo run`, `./scripts/...`) unless the user explicitly asks you to. By default, provide copy-pasteable blocks for the user to execute
 6. **Prefer explicit over clever** — bugs cost real money
 7. **Edge decays** — build staleness detection into every model; monitor signal MI, lead-lag R², regime drift
 

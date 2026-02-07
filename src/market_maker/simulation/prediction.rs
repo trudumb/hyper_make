@@ -6,6 +6,7 @@
 //! - Model outputs (fill probabilities, adverse selection, etc.)
 //! - Actual outcomes (filled in asynchronously)
 
+use super::fill_sim::FillSimulator;
 use crate::{Ladder, LadderLevel, MarketParams, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -261,11 +262,15 @@ impl ModelPredictions {
         glft_half_spread_bps: f64,
         final_half_spread_bps: f64,
         inventory_skew_bps: f64,
+        fill_sim: Option<&FillSimulator>,
     ) -> Self {
         let mut levels = Vec::new();
 
         // Process bid levels
         for level in &ladder.bids {
+            let (queue_pos, queue_total) = fill_sim
+                .map(|fs| fs.estimate_queue_position(level.price, true))
+                .unwrap_or((0.0, 0.0));
             levels.push(LevelPrediction {
                 side: Side::Buy,
                 price: level.price,
@@ -276,13 +281,16 @@ impl ModelPredictions {
                 p_fill_10s: estimate_fill_probability(level.depth_bps, params, 10.0),
                 p_adverse_given_fill: params.predicted_alpha,
                 expected_pnl_given_fill: estimate_expected_pnl(level, params, Side::Buy),
-                estimated_queue_position: 0.0, // TODO: From queue tracker
-                estimated_queue_total: 0.0,
+                estimated_queue_position: queue_pos,
+                estimated_queue_total: queue_total,
             });
         }
 
         // Process ask levels
         for level in &ladder.asks {
+            let (queue_pos, queue_total) = fill_sim
+                .map(|fs| fs.estimate_queue_position(level.price, false))
+                .unwrap_or((0.0, 0.0));
             levels.push(LevelPrediction {
                 side: Side::Sell,
                 price: level.price,
@@ -293,8 +301,8 @@ impl ModelPredictions {
                 p_fill_10s: estimate_fill_probability(level.depth_bps, params, 10.0),
                 p_adverse_given_fill: params.predicted_alpha,
                 expected_pnl_given_fill: estimate_expected_pnl(level, params, Side::Sell),
-                estimated_queue_position: 0.0,
-                estimated_queue_total: 0.0,
+                estimated_queue_position: queue_pos,
+                estimated_queue_total: queue_total,
             });
         }
 

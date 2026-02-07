@@ -303,16 +303,23 @@ impl KappaOrchestrator {
             let book_valid = book_kappa > 100.0 && self.config.use_book_kappa;
             let robust_valid = robust_kappa > 100.0 && self.config.use_robust_kappa;
 
+            // Cap robust_kappa at 2× prior during warmup.
+            // Robust kappa measures market trade distances (BBO fills at 1-2 bps),
+            // not fill distances at OUR quote depths (8+ bps). Without capping,
+            // robust_kappa inflates to ~10000 which biases the blend upward.
+            let max_robust_warmup = self.config.prior_kappa * 2.0;
+            let capped_robust = robust_kappa.min(max_robust_warmup);
+
             // Weight allocation during warmup:
             // - Book: 40% (direct market structure signal)
-            // - Robust: 30% (market-wide fill behavior)
+            // - Robust: 30% (market-wide fill behavior, capped)
             // - Prior: 30% minimum (regularization/safety)
             let book_weight = if book_valid { 0.4 } else { 0.0 };
             let robust_weight = if robust_valid { 0.3 } else { 0.0 };
             let prior_weight = 1.0 - book_weight - robust_weight;
 
             let blended = book_weight * book_kappa
-                + robust_weight * robust_kappa
+                + robust_weight * capped_robust
                 + prior_weight * self.config.prior_kappa;
 
             return blended.clamp(50.0, 10000.0);
@@ -393,6 +400,10 @@ impl KappaOrchestrator {
             let book_valid = book_kappa > 100.0 && self.config.use_book_kappa;
             let robust_valid = robust_kappa > 100.0 && self.config.use_robust_kappa;
 
+            // Cap robust_kappa at 2× prior (mirrors kappa_raw() logic)
+            let max_robust_warmup = self.config.prior_kappa * 2.0;
+            let capped_robust = robust_kappa.min(max_robust_warmup);
+
             let book_weight = if book_valid { 0.4 } else { 0.0 };
             let robust_weight = if robust_valid { 0.3 } else { 0.0 };
             let prior_weight = 1.0 - book_weight - robust_weight;
@@ -400,7 +411,7 @@ impl KappaOrchestrator {
             return (
                 (self.own_kappa.posterior_mean(), 0.0), // own disabled during warmup
                 (book_kappa, book_weight),              // book weighted if valid
-                (robust_kappa, robust_weight),          // robust weighted if valid
+                (capped_robust, robust_weight),         // robust weighted if valid (capped)
                 (self.config.prior_kappa, prior_weight), // prior gets remainder
                 true,                                   // is_warmup
             );

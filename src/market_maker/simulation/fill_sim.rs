@@ -343,6 +343,20 @@ impl FillSimulator {
     pub fn clear_recent(&mut self) {
         self.recent_fills.clear();
     }
+
+    /// Estimate our queue position at a given price level.
+    /// Returns (estimated_position, estimated_total) where position is our
+    /// estimated place in the queue and total is the total queue depth.
+    pub fn estimate_queue_position(&self, price: f64, is_buy: bool) -> (f64, f64) {
+        let volume_at_level = self.book_depth_at_price(price, is_buy);
+        if volume_at_level > 0.0 && !self.config.ignore_book_depth {
+            // We're at the back of the queue (conservative estimate)
+            (volume_at_level, volume_at_level)
+        } else {
+            // No book data or ignoring book depth
+            (0.0, 0.0)
+        }
+    }
 }
 
 /// Statistics about fill simulation

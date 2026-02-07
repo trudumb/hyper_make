@@ -86,6 +86,7 @@ use hyperliquid_rust_sdk::market_maker::{
 use hyperliquid_rust_sdk::market_maker::belief::{BeliefUpdate, CentralBeliefState};
 use hyperliquid_rust_sdk::market_maker::risk::{RiskState, RiskAggregator, RiskSeverity};
 use hyperliquid_rust_sdk::market_maker::risk::monitors::*;
+use hyperliquid_rust_sdk::round_to_significant_and_decimal;
 use hyperliquid_rust_sdk::market_maker::checkpoint::{
     CheckpointBundle, CheckpointManager, CheckpointMetadata,
 };
@@ -179,6 +180,22 @@ struct Cli {
     /// Maximum checkpoint age in hours before skipping restore
     #[arg(long, default_value = "4")]
     max_checkpoint_age_hours: f64,
+
+    /// Force restore checkpoint regardless of age (useful for iterative paper trading)
+    #[arg(long)]
+    force_restore: bool,
+
+    /// Paper trading calibration mode: tighter spreads, faster warmup for generating fills
+    #[arg(long)]
+    paper_mode: bool,
+
+    /// Quote lifetime in seconds for fill probability model
+    #[arg(long, default_value_t = 10.0)]
+    quote_lifetime_s: f64,
+
+    /// Minimum order notional in USD
+    #[arg(long, default_value_t = 10.0)]
+    min_notional: f64,
 }
 
 // ============================================================================
@@ -278,6 +295,18 @@ fn generate_mock_feature_health(cycle_count: u64) -> FeatureHealthState {
 // Simulation State (using real LadderStrategy)
 // ============================================================================
 
+/// Configuration for SimulationState construction
+struct SimulationConfig {
+    asset: String,
+    gamma: f64,
+    target_spread_bps: f64,
+    ladder_levels: usize,
+    target_liquidity: f64,
+    quote_lifetime_s: f64,
+    min_notional: f64,
+    paper_mode: bool,
+}
+
 /// Pending fill for adverse selection outcome tracking
 struct PendingFillOutcome {
     timestamp_ns: u64,
@@ -322,6 +351,10 @@ struct SimulationState {
     decimals: u32,
     /// Size decimals
     sz_decimals: u32,
+    /// Quote lifetime in seconds for fill probability model
+    quote_lifetime_s: f64,
+    /// Minimum order notional in USD
+    min_notional: f64,
 
     // === Adaptive GLFT Components ===
     adaptive_spreads: AdaptiveSpreadCalculator,
@@ -376,28 +409,51 @@ struct SimulationState {
     calibration_controller: CalibrationController,
     pending_fill_outcomes: VecDeque<PendingFillOutcome>,
     total_fill_count: u64,
+
+    /// Paper trading calibration mode (tighter spreads, faster warmup)
+    #[allow(dead_code)]
+    paper_mode: bool,
 }
 
 impl SimulationState {
-    fn new(
-        asset: String,
-        gamma: f64,
-        target_spread_bps: f64,
-        ladder_levels: usize,
-        target_liquidity: f64,
-    ) -> Self {
+    fn new(config: SimulationConfig) -> Self {
+        let SimulationConfig {
+            asset,
+            gamma,
+            target_spread_bps,
+            ladder_levels,
+            target_liquidity,
+            quote_lifetime_s,
+            min_notional,
+            paper_mode,
+        } = config;
+
+        // Paper mode: lower gamma for tighter theoretical spreads
+        let effective_gamma = if paper_mode { gamma * 0.5 } else { gamma };
+
+        // Paper mode: lower spread floor for more aggressive quoting
+        let min_spread = if paper_mode {
+            (target_spread_bps / 10_000.0 / 2.0).min(0.0002) // Cap at 2 bps per side
+        } else {
+            target_spread_bps / 10_000.0 / 2.0
+        };
+
         // Create production-style RiskConfig
         let risk_config = RiskConfig {
-            gamma_base: gamma.clamp(0.01, 10.0),
-            min_spread_floor: target_spread_bps / 10_000.0 / 2.0,
+            gamma_base: effective_gamma.clamp(0.01, 10.0),
+            min_spread_floor: min_spread,
             ..Default::default()
         };
 
         // Create LadderConfig with specified levels
-        let ladder_config = LadderConfig {
+        let mut ladder_config = LadderConfig {
             num_levels: ladder_levels,
             ..Default::default()
         };
+        if paper_mode {
+            // Lower min depth for tighter quoting in calibration mode
+            ladder_config.min_depth_bps = 2.0;
+        }
 
         // Create the real LadderStrategy
         let strategy = LadderStrategy::with_config(risk_config, ladder_config);
@@ -410,10 +466,34 @@ impl SimulationState {
             _ => (2, 3),
         };
 
-        // Create adaptive components with defaults
-        let adaptive_spreads = AdaptiveSpreadCalculator::new(AdaptiveBayesianConfig::default());
+        // Create adaptive components — paper mode lowers the floor for more fills
+        // Default floor = fee(1.5) + AS_mean(3.0) + k(1.17) × AS_std(3.0) = 8.01 bps
+        // Paper mode floor = fee(1.5) + AS_mean(1.0) + k(0.0) × AS_std(2.0) = 2.5 bps
+        let adaptive_config = if paper_mode {
+            AdaptiveBayesianConfig {
+                as_prior_mean: 0.0001,       // 1 bps AS prior (vs 3 bps default)
+                as_prior_std: 0.0002,        // 2 bps uncertainty (vs 3 bps default)
+                floor_risk_k: 0.0,           // No safety margin — learn from fills
+                floor_absolute_min: 0.0001,  // 1 bp hard floor
+                ..AdaptiveBayesianConfig::default()
+            }
+        } else {
+            AdaptiveBayesianConfig::default()
+        };
+        let adaptive_spreads = AdaptiveSpreadCalculator::new(adaptive_config);
         let mut hjb_controller = HJBInventoryController::new(HJBConfig::default());
         hjb_controller.start_session();
+
+        // Paper mode: faster warmup for quicker convergence
+        let estimator_config = if paper_mode {
+            EstimatorConfig {
+                min_volume_ticks: 3,
+                min_trade_observations: 2,
+                ..EstimatorConfig::default()
+            }
+        } else {
+            EstimatorConfig::default()
+        };
 
         Self {
             asset,
@@ -423,15 +503,17 @@ impl SimulationState {
             best_ask: 0.0,
             bid_levels: Vec::new(),
             ask_levels: Vec::new(),
-            estimator: ParameterEstimator::new(EstimatorConfig::default()),
+            estimator: ParameterEstimator::new(estimator_config),
             strategy,
             inventory: 0.0,
             cycle_count: 0,
-            gamma,
+            gamma: effective_gamma,
             max_position: 1.0,
             target_liquidity,
             decimals,
             sz_decimals,
+            quote_lifetime_s,
+            min_notional,
             // Adaptive components
             adaptive_spreads,
             hjb_controller,
@@ -482,6 +564,7 @@ impl SimulationState {
             }),
             pending_fill_outcomes: VecDeque::with_capacity(64),
             total_fill_count: 0,
+            paper_mode,
         }
     }
 
@@ -551,6 +634,11 @@ impl SimulationState {
         if self.mid_price > 0.0 {
             self.adaptive_spreads
                 .on_l2_update(&bids, &asks, self.mid_price);
+
+            // Feed L2 to parameter estimator for book-structure kappa estimation
+            // CRITICAL: Live system does this in l2_book.rs:88 but paper trader was missing it,
+            // causing book_kappa to stay at prior (2500) and never learn from actual book depth
+            self.estimator.on_l2_book(&bids, &asks, self.mid_price);
         }
 
         // === Replicate live L2 signal processing from handlers.rs:793-860 ===
@@ -727,7 +815,7 @@ impl SimulationState {
             mid_price: self.mid_price,
             decimals: self.decimals,
             sz_decimals: self.sz_decimals,
-            min_notional: 10.0, // $10 minimum
+            min_notional: self.min_notional,
         };
 
         // Update calibration controller with current estimator state
@@ -736,11 +824,40 @@ impl SimulationState {
         self.calibration_controller.update_calibration_status(as_fills, kappa_conf);
 
         // Build MarketParams from estimator (same as production)
-        let market_params = self.build_market_params();
+        let mut market_params = self.build_market_params();
+
+        // Edge surface diagnostic logging
+        if !market_params.should_quote_edge {
+            tracing::debug!(
+                edge_bps = %format!("{:.2}", market_params.current_edge_bps),
+                flow_confidence = %format!("{:.2}", market_params.flow_decomp_confidence),
+                "Edge surface indicates no edge - GLFT circuit breaker may trigger"
+            );
+        }
+
+        // Paper mode: force minimum kappa to generate competitive spreads.
+        // GLFT half-spread ≈ 1/kappa + fee when gamma << kappa.
+        // With kappa=3250, half-spread = 3.1 + 1.5 = 4.6 bps per side.
+        // With kappa=8000, half-spread = 1.25 + 1.5 = 2.75 bps per side.
+        // Higher kappa = tighter spreads = more fills = faster learning.
+        // This is NOT representative of production (where kappa is learned from own fills),
+        // but it breaks the warmup catch-22 by bootstrapping fill data.
+        if self.paper_mode {
+            let paper_kappa_floor = 8000.0;
+            if market_params.kappa < paper_kappa_floor {
+                market_params.kappa = paper_kappa_floor;
+            }
+            if market_params.adaptive_kappa < paper_kappa_floor {
+                market_params.adaptive_kappa = paper_kappa_floor;
+            }
+            if market_params.kappa_robust < paper_kappa_floor {
+                market_params.kappa_robust = paper_kappa_floor;
+            }
+        }
 
         // Update strategy's fill model with current volatility
         let sigma = market_params.sigma.max(0.00001);
-        let tau = 10.0; // Typical quote lifetime
+        let tau = self.quote_lifetime_s;
         self.strategy.update_fill_model_params(sigma, tau);
 
         // Use the REAL LadderStrategy to generate quotes
@@ -1329,6 +1446,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.asset, cli.duration, cli.network
     );
 
+    if cli.paper_mode {
+        warn!("Paper trading calibration mode active: tighter spreads, faster warmup");
+        warn!("Results are NOT representative of production quoting");
+    }
+
     // Determine base URL
     let base_url = match cli.network.as_str() {
         "mainnet" => BaseUrl::Mainnet,
@@ -1341,15 +1463,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create simulation components
     let executor = Arc::new(SimulationExecutor::new(cli.verbose));
-    let mut fill_simulator = FillSimulator::new(
-        executor.clone(),
+    // Paper mode: aggressive fill simulation to break the warmup catch-22.
+    // Default mode uses conservative probabilities (30% touch, 50% queue)
+    // which accurately model production fills but prevent learning when no fills exist.
+    let fill_config = if cli.paper_mode {
+        FillSimulatorConfig {
+            touch_fill_probability: 0.9,   // Near-certain fills when price crosses
+            queue_position_factor: 0.9,    // Assume good queue position
+            ignore_book_depth: true,       // Sim orders aren't in real book
+            ..Default::default()
+        }
+    } else {
         FillSimulatorConfig {
             touch_fill_probability: 0.3,
             queue_position_factor: 0.5,
-            ignore_book_depth: true, // Sim orders aren't in real book
+            ignore_book_depth: true,
             ..Default::default()
-        },
-    );
+        }
+    };
+    let mut fill_simulator = FillSimulator::new(executor.clone(), fill_config);
 
     // Create prediction logger
     let prediction_log_path = PathBuf::from(&cli.output_dir).join("predictions.jsonl");
@@ -1362,13 +1494,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut outcome_tracker = OutcomeTracker::new(0.00015); // 1.5 bps maker fee
 
     // Initialize simulation state
-    let mut state = SimulationState::new(
-        cli.asset.clone(),
-        cli.gamma,
-        cli.target_spread_bps,
-        cli.ladder_levels,
-        cli.target_liquidity,
-    );
+    let mut state = SimulationState::new(SimulationConfig {
+        asset: cli.asset.clone(),
+        gamma: cli.gamma,
+        target_spread_bps: cli.target_spread_bps,
+        ladder_levels: cli.ladder_levels,
+        target_liquidity: cli.target_liquidity,
+        quote_lifetime_s: cli.quote_lifetime_s,
+        min_notional: cli.min_notional,
+        paper_mode: cli.paper_mode,
+    });
 
     // Restore from checkpoint if enabled
     if !cli.disable_checkpoint {
@@ -1394,10 +1529,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
                             let checkpoint_age_hours = (now_ms.saturating_sub(bundle.metadata.timestamp_ms)) as f64 / (3600.0 * 1000.0);
-                            if checkpoint_age_hours > cli.max_checkpoint_age_hours {
+                            if !cli.force_restore && checkpoint_age_hours > cli.max_checkpoint_age_hours {
                                 warn!(
-                                    "Checkpoint is {:.1} hours old (max: {}h), skipping restore",
+                                    "Checkpoint is {:.1} hours old (max: {}h), skipping restore (use --force-restore to override)",
                                     checkpoint_age_hours, cli.max_checkpoint_age_hours
+                                );
+                            } else if cli.force_restore && checkpoint_age_hours > cli.max_checkpoint_age_hours {
+                                warn!(
+                                    "Force-restoring checkpoint despite being {:.1} hours old (max: {}h)",
+                                    checkpoint_age_hours, cli.max_checkpoint_age_hours
+                                );
+                                state.restore_from_bundle(&bundle);
+                                info!(
+                                    asset = %bundle.metadata.asset,
+                                    samples = bundle.pre_fill.learning_samples,
+                                    session_s = bundle.metadata.session_duration_s,
+                                    age_hours = checkpoint_age_hours,
+                                    "Force-restored from old checkpoint"
                                 );
                             } else {
                                 state.restore_from_bundle(&bundle);
@@ -1753,7 +1901,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         last_risk_log = Instant::now();
                     }
 
-                    if let Some(ladder) = state.generate_quotes() {
+                    if let Some(mut ladder) = state.generate_quotes() {
+                        // --- Risk-based quote gating ---
+
+                        // Reduce-only mode: only quote the side that reduces inventory
+                        if risk.reduce_only {
+                            if state.inventory > 0.0 {
+                                // Long: only keep asks (selling reduces position)
+                                ladder.bids.clear();
+                                info!("[RISK] Reduce-only: clearing bids (long inventory {:.4})", state.inventory);
+                            } else if state.inventory < 0.0 {
+                                // Short: only keep bids (buying reduces position)
+                                ladder.asks.clear();
+                                info!("[RISK] Reduce-only: clearing asks (short inventory {:.4})", state.inventory);
+                            } else {
+                                // Flat: skip quoting entirely
+                                info!("[RISK] Reduce-only: flat inventory, skipping quotes");
+                                continue;
+                            }
+                        }
+
+                        // Side-specific pulls
+                        if risk.pull_buys {
+                            ladder.bids.clear();
+                            info!("[RISK] Pulling buy-side quotes");
+                        }
+                        if risk.pull_sells {
+                            ladder.asks.clear();
+                            info!("[RISK] Pulling sell-side quotes");
+                        }
+
+                        // Spread widening: push prices away from mid
+                        if risk.spread_factor > 1.0 {
+                            let mid = state.mid_price;
+                            let decimals = state.decimals;
+                            for level in ladder.bids.iter_mut() {
+                                level.price = round_to_significant_and_decimal(
+                                    mid - (mid - level.price) * risk.spread_factor,
+                                    5,
+                                    decimals,
+                                );
+                            }
+                            for level in ladder.asks.iter_mut() {
+                                level.price = round_to_significant_and_decimal(
+                                    mid + (level.price - mid) * risk.spread_factor,
+                                    5,
+                                    decimals,
+                                );
+                            }
+                            info!("[RISK] Spread widened by factor {:.2}", risk.spread_factor);
+                        }
+
+                        // Skew: shift all prices by skew offset
+                        if risk.skew_bps != 0.0 {
+                            let skew_offset = state.mid_price * risk.skew_bps / 10_000.0;
+                            let decimals = state.decimals;
+                            for level in ladder.bids.iter_mut() {
+                                level.price = round_to_significant_and_decimal(
+                                    level.price + skew_offset,
+                                    5,
+                                    decimals,
+                                );
+                            }
+                            for level in ladder.asks.iter_mut() {
+                                level.price = round_to_significant_and_decimal(
+                                    level.price + skew_offset,
+                                    5,
+                                    decimals,
+                                );
+                            }
+                            info!("[RISK] Skew applied: {:.1} bps", risk.skew_bps);
+                        }
+
+                        // --- End risk-based quote gating ---
+
                         stats.quote_cycles += 1;
 
                         // Queue-aware order management:
@@ -1852,6 +2073,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cli.target_spread_bps / 2.0,
                             cli.target_spread_bps / 2.0,
                             0.0,
+                            Some(&fill_simulator),
                         );
 
                         // Log prediction

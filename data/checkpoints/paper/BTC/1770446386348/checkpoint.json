@@ -1,9 +1,9 @@
 {
   "metadata": {
     "version": 1,
-    "timestamp_ms": 1770451878785,
+    "timestamp_ms": 1770446386348,
     "asset": "BTC",
-    "session_duration_s": 218.451502169
+    "session_duration_s": 300.003436359
   },
   "learned_params": {
     "alpha_touch": {
@@ -303,38 +303,38 @@
       0.1
     ],
     "signal_outcome_sum": [
-      14.725450739931608,
-      6.375832428398699,
-      13.518808081755001,
-      10.848104065954479,
-      10.44435559656095
+      0.33711614877283613,
+      0.550822220687662,
+      0.6977218109228718,
+      0.477303165873536,
+      0.4772927716568872
     ],
     "signal_sq_sum": [
-      12.558170071756239,
-      5.351569481855249,
-      9.723515033216279,
-      6.550356056822248,
-      6.179893204384281
+      0.11905148120632877,
+      0.31783271146757514,
+      0.5099649030679968,
+      0.238651582936768,
+      0.23864118883329646
     ],
-    "learning_samples": 52,
+    "learning_samples": 2,
     "regime_probs": [
       0.1,
       0.7,
       0.15,
       0.05
     ],
-    "imbalance_ewma_mean": 1.582589732527153,
-    "imbalance_ewma_var": 15.304347068897963,
-    "flow_ewma_mean": 0.022557399209379485,
-    "flow_ewma_var": 0.17701833001057354,
+    "imbalance_ewma_mean": -1.9502789129887252,
+    "imbalance_ewma_var": 2.092464447154418,
+    "flow_ewma_mean": -0.0034026808222923904,
+    "flow_ewma_var": 0.023542913165834387,
     "funding_ewma_mean": 0.0,
     "funding_ewma_var": 1e-12,
-    "regime_trust_prev": 0.5684075539383803,
-    "regime_ewma_mean": 0.4239102376764401,
-    "regime_ewma_var": 0.0019612901796951404,
-    "changepoint_ewma_mean": 0.019886352811215733,
+    "regime_trust_prev": 0.5654771109991539,
+    "regime_ewma_mean": 0.43576868891092674,
+    "regime_ewma_var": 2.180353279624525e-6,
+    "changepoint_ewma_mean": 0.01988816616156006,
     "changepoint_ewma_var": 1e-12,
-    "normalizer_obs_count": 2036
+    "normalizer_obs_count": 927
   },
   "enhanced": {
     "learned_weights": [
@@ -368,22 +368,22 @@
     "total_predictions": 0
   },
   "vol_filter": {
-    "sigma_mean": 0.0098831682726932,
-    "sigma_std": 0.047108874670918746,
+    "sigma_mean": 0.9999998948574748,
+    "sigma_std": 0.0003242542496020283,
     "regime_probs": [
-      0.10800000000000008,
-      0.6680000000000005,
-      0.1520000000000001,
-      0.07200000000000005
+      0.1485781420464013,
+      0.5530383373737238,
+      0.23040749352879872,
+      0.06797602705107683
     ],
-    "observation_count": 816
+    "observation_count": 271
   },
   "regime_hmm": {
     "belief": [
-      0.0013504508105259033,
-      0.0038552540190317343,
-      0.9947929131994062,
-      1.3819710360083594e-6
+      0.5657914447667239,
+      0.43168687985936954,
+      0.0025216753739032262,
+      3.259529888730104e-15
     ],
     "transition_counts": [
       [
@@ -411,83 +411,83 @@
         0.0
       ]
     ],
-    "observation_count": 5535,
-    "recalibration_count": 3
+    "observation_count": 1360,
+    "recalibration_count": 1
   },
   "informed_flow": {
     "component_params": [
       {
-        "mu_size": -3.1219061969381197,
-        "sigma_size": 0.8051271498249325,
-        "lambda_0": 10.0,
+        "mu_size": -1.8379880352283047,
+        "sigma_size": 0.9314082242295866,
+        "lambda_0": 7.038489725740654,
         "alpha": 0.5,
         "beta": 2.0,
-        "impact_per_unit": -10.0,
-        "impact_variance": 0.8884697119639843
+        "impact_per_unit": -0.06989533700304358,
+        "impact_variance": 0.4619755588550401
       },
       {
-        "mu_size": -4.604221062384568,
-        "sigma_size": 0.1,
-        "lambda_0": 5.083265118435847,
+        "mu_size": -4.531120119229405,
+        "sigma_size": 0.2597585877511317,
+        "lambda_0": 1.6952901997092067,
         "alpha": 0.1,
         "beta": 5.0,
         "impact_per_unit": 10.0,
-        "impact_variance": 7.202584973116504
+        "impact_variance": 0.7657293369919825
       },
       {
-        "mu_size": -1.8286652958037102,
-        "sigma_size": 1.0258623860072775,
-        "lambda_0": 10.0,
+        "mu_size": -2.4267468283658067,
+        "sigma_size": 0.2021889258905931,
+        "lambda_0": 1.923908130761496,
         "alpha": 0.8,
         "beta": 1.0,
-        "impact_per_unit": -1.002859185759948,
-        "impact_variance": 0.14019792058289515
+        "impact_per_unit": -1.8137807893605906,
+        "impact_variance": 0.1
       }
     ],
     "mixing_weights": [
-      0.436888591796498,
-      0.4430284665888989,
-      0.12008294161460319
+      0.10446980560598598,
+      0.873784641546268,
+      0.021745552847745996
     ],
-    "observation_count": 5535
+    "observation_count": 1360
   },
   "fill_rate": {
-    "lambda_0_mean": 0.026527970526667815,
-    "lambda_0_variance": 0.00019007600381070006,
-    "lambda_0_n_obs": 58.88376176631044,
+    "lambda_0_mean": 0.07550962518909145,
+    "lambda_0_variance": 0.004657246767652714,
+    "lambda_0_n_obs": 11.855419540370628,
     "delta_char_mean": 10.0,
-    "delta_char_variance": 31.383363915869957,
-    "delta_char_n_obs": 3.1864015682981623,
-    "observation_count": 65
+    "delta_char_variance": 20.27918959580058,
+    "delta_char_n_obs": 4.931163522466797,
+    "observation_count": 2
   },
   "kappa_own": {
     "prior_alpha": 5.0,
     "prior_beta": 0.002,
-    "observation_count": 65,
-    "sum_distances": 0.0006500000000000011,
-    "sum_sq_distances": 6.500000000000004e-9,
-    "kappa_posterior_mean": 26415.09433962263
+    "observation_count": 2,
+    "sum_distances": 0.00002,
+    "sum_sq_distances": 2.0000000000000003e-10,
+    "kappa_posterior_mean": 3465.3465346534654
   },
   "kappa_bid": {
     "prior_alpha": 5.0,
     "prior_beta": 0.002,
-    "observation_count": 43,
-    "sum_distances": 0.00043000000000000053,
-    "sum_sq_distances": 4.300000000000002e-9,
-    "kappa_posterior_mean": 19753.08641975308
+    "observation_count": 0,
+    "sum_distances": 0.0,
+    "sum_sq_distances": 0.0,
+    "kappa_posterior_mean": 2500.0
   },
   "kappa_ask": {
     "prior_alpha": 5.0,
     "prior_beta": 0.002,
-    "observation_count": 22,
-    "sum_distances": 0.00022,
-    "sum_sq_distances": 2.200000000000001e-9,
-    "kappa_posterior_mean": 12162.162162162162
+    "observation_count": 2,
+    "sum_distances": 0.00002,
+    "sum_sq_distances": 2.0000000000000003e-10,
+    "kappa_posterior_mean": 3465.3465346534654
   },
   "momentum": {
     "continuation_by_magnitude": [
-      0.603514629016612,
-      0.4857129700092066,
+      0.7948425300744678,
+      0.5,
       0.5,
       0.5,
       0.5,
@@ -498,8 +498,8 @@
       0.5
     ],
     "counts_by_magnitude": [
-      387,
-      63,
+      105,
+      0,
       0,
       0,
       0,
