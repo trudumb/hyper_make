@@ -140,6 +140,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     pub(crate) async fn place_new_order(&mut self, side: Side, quote: &Quote) -> Result<()> {
         let is_buy = side == Side::Buy;
 
+        // === Position Guard Hard Entry Gate ===
+        // Reject orders that would push worst-case position beyond hard limit
+        let entry_check = self.safety.position_guard.check_order_entry(
+            self.position.position(),
+            quote.size,
+            side,
+        );
+        if !entry_check.is_allowed() {
+            if let super::super::risk::OrderEntryCheck::Rejected { reason, .. } = &entry_check {
+                warn!(
+                    side = %side_str(side),
+                    size = quote.size,
+                    position = self.position.position(),
+                    "{reason}"
+                );
+            }
+            return Ok(());
+        }
+
         // === Margin Pre-Flight Check ===
         // Verify order meets margin requirements before placing
         let sizing_result = self.infra.margin_sizer.adjust_size(

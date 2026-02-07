@@ -77,7 +77,7 @@ use hyperliquid_rust_sdk::market_maker::{
     BookLevel as EstimatorBookLevel, CumulativeOFI, CumulativeOFIConfig, EnhancedFlowConfig,
     EnhancedFlowEstimator, HmmObservation, LiquidityEvaporationConfig,
     LiquidityEvaporationDetector, RegimeHMM, ThresholdKappa, ThresholdKappaConfig,
-    TradeSizeDistribution, TradeSizeDistributionConfig, VpinConfig, VpinEstimator,
+    TradeFeatures, TradeSizeDistribution, TradeSizeDistributionConfig, VpinConfig, VpinEstimator,
     // Infra
     MarginAwareSizer, MarginConfig,
     // Strategy/params
@@ -412,6 +412,8 @@ struct SimulationState {
     cached_bid_sizes: Vec<f64>,
     cached_ask_sizes: Vec<f64>,
     cached_trades: VecDeque<(f64, bool, u64)>,
+    /// Last trade timestamp for inter-arrival computation
+    last_trade_ms: u64,
 
     // === Signal health logging ===
     last_signal_log: Instant,
@@ -569,6 +571,7 @@ impl SimulationState {
             cached_bid_sizes: Vec::new(),
             cached_ask_sizes: Vec::new(),
             cached_trades: VecDeque::new(),
+            last_trade_ms: 0,
             // Signal health logging
             last_signal_log: Instant::now(),
             // Checkpoint persistence
@@ -610,6 +613,10 @@ impl SimulationState {
 
             // Check pending fill outcomes for adverse selection learning
             self.check_adverse_selection_outcomes();
+
+            // === FIX: Update AS estimator with current mid to resolve pending fills ===
+            // Without this, horizon_stats.as_ewma stays at 0.0 and edge prediction has no AS correction
+            self.adverse_selection.update(mid);
 
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -736,6 +743,39 @@ impl SimulationState {
         // 3. Signal integrator: buy pressure tracking
         self.signal_integrator.on_trade_for_pressure(size, is_buy);
 
+        // 3a. Signal integrator: InformedFlow EM estimator
+        {
+            let inter_arrival_ms = if self.last_trade_ms > 0 {
+                now_ms.saturating_sub(self.last_trade_ms)
+            } else {
+                1000 // default 1s for first trade
+            };
+            // Book imbalance from cached sizes: (bid_depth - ask_depth) / (bid_depth + ask_depth)
+            let bid_depth: f64 = self.cached_bid_sizes.iter().sum();
+            let ask_depth: f64 = self.cached_ask_sizes.iter().sum();
+            let book_imbalance = if bid_depth + ask_depth > 0.0 {
+                (bid_depth - ask_depth) / (bid_depth + ask_depth)
+            } else {
+                0.0
+            };
+            // Price impact: how much the mid moved since last trade (crude proxy)
+            let price_impact_bps = if self.prev_mid > 0.0 {
+                ((self.mid_price - self.prev_mid) / self.prev_mid).abs() * 10_000.0
+            } else {
+                0.0
+            };
+            let features = TradeFeatures {
+                size,
+                inter_arrival_ms,
+                price_impact_bps,
+                book_imbalance,
+                is_buy,
+                timestamp_ms: now_ms,
+            };
+            self.signal_integrator.on_trade(&features);
+            self.last_trade_ms = now_ms;
+        }
+
         // 3b. Hawkes order flow (feeds flow_imbalance for HMM observations)
         self.hawkes.record_trade(is_buy, size);
 
@@ -827,6 +867,12 @@ impl SimulationState {
             liquidation_pressure,
         );
         self.regime_hmm.forward_update(&obs);
+
+        // 8b. Feed regime probabilities to signal integrator for regime-aware kappa blending
+        {
+            let probs = self.regime_hmm.regime_probabilities();
+            self.signal_integrator.set_regime_probabilities(probs);
+        }
 
         // 9. Position continuation model: sync regime
         let regime_probs = self.regime_hmm.regime_probabilities();
@@ -1216,6 +1262,23 @@ impl SimulationState {
         // === FIX: Wire calibration controller fill tracking ===
         self.calibration_controller.record_fill();
 
+        // === FIX: Wire signal integrator fill tracking (kappa + model gating) ===
+        self.signal_integrator.on_fill(
+            timestamp_ms,
+            fill.fill_price,
+            fill.fill_size,
+            self.mid_price,
+        );
+
+        // === FIX: Wire adverse selection estimator fill tracking ===
+        // Without this, the AS estimator never sees fills and best_horizon_as_bps() returns 0.0 forever
+        self.adverse_selection.record_fill(
+            fill.oid,
+            fill.fill_size,
+            is_buy,
+            self.mid_price,
+        );
+
         // === FIX: Queue fill for adverse selection outcome tracking ===
         self.pending_fill_outcomes.push_back(PendingFillOutcome {
             timestamp_ns: fill.timestamp_ns,
@@ -1277,6 +1340,11 @@ impl SimulationState {
                 was_adverse,
                 Some(magnitude_bps),
             );
+
+            // === FIX: Wire model gating AS prediction feedback ===
+            // This lets model_gating track how well the AS classifier predicts adverse fills
+            let predicted_as_prob = self.pre_fill_classifier.cached_toxicity();
+            self.signal_integrator.update_as_prediction(predicted_as_prob, was_adverse);
 
             if was_adverse {
                 info!(
@@ -2000,7 +2068,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pnl: fill_pnl,
                                 cum_pnl: cumulative_pnl,
                                 side: if fill.side == Side::Buy { "BID".to_string() } else { "ASK".to_string() },
-                                adverse_selection: "0.0".to_string(),
+                                adverse_selection: format!("{predicted_as:.2}"),
                             };
 
                             // Keep last 100 fills

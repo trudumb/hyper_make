@@ -2,20 +2,25 @@
 
 ## Edge Prediction Overshoot Analysis (2026-02-07)
 
-Predicted 7.24 bps vs realized 2.87 bps (2.5x overshoot). Three root causes identified and two fixed:
+### 40x Overshoot Root Cause (predicted 58.4 bps, realized 1.44 bps)
 
-### Fixes Applied
+Four bugs in `src/bin/paper_trader.rs` (lead-owned), all in EdgeSnapshot construction:
+
+1. **predicted_spread == realized_spread**: Both use `fill_depth_bps * 2.0` (line 2033-2034)
+2. **predicted_edge uses raw depth, not GLFT spread**: `fill_depth_bps * 2.0` (~30 bps) instead of GLFT half-spread (~5.5 bps)
+3. **AS estimator never fed fills**: `adverse_selection.record_fill()` never called, so `best_horizon_as_bps()` always returns 0.0
+4. **realized_as = min(depth, predicted_as) = 0**: Since predicted_as=0, realized_as=0 always
+
+Compound effect: predicted_edge = 30 - 0 - 1.5 = 28.5 bps vs realized ~0.7 bps = 40x
+
+### Earlier Fixes (2.5x overshoot phase)
 1. **adverse_prior raised from 0.15 to 0.25** in `TheoreticalEdgeConfig::default()`
-   - 0.15 underestimates BTC's 20-30% informed flow on Hyperliquid
-   - ~1-2 bps overshoot contribution
-2. **Fill dampening floor tightened from 0.5 to 0.3** in both `calculate_edge()` and `calculate_edge_enhanced()`
-   - Range now [0.3, 1.0] instead of [0.5, 1.0]
-   - ~1 bps overshoot contribution
+2. **Fill dampening floor tightened from 0.5 to 0.3** in `calculate_edge()` and `calculate_edge_enhanced()`
 
 ### Pending Fix (Needs Coordination)
-3. **Spread capture uses market spread, not our spread** - biggest contributor (~2 bps)
+3. **Spread capture uses market spread, not our spread** in TheoreticalEdgeEstimator
    - `spread_edge_bps = spread_bps / 2.0` uses L2 market spread
-   - Should use min(market_spread, our_GLFT_spread) since we capture at most our own half-spread
+   - Should use min(market_spread, our_GLFT_spread)
    - Requires passing GLFT-computed half-spread to `calculate_edge()` callers
 
 ### Key Formula Reference

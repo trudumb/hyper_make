@@ -1316,21 +1316,23 @@ impl BuyPressureTracker {
                 0.5
             };
 
-            // Update EWMA
+            // Compute z-score BEFORE updating EWMA (prevents update-before-compute compression)
             if !self.initialized {
                 self.ewma_mean = buy_ratio;
                 self.ewma_var = 0.01; // Initial variance
                 self.initialized = true;
+                self.cached_z_score = 0.0; // No z-score on first window
             } else {
+                // Pre-compute z-score using PREVIOUS EWMA state
+                let std = self.ewma_var.sqrt().max(1e-6);
+                self.cached_z_score = (buy_ratio - self.ewma_mean) / std;
+
+                // THEN update EWMA mean and variance
                 let diff = buy_ratio - self.ewma_mean;
                 self.ewma_mean += self.alpha * diff;
                 // Welford-style incremental variance with EMA weighting
                 self.ewma_var = (1.0 - self.alpha) * (self.ewma_var + self.alpha * diff * diff);
             }
-
-            // Compute z-score
-            let std = self.ewma_var.sqrt().max(1e-6);
-            self.cached_z_score = (buy_ratio - self.ewma_mean) / std;
 
             // Reset window
             self.window_buy_volume = 0.0;

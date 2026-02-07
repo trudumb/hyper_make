@@ -47,7 +47,7 @@ use crate::market_maker::{
     },
     risk::{
         CircuitBreakerConfig, CircuitBreakerMonitor, DrawdownConfig, DrawdownTracker, KillSwitch,
-        KillSwitchConfig, RiskAggregator, RiskChecker, RiskLimits,
+        KillSwitchConfig, PositionGuard, RiskAggregator, RiskChecker, RiskLimits,
     },
     tracking::{
         ImpulseFilter, ModelCalibrationOrchestrator, PnLConfig, PnLTracker, QueueConfig,
@@ -165,16 +165,25 @@ pub struct SafetyComponents {
     pub drawdown_tracker: DrawdownTracker,
     /// Signal diagnostic store for fill analysis
     pub signal_store: FillSignalStore,
+    /// Pre-order position guard (hard entry gate)
+    pub position_guard: PositionGuard,
 }
 
 impl SafetyComponents {
     /// Create safety components from config.
-    pub fn new(kill_switch_config: KillSwitchConfig, risk_aggregator: RiskAggregator) -> Self {
+    pub fn new(
+        kill_switch_config: KillSwitchConfig,
+        risk_aggregator: RiskAggregator,
+        max_position: f64,
+        gamma: f64,
+    ) -> Self {
         Self::with_risk_limits(
             kill_switch_config,
             risk_aggregator,
             RiskLimits::default(),
             DrawdownConfig::default(),
+            max_position,
+            gamma,
         )
     }
 
@@ -184,6 +193,8 @@ impl SafetyComponents {
         risk_aggregator: RiskAggregator,
         risk_limits: RiskLimits,
         drawdown_config: DrawdownConfig,
+        max_position: f64,
+        gamma: f64,
     ) -> Self {
         Self {
             kill_switch: KillSwitch::new(kill_switch_config),
@@ -193,6 +204,7 @@ impl SafetyComponents {
             // Initial equity of 10,000 is a placeholder; updated on first margin refresh
             drawdown_tracker: DrawdownTracker::new(drawdown_config, 10_000.0),
             signal_store: FillSignalStore::new(),
+            position_guard: PositionGuard::new(max_position, gamma),
         }
     }
 }
@@ -803,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_safety_components_construction() {
-        let safety = SafetyComponents::new(KillSwitchConfig::default(), RiskAggregator::new());
+        let safety = SafetyComponents::new(KillSwitchConfig::default(), RiskAggregator::new(), 1.0, 0.1);
         // Kill switch should not be triggered initially
         assert!(!safety.kill_switch.is_triggered());
         // Risk checker should be created with defaults
@@ -819,6 +831,8 @@ mod tests {
             RiskAggregator::new(),
             limits,
             DrawdownConfig::default(),
+            1.0,  // max_position
+            0.15, // gamma
         );
         // Risk checker should enforce the custom limit
         assert_eq!(

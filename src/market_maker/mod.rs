@@ -300,6 +300,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let safety = core::SafetyComponents::new(
             kill_switch_config.clone(),
             Self::build_risk_aggregator(&kill_switch_config),
+            config.max_position,
+            config.risk_aversion,
         );
         let infra = core::InfraComponents::new(
             margin_config,
@@ -709,7 +711,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         risk::RiskAggregator::new()
             .with_monitor(Box::new(LossMonitor::new(config.max_daily_loss)))
-            .with_monitor(Box::new(DrawdownMonitor::new(config.max_drawdown / 100.0)))
+            .with_monitor(Box::new(DrawdownMonitor::new(config.max_drawdown)))
             .with_monitor(Box::new(PositionMonitor::new()))
             .with_monitor(Box::new(DataStalenessMonitor::new(
                 config.stale_data_threshold,
