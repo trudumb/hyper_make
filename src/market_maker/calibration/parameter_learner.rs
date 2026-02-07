@@ -775,37 +775,30 @@ impl Default for LearnedParameters {
 impl LearnedParameters {
     /// Create parameters optimized for liquid markets (BTC mainnet).
     pub fn for_liquid_market() -> Self {
-        let mut params = Self::default();
-
-        // Liquid markets have lower adverse selection
-        params.alpha_touch = BayesianParam::beta("alpha_touch", 0.20, 10.0);
-
-        // Higher kappa (more fills per unit spread)
-        params.kappa = BayesianParam::gamma("kappa", 3000.0, 5.0);
-
-        // Tighter spread floor
-        params.spread_floor_bps = BayesianParam::normal("spread_floor_bps", 4.0, 1.0);
-
-        params
+        Self {
+            // Liquid markets have lower adverse selection
+            alpha_touch: BayesianParam::beta("alpha_touch", 0.20, 10.0),
+            // Higher kappa (more fills per unit spread)
+            kappa: BayesianParam::gamma("kappa", 3000.0, 5.0),
+            // Tighter spread floor
+            spread_floor_bps: BayesianParam::normal("spread_floor_bps", 4.0, 1.0),
+            ..Self::default()
+        }
     }
 
     /// Create parameters optimized for thin DEX markets (HIP-3).
     pub fn for_thin_dex() -> Self {
-        let mut params = Self::default();
-
-        // Thin markets have higher adverse selection
-        params.alpha_touch = BayesianParam::beta("alpha_touch", 0.30, 6.0);
-
-        // Lower kappa (fewer fills)
-        params.kappa = BayesianParam::gamma("kappa", 1000.0, 3.0);
-
-        // Wider spread floor
-        params.spread_floor_bps = BayesianParam::normal("spread_floor_bps", 8.0, 4.0);
-
-        // Higher regime stickiness (regimes change slowly)
-        params.regime_sticky_diagonal = BayesianParam::beta("regime_sticky_diagonal", 0.98, 100.0);
-
-        params
+        Self {
+            // Thin markets have higher adverse selection
+            alpha_touch: BayesianParam::beta("alpha_touch", 0.30, 6.0),
+            // Lower kappa (fewer fills)
+            kappa: BayesianParam::gamma("kappa", 1000.0, 3.0),
+            // Wider spread floor
+            spread_floor_bps: BayesianParam::normal("spread_floor_bps", 8.0, 4.0),
+            // Higher regime stickiness (regimes change slowly)
+            regime_sticky_diagonal: BayesianParam::beta("regime_sticky_diagonal", 0.98, 100.0),
+            ..Self::default()
+        }
     }
 
     /// Reset all parameters to their priors.

@@ -52,10 +52,20 @@ use crate::market_maker::estimator::{
     BinanceFlowAnalyzer, BinanceFlowConfig, BuyPressureTracker, CrossVenueAnalyzer,
     CrossVenueConfig, CrossVenueFeatures, FlowDecomposition, FlowFeatureVec, InformedFlowConfig,
     InformedFlowEstimator, LagAnalyzer, LagAnalyzerConfig, LeadLagStabilityGate,
-    RegimeKappaConfig, RegimeKappaEstimator, TradeFeatures, VolatilityRegime,
+    RegimeKappaConfig, RegimeKappaEstimator, TimestampRange, TradeFeatures, VolatilityRegime,
 };
 use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
 use tracing::{debug, info};
+
+/// Lag analyzer diagnostic status.
+pub struct LagAnalyzerStatus<'a> {
+    pub is_ready: bool,
+    pub observation_counts: (usize, usize),
+    pub optimal_lag_ms: Option<i64>,
+    pub mi_bits: Option<f64>,
+    pub last_signal: &'a LeadLagSignal,
+    pub sample_timestamps: (TimestampRange, TimestampRange),
+}
 
 /// Configuration for signal integrator.
 #[derive(Debug, Clone)]
@@ -600,11 +610,11 @@ impl SignalIntegrator {
 
     /// Get integrated signals for quote generation.
     pub fn get_signals(&self) -> IntegratedSignals {
-        let mut signals = IntegratedSignals::default();
-
-        // === Lead-Lag Significance Diagnostics ===
-        signals.lead_lag_significant = self.lag_analyzer.is_lag_significant();
-        signals.lead_lag_null_p95 = self.lag_analyzer.null_mi_p95();
+        let mut signals = IntegratedSignals {
+            lead_lag_significant: self.lag_analyzer.is_lag_significant(),
+            lead_lag_null_p95: self.lag_analyzer.null_mi_p95(),
+            ..Default::default()
+        };
 
         // === Lead-Lag Signal ===
         if self.config.use_lead_lag && self.last_lead_lag_signal.is_actionable {
@@ -800,7 +810,7 @@ impl SignalIntegrator {
         signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps;
 
         // Log periodically
-        if self.update_count % 100 == 0 && self.update_count > 0 {
+        if self.update_count.is_multiple_of(100) && self.update_count > 0 {
             self.log_status(&signals);
         }
 
@@ -839,30 +849,19 @@ impl SignalIntegrator {
     }
 
     /// Get lag analyzer status for diagnostics.
-    /// Returns (is_ready, (signal_count, target_count), optimal_lag_ms, mi_bits, last_signal, sample_timestamps)
-    #[allow(clippy::type_complexity)]
-    pub fn lag_analyzer_status(
-        &self,
-    ) -> (
-        bool,
-        (usize, usize),
-        Option<i64>,
-        Option<f64>,
-        &LeadLagSignal,
-        ((Option<i64>, Option<i64>), (Option<i64>, Option<i64>)),
-    ) {
-        let (lag, mi) = self
+    pub fn lag_analyzer_status(&self) -> LagAnalyzerStatus<'_> {
+        let (optimal_lag_ms, mi_bits) = self
             .lag_analyzer
             .optimal_lag()
             .map_or((None, None), |(l, m)| (Some(l), Some(m)));
-        (
-            self.lag_analyzer.is_ready(),
-            self.lag_analyzer.observation_counts(),
-            lag,
-            mi,
-            &self.last_lead_lag_signal,
-            self.lag_analyzer.sample_timestamps(),
-        )
+        LagAnalyzerStatus {
+            is_ready: self.lag_analyzer.is_ready(),
+            observation_counts: self.lag_analyzer.observation_counts(),
+            optimal_lag_ms,
+            mi_bits,
+            last_signal: &self.last_lead_lag_signal,
+            sample_timestamps: self.lag_analyzer.sample_timestamps(),
+        }
     }
 
     /// Log current status.

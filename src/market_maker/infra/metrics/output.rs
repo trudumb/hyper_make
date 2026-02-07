@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
-use super::dashboard::DashboardState;
+use super::dashboard::{DashboardSnapshotParams, DashboardState};
 use super::summary::MetricsSummary;
 use super::PrometheusMetrics;
 
@@ -890,7 +890,7 @@ impl PrometheusMetrics {
         let fees = self.dashboard.total_fees();
 
         // Use dashboard aggregator snapshot to get fills, calibration, and regime history
-        self.dashboard.snapshot(
+        let params = DashboardSnapshotParams {
             mid_price,
             spread_bps,
             position,
@@ -899,12 +899,13 @@ impl PrometheusMetrics {
             cascade_severity,
             jump_ratio,
             sigma,
-            fill_prob * 100.0, // As percentage
-            adverse_prob * 100.0,
+            fill_prob: fill_prob * 100.0, // As percentage
+            adverse_prob: adverse_prob * 100.0,
             spread_capture,
             adverse_selection,
             inventory_cost,
             fees,
-        )
+        };
+        self.dashboard.snapshot(&params)
     }
 }

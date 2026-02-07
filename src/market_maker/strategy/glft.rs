@@ -370,7 +370,7 @@ impl GLFTStrategy {
     /// - Mean-reverting: Don't chase (0.3x)
     /// - Volatile: Cautious (0.5x)
     /// - Quiet: Normal (1.0x)
-    /// Compute proactive directional skew based on momentum predictions.
+    ///   Compute proactive directional skew based on momentum predictions.
     ///
     /// This is the OPPOSITE of inventory skew - we WANT to get filled WITH momentum
     /// to BUILD position in a profitable direction.

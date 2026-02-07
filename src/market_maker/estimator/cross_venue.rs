@@ -178,7 +178,7 @@ impl CrossVenueFeatures {
 }
 
 /// Bivariate flow observation - joint snapshot of both venues.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BivariateFlowObservation {
     /// Binance flow features.
     pub binance: FlowFeatureVec,
@@ -191,17 +191,6 @@ pub struct BivariateFlowObservation {
 
     /// Timestamp of observation (ms).
     pub timestamp_ms: i64,
-}
-
-impl Default for BivariateFlowObservation {
-    fn default() -> Self {
-        Self {
-            binance: FlowFeatureVec::default(),
-            hl: FlowFeatureVec::default(),
-            cross: CrossVenueFeatures::default(),
-            timestamp_ms: 0,
-        }
-    }
 }
 
 /// Rolling correlation tracker.

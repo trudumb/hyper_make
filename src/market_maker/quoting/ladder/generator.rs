@@ -123,13 +123,14 @@ impl Ladder {
         // 6. Apply RL policy adjustments (spread delta + asymmetric skew)
         apply_rl_adjustments(
             &mut ladder,
-            params.rl_spread_delta_bps,
-            params.rl_bid_skew_bps,
-            params.rl_ask_skew_bps,
-            params.rl_confidence,
-            params.mid_price,
-            params.market_mid,
-            params.decimals,
+            &RlAdjustmentParams {
+                spread_delta_bps: params.rl_spread_delta_bps,
+                bid_skew_bps: params.rl_bid_skew_bps,
+                ask_skew_bps: params.rl_ask_skew_bps,
+                confidence: params.rl_confidence,
+                market_mid: params.market_mid,
+                decimals: params.decimals,
+            },
         );
 
         ladder
@@ -246,13 +247,14 @@ impl Ladder {
         // 7. Apply RL policy adjustments (spread delta + asymmetric skew)
         apply_rl_adjustments(
             &mut ladder,
-            params.rl_spread_delta_bps,
-            params.rl_bid_skew_bps,
-            params.rl_ask_skew_bps,
-            params.rl_confidence,
-            params.mid_price,
-            params.market_mid,
-            params.decimals,
+            &RlAdjustmentParams {
+                spread_delta_bps: params.rl_spread_delta_bps,
+                bid_skew_bps: params.rl_bid_skew_bps,
+                ask_skew_bps: params.rl_ask_skew_bps,
+                confidence: params.rl_confidence,
+                market_mid: params.market_mid,
+                decimals: params.decimals,
+            },
         );
 
         ladder
@@ -876,7 +878,7 @@ pub(crate) fn apply_inventory_skew_with_drift(
     // This prevents cascading errors from upstream bugs (e.g., reservation_shift overflow)
     let safe_mid = {
         let ratio = mid / market_mid;
-        if ratio < 0.8 || ratio > 1.2 {
+        if !(0.8..=1.2).contains(&ratio) {
             tracing::error!(
                 microprice = %format!("{:.4}", mid),
                 market_mid = %format!("{:.4}", market_mid),
@@ -948,6 +950,16 @@ pub(crate) fn apply_inventory_skew_with_drift(
     }
 }
 
+/// RL policy adjustments for quote ladder modification.
+pub(crate) struct RlAdjustmentParams {
+    pub spread_delta_bps: f64,
+    pub bid_skew_bps: f64,
+    pub ask_skew_bps: f64,
+    pub confidence: f64,
+    pub market_mid: f64,
+    pub decimals: u32,
+}
+
 /// Apply RL policy adjustments to the ladder.
 ///
 /// RL recommendations adjust quotes after all other calculations:
@@ -962,29 +974,20 @@ pub(crate) fn apply_inventory_skew_with_drift(
 /// - Bids cannot go above market_mid (prevents crossing)
 /// - Asks cannot go below market_mid (prevents crossing)
 /// - Max adjustment capped at ±5 bps per side
-pub(crate) fn apply_rl_adjustments(
-    ladder: &mut Ladder,
-    spread_delta_bps: f64,
-    bid_skew_bps: f64,
-    ask_skew_bps: f64,
-    confidence: f64,
-    _mid: f64,
-    market_mid: f64,
-    decimals: u32,
-) {
+pub(crate) fn apply_rl_adjustments(ladder: &mut Ladder, params: &RlAdjustmentParams) {
     // Skip if confidence too low or no adjustment needed
-    if confidence < 0.1 {
+    if params.confidence < 0.1 {
         return;
     }
 
     // Scale adjustments by confidence
-    let effective_confidence = confidence.clamp(0.0, 1.0);
+    let effective_confidence = params.confidence.clamp(0.0, 1.0);
 
     // Total bid adjustment: spread_delta (widens both) + bid_skew (positive widens bid)
     // Positive spread_delta = widen = move bid DOWN (further from mid)
     // Positive bid_skew = widen bid = move bid DOWN
-    let raw_bid_adj_bps = spread_delta_bps + bid_skew_bps;
-    let raw_ask_adj_bps = spread_delta_bps + ask_skew_bps;
+    let raw_bid_adj_bps = params.spread_delta_bps + params.bid_skew_bps;
+    let raw_ask_adj_bps = params.spread_delta_bps + params.ask_skew_bps;
 
     // Clamp to reasonable bounds before scaling
     let clamped_bid_adj = raw_bid_adj_bps.clamp(-5.0, 5.0);
@@ -1001,10 +1004,10 @@ pub(crate) fn apply_rl_adjustments(
 
     // Log RL adjustment
     tracing::info!(
-        spread_delta_bps = %format!("{:.2}", spread_delta_bps),
-        bid_skew_bps = %format!("{:.2}", bid_skew_bps),
-        ask_skew_bps = %format!("{:.2}", ask_skew_bps),
-        confidence = %format!("{:.2}", confidence),
+        spread_delta_bps = %format!("{:.2}", params.spread_delta_bps),
+        bid_skew_bps = %format!("{:.2}", params.bid_skew_bps),
+        ask_skew_bps = %format!("{:.2}", params.ask_skew_bps),
+        confidence = %format!("{:.2}", params.confidence),
         effective_bid_adj_bps = %format!("{:.2}", bid_adj_bps),
         effective_ask_adj_bps = %format!("{:.2}", ask_adj_bps),
         "RL adjustment applied to ladder"
@@ -1015,8 +1018,8 @@ pub(crate) fn apply_rl_adjustments(
         let adj_frac = bid_adj_bps / 10000.0;
         let new_price = level.price * (1.0 - adj_frac);
         // Safety: don't let bid go above market_mid
-        let safe_price = new_price.min(market_mid * 0.9999);
-        level.price = round_to_significant_and_decimal(safe_price, 5, decimals);
+        let safe_price = new_price.min(params.market_mid * 0.9999);
+        level.price = round_to_significant_and_decimal(safe_price, 5, params.decimals);
     }
 
     // Apply to asks: positive adjustment = widen = higher price
@@ -1024,8 +1027,8 @@ pub(crate) fn apply_rl_adjustments(
         let adj_frac = ask_adj_bps / 10000.0;
         let new_price = level.price * (1.0 + adj_frac);
         // Safety: don't let ask go below market_mid
-        let safe_price = new_price.max(market_mid * 1.0001);
-        level.price = round_to_significant_and_decimal(safe_price, 5, decimals);
+        let safe_price = new_price.max(params.market_mid * 1.0001);
+        level.price = round_to_significant_and_decimal(safe_price, 5, params.decimals);
     }
 }
 
@@ -1549,13 +1552,14 @@ mod tests {
         // RL recommends widening by 2 bps with high confidence
         apply_rl_adjustments(
             &mut ladder,
-            2.0,  // spread_delta: widen both sides by 2 bps
-            0.0,  // no bid skew
-            0.0,  // no ask skew
-            0.9,  // 90% confidence
-            100.0,
-            100.0,
-            2,
+            &RlAdjustmentParams {
+                spread_delta_bps: 2.0,  // widen both sides by 2 bps
+                bid_skew_bps: 0.0,      // no bid skew
+                ask_skew_bps: 0.0,      // no ask skew
+                confidence: 0.9,        // 90% confidence
+                market_mid: 100.0,
+                decimals: 2,
+            },
         );
 
         // Bids should be LOWER (further from mid) after widening
@@ -1583,13 +1587,14 @@ mod tests {
         // This creates asymmetry favoring buying
         apply_rl_adjustments(
             &mut ladder,
-            0.0,   // no symmetric spread delta
-            2.0,   // widen bid by 2 bps
-            -2.0,  // tighten ask by 2 bps
-            1.0,   // 100% confidence
-            100.0,
-            100.0,
-            2,
+            &RlAdjustmentParams {
+                spread_delta_bps: 0.0,   // no symmetric spread delta
+                bid_skew_bps: 2.0,       // widen bid by 2 bps
+                ask_skew_bps: -2.0,      // tighten ask by 2 bps
+                confidence: 1.0,         // 100% confidence
+                market_mid: 100.0,
+                decimals: 2,
+            },
         );
 
         // Bid widened = lower price
@@ -1615,13 +1620,14 @@ mod tests {
         // RL recommends large adjustment but with LOW confidence
         apply_rl_adjustments(
             &mut ladder,
-            5.0,  // large spread delta
-            0.0,
-            0.0,
-            0.05, // Only 5% confidence - below 10% threshold
-            100.0,
-            100.0,
-            2,
+            &RlAdjustmentParams {
+                spread_delta_bps: 5.0,  // large spread delta
+                bid_skew_bps: 0.0,
+                ask_skew_bps: 0.0,
+                confidence: 0.05, // Only 5% confidence - below 10% threshold
+                market_mid: 100.0,
+                decimals: 2,
+            },
         );
 
         // Prices should be unchanged (low confidence ignored)
@@ -1643,13 +1649,14 @@ mod tests {
         // RL recommends TIGHTENING (negative) which could cross mid
         apply_rl_adjustments(
             &mut ladder,
-            -10.0,  // Aggressive tightening
-            0.0,
-            0.0,
-            1.0,
-            100.0,
-            100.0, // market_mid = 100
-            2,
+            &RlAdjustmentParams {
+                spread_delta_bps: -10.0,  // Aggressive tightening
+                bid_skew_bps: 0.0,
+                ask_skew_bps: 0.0,
+                confidence: 1.0,
+                market_mid: 100.0, // market_mid = 100
+                decimals: 2,
+            },
         );
 
         // Safety guard: bid should not go above market_mid * 0.9999

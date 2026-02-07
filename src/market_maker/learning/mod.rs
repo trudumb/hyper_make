@@ -606,12 +606,10 @@ impl LearningModule {
         // Calculate p_positive_edge
         let p_positive = if prediction.std > 1e-9 {
             crate::market_maker::control::types::normal_cdf(prediction.mean / prediction.std)
+        } else if prediction.mean > 0.0 {
+            1.0
         } else {
-            if prediction.mean > 0.0 {
-                1.0
-            } else {
-                0.0
-            }
+            0.0
         };
 
         LearningModuleOutput {

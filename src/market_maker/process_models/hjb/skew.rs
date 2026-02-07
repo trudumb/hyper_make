@@ -743,7 +743,7 @@ impl HJBInventoryController {
             }
         }
 
-        q.max(0.0).min(100.0) // Cap at 100 units
+        q.clamp(0.0, 100.0) // Cap at 100 units
     }
 
     /// Get queue value configuration parameters for diagnostics.

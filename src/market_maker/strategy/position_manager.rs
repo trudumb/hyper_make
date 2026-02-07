@@ -261,7 +261,7 @@ impl PositionDecisionEngine {
     /// * `size` - Fill size (used for weight calculation)
     pub fn observe_fill(&mut self, fill_side_sign: f64, position_sign: f64, size: f64) {
         let is_aligned = fill_side_sign * position_sign > 0.0;
-        let weight = size.sqrt().max(0.1).min(3.0); // Size-weighted update
+        let weight = size.sqrt().clamp(0.1, 3.0); // Size-weighted update
         self.continuation.observe_fill(is_aligned, weight);
 
         // Apply decay periodically

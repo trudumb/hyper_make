@@ -275,8 +275,7 @@ impl QuickMCSimulator {
         } else {
             // For large lambda, use normal approximation
             let z = rng.gen::<f64>() * 2.0 - 1.0; // Simple uniform approximation
-            let samples = (lambda + z * lambda.sqrt()).round().max(0.0) as usize;
-            samples
+            (lambda + z * lambda.sqrt()).round().max(0.0) as usize
         }
     }
 

@@ -373,7 +373,7 @@ impl VpinEstimator {
             // Carry over excess to next bucket
             if overflow > 1e-12 {
                 let overflow_frac = overflow / self.current_total_volume;
-                self.current_buy_volume = self.current_buy_volume * overflow_frac;
+                self.current_buy_volume *= overflow_frac;
                 self.current_total_volume = overflow;
                 self.current_n_trades = 1; // At least one trade contributed to overflow
             } else {

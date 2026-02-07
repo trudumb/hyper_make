@@ -557,11 +557,12 @@ impl MarketScenario for TrendingScenario {
     }
 
     fn market_params_at(&self, step: usize) -> MarketParams {
-        let mut params = MarketParams::default();
-        params.sigma = self.base_sigma;
-        params.momentum_bps = self.drift_per_step * 10000.0 * (step as f64 + 1.0);
-        params.p_momentum_continue = 0.7; // High continuation prob in trend
-        params
+        MarketParams {
+            sigma: self.base_sigma,
+            momentum_bps: self.drift_per_step * 10000.0 * (step as f64 + 1.0),
+            p_momentum_continue: 0.7, // High continuation prob in trend
+            ..Default::default()
+        }
     }
 
     fn name(&self) -> &str {
@@ -619,10 +620,11 @@ impl MarketScenario for MeanRevertingScenario {
     fn market_params_at(&self, step: usize) -> MarketParams {
         let phase = 2.0 * std::f64::consts::PI * step as f64 / self.period as f64;
 
-        let mut params = MarketParams::default();
-        params.sigma = 0.0001 + 0.00005 * phase.cos().abs();
-        params.flow_imbalance = -phase.sin() * 0.3; // Counter-flow at extremes
-        params
+        MarketParams {
+            sigma: 0.0001 + 0.00005 * phase.cos().abs(),
+            flow_imbalance: -phase.sin() * 0.3, // Counter-flow at extremes
+            ..Default::default()
+        }
     }
 
     fn name(&self) -> &str {

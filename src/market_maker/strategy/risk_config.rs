@@ -102,7 +102,7 @@ pub struct RiskConfig {
     /// - Maker fee: 1.5 bps
     /// - Normal spread floor: 8 bps
     /// - Required to break even: toxic_mult = (|toxic_edge| + fees) / normal_spread
-    ///                                      = (14 + 1.5) / 8 = 1.94 ≈ 2.0
+    ///   = (14 + 1.5) / 8 = 1.94 ≈ 2.0
     pub toxic_hour_gamma_multiplier: f64,
 
     /// Toxic hours configuration (UTC).

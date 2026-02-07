@@ -14,7 +14,7 @@ pub enum Action {
     /// Place quotes with the given ladder.
     Quote {
         /// The ladder of quotes to place
-        ladder: Ladder,
+        ladder: Box<Ladder>,
         /// Expected value of this action
         expected_value: f64,
     },
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn test_action_classification() {
         let quote = Action::Quote {
-            ladder: Ladder::default(),
+            ladder: Box::new(Ladder::default()),
             expected_value: 1.0,
         };
         assert!(quote.is_quoting());

@@ -688,7 +688,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             );
 
                             // Log every 100 fills
-                            if total_fills % 100 == 0 {
+                            if total_fills.is_multiple_of(100) {
                                 let kappa = self.stochastic.learned_params.kappa.estimate();
                                 let kappa_n = self.stochastic.learned_params.kappa.n_observations;
                                 debug!(
@@ -704,7 +704,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                         // Periodic INFO-level summary of learned parameters (every 100 fills)
                         let total_obs = self.stochastic.learned_params.total_fills_observed;
-                        if total_obs > 0 && total_obs % 100 == 0 {
+                        if total_obs > 0 && total_obs.is_multiple_of(100) {
                             let status = self.stochastic.learned_params.calibration_status();
                             let alpha = self.stochastic.learned_params.alpha_touch.estimate();
                             let alpha_cv = self.stochastic.learned_params.alpha_touch.cv();

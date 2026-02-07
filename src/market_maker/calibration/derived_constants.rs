@@ -179,7 +179,7 @@ pub fn derive_ewma_alpha(half_life_samples: f64) -> f64 {
     if half_life_samples <= 0.0 {
         return 0.1; // Fallback
     }
-    1.0 - (-0.693147 / half_life_samples).exp()
+    1.0 - (-std::f64::consts::LN_2 / half_life_samples).exp()
 }
 
 /// Volatility-derived Kalman filter parameters.

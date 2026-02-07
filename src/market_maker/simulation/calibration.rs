@@ -284,21 +284,21 @@ impl CalibrationAnalyzer {
             let regime = record.market_state.regime;
             self.conditional_fill_predictions
                 .entry(ConditionalSlice::Regime(regime))
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((level.p_fill_1s, was_filled));
 
             // Add volatility slice
             let vol_quartile = volatility_to_quartile(record.market_state.sigma_effective);
             self.conditional_fill_predictions
                 .entry(ConditionalSlice::VolatilityQuartile(vol_quartile))
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((level.p_fill_1s, was_filled));
 
             // Add inventory state slice
             let inv_state = inventory_to_state(record.market_state.inventory);
             self.conditional_fill_predictions
                 .entry(ConditionalSlice::InventoryState(inv_state))
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((level.p_fill_1s, was_filled));
         }
 
@@ -368,7 +368,7 @@ impl CalibrationAnalyzer {
         let overall_curve = self.compute_fill_calibration_curve();
 
         let mut conditional_brier = HashMap::new();
-        for (slice, _) in &self.conditional_fill_predictions {
+        for slice in self.conditional_fill_predictions.keys() {
             if let Some(brier) = self.compute_conditional_brier(slice) {
                 conditional_brier.insert(slice.clone(), brier);
             }

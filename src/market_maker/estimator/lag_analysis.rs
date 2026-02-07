@@ -28,6 +28,9 @@ use std::collections::VecDeque;
 
 use super::mutual_info::MutualInfoEstimator;
 
+/// Timestamp range as (first, last) for a buffer. Used for diagnostics.
+pub type TimestampRange = (Option<i64>, Option<i64>);
+
 /// Configuration for lag analysis.
 #[derive(Debug, Clone)]
 pub struct LagAnalyzerConfig {
@@ -435,7 +438,7 @@ impl LagAnalyzer {
     }
 
     /// Get sample timestamps for debugging (first, last from each buffer).
-    pub fn sample_timestamps(&self) -> ((Option<i64>, Option<i64>), (Option<i64>, Option<i64>)) {
+    pub fn sample_timestamps(&self) -> (TimestampRange, TimestampRange) {
         let signal_first = self.signal_buffer.front().map(|o| o.timestamp_ms);
         let signal_last = self.signal_buffer.back().map(|o| o.timestamp_ms);
         let target_first = self.target_buffer.front().map(|o| o.timestamp_ms);

@@ -176,7 +176,7 @@ impl ContinuationPosterior {
     /// * `is_aligned` - True if fill was in the direction of the position
     /// * `weight` - Observation weight (typically sqrt(size) for size-weighted updates)
     pub fn observe_fill(&mut self, is_aligned: bool, weight: f64) {
-        let w = weight.max(0.01).min(5.0); // Clamp weight to reasonable range
+        let w = weight.clamp(0.01, 5.0); // Clamp weight to reasonable range
         if is_aligned {
             self.alpha += w;
         } else {

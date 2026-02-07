@@ -222,7 +222,7 @@ impl InformationRatioTracker {
             ));
         }
 
-        if base_rate < 0.05 || base_rate > 0.95 {
+        if !(0.05..=0.95).contains(&base_rate) {
             warnings.push(format!(
                 "Extreme base rate: {:.1}% (outcomes heavily imbalanced)",
                 base_rate * 100.0

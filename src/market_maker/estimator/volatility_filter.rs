@@ -580,7 +580,7 @@ impl VolatilityFilter {
         };
         let log_vol_std = if cp.sigma_std > 0.0 && cp.sigma_mean > 0.0 {
             // Approximate log-space std from linear-space std
-            (cp.sigma_std / cp.sigma_mean).min(2.0).max(0.1)
+            (cp.sigma_std / cp.sigma_mean).clamp(0.1, 2.0)
         } else {
             self.config.initial_log_vol_std
         };

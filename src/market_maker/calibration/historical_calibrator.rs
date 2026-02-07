@@ -200,13 +200,13 @@ impl HistoricalCalibrator {
         // Calculate kappa = fills / spread for each snapshot
         for window in snapshots.windows(2) {
             let dt_s = (window[1].timestamp_ms - window[0].timestamp_ms) as f64 / 1000.0;
-            if dt_s < 0.1 || dt_s > 10.0 {
+            if !(0.1..=10.0).contains(&dt_s) {
                 continue; // Skip invalid windows
             }
 
             let spread_bps =
                 (window[0].ask - window[0].bid) / window[0].mid_price * 10_000.0;
-            if spread_bps < 0.5 || spread_bps > 100.0 {
+            if !(0.5..=100.0).contains(&spread_bps) {
                 continue; // Skip invalid spreads
             }
 
@@ -486,11 +486,11 @@ impl HistoricalCalibrator {
 
     /// Run full calibration and return learned parameters.
     pub fn calibrate(&self) -> LearnedParameters {
-        let mut params = LearnedParameters::default();
-
-        // Tier 1: P&L Critical
-        params.alpha_touch = self.calibrate_alpha_touch();
-        params.spread_floor_bps = self.calibrate_spread_floor();
+        let mut params = LearnedParameters {
+            alpha_touch: self.calibrate_alpha_touch(),
+            spread_floor_bps: self.calibrate_spread_floor(),
+            ..Default::default()
+        };
 
         let (gamma_mult, _toxic_hours) = self.calibrate_toxic_hours();
         params.toxic_hour_gamma_mult = gamma_mult;

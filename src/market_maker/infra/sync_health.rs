@@ -290,13 +290,11 @@ impl SyncHealthTracker {
         }
 
         // Compute ratio (smaller / larger)
-        let ratio = if recent.local_count <= recent.exchange_count {
+        if recent.local_count <= recent.exchange_count {
             recent.local_count as f64 / recent.exchange_count as f64
         } else {
             recent.exchange_count as f64 / recent.local_count as f64
-        };
-
-        ratio
+        }
     }
 
     /// Compute orphan ratio score [0.0, 1.0].

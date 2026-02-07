@@ -679,11 +679,11 @@ impl ParameterAggregator {
             // Use learned values when calibrated and enabled
             use_learned_parameters: sources
                 .learned_params
-                .map_or(false, |l| l.enabled && l.calibrated),
+                .is_some_and(|l| l.enabled && l.calibrated),
             learned_kappa: sources.learned_params.map_or(2000.0, |l| l.kappa),
             learned_alpha_touch: sources.learned_params.map_or(0.25, |l| l.alpha_touch),
             learned_spread_floor_bps: sources.learned_params.map_or(5.0, |l| l.spread_floor_bps),
-            learned_params_calibrated: sources.learned_params.map_or(false, |l| l.calibrated),
+            learned_params_calibrated: sources.learned_params.is_some_and(|l| l.calibrated),
         }
     }
 }

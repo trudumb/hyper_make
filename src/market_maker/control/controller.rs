@@ -205,7 +205,7 @@ impl OptimalController {
         // The GLFT formula naturally widens spreads when gamma increases.
         if state.can_quote() {
             candidates.push(Action::Quote {
-                ladder: Ladder::default(),
+                ladder: Box::new(Ladder::default()),
                 expected_value: state.expected_edge() * 0.1, // Simple estimate
             });
         }
@@ -339,14 +339,14 @@ impl OptimalController {
             QuoteDecision::Quote { expected_edge, .. } => {
                 // Quote with full size - gamma already handles uncertainty
                 Action::Quote {
-                    ladder: Ladder::default(),
+                    ladder: Box::new(Ladder::default()),
                     expected_value: *expected_edge,
                 }
             }
             QuoteDecision::ReducedSize { .. } => {
                 // Quote with full size - gamma handles the risk
                 Action::Quote {
-                    ladder: Ladder::default(),
+                    ladder: Box::new(Ladder::default()),
                     expected_value: state.expected_edge(),
                 }
             }
@@ -426,12 +426,12 @@ impl OptimalController {
                     );
                 }
                 Action::Quote {
-                    ladder: Ladder::default(),
+                    ladder: Box::new(Ladder::default()),
                     expected_value: *expected_edge,
                 }
             }
             QuoteDecision::ReducedSize { .. } => Action::Quote {
-                ladder: Ladder::default(),
+                ladder: Box::new(Ladder::default()),
                 expected_value: state.expected_edge(),
             },
             _ => Action::NoQuote {
@@ -448,13 +448,13 @@ impl OptimalController {
     fn myopic_to_action(&self, myopic: &QuoteDecision, state: &ControlState) -> Action {
         match myopic {
             QuoteDecision::Quote { expected_edge, .. } => Action::Quote {
-                ladder: Ladder::default(),
+                ladder: Box::new(Ladder::default()),
                 expected_value: *expected_edge,
             },
             QuoteDecision::ReducedSize { .. } => {
                 // ReducedSize is converted to Quote - gamma handles the risk
                 Action::Quote {
-                    ladder: Ladder::default(),
+                    ladder: Box::new(Ladder::default()),
                     expected_value: state.expected_edge(),
                 }
             }
@@ -566,9 +566,10 @@ impl OptimalController {
             predicted_funding: provider.predicted_funding(),
             learning_trust: provider.learning_trust(),
             model_health: if provider.is_model_degraded() {
-                let mut health = ModelHealth::default();
-                health.overall = crate::market_maker::learning::Health::Degraded;
-                health
+                ModelHealth {
+                    overall: crate::market_maker::learning::Health::Degraded,
+                    ..Default::default()
+                }
             } else {
                 ModelHealth::default()
             },

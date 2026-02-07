@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize};
 use super::MarketParams;
 
 /// Calibration state for the risk model.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CalibrationState {
     /// No samples yet, using conservative defaults
+    #[default]
     Cold,
     /// Collecting samples, not yet enough for calibration
     Warming { samples: usize, required: usize },
@@ -37,11 +38,6 @@ pub enum CalibrationState {
     Stale { hours_since_calibration: f64 },
 }
 
-impl Default for CalibrationState {
-    fn default() -> Self {
-        CalibrationState::Cold
-    }
-}
 
 /// Calibrated risk model using log-additive gamma.
 ///

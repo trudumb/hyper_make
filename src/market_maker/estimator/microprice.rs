@@ -775,7 +775,7 @@ impl MicropriceEstimator {
         let raw_microprice = mid * (1.0 + adjustment_clamped);
 
         // Log dampening when significant
-        if dampening < 1.0 && self.n % 100 == 0 {
+        if dampening < 1.0 && self.n.is_multiple_of(100) {
             debug!(
                 depth_usd = %format!("{:.0}", depth_usd),
                 dampening = %format!("{:.2}", dampening),

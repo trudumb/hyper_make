@@ -169,19 +169,10 @@ pub struct SignalInfo {
 }
 
 /// Calibration state for dashboard.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct CalibrationState {
     pub fill: CalibrationMetrics,
     pub adverse_selection: CalibrationMetrics,
-}
-
-impl Default for CalibrationState {
-    fn default() -> Self {
-        Self {
-            fill: CalibrationMetrics::default(),
-            adverse_selection: CalibrationMetrics::default(),
-        }
-    }
 }
 
 // ============================================================================
@@ -858,6 +849,24 @@ impl Default for DashboardConfig {
     }
 }
 
+/// Input data for generating a dashboard snapshot.
+pub struct DashboardSnapshotParams {
+    pub mid_price: f64,
+    pub spread_bps: f64,
+    pub position: f64,
+    pub kappa: f64,
+    pub gamma: f64,
+    pub sigma: f64,
+    pub cascade_severity: f64,
+    pub jump_ratio: f64,
+    pub fill_prob: f64,
+    pub adverse_prob: f64,
+    pub spread_capture: f64,
+    pub adverse_selection: f64,
+    pub inventory_cost: f64,
+    pub fees: f64,
+}
+
 /// Aggregates data from system components for dashboard API.
 pub struct DashboardAggregator {
     /// Configuration.
@@ -1094,26 +1103,11 @@ impl DashboardAggregator {
     }
 
     /// Generate dashboard snapshot from current state.
-    pub fn snapshot(
-        &self,
-        mid_price: f64,
-        spread_bps: f64,
-        position: f64,
-        kappa: f64,
-        gamma: f64,
-        cascade_severity: f64,
-        jump_ratio: f64,
-        sigma: f64,
-        fill_prob: f64,
-        adverse_prob: f64,
-        spread_capture: f64,
-        adverse_selection: f64,
-        inventory_cost: f64,
-        fees: f64,
-    ) -> DashboardState {
+    pub fn snapshot(&self, params: &DashboardSnapshotParams) -> DashboardState {
         // Compute regime
-        let regime = classify_regime(cascade_severity, jump_ratio, sigma);
-        let probs = compute_regime_probabilities(cascade_severity, jump_ratio, sigma);
+        let regime = classify_regime(params.cascade_severity, params.jump_ratio, params.sigma);
+        let probs =
+            compute_regime_probabilities(params.cascade_severity, params.jump_ratio, params.sigma);
 
         // Record regime snapshot if needed
         self.maybe_record_regime(&probs);
@@ -1166,21 +1160,24 @@ impl DashboardAggregator {
 
         DashboardState {
             quotes: LiveQuotes {
-                mid: mid_price,
-                spread_bps,
-                inventory: position,
+                mid: params.mid_price,
+                spread_bps: params.spread_bps,
+                inventory: params.position,
                 regime: regime.clone(),
-                kappa,
-                gamma,
-                fill_prob,
-                adverse_prob,
+                kappa: params.kappa,
+                gamma: params.gamma,
+                fill_prob: params.fill_prob,
+                adverse_prob: params.adverse_prob,
             },
             pnl: PnLAttribution {
-                spread_capture,
-                adverse_selection,
-                inventory_cost,
-                fees,
-                total: spread_capture + adverse_selection + inventory_cost + fees,
+                spread_capture: params.spread_capture,
+                adverse_selection: params.adverse_selection,
+                inventory_cost: params.inventory_cost,
+                fees: params.fees,
+                total: params.spread_capture
+                    + params.adverse_selection
+                    + params.inventory_cost
+                    + params.fees,
             },
             regime: RegimeState {
                 current: regime,
@@ -1220,38 +1217,10 @@ impl DashboardAggregator {
     /// Generate dashboard snapshot with feature health data.
     pub fn snapshot_with_feature_health(
         &self,
-        mid_price: f64,
-        spread_bps: f64,
-        position: f64,
-        kappa: f64,
-        gamma: f64,
-        cascade_severity: f64,
-        jump_ratio: f64,
-        sigma: f64,
-        fill_prob: f64,
-        adverse_prob: f64,
-        spread_capture: f64,
-        adverse_selection: f64,
-        inventory_cost: f64,
-        fees: f64,
+        params: &DashboardSnapshotParams,
         feature_health: FeatureHealthState,
     ) -> DashboardState {
-        let mut state = self.snapshot(
-            mid_price,
-            spread_bps,
-            position,
-            kappa,
-            gamma,
-            cascade_severity,
-            jump_ratio,
-            sigma,
-            fill_prob,
-            adverse_prob,
-            spread_capture,
-            adverse_selection,
-            inventory_cost,
-            fees,
-        );
+        let mut state = self.snapshot(params);
         state.feature_health = feature_health;
         state
     }
@@ -1312,9 +1281,23 @@ mod tests {
         aggregator.record_fill(-3.0, false, 4.0);
 
         // Generate snapshot
-        let state = aggregator.snapshot(
-            50000.0, 5.0, 0.1, 500.0, 0.2, 0.1, 1.5, 0.001, 0.2, 0.15, 100.0, -50.0, -10.0, -5.0,
-        );
+        let params = DashboardSnapshotParams {
+            mid_price: 50000.0,
+            spread_bps: 5.0,
+            position: 0.1,
+            kappa: 500.0,
+            gamma: 0.2,
+            sigma: 0.001,
+            cascade_severity: 0.1,
+            jump_ratio: 1.5,
+            fill_prob: 0.2,
+            adverse_prob: 0.15,
+            spread_capture: 100.0,
+            adverse_selection: -50.0,
+            inventory_cost: -10.0,
+            fees: -5.0,
+        };
+        let state = aggregator.snapshot(&params);
 
         assert_eq!(state.quotes.mid, 50000.0);
         assert_eq!(state.fills.len(), 2);
@@ -1385,23 +1368,23 @@ mod tests {
             ..Default::default()
         };
 
-        let state = aggregator.snapshot_with_feature_health(
-            50000.0,
-            5.0,
-            0.1,
-            500.0,
-            0.2,
-            0.1,
-            1.5,
-            0.001,
-            0.2,
-            0.15,
-            100.0,
-            -50.0,
-            -10.0,
-            -5.0,
-            feature_health,
-        );
+        let params = DashboardSnapshotParams {
+            mid_price: 50000.0,
+            spread_bps: 5.0,
+            position: 0.1,
+            kappa: 500.0,
+            gamma: 0.2,
+            sigma: 0.001,
+            cascade_severity: 0.1,
+            jump_ratio: 1.5,
+            fill_prob: 0.2,
+            adverse_prob: 0.15,
+            spread_capture: 100.0,
+            adverse_selection: -50.0,
+            inventory_cost: -10.0,
+            fees: -5.0,
+        };
+        let state = aggregator.snapshot_with_feature_health(&params, feature_health);
 
         assert_eq!(state.feature_health.interactions.vol_x_momentum, 0.5);
         assert_eq!(state.feature_health.interactions.regime_x_inventory, 0.3);

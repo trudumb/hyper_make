@@ -474,13 +474,13 @@ impl StochasticController {
     fn myopic_to_action(&self, decision: &QuoteDecision) -> Action {
         match decision {
             QuoteDecision::Quote { expected_edge, .. } => Action::Quote {
-                ladder: Ladder::default(),
+                ladder: Box::new(Ladder::default()),
                 expected_value: *expected_edge,
             },
             QuoteDecision::ReducedSize { .. } => {
                 // ReducedSize maps to Quote - gamma handles the risk
                 Action::Quote {
-                    ladder: Ladder::default(),
+                    ladder: Box::new(Ladder::default()),
                     expected_value: 0.0, // Conservative estimate
                 }
             }

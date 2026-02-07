@@ -421,7 +421,7 @@ impl FillSignalStore {
         
         // Write as JSON array
         serde_json::to_writer_pretty(&mut writer, &complete)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         writer.flush()?;
 
         let count = complete.len();
@@ -1069,9 +1069,7 @@ impl FillProcessor {
         // Simplified: was_adverse = false means our fill was "correct" (price moved in our favor)
         let actual_direction = if fill.is_buy {
             if was_adverse { -1i8 } else { 1 }  // Adverse on buy = price dropped
-        } else {
-            if was_adverse { 1i8 } else { -1 }   // Adverse on sell = price rose
-        };
+        } else if was_adverse { 1i8 } else { -1 };
         
         state.theoretical_edge.update_from_fill(
             book_imbalance,

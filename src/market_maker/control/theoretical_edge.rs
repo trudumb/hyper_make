@@ -78,8 +78,7 @@ impl CrossAssetSignal {
 
         // BTC return in same direction as position = higher P(correct)
         // Scale: 10 bps BTC return with 0.8 correlation adds ~2% to P(correct)
-        let boost = (self.btc_return_bps / 50.0).clamp(-0.10, 0.10) * self.correlation;
-        boost
+        (self.btc_return_bps / 50.0).clamp(-0.10, 0.10) * self.correlation
     }
 }
 
@@ -1177,7 +1176,7 @@ impl TheoreticalEdgeEstimator {
         }
 
         // Periodic logging
-        if self.calculations % 100 == 0 {
+        if self.calculations.is_multiple_of(100) {
             debug!(
                 calculations = self.calculations,
                 quotes_triggered = self.quotes_triggered,
@@ -1303,7 +1302,7 @@ impl TheoreticalEdgeEstimator {
         }
 
         // Periodic logging with Bayesian diagnostics
-        if self.calculations % 100 == 0 {
+        if self.calculations.is_multiple_of(100) {
             debug!(
                 calculations = self.calculations,
                 quotes_triggered = self.quotes_triggered,
@@ -1631,7 +1630,7 @@ impl TheoreticalEdgeEstimator {
         let as_weight = 1.0 / (1.0 + realized_as_bps.abs() / 5.0);
         
         // Larger fills = more informative, weight up (with cap)
-        let size_weight = (fill_size / 0.01).sqrt().min(2.0).max(0.5);
+        let size_weight = (fill_size / 0.01).sqrt().clamp(0.5, 2.0);
         
         let weight = as_weight * size_weight;
         

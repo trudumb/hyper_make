@@ -57,7 +57,7 @@ impl TimeOfDayFeatures {
     pub fn from_timestamp_ms(timestamp_ms: i64) -> Self {
         let secs = timestamp_ms / 1000;
         let hours_since_midnight = ((secs % 86400) as f64) / 3600.0;
-        let days_since_epoch = (secs / 86400) as i64;
+        let days_since_epoch = secs / 86400;
 
         // Unix epoch (1970-01-01) was a Thursday (day 4)
         let day_of_week = ((days_since_epoch + 4) % 7) as u8;
@@ -149,6 +149,20 @@ pub struct FundingFeatures {
     pub funding_magnitude_proximity: f64,
 }
 
+impl Default for FundingFeatures {
+    /// Default funding features (for warmup).
+    fn default() -> Self {
+        Self {
+            time_to_settlement_secs: 4.0 * 3600.0, // Midpoint
+            settlement_proximity: 0.5,
+            funding_rate_8h: 0.0,
+            funding_rate_delta: 0.0,
+            predicted_flow: 0.0,
+            funding_magnitude_proximity: 0.0, // No pressure at default
+        }
+    }
+}
+
 impl FundingFeatures {
     /// Create funding features from current state.
     ///
@@ -184,18 +198,6 @@ impl FundingFeatures {
             funding_rate_delta: funding_rate_8h - prev_funding_rate,
             predicted_flow,
             funding_magnitude_proximity,
-        }
-    }
-
-    /// Default funding features (for warmup).
-    pub fn default() -> Self {
-        Self {
-            time_to_settlement_secs: 4.0 * 3600.0, // Midpoint
-            settlement_proximity: 0.5,
-            funding_rate_8h: 0.0,
-            funding_rate_delta: 0.0,
-            predicted_flow: 0.0,
-            funding_magnitude_proximity: 0.0, // No pressure at default
         }
     }
 

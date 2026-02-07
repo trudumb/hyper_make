@@ -1635,21 +1635,15 @@ impl ParameterEstimator {
     /// Restore sub-estimator state from checkpoint data.
     pub fn restore_checkpoint(
         &mut self,
-        vol_filter: &crate::market_maker::checkpoint::VolFilterCheckpoint,
-        informed_flow: &crate::market_maker::checkpoint::InformedFlowCheckpoint,
-        fill_rate: &crate::market_maker::checkpoint::FillRateCheckpoint,
-        kappa_own: &crate::market_maker::checkpoint::KappaCheckpoint,
-        kappa_bid: &crate::market_maker::checkpoint::KappaCheckpoint,
-        kappa_ask: &crate::market_maker::checkpoint::KappaCheckpoint,
-        momentum: &crate::market_maker::checkpoint::MomentumCheckpoint,
+        bundle: &crate::market_maker::checkpoint::CheckpointBundle,
     ) {
-        self.volatility_filter.restore_checkpoint(vol_filter);
-        self.informed_flow.restore_checkpoint(informed_flow);
-        self.fill_rate_model.restore_checkpoint(fill_rate);
-        self.own_kappa.restore_checkpoint(kappa_own);
-        self.own_kappa_bid.restore_checkpoint(kappa_bid);
-        self.own_kappa_ask.restore_checkpoint(kappa_ask);
-        self.momentum_model.restore_checkpoint(momentum);
+        self.volatility_filter.restore_checkpoint(&bundle.vol_filter);
+        self.informed_flow.restore_checkpoint(&bundle.informed_flow);
+        self.fill_rate_model.restore_checkpoint(&bundle.fill_rate);
+        self.own_kappa.restore_checkpoint(&bundle.kappa_own);
+        self.own_kappa_bid.restore_checkpoint(&bundle.kappa_bid);
+        self.own_kappa_ask.restore_checkpoint(&bundle.kappa_ask);
+        self.momentum_model.restore_checkpoint(&bundle.momentum);
     }
 }
 

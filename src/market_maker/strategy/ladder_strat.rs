@@ -698,7 +698,7 @@ impl LadderStrategy {
 
         // SAFETY: Validate adjusted microprice doesn't diverge from market_mid
         let microprice_ratio = adjusted_microprice / market_params.market_mid;
-        let adjusted_microprice = if microprice_ratio < 0.8 || microprice_ratio > 1.2 {
+        let adjusted_microprice = if !(0.8..=1.2).contains(&microprice_ratio) {
             // This should never happen with the new bounded shift formula
             tracing::error!(
                 adjusted = %format!("{:.4}", adjusted_microprice),

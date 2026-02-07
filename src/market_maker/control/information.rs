@@ -320,7 +320,7 @@ mod tests {
         let iv = InformationValue::default();
         let state = ControlState::default();
         let action = Action::Quote {
-            ladder: Default::default(),
+            ladder: Box::default(),
             expected_value: 1.0,
         };
 
@@ -336,7 +336,7 @@ mod tests {
         state.belief.total_edge_uncertainty = 5.0; // High uncertainty
 
         let _action = Action::Quote {
-            ladder: Default::default(),
+            ladder: Box::default(),
             expected_value: 0.1, // Small expected value
         };
 
@@ -352,7 +352,7 @@ mod tests {
         state.time = 0.98; // Near terminal
 
         let action = Action::Quote {
-            ladder: Default::default(),
+            ladder: Box::default(),
             expected_value: 0.1,
         };
 
@@ -377,12 +377,12 @@ mod tests {
         let state = ControlState::default();
 
         let now = Action::Quote {
-            ladder: Default::default(),
+            ladder: Box::default(),
             expected_value: 0.5,
         };
 
         let later = Action::Quote {
-            ladder: Default::default(),
+            ladder: Box::default(),
             expected_value: 0.6,
         };
 

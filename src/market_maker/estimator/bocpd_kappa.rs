@@ -261,8 +261,8 @@ impl RegressionStats {
         }
 
         // Update X'y
-        for i in 0..N_FEATURES {
-            self.xty[i] += x[i] * y;
+        for (i, xi) in x.iter().enumerate().take(N_FEATURES) {
+            self.xty[i] += xi * y;
         }
 
         // Update y statistics
@@ -316,9 +316,9 @@ impl RegressionStats {
 
         // Add coefficient uncertainty (simplified)
         let mut coef_var = 0.0;
-        for i in 0..N_FEATURES {
+        for (i, xi) in x.iter().enumerate().take(N_FEATURES) {
             let precision = self.xtx[i][i] + 1.0; // Regularization
-            coef_var += x[i] * x[i] / precision;
+            coef_var += xi * xi / precision;
         }
 
         noise_var * (1.0 + coef_var)
@@ -455,9 +455,9 @@ impl BOCPDKappaPredictor {
 
         // Compute predictive probabilities for each run length
         let mut pred_probs = vec![0.0; max_len + 1];
-        for r in 0..=max_len {
+        for (r, pred_prob) in pred_probs.iter_mut().enumerate().take(max_len + 1) {
             if self.run_length_probs[r] > 1e-10 {
-                pred_probs[r] = self.run_stats[r].predictive_log_likelihood(
+                *pred_prob = self.run_stats[r].predictive_log_likelihood(
                     features,
                     realized_kappa,
                     self.config.prior_coef_precision,
@@ -466,7 +466,7 @@ impl BOCPDKappaPredictor {
                     self.config.prior_noise_beta,
                 );
             } else {
-                pred_probs[r] = f64::NEG_INFINITY;
+                *pred_prob = f64::NEG_INFINITY;
             }
         }
 
@@ -487,8 +487,8 @@ impl BOCPDKappaPredictor {
 
         // Changepoint mass (all run lengths contribute to r=0)
         let mut cp_mass = 0.0;
-        for r in 0..max_len {
-            cp_mass += pred_probs[r] * hazard * self.run_length_probs[r];
+        for (r, &pred_prob) in pred_probs.iter().enumerate().take(max_len) {
+            cp_mass += pred_prob * hazard * self.run_length_probs[r];
         }
         new_probs[0] = cp_mass;
 

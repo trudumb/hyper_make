@@ -175,29 +175,23 @@ impl EmissionParams {
         }
     }
 
-    /// Create full emission parameters with leading indicators.
-    pub fn new_full(
-        mean_vol: f64,
-        std_vol: f64,
-        mean_spread: f64,
-        std_spread: f64,
-        mean_oi_level: f64,
-        std_oi_level: f64,
-        mean_oi_velocity: f64,
-        std_oi_velocity: f64,
-        liquidation_weight: f64,
-    ) -> Self {
-        Self {
-            mean_volatility: mean_vol.max(1e-9),
-            std_volatility: std_vol.max(1e-9),
-            mean_spread: mean_spread.max(0.1),
-            std_spread: std_spread.max(0.1),
-            mean_oi_level: mean_oi_level.max(0.1),
-            std_oi_level: std_oi_level.max(0.01),
-            mean_oi_velocity,
-            std_oi_velocity: std_oi_velocity.max(0.01),
-            liquidation_weight: liquidation_weight.clamp(0.0, 1.0),
-        }
+    /// Apply validation constraints: clamp and enforce minimums on all fields.
+    ///
+    /// Use with struct literal syntax:
+    /// ```
+    /// EmissionParams { mean_volatility: 0.001, ... }.validated()
+    /// ```
+    pub fn validated(mut self) -> Self {
+        self.mean_volatility = self.mean_volatility.max(1e-9);
+        self.std_volatility = self.std_volatility.max(1e-9);
+        self.mean_spread = self.mean_spread.max(0.1);
+        self.std_spread = self.std_spread.max(0.1);
+        self.mean_oi_level = self.mean_oi_level.max(0.1);
+        self.std_oi_level = self.std_oi_level.max(0.01);
+        // mean_oi_velocity has no constraint (can be negative)
+        self.std_oi_velocity = self.std_oi_velocity.max(0.01);
+        self.liquidation_weight = self.liquidation_weight.clamp(0.0, 1.0);
+        self
     }
 
     /// Compute log-likelihood of observation under this emission distribution.
@@ -260,53 +254,53 @@ impl EmissionParams {
 fn default_emission_params() -> [EmissionParams; NUM_REGIMES] {
     [
         // Low regime: quiet market, stable OI
-        EmissionParams::new_full(
-            0.001,   // vol
-            0.0005,  // vol std
-            3.0,     // spread
-            1.5,     // spread std
-            1.05,    // OI slightly above average
-            0.1,     // OI std
-            0.0,     // OI velocity (stable)
-            0.02,    // velocity std
-            0.0,     // no liquidation pressure
-        ),
+        EmissionParams {
+            mean_volatility: 0.001,
+            std_volatility: 0.0005,
+            mean_spread: 3.0,
+            std_spread: 1.5,
+            mean_oi_level: 1.05,
+            std_oi_level: 0.1,
+            mean_oi_velocity: 0.0,
+            std_oi_velocity: 0.02,
+            liquidation_weight: 0.0,
+        }.validated(),
         // Normal regime: standard conditions
-        EmissionParams::new_full(
-            0.0025,  // vol
-            0.001,   // vol std
-            5.0,     // spread
-            2.0,     // spread std
-            1.0,     // average OI
-            0.15,    // OI std
-            0.0,     // OI velocity (stable)
-            0.03,    // velocity std
-            0.0,     // no liquidation pressure
-        ),
+        EmissionParams {
+            mean_volatility: 0.0025,
+            std_volatility: 0.001,
+            mean_spread: 5.0,
+            std_spread: 2.0,
+            mean_oi_level: 1.0,
+            std_oi_level: 0.15,
+            mean_oi_velocity: 0.0,
+            std_oi_velocity: 0.03,
+            liquidation_weight: 0.0,
+        }.validated(),
         // High regime: elevated vol, OI starting to drop
-        EmissionParams::new_full(
-            0.01,    // vol
-            0.005,   // vol std
-            10.0,    // spread
-            5.0,     // spread std
-            0.95,    // OI slightly below average (stress)
-            0.2,     // OI std (higher variance)
-            -0.02,   // OI velocity slightly negative
-            0.05,    // velocity std
-            0.2,     // some liquidation pressure
-        ),
+        EmissionParams {
+            mean_volatility: 0.01,
+            std_volatility: 0.005,
+            mean_spread: 10.0,
+            std_spread: 5.0,
+            mean_oi_level: 0.95,
+            std_oi_level: 0.2,
+            mean_oi_velocity: -0.02,
+            std_oi_velocity: 0.05,
+            liquidation_weight: 0.2,
+        }.validated(),
         // Extreme/Cascade regime: crisis conditions, OI dropping fast
-        EmissionParams::new_full(
-            0.05,    // vol (very high)
-            0.025,   // vol std
-            25.0,    // spread (very wide)
-            15.0,    // spread std
-            0.8,     // OI significantly below average (cascades)
-            0.25,    // OI std (high variance)
-            -0.1,    // OI velocity negative (forced liquidations)
-            0.08,    // velocity std
-            0.8,     // high liquidation pressure
-        ),
+        EmissionParams {
+            mean_volatility: 0.05,
+            std_volatility: 0.025,
+            mean_spread: 25.0,
+            std_spread: 15.0,
+            mean_oi_level: 0.8,
+            std_oi_level: 0.25,
+            mean_oi_velocity: -0.1,
+            std_oi_velocity: 0.08,
+            liquidation_weight: 0.8,
+        }.validated(),
     ]
 }
 
@@ -614,17 +608,17 @@ impl RegimeHMM {
         // Step 1: Prediction (time update)
         // predicted[j] = sum_i transition_matrix[i][j] * belief[i]
         let mut predicted = [0.0; NUM_REGIMES];
-        for j in 0..NUM_REGIMES {
+        for (j, pred) in predicted.iter_mut().enumerate().take(NUM_REGIMES) {
             for i in 0..NUM_REGIMES {
-                predicted[j] += self.transition_matrix[i][j] * self.belief[i];
+                *pred += self.transition_matrix[i][j] * self.belief[i];
             }
         }
 
         // Step 2: Update (measurement update)
         // new_belief[j] proportional to emission_likelihood(j, obs) * predicted[j]
-        for j in 0..NUM_REGIMES {
+        for (j, &pred) in predicted.iter().enumerate().take(NUM_REGIMES) {
             let likelihood = self.emission_likelihood(j, observation);
-            self.belief[j] = likelihood * predicted[j];
+            self.belief[j] = likelihood * pred;
         }
 
         // Normalize to ensure probabilities sum to 1
@@ -831,8 +825,8 @@ impl RegimeHMM {
         }
 
         // Sort for percentile computation
-        let mut vol_sorted: Vec<f64> = volatilities.iter().copied().collect();
-        let mut spread_sorted: Vec<f64> = spreads.iter().copied().collect();
+        let mut vol_sorted: Vec<f64> = volatilities.to_vec();
+        let mut spread_sorted: Vec<f64> = spreads.to_vec();
         vol_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         spread_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 

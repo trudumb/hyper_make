@@ -260,8 +260,8 @@ impl Default for InternalState {
         // Initialize changepoint with spread distribution (not all mass on r=0)
         let init_spread = 20;
         let mut changepoint_run_probs = vec![0.0; init_spread];
-        for i in 0..init_spread {
-            changepoint_run_probs[i] = (0.8_f64).powi(i as i32);
+        for (i, prob) in changepoint_run_probs.iter_mut().enumerate().take(init_spread) {
+            *prob = (0.8_f64).powi(i as i32);
         }
         let sum: f64 = changepoint_run_probs.iter().sum();
         for p in &mut changepoint_run_probs {
@@ -376,20 +376,45 @@ pub struct CentralBeliefState {
     start_time: Instant,
 }
 
+/// Own fill data for belief state updates.
+struct OwnFillParams {
+    price: f64,
+    mid: f64,
+    is_aligned: bool,
+    realized_as_bps: f64,
+    realized_edge_bps: f64,
+    timestamp_ms: u64,
+    order_id: Option<u64>,
+}
+
+/// Cross-venue analysis results for belief state integration.
+struct CrossVenueParams {
+    direction: f64,
+    confidence: f64,
+    discovery_venue: f64,
+    max_toxicity: f64,
+    avg_toxicity: f64,
+    agreement: f64,
+    divergence: f64,
+    intensity_ratio: f64,
+    imbalance_correlation: f64,
+    toxicity_alert: bool,
+    divergence_alert: bool,
+    timestamp_ms: u64,
+}
+
 impl CentralBeliefState {
     /// Create a new centralized belief state.
     pub fn new(config: CentralBeliefConfig) -> Self {
-        let mut state = InternalState::default();
-
-        // Initialize kappa priors from config
-        state.kappa_smoothed = config.kappa_prior;
-        state.own_kappa_alpha = config.kappa_prior_strength;
-        state.own_kappa_beta = config.kappa_prior_strength / config.kappa_prior;
-        state.book_kappa = config.kappa_prior;
-        state.robust_kappa = config.kappa_prior;
-
-        // Initialize drift prior
-        state.drift_prior_precision = 1.0 / (config.drift_prior_sigma.powi(2));
+        let state = InternalState {
+            kappa_smoothed: config.kappa_prior,
+            own_kappa_alpha: config.kappa_prior_strength,
+            own_kappa_beta: config.kappa_prior_strength / config.kappa_prior,
+            book_kappa: config.kappa_prior,
+            robust_kappa: config.kappa_prior,
+            drift_prior_precision: 1.0 / (config.drift_prior_sigma.powi(2)),
+            ..Default::default()
+        };
 
         Self {
             config,
@@ -461,8 +486,7 @@ impl CentralBeliefState {
                 order_id,
                 ..
             } => {
-                self.process_own_fill(
-                    state,
+                let fill = OwnFillParams {
                     price,
                     mid,
                     is_aligned,
@@ -470,7 +494,8 @@ impl CentralBeliefState {
                     realized_edge_bps,
                     timestamp_ms,
                     order_id,
-                );
+                };
+                self.process_own_fill(state, &fill);
             }
 
             BeliefUpdate::MarketTrade {
@@ -568,8 +593,7 @@ impl CentralBeliefState {
                 divergence_alert,
                 timestamp_ms,
             } => {
-                self.process_cross_venue_update(
-                    state,
+                let params = CrossVenueParams {
                     direction,
                     confidence,
                     discovery_venue,
@@ -582,7 +606,8 @@ impl CentralBeliefState {
                     toxicity_alert,
                     divergence_alert,
                     timestamp_ms,
-                );
+                };
+                self.process_cross_venue_update(state, &params);
             }
 
             BeliefUpdate::SoftReset { retention } => {
@@ -624,24 +649,14 @@ impl CentralBeliefState {
         state.last_update_ms = timestamp_ms;
 
         // Apply decay periodically
-        if state.n_price_obs % 1000 == 0 {
+        if state.n_price_obs.is_multiple_of(1000) {
             self.apply_decay(state);
         }
     }
 
-    fn process_own_fill(
-        &self,
-        state: &mut InternalState,
-        price: f64,
-        mid: f64,
-        is_aligned: bool,
-        realized_as_bps: f64,
-        realized_edge_bps: f64,
-        timestamp_ms: u64,
-        order_id: Option<u64>,
-    ) {
+    fn process_own_fill(&self, state: &mut InternalState, fill: &OwnFillParams) {
         // Update kappa posterior (Gamma)
-        let distance = ((price - mid) / mid).abs();
+        let distance = ((fill.price - fill.mid) / fill.mid).abs();
         state.own_kappa_alpha += 1.0;
         state.own_kappa_beta += distance.max(0.0001); // Avoid zero
         state.own_kappa_n_fills += 1;
@@ -657,28 +672,28 @@ impl CentralBeliefState {
         }
 
         // Update continuation posterior (Beta-Binomial)
-        if is_aligned {
+        if fill.is_aligned {
             state.continuation_alpha += 1.0;
         } else {
             state.continuation_beta += 1.0;
         }
 
         // Update edge statistics
-        state.edge_sum += realized_edge_bps;
-        state.edge_sum_sq += realized_edge_bps * realized_edge_bps;
+        state.edge_sum += fill.realized_edge_bps;
+        state.edge_sum_sq += fill.realized_edge_bps * fill.realized_edge_bps;
         state.edge_n += 1.0;
 
         // Update AS bias
         let alpha = 0.1;
-        state.as_bias = (1.0 - alpha) * state.as_bias + alpha * realized_as_bps;
+        state.as_bias = (1.0 - alpha) * state.as_bias + alpha * fill.realized_as_bps;
 
         // Link prediction if we have order_id
-        if let Some(oid) = order_id {
-            self.link_fill_prediction(state, oid, realized_edge_bps > 0.0);
+        if let Some(oid) = fill.order_id {
+            self.link_fill_prediction(state, oid, fill.realized_edge_bps > 0.0);
         }
 
         state.n_fills += 1;
-        state.last_update_ms = timestamp_ms;
+        state.last_update_ms = fill.timestamp_ms;
     }
 
     fn process_market_trade(&self, state: &mut InternalState, price: f64, mid: f64) {
@@ -807,60 +822,46 @@ impl CentralBeliefState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn process_cross_venue_update(
-        &self,
-        state: &mut InternalState,
-        direction: f64,
-        confidence: f64,
-        discovery_venue: f64,
-        max_toxicity: f64,
-        avg_toxicity: f64,
-        agreement: f64,
-        divergence: f64,
-        intensity_ratio: f64,
-        imbalance_correlation: f64,
-        toxicity_alert: bool,
-        divergence_alert: bool,
-        timestamp_ms: u64,
-    ) {
+    fn process_cross_venue_update(&self, state: &mut InternalState, params: &CrossVenueParams) {
         // Update cross-venue state with smoothing
         // Use EMA smoothing for continuous values to reduce noise
         let alpha = 0.3; // Smoothing factor
 
         if state.cv_is_valid {
             // Smooth updates for continuous values
-            state.cv_direction = (1.0 - alpha) * state.cv_direction + alpha * direction;
-            state.cv_confidence = (1.0 - alpha) * state.cv_confidence + alpha * confidence;
+            state.cv_direction = (1.0 - alpha) * state.cv_direction + alpha * params.direction;
+            state.cv_confidence = (1.0 - alpha) * state.cv_confidence + alpha * params.confidence;
             state.cv_discovery_venue =
-                (1.0 - alpha) * state.cv_discovery_venue + alpha * discovery_venue;
-            state.cv_max_toxicity = (1.0 - alpha) * state.cv_max_toxicity + alpha * max_toxicity;
-            state.cv_avg_toxicity = (1.0 - alpha) * state.cv_avg_toxicity + alpha * avg_toxicity;
-            state.cv_agreement = (1.0 - alpha) * state.cv_agreement + alpha * agreement;
-            state.cv_divergence = (1.0 - alpha) * state.cv_divergence + alpha * divergence;
+                (1.0 - alpha) * state.cv_discovery_venue + alpha * params.discovery_venue;
+            state.cv_max_toxicity =
+                (1.0 - alpha) * state.cv_max_toxicity + alpha * params.max_toxicity;
+            state.cv_avg_toxicity =
+                (1.0 - alpha) * state.cv_avg_toxicity + alpha * params.avg_toxicity;
+            state.cv_agreement = (1.0 - alpha) * state.cv_agreement + alpha * params.agreement;
+            state.cv_divergence = (1.0 - alpha) * state.cv_divergence + alpha * params.divergence;
             state.cv_intensity_ratio =
-                (1.0 - alpha) * state.cv_intensity_ratio + alpha * intensity_ratio;
+                (1.0 - alpha) * state.cv_intensity_ratio + alpha * params.intensity_ratio;
             state.cv_imbalance_correlation =
-                (1.0 - alpha) * state.cv_imbalance_correlation + alpha * imbalance_correlation;
+                (1.0 - alpha) * state.cv_imbalance_correlation + alpha * params.imbalance_correlation;
         } else {
             // First update - initialize directly
-            state.cv_direction = direction;
-            state.cv_confidence = confidence;
-            state.cv_discovery_venue = discovery_venue;
-            state.cv_max_toxicity = max_toxicity;
-            state.cv_avg_toxicity = avg_toxicity;
-            state.cv_agreement = agreement;
-            state.cv_divergence = divergence;
-            state.cv_intensity_ratio = intensity_ratio;
-            state.cv_imbalance_correlation = imbalance_correlation;
+            state.cv_direction = params.direction;
+            state.cv_confidence = params.confidence;
+            state.cv_discovery_venue = params.discovery_venue;
+            state.cv_max_toxicity = params.max_toxicity;
+            state.cv_avg_toxicity = params.avg_toxicity;
+            state.cv_agreement = params.agreement;
+            state.cv_divergence = params.divergence;
+            state.cv_intensity_ratio = params.intensity_ratio;
+            state.cv_imbalance_correlation = params.imbalance_correlation;
         }
 
         // Boolean alerts are not smoothed
-        state.cv_toxicity_alert = toxicity_alert;
-        state.cv_divergence_alert = divergence_alert;
+        state.cv_toxicity_alert = params.toxicity_alert;
+        state.cv_divergence_alert = params.divergence_alert;
         state.cv_is_valid = true;
         state.cv_observation_count += 1;
-        state.cv_last_update_ms = timestamp_ms;
+        state.cv_last_update_ms = params.timestamp_ms;
     }
 
     fn soft_reset(&self, state: &mut InternalState, retention: f64) {
@@ -1174,9 +1175,9 @@ impl CentralBeliefState {
             .sum::<f64>();
 
         // Determine result
-        let result = if state.changepoint_obs_count < 10 {
-            ChangepointResult::None
-        } else if prob_5 <= self.config.changepoint_threshold {
+        let result = if state.changepoint_obs_count < 10
+            || prob_5 <= self.config.changepoint_threshold
+        {
             ChangepointResult::None
         } else if state.changepoint_consecutive_high >= 2 {
             ChangepointResult::Confirmed

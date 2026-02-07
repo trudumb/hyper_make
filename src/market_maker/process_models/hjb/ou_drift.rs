@@ -228,9 +228,7 @@ impl OUDriftEstimator {
                 // σ²_D ≈ mean(innovation²) / dt (simplified)
                 let avg_dt = 0.1; // Assume 100ms average between observations
                 self.sigma_drift = (mean_sq_innovation / avg_dt)
-                    .sqrt()
-                    .max(1e-6)
-                    .min(0.1);
+                    .sqrt().clamp(1e-6, 0.1);
 
                 // Reset accumulators
                 self.innovation_sum_sq = 0.0;

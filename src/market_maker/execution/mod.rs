@@ -31,15 +31,15 @@
 //!
 //! // Order lifecycle tracking
 //! let lifecycle_tracker = OrderLifecycleTracker::new(1000);
-//! lifecycle_tracker.create_order(
-//!     12345,
-//!     "cloid-uuid".to_string(),
-//!     "BTC".to_string(),
-//!     Side::Bid,
-//!     50000.0,
-//!     0.01,
-//!     current_time_ms(),
-//! );
+//! lifecycle_tracker.create_order(CreateOrderParams {
+//!     order_id: 12345,
+//!     client_order_id: "cloid-uuid".to_string(),
+//!     symbol: "BTC".to_string(),
+//!     side: Side::Bid,
+//!     price: 50000.0,
+//!     size: 0.01,
+//!     timestamp_ms: current_time_ms(),
+//! });
 //! lifecycle_tracker.update_order(12345, OrderEvent::new(
 //!     current_time_ms() + 100,
 //!     OrderState::Filled,
@@ -77,5 +77,6 @@ mod order_lifecycle;
 // Re-export key types
 pub use fill_tracker::{FillMetrics, FillRecord, FillTracker, Side};
 pub use order_lifecycle::{
-    CancelAnalysis, FillStatistics, OrderEvent, OrderLifecycle, OrderLifecycleTracker, OrderState,
+    CancelAnalysis, CreateOrderParams, FillStatistics, OrderEvent, OrderLifecycle,
+    OrderLifecycleTracker, OrderState,
 };

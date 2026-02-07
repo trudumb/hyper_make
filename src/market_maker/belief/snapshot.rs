@@ -21,7 +21,7 @@ use super::Regime;
 ///
 /// This is the primary interface for consumers. All fields are
 /// public for easy access without getter methods.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BeliefSnapshot {
     // === Core Bayesian Posteriors ===
     /// Drift and volatility beliefs (Normal-Inverse-Gamma)
@@ -59,23 +59,6 @@ pub struct BeliefSnapshot {
     // === Meta ===
     /// Statistics about the belief state
     pub stats: BeliefStats,
-}
-
-impl Default for BeliefSnapshot {
-    fn default() -> Self {
-        Self {
-            drift_vol: DriftVolatilityBeliefs::default(),
-            kappa: KappaBeliefs::default(),
-            continuation: ContinuationBeliefs::default(),
-            regime: RegimeBeliefs::default(),
-            changepoint: ChangepointBeliefs::default(),
-            edge: EdgeBeliefs::default(),
-            microstructure: MicrostructureBeliefs::default(),
-            cross_venue: CrossVenueBeliefs::default(),
-            calibration: CalibrationState::default(),
-            stats: BeliefStats::default(),
-        }
-    }
 }
 
 impl BeliefSnapshot {
@@ -964,8 +947,8 @@ pub struct CrossVenueBeliefs {
     /// Intensity ratio: λ_B / (λ_B + λ_H) [0, 1].
     ///
     /// Where is the trading activity concentrated?
-    /// > 0.6 = Binance is the action (follow Binance signals)
-    /// < 0.4 = HL is the action (rely on local flow)
+    /// \> 0.6 = Binance is the action (follow Binance signals)
+    /// \< 0.4 = HL is the action (rely on local flow)
     pub intensity_ratio: f64,
 
     /// Rolling correlation of imbalances [-1, 1].
@@ -1103,7 +1086,7 @@ impl CrossVenueBeliefs {
 // =============================================================================
 
 /// Model calibration state for tracking prediction quality.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CalibrationState {
     /// Fill probability calibration
     pub fill: CalibrationMetrics,
@@ -1198,19 +1181,6 @@ impl LatencyCalibration {
     /// Check if freshness matters (ir_degradation_ratio > 1.2)
     pub fn freshness_matters(&self) -> bool {
         self.ir_degradation_ratio > 1.2
-    }
-}
-
-impl Default for CalibrationState {
-    fn default() -> Self {
-        Self {
-            fill: CalibrationMetrics::default(),
-            adverse_selection: CalibrationMetrics::default(),
-            signal_quality: std::collections::HashMap::new(),
-            pending_count: 0,
-            linked_count: 0,
-            latency: LatencyCalibration::default(),
-        }
     }
 }
 

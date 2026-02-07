@@ -766,14 +766,14 @@ impl PreFillASClassifier {
             .unwrap_or(1.0);
 
         // Update running statistics for each signal
-        for i in 0..5 {
-            self.signal_outcome_sum[i] += signals[i] * target * sample_weight;
-            self.signal_sq_sum[i] += signals[i] * signals[i] * sample_weight;
+        for (i, signal) in signals.iter().enumerate() {
+            self.signal_outcome_sum[i] += signal * target * sample_weight;
+            self.signal_sq_sum[i] += signal * signal * sample_weight;
         }
         self.learning_samples += 1;
 
         // Every 50 samples, update weights using regularized regression
-        if self.learning_samples % 50 == 0 {
+        if self.learning_samples.is_multiple_of(50) {
             self.update_weights();
         }
     }
@@ -1115,7 +1115,7 @@ mod tests {
         // SYMMETRIC TEST: Buy flow should only affect bids, not asks
         classifier.update_trade_flow(80.0, 20.0); // Strong buy flow (trade_direction ≈ +0.6)
         let bid_tox_with_buy_flow = classifier.predict_toxicity(true);
-        let ask_tox_with_buy_flow = classifier.predict_toxicity(false);
+        let _ask_tox_with_buy_flow = classifier.predict_toxicity(false);
 
         // Bids should be toxic (we're buying with the crowd)
         assert!(bid_tox_with_buy_flow > 0.1, "Buy flow should make bids toxic");

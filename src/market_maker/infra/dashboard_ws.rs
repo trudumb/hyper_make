@@ -44,7 +44,7 @@ use super::metrics::dashboard::{
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DashboardPush {
     /// Full state snapshot (sent on connect + periodically)
-    Snapshot { state: DashboardState },
+    Snapshot { state: Box<DashboardState> },
 
     /// Incremental update (throttled, only changed fields)
     Update {
@@ -168,7 +168,7 @@ impl DashboardWsState {
     /// Push a snapshot to all clients
     pub fn push_snapshot(&self) {
         let state = self.current_state.read().unwrap().clone();
-        self.push(DashboardPush::Snapshot { state });
+        self.push(DashboardPush::Snapshot { state: Box::new(state) });
     }
 
     /// Push a fill event immediately
@@ -233,7 +233,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<DashboardWsState>) {
     // Send initial snapshot
     {
         let current = state.current_state.read().unwrap().clone();
-        let msg = DashboardPush::Snapshot { state: current };
+        let msg = DashboardPush::Snapshot { state: Box::new(current) };
         if let Ok(json) = serde_json::to_string(&msg) {
             if sender.send(Message::Text(json)).await.is_err() {
                 state.client_count.fetch_sub(1, Ordering::SeqCst);
@@ -288,7 +288,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<DashboardWsState>) {
                             match cmd {
                                 DashboardCommand::RequestSnapshot { .. } => {
                                     let current = state.current_state.read().unwrap().clone();
-                                    let msg = DashboardPush::Snapshot { state: current };
+                                    let msg = DashboardPush::Snapshot { state: Box::new(current) };
                                     if let Ok(json) = serde_json::to_string(&msg) {
                                         let _ = sender.send(Message::Text(json)).await;
                                     }
@@ -326,7 +326,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<DashboardWsState>) {
                 if last_snapshot.elapsed() >= snapshot_interval {
                     last_snapshot = Instant::now();
                     let current = state.current_state.read().unwrap().clone();
-                    let msg = DashboardPush::Snapshot { state: current };
+                    let msg = DashboardPush::Snapshot { state: Box::new(current) };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         if sender.send(Message::Text(json)).await.is_err() {
                             break;
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn test_push_serialization() {
         let push = DashboardPush::Snapshot {
-            state: DashboardState::default(),
+            state: Box::new(DashboardState::default()),
         };
         let json = serde_json::to_string(&push).unwrap();
         assert!(json.contains("\"type\":\"snapshot\""));

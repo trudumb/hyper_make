@@ -98,14 +98,12 @@ impl AffectedTracker {
                     oids: self.affected_oids.clone(),
                 }
             }
+        } else if self.affected_oids.is_empty() {
+            ReconcileScope::SideOnly { side: Side::Sell }
         } else {
-            if self.affected_oids.is_empty() {
-                ReconcileScope::SideOnly { side: Side::Sell }
-            } else {
-                ReconcileScope::SideAndLevels {
-                    side: Side::Sell,
-                    oids: self.affected_oids.clone(),
-                }
+            ReconcileScope::SideAndLevels {
+                side: Side::Sell,
+                oids: self.affected_oids.clone(),
             }
         }
     }

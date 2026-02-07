@@ -1135,15 +1135,7 @@ impl SimulationState {
             .restore_checkpoint(&bundle.pre_fill);
         self.enhanced_classifier
             .restore_checkpoint(&bundle.enhanced);
-        self.estimator.restore_checkpoint(
-            &bundle.vol_filter,
-            &bundle.informed_flow,
-            &bundle.fill_rate,
-            &bundle.kappa_own,
-            &bundle.kappa_bid,
-            &bundle.kappa_ask,
-            &bundle.momentum,
-        );
+        self.estimator.restore_checkpoint(bundle);
         self.regime_hmm.restore_checkpoint(&bundle.regime_hmm);
         self.learned_params = bundle.learned_params.clone();
     }
@@ -1186,7 +1178,7 @@ impl SimulationStats {
     fn format(&self) -> String {
         let mut output = String::new();
 
-        output.push_str("\n");
+        output.push('\n');
         output.push_str("╔══════════════════════════════════════════════════════════════╗\n");
         output.push_str("║           PAPER TRADING SIMULATION SUMMARY                   ║\n");
         output.push_str("╠══════════════════════════════════════════════════════════════╣\n");
@@ -2180,7 +2172,7 @@ async fn subscribe_l2_book_inner(
     while let Some(arc_msg) = receiver.recv().await {
         if let Message::L2Book(book) = &*arc_msg {
             // levels is Vec<Vec<OrderBookLevel>> - [0] = bids, [1] = asks
-            let bids: Vec<(f64, f64)> = if book.data.levels.len() > 0 {
+            let bids: Vec<(f64, f64)> = if !book.data.levels.is_empty() {
                 book.data.levels[0]
                     .iter()
                     .filter_map(|l| {

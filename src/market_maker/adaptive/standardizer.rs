@@ -396,7 +396,7 @@ impl PredictionStandardizer {
 
         // Periodically recalibrate temperature
         if self.calibration_count >= self.min_calibration_samples
-            && self.calibration_count % 100 == 0
+            && self.calibration_count.is_multiple_of(100)
         {
             self.recalibrate();
         }
@@ -642,7 +642,7 @@ impl MultiFeatureStandardizer {
         self.output_count += 1;
 
         // Periodic recalibration
-        if self.output_count % 100 == 0 && self.output_count > 100 {
+        if self.output_count.is_multiple_of(100) && self.output_count > 100 {
             self.recalibrate_output();
         }
 
@@ -874,7 +874,7 @@ mod tests {
         }
 
         // Should detect concentration
-        let diag = ps.diagnostics();
+        let _diag = ps.diagnostics();
         // Note: May need many samples for concentration to be detected
         // This test mainly verifies the logic doesn't panic
     }
@@ -933,6 +933,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        (nanos as f64 / u32::MAX as f64)
+        nanos as f64 / u32::MAX as f64
     }
 }

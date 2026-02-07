@@ -14,15 +14,15 @@
 //! let tracker = OrderLifecycleTracker::new(1000);
 //!
 //! // Create an order
-//! tracker.create_order(
-//!     12345,
-//!     "cloid-uuid".to_string(),
-//!     "BTC".to_string(),
-//!     Side::Bid,
-//!     50000.0,
-//!     0.01,
-//!     current_time_ms(),
-//! );
+//! tracker.create_order(CreateOrderParams {
+//!     order_id: 12345,
+//!     client_order_id: "cloid-uuid".to_string(),
+//!     symbol: "BTC".to_string(),
+//!     side: Side::Bid,
+//!     price: 50000.0,
+//!     size: 0.01,
+//!     timestamp_ms: current_time_ms(),
+//! });
 //!
 //! // Update order state
 //! tracker.update_order(12345, OrderEvent {
@@ -211,11 +211,7 @@ impl OrderLifecycle {
         }
 
         self.events.last().map(|last| {
-            if last.timestamp >= self.created_at {
-                last.timestamp - self.created_at
-            } else {
-                0 // Shouldn't happen, but handle gracefully
-            }
+            last.timestamp.saturating_sub(self.created_at)
         })
     }
 
@@ -293,6 +289,17 @@ impl CancelAnalysis {
     }
 }
 
+/// Parameters for creating a new tracked order.
+pub struct CreateOrderParams {
+    pub order_id: u64,
+    pub client_order_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+    pub timestamp_ms: u64,
+}
+
 /// Thread-safe order lifecycle tracker.
 ///
 /// Tracks active and completed orders with their full lifecycle history.
@@ -324,35 +331,20 @@ impl OrderLifecycleTracker {
     ///
     /// # Arguments
     ///
-    /// * `order_id` - Exchange order ID
-    /// * `client_order_id` - Client order ID for correlation
-    /// * `symbol` - Trading symbol
-    /// * `side` - Order side
-    /// * `price` - Limit price
-    /// * `size` - Order size
-    /// * `timestamp` - Creation timestamp in milliseconds
-    pub fn create_order(
-        &self,
-        order_id: u64,
-        client_order_id: String,
-        symbol: String,
-        side: Side,
-        price: f64,
-        size: f64,
-        timestamp: u64,
-    ) {
+    /// * `params` - Order creation parameters
+    pub fn create_order(&self, params: CreateOrderParams) {
         let lifecycle = OrderLifecycle::new(
-            order_id,
-            client_order_id,
-            symbol,
-            side,
-            price,
-            size,
-            timestamp,
+            params.order_id,
+            params.client_order_id,
+            params.symbol,
+            params.side,
+            params.price,
+            params.size,
+            params.timestamp_ms,
         );
 
         let mut orders = self.orders.write().unwrap();
-        orders.insert(order_id, lifecycle);
+        orders.insert(params.order_id, lifecycle);
     }
 
     /// Update an order with a new event.
@@ -840,15 +832,15 @@ mod tests {
     fn test_order_lifecycle_tracker_create_order() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        tracker.create_order(
-            123,
-            "cloid-1".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 123,
+            client_order_id: "cloid-1".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
 
         assert_eq!(tracker.active_count(), 1);
 
@@ -861,15 +853,15 @@ mod tests {
     fn test_order_lifecycle_tracker_update_order() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        tracker.create_order(
-            123,
-            "cloid-1".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 123,
+            client_order_id: "cloid-1".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
 
         // Partial fill
         assert!(tracker.update_order(
@@ -904,24 +896,24 @@ mod tests {
     fn test_order_lifecycle_tracker_active_orders() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        tracker.create_order(
-            1,
-            "cloid-1".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
-        tracker.create_order(
-            2,
-            "cloid-2".to_string(),
-            "BTC".to_string(),
-            Side::Ask,
-            50100.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 1,
+            client_order_id: "cloid-1".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
+        tracker.create_order(CreateOrderParams {
+            order_id: 2,
+            client_order_id: "cloid-2".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Ask,
+            price: 50100.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
 
         let active = tracker.active_orders();
         assert_eq!(active.len(), 2);
@@ -932,15 +924,15 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(100);
 
         for i in 0..5 {
-            tracker.create_order(
-                i,
-                format!("cloid-{}", i),
-                "BTC".to_string(),
-                Side::Bid,
-                50000.0,
-                0.01,
-                1000 + i,
-            );
+            tracker.create_order(CreateOrderParams {
+                order_id: i,
+                client_order_id: format!("cloid-{}", i),
+                symbol: "BTC".to_string(),
+                side: Side::Bid,
+                price: 50000.0,
+                size: 0.01,
+                timestamp_ms: 1000 + i,
+            });
             tracker.update_order(i, OrderEvent::new(1100 + i, OrderState::Filled, 0.01, 0.0));
         }
 
@@ -957,15 +949,15 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(3); // Only keep 3
 
         for i in 0..5 {
-            tracker.create_order(
-                i,
-                format!("cloid-{}", i),
-                "BTC".to_string(),
-                Side::Bid,
-                50000.0,
-                0.01,
-                1000,
-            );
+            tracker.create_order(CreateOrderParams {
+                order_id: i,
+                client_order_id: format!("cloid-{}", i),
+                symbol: "BTC".to_string(),
+                side: Side::Bid,
+                price: 50000.0,
+                size: 0.01,
+                timestamp_ms: 1000,
+            });
             tracker.update_order(i, OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0));
         }
 
@@ -985,28 +977,28 @@ mod tests {
 
         // 2 cancelled before fill
         for i in 0..2 {
-            tracker.create_order(
-                i,
-                format!("cloid-{}", i),
-                "BTC".to_string(),
-                Side::Bid,
-                50000.0,
-                0.01,
-                1000,
-            );
+            tracker.create_order(CreateOrderParams {
+                order_id: i,
+                client_order_id: format!("cloid-{}", i),
+                symbol: "BTC".to_string(),
+                side: Side::Bid,
+                price: 50000.0,
+                size: 0.01,
+                timestamp_ms: 1000,
+            });
             tracker.update_order(i, OrderEvent::new(1100, OrderState::Cancelled, 0.0, 0.01));
         }
 
         // 1 cancelled after partial
-        tracker.create_order(
-            2,
-            "cloid-2".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 2,
+            client_order_id: "cloid-2".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
         tracker.update_order(
             2,
             OrderEvent::new(1050, OrderState::PartiallyFilled, 0.005, 0.005),
@@ -1017,15 +1009,15 @@ mod tests {
         );
 
         // 1 filled (not cancelled)
-        tracker.create_order(
-            3,
-            "cloid-3".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 3,
+            client_order_id: "cloid-3".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
         tracker.update_order(3, OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0));
 
         let analysis = tracker.cancel_analysis();
@@ -1039,33 +1031,33 @@ mod tests {
     fn test_order_lifecycle_tracker_active_orders_by_side() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        tracker.create_order(
-            1,
-            "cloid-1".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
-        tracker.create_order(
-            2,
-            "cloid-2".to_string(),
-            "BTC".to_string(),
-            Side::Ask,
-            50100.0,
-            0.01,
-            1000,
-        );
-        tracker.create_order(
-            3,
-            "cloid-3".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            49900.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 1,
+            client_order_id: "cloid-1".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
+        tracker.create_order(CreateOrderParams {
+            order_id: 2,
+            client_order_id: "cloid-2".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Ask,
+            price: 50100.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
+        tracker.create_order(CreateOrderParams {
+            order_id: 3,
+            client_order_id: "cloid-3".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 49900.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
 
         let bids = tracker.active_orders_by_side(Side::Bid);
         let asks = tracker.active_orders_by_side(Side::Ask);
@@ -1078,24 +1070,24 @@ mod tests {
     fn test_order_lifecycle_tracker_active_orders_by_symbol() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        tracker.create_order(
-            1,
-            "cloid-1".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
-        tracker.create_order(
-            2,
-            "cloid-2".to_string(),
-            "ETH".to_string(),
-            Side::Bid,
-            3000.0,
-            0.1,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 1,
+            client_order_id: "cloid-1".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
+        tracker.create_order(CreateOrderParams {
+            order_id: 2,
+            client_order_id: "cloid-2".to_string(),
+            symbol: "ETH".to_string(),
+            side: Side::Bid,
+            price: 3000.0,
+            size: 0.1,
+            timestamp_ms: 1000,
+        });
 
         let btc_orders = tracker.active_orders_by_symbol("BTC");
         let eth_orders = tracker.active_orders_by_symbol("ETH");
@@ -1108,15 +1100,15 @@ mod tests {
     fn test_order_lifecycle_tracker_remove_order() {
         let tracker = OrderLifecycleTracker::new(100);
 
-        tracker.create_order(
-            1,
-            "cloid-1".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 1,
+            client_order_id: "cloid-1".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
 
         let removed = tracker.remove_order(1);
         assert!(removed.is_some());
@@ -1130,15 +1122,15 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(100);
 
         for i in 0..3 {
-            tracker.create_order(
-                i,
-                format!("cloid-{}", i),
-                "BTC".to_string(),
-                Side::Bid,
-                50000.0,
-                0.01,
-                1000,
-            );
+            tracker.create_order(CreateOrderParams {
+                order_id: i,
+                client_order_id: format!("cloid-{}", i),
+                symbol: "BTC".to_string(),
+                side: Side::Bid,
+                price: 50000.0,
+                size: 0.01,
+                timestamp_ms: 1000,
+            });
         }
 
         assert_eq!(tracker.active_count(), 3);
@@ -1151,15 +1143,15 @@ mod tests {
         let tracker = OrderLifecycleTracker::new(100);
 
         for i in 0..3 {
-            tracker.create_order(
-                i,
-                format!("cloid-{}", i),
-                "BTC".to_string(),
-                Side::Bid,
-                50000.0,
-                0.01,
-                1000,
-            );
+            tracker.create_order(CreateOrderParams {
+                order_id: i,
+                client_order_id: format!("cloid-{}", i),
+                symbol: "BTC".to_string(),
+                side: Side::Bid,
+                price: 50000.0,
+                size: 0.01,
+                timestamp_ms: 1000,
+            });
             tracker.update_order(i, OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0));
         }
 
@@ -1174,28 +1166,28 @@ mod tests {
 
         // 2 fully filled
         for i in 0..2 {
-            tracker.create_order(
-                i,
-                format!("cloid-{}", i),
-                "BTC".to_string(),
-                Side::Bid,
-                50000.0,
-                0.01,
-                1000,
-            );
+            tracker.create_order(CreateOrderParams {
+                order_id: i,
+                client_order_id: format!("cloid-{}", i),
+                symbol: "BTC".to_string(),
+                side: Side::Bid,
+                price: 50000.0,
+                size: 0.01,
+                timestamp_ms: 1000,
+            });
             tracker.update_order(i, OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0));
         }
 
         // 1 partially filled then cancelled
-        tracker.create_order(
-            2,
-            "cloid-2".to_string(),
-            "BTC".to_string(),
-            Side::Bid,
-            50000.0,
-            0.01,
-            1000,
-        );
+        tracker.create_order(CreateOrderParams {
+            order_id: 2,
+            client_order_id: "cloid-2".to_string(),
+            symbol: "BTC".to_string(),
+            side: Side::Bid,
+            price: 50000.0,
+            size: 0.01,
+            timestamp_ms: 1000,
+        });
         tracker.update_order(
             2,
             OrderEvent::new(1050, OrderState::PartiallyFilled, 0.005, 0.005),
@@ -1251,15 +1243,15 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..25 {
                         let order_id = thread_id * 100 + i;
-                        tracker.create_order(
+                        tracker.create_order(CreateOrderParams {
                             order_id,
-                            format!("cloid-{}", order_id),
-                            "BTC".to_string(),
-                            Side::Bid,
-                            50000.0,
-                            0.01,
-                            1000,
-                        );
+                            client_order_id: format!("cloid-{}", order_id),
+                            symbol: "BTC".to_string(),
+                            side: Side::Bid,
+                            price: 50000.0,
+                            size: 0.01,
+                            timestamp_ms: 1000,
+                        });
                         tracker.update_order(
                             order_id,
                             OrderEvent::new(1100, OrderState::Filled, 0.01, 0.0),

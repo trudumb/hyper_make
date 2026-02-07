@@ -1084,7 +1084,7 @@ impl TradeSizeDistribution {
         // Compute median
         let mut sorted: Vec<f64> = self.sizes.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        self.cached_median = if sorted.len() % 2 == 0 {
+        self.cached_median = if sorted.len().is_multiple_of(2) {
             let mid = sorted.len() / 2;
             (sorted[mid - 1] + sorted[mid]) / 2.0
         } else {

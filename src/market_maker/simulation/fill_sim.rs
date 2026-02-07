@@ -280,7 +280,7 @@ impl FillSimulator {
         };
 
         // Factor 2: Trade size relative to our order
-        let size_factor = (trade.size / order.size).min(2.0).max(0.5);
+        let size_factor = (trade.size / order.size).clamp(0.5, 2.0);
 
         // Factor 3: Queue position
         let now_ns = SystemTime::now()

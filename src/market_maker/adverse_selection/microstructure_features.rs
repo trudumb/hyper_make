@@ -265,6 +265,19 @@ impl MicrostructureFeatures {
 }
 
 /// Microstructure feature extractor
+/// Microstructure inputs for toxicity score computation.
+struct ToxicityInputs {
+    intensity: f64,
+    impact: f64,
+    run_length: f64,
+    vol_imbalance: f64,
+    spread_widen: f64,
+    arrival_speed: f64,
+    size: f64,
+    size_concentration: f64,
+    direction_concentration: f64,
+}
+
 ///
 /// Computes statistically meaningful features from trade and book data.
 /// All features are designed to detect informed trading.
@@ -450,12 +463,12 @@ impl MicrostructureExtractor {
         // Decay entropy counts to keep them recent (every 200 trades)
         if self.entropy_window_count >= 200 {
             for count in &mut self.size_bucket_counts {
-                *count = *count / 2;
+                *count /= 2;
             }
             for count in &mut self.direction_counts {
-                *count = *count / 2;
+                *count /= 2;
             }
-            self.entropy_window_count = self.entropy_window_count / 2;
+            self.entropy_window_count /= 2;
         }
     }
 
@@ -607,17 +620,17 @@ impl MicrostructureExtractor {
 
         // === Combined toxicity score ===
         // Weighted combination emphasizing strong signals
-        let toxicity_score = self.compute_toxicity_score(
-            intensity_zscore,
-            impact_zscore,
-            run_length_zscore,
-            volume_imbalance,
-            spread_widening,
-            arrival_speed_zscore,
-            size_zscore,
+        let toxicity_score = self.compute_toxicity_score(&ToxicityInputs {
+            intensity: intensity_zscore,
+            impact: impact_zscore,
+            run_length: run_length_zscore,
+            vol_imbalance: volume_imbalance,
+            spread_widen: spread_widening,
+            arrival_speed: arrival_speed_zscore,
+            size: size_zscore,
             size_concentration,
             direction_concentration,
-        );
+        });
 
         MicrostructureFeatures {
             intensity_zscore,
@@ -636,18 +649,7 @@ impl MicrostructureExtractor {
     }
 
     /// Compute combined toxicity score using theory-driven weights
-    fn compute_toxicity_score(
-        &self,
-        intensity: f64,
-        impact: f64,
-        run_length: f64,
-        vol_imbalance: f64,
-        spread_widen: f64,
-        arrival_speed: f64,
-        size: f64,
-        size_concentration: f64,
-        direction_concentration: f64,
-    ) -> f64 {
+    fn compute_toxicity_score(&self, inputs: &ToxicityInputs) -> f64 {
         // Weights based on microstructure theory importance:
         // - Price impact (Kyle's λ) is the gold standard for information
         // - Run length is strong evidence of informed trading
@@ -669,15 +671,15 @@ impl MicrostructureExtractor {
         // Convert z-scores to [0, 1] probabilities using sigmoid
         let sigmoid = |z: f64| 1.0 / (1.0 + (-z).exp());
 
-        let score = W_IMPACT * sigmoid(impact)
-            + W_RUN * sigmoid(run_length)
-            + W_INTENSITY * sigmoid(intensity)
-            + W_ARRIVAL * sigmoid(arrival_speed)
-            + W_SPREAD * sigmoid(spread_widen * 2.0) // Scale spread signal
-            + W_IMBALANCE * sigmoid(vol_imbalance.abs() * 2.0)
-            + W_SIZE * sigmoid(size)
-            + W_SIZE_CONC * size_concentration  // Already [0, 1]
-            + W_DIR_CONC * direction_concentration; // Already [0, 1]
+        let score = W_IMPACT * sigmoid(inputs.impact)
+            + W_RUN * sigmoid(inputs.run_length)
+            + W_INTENSITY * sigmoid(inputs.intensity)
+            + W_ARRIVAL * sigmoid(inputs.arrival_speed)
+            + W_SPREAD * sigmoid(inputs.spread_widen * 2.0) // Scale spread signal
+            + W_IMBALANCE * sigmoid(inputs.vol_imbalance.abs() * 2.0)
+            + W_SIZE * sigmoid(inputs.size)
+            + W_SIZE_CONC * inputs.size_concentration  // Already [0, 1]
+            + W_DIR_CONC * inputs.direction_concentration; // Already [0, 1]
 
         score.clamp(0.0, 1.0)
     }

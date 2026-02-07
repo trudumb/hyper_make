@@ -415,7 +415,7 @@ impl ABTest {
 
         // Check statistical significance
         let p_value = metrics.statistical_significance();
-        p_value < 0.05 || p_value > 0.95
+        !(0.05..=0.95).contains(&p_value)
     }
 
     /// Get the winner if test is conclusive.

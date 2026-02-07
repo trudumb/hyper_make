@@ -10,7 +10,7 @@ mod signal_improvement_proof {
     use crate::market_maker::calibration::InformedFlowAdjustment;
     use crate::market_maker::control::actions::{Action, NoQuoteReason};
     use crate::market_maker::control::simulation::{
-        MarketScenario, SimulationConfig, SimulationEngine, SimulationResult,
+        MarketScenario, SimulationConfig, SimulationEngine,
     };
     use crate::market_maker::control::traits::{ControlOutput, ControlStateProvider, ControlSolver, StateSnapshot};
     use crate::market_maker::quoting::{Ladder, LadderLevel};
@@ -147,7 +147,7 @@ mod signal_improvement_proof {
             };
 
             ControlOutput {
-                action: Action::Quote { ladder, expected_value: state.expected_edge() },
+                action: Action::Quote { ladder: Box::new(ladder), expected_value: state.expected_edge() },
                 expected_value: state.expected_edge(),
                 confidence: state.confidence(),
             }
@@ -222,7 +222,7 @@ mod signal_improvement_proof {
             };
 
             ControlOutput {
-                action: Action::Quote { ladder, expected_value: state.expected_edge() },
+                action: Action::Quote { ladder: Box::new(ladder), expected_value: state.expected_edge() },
                 expected_value: state.expected_edge() * (1.0 - p_informed * 0.2),
                 confidence: state.confidence() * (1.0 - p_informed * 0.3),
             }

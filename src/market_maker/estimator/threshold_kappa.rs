@@ -149,7 +149,7 @@ impl ThresholdKappa {
 
         // Volatility-scaled threshold
         // Higher volatility → higher threshold (momentum needs bigger moves to trigger)
-        let vol_scale = (self.abs_return_ema / 10.0).max(0.5).min(2.0);
+        let vol_scale = (self.abs_return_ema / 10.0).clamp(0.5, 2.0);
         let effective_threshold = self.config.threshold_bps * vol_scale;
 
         if deviation < effective_threshold {
@@ -165,7 +165,7 @@ impl ThresholdKappa {
     /// Compute current regime classification.
     fn compute_regime(&self) -> ThresholdKappaRegime {
         let deviation = self.return_ema.abs();
-        let vol_scale = (self.abs_return_ema / 10.0).max(0.5).min(2.0);
+        let vol_scale = (self.abs_return_ema / 10.0).clamp(0.5, 2.0);
         let t = self.config.threshold_bps * vol_scale;
 
         if deviation < t * 0.5 {
@@ -186,7 +186,7 @@ impl ThresholdKappa {
 
     /// Get kappa at a specific deviation level (for simulation).
     pub fn kappa_at_deviation(&self, deviation_bps: f64) -> f64 {
-        let vol_scale = (self.abs_return_ema / 10.0).max(0.5).min(2.0);
+        let vol_scale = (self.abs_return_ema / 10.0).clamp(0.5, 2.0);
         let effective_threshold = self.config.threshold_bps * vol_scale;
 
         if deviation_bps.abs() < effective_threshold {

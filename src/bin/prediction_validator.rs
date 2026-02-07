@@ -263,6 +263,17 @@ pub struct PendingOutcome {
     pub regime: usize,
 }
 
+/// Input for recording a new prediction outcome.
+struct PendingOutcomeInput {
+    prediction_type: ValidatorPredictionType,
+    predicted_prob: f64,
+    fill_side: Option<Side>,
+    reference_price: f64,
+    timestamp_ms: u64,
+    markout_ms: u64,
+    regime: usize,
+}
+
 // ============================================================================
 // Regime Statistics
 // ============================================================================
@@ -808,10 +819,12 @@ impl PredictionValidator {
     pub fn enable_binance_feed(&mut self, asset: &str) {
         // Use a larger buffer for Binance since bookTicker updates are very fast (~10ms)
         // Default 2000 only holds ~1.5s of Binance data; need 60000 for ~60s
-        let mut config = SignalIntegratorConfig::default();
-        config.lag_config = LagAnalyzerConfig {
-            buffer_capacity: 60000, // ~60 seconds at 10ms intervals
-            ..LagAnalyzerConfig::default()
+        let mut config = SignalIntegratorConfig {
+            lag_config: LagAnalyzerConfig {
+                buffer_capacity: 60000, // ~60 seconds at 10ms intervals
+                ..LagAnalyzerConfig::default()
+            },
+            ..SignalIntegratorConfig::default()
         };
 
         // ADAPTIVE VPIN bucket sizing
@@ -899,15 +912,15 @@ impl PredictionValidator {
             Some(Side::Bid)
         };
 
-        self.record_pending_outcome(
-            ValidatorPredictionType::LeadLag,
-            p_direction,
-            predicted_direction,
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::LeadLag,
+            predicted_prob: p_direction,
+            fill_side: predicted_direction,
+            reference_price: mid,
             timestamp_ms,
-            ValidatorPredictionType::LeadLag.markout_ms(),
+            markout_ms: ValidatorPredictionType::LeadLag.markout_ms(),
             regime,
-        );
+        });
 
         self.stats.predictions_made += 1;
     }
@@ -1151,15 +1164,15 @@ impl PredictionValidator {
 
         // 1. InformedFlow prediction
         let p_informed = self.flow_estimator.decomposition().p_informed;
-        self.record_pending_outcome(
-            ValidatorPredictionType::InformedFlow,
-            p_informed,
-            Some(fill.side),
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::InformedFlow,
+            predicted_prob: p_informed,
+            fill_side: Some(fill.side),
+            reference_price: mid,
             timestamp_ms,
-            self.markout_ms.max(ValidatorPredictionType::InformedFlow.markout_ms()),
+            markout_ms: self.markout_ms.max(ValidatorPredictionType::InformedFlow.markout_ms()),
             regime,
-        );
+        });
 
         // 2. PreFillToxicity prediction (old classifier)
         // Pipe blended toxicity from IntegratedSignals (includes VPIN when valid)
@@ -1171,74 +1184,74 @@ impl PredictionValidator {
             Side::Bid => self.pre_fill_classifier.predict_toxicity(true),
             Side::Ask => self.pre_fill_classifier.predict_toxicity(false),
         };
-        self.record_pending_outcome(
-            ValidatorPredictionType::PreFillToxicity,
-            p_toxic,
-            Some(fill.side),
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::PreFillToxicity,
+            predicted_prob: p_toxic,
+            fill_side: Some(fill.side),
+            reference_price: mid,
             timestamp_ms,
-            self.markout_ms.max(ValidatorPredictionType::PreFillToxicity.markout_ms()),
+            markout_ms: self.markout_ms.max(ValidatorPredictionType::PreFillToxicity.markout_ms()),
             regime,
-        );
+        });
 
         // 3. EnhancedToxicity prediction (microstructure features)
         let p_enhanced_toxic = match fill.side {
             Side::Bid => self.enhanced_classifier.predict_toxicity(true),
             Side::Ask => self.enhanced_classifier.predict_toxicity(false),
         };
-        self.record_pending_outcome(
-            ValidatorPredictionType::EnhancedToxicity,
-            p_enhanced_toxic,
-            Some(fill.side),
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::EnhancedToxicity,
+            predicted_prob: p_enhanced_toxic,
+            fill_side: Some(fill.side),
+            reference_price: mid,
             timestamp_ms,
-            self.markout_ms.max(ValidatorPredictionType::EnhancedToxicity.markout_ms()),
+            markout_ms: self.markout_ms.max(ValidatorPredictionType::EnhancedToxicity.markout_ms()),
             regime,
-        );
+        });
 
         // 4. RegimeHighVol prediction
         let regime_probs = self.regime_hmm.regime_probabilities();
         // P(high vol) = P(volatile) + P(cascade) - assuming regime indices 2 and 3 are volatile/extreme
         let p_high_vol = regime_probs.get(2).copied().unwrap_or(0.0) 
                        + regime_probs.get(3).copied().unwrap_or(0.0);
-        self.record_pending_outcome(
-            ValidatorPredictionType::RegimeHighVol,
-            p_high_vol,
-            None,
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::RegimeHighVol,
+            predicted_prob: p_high_vol,
+            fill_side: None,
+            reference_price: mid,
             timestamp_ms,
-            ValidatorPredictionType::RegimeHighVol.markout_ms(),
+            markout_ms: ValidatorPredictionType::RegimeHighVol.markout_ms(),
             regime,
-        );
+        });
 
         // 4. Momentum prediction
         let momentum_bps = self.buffers.momentum(10);
         // P(price continues) = sigmoid of momentum
         let p_continues = 1.0 / (1.0 + (-momentum_bps / 5.0).exp()); // Scale by 5 bps
-        self.record_pending_outcome(
-            ValidatorPredictionType::Momentum,
-            p_continues,
-            if momentum_bps >= 0.0 { Some(Side::Ask) } else { Some(Side::Bid) },
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::Momentum,
+            predicted_prob: p_continues,
+            fill_side: if momentum_bps >= 0.0 { Some(Side::Ask) } else { Some(Side::Bid) },
+            reference_price: mid,
             timestamp_ms,
-            ValidatorPredictionType::Momentum.markout_ms(),
+            markout_ms: ValidatorPredictionType::Momentum.markout_ms(),
             regime,
-        );
+        });
 
         // 5. BuyPressure prediction (enhanced with volume-weighting and clustering)
         let (vw_buy_ratio, clustering_boost) = self.buffers.buy_pressure_with_clustering(20);
         // Boost prediction confidence when clustering is detected
         let buy_pressure = vw_buy_ratio + (vw_buy_ratio - 0.5) * clustering_boost * 0.3;
         let buy_pressure = buy_pressure.clamp(0.01, 0.99);
-        self.record_pending_outcome(
-            ValidatorPredictionType::BuyPressure,
-            buy_pressure,
-            None, // Resolved on next trade
-            mid,
+        self.record_pending_outcome(PendingOutcomeInput {
+            prediction_type: ValidatorPredictionType::BuyPressure,
+            predicted_prob: buy_pressure,
+            fill_side: None, // Resolved on next trade
+            reference_price: mid,
             timestamp_ms,
-            0, // Special: resolved on next trade
+            markout_ms: 0, // Special: resolved on next trade
             regime,
-        );
+        });
 
         let mut prediction_count = 6;
 
@@ -1255,28 +1268,28 @@ impl PredictionValidator {
                 } else {
                     Some(Side::Bid) // Bearish
                 };
-                self.record_pending_outcome(
-                    ValidatorPredictionType::CrossVenueAgreement,
-                    p_agreement * signals.cross_venue_confidence,
-                    agreement_direction,
-                    mid,
+                self.record_pending_outcome(PendingOutcomeInput {
+                    prediction_type: ValidatorPredictionType::CrossVenueAgreement,
+                    predicted_prob: p_agreement * signals.cross_venue_confidence,
+                    fill_side: agreement_direction,
+                    reference_price: mid,
                     timestamp_ms,
-                    ValidatorPredictionType::CrossVenueAgreement.markout_ms(),
+                    markout_ms: ValidatorPredictionType::CrossVenueAgreement.markout_ms(),
                     regime,
-                );
+                });
                 prediction_count += 1;
 
                 // CrossVenueToxicity: When cross-venue toxicity is high, predict adverse fill
                 // Use max toxicity as the probability of adverse fill
-                self.record_pending_outcome(
-                    ValidatorPredictionType::CrossVenueToxicity,
-                    signals.cross_venue_max_toxicity,
-                    Some(fill.side), // Same side as the synthetic fill
-                    mid,
+                self.record_pending_outcome(PendingOutcomeInput {
+                    prediction_type: ValidatorPredictionType::CrossVenueToxicity,
+                    predicted_prob: signals.cross_venue_max_toxicity,
+                    fill_side: Some(fill.side), // Same side as the synthetic fill
+                    reference_price: mid,
                     timestamp_ms,
-                    ValidatorPredictionType::CrossVenueToxicity.markout_ms(),
+                    markout_ms: ValidatorPredictionType::CrossVenueToxicity.markout_ms(),
                     regime,
-                );
+                });
                 prediction_count += 1;
 
                 // CrossVenueDirection: Predict price moves in direction of cross-venue signal
@@ -1287,15 +1300,15 @@ impl PredictionValidator {
                 } else {
                     Some(Side::Bid) // Bearish
                 };
-                self.record_pending_outcome(
-                    ValidatorPredictionType::CrossVenueDirection,
-                    p_direction * signals.cross_venue_confidence,
-                    predicted_direction,
-                    mid,
+                self.record_pending_outcome(PendingOutcomeInput {
+                    prediction_type: ValidatorPredictionType::CrossVenueDirection,
+                    predicted_prob: p_direction * signals.cross_venue_confidence,
+                    fill_side: predicted_direction,
+                    reference_price: mid,
                     timestamp_ms,
-                    ValidatorPredictionType::CrossVenueDirection.markout_ms(),
+                    markout_ms: ValidatorPredictionType::CrossVenueDirection.markout_ms(),
                     regime,
-                );
+                });
                 prediction_count += 1;
             }
         }
@@ -1304,28 +1317,19 @@ impl PredictionValidator {
     }
 
     /// Record a pending outcome
-    fn record_pending_outcome(
-        &mut self,
-        prediction_type: ValidatorPredictionType,
-        predicted_prob: f64,
-        fill_side: Option<Side>,
-        reference_price: f64,
-        timestamp_ms: u64,
-        markout_ms: u64,
-        regime: usize,
-    ) {
+    fn record_pending_outcome(&mut self, input: PendingOutcomeInput) {
         let id = self.next_prediction_id;
         self.next_prediction_id += 1;
 
         self.pending_outcomes.push_back(PendingOutcome {
             prediction_id: id,
-            prediction_type,
-            predicted_prob: predicted_prob.clamp(0.0, 1.0),
-            fill_side,
-            reference_price,
-            timestamp_ms,
-            markout_ms,
-            regime,
+            prediction_type: input.prediction_type,
+            predicted_prob: input.predicted_prob.clamp(0.0, 1.0),
+            fill_side: input.fill_side,
+            reference_price: input.reference_price,
+            timestamp_ms: input.timestamp_ms,
+            markout_ms: input.markout_ms,
+            regime: input.regime,
         });
     }
 
@@ -1700,16 +1704,15 @@ impl PredictionValidator {
         // Print lead-lag diagnostics if enabled
         if let Some(ref integrator) = self.signal_integrator {
             let signals = integrator.get_signals();
-            let (ready, obs_counts, opt_lag, opt_mi, last_signal, timestamps) =
-                integrator.lag_analyzer_status();
-            let ((sig_first, sig_last), (tgt_first, tgt_last)) = timestamps;
+            let status = integrator.lag_analyzer_status();
+            let ((sig_first, sig_last), (tgt_first, tgt_last)) = status.sample_timestamps;
             println!();
             println!("LeadLag: ready={} | signal_obs={} target_obs={} | lag={:?}ms mi={:.3?}",
-                ready,
-                obs_counts.0,
-                obs_counts.1,
-                opt_lag,
-                opt_mi,
+                status.is_ready,
+                status.observation_counts.0,
+                status.observation_counts.1,
+                status.optimal_lag_ms,
+                status.mi_bits,
             );
             println!("  timestamps: signal=[{:?}..{:?}] target=[{:?}..{:?}]",
                 sig_first, sig_last, tgt_first, tgt_last,
@@ -1724,10 +1727,10 @@ impl PredictionValidator {
                 );
             }
             println!("  last_signal: actionable={} diff={:.1}bps skew_dir={} skew_mag={:.1}bps",
-                last_signal.is_actionable,
-                last_signal.diff_bps,
-                last_signal.skew_direction,
-                last_signal.skew_magnitude_bps,
+                status.last_signal.is_actionable,
+                status.last_signal.diff_bps,
+                status.last_signal.skew_direction,
+                status.last_signal.skew_magnitude_bps,
             );
 
             // Print cross-venue diagnostics

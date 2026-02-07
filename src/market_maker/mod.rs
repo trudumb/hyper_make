@@ -488,15 +488,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.tier1
             .enhanced_classifier
             .restore_checkpoint(&bundle.enhanced);
-        self.estimator.restore_checkpoint(
-            &bundle.vol_filter,
-            &bundle.informed_flow,
-            &bundle.fill_rate,
-            &bundle.kappa_own,
-            &bundle.kappa_bid,
-            &bundle.kappa_ask,
-            &bundle.momentum,
-        );
+        self.estimator.restore_checkpoint(bundle);
         self.stochastic
             .regime_hmm
             .restore_checkpoint(&bundle.regime_hmm);

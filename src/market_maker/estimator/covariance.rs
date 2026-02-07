@@ -308,9 +308,9 @@ impl FeatureCorrelationTracker {
 
         if self.observation_count == 0 {
             // Initialize with first observation
-            for i in 0..self.n {
-                self.means[i] = features[i];
-                self.mean_squares[i] = features[i] * features[i];
+            for (i, &feat) in features.iter().enumerate().take(self.n) {
+                self.means[i] = feat;
+                self.mean_squares[i] = feat * feat;
             }
             for i in 0..self.n {
                 for j in (i + 1)..self.n {
@@ -321,10 +321,10 @@ impl FeatureCorrelationTracker {
         } else {
             // EWMA update
             let one_minus_alpha = 1.0 - self.alpha;
-            for i in 0..self.n {
-                self.means[i] = self.alpha * features[i] + one_minus_alpha * self.means[i];
+            for (i, &feat) in features.iter().enumerate().take(self.n) {
+                self.means[i] = self.alpha * feat + one_minus_alpha * self.means[i];
                 self.mean_squares[i] =
-                    self.alpha * features[i] * features[i] + one_minus_alpha * self.mean_squares[i];
+                    self.alpha * feat * feat + one_minus_alpha * self.mean_squares[i];
             }
             for i in 0..self.n {
                 for j in (i + 1)..self.n {
@@ -378,9 +378,9 @@ impl FeatureCorrelationTracker {
     /// Get full NxN correlation matrix.
     pub(crate) fn correlation_matrix(&self) -> Vec<Vec<f64>> {
         let mut matrix = vec![vec![0.0; self.n]; self.n];
-        for i in 0..self.n {
-            for j in 0..self.n {
-                matrix[i][j] = self.correlation(i, j);
+        for (i, row) in matrix.iter_mut().enumerate().take(self.n) {
+            for (j, cell) in row.iter_mut().enumerate().take(self.n) {
+                *cell = self.correlation(i, j);
             }
         }
         matrix
@@ -420,8 +420,8 @@ impl FeatureCorrelationTracker {
             // Matrix-vector multiply
             let mut w = vec![0.0; n];
             for i in 0..n {
-                for j in 0..n {
-                    w[i] += matrix[i][j] * v[j];
+                for (j, &vj) in v.iter().enumerate().take(n) {
+                    w[i] += matrix[i][j] * vj;
                 }
             }
 
@@ -436,13 +436,13 @@ impl FeatureCorrelationTracker {
         // Rayleigh quotient for eigenvalue estimate
         let mut numer = 0.0;
         let mut denom = 0.0;
-        for i in 0..n {
+        for (i, &vi) in v.iter().enumerate().take(n) {
             let mut av_i = 0.0;
-            for j in 0..n {
-                av_i += matrix[i][j] * v[j];
+            for (j, &vj) in v.iter().enumerate().take(n) {
+                av_i += matrix[i][j] * vj;
             }
-            numer += v[i] * av_i;
-            denom += v[i] * v[i];
+            numer += vi * av_i;
+            denom += vi * vi;
         }
 
         numer / denom.max(1e-10)
@@ -454,8 +454,8 @@ impl FeatureCorrelationTracker {
 
         // Shift matrix slightly to avoid singularity
         let mut shifted = matrix.to_vec();
-        for i in 0..n {
-            shifted[i][i] += 0.01;
+        for (i, row) in shifted.iter_mut().enumerate().take(n) {
+            row[i] += 0.01;
         }
 
         let mut v: Vec<f64> = (0..n).map(|i| 1.0 / (i + 1) as f64).collect();
@@ -466,9 +466,9 @@ impl FeatureCorrelationTracker {
             for _ in 0..10 {
                 for i in 0..n {
                     let mut sum = v[i];
-                    for j in 0..n {
+                    for (j, &wj) in w.iter().enumerate().take(n) {
                         if j != i {
-                            sum -= shifted[i][j] * w[j];
+                            sum -= shifted[i][j] * wj;
                         }
                     }
                     w[i] = sum / shifted[i][i].max(1e-10);
@@ -486,13 +486,13 @@ impl FeatureCorrelationTracker {
         // Inverse of Rayleigh quotient gives smallest eigenvalue of original matrix
         let mut numer = 0.0;
         let mut denom = 0.0;
-        for i in 0..n {
+        for (i, &vi) in v.iter().enumerate().take(n) {
             let mut av_i = 0.0;
-            for j in 0..n {
-                av_i += matrix[i][j] * v[j];
+            for (j, &vj) in v.iter().enumerate().take(n) {
+                av_i += matrix[i][j] * vj;
             }
-            numer += v[i] * av_i;
-            denom += v[i] * v[i];
+            numer += vi * av_i;
+            denom += vi * vi;
         }
 
         numer / denom.max(1e-10)
@@ -509,7 +509,7 @@ impl FeatureCorrelationTracker {
             return vifs;
         }
 
-        for i in 0..self.n {
+        for (i, vif) in vifs.iter_mut().enumerate().take(self.n) {
             // VIF_i = 1 / (1 - R²_i)
             // where R²_i is the R² from regressing feature i on all others
             // Approximate with max correlation squared
@@ -523,9 +523,9 @@ impl FeatureCorrelationTracker {
 
             // VIF approximation using max correlation
             if max_corr_sq < 0.999 {
-                vifs[i] = 1.0 / (1.0 - max_corr_sq);
+                *vif = 1.0 / (1.0 - max_corr_sq);
             } else {
-                vifs[i] = f64::INFINITY;
+                *vif = f64::INFINITY;
             }
         }
 

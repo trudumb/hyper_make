@@ -129,7 +129,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Phase 7: Use centralized belief snapshot for logging
             let beliefs = self.central_beliefs.snapshot();
             let log_interval = if beliefs.drift_vol.n_observations < 100 { 10 } else { 100 };
-            if beliefs.drift_vol.n_observations % log_interval == 0 || beliefs.drift_vol.expected_drift.abs() > 0.0005 {
+            if beliefs.drift_vol.n_observations.is_multiple_of(log_interval) || beliefs.drift_vol.expected_drift.abs() > 0.0005 {
                 info!(
                     price_return_bps = %format!("{:.2}", price_return * 10000.0),
                     dt_secs = %format!("{:.3}", dt),
@@ -552,7 +552,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let effective_bias_bps = raw_bias_bps * confidence;
 
             // Log every 20 observations or when bias is meaningful
-            if effective_bias_bps.abs() > 0.1 || belief_snapshot.drift_vol.n_observations % 20 == 0 {
+            if effective_bias_bps.abs() > 0.1 || belief_snapshot.drift_vol.n_observations.is_multiple_of(20) {
                 info!(
                     raw_belief_bias_bps = %format!("{:.2}", raw_bias_bps),
                     effective_bias_bps = %format!("{:.2}", effective_bias_bps),
@@ -1187,7 +1187,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 ci_95_upper: market_params.kappa * 1.3,
                 cv: 0.15, // Default coefficient of variation
                 is_heavy_tailed: false,
-                observation_count: self.tier1.adverse_selection.fills_measured() as usize,
+                observation_count: self.tier1.adverse_selection.fills_measured(),
                 mean_distance_bps: 0.0, // TODO: get from estimator
             };
             self.infra
@@ -1532,8 +1532,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Store state-action pair for credit assignment when fill occurs
         self.stochastic.rl_agent.set_last_state_action(
-            mdp_state.clone(),
-            rl_recommendation.action.clone(),
+            mdp_state,
+            rl_recommendation.action,
         );
 
         // Populate MarketParams with RL recommendations
@@ -1669,7 +1669,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Log L2 wiring status periodically (every 100 cycles or when p_positive is significant)
         if let Some(l2_p) = l2_p_positive {
-            if (l2_p - 0.5).abs() > 0.05 || self.learning.pending_predictions_count() % 100 == 0 {
+            if (l2_p - 0.5).abs() > 0.05 || self.learning.pending_predictions_count().is_multiple_of(100) {
                 debug!(
                     l2_p_positive_edge = %format!("{:.3}", l2_p),
                     l2_model_health = %format!("{:.2}", l2_health_score),
@@ -1686,7 +1686,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             belief_snapshot.changepoint.prob_5
         } else {
             // Log during warmup so we can verify the fix is working
-            if belief_snapshot.changepoint.observation_count % 10 == 0
+            if belief_snapshot.changepoint.observation_count.is_multiple_of(10)
                 || belief_snapshot.changepoint.observation_count < 5
             {
                 debug!(

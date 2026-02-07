@@ -257,8 +257,8 @@ impl ChangepointDetector {
 
         // Spread probability: higher mass on r=0 decaying geometrically
         // This represents "uncertain, probably early in a regime"
-        for i in 0..init_spread {
-            run_length_probs[i] = (0.8_f64).powi(i as i32);
+        for (i, prob) in run_length_probs.iter_mut().enumerate().take(init_spread) {
+            *prob = (0.8_f64).powi(i as i32);
         }
         // Normalize
         let sum: f64 = run_length_probs.iter().sum();
@@ -632,14 +632,14 @@ fn gamma_ln(x: f64) -> f64 {
 
     let g = 7;
     let c = [
-        0.99999999999980993,
+        0.999_999_999_999_809_9,
         676.5203681218851,
         -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
         12.507343278686905,
         -0.13857109526572012,
-        9.9843695780195716e-6,
+        9.984_369_578_019_572e-6,
         1.5056327351493116e-7,
     ];
 
@@ -648,8 +648,8 @@ fn gamma_ln(x: f64) -> f64 {
     } else {
         let x = x - 1.0;
         let mut a = c[0];
-        for i in 1..=g + 1 {
-            a += c[i] / (x + i as f64);
+        for (i, &coeff) in c.iter().enumerate().skip(1).take(g + 1) {
+            a += coeff / (x + i as f64);
         }
         let t = x + g as f64 + 0.5;
         0.5 * (2.0 * PI).ln() + (t).ln() * (x + 0.5) - t + a.ln()

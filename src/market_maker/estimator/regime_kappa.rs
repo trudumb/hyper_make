@@ -265,7 +265,7 @@ impl RegimeKappaEstimator {
         self.fills_per_regime[regime] += 1;
 
         // Periodic logging
-        if self.total_fills % 50 == 0 {
+        if self.total_fills.is_multiple_of(50) {
             self.log_status();
         }
     }
@@ -406,7 +406,7 @@ impl RegimeKappaEstimator {
             "Regime kappa breakdown"
         );
 
-        if breakdown.total_fills % 100 == 0 {
+        if breakdown.total_fills.is_multiple_of(100) {
             info!(
                 kappa_effective = %format!("{:.0}", breakdown.kappa_effective),
                 regime_probs = %format!("[{:.2}, {:.2}, {:.2}, {:.2}]",

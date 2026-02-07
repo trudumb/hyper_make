@@ -85,58 +85,44 @@ impl ValueFunction {
     ///
     /// Returns feature vector φ(s).
     pub fn compute_basis(state: &ControlState) -> Vec<f64> {
-        let mut features = Vec::with_capacity(15);
-
-        // === Wealth features ===
-        // 0: Constant (bias term)
-        features.push(1.0);
-
-        // 1: Wealth (linear)
-        features.push(state.wealth / 1000.0); // Normalize
-
-        // 2: Wealth squared (risk aversion)
-        features.push((state.wealth / 1000.0).powi(2));
-
-        // === Position features ===
-        // 3: Position (linear)
-        features.push(state.position);
-
-        // 4: Position squared (inventory cost)
-        features.push(state.position.powi(2));
-
-        // 5: Absolute position
-        features.push(state.position.abs());
-
-        // === Time features ===
-        // 6: Time fraction
-        features.push(state.time);
-
-        // 7: Time urgency: √(1-t)
-        features.push(state.time_remaining().sqrt());
-
-        // 8: Terminal indicator (smooth)
-        features.push(sigmoid((state.time - 0.95) * 20.0));
-
-        // === Cross terms ===
-        // 9: Position × Time (inventory becomes more costly near end)
-        features.push(state.position * state.time);
-
-        // 10: Position × Expected AS (inventory × toxicity)
-        features.push(state.position * state.belief.expected_as() / 10.0);
-
-        // === Belief features ===
-        // 11: Expected edge
-        features.push(state.expected_edge() / 10.0);
-
-        // 12: Edge uncertainty
-        features.push(state.edge_uncertainty() / 10.0);
-
-        // 13: Confidence
-        features.push(state.confidence());
-
-        // === Regime features ===
-        // 14: Regime entropy (uncertainty about volatility)
-        features.push(state.regime_entropy());
+        let features = vec![
+            // === Wealth features ===
+            // 0: Constant (bias term)
+            1.0,
+            // 1: Wealth (linear)
+            state.wealth / 1000.0, // Normalize
+            // 2: Wealth squared (risk aversion)
+            (state.wealth / 1000.0).powi(2),
+            // === Position features ===
+            // 3: Position (linear)
+            state.position,
+            // 4: Position squared (inventory cost)
+            state.position.powi(2),
+            // 5: Absolute position
+            state.position.abs(),
+            // === Time features ===
+            // 6: Time fraction
+            state.time,
+            // 7: Time urgency: √(1-t)
+            state.time_remaining().sqrt(),
+            // 8: Terminal indicator (smooth)
+            sigmoid((state.time - 0.95) * 20.0),
+            // === Cross terms ===
+            // 9: Position × Time (inventory becomes more costly near end)
+            state.position * state.time,
+            // 10: Position × Expected AS (inventory × toxicity)
+            state.position * state.belief.expected_as() / 10.0,
+            // === Belief features ===
+            // 11: Expected edge
+            state.expected_edge() / 10.0,
+            // 12: Edge uncertainty
+            state.edge_uncertainty() / 10.0,
+            // 13: Confidence
+            state.confidence(),
+            // === Regime features ===
+            // 14: Regime entropy (uncertainty about volatility)
+            state.regime_entropy(),
+        ];
 
         features
     }
@@ -191,8 +177,8 @@ impl ValueFunction {
 
         // Regularization
         let lambda = 0.01;
-        for i in 0..d {
-            a[i][i] += lambda * n as f64;
+        for (i, row) in a.iter_mut().enumerate().take(d) {
+            row[i] += lambda * n as f64;
         }
 
         // Solve A w = b using simple iteration (could use proper linear algebra)
@@ -247,9 +233,9 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 
         for i in 0..n {
             let mut sum = b[i];
-            for j in 0..n {
+            for (j, &xj) in x.iter().enumerate().take(n) {
                 if i != j {
-                    sum -= a[i][j] * x[j];
+                    sum -= a[i][j] * xj;
                 }
             }
 

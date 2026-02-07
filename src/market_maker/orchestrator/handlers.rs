@@ -589,7 +589,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         // Update Q-values with the transition using the ACTUAL action
                         self.stochastic.rl_agent.update(
                             state,
-                            action.clone(),
+                            action,
                             reward,
                             current_state,
                             false, // not done
@@ -608,7 +608,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         // Fallback: no stored action (shouldn't happen normally)
                         let action = MDPAction::default();
                         self.stochastic.rl_agent.update(
-                            current_state.clone(),
+                            current_state,
                             action,
                             reward,
                             current_state,
@@ -725,7 +725,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // Check if order is now fully filled by looking at orders tracker
                     // Check if this was a full fill (remaining size = 0)
                     // remaining = size - filled; if order not found, assume full fill
-                    let is_full_fill = self.orders.get_order(fill.oid).map_or(true, |o| o.size - o.filled <= 0.0);
+                    let is_full_fill = self.orders.get_order(fill.oid).is_none_or(|o| o.size - o.filled <= 0.0);
                     let _trigger = self.event_accumulator.on_fill(side, fill.oid, size, is_full_fill);
 
                     // === Position Continuation Model: Update posterior on fill ===
@@ -1350,7 +1350,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         static PERIODIC_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = PERIODIC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if count % 60 == 0 {
+        if count.is_multiple_of(60) {
             let summary = self.stochastic.model_calibration.summary();
 
             // Log calibration summary
@@ -1425,7 +1425,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Log stats periodically
             let stats = self.event_accumulator.stats();
-            if stats.total_reconciles % 100 == 0 {
+            if stats.total_reconciles.is_multiple_of(100) {
                 info!(
                     total_events = stats.total_events,
                     total_reconciles = stats.total_reconciles,
@@ -1467,7 +1467,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         static BINANCE_UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = BINANCE_UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if count % 1000 == 0 {
+        if count.is_multiple_of(1000) {
             let signal = self.stochastic.signal_integrator.lead_lag_signal();
             if signal.is_actionable {
                 info!(
@@ -1503,7 +1503,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         static BINANCE_TRADE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = BINANCE_TRADE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if count % 500 == 0 {
+        if count.is_multiple_of(500) {
             let cv_features = self.stochastic.signal_integrator.cross_venue_features();
             if cv_features.sample_count >= 20 {
                 trace!(

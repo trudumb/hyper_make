@@ -273,7 +273,7 @@ impl BeliefState {
         let prior = Self::default();
 
         // Fill rate: keep some observations
-        let retained_fills = (self.n_fills as f64 * retention) as f64;
+        let retained_fills = self.n_fills as f64 * retention;
         self.lambda = GammaPosterior::new(
             prior.lambda.alpha + retained_fills,
             prior.lambda.beta + self.total_time * retention,

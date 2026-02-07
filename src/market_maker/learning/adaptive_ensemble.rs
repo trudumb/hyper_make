@@ -217,7 +217,7 @@ impl AdaptiveEnsemble {
     /// 2. Apply minimum floor using water-filling algorithm:
     ///    - Models below floor get exactly floor
     ///    - Remaining weight is distributed proportionally among other models
-    /// This guarantees all models have weight >= min_weight after normalization.
+    ///      This guarantees all models have weight >= min_weight after normalization.
     pub fn compute_weights(&mut self) {
         if self.models.is_empty() {
             return;
