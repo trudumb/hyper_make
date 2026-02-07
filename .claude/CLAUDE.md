@@ -247,3 +247,78 @@ When entering plan mode or creating implementation plans:
 4. Reference plan files in Serena session memories for continuity
 
 This keeps plans version-controlled with the project and accessible across sessions.
+
+---
+
+## Agent Teams
+
+This project has **agent teams** enabled (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in global settings). Agent teams let you coordinate multiple Claude Code instances working in parallel, each with its own context window.
+
+### When to Use Teams vs Subagents
+
+| Scenario | Use |
+|----------|-----|
+| Quick focused lookup (e.g., find a function) | Subagent |
+| Independent parallel work on separate files | **Agent Team** |
+| Workers need to share findings or challenge each other | **Agent Team** |
+| Sequential task where only the result matters | Subagent |
+
+### Recommended Team Configurations
+
+**Multi-Module Feature Work** (e.g., new signal + integration):
+```
+Create an agent team:
+- Teammate 1: Implement the new signal module in src/signals/
+- Teammate 2: Add measurement infrastructure + calibration tests
+- Teammate 3: Wire integration into the quote engine
+Require plan approval before any teammate makes changes.
+```
+
+**Parallel Code Review / Debugging**:
+```
+Create an agent team to investigate the PnL regression:
+- Teammate 1: Audit adverse selection classifier calibration
+- Teammate 2: Check regime detection HMM for parameter drift
+- Teammate 3: Analyze fill intensity model vs recent market data
+Have them share findings and challenge each other's conclusions.
+```
+
+**Cross-Layer Implementation** (e.g., data pipeline → model → integration):
+```
+Create an agent team:
+- Teammate 1 (data): Build the Binance websocket feed in src/exchange/
+- Teammate 2 (model): Implement lead-lag estimator in src/models/
+- Teammate 3 (integration): Wire into quote engine, blocked on teammates 1 & 2
+Use Sonnet for each teammate.
+```
+
+### Team Rules for This Project
+
+1. **File ownership**: Each teammate must own distinct files. Two teammates editing the same file causes overwrites.
+2. **Skill awareness**: Teammates inherit CLAUDE.md, so they know the skill hierarchy. For model work, the lead should instruct teammates to read `measurement-infrastructure` first.
+3. **Plan approval for risky changes**: Always require plan approval for teammates modifying:
+   - Quote engine (`src/quote_engine/`)
+   - Risk management (`src/risk/`)
+   - Exchange connectivity (`src/exchange/`)
+4. **Defense-first applies to teams too**: If a teammate proposes aggressive parameter changes, the lead should push back. When in doubt, widen spreads.
+5. **Manual execution only**: Teammates must NOT run binaries or scripts. They produce code; the user executes manually.
+6. **Delegate mode**: For complex multi-teammate tasks, use Shift+Tab to put the lead in delegate mode so it coordinates rather than implements.
+
+### Display Mode
+
+The default is `"auto"` (uses split panes if inside tmux, in-process otherwise). To force a mode, add to `~/.claude/settings.json`:
+
+```json
+{
+  "teammateMode": "in-process"
+}
+```
+
+Or per-session: `claude --teammate-mode in-process`
+
+### Cleanup
+
+Always have the lead clean up when done:
+```
+Shut down all teammates, then clean up the team.
+```
