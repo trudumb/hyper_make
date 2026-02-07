@@ -709,6 +709,17 @@ pub struct MarketParams {
     /// None = no kappa spread adjustment applied.
     pub kappa_spread_bps: Option<f64>,
 
+    // ==================== Regime-Conditioned Kappa ====================
+    /// Effective kappa from regime-conditioned estimator (blended across regimes).
+    /// Per-regime priors: Low=3000, Normal=2000, High=1000, Extreme=500.
+    /// Used for regime-aware kappa blending in ladder strategy.
+    /// None = regime kappa not available (feature disabled or not warmed up).
+    pub regime_kappa: Option<f64>,
+
+    /// Current dominant volatility regime index from regime kappa estimator.
+    /// 0=Low, 1=Normal, 2=High, 3=Extreme.
+    pub regime_kappa_current_regime: usize,
+
     // ==================== Bayesian Gamma Components (Alpha Plan) ====================
     /// Trend confidence [0, 1] from directional signals.
     /// High confidence → can quote tighter spreads (lower gamma).
@@ -1042,6 +1053,9 @@ impl Default for MarketParams {
             proactive_min_momentum_bps: 5.0,         // Need 5 bps minimum momentum
             // Kappa-Driven Spread (Phase 3)
             kappa_spread_bps: None, // No kappa spread cap until computed
+            // Regime-Conditioned Kappa
+            regime_kappa: None,                // Not available until regime estimator warmed up
+            regime_kappa_current_regime: 1,    // Normal regime default
             // Bayesian Gamma Components (Alpha Plan)
             trend_confidence: 0.5,        // 50% confidence initially (uncertain)
             bootstrap_confidence: 0.0,    // Not calibrated initially

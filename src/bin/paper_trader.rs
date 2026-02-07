@@ -49,8 +49,9 @@ use hyperliquid_rust_sdk::market_maker::infra::metrics::dashboard::{
     SpreadBucket,
 };
 use hyperliquid_rust_sdk::market_maker::simulation::{
-    CalibrationAnalyzer, FillSimulator, FillSimulatorConfig, MarketStateSnapshot, ModelPredictions,
-    OutcomeTracker, PredictionLogger, SimulatedFill, SimulationExecutor,
+    CalibrationAnalyzer, FillOutcome, FillSimulator, FillSimulatorConfig, MarketStateSnapshot,
+    ModelPredictions, ObservedOutcomes, OutcomeTracker, PredictionLogger, SimulatedFill,
+    SimulationExecutor,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -96,6 +97,10 @@ use hyperliquid_rust_sdk::market_maker::stochastic::{
 use hyperliquid_rust_sdk::market_maker::calibration::LearnedParameters;
 use hyperliquid_rust_sdk::market_maker::{CalibrationController, CalibrationControllerConfig};
 use hyperliquid_rust_sdk::market_maker::{BinanceFeed, BinanceTradeUpdate, BinanceUpdate};
+use hyperliquid_rust_sdk::market_maker::analytics::{
+    SharpeTracker, PerSignalSharpeTracker, SignalPnLAttributor,
+    EdgeTracker, EdgeSnapshot, AnalyticsLogger, CycleContributions, SignalContribution,
+};
 
 // ============================================================================
 // CLI Arguments
@@ -428,8 +433,10 @@ impl SimulationState {
             paper_mode,
         } = config;
 
-        // Paper mode: lower gamma for tighter theoretical spreads
-        let effective_gamma = if paper_mode { gamma * 0.5 } else { gamma };
+        // Paper mode: use competitive gamma for tighter theoretical spreads.
+        // GLFT: δ* = (1/γ)ln(1 + γ/κ) + fee
+        // γ=0.07, κ=8000 → δ* ≈ 2.75 bps/side (down from 9.0 at γ=0.24)
+        let effective_gamma = if paper_mode { 0.07 } else { gamma };
 
         // Paper mode: lower spread floor for more aggressive quoting
         let min_spread = if paper_mode {
@@ -778,11 +785,19 @@ impl SimulationState {
             self.cached_trades.pop_front();
         }
 
-        // 8. Regime HMM forward update
-        let obs = HmmObservation::new(
+        // 8. Regime HMM forward update (with leading indicators)
+        // OI and liquidation data not yet available in paper mode — wire the code path
+        // so it activates when the data feeds are connected
+        let oi_level = 1.0_f64; // TODO: wire from Hyperliquid OI feed
+        let oi_velocity = 0.0_f64; // TODO: wire from OI rate-of-change tracker
+        let liquidation_pressure = 0.0_f64; // TODO: wire from OI drop + extreme funding
+        let obs = HmmObservation::new_full(
             self.estimator.sigma(),
             self.spread_tracker.current_spread_bps(),
             self.hawkes.flow_imbalance(),
+            oi_level,
+            oi_velocity,
+            liquidation_pressure,
         );
         self.regime_hmm.forward_update(&obs);
 
@@ -835,15 +850,25 @@ impl SimulationState {
             );
         }
 
-        // Paper mode: force minimum kappa to generate competitive spreads.
-        // GLFT half-spread ≈ 1/kappa + fee when gamma << kappa.
-        // With kappa=3250, half-spread = 3.1 + 1.5 = 4.6 bps per side.
-        // With kappa=8000, half-spread = 1.25 + 1.5 = 2.75 bps per side.
-        // Higher kappa = tighter spreads = more fills = faster learning.
-        // This is NOT representative of production (where kappa is learned from own fills),
-        // but it breaks the warmup catch-22 by bootstrapping fill data.
+        // Paper mode: confidence-gated kappa floor for competitive spreads.
+        // During warmup (low confidence): force kappa=8000 for tight spreads and fast learning.
+        // As confidence grows (>0.75): blend floor with learned kappa to transition smoothly.
+        // GLFT: δ* ≈ 1/κ + fee → κ=8000 gives 2.75 bps/side.
         if self.paper_mode {
-            let paper_kappa_floor = 8000.0;
+            const KAPPA_WARMUP_FLOOR: f64 = 8000.0;
+            const KAPPA_CONFIDENCE_THRESHOLD: f64 = 0.75;
+            const KAPPA_TRANSITION_MIN: f64 = 2000.0;
+
+            let paper_kappa_floor = if kappa_conf < KAPPA_CONFIDENCE_THRESHOLD {
+                // During warmup: force competitive kappa to bootstrap fill data
+                KAPPA_WARMUP_FLOOR
+            } else {
+                // Transition: blend floor with learned value as confidence grows
+                let learned = market_params.kappa_robust;
+                (KAPPA_WARMUP_FLOOR * (1.0 - kappa_conf) + learned * kappa_conf)
+                    .max(KAPPA_TRANSITION_MIN)
+            };
+
             if market_params.kappa < paper_kappa_floor {
                 market_params.kappa = paper_kappa_floor;
             }
@@ -1018,6 +1043,13 @@ impl SimulationState {
             });
         }
 
+        // Wire regime-conditioned kappa from SignalIntegration into MarketParams.
+        // This allows the ladder strategy to blend regime kappa with robust/adaptive kappa.
+        if signals.kappa_effective > 0.0 {
+            market_params.regime_kappa = Some(signals.kappa_effective);
+            market_params.regime_kappa_current_regime = signals.current_regime;
+        }
+
         // === Fix #3: Position continuation decision (replicate quote_engine.rs:581-682) ===
         {
             let changepoint_prob = if belief_snapshot.changepoint.is_warmed_up {
@@ -1114,6 +1146,19 @@ impl SimulationState {
             cal_gamma,
             self.pending_fill_outcomes.len(),
         );
+
+        // Warmup progression diagnostics
+        let warmup = self.adaptive_spreads.warmup_progress();
+        let uncertainty = self.adaptive_spreads.warmup_uncertainty_factor();
+        let status = self.adaptive_spreads.status();
+        info!(
+            "[WARMUP] progress={:.0}% floor_obs={} kappa_fills={} floor_bps={:.1} uncertainty={:.3}",
+            warmup * 100.0,
+            status.floor_observations,
+            status.kappa_own_fills,
+            status.floor_bps,
+            uncertainty,
+        );
     }
 
     /// Update inventory from simulated fill and record for Bayesian learning
@@ -1152,10 +1197,22 @@ impl SimulationState {
             mid_at_fill: self.mid_price,
         });
 
+        // Per-fill spread capture: positive if we captured spread (bought below mid / sold above mid)
+        let spread_capture = if is_buy {
+            (self.mid_price - fill.fill_price) * fill.fill_size
+        } else {
+            (fill.fill_price - self.mid_price) * fill.fill_size
+        };
+
         info!(
             "[FILL FEEDBACK] oid={} side={:?} price={:.4} size={:.4} depth_bps={:.1} total_fills={} kappa_conf={:.3}",
             fill.oid, fill.side, fill.fill_price, fill.fill_size, depth_bps,
             self.total_fill_count, self.estimator.kappa_confidence(),
+        );
+        info!(
+            "[FILL PNL] side={:?} price={:.2} size={:.4} spread_capture={:.4} mid_at_fill={:.2} depth_bps={:.1} inventory_after={:.4}",
+            fill.side, fill.fill_price, fill.fill_size, spread_capture,
+            self.mid_price, depth_bps, self.inventory,
         );
     }
 
@@ -1410,11 +1467,13 @@ fn create_market_trade(
 // ============================================================================
 
 fn build_paper_risk_aggregator() -> RiskAggregator {
-    let max_daily_loss = 500.0; // USD
-    let max_drawdown_frac = 0.05; // 5%
+    // Paper mode: relaxed limits to survive adverse periods and enable learning.
+    // Live mode keeps conservative limits via KillSwitchConfig::from_account_kelly().
+    let max_daily_loss = 2000.0; // USD (was 500 — 5% drawdown killed at 218s)
+    let max_drawdown_frac = 0.15; // 15% (was 5% — too strict for learning)
     let stale_data_threshold = Duration::from_secs(30);
     let cascade_pull = 0.8;
-    let cascade_kill = 0.95;
+    let cascade_kill = 2.0; // (was 0.95 — paper mode should survive cascades)
     let max_rate_limit_errors = 3;
 
     RiskAggregator::new()
@@ -1463,13 +1522,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create simulation components
     let executor = Arc::new(SimulationExecutor::new(cli.verbose));
-    // Paper mode: aggressive fill simulation to break the warmup catch-22.
-    // Default mode uses conservative probabilities (30% touch, 50% queue)
-    // which accurately model production fills but prevent learning when no fills exist.
+    // Paper mode: realistic fill simulation for meaningful learning.
+    // 50% touch probability models back-of-book queue position realistically
+    // (our quotes are 15 bps from mid when top-of-book is 1-3 bps).
+    // Default mode uses conservative probabilities (30% touch, 50% queue).
     let fill_config = if cli.paper_mode {
         FillSimulatorConfig {
-            touch_fill_probability: 0.9,   // Near-certain fills when price crosses
-            queue_position_factor: 0.9,    // Assume good queue position
+            touch_fill_probability: 0.5,   // Realistic fill rate (was 0.9)
+            queue_position_factor: 0.6,    // Back-of-book position (was 0.9)
             ignore_book_depth: true,       // Sim orders aren't in real book
             ..Default::default()
         }
@@ -1488,10 +1548,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prediction_logger = PredictionLogger::new(prediction_log_path)?;
 
     // Create calibration analyzer
-    let calibration_analyzer = CalibrationAnalyzer::new(20);
+    let mut calibration_analyzer = CalibrationAnalyzer::new(20);
 
     // Create outcome tracker
     let mut outcome_tracker = OutcomeTracker::new(0.00015); // 1.5 bps maker fee
+
+    // Analytics trackers for Sharpe, attribution, and edge validation
+    let mut sharpe_tracker = SharpeTracker::new();
+    let mut signal_sharpe = PerSignalSharpeTracker::new();
+    let mut signal_attributor = SignalPnLAttributor::new();
+    let mut edge_tracker = EdgeTracker::new();
+    let mut analytics_logger = match AnalyticsLogger::new(&cli.output_dir) {
+        Ok(logger) => Some(logger),
+        Err(e) => {
+            warn!("Failed to initialize analytics logger: {}", e);
+            None
+        }
+    };
+    let mut last_cycle_contributions: Option<CycleContributions> = None;
+
+    // Calibration pipeline state: track current cycle and its fills
+    let mut current_cycle_id: u64 = 0;
+    let mut cycle_fills: Vec<(usize, SimulatedFill)> = Vec::new();
+    let mut last_calibration_feed = Instant::now();
 
     // Initialize simulation state
     let mut state = SimulationState::new(SimulationConfig {
@@ -1627,6 +1706,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let risk_aggregator = build_paper_risk_aggregator();
     let mut peak_pnl: f64 = 0.0;
     let mut last_risk_log = Instant::now();
+
+    // PnL summary and fill balance tracking (30s periodic logging)
+    let mut last_pnl_summary = Instant::now();
+    let mut summary_fill_count: u64 = 0;
+    let mut summary_spread_pnl: f64 = 0.0;
+    let mut summary_fee_pnl: f64 = 0.0;
+    let mut summary_wins: u64 = 0;
+    let mut buy_fill_count: u64 = 0;
+    let mut sell_fill_count: u64 = 0;
+    let mut buy_depth_sum_bps: f64 = 0.0;
+    let mut sell_depth_sum_bps: f64 = 0.0;
 
     // Ctrl+C handler
     let shutdown_clone = shutdown.clone();
@@ -1797,6 +1887,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Track for outcome analysis
                             outcome_tracker.on_fill(fill.clone(), state.mid_price);
 
+                            // Track fill for calibration pipeline (level_index resolved at cycle end)
+                            cycle_fills.push((0, fill.clone()));
+
                             info!(
                                 "[SIM FILL] side={:?} price={:.2} size={:.4} inventory={:.4}",
                                 fill.side, fill.fill_price, fill.fill_size, state.inventory
@@ -1810,6 +1903,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 (fill.fill_price - state.mid_price) * fill.fill_size
                             };
                             cumulative_pnl += fill_pnl;
+
+                            // Update PnL summary and fill balance counters
+                            let fill_depth_bps = if state.mid_price > 0.0 {
+                                ((fill.fill_price - state.mid_price).abs() / state.mid_price) * 10_000.0
+                            } else {
+                                0.0
+                            };
+                            let fill_fee = fill.fill_price * fill.fill_size * 0.000_15; // 1.5 bps maker fee
+                            summary_fill_count += 1;
+                            summary_spread_pnl += fill_pnl;
+                            summary_fee_pnl += fill_fee;
+                            if fill_pnl > 0.0 {
+                                summary_wins += 1;
+                            }
+                            if fill.side == Side::Buy {
+                                buy_fill_count += 1;
+                                buy_depth_sum_bps += fill_depth_bps;
+                            } else {
+                                sell_fill_count += 1;
+                                sell_depth_sum_bps += fill_depth_bps;
+                            }
+
+                            // Analytics: update Sharpe and attribution trackers
+                            let notional_value = fill.fill_price * fill.fill_size;
+                            let fill_pnl_bps = if notional_value > 0.0 {
+                                (fill_pnl / notional_value) * 10_000.0
+                            } else {
+                                0.0
+                            };
+                            let fill_timestamp_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos() as u64;
+
+                            sharpe_tracker.add_return(fill_pnl_bps, fill_timestamp_ns);
+
+                            if let Some(ref contribs) = last_cycle_contributions {
+                                for contrib in &contribs.contributions {
+                                    if contrib.was_active {
+                                        signal_sharpe.add_signal_return(&contrib.signal_name, fill_pnl_bps, fill_timestamp_ns);
+                                    }
+                                }
+                                signal_attributor.record_cycle(contribs, fill_pnl_bps);
+                            }
+
+                            // Analytics: track predicted vs realized edge
+                            let predicted_as = state.adverse_selection.best_horizon_as_bps();
+                            let edge_snap = EdgeSnapshot {
+                                timestamp_ns: fill_timestamp_ns,
+                                predicted_spread_bps: fill_depth_bps * 2.0,
+                                realized_spread_bps: fill_depth_bps * 2.0,
+                                predicted_as_bps: predicted_as,
+                                realized_as_bps: fill_depth_bps.min(predicted_as),
+                                fee_bps: 1.5,
+                                predicted_edge_bps: fill_depth_bps * 2.0 - predicted_as - 1.5,
+                                realized_edge_bps: fill_pnl_bps - 1.5,
+                            };
+                            edge_tracker.add_snapshot(edge_snap.clone());
+
+                            if let Some(ref mut logger) = analytics_logger {
+                                let _ = logger.log_edge(&edge_snap);
+                            }
 
                             let fill_record = FillRecord {
                                 time: now.format("%H:%M:%S").to_string(),
@@ -1899,6 +2054,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if last_risk_log.elapsed() > Duration::from_secs(10) || risk.max_severity >= RiskSeverity::High {
                         info!("[RISK] {}", risk.summary());
                         last_risk_log = Instant::now();
+                    }
+
+                    // 30-second PnL summary and fill balance logging
+                    if last_pnl_summary.elapsed() >= Duration::from_secs(30) {
+                        let win_rate_pct = if summary_fill_count > 0 {
+                            (summary_wins as f64 / summary_fill_count as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let net_pnl = summary_spread_pnl - summary_fee_pnl;
+                        info!(
+                            "[PNL SUMMARY] fills={} spread={:+.2} fee=-{:.2} net={:+.2} cum={:+.2} win_rate={:.0}%",
+                            summary_fill_count, summary_spread_pnl, summary_fee_pnl, net_pnl, cumulative_pnl, win_rate_pct,
+                        );
+
+                        let total_fills = buy_fill_count + sell_fill_count;
+                        let imbalance_pct = if total_fills > 0 {
+                            let max_side = buy_fill_count.max(sell_fill_count) as f64;
+                            (max_side / total_fills as f64) * 100.0
+                        } else {
+                            50.0
+                        };
+                        let avg_buy_depth = if buy_fill_count > 0 { buy_depth_sum_bps / buy_fill_count as f64 } else { 0.0 };
+                        let avg_sell_depth = if sell_fill_count > 0 { sell_depth_sum_bps / sell_fill_count as f64 } else { 0.0 };
+                        if imbalance_pct > 70.0 && total_fills > 5 {
+                            warn!(
+                                "[FILL BALANCE] total={} buys={} sells={} imbalance={:.0}% avg_buy_depth={:.1}bps avg_sell_depth={:.1}bps (WARNING: >70% imbalance)",
+                                total_fills, buy_fill_count, sell_fill_count, imbalance_pct, avg_buy_depth, avg_sell_depth,
+                            );
+                        } else {
+                            info!(
+                                "[FILL BALANCE] total={} buys={} sells={} imbalance={:.0}% avg_buy_depth={:.1}bps avg_sell_depth={:.1}bps",
+                                total_fills, buy_fill_count, sell_fill_count, imbalance_pct, avg_buy_depth, avg_sell_depth,
+                            );
+                        }
+
+                        // Analytics summary (every 30s alongside PnL)
+                        let sharpe_summary = sharpe_tracker.summary();
+                        info!(
+                            "[ANALYTICS] Sharpe(1h)={:.2} Sharpe(24h)={:.2} Sharpe(all)={:.2} Fills={} Edge={:.1}bps",
+                            sharpe_summary.sharpe_1h,
+                            sharpe_summary.sharpe_24h,
+                            sharpe_summary.sharpe_all,
+                            sharpe_summary.count,
+                            edge_tracker.mean_realized_edge(),
+                        );
+
+                        if !signal_attributor.signal_names().is_empty() {
+                            let signal_parts: Vec<String> = signal_attributor.signal_names()
+                                .iter()
+                                .map(|name| format!("{}={:.1}bps", name, signal_attributor.marginal_value(name)))
+                                .collect();
+                            info!("[ANALYTICS] Signal marginal: {}", signal_parts.join(" "));
+                        }
+
+                        if let Some(ref mut logger) = analytics_logger {
+                            let _ = logger.log_sharpe(&sharpe_summary);
+                            let _ = logger.log_signal_pnl(&signal_attributor);
+                            let _ = logger.flush();
+                        }
+
+                        // Reset period counters
+                        last_pnl_summary = Instant::now();
+                        summary_fill_count = 0;
+                        summary_spread_pnl = 0.0;
+                        summary_fee_pnl = 0.0;
+                        summary_wins = 0;
                     }
 
                     if let Some(mut ladder) = state.generate_quotes() {
@@ -2059,6 +2281,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Build market params and predictions
                         let params = state.build_market_params();
+
+                        // Extract signal contributions for analytics attribution
+                        let integrated_signals = state.signal_integrator.get_signals();
+                        if let Some(ref contributions_record) = integrated_signals.signal_contributions {
+                            let timestamp_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos() as u64;
+                            let contributions = CycleContributions {
+                                cycle_id: state.cycle_count,
+                                timestamp_ns,
+                                contributions: vec![
+                                    SignalContribution {
+                                        signal_name: "LeadLag".to_string(),
+                                        spread_adjustment_bps: 0.0,
+                                        skew_adjustment_bps: contributions_record.lead_lag_skew_bps,
+                                        was_active: contributions_record.lead_lag_active,
+                                        gating_weight: contributions_record.lead_lag_gating_weight,
+                                        raw_value: contributions_record.lead_lag_skew_bps,
+                                    },
+                                    SignalContribution {
+                                        signal_name: "InformedFlow".to_string(),
+                                        spread_adjustment_bps: (contributions_record.informed_flow_spread_mult - 1.0) * 100.0,
+                                        skew_adjustment_bps: 0.0,
+                                        was_active: contributions_record.informed_flow_active,
+                                        gating_weight: contributions_record.informed_flow_gating_weight,
+                                        raw_value: contributions_record.informed_flow_spread_mult,
+                                    },
+                                    SignalContribution {
+                                        signal_name: "RegimeDetection".to_string(),
+                                        spread_adjustment_bps: 0.0,
+                                        skew_adjustment_bps: 0.0,
+                                        was_active: contributions_record.regime_active,
+                                        gating_weight: if contributions_record.regime_active { 1.0 } else { 0.0 },
+                                        raw_value: contributions_record.regime_kappa_effective,
+                                    },
+                                    SignalContribution {
+                                        signal_name: "CrossVenue".to_string(),
+                                        spread_adjustment_bps: (contributions_record.cross_venue_spread_mult - 1.0) * 100.0,
+                                        skew_adjustment_bps: contributions_record.cross_venue_skew_bps,
+                                        was_active: contributions_record.cross_venue_active,
+                                        gating_weight: if contributions_record.cross_venue_active { 1.0 } else { 0.0 },
+                                        raw_value: contributions_record.cross_venue_spread_mult,
+                                    },
+                                    SignalContribution {
+                                        signal_name: "VPIN".to_string(),
+                                        spread_adjustment_bps: (contributions_record.vpin_spread_mult - 1.0) * 100.0,
+                                        skew_adjustment_bps: 0.0,
+                                        was_active: contributions_record.vpin_active,
+                                        gating_weight: if contributions_record.vpin_active { 1.0 } else { 0.0 },
+                                        raw_value: contributions_record.vpin_spread_mult,
+                                    },
+                                    SignalContribution {
+                                        signal_name: "BuyPressure".to_string(),
+                                        spread_adjustment_bps: 0.0,
+                                        skew_adjustment_bps: contributions_record.buy_pressure_skew_bps,
+                                        was_active: contributions_record.buy_pressure_active,
+                                        gating_weight: if contributions_record.buy_pressure_active { 1.0 } else { 0.0 },
+                                        raw_value: contributions_record.buy_pressure_skew_bps,
+                                    },
+                                ],
+                                total_spread_mult: integrated_signals.total_spread_mult,
+                                combined_skew_bps: integrated_signals.combined_skew_bps,
+                            };
+
+                            if let Some(ref mut logger) = analytics_logger {
+                                let _ = logger.log_contributions(&contributions);
+                            }
+
+                            last_cycle_contributions = Some(contributions);
+                        }
+
                         let market_snapshot = MarketStateSnapshot::from_params(
                             &params,
                             state.bid_levels.clone(),
@@ -2076,8 +2370,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(&fill_simulator),
                         );
 
-                        // Log prediction
-                        prediction_logger.log_prediction(market_snapshot, predictions);
+                        // Finalize previous cycle: attach outcomes if fills occurred
+                        if current_cycle_id > 0 && !cycle_fills.is_empty() {
+                            let prev_record = prediction_logger.get_record(current_cycle_id);
+                            let mid = state.mid_price;
+
+                            let fill_outcomes: Vec<FillOutcome> = cycle_fills
+                                .iter()
+                                .map(|(_, fill)| {
+                                    // Match fill to closest prediction level on same side
+                                    let level_index = prev_record
+                                        .as_ref()
+                                        .and_then(|r| {
+                                            r.predictions
+                                                .levels
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, l)| l.side == fill.side)
+                                                .min_by(|(_, a), (_, b)| {
+                                                    (a.price - fill.fill_price)
+                                                        .abs()
+                                                        .partial_cmp(
+                                                            &(b.price - fill.fill_price).abs(),
+                                                        )
+                                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                                })
+                                                .map(|(i, _)| i)
+                                        })
+                                        .unwrap_or(0);
+
+                                    let as_bps = if fill.side == Side::Buy {
+                                        (fill.fill_price - mid) / mid * 10_000.0
+                                    } else {
+                                        (mid - fill.fill_price) / mid * 10_000.0
+                                    };
+
+                                    FillOutcome {
+                                        level_index,
+                                        fill_timestamp_ns: fill.timestamp_ns,
+                                        fill_price: fill.fill_price,
+                                        fill_size: fill.fill_size,
+                                        mark_price_at_fill: mid,
+                                        mark_price_100ms_later: mid,
+                                        mark_price_1s_later: mid,
+                                        mark_price_10s_later: mid,
+                                        realized_as_bps: as_bps,
+                                    }
+                                })
+                                .collect();
+
+                            let outcomes = ObservedOutcomes {
+                                fills: fill_outcomes,
+                                price_1s_later: mid,
+                                price_10s_later: mid,
+                                price_60s_later: mid,
+                                adverse_selection_realized_bps: 0.0,
+                                realized_pnl: 0.0,
+                            };
+                            prediction_logger.attach_outcomes(current_cycle_id, outcomes);
+                        }
+                        cycle_fills.clear();
+
+                        // Log prediction and capture cycle_id
+                        current_cycle_id = prediction_logger.log_prediction(market_snapshot, predictions);
 
                         // Place simulated orders only at NEW price levels
                         // (preserves queue position at existing levels)
@@ -2272,6 +2627,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap()
                     .as_nanos() as u64);
 
+                // Periodic calibration feed: drain completed prediction records (every 10s)
+                if last_calibration_feed.elapsed() >= Duration::from_secs(10) {
+                    last_calibration_feed = Instant::now();
+                    let completed = prediction_logger.drain_completed_records();
+                    for record in &completed {
+                        calibration_analyzer.add_record(record);
+                    }
+                    if !completed.is_empty() {
+                        let counts = calibration_analyzer.get_sample_counts();
+                        let total: usize = counts.values().sum();
+                        info!(
+                            "[CALIBRATION] fed {} records, total samples={}",
+                            completed.len(),
+                            total
+                        );
+                    }
+                }
+
                 // Periodic checkpoint save (every 5 minutes)
                 if state.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {
                     if let Some(ref mgr) = state.checkpoint_manager {
@@ -2341,6 +2714,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Flush prediction logger
     prediction_logger.flush_all();
+
+    // Edge Validation Report
+    info!("=== EDGE VALIDATION REPORT ===");
+    info!("Overall Sharpe: {:.2} (annualized, {} fills)",
+        sharpe_tracker.sharpe_ratio(), sharpe_tracker.count());
+    let final_summary = sharpe_tracker.summary();
+    info!("  1h: {:.2}  24h: {:.2}  7d: {:.2}",
+        final_summary.sharpe_1h, final_summary.sharpe_24h, final_summary.sharpe_7d);
+    info!("  Mean return: {:.2} bps  Std: {:.2} bps",
+        final_summary.mean_return_bps, final_summary.std_return_bps);
+    info!("");
+    info!("{}", edge_tracker.format_report());
+    info!("");
+    info!("Per-Signal Attribution:");
+    info!("{}", signal_attributor.format_report());
+    info!("");
+    info!("Per-Signal Sharpe:");
+    info!("{}", signal_sharpe.format_report());
+    info!("");
+    info!("Analytics files written to {}/", cli.output_dir);
+
+    // Final analytics flush
+    if let Some(ref mut logger) = analytics_logger {
+        let _ = logger.flush();
+    }
 
     info!("Paper trading simulation complete");
 

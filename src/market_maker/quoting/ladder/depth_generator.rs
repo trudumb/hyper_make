@@ -104,7 +104,7 @@ impl DynamicDepths {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum DepthSpacing {
     /// Geometric spacing: depths grow exponentially from optimal
-    /// Example with ratio 1.5: [δ*, δ*×1.5, δ*×2.25, δ*×3.375, ...]
+    /// Example with ratio 1.2: [δ*, δ*×1.2, δ*×1.44, δ*×1.728, ...]
     #[default]
     Geometric,
     /// Linear spacing: depths grow by fixed step from optimal
@@ -173,14 +173,14 @@ impl Default for DynamicDepthConfig {
             max_depth_multiple: 5.0, // Up to 5x optimal spread
             max_depth_bps: 200.0,    // Hard cap at 200bp
             spacing: DepthSpacing::Geometric,
-            geometric_ratio: 1.5,    // Each level 50% further than previous
+            geometric_ratio: 1.2,    // Each level 20% further than previous (tighter clustering near touch)
             linear_step_bps: 3.0,    // Or 3bp steps for linear
             maker_fee_rate: 0.00015, // 1.5bp maker fee (Hyperliquid actual)
             // FIRST PRINCIPLES: This is a safety floor, not the primary floor.
-            // The adaptive floor (6 bps) from AdaptiveBayesianConfig is the effective floor.
-            // Set this lower so adaptive floor takes precedence.
-            // Trade history (Dec 2025): break-even ~6.67 bps, adaptive floor = 6 bps
-            min_spread_floor_bps: 4.0, // Safety floor, adaptive floor (6 bps) takes over
+            // The adaptive floor from AdaptiveBayesianConfig is the effective floor.
+            // Set to 1.0 so GLFT optimal determines the actual spread floor.
+            // The adaptive floor (when active) takes precedence at ~6 bps.
+            min_spread_floor_bps: 1.0, // Safety floor only; GLFT and adaptive floor drive actual spread
             enable_asymmetric: true,
             // FIRST PRINCIPLES: GLFT optimal spread δ* = (1/γ) × ln(1 + γ/κ)
             // is derived from stochastic control theory and should be trusted.
@@ -563,7 +563,7 @@ impl DynamicDepthGenerator {
     /// Clamped to [min_depth_bps, max] range.
     ///
     /// When start is much smaller than max, this creates a distributed ladder.
-    /// Example: start=2bp, max=50bp, ratio=1.5, n=5 → [2, 3, 4.5, 6.75, 10.12]
+    /// Example: start=2bp, max=50bp, ratio=1.2, n=5 → [2, 2.4, 2.88, 3.46, 4.15]
     fn geometric_depths(&self, start: f64, max: f64, n: usize) -> Vec<f64> {
         let ratio = self.config.geometric_ratio;
 

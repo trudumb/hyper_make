@@ -216,6 +216,47 @@ impl SignalIntegratorConfig {
     }
 }
 
+/// Records each signal's individual contribution before blending.
+/// Used by the analytics module for per-signal PnL attribution.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SignalContributionRecord {
+    /// Lead-lag cross-exchange skew in bps
+    pub lead_lag_skew_bps: f64,
+    /// Whether lead-lag signal was significant (above MI threshold)
+    pub lead_lag_active: bool,
+    /// IR-based gating weight for lead-lag (0.0-1.0)
+    pub lead_lag_gating_weight: f64,
+
+    /// Informed flow spread multiplier (1.0 = no adjustment)
+    pub informed_flow_spread_mult: f64,
+    /// Whether informed flow decomposition is active
+    pub informed_flow_active: bool,
+    /// IR-based gating weight for informed flow (0.0-1.0)
+    pub informed_flow_gating_weight: f64,
+
+    /// Effective kappa from regime detection
+    pub regime_kappa_effective: f64,
+    /// Whether regime kappa is active
+    pub regime_active: bool,
+
+    /// Cross-venue spread multiplier
+    pub cross_venue_spread_mult: f64,
+    /// Cross-venue skew in bps
+    pub cross_venue_skew_bps: f64,
+    /// Whether cross-venue signals are valid
+    pub cross_venue_active: bool,
+
+    /// VPIN-based spread widening (multiplier, 1.0 = no adjustment)
+    pub vpin_spread_mult: f64,
+    /// Whether VPIN is above toxicity threshold
+    pub vpin_active: bool,
+
+    /// Buy pressure skew in bps
+    pub buy_pressure_skew_bps: f64,
+    /// Whether buy pressure is above z-threshold
+    pub buy_pressure_active: bool,
+}
+
 /// Integrated signals for quote generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IntegratedSignals {
@@ -304,6 +345,11 @@ pub struct IntegratedSignals {
     pub total_spread_mult: f64,
     /// Combined skew in bps (positive = bullish).
     pub combined_skew_bps: f64,
+
+    // === Attribution ===
+    /// Per-signal contribution record for attribution analysis.
+    /// Populated by get_signals(), None for manually constructed instances.
+    pub signal_contributions: Option<SignalContributionRecord>,
 }
 
 impl IntegratedSignals {
@@ -809,6 +855,46 @@ impl SignalIntegrator {
 
         signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps;
 
+        // === Build per-signal contribution record for attribution ===
+        let vpin_active = self.config.use_vpin_toxicity && self.vpin_valid
+            && self.latest_hl_vpin > self.config.vpin_widen_threshold;
+        signals.signal_contributions = Some(SignalContributionRecord {
+            lead_lag_skew_bps: signals.lead_lag_skew_bps,
+            lead_lag_active: signals.lead_lag_actionable,
+            lead_lag_gating_weight: signals.lead_lag_gating_weight,
+
+            informed_flow_spread_mult: signals.informed_flow_spread_mult,
+            informed_flow_active: self.config.use_informed_flow && signals.p_informed > 0.0,
+            informed_flow_gating_weight: signals.informed_flow_gating_weight,
+
+            regime_kappa_effective: signals.kappa_effective,
+            regime_active: self.config.use_regime_kappa,
+
+            cross_venue_spread_mult: signals.cross_venue_spread_mult,
+            cross_venue_skew_bps,
+            cross_venue_active: signals.cross_venue_valid,
+
+            vpin_spread_mult: if vpin_active {
+                // Isolate VPIN contribution: ratio of blended to EM-only spread mult
+                // When VPIN is not active this is 1.0 (no adjustment)
+                let em_only_mult = self.config.informed_flow_adjustment
+                    .spread_multiplier(self.last_flow_decomp.p_informed);
+                if em_only_mult > 0.0 {
+                    signals.informed_flow_spread_mult / em_only_mult
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            },
+            vpin_active,
+
+            buy_pressure_skew_bps,
+            buy_pressure_active: self.config.use_buy_pressure
+                && self.buy_pressure.is_warmed_up()
+                && signals.buy_pressure_z.abs() > self.config.buy_pressure_z_threshold,
+        });
+
         // Log periodically
         if self.update_count.is_multiple_of(100) && self.update_count > 0 {
             self.log_status(&signals);
@@ -1004,5 +1090,47 @@ mod tests {
 
         // Should have higher P(informed) after informed-looking trades
         assert!(signals.p_informed > 0.1);
+    }
+
+    #[test]
+    fn test_signal_contributions_recorded() {
+        let integrator = SignalIntegrator::default_config();
+        let signals = integrator.get_signals();
+
+        // get_signals() should always populate the contribution record
+        assert!(signals.signal_contributions.is_some());
+
+        let contrib = signals.signal_contributions.unwrap();
+
+        // With no data fed in, signals should be at their defaults
+        assert!(!contrib.lead_lag_active);
+        assert_eq!(contrib.lead_lag_skew_bps, 0.0);
+
+        // Informed flow spread mult should be reasonable (0.9-1.0 range for no-data case)
+        assert!(contrib.informed_flow_spread_mult >= 0.9);
+        assert!(contrib.informed_flow_spread_mult <= 1.0);
+
+        // Regime kappa should be active (default config enables it)
+        assert!(contrib.regime_active);
+        assert!(contrib.regime_kappa_effective > 0.0);
+
+        // Cross-venue not active (valid) without sufficient data
+        assert!(!contrib.cross_venue_active);
+        assert!(contrib.cross_venue_spread_mult >= 1.0);
+
+        // VPIN not active without data
+        assert!(!contrib.vpin_active);
+        assert_eq!(contrib.vpin_spread_mult, 1.0);
+
+        // Buy pressure not active without warmup
+        assert!(!contrib.buy_pressure_active);
+        assert_eq!(contrib.buy_pressure_skew_bps, 0.0);
+    }
+
+    #[test]
+    fn test_signal_contributions_none_for_default() {
+        // Manually constructed IntegratedSignals should have None contributions
+        let signals = IntegratedSignals::default();
+        assert!(signals.signal_contributions.is_none());
     }
 }

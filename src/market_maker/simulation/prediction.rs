@@ -570,6 +570,32 @@ impl PredictionLogger {
         self.writer.lock().unwrap().flush().ok();
     }
 
+    /// Retrieve a pending record by cycle_id (e.g. after outcomes attached)
+    pub fn get_record(&self, cycle_id: u64) -> Option<PredictionRecord> {
+        self.pending_records.lock().unwrap().get(&cycle_id).cloned()
+    }
+
+    /// Drain all pending records that have outcomes attached.
+    /// Returns completed records (with Some(outcomes)) and removes them from pending.
+    /// Records without outcomes are left in place.
+    pub fn drain_completed_records(&self) -> Vec<PredictionRecord> {
+        let mut pending = self.pending_records.lock().unwrap();
+        let completed_ids: Vec<u64> = pending
+            .iter()
+            .filter(|(_, r)| r.outcomes.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut completed = Vec::with_capacity(completed_ids.len());
+        for id in completed_ids {
+            if let Some(record) = pending.remove(&id) {
+                self.write_record(&record);
+                completed.push(record);
+            }
+        }
+        completed
+    }
+
     /// Get statistics about logged predictions
     pub fn get_stats(&self) -> PredictionLoggerStats {
         let pending = self.pending_records.lock().unwrap();

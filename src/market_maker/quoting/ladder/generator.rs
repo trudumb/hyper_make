@@ -130,6 +130,7 @@ impl Ladder {
                 confidence: params.rl_confidence,
                 market_mid: params.market_mid,
                 decimals: params.decimals,
+                warmup_pct: params.warmup_pct,
             },
         );
 
@@ -254,6 +255,7 @@ impl Ladder {
                 confidence: params.rl_confidence,
                 market_mid: params.market_mid,
                 decimals: params.decimals,
+                warmup_pct: params.warmup_pct,
             },
         );
 
@@ -958,6 +960,9 @@ pub(crate) struct RlAdjustmentParams {
     pub confidence: f64,
     pub market_mid: f64,
     pub decimals: u32,
+    /// Warmup progress [0.0, 1.0]. RL adjustments are disabled when < 0.5
+    /// to prevent untrained RL policies from widening spreads during early learning.
+    pub warmup_pct: f64,
 }
 
 /// Apply RL policy adjustments to the ladder.
@@ -977,6 +982,17 @@ pub(crate) struct RlAdjustmentParams {
 pub(crate) fn apply_rl_adjustments(ladder: &mut Ladder, params: &RlAdjustmentParams) {
     // Skip if confidence too low or no adjustment needed
     if params.confidence < 0.1 {
+        return;
+    }
+
+    // Disable RL adjustments during warmup (<50%) to prevent untrained policies
+    // from adding unnecessary spread widening during early learning phase
+    if params.warmup_pct < 0.5 {
+        tracing::debug!(
+            warmup_pct = %format!("{:.0}%", params.warmup_pct * 100.0),
+            rl_confidence = %format!("{:.2}", params.confidence),
+            "RL adjustments disabled: warmup < 50%"
+        );
         return;
     }
 
@@ -1559,6 +1575,7 @@ mod tests {
                 confidence: 0.9,        // 90% confidence
                 market_mid: 100.0,
                 decimals: 2,
+                warmup_pct: 1.0,        // fully warmed up for test
             },
         );
 
@@ -1594,6 +1611,7 @@ mod tests {
                 confidence: 1.0,         // 100% confidence
                 market_mid: 100.0,
                 decimals: 2,
+                warmup_pct: 1.0,         // fully warmed up for test
             },
         );
 
@@ -1627,6 +1645,7 @@ mod tests {
                 confidence: 0.05, // Only 5% confidence - below 10% threshold
                 market_mid: 100.0,
                 decimals: 2,
+                warmup_pct: 1.0,  // fully warmed up for test
             },
         );
 
@@ -1656,6 +1675,7 @@ mod tests {
                 confidence: 1.0,
                 market_mid: 100.0, // market_mid = 100
                 decimals: 2,
+                warmup_pct: 1.0,  // fully warmed up for test
             },
         );
 

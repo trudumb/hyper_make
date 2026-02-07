@@ -37,7 +37,7 @@ pub use executor::SimulationExecutor;
 pub use fill_sim::{FillSimulator, FillSimulatorConfig, SimulatedFill};
 pub use outcome::{CycleAttribution, OutcomeTracker, PnLDecomposition};
 pub use prediction::{
-    LevelPrediction, MarketStateSnapshot, ModelPredictions, ObservedOutcomes, PredictionLogger,
-    PredictionRecord,
+    FillOutcome, LevelPrediction, MarketStateSnapshot, ModelPredictions, ObservedOutcomes,
+    PredictionLogger, PredictionRecord,
 };
 pub use quick_mc::{MCSimulationResult, QuickMCConfig, QuickMCSimulator};

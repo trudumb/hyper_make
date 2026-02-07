@@ -582,6 +582,10 @@ impl ParameterAggregator {
             // Kappa-Driven Spread (Phase 3) - computed separately in quote_engine
             kappa_spread_bps: None,
 
+            // Regime-Conditioned Kappa - wired from SignalIntegration in paper_trader/quote_engine
+            regime_kappa: None,
+            regime_kappa_current_regime: 1, // Normal default
+
             // === Bayesian Gamma Components (Alpha Plan) ===
             // These are populated from QuoteGate and TheoreticalEdgeEstimator
             // Default to neutral values; actual values populated in quote_engine.rs

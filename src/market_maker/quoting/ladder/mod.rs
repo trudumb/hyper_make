@@ -245,6 +245,9 @@ pub struct LadderParams {
     /// - ADD: negative (reverse skew, tighter on position-building side)
     /// - REDUCE: positive × urgency (normal mean-reversion)
     pub effective_inventory_ratio: f64,
+
+    /// Warmup progress [0.0, 1.0]. Used to gate RL adjustments (disabled when < 0.5).
+    pub warmup_pct: f64,
 }
 
 #[cfg(test)]
@@ -305,6 +308,7 @@ mod tests {
             // Position continuation disabled for this test
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.0,
+            warmup_pct: 1.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -360,6 +364,7 @@ mod tests {
             // Position continuation disabled for this test
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.0,
+            warmup_pct: 1.0,
         };
 
         let params_long = LadderParams {
@@ -429,6 +434,7 @@ mod tests {
             // Position continuation disabled for this test
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.0,
+            warmup_pct: 1.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -488,6 +494,7 @@ mod tests {
             // Position continuation disabled for this test
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.3, // Matches inventory_ratio for REDUCE
+            warmup_pct: 1.0,
         };
 
         // Same params but WITHOUT drift adjustment

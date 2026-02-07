@@ -710,6 +710,32 @@ fn print_ascii(report: &CalibrationReport) {
         println!("{}", separator);
     }
 
+    // Edge Validation Section (from paper trader analytics data)
+    println!(" EDGE VALIDATION (from paper trader data)");
+    println!("{}", separator);
+
+    let sharpe_path = "logs/paper_trading/sharpe_metrics.jsonl";
+    if std::path::Path::new(sharpe_path).exists() {
+        if let Ok(content) = std::fs::read_to_string(sharpe_path) {
+            if let Some(last_line) = content.lines().last() {
+                println!(" Latest Sharpe metrics: {}", last_line);
+            }
+        }
+    } else {
+        println!("  No analytics data available. Run paper_trader to collect data.");
+    }
+
+    let pnl_path = "logs/paper_trading/signal_pnl.jsonl";
+    if std::path::Path::new(pnl_path).exists() {
+        if let Ok(content) = std::fs::read_to_string(pnl_path) {
+            if let Some(last_line) = content.lines().last() {
+                println!(" Latest signal PnL: {}", last_line);
+            }
+        }
+    }
+
+    println!("{}", separator);
+
     // Summary Section
     println!(" SUMMARY");
     println!("{}", separator);

@@ -634,7 +634,7 @@ impl LadderStrategy {
 
         // === KAPPA: Robust V3 > Adaptive > Legacy ===
         // Priority: 1. Robust kappa (outlier-resistant), 2. Adaptive, 3. Legacy
-        let kappa = if market_params.use_kappa_robust {
+        let mut kappa = if market_params.use_kappa_robust {
             // V3 Robust kappa: from KappaOrchestrator (outlier-resistant)
             // Blends book-structure κ, Student-t robust κ, and own-fill κ
             info!(
@@ -658,6 +658,49 @@ impl LadderStrategy {
             let alpha = market_params.predicted_alpha.min(0.5);
             market_params.kappa * (1.0 - alpha)
         };
+
+        // === REGIME KAPPA BLENDING ===
+        // Blend selected kappa with regime-conditioned kappa (70% current + 30% regime).
+        // Regime kappa captures structural differences: Low vol → 3000, Normal → 2000,
+        // High → 1000, Extreme → 500. This makes spreads naturally widen in volatile regimes.
+        if let Some(regime_kappa) = market_params.regime_kappa {
+            let kappa_before_regime = kappa;
+            const REGIME_BLEND_WEIGHT: f64 = 0.3;
+            kappa = (1.0 - REGIME_BLEND_WEIGHT) * kappa + REGIME_BLEND_WEIGHT * regime_kappa;
+            debug!(
+                kappa_before = %format!("{:.0}", kappa_before_regime),
+                regime_kappa = %format!("{:.0}", regime_kappa),
+                kappa_after = %format!("{:.0}", kappa),
+                regime = market_params.regime_kappa_current_regime,
+                "Regime kappa blending applied"
+            );
+        }
+        // NOTE: Agent 3's alpha-based kappa adjustment follows below.
+
+        // === AS FEEDBACK: Reduce kappa when informed flow detected ===
+        // predicted_alpha measures P(next trade is informed) from vol surprise, flow, jumps.
+        // When alpha is high and AS is warmed up, lower kappa → wider spreads → defensive.
+        // This applies to ALL kappa sources (robust, adaptive, legacy) since informed flow
+        // affects us regardless of how kappa was estimated.
+        // Note: legacy branch already discounts by alpha, so skip double-counting.
+        let alpha_for_kappa = market_params.predicted_alpha;
+        const ALPHA_KAPPA_THRESHOLD: f64 = 0.3;
+        const ALPHA_KAPPA_SENSITIVITY: f64 = 0.5;
+        if alpha_for_kappa > ALPHA_KAPPA_THRESHOLD
+            && market_params.as_warmed_up
+            && (market_params.use_kappa_robust
+                || (market_params.use_adaptive_spreads && market_params.adaptive_can_estimate))
+        {
+            // At alpha=0.6 → kappa *= 0.7, at alpha=1.0 → kappa *= 0.5
+            let kappa_before_alpha = kappa;
+            kappa *= 1.0 - ALPHA_KAPPA_SENSITIVITY * alpha_for_kappa;
+            info!(
+                alpha = %format!("{:.3}", alpha_for_kappa),
+                kappa_before = %format!("{:.0}", kappa_before_alpha),
+                kappa_after = %format!("{:.0}", kappa),
+                "AS feedback: reducing kappa for informed flow defense"
+            );
+        }
 
         let time_horizon = self.holding_time(market_params.arrival_intensity);
 
@@ -746,6 +789,7 @@ impl LadderStrategy {
             // Position Continuation Model (HOLD/ADD/REDUCE)
             position_action: market_params.position_action,
             effective_inventory_ratio: market_params.effective_inventory_ratio,
+            warmup_pct: market_params.adaptive_warmup_progress,
         };
 
         // === SPREAD FLOOR: Adaptive vs Static ===
@@ -769,6 +813,15 @@ impl LadderStrategy {
         };
         let effective_floor_bps = effective_floor_frac * 10_000.0;
 
+        // [SPREAD TRACE] Phase 1: floor — capture GLFT optimal for diagnostics
+        let glft_optimal_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
+        tracing::info!(
+            phase = "floor",
+            glft_optimal_bps = %format!("{:.2}", glft_optimal_bps),
+            effective_floor_bps = %format!("{:.2}", effective_floor_bps),
+            "[SPREAD TRACE] after floor computation"
+        );
+
         // === CONDITIONAL AS: Learned from data, not magic numbers ===
         // E[AS | fill] ≠ E[AS] unconditional. Fills cluster around toxic moments.
         // The fill tracker maintains a Bayesian posterior of realized fill AS.
@@ -776,6 +829,14 @@ impl LadderStrategy {
         // If no fill data yet, use 0 buffer (don't penalize before measuring).
         let conditional_as_buffer_bps = market_params.conditional_as_posterior_mean_bps.unwrap_or(0.0);
         let effective_floor_bps = effective_floor_bps + conditional_as_buffer_bps;
+
+        // [SPREAD TRACE] Phase 2: AS buffer
+        tracing::info!(
+            phase = "as_buffer",
+            conditional_as_buffer_bps = %format!("{:.2}", conditional_as_buffer_bps),
+            effective_floor_bps = %format!("{:.2}", effective_floor_bps),
+            "[SPREAD TRACE] after conditional AS buffer"
+        );
 
         // Log when conditional AS buffer is active (learned from fill data)
         if conditional_as_buffer_bps > 0.1 {
@@ -817,6 +878,15 @@ impl LadderStrategy {
             )
         };
 
+        // [SPREAD TRACE] Phase 3: GLFT depths computed
+        tracing::info!(
+            phase = "glft_depths",
+            touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
+            touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
+            total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
+            "[SPREAD TRACE] after GLFT depth computation"
+        );
+
         // Apply stochastic floor to dynamic depths
         // Ensure all levels are at least at effective_floor_bps
         for depth in dynamic_depths.bid.iter_mut() {
@@ -829,6 +899,15 @@ impl LadderStrategy {
                 *depth = effective_floor_bps;
             }
         }
+
+        // [SPREAD TRACE] Phase 4: floor clamp applied
+        tracing::info!(
+            phase = "floor_clamp",
+            touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
+            touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
+            total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
+            "[SPREAD TRACE] after floor clamp to effective_floor"
+        );
 
         // === KAPPA-DRIVEN SPREAD CAP (Phase 3) ===
         // When kappa is high (lots of fill intensity), cap spreads to be tighter.
@@ -848,6 +927,16 @@ impl LadderStrategy {
                 }
             }
         }
+
+        // [SPREAD TRACE] Phase 5: kappa cap applied
+        tracing::info!(
+            phase = "kappa_cap",
+            kappa_cap_bps = %format!("{:.1}", market_params.kappa_spread_bps.unwrap_or(0.0)),
+            touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
+            touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
+            total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
+            "[SPREAD TRACE] after kappa spread cap"
+        );
 
         // === REMOVED: L2 SPREAD MULTIPLIER ===
         // The l2_spread_multiplier has been removed. All uncertainty is now handled
@@ -954,11 +1043,46 @@ impl LadderStrategy {
 
             // 3. URGENCY COMPONENT: Amplify when position opposes momentum
             // If long and price falling, or short and price rising → urgent reduction needed
-            let urgency_signal = if market_params.position_opposes_momentum {
+            let mut urgency_score_adj = market_params.urgency_score;
+
+            // 3a. Falling knife / rising knife amplification (mirrors glft.rs:1037-1068)
+            // MarketParams carries falling_knife_score and rising_knife_score from momentum estimator.
+            // If position opposes the dominant momentum direction AND severity > 0.5,
+            // amplify inventory reduction urgency to avoid getting run over.
+            let momentum_severity = market_params
+                .falling_knife_score
+                .max(market_params.rising_knife_score);
+            let momentum_direction =
+                if market_params.falling_knife_score > market_params.rising_knife_score {
+                    -1.0 // Market falling
+                } else if market_params.rising_knife_score > market_params.falling_knife_score {
+                    1.0 // Market rising
+                } else {
+                    0.0 // Neutral
+                };
+            let knife_opposes_position = (inventory_ratio > 0.0 && momentum_direction < 0.0)
+                || (inventory_ratio < 0.0 && momentum_direction > 0.0);
+
+            if knife_opposes_position && momentum_severity > 0.5 {
+                // Amplify urgency: at severity=1.5 → adds 0.5 urgency
+                urgency_score_adj = (urgency_score_adj + momentum_severity / 3.0).min(1.0);
+                if momentum_severity > 1.0 {
+                    info!(
+                        inventory_ratio = %format!("{:.3}", inventory_ratio),
+                        falling_knife = %format!("{:.2}", market_params.falling_knife_score),
+                        rising_knife = %format!("{:.2}", market_params.rising_knife_score),
+                        urgency_adj = %format!("{:.2}", urgency_score_adj),
+                        "Momentum-opposed position: amplifying urgency via falling/rising knife"
+                    );
+                }
+            }
+
+            let urgency_signal = if market_params.position_opposes_momentum || knife_opposes_position
+            {
                 // Use HJB drift urgency direction with urgency score magnitude
                 // This gives strong directional pressure when in danger
                 let urgency_direction = if inventory_ratio > 0.0 { 1.0 } else { -1.0 };
-                urgency_direction * market_params.urgency_score.min(1.0) * 0.2
+                urgency_direction * urgency_score_adj.min(1.0) * 0.2
             } else {
                 0.0
             };
@@ -986,6 +1110,19 @@ impl LadderStrategy {
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
                 "Margin allocation (stochastic-weighted split)"
+            );
+
+            // [SIGNALS] Diagnostic: all activated signal values per quote cycle
+            info!(
+                alpha = %format!("{:.3}", market_params.predicted_alpha),
+                falling_knife = %format!("{:.1}", market_params.falling_knife_score),
+                rising_knife = %format!("{:.1}", market_params.rising_knife_score),
+                momentum_severity = %format!("{:.2}", momentum_severity),
+                knife_opposes = %knife_opposes_position,
+                urgency_adj = %format!("{:.3}", urgency_score_adj),
+                kappa_used = %format!("{:.0}", kappa),
+                as_warmed_up = %market_params.as_warmed_up,
+                "[SIGNALS] signal contribution summary"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
