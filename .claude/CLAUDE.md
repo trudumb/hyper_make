@@ -1,324 +1,176 @@
 # CLAUDE.md - Hyperliquid Market Making System
 
-## Project Overview
-
-This is a quantitative market making system for Hyperliquid perpetual futures, built in Rust. The system implements Guéant-Lehalle-Fernandez-Tapia (GLFT) optimal market making with proprietary extensions for:
-
-- Exchange-specific fill intensity modeling (Hawkes processes)
-- Adverse selection prediction and avoidance
-- Cross-exchange lead-lag exploitation (Binance → Hyperliquid)
-- Regime detection and adaptive parameter tuning
-
-**Primary Goal:** Capture bid-ask spread while minimizing adverse selection losses.
-
-**Key Insight:** Edge comes from superior parameter estimation, not from the GLFT formula itself (which is public). The competitive advantage is in:
-1. Better kappa (fill intensity) estimation using exchange-specific features
-2. Faster adverse selection detection
-3. Cross-exchange information advantages
-4. Regime-aware parameter adaptation
+Rust-based quantitative market making for Hyperliquid perpetual futures using GLFT optimal market making with proprietary extensions. See @README.md for full project overview.
 
 ---
 
-## Skill System
+## Build & Verification
 
-This project uses a skill-based architecture for Claude CLI. Skills provide domain-specific guidance for building and maintaining the trading system.
+```bash
+# Build
+cargo build                      # Dev build
+cargo build --release            # Release build (incremental, fast)
+cargo build --profile release-prod  # Production build (LTO, slow)
 
-### Skill Hierarchy
+# Test & lint — ALWAYS run after making changes
+cargo test                       # Run all tests
+cargo test <test_name>           # Prefer single tests for speed
+cargo clippy -- -D warnings      # Lint — treat warnings as errors
 
-```
-foundation/          # Must read first for any model work
-├── measurement-infrastructure/   # Prediction logging
-├── calibration-analysis/         # Model validation
-└── signal-audit/                 # Feature selection
-
-models/              # Individual predictive components
-├── fill-intensity-hawkes/        # Kappa estimation
-├── adverse-selection-classifier/ # Toxic flow prediction
-├── regime-detection-hmm/         # Market state tracking
-└── lead-lag-estimator/           # Cross-exchange signal
-
-integration/         # Putting it together
-└── quote-engine/                 # Full pipeline
-
-operations/          # Production concerns
-└── daily-calibration-report/     # Health monitoring
+# Binaries (user runs these manually, never run them yourself)
+# market_maker, parameter_estimator, paper_trader, health_dashboard, calibration_report
 ```
 
-### Skill Dependencies
-
-```
-measurement-infrastructure (ALWAYS READ FIRST)
-         │
-         ├──→ calibration-analysis
-         │
-         └──→ signal-audit
-                   │
-                   ├──→ fill-intensity-hawkes
-                   │
-                   ├──→ adverse-selection-classifier
-                   │
-                   ├──→ regime-detection-hmm
-                   │
-                   └──→ lead-lag-estimator
-                              │
-                              └──→ quote-engine
-                                        │
-                                        └──→ daily-calibration-report
-```
-
-### When to Read Which Skills
-
-| Task | Skills to Read (in order) |
-|------|---------------------------|
-| Any model work | measurement-infrastructure FIRST, always |
-| Debug PnL issue | calibration-analysis → identify weak component → that model's skill |
-| Add new signal | signal-audit → measurement-infrastructure |
-| Improve fill prediction | measurement-infrastructure → signal-audit → fill-intensity-hawkes |
-| System losing money in cascades | adverse-selection-classifier, regime-detection-hmm |
-| Cross-exchange edge decaying | lead-lag-estimator |
-| Wire up new component | quote-engine |
-| Production monitoring | daily-calibration-report |
-
----
-
-## Development Principles
-
-### 1. Measurement Before Modeling
-
-**Never build a model without first measuring what you're trying to predict.**
-
-Before implementing any predictive component:
-1. Define the prediction target precisely
-2. Set up logging for predictions and outcomes
-3. Establish baseline metrics (base rate, naive predictor)
-4. Only then build the model
-5. Validate against calibration metrics
-
-### 2. Calibration is Ground Truth
-
-A model is only as good as its calibration metrics say it is. Key metrics:
-
-- **Brier Score**: Mean squared error of probability predictions
-- **Information Ratio**: Resolution / Uncertainty — measures how much a feature shifts beliefs
-- **Conditional Calibration**: Metrics sliced by regime, volatility, etc.
-
-Features inform Bayesian priors, not predict perfectly. IR 0.5–1.0 is useful for belief updates;
-IR > 1.0 is an exceptional standalone predictor. Only remove features with IR < 0.5 after 500+
-samples. Watch for inter-feature correlation inflating aggregate value.
-
-### 3. Edge Decays
-
-All alpha decays. Monitor for:
-- Signal MI dropping week-over-week
-- Lead-lag R² declining (arbitrageurs closing the gap)
-- Regime parameters drifting
-
-Build staleness detection into every model.
-
-### 4. Regime Awareness
-
-Never use a single parameter value. Everything is regime-dependent:
-- Kappa (fill rate) varies 10x between quiet and cascade
-- Optimal gamma (risk aversion) varies 5x
-- Spread floors vary 10x
-
-Use the HMM belief state to blend parameters, not hard switches.
-
-### 5. Defense First
-
-When uncertain, widen spreads. The cost of missing a trade is small. The cost of getting run over in a liquidation cascade is large.
-
----
-
-## Key Domain Concepts
-
-### GLFT Formula
-
-The optimal half-spread from Guéant-Lehalle-Fernandez-Tapia:
-
-```
-δ* = (1/γ) * ln(1 + γ/κ) + fee
-```
-
-Where:
-- γ = risk aversion parameter (higher = wider spreads)
-- κ = fill intensity (fills per unit spread)
-- fee = maker fee (1.5 bps on Hyperliquid)
-
-**The formula is trivial. The edge is in estimating γ and κ correctly.**
-
-### Hyperliquid-Specific Features
-
-1. **Funding Rate**: Paid every 8 hours. Creates predictable flow patterns around settlement.
-2. **Open Interest**: On-chain, real-time. OI drops signal liquidation cascades.
-3. **Liquidation Cascades**: Forced selling creates toxic flow. Detect via OI drop + extreme funding.
-4. **Vault Competition**: Other market makers (HLP vault, etc.) compete for queue position.
-
-### Cross-Exchange Dynamics
-
-Binance BTC perp is the most liquid venue. Price discovery happens there first.
-- Binance leads Hyperliquid by 50-500ms depending on volatility
-- This lead-lag is exploitable but decaying as arbitrageurs compete
+IMPORTANT: After any code change, run `cargo clippy -- -D warnings` and fix all warnings before considering the task done.
 
 ---
 
 ## Coding Conventions
 
-### Rust Style
-
-```rust
-// Use strong types for domain concepts
-struct Bps(f64);
-struct Price(f64);
-struct Size(f64);
-
-// Document units in variable names
-let spread_bps: f64 = 5.0;
-let time_to_settlement_s: f64 = 3600.0;
-let funding_rate_8h: f64 = 0.0001;
-
-// Use const for magic numbers
-const MAKER_FEE_BPS: f64 = 1.5;
-const CASCADE_OI_DROP_THRESHOLD: f64 = -0.02;
-```
-
-### Critical Invariants
-
-```rust
-assert!(ask_price > bid_price);           // Spread positive
-assert!(kappa > 0.0);                     // Or GLFT blows up
-assert!(inventory.abs() <= max_inventory); // Risk limits
-assert!(bid_price < microprice);          // Correct side of mid
-assert!(ask_price > microprice);
-```
+- Use strong newtypes for domain concepts: `Bps(f64)`, `Price(f64)`, `Size(f64)`
+- Document units in variable names: `spread_bps`, `time_to_settlement_s`, `funding_rate_8h`
+- Use `const` for magic numbers, never inline
+- `bps` vs `fraction`, `seconds` vs `milliseconds`, `8h` vs `annualized` — unit mismatches cause real money loss
 
 ---
 
-## Implementation Priority
+## Skill System
 
-Build components in this order (each depends on previous):
+Domain knowledge lives in `.claude/skills/`, not here. Skills are loaded on demand — read them when relevant to the task.
 
-1. **Week 1-2**: measurement-infrastructure, calibration-analysis
-2. **Week 3-4**: signal-audit
-3. **Week 5-6**: lead-lag-estimator (highest edge/effort)
-4. **Week 7-8**: regime-detection-hmm
-5. **Week 9-10**: adverse-selection-classifier
-6. **Week 11-12**: fill-intensity-hawkes
-7. **Week 13**: quote-engine integration, daily-calibration-report
-
----
-
-## Anti-Patterns
-
-1. **Trusting Backtest Results**: Always paper trade 1+ week before live
-2. **Overfitting**: Need 100+ samples per parameter minimum
-3. **Ignoring Regime Shifts**: Always track metrics by regime
-4. **Point Estimates Without Uncertainty**: Use distributions, widen when uncertain
-5. **Synchronous Model Updates**: Never retrain in the hot path
+| Task | Read these skills (in order) |
+|------|------------------------------|
+| Any model work | `measurement-infrastructure` FIRST, always |
+| Debug PnL issue | `calibration-analysis` → weak component's skill |
+| Add new signal | `signal-audit` → `measurement-infrastructure` |
+| Improve fill prediction | `measurement-infrastructure` → `signal-audit` → `fill-intensity-hawkes` |
+| Losing money in cascades | `adverse-selection-classifier`, `regime-detection-hmm` |
+| Cross-exchange edge decay | `lead-lag-estimator` |
+| Wire up new component | `quote-engine` |
 
 ---
 
-## Notes for Claude
+## Core Rules
 
-1. **Always check calibration metrics** before and after changes
-2. **The foundation skills are not optional** - read measurement-infrastructure first
-3. **Prefer explicit over clever** - bugs cost real money
-4. **Units matter** - bps vs fraction, seconds vs milliseconds, 8h vs annualized
-5. **Regime matters** - single parameter values are almost always wrong
-6. **Defense wins** - when in doubt, widen spreads
-7. **Manual Execution Only**: The user wants to run all code manually. Do NOT execute binaries or scripts (e.g. `cargo run`, `./scripts/...`). Provide copy-pasteable blocks for the user to execute.
+IMPORTANT — these are non-negotiable:
+
+1. **Measurement before modeling** — never build a model without first defining the prediction target, setting up logging, and establishing baseline metrics
+2. **Calibration is ground truth** — track Brier Score, Information Ratio, and Conditional Calibration for every model
+3. **Everything is regime-dependent** — never use a single parameter value; kappa varies 10x, gamma varies 5x between quiet and cascade
+4. **Defense first** — when uncertain, widen spreads. Missing a trade is cheap; getting run over in a cascade is not
+5. **Manual execution only** — YOU MUST NOT run binaries or scripts (`cargo run`, `./scripts/...`). Provide copy-pasteable blocks for the user to execute
+6. **Prefer explicit over clever** — bugs cost real money
+7. **Edge decays** — build staleness detection into every model; monitor signal MI, lead-lag R², regime drift
 
 ---
 
-## Project Plans
+## Git & GitHub Workflow
 
-**Always save implementation plans to `.claude/plans/` inside the project directory.**
+IMPORTANT: Use `gh` CLI for ALL GitHub interactions. Never use raw API calls or web fetch.
+
+### Commit Conventions
+
+This project uses **conventional commits**. Write in imperative mood, explain "why" not "what":
 
 ```
-.claude/
-└── plans/
-    └── <descriptive-name>.md
+feat(model): Add Hawkes process intensity estimator
+fix(quote-engine): Correct spread floor in cascade regime
+refactor(signals): Extract lead-lag into standalone module
+perf(ws): Reduce Binance feed latency with zero-copy parsing
+test(calibration): Add Brier score regression tests
+docs(skills): Update measurement-infrastructure skill
+chore(deps): Bump tokio to 1.35
 ```
 
-When entering plan mode or creating implementation plans:
-1. Create the plan file at `.claude/plans/<descriptive-name>.md`
-2. Use kebab-case naming (e.g., `feature-engineering-improvements.md`)
-3. Include: objectives, phases, files to modify, verification steps
-4. Reference plan files in Serena session memories for continuity
+Scopes: `model`, `quote-engine`, `signals`, `exchange`, `risk`, `calibration`, `ws`, `config`, `deps`, `skills`
 
-This keeps plans version-controlled with the project and accessible across sessions.
+### Branch Strategy
+
+- **No direct commits to `main`** — all changes go through PRs
+- Branch naming: `feat/<name>`, `fix/<name>`, `refactor/<name>`, `perf/<name>`
+- Merge only after tests pass and clippy is clean
+
+### GitHub CLI Commands
+
+```bash
+# Branches & PRs
+gh pr create --title "feat(model): Add regime HMM" --body "## Summary\n- ..."
+gh pr view <number>                    # View PR details
+gh pr diff <number>                    # View PR diff
+gh pr checks <number>                  # Check CI status
+gh pr merge <number> --squash          # Squash merge after approval
+gh pr list --state open                # List open PRs
+
+# Code review
+gh pr review <number> --approve
+gh pr review <number> --request-changes --body "..."
+gh pr comment <number> --body "..."
+
+# Issues
+gh issue create --title "..." --body "..." --label "bug"
+gh issue list --label "model" --state open
+gh issue view <number>
+gh issue close <number> --reason completed
+
+# CI/CD & repo
+gh run list                            # List recent workflow runs
+gh run view <run-id>                   # View run details
+gh run watch <run-id>                  # Watch run in progress
+gh release list                        # List releases
+```
+
+### PR Workflow
+
+1. Create feature branch: `git checkout -b feat/<name>`
+2. Implement changes, run `cargo test && cargo clippy -- -D warnings`
+3. Commit with conventional format (atomic commits — one logical change per commit)
+4. Push and create PR: `gh pr create --title "..." --body "..."`
+5. PR body must include: **Summary** (what & why), **Test plan** (how to verify), **Risk** (what could go wrong for a trading system)
+6. Wait for CI checks: `gh pr checks <number>`
+7. After review approval, squash merge: `gh pr merge <number> --squash`
+
+### Code Review via `gh`
+
+When reviewing PRs, use `gh` to fetch all context:
+```bash
+gh pr view <number> --json title,body,author,files,reviews
+gh pr diff <number>
+gh pr checks <number>
+```
+
+Review checklist for this project:
+- Calibration metrics validated before/after
+- No hardcoded parameters (must be regime-dependent)
+- Units documented in variable names
+- Risk limits respected (`inventory.abs() <= max_inventory`)
+- Spread invariants maintained (`ask > bid`, both correct side of microprice)
+
+---
+
+## Workflow
+
+- **Verify your work**: Run tests and clippy after changes. If you can't verify it, flag it to the user
+- **Plans**: Save to `.claude/plans/<descriptive-name>.md` (kebab-case). Include objectives, phases, files to modify, verification steps
+- **Compaction**: When compacting, preserve the full list of modified files, test commands used, and any calibration metrics discussed
+- **Subagents**: Use for codebase exploration and investigation to keep main context clean
 
 ---
 
 ## Agent Teams
 
-This project has **agent teams** enabled (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in global settings). Agent teams let you coordinate multiple Claude Code instances working in parallel, each with its own context window.
+Teams are enabled. Key rules:
 
-### When to Use Teams vs Subagents
+1. **File ownership** — each teammate owns distinct files; no two teammates edit the same file
+2. **Plan approval required** for changes to: `src/quote_engine/`, `src/risk/`, `src/exchange/`
+3. **Teammates must NOT run binaries** — they produce code; user executes manually
+4. **Defense-first applies to teams** — push back on aggressive parameter changes
 
-| Scenario | Use |
-|----------|-----|
-| Quick focused lookup (e.g., find a function) | Subagent |
-| Independent parallel work on separate files | **Agent Team** |
-| Workers need to share findings or challenge each other | **Agent Team** |
-| Sequential task where only the result matters | Subagent |
+---
 
-### Recommended Team Configurations
+## Common Gotchas
 
-**Multi-Module Feature Work** (e.g., new signal + integration):
-```
-Create an agent team:
-- Teammate 1: Implement the new signal module in src/signals/
-- Teammate 2: Add measurement infrastructure + calibration tests
-- Teammate 3: Wire integration into the quote engine
-Require plan approval before any teammate makes changes.
-```
-
-**Parallel Code Review / Debugging**:
-```
-Create an agent team to investigate the PnL regression:
-- Teammate 1: Audit adverse selection classifier calibration
-- Teammate 2: Check regime detection HMM for parameter drift
-- Teammate 3: Analyze fill intensity model vs recent market data
-Have them share findings and challenge each other's conclusions.
-```
-
-**Cross-Layer Implementation** (e.g., data pipeline → model → integration):
-```
-Create an agent team:
-- Teammate 1 (data): Build the Binance websocket feed in src/exchange/
-- Teammate 2 (model): Implement lead-lag estimator in src/models/
-- Teammate 3 (integration): Wire into quote engine, blocked on teammates 1 & 2
-Use Sonnet for each teammate.
-```
-
-### Team Rules for This Project
-
-1. **File ownership**: Each teammate must own distinct files. Two teammates editing the same file causes overwrites.
-2. **Skill awareness**: Teammates inherit CLAUDE.md, so they know the skill hierarchy. For model work, the lead should instruct teammates to read `measurement-infrastructure` first.
-3. **Plan approval for risky changes**: Always require plan approval for teammates modifying:
-   - Quote engine (`src/quote_engine/`)
-   - Risk management (`src/risk/`)
-   - Exchange connectivity (`src/exchange/`)
-4. **Defense-first applies to teams too**: If a teammate proposes aggressive parameter changes, the lead should push back. When in doubt, widen spreads.
-5. **Manual execution only**: Teammates must NOT run binaries or scripts. They produce code; the user executes manually.
-6. **Delegate mode**: For complex multi-teammate tasks, use Shift+Tab to put the lead in delegate mode so it coordinates rather than implements.
-
-### Display Mode
-
-The default is `"auto"` (uses split panes if inside tmux, in-process otherwise). To force a mode, add to `~/.claude/settings.json`:
-
-```json
-{
-  "teammateMode": "in-process"
-}
-```
-
-Or per-session: `claude --teammate-mode in-process`
-
-### Cleanup
-
-Always have the lead clean up when done:
-```
-Shut down all teammates, then clean up the team.
-```
+- `kappa` must be > 0.0 or GLFT formula blows up
+- Maker fee is 1.5 bps on Hyperliquid — always include in spread calculation
+- Binance leads Hyperliquid by 50-500ms — this lead-lag is exploitable but decaying
+- Funding rate settlement creates predictable flow patterns — don't ignore near settlement
+- OI drops signal liquidation cascades — widen immediately
