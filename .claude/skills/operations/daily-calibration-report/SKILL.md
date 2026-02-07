@@ -1,6 +1,7 @@
 ---
 name: Daily Calibration Report
 description: Automated daily health check of all model components for early warning of degradation and drift
+disable-model-invocation: true
 ---
 
 # Daily Calibration Report Skill

@@ -44,6 +44,9 @@ pub struct KillSwitchConfig {
     /// Maximum number of rate limit errors before shutdown
     pub max_rate_limit_errors: u32,
 
+    /// Cascade severity threshold for kill switch (default 5.0, production 1.5)
+    pub cascade_severity_threshold: f64,
+
     /// Enable/disable the kill switch (for testing)
     pub enabled: bool,
 }
@@ -59,12 +62,40 @@ impl Default for KillSwitchConfig {
             // plus network latency and exchange processing
             stale_data_threshold: Duration::from_secs(30),
             max_rate_limit_errors: 3,
+            cascade_severity_threshold: 5.0,
             enabled: true,
         }
     }
 }
 
 impl KillSwitchConfig {
+    /// Production preset for initial live deployment.
+    ///
+    /// Ultra-conservative thresholds from Phase 3 plan:
+    /// - $50 daily loss limit (0.5% of $10K account)
+    /// - 2% max drawdown
+    /// - 10s stale data threshold (tighter than default 30s)
+    /// - 2 rate limit errors max
+    /// - Position limit from `max_position_usd` (asset-agnostic)
+    ///
+    /// Cascade threshold is set via `check_cascade()` method (1.5x).
+    ///
+    /// # Arguments
+    /// * `_account_value_usd` - Account equity (reserved for future Kelly scaling)
+    /// * `max_position_usd` - Maximum position notional in USD (e.g., 1000.0)
+    pub fn production(_account_value_usd: f64, max_position_usd: f64) -> Self {
+        Self {
+            max_daily_loss: 50.0,
+            max_drawdown: 0.02,
+            max_position_value: max_position_usd,
+            max_position_contracts: f64::MAX, // Derived at runtime from USD/price
+            stale_data_threshold: Duration::from_secs(10),
+            max_rate_limit_errors: 2,
+            cascade_severity_threshold: 1.5,
+            enabled: true,
+        }
+    }
+
     /// Create config derived from account value using Kelly-scaled risk limits.
     ///
     /// DERIVATION: Instead of arbitrary magic numbers, limits are derived from:
@@ -229,46 +260,32 @@ impl std::fmt::Display for KillReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KillReason::MaxLoss { loss, limit } => {
-                write!(f, "Max daily loss exceeded: ${:.2} > ${:.2}", loss, limit)
+                write!(f, "Max daily loss exceeded: ${loss:.2} > ${limit:.2}")
             }
             KillReason::MaxDrawdown { drawdown, limit } => {
-                write!(
-                    f,
-                    "Max drawdown exceeded: {:.2}% > {:.2}%",
-                    drawdown * 100.0,
-                    limit * 100.0
-                )
+                let dd_pct = drawdown * 100.0;
+                let lim_pct = limit * 100.0;
+                write!(f, "Max drawdown exceeded: {dd_pct:.2}% > {lim_pct:.2}%")
             }
             KillReason::MaxPosition { value, limit } => {
-                write!(
-                    f,
-                    "Max position value exceeded: ${:.2} > ${:.2}",
-                    value, limit
-                )
+                write!(f, "Max position value exceeded: ${value:.2} > ${limit:.2}")
             }
             KillReason::PositionRunaway { contracts, limit } => {
-                write!(
-                    f,
-                    "Position runaway: {:.6} contracts > {:.6} (2x limit)",
-                    contracts, limit
-                )
+                write!(f, "Position runaway: {contracts:.6} contracts > {limit:.6} (2x limit)")
             }
             KillReason::StaleData { elapsed, threshold } => {
-                write!(
-                    f,
-                    "Stale data: no update for {:.1}s > {:.1}s threshold",
-                    elapsed.as_secs_f64(),
-                    threshold.as_secs_f64()
-                )
+                let el = elapsed.as_secs_f64();
+                let th = threshold.as_secs_f64();
+                write!(f, "Stale data: no update for {el:.1}s > {th:.1}s threshold")
             }
             KillReason::RateLimit { count, limit } => {
-                write!(f, "Rate limit errors: {} > {} limit", count, limit)
+                write!(f, "Rate limit errors: {count} > {limit} limit")
             }
             KillReason::CascadeDetected { severity } => {
-                write!(f, "Liquidation cascade detected: severity {:.2}", severity)
+                write!(f, "Liquidation cascade detected: severity {severity:.2}")
             }
             KillReason::Manual { reason } => {
-                write!(f, "Manual shutdown: {}", reason)
+                write!(f, "Manual shutdown: {reason}")
             }
         }
     }
@@ -638,11 +655,11 @@ impl KillSwitch {
     fn check_cascade(
         &self,
         state: &KillSwitchState,
-        _config: &KillSwitchConfig,
+        config: &KillSwitchConfig,
     ) -> Option<KillReason> {
-        // Cascade severity > 1.0 means intensity is above normal
-        // We trigger at severity > 5.0 (5x normal intensity)
-        if state.cascade_severity > 5.0 {
+        // Cascade severity > threshold means liquidation cascade is too intense
+        // Default: 5.0 (5x normal), Production: 1.5 (tighter for live capital)
+        if state.cascade_severity > config.cascade_severity_threshold {
             return Some(KillReason::CascadeDetected {
                 severity: state.cascade_severity,
             });
@@ -699,6 +716,38 @@ mod tests {
         assert_eq!(config.max_daily_loss, 500.0);
         assert_eq!(config.max_drawdown, 0.05);
         assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_production_config() {
+        let config = KillSwitchConfig::production(10_000.0, 1_000.0);
+        assert_eq!(config.max_daily_loss, 50.0);
+        assert_eq!(config.max_drawdown, 0.02);
+        assert_eq!(config.max_position_contracts, f64::MAX); // Derived at runtime from USD/price
+        assert_eq!(config.max_position_value, 1_000.0); // USD limit passed directly
+        assert_eq!(config.stale_data_threshold, Duration::from_secs(10));
+        assert_eq!(config.max_rate_limit_errors, 2);
+        assert_eq!(config.cascade_severity_threshold, 1.5);
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_cascade_with_production_threshold() {
+        let config = KillSwitchConfig::production(10_000.0, 1_000.0);
+        let ks = KillSwitch::new(config);
+
+        // 2.0 severity > 1.5 production threshold → should trigger
+        let state = KillSwitchState {
+            cascade_severity: 2.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        let reason = ks.check(&state);
+        assert!(reason.is_some());
+        match reason.unwrap() {
+            KillReason::CascadeDetected { severity } => assert_eq!(severity, 2.0),
+            _ => panic!("Expected CascadeDetected"),
+        }
     }
 
     #[test]

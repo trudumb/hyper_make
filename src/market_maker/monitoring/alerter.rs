@@ -66,6 +66,14 @@ pub enum AlertType {
     RegimeShift,
     /// Information ratio dropped below 1.0 (model adding noise)
     InformationRatioBelowOne,
+    /// Spread has blown up beyond acceptable range
+    SpreadBlowup,
+    /// Inventory imbalance approaching dangerous levels
+    InventoryImbalance,
+    /// Kill switch is armed (one or more monitors at HIGH severity)
+    KillSwitchArmed,
+    /// No fills received within expected timeframe
+    NoFills,
 }
 
 impl AlertType {
@@ -85,6 +93,10 @@ impl AlertType {
             AlertType::InsufficientSamples => "InsufficientSamples",
             AlertType::RegimeShift => "RegimeShift",
             AlertType::InformationRatioBelowOne => "InformationRatioBelowOne",
+            AlertType::SpreadBlowup => "SpreadBlowup",
+            AlertType::InventoryImbalance => "InventoryImbalance",
+            AlertType::KillSwitchArmed => "KillSwitchArmed",
+            AlertType::NoFills => "NoFills",
         }
     }
 }
@@ -147,11 +159,11 @@ impl Alert {
     pub fn format(&self) -> String {
         let value_str = self
             .value
-            .map(|v| format!(" (value: {:.4})", v))
+            .map(|v| format!(" (value: {v:.4})"))
             .unwrap_or_default();
         let threshold_str = self
             .threshold
-            .map(|t| format!(" (threshold: {:.4})", t))
+            .map(|t| format!(" (threshold: {t:.4})"))
             .unwrap_or_default();
         let ack_str = if self.acknowledged { " [ACK]" } else { "" };
 
@@ -185,6 +197,14 @@ pub struct AlertConfig {
     pub latency_warning_ms: f64,
     /// Position warning when at this fraction of limit (default: 0.8 = 80%)
     pub position_warning_pct: f64,
+    /// Spread warning threshold in bps (default: 20.0)
+    pub spread_warning_bps: f64,
+    /// Inventory imbalance warning when at this fraction of max (default: 0.7)
+    pub inventory_warning_pct: f64,
+    /// No-fill warning threshold in seconds (default: 300 = 5 min)
+    pub no_fill_warning_s: u64,
+    /// Signal MI threshold below which signal is considered degraded (default: 0.05)
+    pub signal_mi_warning: f64,
     /// Deduplication window in seconds (default: 300 = 5 min)
     pub dedup_window_s: u64,
 }
@@ -199,6 +219,10 @@ impl Default for AlertConfig {
             fill_rate_warning_pct: 0.5,
             latency_warning_ms: 50.0,
             position_warning_pct: 0.8,
+            spread_warning_bps: 20.0,
+            inventory_warning_pct: 0.7,
+            no_fill_warning_s: 300,
+            signal_mi_warning: 0.05,
             dedup_window_s: 300,
         }
     }
@@ -282,7 +306,7 @@ impl Alerter {
                     timestamp,
                     AlertType::CalibrationDegraded,
                     AlertSeverity::Critical,
-                    format!("Calibration critically degraded for {}", component),
+                    format!("Calibration critically degraded for {component}"),
                 )
                 .with_value(ir)
                 .with_threshold(self.config.ir_critical_threshold),
@@ -295,7 +319,7 @@ impl Alerter {
                     timestamp,
                     AlertType::CalibrationDegraded,
                     AlertSeverity::Warning,
-                    format!("Calibration degraded for {}", component),
+                    format!("Calibration degraded for {component}"),
                 )
                 .with_value(ir)
                 .with_threshold(self.config.ir_warning_threshold),
@@ -373,10 +397,7 @@ impl Alerter {
                     timestamp,
                     AlertType::FillRateCollapse,
                     AlertSeverity::Warning,
-                    format!(
-                        "Fill rate collapse: {:.1}/hr (baseline: {:.1}/hr)",
-                        current, baseline
-                    ),
+                    format!("Fill rate collapse: {current:.1}/hr (baseline: {baseline:.1}/hr)"),
                 )
                 .with_value(ratio)
                 .with_threshold(self.config.fill_rate_warning_pct),
@@ -404,7 +425,7 @@ impl Alerter {
                     timestamp,
                     AlertType::LatencySpike,
                     AlertSeverity::Warning,
-                    format!("Latency spike: {:.1}ms", latency_ms),
+                    format!("Latency spike: {latency_ms:.1}ms"),
                 )
                 .with_value(latency_ms)
                 .with_threshold(self.config.latency_warning_ms),
@@ -451,6 +472,149 @@ impl Alerter {
         } else {
             None
         }
+    }
+
+    /// Check spread and return alert if blown up.
+    ///
+    /// # Arguments
+    ///
+    /// * `spread_bps` - Current average spread in basis points
+    /// * `timestamp` - Current timestamp in milliseconds
+    pub fn check_spread(&self, spread_bps: f64, timestamp: u64) -> Option<Alert> {
+        if spread_bps > self.config.spread_warning_bps {
+            if self.should_dedupe(AlertType::SpreadBlowup, timestamp) {
+                return None;
+            }
+            self.record_alert_time(AlertType::SpreadBlowup, timestamp);
+            Some(
+                Alert::new(
+                    self.next_id(),
+                    timestamp,
+                    AlertType::SpreadBlowup,
+                    AlertSeverity::Warning,
+                    format!("Spread blow-up: {:.1} bps (threshold: {:.1} bps)", spread_bps, self.config.spread_warning_bps),
+                )
+                .with_value(spread_bps)
+                .with_threshold(self.config.spread_warning_bps),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Check inventory imbalance and return alert if approaching dangerous levels.
+    ///
+    /// # Arguments
+    ///
+    /// * `inventory_abs` - Absolute inventory size
+    /// * `max_inventory` - Maximum allowed inventory
+    /// * `timestamp` - Current timestamp in milliseconds
+    pub fn check_inventory(&self, inventory_abs: f64, max_inventory: f64, timestamp: u64) -> Option<Alert> {
+        if max_inventory <= 0.0 {
+            return None;
+        }
+        let utilization = inventory_abs / max_inventory;
+        if utilization >= self.config.inventory_warning_pct {
+            if self.should_dedupe(AlertType::InventoryImbalance, timestamp) {
+                return None;
+            }
+            self.record_alert_time(AlertType::InventoryImbalance, timestamp);
+            Some(
+                Alert::new(
+                    self.next_id(),
+                    timestamp,
+                    AlertType::InventoryImbalance,
+                    AlertSeverity::Warning,
+                    format!(
+                        "Inventory imbalance: {:.4} / {:.4} ({:.0}%)",
+                        inventory_abs, max_inventory, utilization * 100.0
+                    ),
+                )
+                .with_value(utilization)
+                .with_threshold(self.config.inventory_warning_pct),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Check signal health (MI) and return alert if degraded.
+    ///
+    /// # Arguments
+    ///
+    /// * `mi` - Current mutual information value
+    /// * `signal_name` - Name of the signal (e.g., "lead_lag")
+    /// * `timestamp` - Current timestamp in milliseconds
+    pub fn check_signal_health(&self, mi: f64, signal_name: &str, timestamp: u64) -> Option<Alert> {
+        if mi < self.config.signal_mi_warning {
+            if self.should_dedupe(AlertType::SignalDecaying, timestamp) {
+                return None;
+            }
+            self.record_alert_time(AlertType::SignalDecaying, timestamp);
+            Some(
+                Alert::new(
+                    self.next_id(),
+                    timestamp,
+                    AlertType::SignalDecaying,
+                    AlertSeverity::Warning,
+                    format!("Signal {} degraded: MI={:.4} < {:.4}", signal_name, mi, self.config.signal_mi_warning),
+                )
+                .with_value(mi)
+                .with_threshold(self.config.signal_mi_warning),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Check no-fill condition.
+    ///
+    /// # Arguments
+    ///
+    /// * `seconds_since_last_fill` - Time since last fill in seconds
+    /// * `timestamp` - Current timestamp in milliseconds
+    pub fn check_no_fills(&self, seconds_since_last_fill: u64, timestamp: u64) -> Option<Alert> {
+        if seconds_since_last_fill >= self.config.no_fill_warning_s {
+            if self.should_dedupe(AlertType::NoFills, timestamp) {
+                return None;
+            }
+            self.record_alert_time(AlertType::NoFills, timestamp);
+            Some(
+                Alert::new(
+                    self.next_id(),
+                    timestamp,
+                    AlertType::NoFills,
+                    AlertSeverity::Warning,
+                    format!("No fills for {seconds_since_last_fill} seconds"),
+                )
+                .with_value(seconds_since_last_fill as f64)
+                .with_threshold(self.config.no_fill_warning_s as f64),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Alert that kill switch is armed (a monitor is at HIGH severity).
+    ///
+    /// # Arguments
+    ///
+    /// * `monitor_name` - Name of the monitor that is at HIGH
+    /// * `timestamp` - Current timestamp in milliseconds
+    pub fn check_kill_switch_armed(&self, monitor_name: &str, timestamp: u64) -> Option<Alert> {
+        if self.should_dedupe(AlertType::KillSwitchArmed, timestamp) {
+            return None;
+        }
+        self.record_alert_time(AlertType::KillSwitchArmed, timestamp);
+        Some(
+            Alert::new(
+                self.next_id(),
+                timestamp,
+                AlertType::KillSwitchArmed,
+                AlertSeverity::Critical,
+                format!("Kill switch armed: {monitor_name} at HIGH severity"),
+            ),
+        )
     }
 
     /// Create a manual alert.
@@ -616,7 +780,7 @@ fn format_timestamp_short(millis: u64) -> String {
     let hours = (secs / 3600) % 24;
     let mins = (secs / 60) % 60;
     let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", hours, mins, s)
+    format!("{hours:02}:{mins:02}:{s:02}")
 }
 
 #[cfg(test)]
@@ -1035,6 +1199,85 @@ mod tests {
 
         // Should have 100 alerts
         assert_eq!(alerter.count(), 100);
+    }
+
+    #[test]
+    fn test_check_spread_blowup() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        // Spread at 25 bps > 20 bps threshold
+        let alert = alerter.check_spread(25.0, ts);
+        assert!(alert.is_some());
+        let alert = alert.unwrap();
+        assert_eq!(alert.alert_type, AlertType::SpreadBlowup);
+        assert_eq!(alert.severity, AlertSeverity::Warning);
+    }
+
+    #[test]
+    fn test_check_spread_ok() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        // Spread at 10 bps < 20 bps threshold
+        let alert = alerter.check_spread(10.0, ts);
+        assert!(alert.is_none());
+    }
+
+    #[test]
+    fn test_check_inventory_imbalance() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        // 80% of max inventory
+        let alert = alerter.check_inventory(0.008, 0.01, ts);
+        assert!(alert.is_some());
+        let alert = alert.unwrap();
+        assert_eq!(alert.alert_type, AlertType::InventoryImbalance);
+    }
+
+    #[test]
+    fn test_check_inventory_ok() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        // 50% of max inventory - OK
+        let alert = alerter.check_inventory(0.005, 0.01, ts);
+        assert!(alert.is_none());
+    }
+
+    #[test]
+    fn test_check_signal_health() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        let alert = alerter.check_signal_health(0.03, "lead_lag", ts);
+        assert!(alert.is_some());
+        let alert = alert.unwrap();
+        assert_eq!(alert.alert_type, AlertType::SignalDecaying);
+    }
+
+    #[test]
+    fn test_check_no_fills() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        let alert = alerter.check_no_fills(310, ts);
+        assert!(alert.is_some());
+        let alert = alert.unwrap();
+        assert_eq!(alert.alert_type, AlertType::NoFills);
+    }
+
+    #[test]
+    fn test_check_kill_switch_armed() {
+        let alerter = Alerter::new(AlertConfig::default(), 100);
+        let ts = now();
+
+        let alert = alerter.check_kill_switch_armed("drawdown_monitor", ts);
+        assert!(alert.is_some());
+        let alert = alert.unwrap();
+        assert_eq!(alert.alert_type, AlertType::KillSwitchArmed);
+        assert_eq!(alert.severity, AlertSeverity::Critical);
     }
 
     #[test]

@@ -45,6 +45,7 @@ mod limits;
 mod monitor;
 pub mod monitors;
 mod position_guard;
+mod reentry;
 mod state;
 
 pub use aggregator::{AggregatedRisk, RiskAggregator};
@@ -58,4 +59,5 @@ pub use monitor::{RiskAction, RiskAssessment, RiskMonitor, RiskMonitorBox, RiskS
 pub use position_guard::{PositionGuard, PositionGuardConfig, PositionGuardSummary};
 // Note: Side enum is NOT re-exported to avoid conflict with tracking::Side
 // Use position_guard::Side explicitly if needed
+pub use reentry::{ReentryConfig, ReentryManager, ReentryPhase, ReentrySummary};
 pub use state::RiskState;

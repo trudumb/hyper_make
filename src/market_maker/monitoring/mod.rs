@@ -42,8 +42,12 @@
 
 mod alerter;
 mod dashboard;
+mod postmortem;
 
 pub use alerter::{
     Alert, AlertConfig, AlertHandler, AlertSeverity, AlertType, Alerter, LoggingAlertHandler,
 };
 pub use dashboard::{DashboardState, PositionSide};
+pub use postmortem::{
+    FillRecord, MarketSnapshot, PostMortemDump, RiskSnapshot, SignalSnapshot,
+};

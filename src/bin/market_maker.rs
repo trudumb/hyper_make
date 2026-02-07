@@ -93,9 +93,15 @@ struct Cli {
     #[arg(long)]
     max_bps_diff: Option<u16>,
 
-    /// Override max position size
+    /// Override max position size (in contracts)
     #[arg(long)]
     max_position: Option<f64>,
+
+    /// Max position size in notional USD (asset-agnostic, preferred over --max-position)
+    /// Converted to contracts at startup via: max_position = max_position_usd / mark_price
+    /// Example: 1000.0 → 0.01 BTC at $100K, 40.0 HYPE at $25
+    #[arg(long)]
+    max_position_usd: Option<f64>,
 
     /// Set leverage for the asset (default: max available)
     #[arg(long)]
@@ -420,11 +426,19 @@ pub struct TradingConfig {
     /// Maximum position in contracts (optional).
     /// If not specified, defaults to margin-based limit: (account_value × leverage × 0.5) / price
     /// This is capital-efficient: use gamma to control risk, not arbitrary position limits.
+    /// Prefer `max_position_usd` for asset-agnostic configuration.
     #[serde(
         default = "default_max_position",
         skip_serializing_if = "Option::is_none"
     )]
     pub max_absolute_position_size: Option<f64>,
+
+    /// Maximum position in notional USD (asset-agnostic, preferred).
+    /// Converted to contracts at startup: max_position = max_position_usd / mark_price.
+    /// Example: 1000.0 → 0.01 BTC at $100K, 40.0 HYPE at $25, 0.33 ETH at $3K.
+    /// Takes priority over `max_absolute_position_size` when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_position_usd: Option<f64>,
 
     /// Leverage to use (set on exchange at startup).
     /// Default: max available for the asset (from exchange metadata).
@@ -481,8 +495,9 @@ impl Default for TradingConfig {
             risk_aversion: default_risk_aversion(),
             max_bps_diff: default_max_bps_diff(),
             max_absolute_position_size: default_max_position(),
-            leverage: None, // Uses max available from asset metadata
-            decimals: None, // Auto-calculated from asset metadata
+            max_position_usd: None, // Not set by default (backward-compat)
+            leverage: None,         // Uses max available from asset metadata
+            decimals: None,         // Auto-calculated from asset metadata
         }
     }
 }
@@ -811,10 +826,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let risk_aversion = cli.risk_aversion.unwrap_or(config.trading.risk_aversion);
     let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
     // max_position is now optional - will default to margin-based limit later
-    // Priority: CLI arg > config file > margin-based default
-    let max_position_override: Option<f64> = cli
+    // Priority: CLI --max-position-usd > TOML max_position_usd > CLI --max-position > TOML max_absolute_position_size
+    // USD values are converted to contracts later when mark_px is known
+    let max_position_usd_override: Option<f64> = cli
+        .max_position_usd
+        .or(config.trading.max_position_usd);
+    let max_position_contracts_override: Option<f64> = cli
         .max_position
         .or(config.trading.max_absolute_position_size);
+    // Will be resolved after mark_px is known (USD→contracts conversion happens below)
+    let max_position_override: Option<f64> = if max_position_usd_override.is_some() {
+        None // Defer: USD will be converted to contracts once mark_px is available
+    } else {
+        max_position_contracts_override
+    };
 
     // Create HTTP client with proper timeouts to prevent 502 errors from stale connections
     // This client is shared across InfoClient and ExchangeClient for REST fallback
@@ -1184,10 +1209,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let safety_factor = 0.5; // Leave 50% margin buffer for adverse moves
                 let max_from_leverage = (account_value * leverage as f64 * safety_factor) / mark_px;
 
+                // Resolve USD→contracts now that mark_px is known
+                // Priority: --max-position-usd > TOML max_position_usd > --max-position > TOML max_absolute_position_size
+                let effective_override: Option<f64> = if let Some(usd_limit) = max_position_usd_override {
+                    let contracts = usd_limit / mark_px;
+                    info!(
+                        max_position_usd = %format!("{:.2}", usd_limit),
+                        mark_px = %format!("{:.2}", mark_px),
+                        derived_contracts = %format!("{:.6}", contracts),
+                        "USD position limit → contracts (asset-agnostic)"
+                    );
+                    Some(contracts)
+                } else {
+                    max_position_override
+                };
+
                 // Effective max_position:
                 // - If user specified: use min(user_value, margin_based) - user can only REDUCE
                 // - If not specified: use full margin capacity (capital-efficient default)
-                let capped_max_pos = match max_position_override {
+                let capped_max_pos = match effective_override {
                     Some(user_limit) => {
                         let capped = user_limit.min(max_from_leverage);
                         info!(
@@ -1302,6 +1342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         risk_aversion,
         max_bps_diff,
         max_position,
+        max_position_usd: max_position_usd_override.unwrap_or(0.0),
         decimals,
         sz_decimals,
         multi_asset: false, // Single-asset mode by default
@@ -1604,9 +1645,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let liquidation_config = LiquidationConfig::default();
 
     // Create kill switch config (production safety)
-    let kill_switch_config = KillSwitchConfig {
-        max_position_contracts: max_position, // Use the configured max_position for runaway detection
-        ..Default::default()
+    // When USD limit is set, use it directly for max_position_value (asset-agnostic)
+    let kill_switch_config = if let Some(usd_limit) = max_position_usd_override {
+        KillSwitchConfig {
+            max_position_contracts: max_position,
+            max_position_value: usd_limit,
+            ..Default::default()
+        }
+    } else {
+        KillSwitchConfig {
+            max_position_contracts: max_position,
+            ..Default::default()
+        }
     };
     info!(
         max_daily_loss = %kill_switch_config.max_daily_loss,

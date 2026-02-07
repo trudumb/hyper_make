@@ -63,7 +63,11 @@
       "Bash(git diff:*)",
       "Bash(git status:*)",
       "mcp__serena__find_file",
-      "mcp__serena__insert_before_symbol"
+      "mcp__serena__insert_before_symbol",
+      "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make log --oneline -5 -- .claude/skills/foundation/measurement-infrastructure/SKILL.md)",
+      "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make show HEAD:.claude/skills/foundation/measurement-infrastructure/SKILL.md)",
+      "Bash(git checkout:*)",
+      "Bash(git restore:*)"
     ]
   }
 }

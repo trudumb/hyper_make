@@ -47,138 +47,46 @@ Where H is entropy.
 
 ### Book-Derived Signals
 
-```rust
-struct BookSignals {
-    // Basic
-    spread_bps: f64,
-    mid_price: f64,
-    
-    // Imbalance
-    microprice_imbalance: f64,     // (bid_size - ask_size) / (bid_size + ask_size) at L1
-    book_imbalance_l5: f64,        // Same but integrated over top 5 levels
-    book_pressure: f64,            // Weighted depth asymmetry
-    
-    // Depth
-    depth_at_1bps: f64,
-    depth_at_5bps: f64,
-    depth_at_10bps: f64,
-    
-    // Shape
-    book_slope_bid: f64,           // How quickly depth increases away from mid
-    book_slope_ask: f64,
-}
-```
+- **Basic**: `spread_bps`, `mid_price`
+- **Imbalance**: `microprice_imbalance` (L1), `book_imbalance_l5` (top 5), `book_pressure` (weighted depth asymmetry)
+- **Depth**: `depth_at_1bps`, `depth_at_5bps`, `depth_at_10bps`
+- **Shape**: `book_slope_bid`, `book_slope_ask` (depth increase rate away from mid)
 
 ### Trade-Derived Signals
 
-```rust
-struct TradeSignals {
-    // Volume imbalance
-    trade_imbalance_1s: f64,       // Net signed volume last 1s
-    trade_imbalance_10s: f64,
-    trade_imbalance_60s: f64,
-    
-    // Intensity
-    trade_arrival_rate: f64,       // Trades per second
-    volume_rate: f64,              // Volume per second
-    
-    // Size distribution
-    avg_trade_size: f64,
-    trade_size_std: f64,
-    large_trade_count_1m: u32,     // Trades > 2σ from mean
-    
-    // Aggression
-    aggressor_imbalance: f64,      // (aggressive_buys - aggressive_sells) / total
-}
-```
+- **Volume imbalance**: `trade_imbalance_{1s,10s,60s}` (net signed volume)
+- **Intensity**: `trade_arrival_rate`, `volume_rate`
+- **Size distribution**: `avg_trade_size`, `trade_size_std`, `large_trade_count_1m` (> 2 sigma)
+- **Aggression**: `aggressor_imbalance`
 
 ### Hyperliquid-Specific Signals
 
-```rust
-struct HyperliquidSignals {
-    // Funding
-    funding_rate: f64,
-    funding_rate_change_1h: f64,
-    funding_rate_change_8h: f64,
-    predicted_funding_rate: f64,
-    time_to_funding_settlement_s: f64,
-    
-    // Open Interest
-    open_interest: f64,
-    open_interest_change_1m: f64,
-    open_interest_change_5m: f64,
-    open_interest_change_1h: f64,
-    oi_momentum: f64,              // Acceleration of OI change
-    
-    // Vault activity
-    hlp_vault_position: f64,       // If available
-}
-```
+- **Funding**: `funding_rate`, `funding_rate_change_{1h,8h}`, `predicted_funding_rate`, `time_to_funding_settlement_s`
+- **Open Interest**: `open_interest`, `open_interest_change_{1m,5m,1h}`, `oi_momentum`
+- **Vault**: `hlp_vault_position`
 
 ### Cross-Exchange Signals
 
-```rust
-struct CrossExchangeSignals {
-    // Binance
-    binance_mid: f64,
-    binance_spread_bps: f64,
-    binance_hl_basis_bps: f64,     // Binance mid - HL mid
-    
-    // Lead indicators
-    binance_return_100ms: f64,     // Binance price change last 100ms
-    binance_return_500ms: f64,
-    binance_return_1s: f64,
-    
-    // Volume ratio
-    binance_volume_ratio: f64,     // Binance volume / HL volume
-}
-```
+- **Binance**: `binance_mid`, `binance_spread_bps`, `binance_hl_basis_bps`
+- **Lead indicators**: `binance_return_{100ms,500ms,1s}`
+- **Volume ratio**: `binance_volume_ratio` (Binance / HL)
 
 ### Composite Signals
 
-```rust
-struct CompositeSignals {
-    // Interactions
-    funding_x_imbalance: f64,      // funding_rate * trade_imbalance
-    oi_x_funding: f64,             // OI change * funding rate
-    basis_x_imbalance: f64,        // Cross-exchange basis * book imbalance
-    
-    // Momentum
-    price_momentum_1m: f64,
-    price_momentum_5m: f64,
-    volume_momentum: f64,
-}
-```
+- **Interactions**: `funding_x_imbalance`, `oi_x_funding`, `basis_x_imbalance`
+- **Momentum**: `price_momentum_{1m,5m}`, `volume_momentum`
+
+See [implementation.md](./implementation.md) for full struct definitions.
 
 ---
 
 ## Prediction Targets
 
-```rust
-enum PredictionTarget {
-    // Direction
-    PriceDirection1s,     // sign(price[t+1s] - price[t])
-    PriceDirection10s,
-    PriceDirection60s,
-    
-    // Magnitude
-    AbsReturn1s,
-    AbsReturn10s,
-    Volatility1m,
-    
-    // Fill-related
-    FillWithin1s,
-    FillWithin10s,
-    TimeToNextFill,
-    
-    // Adverse selection
-    AdverseOnNextFill,    // Did price move against us?
-    InformedFlow,         // Was the trade informed?
-    
-    // Regime
-    RegimeTransition,     // Will regime change in next minute?
-}
-```
+- **Direction**: `PriceDirection{1s,10s,60s}` -- sign of future return
+- **Magnitude**: `AbsReturn{1s,10s}`, `Volatility1m`
+- **Fill-related**: `FillWithin{1s,10s}`, `TimeToNextFill`
+- **Adverse selection**: `AdverseOnNextFill`, `InformedFlow`
+- **Regime**: `RegimeTransition` (will regime change in next minute?)
 
 ---
 
@@ -186,329 +94,41 @@ enum PredictionTarget {
 
 ### k-NN Estimator (Kraskov et al.)
 
-For continuous variables, use the k-nearest-neighbor estimator:
-
-```rust
-use kdtree::KdTree;
-
-fn estimate_mutual_information(
-    x: &[f64],
-    y: &[f64],
-    k: usize,  // Typically 3-10
-) -> f64 {
-    let n = x.len();
-    assert_eq!(n, y.len());
-    
-    // Normalize to [0, 1] to handle different scales
-    let x_norm = normalize(x);
-    let y_norm = normalize(y);
-    
-    // Build k-d trees
-    let mut joint_tree = KdTree::new(2);
-    let mut x_tree = KdTree::new(1);
-    let mut y_tree = KdTree::new(1);
-    
-    for i in 0..n {
-        joint_tree.add(&[x_norm[i], y_norm[i]], i).unwrap();
-        x_tree.add(&[x_norm[i]], i).unwrap();
-        y_tree.add(&[y_norm[i]], i).unwrap();
-    }
-    
-    let mut mi_sum = 0.0;
-    
-    for i in 0..n {
-        // Find k-th nearest neighbor distance in joint space (Chebyshev/max norm)
-        let neighbors = joint_tree.nearest(&[x_norm[i], y_norm[i]], k + 1, &chebyshev_distance).unwrap();
-        let eps = neighbors.last().unwrap().0;  // Distance to k-th neighbor
-        
-        // Count points within eps in marginals
-        let n_x = count_within_chebyshev(&x_tree, x_norm[i], eps);
-        let n_y = count_within_chebyshev(&y_tree, y_norm[i], eps);
-        
-        mi_sum += digamma(k as f64) + digamma(n as f64) 
-                  - digamma(n_x as f64) - digamma(n_y as f64);
-    }
-    
-    (mi_sum / n as f64).max(0.0)  // MI is non-negative
-}
-
-fn digamma(x: f64) -> f64 {
-    if x < 6.0 {
-        digamma(x + 1.0) - 1.0 / x
-    } else {
-        x.ln() - 1.0 / (2.0 * x) - 1.0 / (12.0 * x.powi(2))
-    }
-}
-
-fn normalize(x: &[f64]) -> Vec<f64> {
-    let min = x.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let range = (max - min).max(1e-10);
-    x.iter().map(|&v| (v - min) / range).collect()
-}
-```
+For continuous variables, use the k-nearest-neighbor estimator (`estimate_mutual_information`). Normalizes inputs to [0,1], builds k-d trees in joint and marginal spaces, then computes MI via digamma functions on neighbor counts. Typical k = 3-10.
 
 ### For Binary Targets
 
-Use the simpler binned estimator:
+Use the simpler binned estimator (`estimate_mi_binary_target`). Bins the continuous variable, counts joint/marginal frequencies, and computes MI from the frequency table.
 
-```rust
-fn estimate_mi_binary_target(
-    x: &[f64],
-    y: &[bool],
-    num_bins: usize,
-) -> f64 {
-    let n = x.len() as f64;
-    
-    // Bin the continuous variable
-    let x_min = x.iter().cloned().fold(f64::INFINITY, f64::min);
-    let x_max = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let bin_width = (x_max - x_min) / num_bins as f64;
-    
-    // Count joint and marginal frequencies
-    let mut joint_counts = vec![[0usize; 2]; num_bins];  // [bin][outcome]
-    let mut x_counts = vec![0usize; num_bins];
-    let mut y_counts = [0usize; 2];
-    
-    for (&xi, &yi) in x.iter().zip(y.iter()) {
-        let bin = ((xi - x_min) / bin_width).floor() as usize;
-        let bin = bin.min(num_bins - 1);
-        let yi = if yi { 1 } else { 0 };
-        
-        joint_counts[bin][yi] += 1;
-        x_counts[bin] += 1;
-        y_counts[yi] += 1;
-    }
-    
-    // Compute MI
-    let mut mi = 0.0;
-    for bin in 0..num_bins {
-        for outcome in 0..2 {
-            let p_xy = joint_counts[bin][outcome] as f64 / n;
-            let p_x = x_counts[bin] as f64 / n;
-            let p_y = y_counts[outcome] as f64 / n;
-            
-            if p_xy > 0.0 && p_x > 0.0 && p_y > 0.0 {
-                mi += p_xy * (p_xy / (p_x * p_y)).ln();
-            }
-        }
-    }
-    
-    mi.max(0.0)
-}
-```
+See [implementation.md](./implementation.md) for full code of both estimators.
 
 ---
 
 ## Signal Analysis Framework
 
-```rust
-struct SignalAnalysisResult {
-    signal_name: String,
-    target_name: String,
-    
-    // Information content
-    mutual_information_bits: f64,
-    mutual_information_normalized: f64,  // MI / H(Y), fraction of target entropy explained
-    
-    // Linear relationship (for comparison)
-    correlation: f64,
-    correlation_abs: f64,
-    
-    // Predictive power (if target is binary)
-    auc_roc: Option<f64>,
-    
-    // Lag analysis
-    optimal_lag_ms: i64,
-    mi_at_optimal_lag: f64,
-    
-    // Regime dependence
-    mi_by_regime: HashMap<String, f64>,
-    regime_variance_ratio: f64,  // max(MI) / min(MI) across regimes
-    
-    // Stationarity
-    mi_trend_30d: f64,  // Is MI increasing or decreasing over time?
-}
+`SignalAnalysisResult` captures per-signal metrics:
 
-fn analyze_signal(
-    signal_name: &str,
-    signal_values: &[f64],
-    target_name: &str,
-    target_values: &[f64],  // or &[bool] for binary
-    timestamps: &[u64],
-    regimes: &[String],
-) -> SignalAnalysisResult {
-    // Basic MI
-    let mi = estimate_mutual_information(signal_values, target_values, 5);
-    
-    // Correlation
-    let corr = pearson_correlation(signal_values, target_values);
-    
-    // Lag analysis
-    let (optimal_lag, mi_at_lag) = find_optimal_lag(signal_values, target_values, timestamps);
-    
-    // MI by regime
-    let mut mi_by_regime = HashMap::new();
-    let unique_regimes: HashSet<_> = regimes.iter().collect();
-    
-    for regime in unique_regimes {
-        let mask: Vec<bool> = regimes.iter().map(|r| r == regime).collect();
-        let filtered_signal: Vec<f64> = signal_values.iter()
-            .zip(&mask)
-            .filter(|(_, &m)| m)
-            .map(|(s, _)| *s)
-            .collect();
-        let filtered_target: Vec<f64> = target_values.iter()
-            .zip(&mask)
-            .filter(|(_, &m)| m)
-            .map(|(t, _)| *t)
-            .collect();
-        
-        if filtered_signal.len() >= 100 {
-            let regime_mi = estimate_mutual_information(&filtered_signal, &filtered_target, 5);
-            mi_by_regime.insert(regime.clone(), regime_mi);
-        }
-    }
-    
-    // Regime variance
-    let mi_values: Vec<f64> = mi_by_regime.values().cloned().collect();
-    let regime_variance_ratio = if mi_values.len() >= 2 {
-        let max_mi = mi_values.iter().cloned().fold(0.0, f64::max);
-        let min_mi = mi_values.iter().cloned().fold(f64::INFINITY, f64::min);
-        max_mi / min_mi.max(0.001)
-    } else {
-        1.0
-    };
-    
-    // Target entropy (for normalization)
-    let target_entropy = compute_entropy(target_values);
-    
-    SignalAnalysisResult {
-        signal_name: signal_name.to_string(),
-        target_name: target_name.to_string(),
-        mutual_information_bits: mi,
-        mutual_information_normalized: mi / target_entropy.max(0.001),
-        correlation: corr,
-        correlation_abs: corr.abs(),
-        auc_roc: None,  // Compute separately if needed
-        optimal_lag_ms: optimal_lag,
-        mi_at_optimal_lag: mi_at_lag,
-        mi_by_regime,
-        regime_variance_ratio,
-        mi_trend_30d: 0.0,  // Compute from historical data
-    }
-}
+| Field | Description |
+|-------|-------------|
+| `mutual_information_bits` | Raw MI in bits |
+| `mutual_information_normalized` | MI / H(Y), fraction of target entropy explained |
+| `correlation`, `correlation_abs` | Linear relationship (for comparison) |
+| `auc_roc` | ROC AUC for binary targets |
+| `optimal_lag_ms`, `mi_at_optimal_lag` | Best lag and MI at that lag |
+| `mi_by_regime`, `regime_variance_ratio` | Per-regime MI and max/min ratio |
+| `mi_trend_30d` | Stationarity trend |
 
-fn find_optimal_lag(
-    signal: &[f64],
-    target: &[f64],
-    timestamps: &[u64],
-) -> (i64, f64) {
-    let candidate_lags: Vec<i64> = vec![-500, -200, -100, -50, 0, 50, 100, 200, 500];
-    
-    let mut best_lag = 0i64;
-    let mut best_mi = 0.0;
-    
-    for &lag_ms in &candidate_lags {
-        let aligned = align_with_lag(signal, target, timestamps, lag_ms);
-        if aligned.0.len() < 100 { continue; }
-        
-        let mi = estimate_mutual_information(&aligned.0, &aligned.1, 5);
-        if mi > best_mi {
-            best_mi = mi;
-            best_lag = lag_ms;
-        }
-    }
-    
-    (best_lag, best_mi)
-}
-```
+`analyze_signal()` computes MI, correlation, optimal lag (candidate lags: -500ms to +500ms), and per-regime MI (min 100 samples per regime). `find_optimal_lag()` sweeps candidate lags and returns the one with highest MI.
+
+See [implementation.md](./implementation.md) for full code.
 
 ---
 
 ## Signal Audit Report
 
-```rust
-fn generate_signal_audit_report(
-    signals: &HashMap<String, Vec<f64>>,
-    target_name: &str,
-    target: &[f64],
-    timestamps: &[u64],
-    regimes: &[String],
-) -> String {
-    let mut results: Vec<SignalAnalysisResult> = Vec::new();
-    
-    for (name, values) in signals {
-        let result = analyze_signal(name, values, target_name, target, timestamps, regimes);
-        results.push(result);
-    }
-    
-    // Sort by MI descending
-    results.sort_by(|a, b| b.mutual_information_bits.partial_cmp(&a.mutual_information_bits).unwrap());
-    
-    let mut report = format!("=== Signal Audit Report ===\nTarget: {}\n\n", target_name);
-    
-    report.push_str("Signal                      MI (bits)  Corr    Opt Lag   Regime Var\n");
-    report.push_str("─────────────────────────────────────────────────────────────────────\n");
-    
-    for result in &results {
-        report.push_str(&format!(
-            "{:<26} {:.4}     {:.2}    {:>5}ms    {:.1}x\n",
-            result.signal_name,
-            result.mutual_information_bits,
-            result.correlation,
-            result.optimal_lag_ms,
-            result.regime_variance_ratio,
-        ));
-    }
-    
-    // Actionable insights
-    report.push_str("\nACTIONABLE INSIGHTS:\n");
-    
-    // Highest unused signal
-    if let Some(top) = results.first() {
-        report.push_str(&format!(
-            "1. {} has highest MI ({:.4} bits) - prioritize if not already used\n",
-            top.signal_name, top.mutual_information_bits
-        ));
-    }
-    
-    // Regime-conditional signals
-    for result in &results {
-        if result.regime_variance_ratio > 2.0 {
-            report.push_str(&format!(
-                "2. {} has {:.1}x higher MI in some regimes - consider regime conditioning\n",
-                result.signal_name, result.regime_variance_ratio
-            ));
-            break;
-        }
-    }
-    
-    // Lagged signals
-    for result in &results {
-        if result.optimal_lag_ms != 0 && result.mi_at_optimal_lag > result.mutual_information_bits * 1.2 {
-            report.push_str(&format!(
-                "3. {} has 20%+ more MI at {}ms lag - incorporate lag in feature\n",
-                result.signal_name, result.optimal_lag_ms
-            ));
-            break;
-        }
-    }
-    
-    // Correlated but low MI (non-linear relationship)
-    for result in &results {
-        if result.correlation_abs > 0.3 && result.mutual_information_bits < 0.01 {
-            report.push_str(&format!(
-                "4. {} has high correlation but low MI - relationship may be noisy or spurious\n",
-                result.signal_name
-            ));
-            break;
-        }
-    }
-    
-    report
-}
-```
+`generate_signal_audit_report()` analyzes all signals against a target, sorts by MI descending, and produces a table with actionable insights. The report flags: (1) highest-MI signal, (2) regime-conditional signals (variance ratio > 2x), (3) signals with 20%+ more MI at a lag, (4) high-correlation but low-MI signals (possibly spurious).
+
+See [implementation.md](./implementation.md) for full code.
 
 ### Example Report Output
 
@@ -536,42 +156,18 @@ ACTIONABLE INSIGHTS:
 
 ## Signal Quality Thresholds
 
-```rust
-struct SignalQualityThresholds {
-    // Minimum MI to include in model
-    min_mi_bits: f64,           // 0.01 typical
-    
-    // Minimum samples for reliable estimate
-    min_samples: usize,         // 1000 typical
-    
-    // Maximum regime variance before requiring conditioning
-    max_regime_variance: f64,   // 3.0 typical
-    
-    // Minimum correlation for sanity check
-    min_correlation: f64,       // 0.05 typical
-}
+Typical thresholds:
 
-fn filter_signals(
-    results: &[SignalAnalysisResult],
-    thresholds: &SignalQualityThresholds,
-) -> Vec<&SignalAnalysisResult> {
-    results.iter()
-        .filter(|r| {
-            r.mutual_information_bits >= thresholds.min_mi_bits
-            && r.correlation_abs >= thresholds.min_correlation
-        })
-        .collect()
-}
+| Parameter | Typical Value | Purpose |
+|-----------|--------------|---------|
+| `min_mi_bits` | 0.01 | Minimum MI to include in model |
+| `min_samples` | 1000 | Minimum samples for reliable MI estimate |
+| `max_regime_variance` | 3.0 | Above this, require regime conditioning |
+| `min_correlation` | 0.05 | Sanity check floor |
 
-fn flag_regime_conditional(
-    results: &[SignalAnalysisResult],
-    thresholds: &SignalQualityThresholds,
-) -> Vec<&SignalAnalysisResult> {
-    results.iter()
-        .filter(|r| r.regime_variance_ratio > thresholds.max_regime_variance)
-        .collect()
-}
-```
+`filter_signals()` keeps signals above MI and correlation thresholds. `flag_regime_conditional()` flags signals with regime variance ratio above threshold.
+
+See [implementation.md](./implementation.md) for full code.
 
 ---
 
@@ -582,52 +178,13 @@ Signals lose value over time as:
 - Market structure changes
 - Regime shifts
 
-Track MI over rolling windows:
+`compute_signal_decay()` fits a linear regression on historical MI values over time and computes a half-life (days until MI drops 50%). Action thresholds:
 
-```rust
-fn compute_signal_decay(
-    signal_name: &str,
-    historical_mis: &[(NaiveDate, f64)],  // (date, MI) pairs
-) -> SignalDecayReport {
-    // Linear regression on MI over time
-    let n = historical_mis.len() as f64;
-    let x: Vec<f64> = (0..historical_mis.len()).map(|i| i as f64).collect();
-    let y: Vec<f64> = historical_mis.iter().map(|(_, mi)| *mi).collect();
-    
-    let x_mean = x.iter().sum::<f64>() / n;
-    let y_mean = y.iter().sum::<f64>() / n;
-    
-    let slope = x.iter().zip(&y)
-        .map(|(xi, yi)| (xi - x_mean) * (yi - y_mean))
-        .sum::<f64>()
-        / x.iter().map(|xi| (xi - x_mean).powi(2)).sum::<f64>();
-    
-    // Half-life: how long until MI drops by 50%?
-    let current_mi = y.last().unwrap();
-    let half_life_days = if slope < 0.0 {
-        (current_mi * 0.5) / (-slope)
-    } else {
-        f64::INFINITY  // MI is increasing or stable
-    };
-    
-    SignalDecayReport {
-        signal_name: signal_name.to_string(),
-        current_mi: *current_mi,
-        mi_30d_ago: historical_mis.get(historical_mis.len().saturating_sub(30))
-            .map(|(_, mi)| *mi)
-            .unwrap_or(*current_mi),
-        trend_per_day: slope,
-        half_life_days,
-        action: if half_life_days < 30.0 {
-            "URGENT: Signal decaying rapidly. Investigate or replace.".to_string()
-        } else if half_life_days < 90.0 {
-            "WARNING: Signal decaying. Monitor closely.".to_string()
-        } else {
-            "OK: Signal stable.".to_string()
-        },
-    }
-}
-```
+- **< 30 days**: URGENT -- signal decaying rapidly, investigate or replace
+- **< 90 days**: WARNING -- monitor closely
+- **>= 90 days**: OK -- signal stable
+
+See [implementation.md](./implementation.md) for full code.
 
 ---
 
@@ -652,3 +209,7 @@ After signal audit:
 3. Incorporate optimal lags into feature engineering
 4. Read the relevant model skill to build the predictor
 5. Set up decay tracking for production monitoring
+
+## Supporting Files
+
+- [implementation.md](./implementation.md) -- All Rust code: signal structs, MI estimators, analysis framework, report generation, quality thresholds, decay tracking

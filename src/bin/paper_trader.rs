@@ -201,6 +201,12 @@ struct Cli {
     /// Minimum order notional in USD
     #[arg(long, default_value_t = 10.0)]
     min_notional: f64,
+
+    /// Max position size in notional USD (asset-agnostic).
+    /// Converted to contracts on first valid mid price: max_position = max_position_usd / mid_price.
+    /// Default: $1,000.
+    #[arg(long, default_value_t = 1000.0)]
+    max_position_usd: f64,
 }
 
 // ============================================================================
@@ -310,6 +316,8 @@ struct SimulationConfig {
     quote_lifetime_s: f64,
     min_notional: f64,
     paper_mode: bool,
+    /// Max position in notional USD (converted to contracts on first valid mid)
+    max_position_usd: f64,
 }
 
 /// Pending fill for adverse selection outcome tracking
@@ -351,6 +359,10 @@ struct SimulationState {
 
     /// Configuration
     max_position: f64,
+    /// Max position in notional USD (source-of-truth, asset-agnostic)
+    max_position_usd: f64,
+    /// Whether max_position has been derived from USD (on first valid mid)
+    max_position_usd_resolved: bool,
     target_liquidity: f64,
     /// Price decimals (BTC=1, ETH=2, etc.)
     decimals: u32,
@@ -431,6 +443,7 @@ impl SimulationState {
             quote_lifetime_s,
             min_notional,
             paper_mode,
+            max_position_usd,
         } = config;
 
         // Paper mode: use competitive gamma for tighter theoretical spreads.
@@ -515,7 +528,9 @@ impl SimulationState {
             inventory: 0.0,
             cycle_count: 0,
             gamma: effective_gamma,
-            max_position: 1.0,
+            max_position: 1.0, // Placeholder; resolved from max_position_usd on first valid mid
+            max_position_usd,
+            max_position_usd_resolved: false,
             target_liquidity,
             decimals,
             sz_decimals,
@@ -580,6 +595,18 @@ impl SimulationState {
         if mid > 0.0 {
             self.prev_mid = self.mid_price;
             self.mid_price = mid;
+
+            // Resolve USD→contracts on first valid mid price
+            if !self.max_position_usd_resolved && self.max_position_usd > 0.0 {
+                self.max_position = self.max_position_usd / mid;
+                self.max_position_usd_resolved = true;
+                info!(
+                    max_position_usd = %format!("{:.2}", self.max_position_usd),
+                    mid_price = %format!("{:.2}", mid),
+                    max_position_contracts = %format!("{:.6}", self.max_position),
+                    "Resolved USD position limit → contracts"
+                );
+            }
 
             // Check pending fill outcomes for adverse selection learning
             self.check_adverse_selection_outcomes();
@@ -956,7 +983,7 @@ impl SimulationState {
         // Simulate margin state: assume enough capital for max_position at current leverage
         // Live system gets this from WebData2 clearinghouse_state; paper trader must synthesize it.
         {
-            let sim_account_value = self.max_position * self.mid_price; // Enough to fully utilize
+            let sim_account_value = self.max_position_usd; // Account value ≈ max notional
             let position_notional = self.inventory.abs() * self.mid_price;
             let margin_used = position_notional / 3.0; // ~3x leverage
             self.margin_sizer.update_state(sim_account_value, margin_used, position_notional);
@@ -989,7 +1016,7 @@ impl SimulationState {
             exchange_limits_age_ms: 0,
             pending_bid_exposure: 0.0,
             pending_ask_exposure: 0.0,
-            dynamic_max_position_value: self.max_position * self.mid_price,
+            dynamic_max_position_value: self.max_position_usd,
             dynamic_limit_valid: false,
             tick_size_bps: 10.0,
             near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
@@ -1582,6 +1609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quote_lifetime_s: cli.quote_lifetime_s,
         min_notional: cli.min_notional,
         paper_mode: cli.paper_mode,
+        max_position_usd: cli.max_position_usd,
     });
 
     // Restore from checkpoint if enabled
@@ -2034,7 +2062,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.inventory,
                         state.max_position,
                         state.mid_price,
-                        state.max_position * state.mid_price,
+                        state.max_position_usd, // USD-based position limit (asset-agnostic)
                         10_000.0, // paper account value
                         state.estimator.sigma_clean(),
                         state.liquidation_detector.cascade_severity(),

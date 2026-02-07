@@ -36,17 +36,20 @@ IMPORTANT: After any code change, run `cargo clippy -- -D warnings` and fix all 
 
 ## Skill System
 
-Domain knowledge lives in `.claude/skills/`, not here. Skills are loaded on demand — read them when relevant to the task.
+Domain knowledge lives in `.claude/skills/`, not here. Skills are loaded on demand — read them when relevant to the task. Workflow skills (`/debug-pnl`, `/add-signal`, `/paper-trading`) run as forked subagents.
 
-| Task | Read these skills (in order) |
-|------|------------------------------|
+| Task | Skills / Workflows |
+|------|-------------------|
 | Any model work | `measurement-infrastructure` FIRST, always |
-| Debug PnL issue | `calibration-analysis` → weak component's skill |
-| Add new signal | `signal-audit` → `measurement-infrastructure` |
-| Improve fill prediction | `measurement-infrastructure` → `signal-audit` → `fill-intensity-hawkes` |
-| Losing money in cascades | `adverse-selection-classifier`, `regime-detection-hmm` |
+| Debug PnL issue | `/debug-pnl` workflow, or: `calibration-analysis` → component skill |
+| Add new signal | `/add-signal` workflow, or: `signal-audit` → `measurement-infrastructure` |
+| Improve fill prediction | `fill-intensity-hawkes` → `signal-audit` |
+| Losing money in cascades | `adverse-selection-classifier` + `regime-detection-hmm` + `risk-management` |
 | Cross-exchange edge decay | `lead-lag-estimator` |
-| Wire up new component | `quote-engine` |
+| Wire up component | `quote-engine` + `infrastructure-ops` |
+| Risk/safety changes | `risk-management` |
+| Controller/decision logic | `stochastic-controller` |
+| Paper trading issues | `/paper-trading` workflow |
 
 ---
 
@@ -158,12 +161,20 @@ Review checklist for this project:
 
 ## Agent Teams
 
-Teams are enabled. Key rules:
+Agent teams enabled via `.claude/settings.json`. Custom agents in `.claude/agents/` encode domain ownership, preloaded skills, review checklists, and coordination rules. Use teams for parallel work on independent modules; use subagents for sequential tasks or same-file edits.
 
-1. **File ownership** — each teammate owns distinct files; no two teammates edit the same file
-2. **Plan approval required** for changes to: `src/quote_engine/`, `src/risk/`, `src/exchange/`
-3. **Teammates must NOT run binaries** — they produce code; user executes manually
-4. **Defense-first applies to teams** — push back on aggressive parameter changes
+**Agents:** `signals`, `strategy`, `infra` (plan mode), `risk` (plan mode), `analytics`
+
+**Compositions:** full-feature (5: all agents), model-improvement (3: signals, strategy, analytics), bug-investigation (3+: hypothesis testing), code-review (3: security, performance, coverage)
+
+**Key rules:**
+- File ownership is exclusive — no two teammates edit the same file
+- `signal_integration.rs` is strategy-only; `mod.rs` re-exports are lead-only
+- Plan approval required for `orchestrator/`, `risk/`, `safety/`, `exchange/`, `src/bin/`
+- All teammates run clippy, no hardcoded params, `#[serde(default)]` on checkpoint fields
+- Teammates must NOT run binaries — user executes manually
+
+The lead owns: `src/market_maker/mod.rs`, `config/`, `belief/`, `multi/`, `latent/`, `src/bin/`, `src/exchange/`, `src/ws/`, `src/info/`, `src/lib.rs`, `.claude/`, `Cargo.toml`
 
 ---
 

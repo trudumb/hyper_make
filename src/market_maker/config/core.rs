@@ -42,8 +42,12 @@ pub struct MarketMakerConfig {
     pub risk_aversion: f64,
     /// Max deviation before requoting (in BPS)
     pub max_bps_diff: u16,
-    /// Maximum absolute position size
+    /// Maximum absolute position size (in contracts, derived at startup)
     pub max_position: f64,
+    /// Maximum position in notional USD (source-of-truth when set).
+    /// Contracts value (`max_position`) is derived from this at startup.
+    /// When zero, the system was configured via contracts directly (backward-compat).
+    pub max_position_usd: f64,
     /// Decimals for price rounding
     pub decimals: u32,
     /// Decimals for size rounding (from asset metadata)
