@@ -301,6 +301,13 @@ impl ParameterAggregator {
                 sources.latest_mid,
                 3600.0, // 1 hour holding period
             ),
+            time_to_funding_settlement_s: sources
+                .funding
+                .time_to_next_funding()
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(28800.0), // Default 8 hours if unknown
+            open_interest: 0.0,   // Set by orchestrator from exchange data
+            oi_change_1m: 0.0,    // Set by orchestrator from OI history
             premium: sources.funding.current_premium(),
             premium_alpha: sources.funding.premium_alpha(),
 

@@ -305,6 +305,18 @@ pub struct MarketParams {
     /// Predicted funding cost for holding period
     pub predicted_funding_cost: f64,
 
+    /// Time to next funding settlement in seconds.
+    /// Used by prediction logging for conditional calibration analysis.
+    pub time_to_funding_settlement_s: f64,
+
+    /// Current open interest (contracts or USD depending on exchange).
+    /// Used for concentration risk checks and cascade detection.
+    pub open_interest: f64,
+
+    /// Open interest change over last 1 minute (fraction).
+    /// Negative values signal potential liquidation cascades.
+    pub oi_change_1m: f64,
+
     // === Tier 2: Spread Process ===
     /// Fair spread from vol-adjusted model
     pub fair_spread: f64,
@@ -899,6 +911,9 @@ impl Default for MarketParams {
             // Tier 2: Funding Rate
             funding_rate: 0.0,
             predicted_funding_cost: 0.0,
+            time_to_funding_settlement_s: 28800.0, // 8 hours in seconds (unknown)
+            open_interest: 0.0,                     // Will be set from exchange data
+            oi_change_1m: 0.0,                      // Will be computed from OI history
             // Tier 2: Spread Process
             fair_spread: 0.0,
             spread_percentile: 0.5,

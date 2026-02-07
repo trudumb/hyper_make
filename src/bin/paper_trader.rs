@@ -84,6 +84,8 @@ use hyperliquid_rust_sdk::market_maker::{
     PositionDecisionConfig, PositionDecisionEngine, action_to_inventory_ratio,
 };
 use hyperliquid_rust_sdk::market_maker::belief::{BeliefUpdate, CentralBeliefState};
+use hyperliquid_rust_sdk::market_maker::risk::{RiskState, RiskAggregator, RiskSeverity};
+use hyperliquid_rust_sdk::market_maker::risk::monitors::*;
 use hyperliquid_rust_sdk::market_maker::checkpoint::{
     CheckpointBundle, CheckpointManager, CheckpointMetadata,
 };
@@ -107,7 +109,7 @@ struct Cli {
     asset: String,
 
     /// Duration to run simulation in seconds
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "300")]
     duration: u64,
 
     /// Network (mainnet, testnet)
@@ -173,6 +175,10 @@ struct Cli {
     /// Disable checkpoint persistence
     #[arg(long)]
     disable_checkpoint: bool,
+
+    /// Maximum checkpoint age in hours before skipping restore
+    #[arg(long, default_value = "4")]
+    max_checkpoint_age_hours: f64,
 }
 
 // ============================================================================
@@ -1283,6 +1289,27 @@ fn create_market_trade(
 }
 
 // ============================================================================
+// Risk Aggregator for Paper Trading
+// ============================================================================
+
+fn build_paper_risk_aggregator() -> RiskAggregator {
+    let max_daily_loss = 500.0; // USD
+    let max_drawdown_frac = 0.05; // 5%
+    let stale_data_threshold = Duration::from_secs(30);
+    let cascade_pull = 0.8;
+    let cascade_kill = 0.95;
+    let max_rate_limit_errors = 3;
+
+    RiskAggregator::new()
+        .with_monitor(Box::new(LossMonitor::new(max_daily_loss)))
+        .with_monitor(Box::new(DrawdownMonitor::new(max_drawdown_frac)))
+        .with_monitor(Box::new(PositionMonitor::new()))
+        .with_monitor(Box::new(DataStalenessMonitor::new(stale_data_threshold)))
+        .with_monitor(Box::new(CascadeMonitor::new(cascade_pull, cascade_kill)))
+        .with_monitor(Box::new(RateLimitMonitor::new(max_rate_limit_errors)))
+}
+
+// ============================================================================
 // Main Simulation Loop
 // ============================================================================
 
@@ -1355,20 +1382,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(mgr) => {
                 match mgr.load_latest() {
                     Ok(Some(bundle)) => {
-                        if bundle.metadata.asset == cli.asset {
-                            state.restore_from_bundle(&bundle);
-                            info!(
-                                asset = %bundle.metadata.asset,
-                                samples = bundle.pre_fill.learning_samples,
-                                session_s = bundle.metadata.session_duration_s,
-                                "Restored from checkpoint"
-                            );
-                        } else {
+                        if bundle.metadata.asset != cli.asset {
                             warn!(
                                 checkpoint_asset = %bundle.metadata.asset,
                                 our_asset = %cli.asset,
                                 "Checkpoint asset mismatch, starting fresh"
                             );
+                        } else {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let checkpoint_age_hours = (now_ms.saturating_sub(bundle.metadata.timestamp_ms)) as f64 / (3600.0 * 1000.0);
+                            if checkpoint_age_hours > cli.max_checkpoint_age_hours {
+                                warn!(
+                                    "Checkpoint is {:.1} hours old (max: {}h), skipping restore",
+                                    checkpoint_age_hours, cli.max_checkpoint_age_hours
+                                );
+                            } else {
+                                state.restore_from_bundle(&bundle);
+                                info!(
+                                    asset = %bundle.metadata.asset,
+                                    samples = bundle.pre_fill.learning_samples,
+                                    session_s = bundle.metadata.session_duration_s,
+                                    age_hours = checkpoint_age_hours,
+                                    "Restored from checkpoint"
+                                );
+                            }
                         }
                     }
                     Ok(None) => info!("No checkpoint found, starting fresh"),
@@ -1434,6 +1474,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let duration = Duration::from_secs(cli.duration);
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Risk aggregator for paper trading
+    let risk_aggregator = build_paper_risk_aggregator();
+    let mut peak_pnl: f64 = 0.0;
+    let mut last_risk_log = Instant::now();
 
     // Ctrl+C handler
     let shutdown_clone = shutdown.clone();
@@ -1538,15 +1583,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_data_received = Instant::now();
     let stale_data_threshold = Duration::from_secs(30);
     let mut stale_warning_logged = false;
+    let mut data_stale = false;
 
     while !shutdown.load(Ordering::SeqCst) && start_time.elapsed() < duration {
         tokio::select! {
             Some(msg) = rx.recv() => {
                 // Reset watchdog on any message
                 last_data_received = Instant::now();
-                if stale_warning_logged {
+                if stale_warning_logged || data_stale {
                     info!("Market data stream recovered");
                     stale_warning_logged = false;
+                    data_stale = false;
                 }
 
                 match msg {
@@ -1653,20 +1700,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
                 // Watchdog: check for stale market data
-                if last_data_received.elapsed() > stale_data_threshold && !stale_warning_logged {
+                if last_data_received.elapsed() > stale_data_threshold && !data_stale {
                     warn!(
-                        "No market data received for {:?}. WebSocket subscriptions may have disconnected.",
+                        "No market data received for {:?}. Cancelling all orders and pausing quotes.",
                         last_data_received.elapsed()
                     );
                     stale_warning_logged = true;
+                    data_stale = true;
+                    // Cancel all active orders defensively
+                    let active = executor.get_active_orders();
+                    for order in &active {
+                        executor.cancel_order(&cli.asset, order.oid).await;
+                    }
                 }
 
-                // Generate quotes on interval
-                if last_quote_time.elapsed() >= quote_interval {
+                // Generate quotes on interval (skip if data is stale)
+                if data_stale {
+                    // Skip quoting entirely while data is stale
+                } else if last_quote_time.elapsed() >= quote_interval {
                     last_quote_time = Instant::now();
 
                     // Periodic signal health check
                     state.log_signal_health();
+
+                    // Risk evaluation before quote generation
+                    peak_pnl = peak_pnl.max(cumulative_pnl);
+                    let risk_state = RiskState::new(
+                        cumulative_pnl,
+                        peak_pnl,
+                        state.inventory,
+                        state.max_position,
+                        state.mid_price,
+                        state.max_position * state.mid_price,
+                        10_000.0, // paper account value
+                        state.estimator.sigma_clean(),
+                        state.liquidation_detector.cascade_severity(),
+                        last_data_received,
+                    );
+                    let risk = risk_aggregator.evaluate(&risk_state);
+
+                    if risk.should_kill() {
+                        warn!("[RISK] Kill switch triggered: {:?}", risk.kill_reasons);
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    if risk.pull_quotes {
+                        warn!("[RISK] Pulling all quotes: {}", risk.summary());
+                        continue;
+                    }
+                    if last_risk_log.elapsed() > Duration::from_secs(10) || risk.max_severity >= RiskSeverity::High {
+                        info!("[RISK] {}", risk.summary());
+                        last_risk_log = Instant::now();
+                    }
 
                     if let Some(ladder) = state.generate_quotes() {
                         stats.quote_cycles += 1;

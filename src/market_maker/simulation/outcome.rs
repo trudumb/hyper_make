@@ -119,6 +119,9 @@ pub struct OutcomeTracker {
 
     /// Maker fee rate
     maker_fee_rate: f64,
+
+    /// Last known mid price (for inventory cost computation)
+    last_mid: f64,
 }
 
 impl OutcomeTracker {
@@ -137,6 +140,7 @@ impl OutcomeTracker {
             simulated_inventory: 0.0,
             avg_entry_price: 0.0,
             maker_fee_rate,
+            last_mid: 0.0,
         }
     }
 
@@ -179,6 +183,8 @@ impl OutcomeTracker {
 
     /// Update with new price data
     pub fn on_price_update(&mut self, mid: f64, timestamp_ns: u64) {
+        self.last_mid = mid;
+
         // Update price tracking for pending fills
         for tracked in self.pending_fills.iter_mut() {
             let age_ns = timestamp_ns.saturating_sub(tracked.fill.timestamp_ns);
@@ -203,22 +209,24 @@ impl OutcomeTracker {
 
     /// Process fills that have all price data
     fn process_completed_fills(&mut self) {
+        let current_mid = self.last_mid;
         while let Some(tracked) = self.pending_fills.front() {
             if tracked.mid_10s_later.is_none() {
                 break;
             }
 
             let tracked = self.pending_fills.pop_front().unwrap();
-            let decomp = self.compute_fill_decomposition(&tracked);
+            let decomp = self.compute_fill_decomposition(&tracked, current_mid);
 
             self.total_spread_capture += decomp.spread_capture;
             self.total_adverse_selection += decomp.adverse_selection;
+            self.total_inventory_cost += decomp.inventory_cost;
             self.total_fee_cost += decomp.fee_cost;
         }
     }
 
     /// Compute PnL decomposition for a single fill
-    fn compute_fill_decomposition(&self, tracked: &TrackedFill) -> PnLDecomposition {
+    fn compute_fill_decomposition(&self, tracked: &TrackedFill, current_mid: f64) -> PnLDecomposition {
         let fill = &tracked.fill;
         let notional = fill.fill_price * fill.fill_size;
 
@@ -234,25 +242,28 @@ impl OutcomeTracker {
 
         let adverse_selection = match fill.side {
             Side::Buy => {
-                // Bought, price dropped = adverse
-                (-price_move).min(0.0) * fill.fill_size
+                // Bought, price dropped = adverse (price_move negative → adverse_selection negative)
+                price_move.min(0.0) * fill.fill_size
             }
             Side::Sell => {
-                // Sold, price rose = adverse
-                price_move.min(0.0) * fill.fill_size
+                // Sold, price rose = adverse (price_move positive → -price_move negative)
+                (-price_move).min(0.0) * fill.fill_size
             }
         };
 
         // Fee cost
         let fee_cost = notional * self.maker_fee_rate;
 
-        let gross_pnl = spread_capture + adverse_selection - fee_cost;
+        // Inventory cost: mark-to-market on current position
+        let inventory_cost = self.compute_inventory_mtm(current_mid);
+
+        let gross_pnl = spread_capture + adverse_selection + inventory_cost - fee_cost;
 
         PnLDecomposition {
             gross_pnl,
             spread_capture,
             adverse_selection,
-            inventory_cost: 0.0, // Computed separately
+            inventory_cost,
             fee_cost,
         }
     }
@@ -330,6 +341,7 @@ impl OutcomeTracker {
         self.total_fills = 0;
         self.simulated_inventory = 0.0;
         self.avg_entry_price = 0.0;
+        self.last_mid = 0.0;
     }
 
     /// Get completed attributions for analysis

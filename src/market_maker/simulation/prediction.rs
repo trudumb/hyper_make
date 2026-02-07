@@ -202,9 +202,9 @@ impl MarketStateSnapshot {
                 * params.calibration_gamma_mult
                 * params.tail_risk_multiplier,
             funding_rate: params.funding_rate,
-            time_to_funding_settlement_s: 0.0, // TODO: Add to MarketParams
-            open_interest: 0.0,                // TODO: Add to MarketParams
-            oi_change_1m: 0.0,                 // TODO: Add to MarketParams
+            time_to_funding_settlement_s: params.time_to_funding_settlement_s,
+            open_interest: params.open_interest,
+            oi_change_1m: params.oi_change_1m,
             inventory,
             pending_bid_exposure: params.pending_bid_exposure,
             pending_ask_exposure: params.pending_ask_exposure,
