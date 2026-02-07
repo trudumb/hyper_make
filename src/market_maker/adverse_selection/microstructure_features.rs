@@ -809,7 +809,13 @@ mod tests {
 
     #[test]
     fn test_volume_imbalance() {
-        let mut extractor = MicrostructureExtractor::default_config();
+        // Use a short EWMA half-life so the test converges in fewer trades
+        let config = MicrostructureConfig {
+            ewma_half_life_s: 0.5, // 5 samples half-life (0.5s * 10 trades/s)
+            min_warmup_trades: 20,
+            ..Default::default()
+        };
+        let mut extractor = MicrostructureExtractor::new(config);
 
         // All buy volume
         for i in 0..50 {
@@ -819,9 +825,9 @@ mod tests {
         let features = extractor.extract();
         assert!(features.volume_imbalance > 0.5, "Should show buy imbalance");
 
-        // Now sell pressure
-        for i in 50..100 {
-            extractor.on_trade(make_trade(i * 100, 100.0, 2.0, false)); // Larger sells
+        // Now sell pressure — larger sells to dominate
+        for i in 50..150 {
+            extractor.on_trade(make_trade(i * 100, 100.0, 2.0, false));
         }
 
         let features = extractor.extract();

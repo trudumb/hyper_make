@@ -178,7 +178,7 @@ impl EmissionParams {
     /// Apply validation constraints: clamp and enforce minimums on all fields.
     ///
     /// Use with struct literal syntax:
-    /// ```
+    /// ```ignore
     /// EmissionParams { mean_volatility: 0.001, ... }.validated()
     /// ```
     pub fn validated(mut self) -> Self {
