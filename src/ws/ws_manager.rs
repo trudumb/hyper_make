@@ -463,8 +463,7 @@ impl WsManager {
                                             let orphaned_count = pending.len();
                                             if orphaned_count > 0 {
                                                 warn!(
-                                                    "Cleaning up {} orphaned WS POST requests after reconnection",
-                                                    orphaned_count
+                                                    "Cleaning up {orphaned_count} orphaned WS POST requests after reconnection"
                                                 );
                                                 // Send error to all pending requests so they fail fast
                                                 // instead of waiting for timeout
@@ -531,9 +530,7 @@ impl WsManager {
 
                                         if max_failures > 0 && failures >= max_failures as u64 {
                                             error!(
-                                                "Max reconnection failures exceeded, giving up failures={} max={}",
-                                                failures,
-                                                max_failures
+                                                "Max reconnection failures exceeded, giving up failures={failures} max={max_failures}"
                                             );
                                             health_state
                                                 .is_reconnecting
@@ -769,8 +766,7 @@ impl WsManager {
                 let mut pending = self.pending_posts.lock().await;
                 pending.remove(&request_id);
                 Err(Error::WsSend(format!(
-                    "WS post request {} timed out after {:?}",
-                    request_id, timeout
+                    "WS post request {request_id} timed out after {timeout:?}"
                 )))
             }
         }
@@ -895,13 +891,12 @@ impl WsManager {
                                 let mut pending_guard = pending.lock().await;
                                 if let Some(sender) = pending_guard.remove(&request_id) {
                                     debug!(
-                                        "Routing WS post response to pending request id={}",
-                                        request_id
+                                        "Routing WS post response to pending request id={request_id}"
                                     );
                                     // Send response to waiting receiver
                                     let _ = sender.send(post_response.data);
                                 } else {
-                                    warn!("WS post response for unknown request ID={}", request_id);
+                                    warn!("WS post response for unknown request ID={request_id}");
                                 }
                                 return Ok(());
                             }

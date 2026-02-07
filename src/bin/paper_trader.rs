@@ -1802,7 +1802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_state(ws_state_for_server)
                 .layer(cors);
 
-            let addr = format!("127.0.0.1:{}", metrics_port);
+            let addr = format!("127.0.0.1:{metrics_port}");
             info!(
                 port = metrics_port,
                 "Dashboard server starting: HTTP at /api/dashboard, WS at /ws/dashboard"

@@ -595,16 +595,39 @@ impl OrderExecutor for HyperliquidExecutor {
                     }
                     error!("Bulk order response data is empty");
                 }
-                ExchangeResponseStatus::Err(e) => {
+                ExchangeResponseStatus::Err(ref e) => {
                     error!("Bulk order failed: {}", e);
+                    // Propagate error to OrderResult so reconcile.rs can detect rate limits
+                    return orders
+                        .iter()
+                        .zip(cloids.iter())
+                        .map(|(_, cloid)| {
+                            OrderResult::failed_with_cloid_and_error(
+                                cloid.clone(),
+                                e.clone(),
+                            )
+                        })
+                        .collect();
                 }
             },
-            Err(e) => {
+            Err(ref e) => {
                 error!("Bulk order request failed: {}", e);
+                // Propagate error to OrderResult so reconcile.rs can detect rate limits
+                let err_str = e.to_string();
+                return orders
+                    .iter()
+                    .zip(cloids.iter())
+                    .map(|(_, cloid)| {
+                        OrderResult::failed_with_cloid_and_error(
+                            cloid.clone(),
+                            err_str.clone(),
+                        )
+                    })
+                    .collect();
             }
         }
 
-        // All failed - preserve CLOIDs for cleanup
+        // All failed with no error info - preserve CLOIDs for cleanup
         orders
             .iter()
             .zip(cloids.iter())

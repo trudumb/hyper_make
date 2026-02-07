@@ -601,7 +601,7 @@ impl LatentStateEstimator {
             trades_processed: self.stats.trades_processed,
             volatility: VolatilityReport {
                 sigma_bps_per_sqrt_s: sigma,
-                regime: format!("{:?}", regime),
+                regime: format!("{regime:?}"),
                 regime_confidence: self.volatility_filter.regime_confidence(),
                 credible_interval: ci,
                 is_warmed_up: self.volatility_filter.is_warmed_up(),
@@ -667,7 +667,7 @@ impl LatentStateEstimator {
         );
         println!("  Warmed up: {}", self.warmed_up);
         if let Some(mid) = self.stats.last_mid {
-            println!("  Last mid: ${:.2}", mid);
+            println!("  Last mid: ${mid:.2}");
         }
         println!();
 
@@ -749,10 +749,10 @@ impl LatentStateEstimator {
                 0.0
             };
 
-            println!("  Total: {:.2} bps", total);
-            println!("  Permanent: {:.2} bps ({:.0}%)", perm, perm_pct);
-            println!("  Temporary: {:.2} bps ({:.0}%)", temp, temp_pct);
-            println!("  Timing: {:.2} bps ({:.0}%)", timing, timing_pct);
+            println!("  Total: {total:.2} bps");
+            println!("  Permanent: {perm:.2} bps ({perm_pct:.0}%)");
+            println!("  Temporary: {temp:.2} bps ({temp_pct:.0}%)");
+            println!("  Timing: {timing:.2} bps ({timing_pct:.0}%)");
             println!(
                 "  Fills measured: {}",
                 report.adverse_selection.fills_measured
@@ -826,21 +826,21 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     if let Some(hours) = s.strip_suffix('h') {
         let h: u64 = hours
             .parse()
-            .map_err(|_| format!("Invalid hours: {}", hours))?;
+            .map_err(|_| format!("Invalid hours: {hours}"))?;
         Ok(Duration::from_secs(h * 3600))
     } else if let Some(mins) = s.strip_suffix('m') {
         let m: u64 = mins
             .parse()
-            .map_err(|_| format!("Invalid minutes: {}", mins))?;
+            .map_err(|_| format!("Invalid minutes: {mins}"))?;
         Ok(Duration::from_secs(m * 60))
     } else if let Some(secs) = s.strip_suffix('s') {
         let sec: u64 = secs
             .parse()
-            .map_err(|_| format!("Invalid seconds: {}", secs))?;
+            .map_err(|_| format!("Invalid seconds: {secs}"))?;
         Ok(Duration::from_secs(sec))
     } else {
         // Try parsing as seconds
-        let sec: u64 = s.parse().map_err(|_| format!("Invalid duration: {}", s))?;
+        let sec: u64 = s.parse().map_err(|_| format!("Invalid duration: {s}"))?;
         Ok(Duration::from_secs(sec))
     }
 }
@@ -860,7 +860,7 @@ fn print_startup_banner(asset: &str, network: &str, duration: &Duration, dex: &O
         env!("CARGO_PKG_VERSION")
     );
     eprintln!("╠═══════════════════════════════════════════════════════════╣");
-    eprintln!("║  Asset: {:<15}  Network: {:<17} ║", asset, network);
+    eprintln!("║  Asset: {asset:<15}  Network: {network:<17} ║");
     if let Some(d) = dex {
         eprintln!(
             "║  DEX: {:<17}  Duration: {:<14} ║",

@@ -443,9 +443,9 @@ impl CalibratedEdgeSignal {
         let is_useful = posterior_prob >= threshold;
         
         let reason = if is_useful {
-            format!("bayesian_ok (P={:.2}≥{:.2}, n={})", posterior_prob, threshold, n)
+            format!("bayesian_ok (P={posterior_prob:.2}≥{threshold:.2}, n={n})")
         } else {
-            format!("bayesian_low (P={:.2}<{:.2}, n={})", posterior_prob, threshold, n)
+            format!("bayesian_low (P={posterior_prob:.2}<{threshold:.2}, n={n})")
         };
         
         BayesianDecision {
@@ -555,9 +555,9 @@ impl CalibratedEdgeSignal {
         let is_useful = posterior_prob >= threshold;
         
         let reason = if is_useful {
-            format!("bayesian_ok (P={:.2}≥{:.2}, n={})", posterior_prob, threshold, n)
+            format!("bayesian_ok (P={posterior_prob:.2}≥{threshold:.2}, n={n})")
         } else {
-            format!("bayesian_low (P={:.2}<{:.2}, n={})", posterior_prob, threshold, n)
+            format!("bayesian_low (P={posterior_prob:.2}<{threshold:.2}, n={n})")
         };
         
         BayesianDecision {

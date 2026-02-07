@@ -782,7 +782,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::ValidateConfig) => {
             let config = load_config(&cli)?;
-            println!("Configuration is valid:\n{:#?}", config);
+            println!("Configuration is valid:\n{config:#?}");
             return Ok(());
         }
         Some(Commands::Status) => {
@@ -867,7 +867,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             asset
         } else {
             // Auto-prefix: "BTC" + "hyna" → "hyna:BTC"
-            let prefixed = format!("{}:{}", dex_name, asset);
+            let prefixed = format!("{dex_name}:{asset}");
             info!(
                 original = %asset,
                 prefixed = %prefixed,
@@ -1713,7 +1713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_microprice_ema(microprice_ema_alpha, microprice_ema_min_change_bps);
 
     // Wire checkpoint persistence for warm-starting across sessions
-    let checkpoint_dir = PathBuf::from(format!("data/checkpoints/{}", asset));
+    let checkpoint_dir = PathBuf::from(format!("data/checkpoints/{asset}"));
     market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
 
     // Wire signal export path for diagnostic infrastructure
@@ -1789,7 +1789,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(cors);
 
             // Security: Bind to localhost only to prevent metrics exposure to network
-            let addr = format!("127.0.0.1:{}", metrics_port);
+            let addr = format!("127.0.0.1:{metrics_port}");
             info!(
                 port = metrics_port,
                 bind = "127.0.0.1",
@@ -1911,7 +1911,7 @@ fn parse_base_url(s: &str) -> Result<BaseUrl, Box<dyn std::error::Error>> {
         "mainnet" => Ok(BaseUrl::Mainnet),
         "testnet" => Ok(BaseUrl::Testnet),
         "localhost" => Ok(BaseUrl::Localhost),
-        _ => Err(format!("Unknown network '{}'. Use: mainnet, testnet, localhost", s).into()),
+        _ => Err(format!("Unknown network '{s}'. Use: mainnet, testnet, localhost").into()),
     }
 }
 
@@ -1923,18 +1923,17 @@ fn generate_sample_config(path: &str) -> Result<(), Box<dyn std::error::Error>> 
         r#"# Hyperliquid Market Maker Configuration
 # See: cargo run --bin market_maker -- --help
 
-{}
+{content}
 
 # Note: Set private key via HYPERLIQUID_PRIVATE_KEY environment variable
 # or uncomment below (not recommended for security):
 # [network]
 # private_key = "your_private_key_here"
-"#,
-        content
+"#
     );
 
     std::fs::write(path, with_comments)?;
-    println!("Sample config written to: {}", path);
+    println!("Sample config written to: {path}");
     Ok(())
 }
 
@@ -1951,17 +1950,14 @@ fn print_startup_banner(asset: &str, quote_asset: &str, network: &BaseUrl, dry_r
     eprintln!();
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
     eprintln!(
-        "║     Hyperliquid Market Maker v{:<10}{}              ║",
-        version, mode
+        "║     Hyperliquid Market Maker v{version:<10}{mode}              ║"
     );
     eprintln!("║                                                           ║");
     eprintln!(
-        "║  Asset:   {:<15}  Network: {:<15}   ║",
-        asset, network_str
+        "║  Asset:   {asset:<15}  Network: {network_str:<15}   ║"
     );
     eprintln!(
-        "║  Quote:   {:<15}                                ║",
-        quote_asset
+        "║  Quote:   {quote_asset:<15}                                ║"
     );
     eprintln!("╚═══════════════════════════════════════════════════════════╝");
     eprintln!();
@@ -1972,7 +1968,7 @@ async fn list_available_dexs(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     let config = load_config(cli)?;
     let base_url = parse_base_url(cli.network.as_ref().unwrap_or(&config.network.base_url))?;
 
-    println!("Connecting to {:?}...", base_url);
+    println!("Connecting to {base_url:?}...");
 
     let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
 
@@ -1995,7 +1991,7 @@ async fn list_available_dexs(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
             println!("  [{:>2}] {} - {}", idx, dex.name, dex.full_name);
             println!("       Deployer: {}", dex.deployer);
             if let Some(ref oracle) = dex.oracle_updater {
-                println!("       Oracle:   {}", oracle);
+                println!("       Oracle:   {oracle}");
             }
             println!();
         }
@@ -2032,7 +2028,7 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     let base_url = parse_base_url(cli.network.as_ref().unwrap_or(&config.network.base_url))?;
     let asset = cli.asset.clone().unwrap_or(config.trading.asset.clone());
 
-    println!("Connecting to {:?}...", base_url);
+    println!("Connecting to {base_url:?}...");
 
     let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
     let user_address = wallet.address();
@@ -2054,10 +2050,10 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     // Print status
     println!();
     println!("═══════════════════════════════════════════════════════════");
-    println!("  Account Status for {}", asset);
+    println!("  Account Status for {asset}");
     println!("═══════════════════════════════════════════════════════════");
     println!();
-    println!("  Wallet:          {}", user_address);
+    println!("  Wallet:          {user_address}");
     println!();
 
     // Account summary
@@ -2085,7 +2081,7 @@ async fn show_account_status(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     if let Some(pos) = position {
         println!("  Position:        {} {}", pos.position.szi, asset);
         if let Some(ref entry_px) = pos.position.entry_px {
-            println!("  Entry Price:     ${}", entry_px);
+            println!("  Entry Price:     ${entry_px}");
         }
         println!("  Unrealized PnL:  ${}", pos.position.unrealized_pnl);
         println!("  Leverage:        {}x", pos.position.leverage.value);

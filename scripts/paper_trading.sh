@@ -47,6 +47,7 @@ VERBOSE=false
 NETWORK="mainnet"
 DASHBOARD=false
 CAPTURE=false
+PAPER_MODE=true
 METRICS_PORT=8080
 
 for arg in "$@"; do
@@ -66,6 +67,9 @@ for arg in "$@"; do
         --capture)
             CAPTURE=true
             DASHBOARD=true  # --capture implies --dashboard
+            ;;
+        --no-paper-mode)
+            PAPER_MODE=false
             ;;
     esac
 done
@@ -152,6 +156,9 @@ if [ "$NETWORK" = "testnet" ]; then
 fi
 if [ "$DASHBOARD" = true ]; then
     PT_ARGS="${PT_ARGS} --dashboard --metrics-port ${METRICS_PORT}"
+fi
+if [ "$PAPER_MODE" = true ]; then
+    PT_ARGS="${PT_ARGS} --paper-mode"
 fi
 
 # Start dashboard HTTP server if requested

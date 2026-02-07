@@ -6,6 +6,7 @@
 /// - `PositionLimit`: Skip side entirely until position changes (do NOT retry)
 /// - `Margin`: Transient, use exponential backoff
 /// - `PriceError`: May retry with adjusted price
+/// - `RateLimit`: Exchange rate limit hit - triggers kill switch counter
 /// - `Other`: Unknown error, use default backoff
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionErrorType {
@@ -18,6 +19,9 @@ pub enum RejectionErrorType {
     /// Price-related error (BadAloPx - price outside spread)
     /// May retry immediately with adjusted price.
     PriceError,
+    /// Rate limit exceeded (429, too many requests, rate limit, etc.)
+    /// Triggers kill switch counter - must back off aggressively.
+    RateLimit,
     /// Unknown error type - use default handling.
     Other,
 }
@@ -32,6 +36,17 @@ impl RejectionErrorType {
     /// The classified error type
     pub fn classify(error: &str) -> Self {
         let error_lower = error.to_lowercase();
+
+        // Rate limit errors - must detect FIRST (before other patterns)
+        // These trigger the kill switch counter and require aggressive backoff.
+        if error_lower.contains("rate limit")
+            || error_lower.contains("rate_limit")
+            || error_lower.contains("too many requests")
+            || error_lower.contains("429")
+            || error_lower.contains("throttl")
+        {
+            return RejectionErrorType::RateLimit;
+        }
 
         // Position limit errors - these should skip the side, not backoff
         if error_lower.contains("perpmaxposition")
@@ -74,6 +89,7 @@ impl RejectionErrorType {
             self,
             RejectionErrorType::PositionLimit
                 | RejectionErrorType::Margin
+                | RejectionErrorType::RateLimit
                 | RejectionErrorType::Other
         )
     }
@@ -84,6 +100,12 @@ impl RejectionErrorType {
             self,
             RejectionErrorType::Margin | RejectionErrorType::PriceError
         )
+    }
+
+    /// Returns true if this is a rate limit error that should trigger
+    /// the kill switch counter.
+    pub fn is_rate_limit(&self) -> bool {
+        matches!(self, RejectionErrorType::RateLimit)
     }
 }
 
@@ -141,6 +163,32 @@ mod tests {
     }
 
     #[test]
+    fn test_error_classification_rate_limit() {
+        // Explicit rate limit
+        let err_type = RejectionErrorType::classify("Rate limit exceeded");
+        assert_eq!(err_type, RejectionErrorType::RateLimit);
+        assert!(err_type.is_rate_limit());
+        assert!(err_type.should_backoff());
+        assert!(!err_type.should_skip_side());
+
+        // HTTP 429
+        let err_type = RejectionErrorType::classify("HTTP 429: Too Many Requests");
+        assert_eq!(err_type, RejectionErrorType::RateLimit);
+
+        // rate_limit with underscore
+        let err_type = RejectionErrorType::classify("rate_limit: slow down");
+        assert_eq!(err_type, RejectionErrorType::RateLimit);
+
+        // Throttle variant
+        let err_type = RejectionErrorType::classify("Request throttled, try again later");
+        assert_eq!(err_type, RejectionErrorType::RateLimit);
+
+        // "too many requests" lowercase
+        let err_type = RejectionErrorType::classify("too many requests from this IP");
+        assert_eq!(err_type, RejectionErrorType::RateLimit);
+    }
+
+    #[test]
     fn test_error_classification_other() {
         // Unknown error
         let err_type = RejectionErrorType::classify("Some unknown error occurred");
@@ -148,5 +196,6 @@ mod tests {
         assert!(!err_type.should_skip_side());
         assert!(err_type.should_backoff());
         assert!(!err_type.is_transient());
+        assert!(!err_type.is_rate_limit());
     }
 }

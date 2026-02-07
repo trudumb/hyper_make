@@ -989,7 +989,7 @@ impl Default for TheoreticalEdgeConfig {
     fn default() -> Self {
         Self {
             alpha: 0.25,           // From order book imbalance studies
-            adverse_prior: 0.15,   // From PIN model estimates (lowered from 0.30)
+            adverse_prior: 0.25,   // BTC-calibrated: 20-30% informed flow typical on Hyperliquid
             min_edge_bps: 1.0,     // Minimum edge AFTER fees
             min_imbalance: 0.10,   // Ignore very weak imbalances
             btc_correlation_threshold: 0.5, // Only use BTC signal if correlated
@@ -1156,8 +1156,9 @@ impl TheoreticalEdgeEstimator {
         
         // Scale edge by fill probability: E[edge] = P(fill) × edge_if_filled
         // Use blend: at p_fill=1.0 use full edge, at p_fill→0 use dampened edge
-        // This prevents complete zeroing on illiquids while still penalizing low fill probability
-        let fill_dampening = 0.5 + 0.5 * p_fill;  // Range: [0.5, 1.0]
+        // Floor of 0.3 prevents complete zeroing on illiquids while properly
+        // penalizing uncertain fill probability (previously 0.5 was too generous)
+        let fill_dampening = 0.3 + 0.7 * p_fill;  // Range: [0.3, 1.0]
         let expected_edge_bps = raw_edge_bps * fill_dampening;
 
         // Should we quote?

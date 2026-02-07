@@ -1045,8 +1045,8 @@ impl QuoteGate {
 
         debug!(
             theoretical_p = %format!("{:.3}", theoretical_p),
-            l2_p = input.l2_p_positive_edge.map_or("N/A".to_string(), |p| format!("{:.3}", p)),
-            l3_belief = input.l3_belief.map_or("N/A".to_string(), |p| format!("{:.3}", p)),
+            l2_p = input.l2_p_positive_edge.map_or("N/A".to_string(), |p| format!("{p:.3}")),
+            l3_belief = input.l3_belief.map_or("N/A".to_string(), |p| format!("{p:.3}")),
             l2_health = %format!("{:.2}", input.l2_model_health),
             l3_trust = %format!("{:.2}", input.l3_trust),
             bootstrap_confidence = %format!("{:.3}", bootstrap_confidence),
@@ -1259,7 +1259,7 @@ impl QuoteGate {
                 // Switch to directional mode even if quote_flat_without_edge is true.
                 info!(
                     flow_imbalance = %format!("{:.3}", input.flow_imbalance),
-                    l2_p_positive = input.l2_p_positive_edge.map_or("N/A".to_string(), |p| format!("{:.3}", p)),
+                    l2_p_positive = input.l2_p_positive_edge.map_or("N/A".to_string(), |p| format!("{p:.3}")),
                     "Quote gate: DIRECTIONAL MODE (strong trend confirmed by L2)"
                 );
                 QuoteDecision::NoQuote {
@@ -1591,8 +1591,7 @@ impl QuoteGate {
         };
 
         format!(
-            "QuoteGate[{} | {} | {:?}]",
-            edge_status, position_status, decision
+            "QuoteGate[{edge_status} | {position_status} | {decision:?}]"
         )
     }
 

@@ -694,7 +694,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 liquidation_px = %format!("{:.4}", liq_px),
                 mark_price = %format!("{:.4}", mark_price),
                 distance_pct = %format!("{:.2}%", distance_pct),
-                buffer_ratio = ?margin_state.liquidation_buffer_ratio().map(|r| format!("{:.2}", r)),
+                buffer_ratio = ?margin_state.liquidation_buffer_ratio().map(|r| format!("{r:.2}")),
                 "Margin state refreshed with liquidation proximity"
             );
         } else {

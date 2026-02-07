@@ -57,7 +57,7 @@ pub enum AnomalyType {
 impl fmt::Display for AnomalyType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AnomalyType::SequenceGap(gap) => write!(f, "sequence_gap_{}", gap),
+            AnomalyType::SequenceGap(gap) => write!(f, "sequence_gap_{gap}"),
             AnomalyType::TimestampRegression => write!(f, "timestamp_regression"),
             AnomalyType::StaleData => write!(f, "stale_data"),
             AnomalyType::CrossedBook => write!(f, "crossed_book"),

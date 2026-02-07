@@ -347,7 +347,7 @@ fn format_timestamp(millis: u64) -> String {
     let hours = (secs / 3600) % 24;
     let mins = (secs / 60) % 60;
     let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", hours, mins, s)
+    format!("{hours:02}:{mins:02}:{s:02}")
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         private_key.parse().expect("Invalid private key");
     let user_address = wallet.address();
 
-    log::info!("Starting WS Debugger for user: {}", user_address);
+    log::info!("Starting WS Debugger for user: {user_address}");
 
     // Create a channel for the WS manager (even if we don't fully use the manager, we need the channel)
     let (_sender, _receiver) = mpsc::unbounded_channel::<String>();
@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to Mainnet WS (using ExchangeClient as a helper to get the URL)
     // NOTE: This is a simplified direct connection to test the subscription
     let url = "wss://api.hyperliquid.xyz/ws";
-    log::info!("Connecting to {}", url);
+    log::info!("Connecting to {url}");
 
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
             // Log everything that looks like data
             if !text.contains("\"channel\":\"pong\"") {
-                log::info!("RECEIVED: {}", text);
+                log::info!("RECEIVED: {text}");
 
                 // If we get a valid WebData2 message, break after a few
                 if text.contains("webData2") {

@@ -312,8 +312,7 @@ impl BayesianBootstrapTracker {
             )
         } else {
             format!(
-                "Continuing bootstrap (P={:.3}, remaining={:.1})",
-                p_calibrated, expected_remaining
+                "Continuing bootstrap (P={p_calibrated:.3}, remaining={expected_remaining:.1})"
             )
         };
 

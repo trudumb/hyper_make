@@ -76,7 +76,7 @@ impl ModelReport {
         if n_predictions < 100 {
             return (
                 "insufficient_data".to_string(),
-                format!("Need 100+ samples, have {}", n_predictions),
+                format!("Need 100+ samples, have {n_predictions}"),
             );
         }
 
@@ -87,17 +87,17 @@ impl ModelReport {
         } else if ir >= 0.9 {
             (
                 "degraded".to_string(),
-                format!("IR marginal ({:.2}), monitor closely", ir),
+                format!("IR marginal ({ir:.2}), monitor closely"),
             )
         } else if ir < 0.9 {
             (
                 "stale".to_string(),
-                format!("IR below threshold ({:.2} < 1.0), consider removal", ir),
+                format!("IR below threshold ({ir:.2} < 1.0), consider removal"),
             )
         } else {
             (
                 "degraded".to_string(),
-                format!("Brier score high ({:.2})", brier),
+                format!("Brier score high ({brier:.2})"),
             )
         }
     }
@@ -565,7 +565,7 @@ fn generate_live_signal_reports() -> Vec<SignalReport> {
             };
 
             reports.push(SignalReport {
-                signal_type: format!("{}", signal_kind),
+                signal_type: format!("{signal_kind}"),
                 relative_strength: health.relative_strength(),
                 decay_rate_per_day: health.decay_rate,
                 status: status.to_string(),
@@ -585,9 +585,9 @@ fn print_ascii(report: &CalibrationReport) {
     let border = "=".repeat(72);
     let separator = "-".repeat(72);
 
-    println!("{}", border);
+    println!("{border}");
     println!("{:^72}", "DAILY CALIBRATION REPORT");
-    println!("{}", border);
+    println!("{border}");
     println!(
         " Generated: {}",
         &report.generated_at[..19].replace('T', " ")
@@ -597,16 +597,16 @@ fn print_ascii(report: &CalibrationReport) {
         " Overall Health: {}",
         format_health_status(&report.overall_health)
     );
-    println!("{}", separator);
+    println!("{separator}");
 
     // Model Performance Section
     println!(" MODEL PERFORMANCE");
-    println!("{}", separator);
+    println!("{separator}");
     println!(
         " {:20} {:>8} {:>8} {:>8} {:>9} {:14}",
         "Model", "IR", "Brier", "CalErr", "N Preds", "Status"
     );
-    println!("{}", separator);
+    println!("{separator}");
 
     for model in &report.models {
         let status_icon = match model.status.as_str() {
@@ -628,17 +628,17 @@ fn print_ascii(report: &CalibrationReport) {
         );
     }
 
-    println!("{}", separator);
+    println!("{separator}");
 
     // Signal Health Section
     if !report.signals.is_empty() {
         println!(" SIGNAL HEALTH");
-        println!("{}", separator);
+        println!("{separator}");
         println!(
             " {:20} {:>12} {:>12} {:>12}",
             "Signal", "Strength", "Decay/Day", "Status"
         );
-        println!("{}", separator);
+        println!("{separator}");
 
         for signal in &report.signals {
             let status_icon = match signal.status.as_str() {
@@ -658,13 +658,13 @@ fn print_ascii(report: &CalibrationReport) {
             );
         }
 
-        println!("{}", separator);
+        println!("{separator}");
     }
 
     // Edge Signal Health Section (IR-Based Thresholds)
     if let Some(edge) = &report.edge_signal {
         println!(" EDGE SIGNAL HEALTH (IR-Based)");
-        println!("{}", separator);
+        println!("{separator}");
         let status_icon = match edge.overall_status.as_str() {
             "PREDICTIVE" => "[OK]",
             "MARGINAL" => "[!!]",
@@ -688,13 +688,13 @@ fn print_ascii(report: &CalibrationReport) {
             edge.mi_decay_rate, edge.derived_threshold
         );
         println!(" Predictions: {}", edge.n_predictions);
-        println!("{}", separator);
+        println!("{separator}");
     }
 
     // Position Threshold Section (P&L Derived)
     if let Some(pos) = &report.position_thresholds {
         println!(" POSITION THRESHOLDS (P&L Derived)");
-        println!("{}", separator);
+        println!("{separator}");
         println!(
             " Derived position threshold: {:.2} (was {:.2})",
             pos.derived_position_threshold, pos.default_position_threshold
@@ -707,18 +707,18 @@ fn print_ascii(report: &CalibrationReport) {
             );
         }
         println!(" Fills recorded: {}", pos.n_fills_recorded);
-        println!("{}", separator);
+        println!("{separator}");
     }
 
     // Edge Validation Section (from paper trader analytics data)
     println!(" EDGE VALIDATION (from paper trader data)");
-    println!("{}", separator);
+    println!("{separator}");
 
     let sharpe_path = "logs/paper_trading/sharpe_metrics.jsonl";
     if std::path::Path::new(sharpe_path).exists() {
         if let Ok(content) = std::fs::read_to_string(sharpe_path) {
             if let Some(last_line) = content.lines().last() {
-                println!(" Latest Sharpe metrics: {}", last_line);
+                println!(" Latest Sharpe metrics: {last_line}");
             }
         }
     } else {
@@ -729,16 +729,16 @@ fn print_ascii(report: &CalibrationReport) {
     if std::path::Path::new(pnl_path).exists() {
         if let Ok(content) = std::fs::read_to_string(pnl_path) {
             if let Some(last_line) = content.lines().last() {
-                println!(" Latest signal PnL: {}", last_line);
+                println!(" Latest signal PnL: {last_line}");
             }
         }
     }
 
-    println!("{}", separator);
+    println!("{separator}");
 
     // Summary Section
     println!(" SUMMARY");
-    println!("{}", separator);
+    println!("{separator}");
     println!(
         " Models: {} total | {} healthy | {} degraded | {} stale",
         report.summary.total_models,
@@ -750,30 +750,30 @@ fn print_ascii(report: &CalibrationReport) {
         " Average IR: {:.2} | Average Brier: {:.3}",
         report.summary.average_ir, report.summary.average_brier
     );
-    println!("{}", separator);
+    println!("{separator}");
 
     // Alerts Section
     if !report.alerts.is_empty() {
-        println!(" ALERTS ({} active)", report.alerts.len());
-        println!("{}", separator);
+        println!(" ALERTS ({}) active", report.alerts.len());
+        println!("{separator}");
         for alert in &report.alerts {
-            println!(" * {}", alert);
+            println!(" * {alert}");
         }
-        println!("{}", separator);
+        println!("{separator}");
     }
 
     // Recommendation
     println!(" RECOMMENDATION");
-    println!("{}", separator);
+    println!("{separator}");
     println!(" {}", report.summary.recommendation);
-    println!("{}", border);
+    println!("{border}");
 }
 
 /// Print JSON formatted report to stdout.
 fn print_json(report: &CalibrationReport) {
     match serde_json::to_string_pretty(report) {
-        Ok(json) => println!("{}", json),
-        Err(e) => eprintln!("Error serializing report to JSON: {}", e),
+        Ok(json) => println!("{json}"),
+        Err(e) => eprintln!("Error serializing report to JSON: {e}"),
     }
 }
 
@@ -829,12 +829,12 @@ fn main() {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&output_path, json) {
-                    eprintln!("Failed to write report to {}: {}", output_path, e);
+                    eprintln!("Failed to write report to {output_path}: {e}");
                 } else {
-                    println!("\nReport written to: {}", output_path);
+                    println!("\nReport written to: {output_path}");
                 }
             }
-            Err(e) => eprintln!("Failed to serialize report: {}", e),
+            Err(e) => eprintln!("Failed to serialize report: {e}"),
         }
     }
 

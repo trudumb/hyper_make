@@ -108,8 +108,7 @@ impl HttpClient {
         // This should never be reached due to the loop structure,
         // but return a clear error if it somehow is
         Err(Error::GenericRequest(format!(
-            "Max retries ({}) exceeded for {}",
-            MAX_RETRIES, url_path
+            "Max retries ({MAX_RETRIES}) exceeded for {url_path}"
         )))
     }
 

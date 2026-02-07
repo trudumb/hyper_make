@@ -405,7 +405,7 @@ impl OutcomeSummary {
 
         if self.total_fills > 0 {
             let pnl_per_fill = self.total_pnl / self.total_fills as f64;
-            output.push_str(&format!("\nPnL per Fill: ${:.4}\n", pnl_per_fill));
+            output.push_str(&format!("\nPnL per Fill: ${pnl_per_fill:.4}\n"));
         }
 
         output

@@ -1344,7 +1344,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // PHASE 4: Using centralized belief snapshot for changepoint values
                 l3_trust = %format!("{:.2}", belief_snapshot.changepoint.learning_trust),
                 l3_cp_prob = %format!("{:.3}", belief_snapshot.changepoint.prob_5),
-                l3_action = %format!("{:?}", action).chars().take(40).collect::<String>(),
+                l3_action = %format!("{action:?}").chars().take(40).collect::<String>(),
                 // Final
                 position = %format!("{:.4}", self.position.position()),
                 "[Trace] L1->L2->L3 pipeline"

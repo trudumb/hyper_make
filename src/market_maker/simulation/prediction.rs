@@ -516,18 +516,14 @@ impl PredictionLogger {
         self.cycle_id
     }
 
-    /// Attach outcomes to a prediction record
+    /// Attach outcomes to a prediction record.
+    /// The record stays in pending until drain_completed_records() is called,
+    /// which writes it to disk and returns it for calibration analysis.
     pub fn attach_outcomes(&self, cycle_id: u64, outcomes: ObservedOutcomes) {
         let mut pending = self.pending_records.lock().unwrap();
 
-        if let Some(record) = pending.remove(&cycle_id) {
-            let completed_record = PredictionRecord {
-                outcomes: Some(outcomes),
-                ..record
-            };
-
-            // Write completed record
-            self.write_record(&completed_record);
+        if let Some(record) = pending.get_mut(&cycle_id) {
+            record.outcomes = Some(outcomes);
         }
     }
 
@@ -535,7 +531,7 @@ impl PredictionLogger {
     fn write_record(&self, record: &PredictionRecord) {
         let json = serde_json::to_string(record).unwrap();
         let mut writer = self.writer.lock().unwrap();
-        writeln!(writer, "{}", json).ok();
+        writeln!(writer, "{json}").ok();
         writer.flush().ok();
     }
 

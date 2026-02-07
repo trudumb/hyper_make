@@ -479,7 +479,7 @@ impl OrderExecutor for SimulationExecutor {
                     self.log_event(
                         OrderEvent::Cancel,
                         Some(order.clone()),
-                        format!("Order {} cancelled", oid),
+                        format!("Order {oid} cancelled"),
                     );
 
                     info!(oid, "[SIM] Order cancelled");
@@ -546,7 +546,7 @@ impl OrderExecutor for SimulationExecutor {
             self.log_event(
                 OrderEvent::Modify,
                 Some(order.clone()),
-                format!("Order {} modified to {} @ {}", oid, new_size, new_price),
+                format!("Order {oid} modified to {new_size} @ {new_price}"),
             );
 
             info!(oid, new_price, new_size, "[SIM] Order modified");

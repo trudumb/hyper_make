@@ -159,7 +159,7 @@ impl std::fmt::Display for EdgeSignalKind {
             EdgeSignalKind::RegimeDetection => write!(f, "RegimeDetection"),
             EdgeSignalKind::AdverseSelection => write!(f, "AdverseSelection"),
             EdgeSignalKind::FillProbability => write!(f, "FillProbability"),
-            EdgeSignalKind::Custom(id) => write!(f, "Custom({})", id),
+            EdgeSignalKind::Custom(id) => write!(f, "Custom({id})"),
         }
     }
 }

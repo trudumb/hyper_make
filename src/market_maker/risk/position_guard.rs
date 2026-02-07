@@ -60,6 +60,10 @@ pub struct PositionGuardConfig {
     pub sigma_bps: f64,
     /// Time horizon for skew calculation (seconds)
     pub tau_seconds: f64,
+    /// Hard entry gate threshold (fraction of max_position).
+    /// Orders are rejected if worst-case position exceeds this fraction of max_position.
+    /// Default: 0.95 (reject when >95% utilized).
+    pub hard_entry_threshold: f64,
 }
 
 impl Default for PositionGuardConfig {
@@ -72,7 +76,30 @@ impl Default for PositionGuardConfig {
             max_skew_bps: 100.0,
             sigma_bps: 50.0,     // 50 bps volatility
             tau_seconds: 300.0,  // 5 minute horizon
+            hard_entry_threshold: 0.95,
         }
+    }
+}
+
+/// Result of a pre-order entry check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderEntryCheck {
+    /// Order is allowed.
+    Allowed,
+    /// Order is rejected because worst-case position exceeds hard limit.
+    Rejected {
+        current_position: f64,
+        proposed_size: f64,
+        worst_case_position: f64,
+        hard_limit: f64,
+        reason: String,
+    },
+}
+
+impl OrderEntryCheck {
+    /// Returns true if the order is allowed.
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, OrderEntryCheck::Allowed)
     }
 }
 
@@ -201,6 +228,51 @@ impl PositionGuard {
     /// Check if either side should be pulled.
     pub fn should_pull_any(&self) -> bool {
         self.should_pull_side(Side::Buy) || self.should_pull_side(Side::Sell)
+    }
+
+    /// Hard pre-order entry gate.
+    ///
+    /// Checks whether placing an order of `proposed_size` on `side` would
+    /// cause the worst-case position to exceed `hard_entry_threshold` of max_position.
+    ///
+    /// This is a stateless check using the provided `current_position` (not cached state)
+    /// to avoid stale-data races.
+    ///
+    /// Orders that REDUCE position are always allowed.
+    pub fn check_order_entry(
+        &self,
+        current_position: f64,
+        proposed_size: f64,
+        side: Side,
+    ) -> OrderEntryCheck {
+        let worst_case = match side {
+            Side::Buy => current_position + proposed_size,
+            Side::Sell => current_position - proposed_size,
+        };
+
+        let hard_limit = self.config.max_position * self.config.hard_entry_threshold;
+
+        // Allow orders that reduce position toward zero
+        if worst_case.abs() < current_position.abs() {
+            return OrderEntryCheck::Allowed;
+        }
+
+        if worst_case.abs() > hard_limit {
+            OrderEntryCheck::Rejected {
+                current_position,
+                proposed_size,
+                worst_case_position: worst_case,
+                hard_limit,
+                reason: format!(
+                    "Hard entry gate: worst-case position {:.6} exceeds {:.1}% limit ({:.6})",
+                    worst_case.abs(),
+                    self.config.hard_entry_threshold * 100.0,
+                    hard_limit,
+                ),
+            }
+        } else {
+            OrderEntryCheck::Allowed
+        }
     }
 
     /// Get inventory skew in basis points.
@@ -498,5 +570,119 @@ mod tests {
         assert!(summary.in_warning_zone());
         assert!(!summary.in_pull_zone());
         assert!(!summary.over_limit());
+    }
+
+    // ====================================================================
+    // Hard Entry Gate Tests
+    // ====================================================================
+
+    #[test]
+    fn test_entry_gate_small_order_allowed() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        let check = guard.check_order_entry(0.0, 0.5, Side::Buy);
+        assert!(check.is_allowed());
+    }
+
+    #[test]
+    fn test_entry_gate_buy_overshoot_rejected() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        // Already at 0.9, buying 0.1 would put us at 1.0 > 0.95 limit
+        let check = guard.check_order_entry(0.9, 0.1, Side::Buy);
+        assert!(!check.is_allowed());
+        if let OrderEntryCheck::Rejected { worst_case_position, hard_limit, .. } = check {
+            assert!((worst_case_position - 1.0).abs() < 1e-10);
+            assert!((hard_limit - 0.95).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_entry_gate_sell_overshoot_rejected() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        // Already short -0.9, selling 0.1 more would put us at -1.0
+        let check = guard.check_order_entry(-0.9, 0.1, Side::Sell);
+        assert!(!check.is_allowed());
+    }
+
+    #[test]
+    fn test_entry_gate_reducing_position_always_allowed() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        // Long 0.99, selling reduces position → always allowed
+        let check = guard.check_order_entry(0.99, 0.5, Side::Sell);
+        assert!(check.is_allowed());
+
+        // Short -0.99, buying reduces position → always allowed
+        let check = guard.check_order_entry(-0.99, 0.5, Side::Buy);
+        assert!(check.is_allowed());
+    }
+
+    #[test]
+    fn test_entry_gate_exactly_at_boundary_allowed() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        // Worst case = exactly 0.95 (not strictly greater) → allowed
+        let check = guard.check_order_entry(0.0, 0.95, Side::Buy);
+        assert!(check.is_allowed());
+    }
+
+    #[test]
+    fn test_entry_gate_just_over_boundary_rejected() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        // Worst case = 0.951 > 0.95 → rejected
+        let check = guard.check_order_entry(0.0, 0.951, Side::Buy);
+        assert!(!check.is_allowed());
+    }
+
+    #[test]
+    fn test_entry_gate_custom_threshold() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 10.0,
+            hard_entry_threshold: 0.80,
+            ..Default::default()
+        });
+        // 80% of 10.0 = 8.0 hard limit
+        let check = guard.check_order_entry(7.0, 1.5, Side::Buy);
+        assert!(!check.is_allowed()); // 8.5 > 8.0
+
+        let check = guard.check_order_entry(7.0, 0.5, Side::Buy);
+        assert!(check.is_allowed()); // 7.5 < 8.0
+    }
+
+    #[test]
+    fn test_entry_gate_reason_string() {
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            hard_entry_threshold: 0.95,
+            ..Default::default()
+        });
+        let check = guard.check_order_entry(0.9, 0.2, Side::Buy);
+        if let OrderEntryCheck::Rejected { reason, .. } = check {
+            assert!(reason.contains("Hard entry gate"));
+            assert!(reason.contains("95.0%"));
+        } else {
+            panic!("Expected Rejected");
+        }
     }
 }

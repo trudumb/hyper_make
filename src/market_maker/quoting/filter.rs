@@ -610,7 +610,7 @@ impl QuoteFilter {
                 warn!(
                     asset = %config.asset,
                     position = %format!("{:.6}", position),
-                    liquidation_price = ?config.liquidation_price.map(|p| format!("{:.4}", p)),
+                    liquidation_price = ?config.liquidation_price.map(|p| format!("{p:.4}")),
                     buffer_ratio = ?config.liquidation_buffer_ratio.map(|r| format!("{:.2}%", r * 100.0)),
                     threshold = %format!("{:.1}%", config.liquidation_trigger_threshold * 100.0),
                     mid_price = %format!("{:.4}", config.mid_price),

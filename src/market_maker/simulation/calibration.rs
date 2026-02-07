@@ -739,8 +739,7 @@ impl StatisticalValidator {
             p_value,
             n,
             &format!(
-                "Mean: {:.4}, Std: {:.4}, SE: {:.4}",
-                mean, std_dev, std_error
+                "Mean: {mean:.4}, Std: {std_dev:.4}, SE: {std_error:.4}"
             ),
         )
     }
@@ -815,8 +814,7 @@ impl StatisticalValidator {
             p_value,
             n,
             &format!(
-                "Observed mean: {:.4}, {} of {} permutations more extreme",
-                observed_mean, more_extreme_count, n_permutations
+                "Observed mean: {observed_mean:.4}, {more_extreme_count} of {n_permutations} permutations more extreme"
             ),
         )
     }

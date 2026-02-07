@@ -180,7 +180,7 @@ fn render_dashboard(state: &HealthState) {
     let bar_len = 40;
     let filled = (state.regime_confidence * bar_len as f64) as usize;
     let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_len - filled);
-    println!("║ [{}]                            ║", bar);
+    println!("║ [{bar}]                            ║");
 
     println!("╠══════════════════════════════════════════════════════════════════════╣");
     println!("║ CIRCUIT BREAKERS                                                     ║");
@@ -220,8 +220,7 @@ fn render_dashboard(state: &HealthState) {
     } else {
         for alert in &state.alerts {
             println!(
-                "║ \x1B[31m⚠ {}\x1B[0m                                                     ║",
-                alert
+                "║ \x1B[31m⚠ {alert}\x1B[0m                                                     ║"
             );
         }
     }
@@ -239,5 +238,5 @@ fn format_ir(ir: f64) -> String {
     } else {
         "\x1B[31m"
     }; // red
-    format!("{}{:4.2}\x1B[0m", color, ir)
+    format!("{color}{ir:4.2}\x1B[0m")
 }

@@ -366,7 +366,7 @@ impl EnhancedClassifierDiagnostics {
     pub fn summary(&self) -> String {
         let weight_str: Vec<String> = self.effective_weights
             .iter()
-            .map(|w| format!("{:.2}", w))
+            .map(|w| format!("{w:.2}"))
             .collect();
 
         format!(

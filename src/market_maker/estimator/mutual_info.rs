@@ -557,7 +557,7 @@ impl SignalAuditManager {
 
         for entry in &ranked {
             let half_life_str = match entry.half_life_days {
-                Some(hl) => format!("{:.1}d", hl),
+                Some(hl) => format!("{hl:.1}d"),
                 None => "N/A".to_string(),
             };
             let status = if entry.is_stale { "STALE" } else { "OK" };
@@ -575,8 +575,7 @@ impl SignalAuditManager {
         let stale_count = ranked.iter().filter(|e| e.is_stale).count();
         if stale_count > 0 {
             report.push_str(&format!(
-                "\nWarning: {} signal(s) are stale and should be reviewed.\n",
-                stale_count
+                "\nWarning: {stale_count} signal(s) are stale and should be reviewed.\n"
             ));
         }
 

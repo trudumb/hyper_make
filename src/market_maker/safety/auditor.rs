@@ -97,8 +97,7 @@ impl SafetyAuditor {
             )
         } else if over_value_limit {
             format!(
-                "{}: value ${:.2} > ${:.2} limit",
-                direction, position_value, max_position_value
+                "{direction}: value ${position_value:.2} > ${max_position_value:.2} limit"
             )
         } else {
             format!(
@@ -222,9 +221,8 @@ impl SafetyAuditor {
             ))
         } else if exceeds_long {
             Some(format!(
-                "Worst-case LONG position {:.4} would exceed limit {:.4} \
-                 (pending_bid={:.4})",
-                worst_case_long, max_position, pending_bid_exposure
+                "Worst-case LONG position {worst_case_long:.4} would exceed limit {max_position:.4} \
+                 (pending_bid={pending_bid_exposure:.4})"
             ))
         } else if exceeds_short {
             Some(format!(

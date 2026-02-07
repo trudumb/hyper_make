@@ -17,7 +17,7 @@ impl PrometheusMetrics {
     /// * `quote_asset` - The collateral/quote asset (e.g., "USDC", "USDE", "USDH")
     pub fn to_prometheus_text(&self, asset: &str, quote_asset: &str) -> String {
         let uptime_secs = self.inner.start_time.elapsed().as_secs_f64();
-        let labels = format!("asset=\"{}\",quote=\"{}\"", asset, quote_asset);
+        let labels = format!("asset=\"{asset}\",quote=\"{quote_asset}\"");
 
         let mut output = String::with_capacity(4096);
 
@@ -331,8 +331,7 @@ impl PrometheusMetrics {
         output.push_str(&format!(
             "# HELP mm_uptime_secs Total uptime in seconds\n\
              # TYPE mm_uptime_secs counter\n\
-             mm_uptime_secs{{{}}} {:.2}\n",
-            labels, uptime_secs
+             mm_uptime_secs{{{labels}}} {uptime_secs:.2}\n"
         ));
 
         // Volatility regime

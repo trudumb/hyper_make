@@ -549,7 +549,7 @@ impl ABTestManager {
                 .push((name.to_string(), metrics, winner));
             Ok(())
         } else {
-            Err(format!("Test '{}' not found", name))
+            Err(format!("Test '{name}' not found"))
         }
     }
 

@@ -592,7 +592,7 @@ impl StochasticController {
             },
             layer3_learning_trust: self.learning_trust,
             layer3_cycle_count: self.cycle_count,
-            layer3_last_action: self.last_action.as_ref().map(|a| format!("{:?}", a)),
+            layer3_last_action: self.last_action.as_ref().map(|a| format!("{a:?}")),
 
             // Meta
             overall_health: self.assess_overall_health(learning_output),

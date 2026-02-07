@@ -14,6 +14,7 @@ use super::super::{
     tracking, CancelResult, MarketMaker, ModifySpec, OrderExecutor, OrderSpec, OrderState, Quote,
     QuotingStrategy, Side, TrackedOrder,
 };
+use super::super::infra::RejectionErrorType;
 use super::{partition_ladder_actions, side_str};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
@@ -507,6 +508,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // This prevents 25 rejections from immediately hitting 120s backoff.
             if rejection_count > 0 {
                 if let Some(ref err) = first_rejection_error {
+                    // Check if this is a rate limit error - triggers kill switch counter
+                    let error_type = RejectionErrorType::classify(err);
+                    if error_type.is_rate_limit() {
+                        self.safety.kill_switch.record_rate_limit_error();
+                        warn!(
+                            side = %side_str(side),
+                            error = %err,
+                            "Rate limit error detected - kill switch counter incremented"
+                        );
+                    }
+
                     if let Some(backoff) =
                         self.infra
                             .rate_limiter

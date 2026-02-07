@@ -969,7 +969,7 @@ impl DashboardAggregator {
             pnl,
             cum_pnl: *cum_pnl,
             side: if is_buy { "BID" } else { "ASK" }.to_string(),
-            adverse_selection: format!("{:.1}", as_bps),
+            adverse_selection: format!("{as_bps:.1}"),
         };
 
         let mut history = self.fill_history.write().unwrap();

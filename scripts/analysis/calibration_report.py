@@ -320,15 +320,30 @@ def generate_report(session_dir: str) -> CalibrationReport:
             "Run longer session (3600s recommended) for statistical significance"
         )
 
-    # Extract fill predictions and outcomes
+    # Extract fill predictions and outcomes from nested PredictionRecord format
+    # Rust serializes: {predictions: {levels: [{p_fill_1s, ...}]}, outcomes: {fills: [{level_index, ...}]}}
     if predictions:
         fill_predictions = []
         fill_outcomes = []
 
         for pred in predictions:
-            if 'fill_probability' in pred and 'was_filled' in pred:
-                fill_predictions.append(pred['fill_probability'])
-                fill_outcomes.append(pred['was_filled'])
+            outcomes = pred.get('outcomes')
+            levels = pred.get('predictions', {}).get('levels', [])
+            if not outcomes or not levels:
+                continue
+
+            # Build set of filled level indices
+            filled_indices = set()
+            for fill in outcomes.get('fills', []):
+                if 'level_index' in fill:
+                    filled_indices.add(fill['level_index'])
+
+            # Each level is a separate prediction/outcome pair
+            for i, level in enumerate(levels):
+                p_fill = level.get('p_fill_1s', 0.0)
+                was_filled = i in filled_indices
+                fill_predictions.append(p_fill)
+                fill_outcomes.append(was_filled)
 
         if fill_predictions:
             report.fill_prediction = compute_brier_decomposition(
@@ -353,9 +368,18 @@ def generate_report(session_dir: str) -> CalibrationReport:
         as_outcomes = []
 
         for pred in predictions:
-            if 'adverse_selection_prob' in pred and 'was_adverse' in pred:
-                as_predictions.append(pred['adverse_selection_prob'])
-                as_outcomes.append(pred['was_adverse'])
+            model_preds = pred.get('predictions', {})
+            outcomes = pred.get('outcomes')
+            if not outcomes:
+                continue
+
+            predicted_as = model_preds.get('expected_adverse_selection_bps')
+            realized_as = outcomes.get('adverse_selection_realized_bps')
+
+            if predicted_as is not None and realized_as is not None:
+                # Convert to binary: adverse if realized AS > threshold (1 bps)
+                as_predictions.append(min(max(predicted_as / 10.0, 0.0), 1.0))  # Normalize to [0,1]
+                as_outcomes.append(realized_as > 1.0)
 
         if as_predictions:
             report.as_prediction = compute_brier_decomposition(

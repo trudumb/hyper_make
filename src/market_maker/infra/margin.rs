@@ -641,14 +641,12 @@ impl MarginAwareSizer {
                     "No available margin".to_string()
                 } else {
                     format!(
-                        "Reduced from {} to {} due to margin limits",
-                        size, adjusted_size
+                        "Reduced from {size} to {adjusted_size} due to margin limits"
                     )
                 }
             } else {
                 format!(
-                    "Reduced from {} to {} due to order size limit",
-                    size, adjusted_size
+                    "Reduced from {size} to {adjusted_size} due to order size limit"
                 )
             };
             (true, Some(reason))
@@ -724,8 +722,7 @@ impl MarginAwareSizer {
                 return (
                     false,
                     Some(format!(
-                        "Would exceed max leverage: {:.2}x > {:.2}x (at ${:.0} notional)",
-                        new_leverage, max_allowed_leverage, new_notional
+                        "Would exceed max leverage: {new_leverage:.2}x > {max_allowed_leverage:.2}x (at ${new_notional:.0} notional)"
                     )),
                 );
             }
@@ -748,8 +745,7 @@ impl MarginAwareSizer {
                 return (
                     false,
                     Some(format!(
-                        "Insufficient margin: need ${:.2}, have ${:.2}",
-                        required_margin, usable_margin
+                        "Insufficient margin: need ${required_margin:.2}, have ${usable_margin:.2}"
                     )),
                 );
             }

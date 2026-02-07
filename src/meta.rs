@@ -363,7 +363,7 @@ impl CollateralInfo {
             // Token not found - use placeholder
             Self {
                 token_index,
-                symbol: format!("TOKEN_{}", token_index),
+                symbol: format!("TOKEN_{token_index}"),
                 full_name: None,
                 sz_decimals: 8,
                 wei_decimals: 8,
@@ -435,7 +435,7 @@ impl CollateralInfo {
     /// String formatted with appropriate decimal places for this token.
     pub fn format_amount(&self, amount: f64) -> String {
         let precision = self.sz_decimals as usize;
-        format!("{:.prec$}", amount, prec = precision)
+        format!("{amount:.precision$}")
     }
 }
 

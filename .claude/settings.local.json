@@ -67,7 +67,8 @@
       "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make log --oneline -5 -- .claude/skills/foundation/measurement-infrastructure/SKILL.md)",
       "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make show HEAD:.claude/skills/foundation/measurement-infrastructure/SKILL.md)",
       "Bash(git checkout:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "Bash(ps:*)"
     ]
   }
 }

@@ -84,8 +84,7 @@ impl RiskMonitor for CascadeMonitor {
                 self.name(),
                 RiskAction::WidenSpreads(widen_factor),
                 format!(
-                    "Elevated cascade risk: severity {:.2}, widening spreads by {:.1}x",
-                    severity, widen_factor
+                    "Elevated cascade risk: severity {severity:.2}, widening spreads by {widen_factor:.1}x"
                 ),
             )
             .with_metric(severity)

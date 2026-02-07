@@ -56,7 +56,7 @@ pub use drawdown::{DrawdownConfig, DrawdownLevel, DrawdownSummary, DrawdownTrack
 pub use kill_switch::*;
 pub use limits::{RiskCheckResult, RiskChecker, RiskLimits};
 pub use monitor::{RiskAction, RiskAssessment, RiskMonitor, RiskMonitorBox, RiskSeverity};
-pub use position_guard::{PositionGuard, PositionGuardConfig, PositionGuardSummary};
+pub use position_guard::{OrderEntryCheck, PositionGuard, PositionGuardConfig, PositionGuardSummary};
 // Note: Side enum is NOT re-exported to avoid conflict with tracking::Side
 // Use position_guard::Side explicitly if needed
 pub use reentry::{ReentryConfig, ReentryManager, ReentryPhase, ReentrySummary};

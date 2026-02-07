@@ -98,8 +98,7 @@ impl RiskMonitor for DataStalenessMonitor {
             return RiskAssessment::critical(
                 self.name(),
                 format!(
-                    "Data stale: {:.1}s since last update (threshold: {:.1}s)",
-                    data_age_secs, stale_secs
+                    "Data stale: {data_age_secs:.1}s since last update (threshold: {stale_secs:.1}s)"
                 ),
             )
             .with_metric(data_age_secs)

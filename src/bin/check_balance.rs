@@ -28,9 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str());
 
-    println!("=== Balance Check for {} ===", user_address);
+    println!("=== Balance Check for {user_address} ===");
     if let Some(dex_name) = dex {
-        println!("=== HIP-3 DEX: {} ===", dex_name);
+        println!("=== HIP-3 DEX: {dex_name} ===");
     }
     println!();
 
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await?;
 
     // Query user state (validator perps OR HIP-3 DEX)
-    println!("Querying user state{}...", dex.map(|d| format!(" for DEX '{}'", d)).unwrap_or_default());
+    println!("Querying user state{}...", dex.map(|d| format!(" for DEX '{d}'")).unwrap_or_default());
     let user_state = info_client.user_state_for_dex(user_address, dex).await?;
 
     println!("\n--- margin_summary (isolated margin) ---");
@@ -116,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         println!("\n  --- Position Totals ---");
-        println!("  Total margin in positions: {:.4}", total_margin_in_positions);
-        println!("  Total unrealized PnL:      {:.4}", total_unrealized_pnl);
+        println!("  Total margin in positions: {total_margin_in_positions:.4}");
+        println!("  Total unrealized PnL:      {total_unrealized_pnl:.4}");
         println!("  Position equity:           {:.4}", total_margin_in_positions + total_unrealized_pnl);
     }
 
@@ -127,9 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let withdrawable: f64 = user_state.withdrawable.parse().unwrap_or(0.0);
     let total_raw_usd: f64 = user_state.margin_summary.total_raw_usd.parse().unwrap_or(0.0);
 
-    println!("  margin_summary.account_value: {:.4}", margin_account_value);
-    println!("  margin_summary.total_raw_usd: {:.4}", total_raw_usd);
-    println!("  withdrawable:                 {:.4}", withdrawable);
+    println!("  margin_summary.account_value: {margin_account_value:.4}");
+    println!("  margin_summary.total_raw_usd: {total_raw_usd:.4}");
+    println!("  withdrawable:                 {withdrawable:.4}");
     println!("  ---");
     println!("  account_value + withdrawable: {:.4}", margin_account_value + withdrawable);
     println!("  total_raw_usd + withdrawable: {:.4}", total_raw_usd + withdrawable);

@@ -718,7 +718,7 @@ impl ValidatorStats {
         let hours = secs / 3600;
         let mins = (secs % 3600) / 60;
         let secs = secs % 60;
-        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+        format!("{hours:02}:{mins:02}:{secs:02}")
     }
 }
 
@@ -1714,9 +1714,7 @@ impl PredictionValidator {
                 status.optimal_lag_ms,
                 status.mi_bits,
             );
-            println!("  timestamps: signal=[{:?}..{:?}] target=[{:?}..{:?}]",
-                sig_first, sig_last, tgt_first, tgt_last,
-            );
+            println!("  timestamps: signal=[{sig_first:?}..{sig_last:?}] target=[{tgt_first:?}..{tgt_last:?}]");
             if let (Some(sf), Some(sl), Some(tf), Some(tl)) = (sig_first, sig_last, tgt_first, tgt_last) {
                 let overlap = sl >= tf && tl >= sf;
                 println!("  overlap={} | signal_range={}ms target_range={}ms gap={}ms",
@@ -1810,16 +1808,16 @@ impl PredictionValidator {
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim().to_lowercase();
     if let Some(hours) = s.strip_suffix('h') {
-        let h: u64 = hours.parse().map_err(|_| format!("Invalid hours: {}", hours))?;
+        let h: u64 = hours.parse().map_err(|_| format!("Invalid hours: {hours}"))?;
         Ok(Duration::from_secs(h * 3600))
     } else if let Some(mins) = s.strip_suffix('m') {
-        let m: u64 = mins.parse().map_err(|_| format!("Invalid minutes: {}", mins))?;
+        let m: u64 = mins.parse().map_err(|_| format!("Invalid minutes: {mins}"))?;
         Ok(Duration::from_secs(m * 60))
     } else if let Some(secs) = s.strip_suffix('s') {
-        let sec: u64 = secs.parse().map_err(|_| format!("Invalid seconds: {}", secs))?;
+        let sec: u64 = secs.parse().map_err(|_| format!("Invalid seconds: {secs}"))?;
         Ok(Duration::from_secs(sec))
     } else {
-        let sec: u64 = s.parse().map_err(|_| format!("Invalid duration: {}", s))?;
+        let sec: u64 = s.parse().map_err(|_| format!("Invalid duration: {s}"))?;
         Ok(Duration::from_secs(sec))
     }
 }
@@ -1836,7 +1834,7 @@ fn print_startup_banner(asset: &str, network: &str, duration: &Duration, dex: &O
     eprintln!("╔═══════════════════════════════════════════════════════════╗");
     eprintln!("║          Prediction Validator v{}                    ║", env!("CARGO_PKG_VERSION"));
     eprintln!("╠═══════════════════════════════════════════════════════════╣");
-    eprintln!("║  Asset: {:<15}  Network: {:<17} ║", asset, network);
+    eprintln!("║  Asset: {asset:<15}  Network: {network:<17} ║");
     if let Some(d) = dex {
         eprintln!(
             "║  DEX: {:<17}  Duration: {:<14} ║",

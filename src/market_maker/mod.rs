@@ -608,6 +608,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.infra.connection_health.state()
                 == crate::market_maker::infra::ConnectionState::Failed,
         )
+        .with_rate_limit_errors(self.safety.kill_switch.state().rate_limit_errors)
     }
 
     /// Get current session time as fraction [0, 1].
@@ -642,7 +643,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             position: self.position.position(),
             mid_price: self.latest_mid,
             last_data_time,
-            rate_limit_errors: 0, // TODO: Track rate limit errors
+            rate_limit_errors: self.safety.kill_switch.state().rate_limit_errors,
             cascade_severity: self.tier1.liquidation_detector.cascade_severity(),
             // Capital-efficient: margin data for position runaway check
             account_value: margin_state.account_value,

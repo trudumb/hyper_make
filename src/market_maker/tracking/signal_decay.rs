@@ -344,7 +344,7 @@ impl SignalDecayReport {
                     alerts.push(SignalAlert {
                         signal_name: name.clone(),
                         severity: AlertSeverity::Critical,
-                        message: format!("Signal decaying rapidly (half-life: {:.1} days)", hl),
+                        message: format!("Signal decaying rapidly (half-life: {hl:.1} days)"),
                         current_mi,
                         half_life_days: Some(hl),
                         recent_change_pct: recent_change.map(|(_, pct)| pct),
@@ -354,7 +354,7 @@ impl SignalDecayReport {
                     alerts.push(SignalAlert {
                         signal_name: name.clone(),
                         severity: AlertSeverity::Warning,
-                        message: format!("Signal aging (half-life: {:.1} days)", hl),
+                        message: format!("Signal aging (half-life: {hl:.1} days)"),
                         current_mi,
                         half_life_days: Some(hl),
                         recent_change_pct: recent_change.map(|(_, pct)| pct),
@@ -420,12 +420,11 @@ impl SignalDecayReport {
             };
 
             let half_life_str = half_life
-                .map(|hl| format!("{:.0}d", hl))
+                .map(|hl| format!("{hl:.0}d"))
                 .unwrap_or_else(|| "N/A".to_string());
 
             lines.push(format!(
-                "{}: MI={:.4} bits {} (half-life: {}, n={})",
-                name, mi, trend_str, half_life_str, obs_count
+                "{name}: MI={mi:.4} bits {trend_str} (half-life: {half_life_str}, n={obs_count})"
             ));
         }
 

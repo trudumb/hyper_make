@@ -290,8 +290,7 @@ pub fn init_logging(
             .init();
 
         eprintln!(
-            "Logging to file: {} (using JSON format for both stdout and file)",
-            log_file
+            "Logging to file: {log_file} (using JSON format for both stdout and file)"
         );
     } else {
         // Stdout only mode

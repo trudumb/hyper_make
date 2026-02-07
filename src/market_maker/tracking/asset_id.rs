@@ -62,8 +62,8 @@ impl AssetId {
     /// Format: `"dex:symbol"` for HIP-3, `"validator:symbol"` for validator perps.
     pub fn canonical_key(symbol: &str, dex: Option<&str>) -> String {
         match dex {
-            Some(d) => format!("{}:{}", d, symbol),
-            None => format!("validator:{}", symbol),
+            Some(d) => format!("{d}:{symbol}"),
+            None => format!("validator:{symbol}"),
         }
     }
 

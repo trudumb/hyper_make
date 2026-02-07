@@ -1420,7 +1420,7 @@ impl MarketParams {
                     .contains(&current_hour_utc)
             {
                 can_quote_tight = false;
-                block_reason = Some(format!("Excluded hour {} UTC", current_hour_utc));
+                block_reason = Some(format!("Excluded hour {current_hour_utc} UTC"));
             }
 
             // Condition 5: Book depth must be sufficient (if enabled)
