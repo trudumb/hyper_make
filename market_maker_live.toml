@@ -1,0 +1,82 @@
+# Hyperliquid Market Maker - Live Production Config
+# Ultra-conservative Phase 1: Collect 200+ fills for parameter calibration
+#
+# Expected: ~$15/side, 30-60 fills/hour, $1-3/day profit at base size
+# Go/No-Go after 200+ fills: realized edge > 0 bps, AS < spread, win rate > 45%
+
+[network]
+base_url = "mainnet"
+
+[trading]
+asset = "HYPE"
+target_liquidity = 0.5         # ~$15 per side at HYPE ~$30
+risk_aversion = 0.5
+max_bps_diff = 2
+max_position_usd = 50.0       # Max $50 notional exposure
+leverage = 3.0
+
+[strategy]
+strategy_type = "ladder"
+half_spread_bps = 10
+inventory_skew_factor = 0.0
+estimation_window_secs = 300
+min_trades = 50
+default_sigma = 0.0001
+default_kappa = 100.0
+default_arrival_intensity = 0.5
+warmup_decay_secs = 300
+min_warmup_trades = 5
+
+[kill_switch]
+max_daily_loss = 5.0           # $5 max daily loss (Phase 1)
+max_drawdown = 0.10            # 10% max drawdown
+max_position_value = 50.0      # $50 max notional
+max_position_contracts = 2.0   # ~2 HYPE max
+
+[stochastic]
+# Core model features
+use_hjb_skew = true
+use_kalman_filter = true
+calibrate_depth_as = true
+use_calibrated_as = false      # Enable after Phase 1 calibration
+
+# Adaptive spreads - learn from fills
+use_adaptive_spreads = true
+sigma_baseline = 0.0002
+
+# Kelly sizing - DISABLED in Phase 1, enable after 50+ fills
+use_kelly_sizing = false
+kelly_fraction = 0.15          # Conservative 15% fractional Kelly
+kelly_min_p_win = 0.55
+kelly_min_edge_bps = 1.5       # Lower than default (fees = 1.5 bps)
+kelly_max_position_fraction = 0.3
+kelly_tracker_decay = 0.99
+kelly_min_warmup_trades = 50   # Need 50 fills before Kelly activates
+
+# Calibration fill rate targeting
+enable_calibration_fill_rate = true
+target_fill_rate_per_hour = 30.0
+min_fill_hungry_gamma = 0.3
+
+# Position management
+enable_position_ramp = true
+
+# Stochastic constraints
+use_latency_spread_floor = true
+use_book_depth_constraint = true
+use_conditional_tight_quoting = true
+
+[logging]
+level = "info"
+format = "pretty"
+
+[monitoring]
+metrics_port = 9090
+enable_http_metrics = true
+
+[checkpoint]
+enabled = true
+save_interval_secs = 300       # Save every 5 minutes
+base_dir = "data/checkpoints"
+
+# Note: Set private key via HYPERLIQUID_PRIVATE_KEY environment variable

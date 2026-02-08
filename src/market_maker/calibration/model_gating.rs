@@ -66,7 +66,7 @@ pub struct ModelGatingConfig {
 impl Default for ModelGatingConfig {
     fn default() -> Self {
         Self {
-            min_samples: 100,
+            min_samples: 500,
             ir_threshold: 0.5,
             high_confidence_threshold: 0.7,
             low_confidence_threshold: 0.3,
@@ -231,6 +231,9 @@ pub struct ModelGating {
 
     /// Last update time (for logging).
     updates_since_log: usize,
+
+    /// Total observations received (for cold-start gating).
+    observation_count: usize,
 }
 
 impl ModelGating {
@@ -244,8 +247,9 @@ impl ModelGating {
             lead_lag_tracker: ModelTracker::new("lead_lag", n_bins),
             regime_tracker: ModelTracker::new("regime", n_bins),
             kappa_tracker: ModelTracker::new("kappa", n_bins),
-            cached_weights: ModelWeights::full(), // Start optimistic
+            cached_weights: ModelWeights::full(),
             updates_since_log: 0,
+            observation_count: 0,
         }
     }
 
@@ -313,6 +317,7 @@ impl ModelGating {
     /// Periodic weight update and logging.
     fn maybe_update_weights(&mut self) {
         self.updates_since_log += 1;
+        self.observation_count += 1;
 
         // Update weights every 100 observations
         if self.updates_since_log >= 100 {
@@ -391,8 +396,14 @@ impl ModelGating {
     /// Get spread multiplier based on model confidence.
     ///
     /// Returns a multiplier >= 1.0 that should be applied to spreads
-    /// when model confidence is low.
+    /// when model confidence is low. During cold start (insufficient
+    /// observations), returns the maximum defensive multiplier.
     pub fn spread_multiplier(&self) -> f64 {
+        // Cold start: not enough data to trust any model
+        if self.observation_count < self.config.min_samples {
+            return self.config.no_confidence_spread_mult;
+        }
+
         let avg_weight = self.cached_weights.average_weight();
 
         if avg_weight >= 0.7 {
@@ -490,6 +501,7 @@ impl ModelGating {
         self.kappa_tracker.ir_tracker.clear();
         self.cached_weights = ModelWeights::full();
         self.updates_since_log = 0;
+        self.observation_count = 0;
     }
 }
 
@@ -583,11 +595,49 @@ mod tests {
 
     #[test]
     fn test_spread_multiplier_high_confidence() {
-        let gating = ModelGating::default_config();
+        // Use a small min_samples so we can pass cold-start without
+        // triggering weight recalculation (which needs all 5 trackers fed)
+        let config = ModelGatingConfig {
+            min_samples: 10,
+            ..ModelGatingConfig::default()
+        };
+        let mut gating = ModelGating::new(config);
+
+        // Feed enough observations to pass cold-start gate (< 100 avoids weight recalc)
+        for _ in 0..10 {
+            gating.update_adverse_selection(0.5, true);
+        }
+
         let mult = gating.spread_multiplier();
 
-        // High confidence = no spread widening
-        assert!((mult - 1.0).abs() < 0.01);
+        // Weights are still full (no weight recalc yet), so no spread widening
+        assert!(
+            (mult - 1.0).abs() < 0.01,
+            "Expected ~1.0 spread mult with full weights, got {mult}"
+        );
+    }
+
+    #[test]
+    fn test_spread_multiplier_cold_start_defensive() {
+        let gating = ModelGating::default_config();
+
+        // Cold start: zero observations should return max defensive multiplier
+        let mult = gating.spread_multiplier();
+        assert!(
+            (mult - gating.config.no_confidence_spread_mult).abs() < 0.001,
+            "Cold start should return no_confidence_spread_mult (2.0), got {mult}"
+        );
+
+        // Feed some data but less than min_samples - still defensive
+        let mut gating2 = ModelGating::default_config();
+        for _ in 0..10 {
+            gating2.update_adverse_selection(0.5, true);
+        }
+        let mult2 = gating2.spread_multiplier();
+        assert!(
+            (mult2 - gating2.config.no_confidence_spread_mult).abs() < 0.001,
+            "Should still be defensive with only 10 observations, got {mult2}"
+        );
     }
 
     #[test]

@@ -859,13 +859,55 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
-        // Apply circuit breaker spread multiplier to market params if needed
+        // === MODEL GATING: Widen spreads when models are poorly calibrated ===
+        let model_gating_mult = self.stochastic.signal_integrator.model_gating_spread_multiplier();
+        if model_gating_mult > 1.0 {
+            spread_multiplier *= model_gating_mult;
+            debug!(
+                model_gating_mult = %format!("{:.2}", model_gating_mult),
+                "ModelGating: Widening spreads (low model confidence)"
+            );
+        }
+
+        // === SIGNAL STALENESS DEFENSE: Widen when enabled signals go stale ===
+        let staleness_mult = self.stochastic.signal_integrator.staleness_spread_multiplier();
+        if staleness_mult > 1.0 {
+            spread_multiplier *= staleness_mult;
+            warn!(
+                staleness_mult = %format!("{:.2}", staleness_mult),
+                "Signal staleness: widening spreads (stale signals detected)"
+            );
+        }
+
+        // === NEGATIVE EDGE ALARM: Widen when realized edge is negative ===
+        if let Some(edge_alarm_mult) = self.tier2.edge_tracker.negative_edge_alarm() {
+            spread_multiplier *= edge_alarm_mult;
+            warn!(
+                edge_alarm_mult = %format!("{:.2}", edge_alarm_mult),
+                mean_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_realized_edge()),
+                fills = self.tier2.edge_tracker.edge_count(),
+                "Negative edge alarm: widening spreads defensively"
+            );
+        }
+
+        // === EDGE KILL: Pause trading if consistently losing money per fill ===
+        if self.tier2.edge_tracker.should_pause_trading() {
+            warn!(
+                mean_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_realized_edge()),
+                fills = self.tier2.edge_tracker.edge_count(),
+                "EDGE KILL: consistently negative realized edge, pausing quotes"
+            );
+            return Ok(());
+        }
+
+        // Apply composed spread multiplier to market params
         if spread_multiplier > 1.0 {
+            market_params.spread_widening_mult *= spread_multiplier;
             debug!(
                 multiplier = %format!("{:.2}", spread_multiplier),
-                "Spread widening active (circuit breaker + threshold kappa)"
+                total_widening = %format!("{:.2}", market_params.spread_widening_mult),
+                "Spread widening active (circuit breaker + threshold kappa + model gating + staleness + edge)"
             );
-            // The spread multiplier will be applied in the strategy
         }
 
         // Apply position-based size reduction from risk checker and drawdown tracker
@@ -1283,6 +1325,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let decision_adjusted_liquidity = self.effective_target_liquidity
             * decision_size_fraction
             * proactive_size_mult;
+
+        // === KELLY CRITERION SIZING ===
+        // When Kelly tracker is warmed up (50+ fills), scale liquidity by optimal fraction.
+        // Clamped to [5%, 30%] — never go below 5% to stay visible on the book.
+        const KELLY_MIN_FRACTION: f64 = 0.05;
+        const KELLY_MAX_FRACTION: f64 = 0.30;
+        let kelly_adjusted_liquidity = if self.stochastic.stochastic_config.use_kelly_sizing {
+            if let Some(raw_kelly) = self.learning.kelly_recommendation() {
+                let kelly_fraction = raw_kelly.clamp(KELLY_MIN_FRACTION, KELLY_MAX_FRACTION);
+                let adjusted = decision_adjusted_liquidity * kelly_fraction;
+                info!(
+                    raw_kelly = %format!("{:.1}%", raw_kelly * 100.0),
+                    clamped_kelly = %format!("{:.1}%", kelly_fraction * 100.0),
+                    base_liquidity = %format!("{:.6}", decision_adjusted_liquidity),
+                    adjusted_liquidity = %format!("{:.6}", adjusted),
+                    "Kelly criterion sizing active"
+                );
+                adjusted
+            } else {
+                decision_adjusted_liquidity
+            }
+        } else {
+            decision_adjusted_liquidity
+        };
 
         // === LAYER 3: STOCHASTIC CONTROLLER ===
         // When enabled, provides POMDP-based sequential decision-making on top of Layer 2
@@ -1776,7 +1842,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &quote_config,
             self.position.position(),
             self.effective_max_position, // First-principles limit
-            decision_adjusted_liquidity, // Decision-adjusted viable size
+            kelly_adjusted_liquidity, // Decision + Kelly-adjusted viable size
             &market_params,
         );
 
@@ -1852,10 +1918,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 &self.infra.exchange_limits,
             );
 
-            // If escalation is needed, the recovery manager should be notified
-            // (This happens automatically via rate limiter when orders get rejected)
+            // If escalation is needed, cancel all position-increasing quotes
+            // This prevents the position from growing further when reduce-only can't place reducing orders
             if reduce_only_result.needs_escalation {
-                debug!("Reduce-only mode activated with potential escalation");
+                warn!(
+                    position = self.position.position(),
+                    filtered_bids = reduce_only_result.filtered_bids,
+                    filtered_asks = reduce_only_result.filtered_asks,
+                    "Reduce-only ESCALATION: cancelling all position-increasing quotes"
+                );
+                // Clear the side that would increase position
+                if reduce_only_result.filtered_bids {
+                    bid_quotes.clear();
+                }
+                if reduce_only_result.filtered_asks {
+                    ask_quotes.clear();
+                }
             }
 
             debug!(
@@ -1956,7 +2034,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 &quote_config,
                 self.position.position(),
                 self.effective_max_position, // First-principles limit
-                decision_adjusted_liquidity, // Decision-adjusted viable size
+                kelly_adjusted_liquidity, // Decision + Kelly-adjusted viable size
                 &market_params,
             );
 

@@ -426,10 +426,45 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // === Kill Switch Check (before processing any message) ===
             if self.safety.kill_switch.is_triggered() {
                 let reasons = self.safety.kill_switch.trigger_reasons();
-                error!(
-                    "KILL SWITCH TRIGGERED: {:?}",
-                    reasons.iter().map(|r| r.to_string()).collect::<Vec<_>>()
+                let reason_strs: Vec<String> = reasons.iter().map(|r| r.to_string()).collect();
+                error!("KILL SWITCH TRIGGERED: {:?}", reason_strs);
+
+                // Write post-mortem dump for incident analysis
+                let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+                let trigger_str = reason_strs.first().cloned().unwrap_or_default();
+                let mut dump = crate::market_maker::monitoring::PostMortemDump::new(
+                    trigger_str,
+                    pnl_summary.total_pnl,
+                    self.safety.kill_switch.config().max_daily_loss,
                 );
+                dump.position = self.position.position();
+                dump.daily_pnl = pnl_summary.total_pnl;
+                dump.realized_pnl = pnl_summary.realized_pnl;
+                dump.unrealized_pnl = pnl_summary.unrealized_pnl;
+                dump.mid_price = self.latest_mid;
+                dump.cascade_severity = self.tier1.liquidation_detector.cascade_severity();
+                dump.risk_state = crate::market_maker::monitoring::RiskSnapshot {
+                    drawdown_pct: if pnl_summary.peak_pnl > 0.0 {
+                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl * 100.0
+                    } else {
+                        0.0
+                    },
+                    margin_utilization_pct: 0.0,
+                    position_utilization_pct: if self.effective_max_position > 0.0 {
+                        self.position.position().abs() / self.effective_max_position * 100.0
+                    } else {
+                        0.0
+                    },
+                    rate_limit_errors: self.safety.kill_switch.state().rate_limit_errors,
+                    kill_switch_reasons: reason_strs,
+                };
+
+                let postmortem_dir = std::path::Path::new("logs/postmortem");
+                match dump.write_to_dir(postmortem_dir) {
+                    Ok(path) => error!("Post-mortem dump written to {path:?}"),
+                    Err(e) => error!("Failed to write post-mortem dump: {e}"),
+                }
+
                 break;
             }
 

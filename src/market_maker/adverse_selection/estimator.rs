@@ -115,6 +115,10 @@ pub struct AdverseSelectionEstimator {
 
     /// Threshold in bps for classifying a fill as "informed"
     informed_threshold_bps: f64,
+
+    /// EWMA of recent adverse selection magnitude (in bps) for spread widening.
+    /// Smoothed over ~10 fills (alpha ≈ 0.1) to react to AS regime changes.
+    recent_as_ewma_bps: f64,
 }
 
 impl AdverseSelectionEstimator {
@@ -137,6 +141,7 @@ impl AdverseSelectionEstimator {
             informed_fills_count: 0,
             uninformed_fills_count: 0,
             informed_threshold_bps: 5.0, // Default: 5 bps = "informed"
+            recent_as_ewma_bps: 0.0,
         }
     }
 
@@ -254,6 +259,11 @@ impl AdverseSelectionEstimator {
             } else {
                 self.uninformed_fills_count += 1;
             }
+
+            // Update rolling AS severity EWMA (alpha=0.1, ~10 fill half-life)
+            const AS_SEVERITY_ALPHA: f64 = 0.1;
+            self.recent_as_ewma_bps = AS_SEVERITY_ALPHA * adverse_move_bps
+                + (1.0 - AS_SEVERITY_ALPHA) * self.recent_as_ewma_bps;
         }
 
         // Periodically update best horizon selection
@@ -534,6 +544,28 @@ impl AdverseSelectionEstimator {
     /// Get the current informed threshold in bps.
     pub fn informed_threshold_bps(&self) -> f64 {
         self.informed_threshold_bps
+    }
+
+    /// Spread multiplier based on recent AS severity (rolling EWMA over ~10 fills).
+    ///
+    /// Returns a multiplier to widen spreads when recent fills show persistent
+    /// adverse selection:
+    /// - > 5 bps AS: 1.5x (heavy AS, widen 50%)
+    /// - > 3 bps AS: 1.25x (moderate AS, widen 25%)
+    /// - otherwise: 1.0x (normal)
+    pub fn recent_as_severity_mult(&self) -> f64 {
+        if self.recent_as_ewma_bps > 5.0 {
+            1.5
+        } else if self.recent_as_ewma_bps > 3.0 {
+            1.25
+        } else {
+            1.0
+        }
+    }
+
+    /// Get the current rolling AS severity in bps (for diagnostics).
+    pub fn recent_as_severity_bps(&self) -> f64 {
+        self.recent_as_ewma_bps
     }
 }
 

@@ -328,10 +328,31 @@ impl ModelPredictions {
     }
 }
 
-/// Fill probability estimation using GLFT intensity model
+/// Fill probability estimation using GLFT intensity model with regime-aware characteristic depth.
+///
+/// Uses soft HMM regime probabilities and realized volatility to scale delta_char_bps:
+/// - Quiet regime: fills need more depth penetration (higher delta_char)
+/// - Cascade regime: everything gets swept (lower delta_char)
+/// - Higher volatility relative to baseline means fills happen easier
 fn estimate_fill_probability(depth_bps: f64, params: &MarketParams, horizon_s: f64) -> f64 {
-    // λ(δ) = κ × exp(-δ/δ_char) where δ_char ≈ 10 bps typically
-    let delta_char_bps = 10.0;
+    // Per-regime characteristic depth (bps) — how deep price needs to move for a fill
+    const DELTA_QUIET: f64 = 15.0; // Quiet — fills need more depth
+    const DELTA_ACTIVE: f64 = 10.0; // Active — normal
+    const DELTA_VOLATILE: f64 = 7.0; // Volatile — fills happen easier
+    const DELTA_CASCADE: f64 = 4.0; // Cascade — everything gets swept
+
+    // Soft regime-weighted delta using HMM probabilities [Quiet, Active, Volatile, Cascade]
+    let regime_probs = params.regime_probs;
+    let base_delta = regime_probs[0] * DELTA_QUIET
+        + regime_probs[1] * DELTA_ACTIVE
+        + regime_probs[2] * DELTA_VOLATILE
+        + regime_probs[3] * DELTA_CASCADE;
+
+    // Scale by realized volatility relative to baseline (0.01% per-second = 1bp/s)
+    // Higher vol → smaller delta_char → fills happen more easily
+    const BASELINE_SIGMA: f64 = 0.0001;
+    let delta_char_bps = base_delta * (params.sigma / BASELINE_SIGMA).sqrt().clamp(0.5, 3.0);
+
     let kappa = if params.use_kappa_robust {
         params.kappa_robust
     } else {

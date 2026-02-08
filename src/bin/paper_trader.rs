@@ -89,7 +89,8 @@ use hyperliquid_rust_sdk::market_maker::risk::{RiskState, RiskAggregator, RiskSe
 use hyperliquid_rust_sdk::market_maker::risk::monitors::*;
 use hyperliquid_rust_sdk::round_to_significant_and_decimal;
 use hyperliquid_rust_sdk::market_maker::checkpoint::{
-    CheckpointBundle, CheckpointManager, CheckpointMetadata,
+    CheckpointBundle, CheckpointManager, CheckpointMetadata, EnsembleWeightsCheckpoint,
+    KellyTrackerCheckpoint,
 };
 use hyperliquid_rust_sdk::market_maker::stochastic::{
     StochasticControlBuilder, StochasticControlConfig,
@@ -204,8 +205,8 @@ struct Cli {
 
     /// Max position size in notional USD (asset-agnostic).
     /// Converted to contracts on first valid mid price: max_position = max_position_usd / mid_price.
-    /// Default: $1,000.
-    #[arg(long, default_value_t = 1000.0)]
+    /// Default: $200 (~6.4 HYPE at $31). Forces inventory management to engage sooner.
+    #[arg(long, default_value_t = 200.0)]
     max_position_usd: f64,
 }
 
@@ -951,6 +952,13 @@ impl SimulationState {
             if market_params.kappa_robust < paper_kappa_floor {
                 market_params.kappa_robust = paper_kappa_floor;
             }
+
+            // Disable regime kappa blending during warmup to prevent the floor from
+            // being blended down (70% floor + 30% regime_kappa ≈ 2000 → kappa drops to ~6200).
+            // Once past confidence threshold, regime blending can resume safely.
+            if kappa_conf < KAPPA_CONFIDENCE_THRESHOLD {
+                market_params.regime_kappa = None;
+            }
         }
 
         // Update strategy's fill model with current volatility
@@ -1287,6 +1295,22 @@ impl SimulationState {
             mid_at_fill: self.mid_price,
         });
 
+        // === FIX: Wire adaptive spread learning from fills (ROOT CAUSE of stuck warmup) ===
+        // Without this, adaptive_spreads never sees fills and warmup_progress() stays at ~10%.
+        // Mirrors the live system's handlers.rs:456-484 logic exactly.
+        if self.mid_price > 0.0 {
+            let direction = if is_buy { 1.0 } else { -1.0 };
+            let as_realized = (self.mid_price - fill.fill_price) * direction / fill.fill_price;
+            let depth_from_mid = (fill.fill_price - self.mid_price).abs() / self.mid_price;
+            let fill_pnl = -as_realized;
+            self.adaptive_spreads.on_fill_simple(
+                as_realized,
+                depth_from_mid,
+                fill_pnl,
+                self.estimator.kappa(),
+            );
+        }
+
         // Per-fill spread capture: positive if we captured spread (bought below mid / sold above mid)
         let spread_capture = if is_buy {
             (self.mid_price - fill.fill_price) * fill.fill_size
@@ -1401,6 +1425,8 @@ impl SimulationState {
             kappa_bid,
             kappa_ask,
             momentum,
+            kelly_tracker: KellyTrackerCheckpoint::default(),
+            ensemble_weights: EnsembleWeightsCheckpoint::default(),
         }
     }
 

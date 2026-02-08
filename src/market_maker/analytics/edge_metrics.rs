@@ -108,6 +108,36 @@ impl EdgeTracker {
         t_stat > T_CRITICAL_95
     }
 
+    /// Returns an alarm multiplier if mean realized edge is negative.
+    ///
+    /// - `None` if fewer than 10 fills or edge is non-negative.
+    /// - `Some(2.0)` if mean realized edge < -1 bps (strongly negative).
+    /// - `Some(1.5)` if mean realized edge < 0 (mildly negative).
+    pub fn negative_edge_alarm(&self) -> Option<f64> {
+        if self.snapshots.len() < 10 {
+            return None;
+        }
+        let mean = self.mean_realized_edge();
+        if mean >= 0.0 {
+            return None;
+        }
+        if mean < -1.0 {
+            Some(2.0)
+        } else {
+            Some(1.5)
+        }
+    }
+
+    /// Whether trading should be paused due to consistently negative edge.
+    ///
+    /// Returns `true` if 20+ fills and mean realized edge < -2 bps.
+    pub fn should_pause_trading(&self) -> bool {
+        if self.snapshots.len() < 20 {
+            return false;
+        }
+        self.mean_realized_edge() < -2.0
+    }
+
     /// Human-readable edge report.
     pub fn format_report(&self) -> String {
         if self.snapshots.is_empty() {
@@ -231,5 +261,66 @@ mod tests {
     fn test_format_report_empty() {
         let tracker = EdgeTracker::new();
         assert_eq!(tracker.format_report(), "No edge data");
+    }
+
+    #[test]
+    fn test_negative_edge_alarm_insufficient_data() {
+        let mut tracker = EdgeTracker::new();
+        // Add fewer than 10 fills with negative edge
+        for _ in 0..9 {
+            tracker.add_snapshot(make_snapshot(5.0, -3.0));
+        }
+        assert!(tracker.negative_edge_alarm().is_none());
+    }
+
+    #[test]
+    fn test_negative_edge_alarm_positive_edge() {
+        let mut tracker = EdgeTracker::new();
+        for _ in 0..20 {
+            tracker.add_snapshot(make_snapshot(5.0, 3.0));
+        }
+        assert!(tracker.negative_edge_alarm().is_none());
+    }
+
+    #[test]
+    fn test_negative_edge_alarm_mild_negative() {
+        let mut tracker = EdgeTracker::new();
+        // Mean realized edge = -0.5 bps (negative but > -1 bps)
+        for _ in 0..10 {
+            tracker.add_snapshot(make_snapshot(5.0, -0.5));
+        }
+        assert_eq!(tracker.negative_edge_alarm(), Some(1.5));
+    }
+
+    #[test]
+    fn test_negative_edge_alarm_strong_negative() {
+        let mut tracker = EdgeTracker::new();
+        // Mean realized edge = -3.0 bps (< -1 bps)
+        for _ in 0..10 {
+            tracker.add_snapshot(make_snapshot(5.0, -3.0));
+        }
+        assert_eq!(tracker.negative_edge_alarm(), Some(2.0));
+    }
+
+    #[test]
+    fn test_should_pause_trading() {
+        let mut tracker = EdgeTracker::new();
+
+        // Fewer than 20 fills — never pause
+        for _ in 0..19 {
+            tracker.add_snapshot(make_snapshot(5.0, -5.0));
+        }
+        assert!(!tracker.should_pause_trading());
+
+        // Add one more to hit 20 fills with mean edge = -5.0 bps (< -2 bps)
+        tracker.add_snapshot(make_snapshot(5.0, -5.0));
+        assert!(tracker.should_pause_trading());
+
+        // Tracker with mild negative edge (> -2 bps) should NOT pause
+        let mut mild_tracker = EdgeTracker::new();
+        for _ in 0..25 {
+            mild_tracker.add_snapshot(make_snapshot(5.0, -1.0));
+        }
+        assert!(!mild_tracker.should_pause_trading());
     }
 }

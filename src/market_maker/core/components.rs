@@ -8,6 +8,7 @@ use crate::market_maker::{
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EnhancedASClassifier,
         PreFillASClassifier,
     },
+    analytics::EdgeTracker,
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{
         CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
@@ -132,6 +133,8 @@ pub struct Tier2Components {
     pub spread_tracker: SpreadProcessEstimator,
     /// P&L tracker
     pub pnl_tracker: PnLTracker,
+    /// Edge validation tracker (predicted vs realized edge)
+    pub edge_tracker: EdgeTracker,
 }
 
 impl Tier2Components {
@@ -147,6 +150,7 @@ impl Tier2Components {
             funding: FundingRateEstimator::new(funding_config),
             spread_tracker: SpreadProcessEstimator::new(spread_config),
             pnl_tracker: PnLTracker::new(pnl_config),
+            edge_tracker: EdgeTracker::new(),
         }
     }
 }
@@ -811,6 +815,7 @@ mod tests {
             PnLConfig::default(),
         );
         assert!((tier2.pnl_tracker.summary(50000.0).total_pnl).abs() < f64::EPSILON);
+        assert_eq!(tier2.edge_tracker.edge_count(), 0);
     }
 
     #[test]

@@ -110,6 +110,18 @@ pub trait QuotingStrategy: Send + Sync {
     fn fill_model_warmed_up(&self) -> bool {
         true // Default: always warmed up for strategies without fill models
     }
+
+    /// Record no-fill observations for depths that were quoted but not filled during a cycle.
+    ///
+    /// Call this at each quote refresh with the depths of the previous cycle's levels.
+    /// This provides negative signal to the Bayesian fill model — "I had an order here
+    /// and it was NOT filled" — which is essential for calibration alongside fill observations.
+    ///
+    /// # Arguments
+    /// * `depths_bps` - Depths (in bps from mid) of levels that were quoted but not filled
+    fn record_quote_cycle_no_fills(&mut self, _depths_bps: &[f64]) {
+        // Default: no-op for strategies without Bayesian fill models
+    }
 }
 
 /// Blanket implementation for Box<dyn QuotingStrategy>.
@@ -162,6 +174,10 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
 
     fn fill_model_warmed_up(&self) -> bool {
         (**self).fill_model_warmed_up()
+    }
+
+    fn record_quote_cycle_no_fills(&mut self, depths_bps: &[f64]) {
+        (**self).record_quote_cycle_no_fills(depths_bps)
     }
 }
 

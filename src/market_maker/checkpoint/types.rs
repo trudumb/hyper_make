@@ -35,6 +35,12 @@ pub struct CheckpointBundle {
     pub kappa_ask: KappaCheckpoint,
     /// Momentum model — continuation probabilities by magnitude
     pub momentum: MomentumCheckpoint,
+    /// Kelly win/loss tracker state for position sizing persistence
+    #[serde(default)]
+    pub kelly_tracker: KellyTrackerCheckpoint,
+    /// Model ensemble weights for prediction persistence
+    #[serde(default)]
+    pub ensemble_weights: EnsembleWeightsCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -191,8 +197,8 @@ pub struct VolFilterCheckpoint {
 impl Default for VolFilterCheckpoint {
     fn default() -> Self {
         Self {
-            sigma_mean: 0.0,
-            sigma_std: 0.0,
+            sigma_mean: 0.0005, // Reasonable crypto vol prior (~5 bps/sqrt(s))
+            sigma_std: 0.0002, // Non-degenerate prior spread
             regime_probs: [0.1, 0.7, 0.15, 0.05],
             observation_count: 0,
         }
@@ -343,6 +349,57 @@ impl Default for MomentumCheckpoint {
     }
 }
 
+/// Kelly win/loss tracker learned state.
+///
+/// Persists EWMA of wins/losses and counts so Kelly sizing
+/// doesn't restart from priors after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KellyTrackerCheckpoint {
+    /// EWMA of win sizes (bps)
+    pub ewma_wins: f64,
+    /// Count of wins
+    pub n_wins: u64,
+    /// EWMA of loss sizes (bps)
+    pub ewma_losses: f64,
+    /// Count of losses
+    pub n_losses: u64,
+    /// EWMA decay factor
+    pub decay: f64,
+}
+
+impl Default for KellyTrackerCheckpoint {
+    fn default() -> Self {
+        Self {
+            ewma_wins: 5.0,
+            n_wins: 0,
+            ewma_losses: 3.0,
+            n_losses: 0,
+            decay: 0.99,
+        }
+    }
+}
+
+/// Model ensemble weight state.
+///
+/// Persists softmax weights learned from fill outcomes
+/// so the ensemble doesn't restart from uniform priors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsembleWeightsCheckpoint {
+    /// Softmax weights per model [GLFT, Empirical, Funding]
+    pub model_weights: Vec<f64>,
+    /// Total weight updates performed
+    pub total_updates: usize,
+}
+
+impl Default for EnsembleWeightsCheckpoint {
+    fn default() -> Self {
+        Self {
+            model_weights: vec![0.5, 0.3, 0.2],
+            total_updates: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +444,17 @@ mod tests {
             kappa_bid: KappaCheckpoint::default(),
             kappa_ask: KappaCheckpoint::default(),
             momentum: MomentumCheckpoint::default(),
+            kelly_tracker: KellyTrackerCheckpoint {
+                ewma_wins: 7.5,
+                n_wins: 42,
+                ewma_losses: 2.1,
+                n_losses: 18,
+                decay: 0.98,
+            },
+            ensemble_weights: EnsembleWeightsCheckpoint {
+                model_weights: vec![0.6, 0.25, 0.15],
+                total_updates: 100,
+            },
         };
 
         // Serialize to JSON
@@ -404,6 +472,14 @@ mod tests {
         assert_eq!(restored.vol_filter.observation_count, 500);
         assert_eq!(restored.kappa_own.prior_alpha, 15.0);
         assert_eq!(restored.kappa_own.observation_count, 200);
+        // Kelly tracker round-trip
+        assert_eq!(restored.kelly_tracker.n_wins, 42);
+        assert_eq!(restored.kelly_tracker.n_losses, 18);
+        assert_eq!(restored.kelly_tracker.ewma_wins, 7.5);
+        assert_eq!(restored.kelly_tracker.decay, 0.98);
+        // Ensemble weights round-trip
+        assert_eq!(restored.ensemble_weights.model_weights, vec![0.6, 0.25, 0.15]);
+        assert_eq!(restored.ensemble_weights.total_updates, 100);
     }
 
     #[test]

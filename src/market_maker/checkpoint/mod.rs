@@ -90,6 +90,8 @@ impl CheckpointManager {
             enhanced_samples = bundle.enhanced.learning_samples,
             vol_filter_obs = bundle.vol_filter.observation_count,
             kappa_own_obs = bundle.kappa_own.observation_count,
+            kelly_wins = bundle.kelly_tracker.n_wins,
+            kelly_losses = bundle.kelly_tracker.n_losses,
             "Checkpoint saved to {}",
             checkpoint_path.display()
         );
@@ -226,6 +228,8 @@ mod tests {
             kappa_bid: KappaCheckpoint::default(),
             kappa_ask: KappaCheckpoint::default(),
             momentum: MomentumCheckpoint::default(),
+            kelly_tracker: KellyTrackerCheckpoint::default(),
+            ensemble_weights: EnsembleWeightsCheckpoint::default(),
         }
     }
 

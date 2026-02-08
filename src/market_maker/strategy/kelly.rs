@@ -331,6 +331,22 @@ impl WinLossTracker {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// Restore tracker state from checkpoint data.
+    pub fn restore_from_checkpoint(
+        &mut self,
+        ewma_wins: f64,
+        n_wins: u64,
+        ewma_losses: f64,
+        n_losses: u64,
+        decay: f64,
+    ) {
+        self.ewma_wins = ewma_wins;
+        self.n_wins = n_wins;
+        self.ewma_losses = ewma_losses;
+        self.n_losses = n_losses;
+        self.decay = decay;
+    }
 }
 
 /// Configuration for Kelly sizer.

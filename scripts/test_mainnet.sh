@@ -96,8 +96,8 @@ mkdir -p "${LOG_DIR}"
 
 # Pre-flight check: verify build
 echo -e "${YELLOW}[1/4] Verifying build...${NC}"
-if ! cargo build --bin market_maker 2>/dev/null; then
-    echo -e "${RED}Build failed! Run 'cargo build' to see errors.${NC}"
+if ! cargo build --release --bin market_maker 2>/dev/null; then
+    echo -e "${RED}Build failed! Run 'cargo build --release' to see errors.${NC}"
     exit 1
 fi
 echo -e "${GREEN}Build OK${NC}"
@@ -170,7 +170,7 @@ fi
 
 # Use timeout with --foreground to ensure signals are forwarded to the child
 RUST_LOG=hyperliquid_rust_sdk::market_maker=debug \
-timeout --foreground "${DURATION}" ./target/debug/market_maker ${MM_ARGS} \
+timeout --foreground "${DURATION}" ./target/release/market_maker ${MM_ARGS} \
     2>&1 | tee -a "${LOG_FILE}.console" || true
 
 # Stop capture tool if started

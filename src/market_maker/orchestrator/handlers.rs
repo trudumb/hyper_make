@@ -487,6 +487,46 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // This updates fill rate tracking for fill-hungry mode
                 self.stochastic.calibration_controller.record_fill();
 
+                // === ModelGating Updates ===
+                // Feed fill data to SignalIntegrator's ModelGating tracker.
+                // This updates kappa IR tracking and regime-conditioned kappa estimation.
+                let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
+                self.stochastic.signal_integrator.on_fill(
+                    fill.time,
+                    fill_price,
+                    fill_size,
+                    self.latest_mid,
+                );
+
+                // Update adverse selection prediction tracking in ModelGating.
+                // predicted_as_prob comes from the Bayesian edge estimator;
+                // was_adverse is true when realized AS exceeds the 3 bps threshold.
+                let predicted_as_prob = self.stochastic.theoretical_edge.bayesian_adverse();
+                let was_adverse = as_realized * 10000.0 > 3.0;
+                self.stochastic
+                    .signal_integrator
+                    .update_as_prediction(predicted_as_prob, was_adverse);
+
+                // === EDGE TRACKING: Record predicted vs realized edge per fill ===
+                {
+                    use crate::market_maker::analytics::EdgeSnapshot;
+                    const MAKER_FEE_BPS: f64 = 1.5;
+                    let depth_bps = depth_from_mid * 10_000.0;
+                    let as_realized_bps = as_realized * 10_000.0;
+                    let predicted_as_bps = predicted_as_prob * 10_000.0;
+                    let snap = EdgeSnapshot {
+                        timestamp_ns: fill.time * 1_000_000, // ms to ns
+                        predicted_spread_bps: depth_bps,
+                        realized_spread_bps: depth_bps,
+                        predicted_as_bps,
+                        realized_as_bps: as_realized_bps,
+                        fee_bps: MAKER_FEE_BPS,
+                        predicted_edge_bps: depth_bps - predicted_as_bps - MAKER_FEE_BPS,
+                        realized_edge_bps: depth_bps - as_realized_bps - MAKER_FEE_BPS,
+                    };
+                    self.tier2.edge_tracker.add_snapshot(snap);
+                }
+
                 // === V2 INTEGRATION: BOCPD Kappa Relationship Update ===
                 // Update BOCPD with observed features→kappa relationship + stress signals.
                 // First-Principles Gap 1: Adaptive hazard rate based on market stress.
@@ -521,7 +561,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
 
                 // DUAL-WRITE (Phase 3): Forward fill to centralized belief state
-                let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
                 let timestamp_ms = fill.time;
                 // Determine if fill is aligned with current position direction
                 let is_aligned = (is_buy && self.position.position() > 0.0)

@@ -207,6 +207,19 @@ impl LadderStrategy {
         self.fill_model.log_diagnostics();
     }
 
+    /// Record no-fill observations for levels that were quoted but not filled.
+    ///
+    /// Each depth represents a level that survived an entire quote cycle without
+    /// being filled. This provides the negative signal needed for calibration:
+    /// without it, the model only sees fills and overestimates fill probability.
+    pub fn record_no_fill_cycle(&mut self, depths_bps: &[f64]) {
+        for &depth in depths_bps {
+            if depth > 0.0 {
+                self.fill_model.record_observation(depth, false);
+            }
+        }
+    }
+
     // =========================================================================
     // Quota-Aware Ladder Density (Death Spiral Prevention)
     // =========================================================================
@@ -937,6 +950,21 @@ impl LadderStrategy {
             total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
             "[SPREAD TRACE] after kappa spread cap"
         );
+
+        // === PRE-FILL AS MULTIPLIERS ===
+        // Apply asymmetric spread widening from pre-fill adverse selection classifier.
+        // These multipliers are [1.0, 3.0] where >1.0 indicates predicted toxicity on that side.
+        // Widen depths (not gamma) to get direct, per-side spread control.
+        if market_params.pre_fill_spread_mult_bid > 1.01 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth *= market_params.pre_fill_spread_mult_bid;
+            }
+        }
+        if market_params.pre_fill_spread_mult_ask > 1.01 {
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth *= market_params.pre_fill_spread_mult_ask;
+            }
+        }
 
         // === REMOVED: L2 SPREAD MULTIPLIER ===
         // The l2_spread_multiplier has been removed. All uncertainty is now handled
@@ -1670,6 +1698,10 @@ impl QuotingStrategy for LadderStrategy {
 
     fn fill_model_warmed_up(&self) -> bool {
         self.fill_model.is_warmed_up()
+    }
+
+    fn record_quote_cycle_no_fills(&mut self, depths_bps: &[f64]) {
+        self.record_no_fill_cycle(depths_bps);
     }
 }
 

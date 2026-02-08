@@ -250,7 +250,7 @@ impl ParameterAggregator {
             conditional_as_posterior_mean_bps: if sources.adaptive_spreads.is_warmed_up() {
                 Some(sources.adaptive_spreads.floor_as_posterior_mean() * 10000.0)
             } else {
-                None // Use 0 buffer during warmup (don't penalize before measuring)
+                Some(2.0) // Conservative prior: 2 bps AS until warmed up
             },
 
             // === Tier 1: Pre-Fill AS Classifier (Phase 3) ===
@@ -610,7 +610,7 @@ impl ParameterAggregator {
             } else {
                 0.0 // Populated from stochastic controller in quote_engine
             },
-            spread_widening_mult: 1.0,    // Populated from QuoteGate when pending confirmation
+            spread_widening_mult: sources.adverse_selection.recent_as_severity_mult(),  // AS severity baseline; further multiplied by QuoteGate in quote_engine
 
             // === First-Principles Stochastic Control (Belief System) ===
             // Phase 7: Centralized beliefs are the single source of truth.

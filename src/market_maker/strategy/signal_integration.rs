@@ -923,7 +923,17 @@ impl SignalIntegrator {
         &self.model_gating
     }
 
-    /// Check if any signal component is warmed up.
+    /// Get the model gating spread multiplier based on IR confidence.
+    /// Returns 1.0 when models are well-calibrated, up to 2.0 when uncalibrated.
+    pub fn model_gating_spread_multiplier(&self) -> f64 {
+        if self.config.use_model_gating {
+            self.model_gating.spread_multiplier()
+        } else {
+            1.0
+        }
+    }
+
+    /// Check if all enabled signal components are warmed up.
     pub fn is_warmed_up(&self) -> bool {
         let lag_ready = !self.config.use_lead_lag || self.lag_analyzer.is_ready();
         let flow_ready = !self.config.use_informed_flow || self.informed_flow.is_warmed_up();
@@ -931,7 +941,32 @@ impl SignalIntegrator {
         let cross_venue_ready =
             !self.config.use_cross_venue || self.binance_flow.is_warmed_up();
 
-        lag_ready || flow_ready || kappa_ready || cross_venue_ready
+        lag_ready && flow_ready && kappa_ready && cross_venue_ready
+    }
+
+    /// Spread multiplier based on signal staleness.
+    /// Returns > 1.0 when enabled signals are stale, providing defensive widening.
+    pub fn staleness_spread_multiplier(&self) -> f64 {
+        let mut stale_count = 0;
+
+        if self.config.use_lead_lag && !self.lag_analyzer.is_ready() {
+            stale_count += 1;
+        }
+        if self.config.use_cross_venue && !self.binance_flow.is_warmed_up() {
+            stale_count += 1;
+        }
+        if self.config.use_informed_flow && !self.informed_flow.is_warmed_up() {
+            stale_count += 1;
+        }
+        if self.config.use_regime_kappa && !self.regime_kappa.is_warmed_up() {
+            stale_count += 1;
+        }
+
+        match stale_count {
+            0 => 1.0,
+            1 => 1.5,
+            _ => 2.0, // Multiple stale signals = maximum defense
+        }
     }
 
     /// Get lag analyzer status for diagnostics.
@@ -1132,5 +1167,34 @@ mod tests {
         // Manually constructed IntegratedSignals should have None contributions
         let signals = IntegratedSignals::default();
         assert!(signals.signal_contributions.is_none());
+    }
+
+    #[test]
+    fn test_staleness_spread_multiplier() {
+        // All signals disabled => no staleness => 1.0
+        let disabled = SignalIntegrator::new(SignalIntegratorConfig::disabled());
+        assert!((disabled.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON);
+
+        // Enable one signal that hasn't warmed up => 1.5x
+        let mut config_one = SignalIntegratorConfig::disabled();
+        config_one.use_lead_lag = true;
+        let one_stale = SignalIntegrator::new(config_one);
+        assert!((one_stale.staleness_spread_multiplier() - 1.5).abs() < f64::EPSILON);
+
+        // Enable two signals that haven't warmed up => 2.0x
+        let mut config_two = SignalIntegratorConfig::disabled();
+        config_two.use_lead_lag = true;
+        config_two.use_cross_venue = true;
+        let two_stale = SignalIntegrator::new(config_two);
+        assert!((two_stale.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
+
+        // Enable all four tracked signals => 2.0x (capped)
+        let mut config_all = SignalIntegratorConfig::disabled();
+        config_all.use_lead_lag = true;
+        config_all.use_cross_venue = true;
+        config_all.use_informed_flow = true;
+        config_all.use_regime_kappa = true;
+        let all_stale = SignalIntegrator::new(config_all);
+        assert!((all_stale.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
     }
 }

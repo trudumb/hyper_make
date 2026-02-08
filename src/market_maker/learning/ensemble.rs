@@ -250,6 +250,8 @@ pub struct ModelEnsemble {
     temperature: f64,
     /// Minimum weight floor
     min_weight: f64,
+    /// Total weight updates performed
+    update_count: usize,
 }
 
 impl Default for ModelEnsemble {
@@ -275,6 +277,7 @@ impl ModelEnsemble {
             model_scores: (0..n_models).map(|_| RingBuffer::new(100)).collect(),
             temperature: 1.0,
             min_weight: 0.05, // Each model gets at least 5%
+            update_count: 0,
         }
     }
 
@@ -288,6 +291,7 @@ impl ModelEnsemble {
             model_scores: (0..n_models).map(|_| RingBuffer::new(100)).collect(),
             temperature: 1.0,
             min_weight: 0.05,
+            update_count: 0,
         }
     }
 
@@ -375,6 +379,8 @@ impl ModelEnsemble {
         for w in &mut self.weights {
             *w /= sum_weights;
         }
+
+        self.update_count += 1;
     }
 
     /// Get current model weights.
@@ -390,6 +396,43 @@ impl ModelEnsemble {
     /// Set temperature for exploration/exploitation.
     pub fn set_temperature(&mut self, temperature: f64) {
         self.temperature = temperature.max(0.1);
+    }
+
+    /// Apply a health penalty to a specific model's weight.
+    ///
+    /// `penalty_factor`: 0.5 for degraded signals, 0.1 for stale signals.
+    /// The weights are renormalized after applying the penalty.
+    pub fn apply_health_penalty(&mut self, model_index: usize, penalty_factor: f64) {
+        if model_index < self.weights.len() {
+            self.weights[model_index] *= penalty_factor;
+            // Renormalize
+            let sum: f64 = self.weights.iter().sum();
+            if sum > 0.0 {
+                for w in &mut self.weights {
+                    *w /= sum;
+                }
+            }
+        }
+    }
+
+    /// Get current model weights (cloned, for checkpoint persistence).
+    pub fn current_weights(&self) -> Vec<f64> {
+        self.weights.clone()
+    }
+
+    /// Get total weight updates performed.
+    pub fn total_updates(&self) -> usize {
+        self.update_count
+    }
+
+    /// Restore weights from checkpoint data.
+    ///
+    /// Only applies if the weight vector length matches the number of models.
+    pub fn restore_weights(&mut self, weights: &[f64], total_updates: usize) {
+        if weights.len() == self.weights.len() {
+            self.weights.copy_from_slice(weights);
+            self.update_count = total_updates;
+        }
     }
 }
 

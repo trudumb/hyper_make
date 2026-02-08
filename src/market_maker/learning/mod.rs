@@ -553,9 +553,64 @@ impl LearningModule {
         self.kelly_tracker.is_warmed_up()
     }
 
+    /// Get Kelly-optimal position fraction for sizing.
+    ///
+    /// Returns Some(fraction) when tracker has enough data (50+ fills),
+    /// None during warmup. Fraction is clamped to [0.05, 0.30].
+    pub fn kelly_recommendation(&self) -> Option<f64> {
+        if !self.kelly_tracker.is_warmed_up() {
+            return None;
+        }
+
+        let p = self.kelly_tracker.win_rate();
+        let b = self.kelly_tracker.odds_ratio();
+
+        if b <= 0.0 || p <= 0.0 {
+            return None;
+        }
+
+        let q = 1.0 - p;
+        let f_full = (p * b - q) / b;
+
+        if f_full <= 0.0 {
+            return Some(0.05); // Minimum floor even with marginal edge
+        }
+
+        // 15% fractional Kelly, clamped
+        let fraction = (0.15 * f_full).clamp(0.05, 0.30);
+        Some(fraction)
+    }
+
     /// Get the Kelly win/loss tracker for cloning to strategy.
     pub fn kelly_tracker(&self) -> &WinLossTracker {
         &self.kelly_tracker
+    }
+
+    /// Get current ensemble weights for checkpoint persistence.
+    pub fn ensemble_weights(&self) -> Vec<f64> {
+        self.ensemble.current_weights()
+    }
+
+    /// Get total ensemble weight updates for checkpoint persistence.
+    pub fn ensemble_total_updates(&self) -> usize {
+        self.ensemble.total_updates()
+    }
+
+    /// Restore Kelly tracker and ensemble weights from checkpoint.
+    pub fn restore_from_checkpoint(
+        &mut self,
+        kelly: &crate::market_maker::checkpoint::KellyTrackerCheckpoint,
+        ensemble: &crate::market_maker::checkpoint::EnsembleWeightsCheckpoint,
+    ) {
+        self.kelly_tracker.restore_from_checkpoint(
+            kelly.ewma_wins,
+            kelly.n_wins,
+            kelly.ewma_losses,
+            kelly.n_losses,
+            kelly.decay,
+        );
+        self.ensemble
+            .restore_weights(&ensemble.model_weights, ensemble.total_updates);
     }
 
     /// Get the risk model config for consistency with strategy.

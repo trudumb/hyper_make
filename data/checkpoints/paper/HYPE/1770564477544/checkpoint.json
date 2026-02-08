@@ -1,0 +1,529 @@
+{
+  "metadata": {
+    "version": 1,
+    "timestamp_ms": 1770564477544,
+    "asset": "HYPE",
+    "session_duration_s": 2400.264077306
+  },
+  "learned_params": {
+    "alpha_touch": {
+      "name": "alpha_touch",
+      "family": "Beta",
+      "prior_mean": 0.25,
+      "prior_strength": 8.0,
+      "posterior_param1": 2.0,
+      "posterior_param2": 6.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "gamma_base": {
+      "name": "gamma_base",
+      "family": "Gamma",
+      "prior_mean": 0.15,
+      "prior_strength": 3.0,
+      "posterior_param1": 3.0,
+      "posterior_param2": 20.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "spread_floor_bps": {
+      "name": "spread_floor_bps",
+      "family": "Normal",
+      "prior_mean": 5.0,
+      "prior_strength": 0.25,
+      "posterior_param1": 5.0,
+      "posterior_param2": 4.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "proactive_skew_sensitivity": {
+      "name": "proactive_skew_sensitivity",
+      "family": "Normal",
+      "prior_mean": 2.0,
+      "prior_strength": 4.0,
+      "posterior_param1": 2.0,
+      "posterior_param2": 0.25,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "quote_gate_edge_threshold": {
+      "name": "quote_gate_edge_threshold",
+      "family": "Beta",
+      "prior_mean": 0.15,
+      "prior_strength": 100.0,
+      "posterior_param1": 15.0,
+      "posterior_param2": 85.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "toxic_hour_gamma_mult": {
+      "name": "toxic_hour_gamma_mult",
+      "family": "LogNormal",
+      "prior_mean": 2.0,
+      "prior_strength": 3.4064542452769913,
+      "posterior_param1": 0.6500583324394191,
+      "posterior_param2": 0.08617769624105241,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "predictive_bias_sensitivity": {
+      "name": "predictive_bias_sensitivity",
+      "family": "Normal",
+      "prior_mean": 2.0,
+      "prior_strength": 1.0,
+      "posterior_param1": 2.0,
+      "posterior_param2": 1.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "max_daily_loss_fraction": {
+      "name": "max_daily_loss_fraction",
+      "family": "Beta",
+      "prior_mean": 0.02,
+      "prior_strength": 50.0,
+      "posterior_param1": 1.0,
+      "posterior_param2": 49.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "max_drawdown": {
+      "name": "max_drawdown",
+      "family": "Beta",
+      "prior_mean": 0.05,
+      "prior_strength": 20.0,
+      "posterior_param1": 1.0,
+      "posterior_param2": 19.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "cascade_oi_threshold": {
+      "name": "cascade_oi_threshold",
+      "family": "Beta",
+      "prior_mean": 0.02,
+      "prior_strength": 100.0,
+      "posterior_param1": 2.0,
+      "posterior_param2": 98.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "bocpd_hazard_rate": {
+      "name": "bocpd_hazard_rate",
+      "family": "Gamma",
+      "prior_mean": 0.004,
+      "prior_strength": 1.0,
+      "posterior_param1": 1.0,
+      "posterior_param2": 250.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "bocpd_threshold": {
+      "name": "bocpd_threshold",
+      "family": "Beta",
+      "prior_mean": 0.7,
+      "prior_strength": 10.0,
+      "posterior_param1": 7.0,
+      "posterior_param2": 3.0000000000000004,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "quote_latch_threshold_bps": {
+      "name": "quote_latch_threshold_bps",
+      "family": "Normal",
+      "prior_mean": 2.5,
+      "prior_strength": 1.0,
+      "posterior_param1": 2.5,
+      "posterior_param2": 1.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "kappa": {
+      "name": "kappa",
+      "family": "Gamma",
+      "prior_mean": 2000.0,
+      "prior_strength": 4.0,
+      "posterior_param1": 4.0,
+      "posterior_param2": 0.002,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "hawkes_mu": {
+      "name": "hawkes_mu",
+      "family": "Gamma",
+      "prior_mean": 0.5,
+      "prior_strength": 5.0,
+      "posterior_param1": 5.0,
+      "posterior_param2": 10.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "hawkes_alpha": {
+      "name": "hawkes_alpha",
+      "family": "Beta",
+      "prior_mean": 0.3,
+      "prior_strength": 10.0,
+      "posterior_param1": 3.0,
+      "posterior_param2": 7.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "hawkes_beta": {
+      "name": "hawkes_beta",
+      "family": "Gamma",
+      "prior_mean": 0.1,
+      "prior_strength": 1.0,
+      "posterior_param1": 1.0,
+      "posterior_param2": 10.0,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "kappa_ewma_alpha": {
+      "name": "kappa_ewma_alpha",
+      "family": "Beta",
+      "prior_mean": 0.9,
+      "prior_strength": 100.0,
+      "posterior_param1": 90.0,
+      "posterior_param2": 9.999999999999998,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "kelly_tracker_decay": {
+      "name": "kelly_tracker_decay",
+      "family": "Beta",
+      "prior_mean": 0.99,
+      "prior_strength": 100.0,
+      "posterior_param1": 99.0,
+      "posterior_param2": 1.0000000000000009,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "regime_sticky_diagonal": {
+      "name": "regime_sticky_diagonal",
+      "family": "Beta",
+      "prior_mean": 0.95,
+      "prior_strength": 100.0,
+      "posterior_param1": 95.0,
+      "posterior_param2": 5.000000000000004,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "kalman_q": {
+      "name": "kalman_q",
+      "family": "InverseGamma",
+      "prior_mean": 1e-8,
+      "prior_strength": 20.0,
+      "posterior_param1": 10.0,
+      "posterior_param2": 9e-8,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "kalman_r": {
+      "name": "kalman_r",
+      "family": "InverseGamma",
+      "prior_mean": 2.5e-9,
+      "prior_strength": 20.0,
+      "posterior_param1": 10.0,
+      "posterior_param2": 2.25e-8,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "momentum_normalizer_bps": {
+      "name": "momentum_normalizer_bps",
+      "family": "Gamma",
+      "prior_mean": 20.0,
+      "prior_strength": 4.0,
+      "posterior_param1": 4.0,
+      "posterior_param2": 0.2,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "depth_spacing_ratio": {
+      "name": "depth_spacing_ratio",
+      "family": "LogNormal",
+      "prior_mean": 1.5,
+      "prior_strength": 5.04942884800136,
+      "posterior_param1": 0.3858547515315237,
+      "posterior_param2": 0.03922071315328133,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "fill_probability_width_bps": {
+      "name": "fill_probability_width_bps",
+      "family": "Normal",
+      "prior_mean": 2.0,
+      "prior_strength": 4.0,
+      "posterior_param1": 2.0,
+      "posterior_param2": 0.25,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "microprice_decay": {
+      "name": "microprice_decay",
+      "family": "Beta",
+      "prior_mean": 0.999,
+      "prior_strength": 1000.0,
+      "posterior_param1": 999.0,
+      "posterior_param2": 1.0000000000000009,
+      "n_observations": 0,
+      "sum_x": 0.0,
+      "sum_x2": 0.0
+    },
+    "total_fills_observed": 0
+  },
+  "pre_fill": {
+    "learned_weights": [
+      0.3,
+      0.25,
+      0.25,
+      0.1,
+      0.1
+    ],
+    "signal_outcome_sum": [
+      26.935708120147062,
+      15.252608631423039,
+      19.749834696531984,
+      16.240419390119527,
+      16.23203071060577
+    ],
+    "signal_sq_sum": [
+      27.969114261553017,
+      13.429039195966062,
+      17.46730555737981,
+      9.156806322630262,
+      9.191156517550038
+    ],
+    "learning_samples": 34,
+    "regime_probs": [
+      0.1,
+      0.7,
+      0.15,
+      0.05
+    ],
+    "imbalance_ewma_mean": -0.9195347460879513,
+    "imbalance_ewma_var": 1.207097895382803,
+    "flow_ewma_mean": -0.8305454054017247,
+    "flow_ewma_var": 0.023104057007070328,
+    "funding_ewma_mean": 0.0,
+    "funding_ewma_var": 1e-12,
+    "regime_trust_prev": 0.6,
+    "regime_ewma_mean": 0.294591517959245,
+    "regime_ewma_var": 0.015633467340690092,
+    "changepoint_ewma_mean": 0.019888665310829,
+    "changepoint_ewma_var": 1e-12,
+    "normalizer_obs_count": 4366
+  },
+  "enhanced": {
+    "learned_weights": [
+      0.12,
+      0.22,
+      0.18,
+      0.08,
+      0.08,
+      0.04,
+      0.08,
+      0.05,
+      0.08,
+      0.07
+    ],
+    "weight_gradients": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "learning_samples": 0,
+    "prediction_sum": 0.0,
+    "outcome_sum": 0.0,
+    "correct_predictions": 0,
+    "total_predictions": 0
+  },
+  "vol_filter": {
+    "sigma_mean": 0.0001390931973073404,
+    "sigma_std": 0.00009326743208376392,
+    "regime_probs": [
+      0.10400000000000008,
+      0.20200000000000015,
+      0.44000000000000034,
+      0.25400000000000017
+    ],
+    "observation_count": 2694
+  },
+  "regime_hmm": {
+    "belief": [
+      0.1,
+      0.6,
+      0.25,
+      0.05
+    ],
+    "transition_counts": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    ],
+    "observation_count": 7077,
+    "recalibration_count": 14
+  },
+  "informed_flow": {
+    "component_params": [
+      {
+        "mu_size": 0.8194935336115793,
+        "sigma_size": 1.966848061166783,
+        "lambda_0": 1.669319660360043,
+        "alpha": 0.5,
+        "beta": 2.0,
+        "impact_per_unit": -0.0077046804851632076,
+        "impact_variance": 2.47302054291309
+      },
+      {
+        "mu_size": 2.612182067409298,
+        "sigma_size": 1.7212284087686376,
+        "lambda_0": 10.0,
+        "alpha": 0.1,
+        "beta": 5.0,
+        "impact_per_unit": -0.03320959490456814,
+        "impact_variance": 100.0
+      },
+      {
+        "mu_size": -0.15527556552166807,
+        "sigma_size": 0.2627789015933515,
+        "lambda_0": 10.0,
+        "alpha": 0.8,
+        "beta": 1.0,
+        "impact_per_unit": -4.247716055110225,
+        "impact_variance": 20.3417208984893
+      }
+    ],
+    "mixing_weights": [
+      0.1139750205293069,
+      0.35979125608289686,
+      0.5262337233877963
+    ],
+    "observation_count": 7077
+  },
+  "fill_rate": {
+    "lambda_0_mean": 0.04081958788433062,
+    "lambda_0_variance": 0.0003283294572110423,
+    "lambda_0_n_obs": 38.29614955612473,
+    "delta_char_mean": 10.0,
+    "delta_char_variance": 25.31513187940557,
+    "delta_char_n_obs": 3.9502065593168907,
+    "observation_count": 34
+  },
+  "kappa_own": {
+    "prior_alpha": 5.0,
+    "prior_beta": 0.002,
+    "observation_count": 14,
+    "sum_distances": 0.00014000000000000001,
+    "sum_sq_distances": 1.4000000000000007e-9,
+    "kappa_posterior_mean": 8878.504672897196
+  },
+  "kappa_bid": {
+    "prior_alpha": 5.0,
+    "prior_beta": 0.002,
+    "observation_count": 10,
+    "sum_distances": 0.0001,
+    "sum_sq_distances": 1.0000000000000005e-9,
+    "kappa_posterior_mean": 7142.857142857143
+  },
+  "kappa_ask": {
+    "prior_alpha": 5.0,
+    "prior_beta": 0.002,
+    "observation_count": 4,
+    "sum_distances": 0.00004,
+    "sum_sq_distances": 4.0000000000000007e-10,
+    "kappa_posterior_mean": 4411.764705882352
+  },
+  "momentum": {
+    "continuation_by_magnitude": [
+      0.9274915514429101,
+      0.7080562630893449,
+      0.914660126764548,
+      0.7942915373569487,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ],
+    "counts_by_magnitude": [
+      1672,
+      243,
+      113,
+      20,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "prior_continuation": 0.5
+  },
+  "kelly_tracker": {
+    "ewma_wins": 5.0,
+    "n_wins": 0,
+    "ewma_losses": 3.0,
+    "n_losses": 0,
+    "decay": 0.99
+  },
+  "ensemble_weights": {
+    "model_weights": [
+      0.5,
+      0.3,
+      0.2
+    ],
+    "total_updates": 0
+  }
+}

@@ -934,7 +934,7 @@ pub(crate) fn apply_inventory_skew_with_drift(
     // Size skew: reduce side that increases position
     // Cap reduction at 90% to never completely remove quotes
     if inventory_ratio.abs() >= EPSILON {
-        let size_reduction = inventory_ratio.abs().min(0.9);
+        let size_reduction = (inventory_ratio.abs() * 2.5).min(0.95);
 
         if inventory_ratio > 0.0 {
             // Long inventory: reduce bid sizes (don't want to buy more)

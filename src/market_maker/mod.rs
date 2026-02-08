@@ -480,6 +480,22 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             kappa_bid,
             kappa_ask,
             momentum,
+            kelly_tracker: {
+                let kt = self.learning.kelly_tracker();
+                let total = kt.total_trades();
+                let n_wins = (total as f64 * kt.win_rate()).round() as u64;
+                checkpoint::KellyTrackerCheckpoint {
+                    ewma_wins: kt.avg_win(),
+                    n_wins,
+                    ewma_losses: kt.avg_loss(),
+                    n_losses: total.saturating_sub(n_wins),
+                    decay: 0.99,
+                }
+            },
+            ensemble_weights: checkpoint::EnsembleWeightsCheckpoint {
+                model_weights: self.learning.ensemble_weights(),
+                total_updates: self.learning.ensemble_total_updates(),
+            },
         }
     }
 
@@ -496,6 +512,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .regime_hmm
             .restore_checkpoint(&bundle.regime_hmm);
         self.stochastic.learned_params = bundle.learned_params.clone();
+        self.learning
+            .restore_from_checkpoint(&bundle.kelly_tracker, &bundle.ensemble_weights);
     }
 
     // =========================================================================
@@ -572,9 +590,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let position = self.position.position();
 
         // HARMONIZED: Use effective_max_position for risk state calculations
+        // Use pnl_tracker's tracked peak_pnl for accurate drawdown calculation
         risk::RiskState::new(
             pnl_summary.total_pnl,
-            pnl_summary.total_pnl.max(0.0), // Peak PnL tracking simplified
+            pnl_summary.peak_pnl,
             position,
             self.effective_max_position, // First-principles limit
             self.latest_mid,
@@ -637,11 +656,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .unwrap_or_else(std::time::Instant::now);
 
         // Build current state for kill switch check using actual P&L
-        let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+        // Use summary_update_peak() to properly track peak PnL for drawdown calculation
+        let pnl_summary = self.tier2.pnl_tracker.summary_update_peak(self.latest_mid);
         let margin_state = self.infra.margin_sizer.state();
         let state = KillSwitchState {
-            daily_pnl: pnl_summary.total_pnl, // Using total as daily for now
-            peak_pnl: pnl_summary.total_pnl,  // Simplified (actual peak needs tracking)
+            daily_pnl: pnl_summary.total_pnl,
+            peak_pnl: pnl_summary.peak_pnl,
             position: self.position.position(),
             mid_price: self.latest_mid,
             last_data_time,

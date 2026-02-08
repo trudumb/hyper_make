@@ -243,12 +243,25 @@ impl LearnedSpreadFloor {
     }
 
     /// Check if the estimator has enough data to be reliable.
+    ///
+    /// Uses a fast path (15 observations) for partial horizon data,
+    /// or the standard path (20 observations) for full convergence.
     pub fn is_warmed_up(&self) -> bool {
-        self.n_observations >= 20
+        self.fast_observation_count() >= 15 || self.n_observations >= 20
     }
 
     /// Get the number of observations.
     pub fn observation_count(&self) -> usize {
+        self.n_observations
+    }
+
+    /// Fast observation count for warmup with partial horizon data.
+    ///
+    /// Every call to `update()` represents at least the fastest horizon (500ms)
+    /// being measured, so this returns the same count as `observation_count()`.
+    /// The distinction exists so warmup can use a lower threshold (15) vs
+    /// full warmup (20), allowing faster convergence in short sessions.
+    pub fn fast_observation_count(&self) -> usize {
         self.n_observations
     }
 
@@ -375,7 +388,8 @@ mod tests {
 
         assert!(!floor.is_warmed_up());
 
-        for _ in 0..19 {
+        // Fast warmup path: 15 observations is enough
+        for _ in 0..14 {
             floor.update(0.0003);
         }
         assert!(!floor.is_warmed_up());

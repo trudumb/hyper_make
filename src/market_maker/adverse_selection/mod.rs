@@ -47,7 +47,7 @@ pub struct AdverseSelectionConfig {
     pub ewma_alpha: f64,
 
     /// Minimum fills required before AS estimates are valid
-    /// Default: 20
+    /// Default: 50
     pub min_fills_warmup: usize,
 
     /// Maximum pending fills to track (memory bound)
@@ -83,7 +83,7 @@ impl Default for AdverseSelectionConfig {
             measurement_horizon_ms: 500, // Reduced from 1000ms
             // MAINNET OPTIMIZED: Faster adaptation to changing AS patterns
             ewma_alpha: 0.12, // Increased from 0.05 - faster adaptation
-            min_fills_warmup: 20,
+            min_fills_warmup: 50, // Increased from 20 — need statistically meaningful sample
             // Increased from 1000 to handle 10-minute tracking window.
             // At ~2 fills/sec peak, 10 min = ~1200 fills. Use 5000 for safety margin.
             max_pending_fills: 5000,

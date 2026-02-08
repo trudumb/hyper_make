@@ -244,13 +244,13 @@ impl PositionDecisionEngine {
     ///
     /// Higher urgency when:
     /// - Low P(continuation) → fear_factor increases
-    /// - High inventory ratio → size_factor increases
-    /// - Position opposed to beliefs → base urgency doubles
+    /// - High inventory ratio → size_factor increases (quadratic+linear for aggressive decay)
+    /// - Position opposed to beliefs → base urgency increases to 1.5
     fn compute_urgency(&self, p_cont: f64, inv_ratio: f64, aligned: bool) -> f64 {
-        let base = if aligned { 0.5 } else { 1.0 };
+        let base = if aligned { 0.5 } else { 1.5 };
         let fear_factor = (1.0 - p_cont).powi(2); // More urgent when p_cont low
-        let size_factor = inv_ratio.sqrt(); // More urgent with larger position
-        (base + fear_factor * size_factor).clamp(0.0, 2.0)
+        let size_factor = inv_ratio.powi(2) + inv_ratio; // Quadratic+linear: aggressive at high inventory
+        (base + fear_factor * size_factor).clamp(0.0, 3.0)
     }
 
     /// Update posterior with fill observation.
