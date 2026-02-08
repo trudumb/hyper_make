@@ -232,6 +232,14 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     checkpoint_manager: Option<checkpoint::CheckpointManager>,
     /// Last time a checkpoint was saved (for periodic save interval).
     last_checkpoint_save: std::time::Instant,
+
+    // === RL Agent Control ===
+    /// Whether RL agent controls quoting actions (vs observe-only)
+    pub(crate) rl_enabled: bool,
+    /// Minimum real fills before RL controls actions
+    rl_min_real_fills: usize,
+    /// Auto-disable RL if mean reward < 0 after this many fills
+    rl_auto_disable_fills: usize,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -371,6 +379,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
+            // RL agent control (disabled by default, enabled via with_rl_enabled)
+            rl_enabled: false,
+            rl_min_real_fills: 20,
+            rl_auto_disable_fills: 100,
         }
     }
 
@@ -454,6 +466,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self
     }
 
+    /// Enable or disable RL agent control of quoting actions (builder).
+    pub fn with_rl_enabled(mut self, enabled: bool) -> Self {
+        self.rl_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable RL agent control of quoting actions (setter).
+    pub fn set_rl_enabled(&mut self, enabled: bool) {
+        self.rl_enabled = enabled;
+    }
+
+    /// Load a paper trader's Q-table as a discounted prior for the live RL agent.
+    ///
+    /// Returns the number of states loaded.
+    pub fn load_paper_rl_prior(
+        &mut self,
+        rl_checkpoint: &checkpoint::types::RLCheckpoint,
+        weight: f64,
+    ) -> usize {
+        let mut paper_agent = learning::QLearningAgent::default();
+        paper_agent.restore_from_checkpoint(rl_checkpoint);
+        let paper_q = paper_agent.export_q_table();
+        let n_states = paper_q.len();
+        self.stochastic.rl_agent.import_q_table_as_prior(&paper_q, weight);
+        n_states
+    }
+
     /// Assemble a checkpoint bundle from current state.
     fn assemble_checkpoint_bundle(&self) -> checkpoint::CheckpointBundle {
         let (vol_filter, informed_flow, fill_rate, kappa_own, kappa_bid, kappa_ask, momentum) =
@@ -496,6 +535,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 model_weights: self.learning.ensemble_weights(),
                 total_updates: self.learning.ensemble_total_updates(),
             },
+            rl_q_table: self.stochastic.rl_agent.to_checkpoint(),
         }
     }
 
@@ -514,6 +554,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.stochastic.learned_params = bundle.learned_params.clone();
         self.learning
             .restore_from_checkpoint(&bundle.kelly_tracker, &bundle.ensemble_weights);
+        self.stochastic
+            .rl_agent
+            .restore_from_checkpoint(&bundle.rl_q_table);
     }
 
     // =========================================================================

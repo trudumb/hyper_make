@@ -13,7 +13,7 @@ target_liquidity = 0.5         # ~$15 per side at HYPE ~$30
 risk_aversion = 0.5
 max_bps_diff = 2
 max_position_usd = 50.0       # Max $50 notional exposure
-leverage = 3.0
+leverage = 3
 
 [strategy]
 strategy_type = "ladder"

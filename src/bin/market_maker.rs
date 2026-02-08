@@ -284,6 +284,17 @@ struct Cli {
     #[arg(long)]
     quote_gate_min_edge_confidence: Option<f64>,
 
+    // === Kill Switch Override Flags ===
+    /// Override max daily loss in USD from TOML config.
+    /// Critical safety parameter — lower is safer. Example: --max-daily-loss 5.0
+    #[arg(long)]
+    max_daily_loss: Option<f64>,
+
+    /// Override max drawdown as fraction (0.0–1.0) from TOML config.
+    /// Example: --max-drawdown 0.10 (= 10% max drawdown)
+    #[arg(long)]
+    max_drawdown: Option<f64>,
+
     // === Signal Diagnostics Flags ===
     /// Path to export fill signal snapshots for calibration analysis.
     /// Enables diagnostic infrastructure that captures all signal values at fill time
@@ -301,6 +312,20 @@ struct Cli {
     /// Binance symbol to subscribe to for lead-lag signal (default: btcusdt).
     #[arg(long, default_value = "btcusdt")]
     binance_symbol: String,
+
+    // === RL Agent (Sim-to-Real Transfer) ===
+    /// Path to paper trader checkpoint directory for loading Q-table as prior.
+    /// The paper trader's learned Q-table becomes an informative prior for the
+    /// live RL agent, discounted by paper_prior_weight (default 0.3).
+    /// Example: --paper-checkpoint data/checkpoints/HYPE
+    #[arg(long)]
+    paper_checkpoint: Option<String>,
+
+    /// Enable RL agent to control quoting actions (default: observe only).
+    /// When enabled, the RL agent applies spread/skew adjustments after
+    /// accumulating enough real fills (default 20).
+    #[arg(long)]
+    enable_rl: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -338,6 +363,62 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub monitoring: MonitoringAppConfig,
+    #[serde(default)]
+    pub kill_switch: KillSwitchAppConfig,
+}
+
+/// Kill switch configuration from TOML.
+/// Maps to `KillSwitchConfig` at runtime, with TOML-friendly field types.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KillSwitchAppConfig {
+    /// Maximum allowed daily loss in USD (default: 500.0 — override this!)
+    #[serde(default = "default_ks_max_daily_loss")]
+    pub max_daily_loss: f64,
+    /// Maximum allowed drawdown as fraction 0.0–1.0 (default: 0.05 = 5%)
+    #[serde(default = "default_ks_max_drawdown")]
+    pub max_drawdown: f64,
+    /// Maximum position value in USD (default: 10000.0)
+    #[serde(default = "default_ks_max_position_value")]
+    pub max_position_value: f64,
+    /// Maximum position size in contracts (default: 1.0)
+    #[serde(default = "default_ks_max_position_contracts")]
+    pub max_position_contracts: f64,
+    /// Seconds without data before stale shutdown (default: 30)
+    #[serde(default = "default_ks_stale_data_secs")]
+    pub stale_data_threshold_secs: u64,
+    /// Cascade severity threshold (default: 5.0)
+    #[serde(default = "default_ks_cascade_severity")]
+    pub cascade_severity_threshold: f64,
+    /// Maximum rate limit errors before shutdown (default: 3)
+    #[serde(default = "default_ks_max_rate_limit_errors")]
+    pub max_rate_limit_errors: u32,
+    /// Enable/disable kill switch (default: true)
+    #[serde(default = "default_ks_enabled")]
+    pub enabled: bool,
+}
+
+fn default_ks_max_daily_loss() -> f64 { 500.0 }
+fn default_ks_max_drawdown() -> f64 { 0.05 }
+fn default_ks_max_position_value() -> f64 { 10_000.0 }
+fn default_ks_max_position_contracts() -> f64 { 1.0 }
+fn default_ks_stale_data_secs() -> u64 { 30 }
+fn default_ks_cascade_severity() -> f64 { 5.0 }
+fn default_ks_max_rate_limit_errors() -> u32 { 3 }
+fn default_ks_enabled() -> bool { true }
+
+impl Default for KillSwitchAppConfig {
+    fn default() -> Self {
+        Self {
+            max_daily_loss: default_ks_max_daily_loss(),
+            max_drawdown: default_ks_max_drawdown(),
+            max_position_value: default_ks_max_position_value(),
+            max_position_contracts: default_ks_max_position_contracts(),
+            stale_data_threshold_secs: default_ks_stale_data_secs(),
+            cascade_severity_threshold: default_ks_cascade_severity(),
+            max_rate_limit_errors: default_ks_max_rate_limit_errors(),
+            enabled: default_ks_enabled(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1645,18 +1726,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let liquidation_config = LiquidationConfig::default();
 
     // Create kill switch config (production safety)
-    // When USD limit is set, use it directly for max_position_value (asset-agnostic)
-    let kill_switch_config = if let Some(usd_limit) = max_position_usd_override {
-        KillSwitchConfig {
-            max_position_contracts: max_position,
-            max_position_value: usd_limit,
-            ..Default::default()
-        }
-    } else {
-        KillSwitchConfig {
-            max_position_contracts: max_position,
-            ..Default::default()
-        }
+    // Priority: CLI flags > TOML [kill_switch] > KillSwitchConfig::default()
+    let ks_toml = &config.kill_switch;
+    let kill_switch_config = KillSwitchConfig {
+        max_daily_loss: cli.max_daily_loss.unwrap_or(ks_toml.max_daily_loss),
+        max_drawdown: cli.max_drawdown.unwrap_or(ks_toml.max_drawdown),
+        max_position_value: if let Some(usd_limit) = max_position_usd_override {
+            usd_limit // USD position limit overrides TOML position value
+        } else {
+            ks_toml.max_position_value
+        },
+        max_position_contracts: max_position, // from CLI/config position sizing
+        stale_data_threshold: std::time::Duration::from_secs(ks_toml.stale_data_threshold_secs),
+        max_rate_limit_errors: ks_toml.max_rate_limit_errors,
+        cascade_severity_threshold: ks_toml.cascade_severity_threshold,
+        enabled: ks_toml.enabled,
     };
     info!(
         max_daily_loss = %kill_switch_config.max_daily_loss,
@@ -1741,6 +1825,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
+    }
+
+    // === RL Agent: Load paper Q-table as prior and enable action control ===
+    if let Some(ref paper_ckpt_path) = cli.paper_checkpoint {
+        let paper_ckpt_file = std::path::Path::new(paper_ckpt_path).join("latest/checkpoint.json");
+        match std::fs::read_to_string(&paper_ckpt_file) {
+            Ok(json) => {
+                match serde_json::from_str::<hyperliquid_rust_sdk::market_maker::checkpoint::CheckpointBundle>(&json) {
+                    Ok(bundle) => {
+                        let sim_to_real = hyperliquid_rust_sdk::market_maker::learning::SimToRealConfig::default();
+                        let states_loaded = market_maker.load_paper_rl_prior(
+                            &bundle.rl_q_table,
+                            sim_to_real.paper_prior_weight,
+                        );
+                        tracing::info!(
+                            path = %paper_ckpt_file.display(),
+                            states = states_loaded,
+                            weight = sim_to_real.paper_prior_weight,
+                            "Loaded paper Q-table as RL prior"
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, "Failed to parse paper checkpoint JSON"),
+                }
+            }
+            Err(e) => tracing::warn!(
+                path = %paper_ckpt_file.display(),
+                error = %e,
+                "Failed to read paper checkpoint file"
+            ),
+        }
+    }
+
+    if cli.enable_rl {
+        market_maker.set_rl_enabled(true);
+        tracing::info!("RL agent ENABLED for action control");
     }
 
     // Sync open orders

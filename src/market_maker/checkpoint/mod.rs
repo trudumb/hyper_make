@@ -92,6 +92,7 @@ impl CheckpointManager {
             kappa_own_obs = bundle.kappa_own.observation_count,
             kelly_wins = bundle.kelly_tracker.n_wins,
             kelly_losses = bundle.kelly_tracker.n_losses,
+            rl_observations = bundle.rl_q_table.total_observations,
             "Checkpoint saved to {}",
             checkpoint_path.display()
         );
@@ -230,6 +231,7 @@ mod tests {
             momentum: MomentumCheckpoint::default(),
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
+            rl_q_table: RLCheckpoint::default(),
         }
     }
 

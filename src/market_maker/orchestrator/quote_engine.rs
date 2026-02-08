@@ -1610,6 +1610,49 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         market_params.rl_is_exploration = rl_recommendation.is_exploration;
         market_params.rl_expected_q = rl_recommendation.expected_q;
 
+        // === RL Action Application (when enabled) ===
+        if self.rl_enabled {
+            let total_rl_updates = self.stochastic.rl_agent.total_updates();
+            let mean_reward = self.stochastic.rl_agent.mean_recent_reward();
+
+            let should_apply = total_rl_updates >= self.rl_min_real_fills as u64
+                && (total_rl_updates < self.rl_auto_disable_fills as u64 || mean_reward >= 0.0);
+
+            if should_apply {
+                // Apply spread delta with safety floor: cannot go negative
+                market_params.rl_spread_delta_bps = rl_recommendation
+                    .spread_delta_bps
+                    .max(-market_params.market_spread_bps + 2.0);
+
+                // Apply skew directly (already stored above, but re-apply clamped)
+                market_params.rl_bid_skew_bps = rl_recommendation.bid_skew_bps;
+                market_params.rl_ask_skew_bps = rl_recommendation.ask_skew_bps;
+
+                market_params.rl_action_applied = true;
+
+                debug!(
+                    spread_delta = %format!("{:.2}", rl_recommendation.spread_delta_bps),
+                    bid_skew = %format!("{:.2}", rl_recommendation.bid_skew_bps),
+                    ask_skew = %format!("{:.2}", rl_recommendation.ask_skew_bps),
+                    confidence = %format!("{:.3}", rl_recommendation.confidence),
+                    total_updates = total_rl_updates,
+                    "RL action APPLIED to market params"
+                );
+            } else if total_rl_updates < self.rl_min_real_fills as u64 {
+                debug!(
+                    total_updates = total_rl_updates,
+                    min_required = self.rl_min_real_fills,
+                    "RL observation-only (insufficient fills)"
+                );
+            } else {
+                warn!(
+                    mean_reward = %format!("{:.3}", mean_reward),
+                    total_updates = total_rl_updates,
+                    "RL auto-disabled (negative mean reward)"
+                );
+            }
+        }
+
         // === Phase 8: Competitor Model Inference ===
         // Get competitor summary and populate MarketParams
         let competitor_summary = self.stochastic.competitor_model.summary();

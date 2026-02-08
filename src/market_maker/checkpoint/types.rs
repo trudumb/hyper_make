@@ -41,6 +41,9 @@ pub struct CheckpointBundle {
     /// Model ensemble weights for prediction persistence
     #[serde(default)]
     pub ensemble_weights: EnsembleWeightsCheckpoint,
+    /// RL agent Q-table for policy persistence
+    #[serde(default)]
+    pub rl_q_table: RLCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -400,6 +403,46 @@ impl Default for EnsembleWeightsCheckpoint {
     }
 }
 
+
+/// RL agent Q-table entry for checkpoint persistence.
+///
+/// Each entry represents a single (state, action) posterior from the
+/// Bayesian Q-learning agent's Normal-Gamma conjugate model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QTableEntry {
+    /// State index in the MDP discretization
+    pub state_index: usize,
+    /// Action index within that state
+    pub action_index: usize,
+    /// Posterior mean
+    pub mu_n: f64,
+    /// Posterior precision scale
+    pub kappa_n: f64,
+    /// Gamma shape parameter
+    pub alpha: f64,
+    /// Gamma rate parameter
+    pub beta: f64,
+    /// Number of observations
+    pub n: u64,
+}
+
+/// RL agent checkpoint for Q-table persistence.
+///
+/// Captures the Bayesian Q-table so the RL agent doesn't restart
+/// from priors after a restart. Only non-default entries are stored
+/// to keep the checkpoint compact.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RLCheckpoint {
+    /// Q-table entries: only (state, action) pairs that have been updated
+    pub q_entries: Vec<QTableEntry>,
+    /// Total episodes completed
+    pub episodes: u64,
+    /// Total reward accumulated
+    pub total_reward: f64,
+    /// Total state-action observations
+    pub total_observations: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +498,31 @@ mod tests {
                 model_weights: vec![0.6, 0.25, 0.15],
                 total_updates: 100,
             },
+            rl_q_table: RLCheckpoint {
+                q_entries: vec![
+                    QTableEntry {
+                        state_index: 0,
+                        action_index: 2,
+                        mu_n: 1.5,
+                        kappa_n: 5.0,
+                        alpha: 3.0,
+                        beta: 2.0,
+                        n: 10,
+                    },
+                    QTableEntry {
+                        state_index: 1,
+                        action_index: 0,
+                        mu_n: -0.3,
+                        kappa_n: 2.0,
+                        alpha: 1.5,
+                        beta: 1.0,
+                        n: 5,
+                    },
+                ],
+                episodes: 50,
+                total_reward: 12.5,
+                total_observations: 15,
+            },
         };
 
         // Serialize to JSON
@@ -480,6 +548,15 @@ mod tests {
         // Ensemble weights round-trip
         assert_eq!(restored.ensemble_weights.model_weights, vec![0.6, 0.25, 0.15]);
         assert_eq!(restored.ensemble_weights.total_updates, 100);
+        // RL checkpoint round-trip
+        assert_eq!(restored.rl_q_table.episodes, 50);
+        assert_eq!(restored.rl_q_table.total_reward, 12.5);
+        assert_eq!(restored.rl_q_table.total_observations, 15);
+        assert_eq!(restored.rl_q_table.q_entries.len(), 2);
+        assert_eq!(restored.rl_q_table.q_entries[0].state_index, 0);
+        assert_eq!(restored.rl_q_table.q_entries[0].action_index, 2);
+        assert_eq!(restored.rl_q_table.q_entries[0].mu_n, 1.5);
+        assert_eq!(restored.rl_q_table.q_entries[0].n, 10);
     }
 
     #[test]

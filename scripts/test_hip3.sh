@@ -184,8 +184,16 @@ fi
 echo -e "${YELLOW}       Press Ctrl+C to stop early (graceful shutdown)${NC}"
 echo ""
 
-# Build command with optional metrics port
-MM_ARGS="--network mainnet --asset ${ASSET} --dex ${DEX} --spread-profile ${SPREAD_PROFILE} --log-file ${LOG_FILE}"
+# Build command with config + optional metrics port
+# Use market_maker_live.toml if it exists, otherwise fall back to market_maker.toml
+if [ -f "market_maker_live.toml" ]; then
+    CONFIG_FILE="market_maker_live.toml"
+else
+    CONFIG_FILE="market_maker.toml"
+fi
+echo -e "${GREEN}Config:         ${CONFIG_FILE}${NC}"
+
+MM_ARGS="--config ${CONFIG_FILE} --network mainnet --asset ${ASSET} --dex ${DEX} --spread-profile ${SPREAD_PROFILE} --log-file ${LOG_FILE}"
 if [ "$DASHBOARD" = true ]; then
     MM_ARGS="${MM_ARGS} --metrics-port ${METRICS_PORT}"
 fi

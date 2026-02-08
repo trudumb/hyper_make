@@ -287,6 +287,7 @@ impl ParameterAggregator {
             rl_confidence: 0.0,                  // Default no confidence
             rl_is_exploration: false,
             rl_expected_q: 0.0,
+            rl_action_applied: false,
 
             // Phase 8: Competitor Model
             // These will be populated from CompetitorModel in orchestrator

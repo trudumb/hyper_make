@@ -42,7 +42,7 @@ pub use ensemble::{EdgeModel, ModelEnsemble};
 pub use execution::ExecutionOptimizer;
 pub use rl_agent::{
     MDPAction, MDPState, QLearningAgent, QLearningConfig, RLPolicyRecommendation,
-    Reward, RewardConfig, ExplorationStrategy,
+    Reward, RewardConfig, ExplorationStrategy, SimToRealConfig,
 };
 pub use competitor_model::{
     CompetitorModel, CompetitorModelConfig, CompetitorSummary,

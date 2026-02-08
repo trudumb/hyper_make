@@ -283,6 +283,8 @@ pub struct MarketParams {
     pub rl_is_exploration: bool,
     /// Expected Q-value from RL agent.
     pub rl_expected_q: f64,
+    /// Whether RL action was applied to quoting (vs observation-only).
+    pub rl_action_applied: bool,
 
     // --- Phase 8: Competitor Model ---
     /// Competitor snipe probability [0, 1].
@@ -913,6 +915,7 @@ impl Default for MarketParams {
             rl_confidence: 0.0,
             rl_is_exploration: false,
             rl_expected_q: 0.0,
+            rl_action_applied: false,
             // Phase 8: Competitor Model
             competitor_snipe_prob: 0.1,      // 10% baseline
             competitor_spread_factor: 1.0,   // No adjustment

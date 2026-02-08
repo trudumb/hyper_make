@@ -89,8 +89,12 @@ use hyperliquid_rust_sdk::market_maker::risk::{RiskState, RiskAggregator, RiskSe
 use hyperliquid_rust_sdk::market_maker::risk::monitors::*;
 use hyperliquid_rust_sdk::round_to_significant_and_decimal;
 use hyperliquid_rust_sdk::market_maker::checkpoint::{
-    CheckpointBundle, CheckpointManager, CheckpointMetadata, EnsembleWeightsCheckpoint,
-    KellyTrackerCheckpoint,
+    CheckpointBundle, CheckpointManager, CheckpointMetadata,
+    EnsembleWeightsCheckpoint, KellyTrackerCheckpoint,
+};
+use hyperliquid_rust_sdk::market_maker::learning::{
+    ExplorationStrategy, MDPState, QLearningAgent, QLearningConfig, RLPolicyRecommendation,
+    Reward,
 };
 use hyperliquid_rust_sdk::market_maker::stochastic::{
     StochasticControlBuilder, StochasticControlConfig,
@@ -433,6 +437,11 @@ struct SimulationState {
     /// Paper trading calibration mode (tighter spreads, faster warmup)
     #[allow(dead_code)]
     paper_mode: bool,
+
+    // === RL Agent for Policy Learning ===
+    /// Q-Learning agent for adaptive quoting policy.
+    /// Paper trader uses Thompson sampling exploration for aggressive learning.
+    rl_agent: QLearningAgent,
 }
 
 impl SimulationState {
@@ -591,6 +600,12 @@ impl SimulationState {
             pending_fill_outcomes: VecDeque::with_capacity(64),
             total_fill_count: 0,
             paper_mode,
+            // RL agent: Thompson sampling for aggressive exploration in paper trading
+            rl_agent: QLearningAgent::new(QLearningConfig {
+                exploration: ExplorationStrategy::ThompsonSampling,
+                min_observations: 5, // Lower threshold for paper — explore more
+                ..Default::default()
+            }),
         }
     }
 
@@ -961,6 +976,40 @@ impl SimulationState {
             }
         }
 
+        // === RL Agent: Observe state and get exploration action ===
+        {
+            let vol_ratio = market_params.sigma / market_params.sigma_effective.max(0.0001);
+            let mdp_state = MDPState::from_continuous(
+                self.inventory,
+                self.max_position,
+                market_params.book_imbalance,
+                vol_ratio,
+                self.adverse_selection.best_horizon_as_bps() / 10.0, // normalize to ~[0,1]
+                market_params.hawkes_branching_ratio,
+            );
+            // Always explore in paper trading
+            let rl_rec = RLPolicyRecommendation::from_agent(&mut self.rl_agent, &mdp_state, true);
+            self.rl_agent.set_last_state_action(mdp_state, rl_rec.action);
+
+            // Store RL recommendations in market_params for logging
+            market_params.rl_spread_delta_bps = rl_rec.spread_delta_bps;
+            market_params.rl_bid_skew_bps = rl_rec.bid_skew_bps;
+            market_params.rl_ask_skew_bps = rl_rec.ask_skew_bps;
+            market_params.rl_confidence = rl_rec.confidence;
+            market_params.rl_is_exploration = rl_rec.is_exploration;
+            market_params.rl_expected_q = rl_rec.expected_q;
+
+            if self.cycle_count.is_multiple_of(100) {
+                let summary = self.rl_agent.summary();
+                tracing::info!(
+                    episodes = summary.episodes,
+                    states_visited = summary.states_visited,
+                    avg_reward = %format!("{:.3}", summary.recent_avg_reward),
+                    "Paper RL agent summary"
+                );
+            }
+        }
+
         // Update strategy's fill model with current volatility
         let sigma = market_params.sigma.max(0.00001);
         let tau = self.quote_lifetime_s;
@@ -1328,6 +1377,47 @@ impl SimulationState {
             fill.side, fill.fill_price, fill.fill_size, spread_capture,
             self.mid_price, depth_bps, self.inventory,
         );
+
+        // === RL Agent: Update Q-values from simulated fill ===
+        {
+            let vol_ratio = self.estimator.sigma() / self.estimator.sigma_clean().max(0.0001);
+            let inventory_risk = (self.inventory.abs() / self.max_position.max(1.0)).clamp(0.0, 1.0);
+            let as_realized = if self.mid_price > 0.0 {
+                let dir = if is_buy { 1.0 } else { -1.0 };
+                (self.mid_price - fill.fill_price) * dir / fill.fill_price
+            } else {
+                0.0
+            };
+            let was_adverse = as_realized > 0.0;
+            let realized_edge_bps = -as_realized * 10_000.0;
+
+            let fill_state = MDPState::from_continuous(
+                self.inventory,
+                self.max_position,
+                0.0, // book_imbalance not easily available here
+                vol_ratio,
+                self.adverse_selection.best_horizon_as_bps() / 10.0, // normalize to ~[0,1]
+                self.hawkes.intensity_percentile(),
+            );
+
+            let reward = Reward::compute(
+                &self.rl_agent.reward_config().clone(),
+                realized_edge_bps,
+                inventory_risk,
+                vol_ratio,
+                was_adverse,
+            );
+
+            if let Some((state, action)) = self.rl_agent.take_last_state_action() {
+                self.rl_agent.update(state, action, reward, fill_state, false);
+                tracing::debug!(
+                    realized_edge_bps = %format!("{:.2}", realized_edge_bps),
+                    inventory_risk = %format!("{:.3}", inventory_risk),
+                    reward_total = %format!("{:.3}", reward.total),
+                    "Paper RL agent updated from simulated fill"
+                );
+            }
+        }
     }
 
     /// Check pending fills for adverse selection outcomes (call after mid updates)
@@ -1427,6 +1517,7 @@ impl SimulationState {
             momentum,
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
+            rl_q_table: self.rl_agent.to_checkpoint(),
         }
     }
 
@@ -1439,6 +1530,7 @@ impl SimulationState {
         self.estimator.restore_checkpoint(bundle);
         self.regime_hmm.restore_checkpoint(&bundle.regime_hmm);
         self.learned_params = bundle.learned_params.clone();
+        self.rl_agent.restore_from_checkpoint(&bundle.rl_q_table);
     }
 }
 

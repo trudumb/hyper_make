@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use tracing::debug;
 
+use crate::market_maker::checkpoint::types::{QTableEntry, RLCheckpoint};
+
 // ============================================================================
 // MDP State Space
 // ============================================================================
@@ -937,6 +939,54 @@ impl BayesianQValue {
     pub fn count(&self) -> u64 {
         self.n
     }
+
+    /// Create a new Q-value using `other`'s posterior as a discounted prior.
+    ///
+    /// Used for sim-to-real transfer: paper trading Q-values become informative
+    /// but down-weighted priors for live trading. `weight` in [0, 1] controls
+    /// how much to trust the paper posterior (0.3 = paper counts as 30% of real).
+    pub fn with_discounted_prior(other: &BayesianQValue, weight: f64) -> BayesianQValue {
+        BayesianQValue {
+            mu_0: other.mu_n,
+            kappa_0: weight * other.kappa_n,
+            mu_n: other.mu_n,
+            kappa_n: weight * other.kappa_n,
+            alpha: 1.0 + weight * (other.alpha - 1.0),
+            beta: other.beta * weight,
+            n: 0, // No real observations yet
+        }
+    }
+
+    /// Posterior precision scale (for checkpoint persistence).
+    pub fn kappa_n(&self) -> f64 {
+        self.kappa_n
+    }
+
+    /// Gamma shape parameter (for checkpoint persistence).
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    /// Gamma rate parameter (for checkpoint persistence).
+    pub fn beta(&self) -> f64 {
+        self.beta
+    }
+
+    /// Restore a Q-value from checkpoint data.
+    ///
+    /// Faithfully restores the full posterior state (mu_n, kappa_n, alpha, beta, n)
+    /// so that learning continues from where it left off.
+    pub fn from_checkpoint(mu_n: f64, kappa_n: f64, alpha: f64, beta: f64, n: u64) -> Self {
+        Self {
+            mu_0: mu_n,    // Use posterior as prior for continued learning
+            kappa_0: kappa_n,
+            mu_n,
+            kappa_n,
+            alpha,
+            beta,
+            n,
+        }
+    }
 }
 
 impl Default for BayesianQValue {
@@ -989,6 +1039,33 @@ pub enum ExplorationStrategy {
     UCB,
     /// Epsilon-greedy with decay
     EpsilonGreedy { epsilon: f64, decay: f64 },
+}
+
+/// Configuration for sim-to-real transfer of RL Q-tables.
+///
+/// Controls how paper trading experience is incorporated as a prior
+/// when transitioning to live trading.
+#[derive(Debug, Clone)]
+pub struct SimToRealConfig {
+    /// Paper fill counts as this fraction of a real fill (0.3 = paper is 30% weight)
+    pub paper_prior_weight: f64,
+    /// Minimum real fills before RL controls actions (observation-only before this)
+    pub min_real_fills: usize,
+    /// Clip actions within this many sigma of paper mean
+    pub action_bound_sigma: f64,
+    /// Auto-disable RL if mean reward < 0 after this many fills
+    pub auto_disable_after_fills: usize,
+}
+
+impl Default for SimToRealConfig {
+    fn default() -> Self {
+        Self {
+            paper_prior_weight: 0.3,
+            min_real_fills: 20,
+            action_bound_sigma: 1.5,
+            auto_disable_after_fills: 100,
+        }
+    }
 }
 
 /// Q-learning agent with Bayesian Q-values.
@@ -1212,6 +1289,126 @@ impl QLearningAgent {
     /// Get and clear the last state-action pair.
     pub fn take_last_state_action(&mut self) -> Option<(MDPState, MDPAction)> {
         self.last_state_action.take()
+    }
+
+    /// Export the Q-table for checkpoint persistence or sim-to-real transfer.
+    pub fn export_q_table(&self) -> HashMap<usize, Vec<BayesianQValue>> {
+        self.q_table.clone()
+    }
+
+    /// Import a paper trading Q-table as a discounted prior for live trading.
+    ///
+    /// For each state-action pair in `paper_q`, creates a `BayesianQValue` with
+    /// the paper posterior as a down-weighted prior. States not present in `paper_q`
+    /// retain their current (default) Q-values.
+    pub fn import_q_table_as_prior(
+        &mut self,
+        paper_q: &HashMap<usize, Vec<BayesianQValue>>,
+        weight: f64,
+    ) {
+        for (&state_idx, paper_values) in paper_q {
+            let live_values = self
+                .q_table
+                .entry(state_idx)
+                .or_insert_with(|| vec![BayesianQValue::new(); MDPAction::ACTION_COUNT]);
+            for (i, paper_qv) in paper_values.iter().enumerate() {
+                if i < live_values.len() {
+                    live_values[i] = BayesianQValue::with_discounted_prior(paper_qv, weight);
+                }
+            }
+        }
+    }
+
+    /// Total number of Bayesian updates across all states and actions.
+    ///
+    /// Useful for checking `SimToRealConfig::min_real_fills` threshold.
+    pub fn total_updates(&self) -> u64 {
+        self.q_table
+            .values()
+            .flat_map(|actions| actions.iter())
+            .map(|q| q.count())
+            .sum()
+    }
+
+    /// Average of recent rewards, or 0.0 if no rewards recorded.
+    ///
+    /// Used by `SimToRealConfig::auto_disable_after_fills` to detect
+    /// negative-EV RL policies that should be turned off.
+    pub fn mean_recent_reward(&self) -> f64 {
+        if self.recent_rewards.is_empty() {
+            0.0
+        } else {
+            self.recent_rewards.iter().sum::<f64>() / self.recent_rewards.len() as f64
+        }
+    }
+
+    /// Serialize Q-table and agent state to checkpoint.
+    ///
+    /// Only stores (state, action) pairs that have been observed (n > 0)
+    /// to keep the checkpoint compact. Default Q-values are reconstructed
+    /// on restore for missing entries.
+    pub fn to_checkpoint(&self) -> RLCheckpoint {
+        let mut entries = Vec::new();
+        let mut total_observations: u64 = 0;
+
+        for (&state_idx, actions) in &self.q_table {
+            for (action_idx, q_val) in actions.iter().enumerate() {
+                if q_val.count() > 0 {
+                    entries.push(QTableEntry {
+                        state_index: state_idx,
+                        action_index: action_idx,
+                        mu_n: q_val.mean(),
+                        kappa_n: q_val.kappa_n(),
+                        alpha: q_val.alpha(),
+                        beta: q_val.beta(),
+                        n: q_val.count(),
+                    });
+                    total_observations += q_val.count();
+                }
+            }
+        }
+
+        RLCheckpoint {
+            q_entries: entries,
+            episodes: self.episodes,
+            total_reward: self.total_reward,
+            total_observations,
+        }
+    }
+
+    /// Restore Q-table and agent state from checkpoint.
+    ///
+    /// Recreates `BayesianQValue` entries using `from_checkpoint()` for each
+    /// stored entry. States/actions not in the checkpoint get default Q-values.
+    pub fn restore_from_checkpoint(&mut self, ckpt: &RLCheckpoint) {
+        self.episodes = ckpt.episodes;
+        self.total_reward = ckpt.total_reward;
+
+        // Clear and rebuild q_table from checkpoint entries
+        self.q_table.clear();
+        for entry in &ckpt.q_entries {
+            let actions = self
+                .q_table
+                .entry(entry.state_index)
+                .or_insert_with(|| vec![BayesianQValue::new(); MDPAction::ACTION_COUNT]);
+            if entry.action_index < actions.len() {
+                actions[entry.action_index] = BayesianQValue::from_checkpoint(
+                    entry.mu_n,
+                    entry.kappa_n,
+                    entry.alpha,
+                    entry.beta,
+                    entry.n,
+                );
+            }
+        }
+
+        debug!(
+            episodes = ckpt.episodes,
+            total_reward = ckpt.total_reward,
+            entries = ckpt.q_entries.len(),
+            total_observations = ckpt.total_observations,
+            "RL agent restored from checkpoint"
+        );
     }
 }
 

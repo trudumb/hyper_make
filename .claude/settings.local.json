@@ -68,7 +68,10 @@
       "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make show HEAD:.claude/skills/foundation/measurement-infrastructure/SKILL.md)",
       "Bash(git checkout:*)",
       "Bash(git restore:*)",
-      "Bash(ps:*)"
+      "Bash(ps:*)",
+      "Bash(perl -ne:*)",
+      "Bash(pgrep:*)",
+      "Bash(done)"
     ]
   }
 }
