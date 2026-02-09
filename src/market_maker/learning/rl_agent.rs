@@ -352,6 +352,127 @@ impl Default for MDPState {
     }
 }
 
+// ============================================================================
+// Compact 3D State Space (Phase 2: P1-2)
+// ============================================================================
+
+/// Compact 3-bucket imbalance for reduced state space.
+/// Merges WeakSell→Sell, WeakBuy→Buy from the 5-bucket version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImbalanceBucketCompact {
+    /// Sell pressure (< -0.05)
+    Sell,
+    /// Neutral (-0.05 to +0.05)
+    Neutral,
+    /// Buy pressure (> +0.05)
+    Buy,
+}
+
+impl ImbalanceBucketCompact {
+    /// Convert continuous imbalance to compact bucket.
+    pub fn from_imbalance(imbalance: f64) -> Self {
+        match imbalance {
+            i if i < -0.05 => Self::Sell,
+            i if i < 0.05 => Self::Neutral,
+            _ => Self::Buy,
+        }
+    }
+
+    /// Get bucket index (0-2).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Sell => 0,
+            Self::Neutral => 1,
+            Self::Buy => 2,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 3;
+
+    /// Reconstruct from bucket index (0-2).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Sell,
+            1 => Self::Neutral,
+            _ => Self::Buy,
+        }
+    }
+}
+
+/// Compact 3D MDP state: Inventory(5) x Volatility(3) x Imbalance(3) = 45 states.
+///
+/// Drops AdverseBucket (AS captured in reward after P0-2) and ExcitationBucket
+/// (correlated with volatility). Merges imbalance from 5 to 3 buckets.
+///
+/// Literature (ISAC): even 1D state (|inventory|) with 1D action (gamma)
+/// achieves 36% inventory reduction. State space efficiency > expressiveness
+/// when data is scarce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MDPStateCompact {
+    /// Inventory bucket (5 levels)
+    pub inventory: InventoryBucket,
+    /// Volatility bucket (3 levels)
+    pub volatility: VolatilityBucket,
+    /// Order book imbalance bucket (3 levels, compact)
+    pub imbalance: ImbalanceBucketCompact,
+}
+
+impl MDPStateCompact {
+    /// Create from continuous state values.
+    pub fn from_continuous(
+        position: f64,
+        max_position: f64,
+        book_imbalance: f64,
+        vol_ratio: f64,
+    ) -> Self {
+        Self {
+            inventory: InventoryBucket::from_position(position, max_position),
+            volatility: VolatilityBucket::from_vol_ratio(vol_ratio),
+            imbalance: ImbalanceBucketCompact::from_imbalance(book_imbalance),
+        }
+    }
+
+    /// Convert to flat state index for Q-table lookup.
+    /// Total states = 5 * 3 * 3 = 45
+    pub fn to_index(&self) -> usize {
+        let mut idx = self.inventory.index();
+        idx = idx * VolatilityBucket::COUNT + self.volatility.index();
+        idx = idx * ImbalanceBucketCompact::COUNT + self.imbalance.index();
+        idx
+    }
+
+    /// Total number of discrete states.
+    pub const STATE_COUNT: usize =
+        InventoryBucket::COUNT * VolatilityBucket::COUNT * ImbalanceBucketCompact::COUNT;
+
+    /// Reconstruct from flat index.
+    pub fn from_index(idx: usize) -> Self {
+        let mut remaining = idx;
+        let imbalance_idx = remaining % ImbalanceBucketCompact::COUNT;
+        remaining /= ImbalanceBucketCompact::COUNT;
+        let volatility_idx = remaining % VolatilityBucket::COUNT;
+        remaining /= VolatilityBucket::COUNT;
+        let inventory_idx = remaining % InventoryBucket::COUNT;
+
+        Self {
+            inventory: InventoryBucket::from_index(inventory_idx),
+            volatility: VolatilityBucket::from_index(volatility_idx),
+            imbalance: ImbalanceBucketCompact::from_index(imbalance_idx),
+        }
+    }
+}
+
+impl Default for MDPStateCompact {
+    fn default() -> Self {
+        Self {
+            inventory: InventoryBucket::Neutral,
+            volatility: VolatilityBucket::Normal,
+            imbalance: ImbalanceBucketCompact::Neutral,
+        }
+    }
+}
+
 /// Maximum number of pending state-action pairs in the FIFO queue.
 const STATE_ACTION_QUEUE_CAPACITY: usize = 8;
 
@@ -640,44 +761,42 @@ impl IntensityAction {
 }
 
 /// Complete parameter-based action for the MDP.
-/// Tunes γ, ω multipliers and quote intensity instead of raw bps adjustments.
-/// Total actions: 5 × 5 × 5 = 125 (more than 27 but still tractable)
+/// Tunes γ, ω multipliers instead of raw bps adjustments.
+/// Total actions: 5 × 5 = 25 (same count as MDPAction, but operating on GLFT parameters).
+///
+/// Literature (Falces Marin 2022): "RL agent controls gamma and skew, NOT raw bid/ask prices.
+/// Won 24/30 days vs pure AS on Sharpe."
+/// ISAC: "1D action (gamma) with 36% inventory reduction."
+///
+/// IntensityAction dropped — sizing is the risk manager's job, not RL's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParameterAction {
     /// Risk aversion multiplier
     pub gamma: GammaAction,
     /// Inventory skew multiplier
     pub omega: OmegaAction,
-    /// Quote intensity
-    pub intensity: IntensityAction,
 }
 
 impl ParameterAction {
     /// Create a new parameter action.
-    pub fn new(gamma: GammaAction, omega: OmegaAction, intensity: IntensityAction) -> Self {
-        Self { gamma, omega, intensity }
+    pub fn new(gamma: GammaAction, omega: OmegaAction) -> Self {
+        Self { gamma, omega }
     }
 
     /// Create from flat index.
     pub fn from_index(idx: usize) -> Self {
-        let intensity_idx = idx % IntensityAction::COUNT;
-        let remaining = idx / IntensityAction::COUNT;
-        let omega_idx = remaining % OmegaAction::COUNT;
-        let gamma_idx = remaining / OmegaAction::COUNT;
+        let omega_idx = idx % OmegaAction::COUNT;
+        let gamma_idx = idx / OmegaAction::COUNT;
 
         Self {
             gamma: GammaAction::from_index(gamma_idx),
             omega: OmegaAction::from_index(omega_idx),
-            intensity: IntensityAction::from_index(intensity_idx),
         }
     }
 
     /// Convert to flat index.
     pub fn to_index(&self) -> usize {
-        let mut idx = self.gamma.index();
-        idx = idx * OmegaAction::COUNT + self.omega.index();
-        idx = idx * IntensityAction::COUNT + self.intensity.index();
-        idx
+        self.gamma.index() * OmegaAction::COUNT + self.omega.index()
     }
 
     /// Get γ multiplier.
@@ -690,38 +809,22 @@ impl ParameterAction {
         self.omega.multiplier()
     }
 
-    /// Get quote intensity [0, 1].
-    pub fn quote_intensity(&self) -> f64 {
-        self.intensity.intensity()
-    }
-
-    /// Total number of parameter actions.
-    pub const ACTION_COUNT: usize = GammaAction::COUNT * OmegaAction::COUNT * IntensityAction::COUNT;
+    /// Total number of parameter actions (5 × 5 = 25).
+    pub const ACTION_COUNT: usize = GammaAction::COUNT * OmegaAction::COUNT;
 
     /// Default neutral action (no changes to base parameters).
     pub fn neutral() -> Self {
         Self {
             gamma: GammaAction::Neutral,
             omega: OmegaAction::Neutral,
-            intensity: IntensityAction::Full,
         }
     }
 
-    /// Defensive action (wider spreads, strong skew, full quote).
+    /// Defensive action (wider spreads, strong skew).
     pub fn defensive() -> Self {
         Self {
             gamma: GammaAction::Defensive,
             omega: OmegaAction::StrongSkew,
-            intensity: IntensityAction::Full,
-        }
-    }
-
-    /// Cautious action (don't quote).
-    pub fn cautious() -> Self {
-        Self {
-            gamma: GammaAction::VeryDefensive,
-            omega: OmegaAction::Neutral,
-            intensity: IntensityAction::NoQuote,
         }
     }
 }
@@ -799,8 +902,8 @@ pub struct RewardConfig {
     pub inventory_penalty_weight: f64,
     /// Weight for volatility penalty
     pub volatility_penalty_weight: f64,
-    /// Weight for adverse selection penalty
-    pub adverse_penalty_weight: f64,
+    /// Weight for inventory change penalty (penalizes accumulation, not just level)
+    pub inventory_change_weight: f64,
     /// Discount factor for future rewards
     pub gamma: f64,
 }
@@ -811,13 +914,17 @@ impl Default for RewardConfig {
             edge_weight: 1.0,
             inventory_penalty_weight: 0.1,
             volatility_penalty_weight: 0.05,
-            adverse_penalty_weight: 0.2,
+            inventory_change_weight: 0.05,
             gamma: 0.95,
         }
     }
 }
 
 /// Reward signal from a transition.
+///
+/// Literature (Falces Marin 2022): reward = spread_capture - realized_AS - fees.
+/// No separate adverse penalty — AS cost is already embedded in realized_edge_bps
+/// when computed as `depth_bps - as_realized_bps - fee_bps`.
 #[derive(Debug, Clone, Copy)]
 pub struct Reward {
     /// Total reward
@@ -828,22 +935,26 @@ pub struct Reward {
     pub inventory_penalty: f64,
     /// Volatility penalty (always non-positive)
     pub volatility_penalty: f64,
-    /// Adverse selection penalty (always non-positive)
-    pub adverse_penalty: f64,
+    /// Inventory change penalty (penalizes accumulation, always non-positive)
+    pub inventory_change_penalty: f64,
 }
 
 impl Reward {
     /// Compute reward from transition.
+    ///
+    /// `realized_edge_bps` should be `spread_capture - AS_cost - fees` (P0-2).
+    /// `prev_inventory_risk` is `|prev_position| / max_position` from the state
+    /// at the time the action was chosen (available from pending state-action queue).
     pub fn compute(
         config: &RewardConfig,
         realized_edge_bps: f64,
-        inventory_risk: f64,  // |position| / max_position
+        inventory_risk: f64,  // |position| / max_position (current)
         vol_ratio: f64,
-        was_adverse: bool,
+        prev_inventory_risk: f64,  // |prev_position| / max_position
     ) -> Self {
         let edge_component = config.edge_weight * realized_edge_bps;
 
-        // Quadratic inventory penalty
+        // Quadratic inventory penalty (penalizes level)
         let inventory_penalty =
             -config.inventory_penalty_weight * inventory_risk.powi(2) * 10.0;
 
@@ -852,21 +963,20 @@ impl Reward {
         let volatility_penalty =
             -config.volatility_penalty_weight * vol_penalty_factor * inventory_risk * 5.0;
 
-        // Adverse selection penalty
-        let adverse_penalty = if was_adverse {
-            -config.adverse_penalty_weight * realized_edge_bps.abs()
-        } else {
-            0.0
-        };
+        // Inventory change penalty (penalizes accumulation, not just level)
+        // An agent that increases inventory from 50% to 60% is penalized more
+        // than one maintaining 60%.
+        let inventory_change_penalty =
+            -config.inventory_change_weight * (inventory_risk - prev_inventory_risk).abs() * 10.0;
 
-        let total = edge_component + inventory_penalty + volatility_penalty + adverse_penalty;
+        let total = edge_component + inventory_penalty + volatility_penalty + inventory_change_penalty;
 
         Self {
             total,
             edge_component,
             inventory_penalty,
             volatility_penalty,
-            adverse_penalty,
+            inventory_change_penalty,
         }
     }
 }
@@ -1056,6 +1166,18 @@ pub struct QLearningConfig {
     pub ucb_c: f64,
     /// Reward configuration
     pub reward_config: RewardConfig,
+    /// Minimum exploration rate for anti-ossification (default 0.05).
+    /// Even with Thompson sampling, mix in uniform random actions at this rate.
+    /// Zheng & Ding (2024): "epsilon should decay to small nonzero baseline, not zero."
+    pub min_exploration_rate: f64,
+    /// Use compact 3D state space (45 states) instead of 5D (675 states).
+    /// Inventory(5) x Volatility(3) x Imbalance(3) = 45.
+    /// ISAC shows even 1D state achieves 36% inventory reduction.
+    pub use_compact_state: bool,
+    /// Use parameter-based actions (GammaAction x OmegaAction = 25) instead of
+    /// BPS delta actions (SpreadAction x SkewAction = 25).
+    /// Falces Marin (2022): "RL controls gamma and skew, NOT raw bid/ask prices."
+    pub use_parameter_actions: bool,
 }
 
 impl Default for QLearningConfig {
@@ -1067,6 +1189,9 @@ impl Default for QLearningConfig {
             min_observations: 10,
             ucb_c: 2.0,
             reward_config: RewardConfig::default(),
+            min_exploration_rate: 0.05,
+            use_compact_state: true,
+            use_parameter_actions: true,
         }
     }
 }
@@ -1110,12 +1235,27 @@ impl Default for SimToRealConfig {
     }
 }
 
+/// Unified state index that can come from either MDPState or MDPStateCompact.
+/// Stored as a flat index for Q-table lookup.
+pub type StateIndex = usize;
+
+/// Unified action index that can come from either MDPAction or ParameterAction.
+/// Both have 25 actions, so the index range is 0..24.
+pub type ActionIndex = usize;
+
+/// Number of actions (same for both MDPAction and ParameterAction = 25).
+pub const UNIFIED_ACTION_COUNT: usize = 25;
+
 /// Q-learning agent with Bayesian Q-values.
+///
+/// The agent operates on state/action indices internally. The caller is responsible
+/// for converting between concrete types (MDPState vs MDPStateCompact, MDPAction vs
+/// ParameterAction) and indices using the config flags.
 #[derive(Debug)]
 pub struct QLearningAgent {
     /// Configuration
     config: QLearningConfig,
-    /// Q-table: state -> action -> BayesianQValue
+    /// Q-table: state_index -> [action Q-values]
     q_table: HashMap<usize, Vec<BayesianQValue>>,
     /// Episode count
     episodes: u64,
@@ -1123,9 +1263,9 @@ pub struct QLearningAgent {
     total_reward: f64,
     /// Recent rewards for monitoring
     recent_rewards: Vec<f64>,
-    /// FIFO queue of pending state-action pairs awaiting reward updates.
+    /// FIFO queue of pending (state_index, action_index) pairs awaiting reward updates.
     /// Supports clustered fills where multiple quotes are outstanding.
-    pending_state_actions: VecDeque<(MDPState, MDPAction)>,
+    pending_state_actions: VecDeque<(StateIndex, ActionIndex)>,
 }
 
 impl QLearningAgent {
@@ -1141,35 +1281,52 @@ impl QLearningAgent {
         }
     }
 
-    /// Get Q-values for a state (initialize if needed).
-    fn get_q_values(&mut self, state: &MDPState) -> &mut Vec<BayesianQValue> {
-        let idx = state.to_index();
-        self.q_table.entry(idx).or_insert_with(|| {
-            vec![BayesianQValue::new(); MDPAction::ACTION_COUNT]
+    /// Whether to use compact 3D state space.
+    pub fn use_compact_state(&self) -> bool {
+        self.config.use_compact_state
+    }
+
+    /// Whether to use parameter-based actions.
+    pub fn use_parameter_actions(&self) -> bool {
+        self.config.use_parameter_actions
+    }
+
+    /// Get Q-values for a state index (initialize if needed).
+    fn get_q_values_by_idx(&mut self, state_idx: usize) -> &mut Vec<BayesianQValue> {
+        self.q_table.entry(state_idx).or_insert_with(|| {
+            vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT]
         })
     }
 
-    /// Select action using the configured exploration strategy.
-    pub fn select_action(&mut self, state: &MDPState) -> MDPAction {
+    /// Select action index using the configured exploration strategy.
+    ///
+    /// Returns a flat action index (0..24). Caller converts to MDPAction or ParameterAction.
+    pub fn select_action_idx(&mut self, state_idx: StateIndex) -> ActionIndex {
         // Copy config values to avoid borrow issues
         let min_observations = self.config.min_observations;
         let exploration = self.config.exploration;
         let ucb_c = self.config.ucb_c;
         let episodes = self.episodes;
+        let min_exploration_rate = self.config.min_exploration_rate;
 
-        let q_values = self.get_q_values(state);
+        let q_values = self.get_q_values_by_idx(state_idx);
 
         // Check if we have enough observations for exploitation
         let total_obs: u64 = q_values.iter().map(|q| q.count()).sum();
         if total_obs < min_observations {
             // Pure exploration: uniform random
-            let action_idx = (sample_uniform() * MDPAction::ACTION_COUNT as f64) as usize;
-            return MDPAction::from_index(action_idx.min(MDPAction::ACTION_COUNT - 1));
+            let action_idx = (sample_uniform() * UNIFIED_ACTION_COUNT as f64) as usize;
+            return action_idx.min(UNIFIED_ACTION_COUNT - 1);
+        }
+
+        // Anti-ossification: mix in uniform random action at min_exploration_rate
+        if min_exploration_rate > 0.0 && sample_uniform() < min_exploration_rate {
+            let action_idx = (sample_uniform() * UNIFIED_ACTION_COUNT as f64) as usize;
+            return action_idx.min(UNIFIED_ACTION_COUNT - 1);
         }
 
         let action_idx = match exploration {
             ExplorationStrategy::ThompsonSampling => {
-                // Sample from each Q-value posterior and select max
                 q_values
                     .iter()
                     .enumerate()
@@ -1179,7 +1336,6 @@ impl QLearningAgent {
                     .unwrap_or(0)
             }
             ExplorationStrategy::UCB => {
-                // Select action with highest UCB
                 q_values
                     .iter()
                     .enumerate()
@@ -1191,10 +1347,8 @@ impl QLearningAgent {
             ExplorationStrategy::EpsilonGreedy { epsilon, decay } => {
                 let effective_epsilon = epsilon * decay.powf(episodes as f64);
                 if sample_uniform() < effective_epsilon {
-                    // Random action
-                    (sample_uniform() * MDPAction::ACTION_COUNT as f64) as usize
+                    (sample_uniform() * UNIFIED_ACTION_COUNT as f64) as usize
                 } else {
-                    // Greedy action
                     q_values
                         .iter()
                         .enumerate()
@@ -1206,26 +1360,32 @@ impl QLearningAgent {
             }
         };
 
-        MDPAction::from_index(action_idx.min(MDPAction::ACTION_COUNT - 1))
+        action_idx.min(UNIFIED_ACTION_COUNT - 1)
     }
 
-    /// Update Q-values with observed transition.
-    pub fn update(
+    /// Legacy: Select action using the configured exploration strategy.
+    /// Returns an MDPAction (for backward compatibility).
+    pub fn select_action(&mut self, state: &MDPState) -> MDPAction {
+        let action_idx = self.select_action_idx(state.to_index());
+        MDPAction::from_index(action_idx)
+    }
+
+    /// Update Q-values with observed transition (index-based).
+    pub fn update_idx(
         &mut self,
-        state: MDPState,
-        action: MDPAction,
+        state_idx: StateIndex,
+        action_idx: ActionIndex,
         reward: Reward,
-        next_state: MDPState,
+        next_state_idx: StateIndex,
         done: bool,
     ) {
-        // Copy gamma to avoid borrow issues
         let gamma = self.config.gamma;
 
         // Get max Q-value for next state
         let max_next_q = if done {
             0.0
         } else {
-            let next_q_values = self.get_q_values(&next_state);
+            let next_q_values = self.get_q_values_by_idx(next_state_idx);
             next_q_values
                 .iter()
                 .map(|q| q.mean())
@@ -1237,12 +1397,12 @@ impl QLearningAgent {
         let td_target = reward.total + gamma * max_next_q;
 
         // Update Q-value with Bayesian posterior update
-        let action_idx = action.to_index();
-        let state_idx = state.to_index();
-        let q_values = self.get_q_values(&state);
-        q_values[action_idx].update(td_target);
-        let q_mean = q_values[action_idx].mean();
-        let q_std = q_values[action_idx].std();
+        let q_values = self.get_q_values_by_idx(state_idx);
+        if action_idx < q_values.len() {
+            q_values[action_idx].update(td_target);
+        }
+        let q_mean = q_values.get(action_idx).map(|q| q.mean()).unwrap_or(0.0);
+        let q_std = q_values.get(action_idx).map(|q| q.std()).unwrap_or(0.0);
 
         // Track rewards
         self.total_reward += reward.total;
@@ -1262,28 +1422,45 @@ impl QLearningAgent {
         );
     }
 
+    /// Legacy: Update Q-values with observed transition using concrete types.
+    pub fn update(
+        &mut self,
+        state: MDPState,
+        action: MDPAction,
+        reward: Reward,
+        next_state: MDPState,
+        done: bool,
+    ) {
+        self.update_idx(state.to_index(), action.to_index(), reward, next_state.to_index(), done);
+    }
+
     /// Record start of a new episode.
-    pub fn start_episode(&mut self, _initial_state: MDPState) {
+    pub fn start_episode(&mut self) {
         self.episodes += 1;
         self.pending_state_actions.clear();
     }
 
-    /// Get the greedy action (exploitation only).
-    pub fn get_greedy_action(&mut self, state: &MDPState) -> MDPAction {
-        let q_values = self.get_q_values(state);
-        let action_idx = q_values
+    /// Get the greedy action index (exploitation only).
+    pub fn get_greedy_action_idx(&mut self, state_idx: StateIndex) -> ActionIndex {
+        let q_values = self.get_q_values_by_idx(state_idx);
+        q_values
             .iter()
             .enumerate()
             .map(|(i, q)| (i, q.mean()))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .map(|(i, _)| i)
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    /// Legacy: Get the greedy action (exploitation only).
+    pub fn get_greedy_action(&mut self, state: &MDPState) -> MDPAction {
+        let action_idx = self.get_greedy_action_idx(state.to_index());
         MDPAction::from_index(action_idx)
     }
 
-    /// Get Q-value statistics for a state.
-    pub fn get_q_stats(&mut self, state: &MDPState) -> QValueStats {
-        let q_values = self.get_q_values(state);
+    /// Get Q-value statistics for a state index.
+    pub fn get_q_stats_idx(&mut self, state_idx: StateIndex) -> QValueStats {
+        let q_values = self.get_q_values_by_idx(state_idx);
         let best_idx = q_values
             .iter()
             .enumerate()
@@ -1295,12 +1472,17 @@ impl QLearningAgent {
         let best_q = &q_values[best_idx];
 
         QValueStats {
-            best_action: MDPAction::from_index(best_idx),
+            best_action_idx: best_idx,
             best_q_mean: best_q.mean(),
             best_q_std: best_q.std(),
             best_q_count: best_q.count(),
             total_observations: q_values.iter().map(|q| q.count()).sum(),
         }
+    }
+
+    /// Legacy: Get Q-value statistics for a state.
+    pub fn get_q_stats(&mut self, state: &MDPState) -> QValueStats {
+        self.get_q_stats_idx(state.to_index())
     }
 
     /// Get summary statistics.
@@ -1324,18 +1506,26 @@ impl QLearningAgent {
         &self.config.reward_config
     }
 
-    /// Push a state-action pair onto the pending queue (FIFO).
-    ///
-    /// If the queue exceeds capacity, the oldest entry is dropped.
-    pub fn push_state_action(&mut self, state: MDPState, action: MDPAction) {
+    /// Get the full agent configuration.
+    pub fn config(&self) -> &QLearningConfig {
+        &self.config
+    }
+
+    /// Push a state-action pair onto the pending queue (FIFO) using indices.
+    pub fn push_state_action_idx(&mut self, state_idx: StateIndex, action_idx: ActionIndex) {
         if self.pending_state_actions.len() >= STATE_ACTION_QUEUE_CAPACITY {
             self.pending_state_actions.pop_front();
         }
-        self.pending_state_actions.push_back((state, action));
+        self.pending_state_actions.push_back((state_idx, action_idx));
+    }
+
+    /// Legacy: Push a state-action pair onto the pending queue (FIFO).
+    pub fn push_state_action(&mut self, state: MDPState, action: MDPAction) {
+        self.push_state_action_idx(state.to_index(), action.to_index());
     }
 
     /// Pop the next (oldest) pending state-action pair for reward update.
-    pub fn take_next_state_action(&mut self) -> Option<(MDPState, MDPAction)> {
+    pub fn take_next_state_action(&mut self) -> Option<(StateIndex, ActionIndex)> {
         self.pending_state_actions.pop_front()
     }
 
@@ -1352,7 +1542,7 @@ impl QLearningAgent {
 
     /// Get and clear the oldest pending state-action pair.
     /// Prefer `take_next_state_action()` for new code — this delegates to it.
-    pub fn take_last_state_action(&mut self) -> Option<(MDPState, MDPAction)> {
+    pub fn take_last_state_action(&mut self) -> Option<(StateIndex, ActionIndex)> {
         self.take_next_state_action()
     }
 
@@ -1362,10 +1552,6 @@ impl QLearningAgent {
     }
 
     /// Import a paper trading Q-table as a discounted prior for live trading.
-    ///
-    /// For each state-action pair in `paper_q`, creates a `BayesianQValue` with
-    /// the paper posterior as a down-weighted prior. States not present in `paper_q`
-    /// retain their current (default) Q-values.
     pub fn import_q_table_as_prior(
         &mut self,
         paper_q: &HashMap<usize, Vec<BayesianQValue>>,
@@ -1375,7 +1561,7 @@ impl QLearningAgent {
             let live_values = self
                 .q_table
                 .entry(state_idx)
-                .or_insert_with(|| vec![BayesianQValue::new(); MDPAction::ACTION_COUNT]);
+                .or_insert_with(|| vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT]);
             for (i, paper_qv) in paper_values.iter().enumerate() {
                 if i < live_values.len() {
                     live_values[i] = BayesianQValue::with_discounted_prior(paper_qv, weight);
@@ -1385,8 +1571,6 @@ impl QLearningAgent {
     }
 
     /// Total number of Bayesian updates across all states and actions.
-    ///
-    /// Useful for checking `SimToRealConfig::min_real_fills` threshold.
     pub fn total_updates(&self) -> u64 {
         self.q_table
             .values()
@@ -1396,9 +1580,6 @@ impl QLearningAgent {
     }
 
     /// Average of recent rewards, or 0.0 if no rewards recorded.
-    ///
-    /// Used by `SimToRealConfig::auto_disable_after_fills` to detect
-    /// negative-EV RL policies that should be turned off.
     pub fn mean_recent_reward(&self) -> f64 {
         if self.recent_rewards.is_empty() {
             0.0
@@ -1408,10 +1589,6 @@ impl QLearningAgent {
     }
 
     /// Serialize Q-table and agent state to checkpoint.
-    ///
-    /// Only stores (state, action) pairs that have been observed (n > 0)
-    /// to keep the checkpoint compact. Default Q-values are reconstructed
-    /// on restore for missing entries.
     pub fn to_checkpoint(&self) -> RLCheckpoint {
         let mut entries = Vec::new();
         let mut total_observations: u64 = 0;
@@ -1438,14 +1615,39 @@ impl QLearningAgent {
             episodes: self.episodes,
             total_reward: self.total_reward,
             total_observations,
+            action_space_version: if self.config.use_parameter_actions { 2 } else { 1 },
+            use_compact_state: self.config.use_compact_state,
         }
     }
 
     /// Restore Q-table and agent state from checkpoint.
-    ///
-    /// Recreates `BayesianQValue` entries using `from_checkpoint()` for each
-    /// stored entry. States/actions not in the checkpoint get default Q-values.
     pub fn restore_from_checkpoint(&mut self, ckpt: &RLCheckpoint) {
+        // Check action space version compatibility
+        let expected_version = if self.config.use_parameter_actions { 2 } else { 1 };
+        if ckpt.action_space_version != 0 && ckpt.action_space_version != expected_version {
+            debug!(
+                checkpoint_version = ckpt.action_space_version,
+                expected_version = expected_version,
+                "Action space version mismatch — starting fresh Q-table"
+            );
+            // Don't restore incompatible Q-table, but keep episode count
+            self.episodes = ckpt.episodes;
+            self.total_reward = ckpt.total_reward;
+            return;
+        }
+
+        // Check state space compatibility
+        if ckpt.use_compact_state != self.config.use_compact_state {
+            debug!(
+                checkpoint_compact = ckpt.use_compact_state,
+                config_compact = self.config.use_compact_state,
+                "State space mismatch — starting fresh Q-table"
+            );
+            self.episodes = ckpt.episodes;
+            self.total_reward = ckpt.total_reward;
+            return;
+        }
+
         self.episodes = ckpt.episodes;
         self.total_reward = ckpt.total_reward;
 
@@ -1455,7 +1657,7 @@ impl QLearningAgent {
             let actions = self
                 .q_table
                 .entry(entry.state_index)
-                .or_insert_with(|| vec![BayesianQValue::new(); MDPAction::ACTION_COUNT]);
+                .or_insert_with(|| vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT]);
             if entry.action_index < actions.len() {
                 actions[entry.action_index] = BayesianQValue::from_checkpoint(
                     entry.mu_n,
@@ -1486,8 +1688,8 @@ impl Default for QLearningAgent {
 /// Q-value statistics for a state.
 #[derive(Debug, Clone)]
 pub struct QValueStats {
-    /// Best action according to posterior mean
-    pub best_action: MDPAction,
+    /// Best action index according to posterior mean
+    pub best_action_idx: ActionIndex,
     /// Posterior mean of best Q-value
     pub best_q_mean: f64,
     /// Posterior std of best Q-value
@@ -1516,20 +1718,30 @@ pub struct AgentSummary {
 // ============================================================================
 
 /// Policy recommendation from the RL agent.
+///
+/// Supports both legacy BPS-delta mode and new parameter-multiplier mode.
+/// When `use_parameter_actions` is true, `gamma_multiplier` and `omega_multiplier`
+/// are populated instead of `spread_delta_bps`/skew fields.
 #[derive(Debug, Clone)]
 pub struct RLPolicyRecommendation {
-    /// Recommended spread delta (bps)
+    /// Recommended spread delta (bps) — legacy BPS-delta mode only
     pub spread_delta_bps: f64,
-    /// Recommended bid skew (bps)
+    /// Recommended bid skew (bps) — legacy BPS-delta mode only
     pub bid_skew_bps: f64,
-    /// Recommended ask skew (bps)
+    /// Recommended ask skew (bps) — legacy BPS-delta mode only
     pub ask_skew_bps: f64,
+    /// Gamma (risk aversion) multiplier — parameter mode only
+    pub gamma_multiplier: f64,
+    /// Omega (inventory skew) multiplier — parameter mode only
+    pub omega_multiplier: f64,
     /// Confidence in recommendation [0, 1]
     pub confidence: f64,
     /// Whether this is exploration or exploitation
     pub is_exploration: bool,
-    /// Underlying MDP action
-    pub action: MDPAction,
+    /// Action index (0..24)
+    pub action_idx: ActionIndex,
+    /// State index used for this recommendation
+    pub state_idx: StateIndex,
     /// Expected Q-value
     pub expected_q: f64,
     /// Q-value uncertainty
@@ -1537,34 +1749,57 @@ pub struct RLPolicyRecommendation {
 }
 
 impl RLPolicyRecommendation {
-    /// Create from agent action selection.
+    /// Create from agent action selection using index-based API.
+    ///
+    /// Always uses Thompson sampling (explore=true) per P1-1. The `explore`
+    /// parameter is kept for API compat but ignored — Thompson sampling
+    /// self-regulates exploration via posterior width.
     pub fn from_agent(
         agent: &mut QLearningAgent,
-        state: &MDPState,
-        explore: bool,
+        state_idx: StateIndex,
+        _explore: bool,
     ) -> Self {
-        let action = if explore {
-            agent.select_action(state)
-        } else {
-            agent.get_greedy_action(state)
-        };
-
-        let stats = agent.get_q_stats(state);
+        // Always explore via Thompson sampling (P1-1)
+        let action_idx = agent.select_action_idx(state_idx);
+        let stats = agent.get_q_stats_idx(state_idx);
 
         // Confidence based on observations and uncertainty
         let obs_factor = (stats.total_observations as f64 / 100.0).min(1.0);
         let uncertainty_factor = 1.0 / (1.0 + stats.best_q_std);
         let confidence = obs_factor * uncertainty_factor;
 
-        Self {
-            spread_delta_bps: action.spread.delta_bps(),
-            bid_skew_bps: action.skew.bid_skew_bps(),
-            ask_skew_bps: action.skew.ask_skew_bps(),
-            confidence,
-            is_exploration: explore && action != stats.best_action,
-            action,
-            expected_q: stats.best_q_mean,
-            q_uncertainty: stats.best_q_std,
+        let is_exploration = action_idx != stats.best_action_idx;
+
+        if agent.use_parameter_actions() {
+            let param_action = ParameterAction::from_index(action_idx);
+            Self {
+                spread_delta_bps: 0.0,
+                bid_skew_bps: 0.0,
+                ask_skew_bps: 0.0,
+                gamma_multiplier: param_action.gamma_multiplier(),
+                omega_multiplier: param_action.omega_multiplier(),
+                confidence,
+                is_exploration,
+                action_idx,
+                state_idx,
+                expected_q: stats.best_q_mean,
+                q_uncertainty: stats.best_q_std,
+            }
+        } else {
+            let mdp_action = MDPAction::from_index(action_idx);
+            Self {
+                spread_delta_bps: mdp_action.spread.delta_bps(),
+                bid_skew_bps: mdp_action.skew.bid_skew_bps(),
+                ask_skew_bps: mdp_action.skew.ask_skew_bps(),
+                gamma_multiplier: 1.0,
+                omega_multiplier: 1.0,
+                confidence,
+                is_exploration,
+                action_idx,
+                state_idx,
+                expected_q: stats.best_q_mean,
+                q_uncertainty: stats.best_q_std,
+            }
         }
     }
 }
@@ -1774,21 +2009,37 @@ mod tests {
     #[test]
     fn test_reward_computation() {
         let config = RewardConfig::default();
-        let reward = Reward::compute(&config, 2.0, 0.3, 1.0, false);
+        let reward = Reward::compute(&config, 2.0, 0.3, 1.0, 0.2);
 
         assert!(reward.edge_component > 0.0);
         assert!(reward.inventory_penalty <= 0.0);
         assert_eq!(reward.volatility_penalty, 0.0); // vol_ratio = 1.0
-        assert_eq!(reward.adverse_penalty, 0.0);    // not adverse
     }
 
     #[test]
-    fn test_reward_adverse_penalty() {
+    fn test_reward_no_double_count_on_adverse() {
         let config = RewardConfig::default();
-        let reward = Reward::compute(&config, -3.0, 0.2, 1.0, true);
+        // Adverse fill: negative edge. Should NOT have extra penalty.
+        let reward = Reward::compute(&config, -3.0, 0.2, 1.0, 0.2);
 
         assert!(reward.edge_component < 0.0);
-        assert!(reward.adverse_penalty < 0.0);
+        // No separate adverse penalty — AS cost is embedded in realized_edge_bps
+        // Total should be edge + inventory penalty + vol penalty + inv change
+        let expected = reward.edge_component + reward.inventory_penalty
+            + reward.volatility_penalty + reward.inventory_change_penalty;
+        assert!((reward.total - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_reward_inventory_change_penalty() {
+        let config = RewardConfig::default();
+        // Inventory increased from 20% to 50% → should be penalized
+        let reward_increase = Reward::compute(&config, 1.0, 0.5, 1.0, 0.2);
+        // Inventory stayed at 50% → no change penalty
+        let reward_stable = Reward::compute(&config, 1.0, 0.5, 1.0, 0.5);
+
+        assert!(reward_increase.inventory_change_penalty < reward_stable.inventory_change_penalty,
+            "Increasing inventory should be penalized more than stable inventory");
     }
 
     #[test]
@@ -1831,7 +2082,11 @@ mod tests {
 
     #[test]
     fn test_q_learning_agent_update() {
-        let mut agent = QLearningAgent::default();
+        let mut agent = QLearningAgent::new(QLearningConfig {
+            use_compact_state: false,
+            use_parameter_actions: false,
+            ..Default::default()
+        });
         let state = MDPState::default();
         let action = MDPAction::default();
         let reward = Reward {
@@ -1839,7 +2094,7 @@ mod tests {
             edge_component: 1.0,
             inventory_penalty: 0.0,
             volatility_penalty: 0.0,
-            adverse_penalty: 0.0,
+            inventory_change_penalty: 0.0,
         };
         let next_state = MDPState::default();
 
@@ -1850,14 +2105,34 @@ mod tests {
     }
 
     #[test]
-    fn test_rl_policy_recommendation() {
-        let mut agent = QLearningAgent::default();
-        let state = MDPState::default();
+    fn test_rl_policy_recommendation_parameter_mode() {
+        let mut agent = QLearningAgent::default(); // use_parameter_actions = true
+        let state_idx = MDPStateCompact::default().to_index();
 
-        let rec = RLPolicyRecommendation::from_agent(&mut agent, &state, false);
+        let rec = RLPolicyRecommendation::from_agent(&mut agent, state_idx, true);
+
+        // In parameter mode, gamma/omega multipliers should be set
+        assert!(rec.gamma_multiplier >= 0.5 && rec.gamma_multiplier <= 2.0);
+        assert!(rec.omega_multiplier >= 0.25 && rec.omega_multiplier <= 2.0);
+        assert!(rec.confidence >= 0.0 && rec.confidence <= 1.0);
+    }
+
+    #[test]
+    fn test_rl_policy_recommendation_legacy_mode() {
+        let mut agent = QLearningAgent::new(QLearningConfig {
+            use_parameter_actions: false,
+            use_compact_state: false,
+            ..Default::default()
+        });
+        let state_idx = MDPState::default().to_index();
+
+        let rec = RLPolicyRecommendation::from_agent(&mut agent, state_idx, false);
 
         assert!(rec.spread_delta_bps >= -3.0 && rec.spread_delta_bps <= 3.0);
         assert!(rec.confidence >= 0.0 && rec.confidence <= 1.0);
+        // In legacy mode, multipliers should be 1.0
+        assert_eq!(rec.gamma_multiplier, 1.0);
+        assert_eq!(rec.omega_multiplier, 1.0);
     }
 
     #[test]
@@ -1910,7 +2185,7 @@ mod tests {
 
     #[test]
     fn test_parameter_action_round_trip() {
-        // Test all 125 parameter actions round-trip through index
+        // Test all 25 parameter actions round-trip through index
         for i in 0..ParameterAction::ACTION_COUNT {
             let action = ParameterAction::from_index(i);
             let recovered = action.to_index();
@@ -1920,8 +2195,10 @@ mod tests {
 
     #[test]
     fn test_parameter_action_count() {
-        // 5 × 5 × 5 = 125 actions
-        assert_eq!(ParameterAction::ACTION_COUNT, 125);
+        // 5 × 5 = 25 actions (IntensityAction dropped — sizing is risk manager's job)
+        assert_eq!(ParameterAction::ACTION_COUNT, 25);
+        assert_eq!(ParameterAction::ACTION_COUNT, UNIFIED_ACTION_COUNT);
+        assert_eq!(MDPAction::ACTION_COUNT, UNIFIED_ACTION_COUNT);
     }
 
     #[test]
@@ -1929,7 +2206,6 @@ mod tests {
         let neutral = ParameterAction::neutral();
         assert_eq!(neutral.gamma_multiplier(), 1.0);
         assert_eq!(neutral.omega_multiplier(), 1.0);
-        assert_eq!(neutral.quote_intensity(), 1.0);
     }
 
     #[test]
@@ -1937,12 +2213,30 @@ mod tests {
         let defensive = ParameterAction::defensive();
         assert!(defensive.gamma_multiplier() > 1.0, "Defensive should have higher γ");
         assert!(defensive.omega_multiplier() > 1.0, "Defensive should have higher skew");
-        assert_eq!(defensive.quote_intensity(), 1.0, "Defensive should still quote");
     }
 
     #[test]
-    fn test_parameter_action_cautious() {
-        let cautious = ParameterAction::cautious();
-        assert_eq!(cautious.quote_intensity(), 0.0, "Cautious should not quote");
+    fn test_compact_state_round_trip() {
+        for idx in 0..MDPStateCompact::STATE_COUNT {
+            let state = MDPStateCompact::from_index(idx);
+            assert_eq!(
+                state.to_index(), idx,
+                "Compact state round-trip failed for index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_state_count() {
+        // 5 × 3 × 3 = 45 states
+        assert_eq!(MDPStateCompact::STATE_COUNT, 45);
+    }
+
+    #[test]
+    fn test_compact_state_from_continuous() {
+        let state = MDPStateCompact::from_continuous(0.0, 100.0, 0.0, 1.0);
+        assert_eq!(state.inventory, InventoryBucket::Neutral);
+        assert_eq!(state.volatility, VolatilityBucket::Normal);
+        assert_eq!(state.imbalance, ImbalanceBucketCompact::Neutral);
     }
 }

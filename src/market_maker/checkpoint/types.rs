@@ -441,6 +441,13 @@ pub struct RLCheckpoint {
     pub total_reward: f64,
     /// Total state-action observations
     pub total_observations: u64,
+    /// Action space version for compatibility checking.
+    /// 0 = legacy (pre-versioning), 1 = BPS-delta (MDPAction), 2 = parameter (ParameterAction).
+    #[serde(default)]
+    pub action_space_version: u32,
+    /// Whether this checkpoint used compact 3D state space.
+    #[serde(default)]
+    pub use_compact_state: bool,
 }
 
 #[cfg(test)]

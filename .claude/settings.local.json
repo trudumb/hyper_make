@@ -71,7 +71,10 @@
       "Bash(ps:*)",
       "Bash(perl -ne:*)",
       "Bash(pgrep:*)",
-      "Bash(done)"
+      "Bash(done)",
+      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

@@ -140,7 +140,7 @@ impl OfflineTrainer {
                     edge_component: exp.edge_component,
                     inventory_penalty: exp.inventory_penalty,
                     volatility_penalty: exp.volatility_penalty,
-                    adverse_penalty: exp.adverse_penalty,
+                    inventory_change_penalty: exp.inventory_change_penalty,
                 };
                 let next_state = MDPState::from_index(exp.next_state_idx);
 

@@ -285,6 +285,14 @@ pub struct MarketParams {
     pub rl_expected_q: f64,
     /// Whether RL action was applied to quoting (vs observation-only).
     pub rl_action_applied: bool,
+    /// RL gamma (risk aversion) multiplier [0.5, 2.0].
+    /// Applied to base γ from GLFT: effective_γ = base_γ × rl_gamma_multiplier.
+    /// > 1.0 = wider spreads (defensive), < 1.0 = tighter spreads (aggressive).
+    pub rl_gamma_multiplier: f64,
+    /// RL omega (inventory skew) multiplier [0.25, 2.0].
+    /// Applied to base skew: effective_ω = base_ω × rl_omega_multiplier.
+    /// > 1.0 = stronger inventory clearing, < 1.0 = weaker clearing.
+    pub rl_omega_multiplier: f64,
 
     // --- Phase 8: Competitor Model ---
     /// Competitor snipe probability [0, 1].
@@ -916,6 +924,8 @@ impl Default for MarketParams {
             rl_is_exploration: false,
             rl_expected_q: 0.0,
             rl_action_applied: false,
+            rl_gamma_multiplier: 1.0,
+            rl_omega_multiplier: 1.0,
             // Phase 8: Competitor Model
             competitor_snipe_prob: 0.1,      // 10% baseline
             competitor_spread_factor: 1.0,   // No adjustment

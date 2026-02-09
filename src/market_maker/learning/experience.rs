@@ -49,8 +49,8 @@ pub struct ExperienceRecord {
     pub inventory_penalty: f64,
     /// Volatility penalty component
     pub volatility_penalty: f64,
-    /// Adverse selection penalty component
-    pub adverse_penalty: f64,
+    /// Inventory change penalty component
+    pub inventory_change_penalty: f64,
     /// Next state index after transition
     pub next_state_idx: usize,
     /// Whether this is a terminal state
@@ -121,7 +121,7 @@ impl ExperienceRecord {
             edge_component: params.reward.edge_component,
             inventory_penalty: params.reward.inventory_penalty,
             volatility_penalty: params.reward.volatility_penalty,
-            adverse_penalty: params.reward.adverse_penalty,
+            inventory_change_penalty: params.reward.inventory_change_penalty,
             next_state_idx: params.next_state.to_index(),
             done: params.done,
             timestamp_ms: params.timestamp_ms,
@@ -224,7 +224,7 @@ mod tests {
             edge_component: 1.2,
             inventory_penalty: -0.3,
             volatility_penalty: -0.2,
-            adverse_penalty: -0.2,
+            inventory_change_penalty: -0.2,
             next_state_idx: 43,
             done: false,
             timestamp_ms: 1234567890,
@@ -268,7 +268,7 @@ mod tests {
             edge_component: 1.5,
             inventory_penalty: -0.2,
             volatility_penalty: -0.1,
-            adverse_penalty: -0.2,
+            inventory_change_penalty: -0.2,
             next_state_idx: 1,
             done: false,
             timestamp_ms: 0,

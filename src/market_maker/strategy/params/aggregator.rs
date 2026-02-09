@@ -288,6 +288,8 @@ impl ParameterAggregator {
             rl_is_exploration: false,
             rl_expected_q: 0.0,
             rl_action_applied: false,
+            rl_gamma_multiplier: 1.0,
+            rl_omega_multiplier: 1.0,
 
             // Phase 8: Competitor Model
             // These will be populated from CompetitorModel in orchestrator
