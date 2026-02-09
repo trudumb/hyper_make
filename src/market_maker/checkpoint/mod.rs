@@ -232,6 +232,7 @@ mod tests {
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
+            kill_switch: KillSwitchCheckpoint::default(),
         }
     }
 

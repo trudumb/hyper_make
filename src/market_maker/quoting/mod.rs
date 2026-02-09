@@ -10,7 +10,7 @@ pub mod kappa_spread;
 mod ladder;
 
 pub use filter::{
-    QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
+    apply_close_bias, QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
     DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
 };
 pub use kappa_spread::{

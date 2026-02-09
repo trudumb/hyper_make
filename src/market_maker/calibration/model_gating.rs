@@ -28,7 +28,7 @@
 //! let spread_mult = gating.spread_multiplier();
 //! ```
 
-use super::information_ratio::InformationRatioTracker;
+use super::information_ratio::{ExponentialIRTracker, InformationRatioTracker};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -61,6 +61,14 @@ pub struct ModelGatingConfig {
 
     /// Number of IR bins for tracking.
     pub n_bins: usize,
+
+    /// Exponential IR decay factor (default 0.998 ~ 500 effective samples).
+    pub exp_ir_decay: f64,
+
+    /// Exponential IR threshold below which model is degrading (default 0.3).
+    /// If exp IR drops below this while flat IR is still above threshold,
+    /// prefer the exp IR (faster regime shift detection).
+    pub exp_ir_threshold: f64,
 }
 
 impl Default for ModelGatingConfig {
@@ -75,6 +83,8 @@ impl Default for ModelGatingConfig {
             prior_mean: 0.5, // Neutral prior; let data drive confidence
             prior_df: 10.0,  // Moderate prior strength
             n_bins: 10,
+            exp_ir_decay: 0.998,
+            exp_ir_threshold: 0.3,
         }
     }
 }
@@ -110,15 +120,17 @@ pub struct ModelTracker {
     #[allow(dead_code)]
     name: String,
     ir_tracker: InformationRatioTracker,
+    exp_ir_tracker: ExponentialIRTracker,
     last_confidence: ModelConfidence,
     disabled: bool,
 }
 
 impl ModelTracker {
-    fn new(name: &str, n_bins: usize) -> Self {
+    fn new(name: &str, n_bins: usize, exp_ir_decay: f64) -> Self {
         Self {
             name: name.to_string(),
             ir_tracker: InformationRatioTracker::new(n_bins),
+            exp_ir_tracker: ExponentialIRTracker::new(exp_ir_decay),
             last_confidence: ModelConfidence::None,
             disabled: false,
         }
@@ -126,6 +138,9 @@ impl ModelTracker {
 
     fn update(&mut self, predicted: f64, outcome: bool) {
         self.ir_tracker.update(predicted, outcome);
+        // For exp IR: outcome=true -> 1.0, outcome=false -> 0.0
+        self.exp_ir_tracker
+            .update(predicted, if outcome { 1.0 } else { 0.0 });
     }
 
     fn confidence(&self, config: &ModelGatingConfig) -> ModelConfidence {
@@ -140,6 +155,22 @@ impl ModelTracker {
         let p_above = self
             .ir_tracker
             .posterior_prob_ir_above(config.ir_threshold, config.prior_mean, config.prior_df);
+
+        // Check exponential IR for early degradation detection.
+        // If exp IR drops below threshold while flat IR is still above,
+        // downgrade confidence to detect regime shifts faster.
+        let exp_ir = self.exp_ir_tracker.information_ratio();
+        let exp_degraded = self.exp_ir_tracker.effective_sample_size() >= 50.0
+            && exp_ir.abs() < config.exp_ir_threshold;
+
+        if exp_degraded {
+            // Exp IR detects degradation — cap at Medium regardless of flat IR
+            if p_above >= config.low_confidence_threshold {
+                return ModelConfidence::Medium;
+            } else {
+                return ModelConfidence::Low;
+            }
+        }
 
         if p_above >= config.high_confidence_threshold {
             ModelConfidence::High
@@ -240,13 +271,14 @@ impl ModelGating {
     /// Create a new model gating system.
     pub fn new(config: ModelGatingConfig) -> Self {
         let n_bins = config.n_bins;
+        let decay = config.exp_ir_decay;
         Self {
             config,
-            as_tracker: ModelTracker::new("adverse_selection", n_bins),
-            informed_flow_tracker: ModelTracker::new("informed_flow", n_bins),
-            lead_lag_tracker: ModelTracker::new("lead_lag", n_bins),
-            regime_tracker: ModelTracker::new("regime", n_bins),
-            kappa_tracker: ModelTracker::new("kappa", n_bins),
+            as_tracker: ModelTracker::new("adverse_selection", n_bins, decay),
+            informed_flow_tracker: ModelTracker::new("informed_flow", n_bins, decay),
+            lead_lag_tracker: ModelTracker::new("lead_lag", n_bins, decay),
+            regime_tracker: ModelTracker::new("regime", n_bins, decay),
+            kappa_tracker: ModelTracker::new("kappa", n_bins, decay),
             cached_weights: ModelWeights::full(),
             updates_since_log: 0,
             observation_count: 0,
@@ -354,19 +386,30 @@ impl ModelGating {
         let rg_ir = self.regime_tracker.ir_tracker.information_ratio();
         let kp_ir = self.kappa_tracker.ir_tracker.information_ratio();
 
+        let as_exp_ir = self.as_tracker.exp_ir_tracker.information_ratio();
+        let if_exp_ir = self.informed_flow_tracker.exp_ir_tracker.information_ratio();
+        let ll_exp_ir = self.lead_lag_tracker.exp_ir_tracker.information_ratio();
+        let rg_exp_ir = self.regime_tracker.exp_ir_tracker.information_ratio();
+        let kp_exp_ir = self.kappa_tracker.exp_ir_tracker.information_ratio();
+
         let spread_mult = self.spread_multiplier();
 
         if spread_mult > 1.2 {
             warn!(
                 as_ir = %format!("{:.2}", as_ir),
+                as_exp_ir = %format!("{:.2}", as_exp_ir),
                 as_weight = %format!("{:.1}", self.cached_weights.adverse_selection),
                 informed_ir = %format!("{:.2}", if_ir),
+                informed_exp_ir = %format!("{:.2}", if_exp_ir),
                 informed_weight = %format!("{:.1}", self.cached_weights.informed_flow),
                 lead_lag_ir = %format!("{:.2}", ll_ir),
+                lead_lag_exp_ir = %format!("{:.2}", ll_exp_ir),
                 lead_lag_weight = %format!("{:.1}", self.cached_weights.lead_lag),
                 regime_ir = %format!("{:.2}", rg_ir),
+                regime_exp_ir = %format!("{:.2}", rg_exp_ir),
                 regime_weight = %format!("{:.1}", self.cached_weights.regime),
                 kappa_ir = %format!("{:.2}", kp_ir),
+                kappa_exp_ir = %format!("{:.2}", kp_exp_ir),
                 kappa_weight = %format!("{:.1}", self.cached_weights.kappa),
                 spread_mult = %format!("{:.2}x", spread_mult),
                 "Model gating: LOW CONFIDENCE - widening spreads"
@@ -374,10 +417,15 @@ impl ModelGating {
         } else {
             info!(
                 as_ir = %format!("{:.2}", as_ir),
+                as_exp_ir = %format!("{:.2}", as_exp_ir),
                 informed_ir = %format!("{:.2}", if_ir),
+                informed_exp_ir = %format!("{:.2}", if_exp_ir),
                 lead_lag_ir = %format!("{:.2}", ll_ir),
+                lead_lag_exp_ir = %format!("{:.2}", ll_exp_ir),
                 regime_ir = %format!("{:.2}", rg_ir),
+                regime_exp_ir = %format!("{:.2}", rg_exp_ir),
                 kappa_ir = %format!("{:.2}", kp_ir),
+                kappa_exp_ir = %format!("{:.2}", kp_exp_ir),
                 avg_weight = %format!("{:.2}", self.cached_weights.average_weight()),
                 "Model gating status"
             );
@@ -454,6 +502,18 @@ impl ModelGating {
         }
     }
 
+    /// Get exponential IR for a specific model.
+    pub fn model_exp_ir(&self, model: &str) -> f64 {
+        match model {
+            "adverse_selection" => self.as_tracker.exp_ir_tracker.information_ratio(),
+            "informed_flow" => self.informed_flow_tracker.exp_ir_tracker.information_ratio(),
+            "lead_lag" => self.lead_lag_tracker.exp_ir_tracker.information_ratio(),
+            "regime" => self.regime_tracker.exp_ir_tracker.information_ratio(),
+            "kappa" => self.kappa_tracker.exp_ir_tracker.information_ratio(),
+            _ => 0.0,
+        }
+    }
+
     /// Get sample count for a specific model.
     pub fn model_samples(&self, model: &str) -> usize {
         match model {
@@ -499,6 +559,11 @@ impl ModelGating {
         self.lead_lag_tracker.ir_tracker.clear();
         self.regime_tracker.ir_tracker.clear();
         self.kappa_tracker.ir_tracker.clear();
+        self.as_tracker.exp_ir_tracker.reset();
+        self.informed_flow_tracker.exp_ir_tracker.reset();
+        self.lead_lag_tracker.exp_ir_tracker.reset();
+        self.regime_tracker.exp_ir_tracker.reset();
+        self.kappa_tracker.exp_ir_tracker.reset();
         self.cached_weights = ModelWeights::full();
         self.updates_since_log = 0;
         self.observation_count = 0;

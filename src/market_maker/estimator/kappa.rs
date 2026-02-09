@@ -480,6 +480,50 @@ impl BayesianKappaEstimator {
         );
     }
 
+    /// Update the prior parameters to reflect a new prior mean and strength.
+    ///
+    /// This allows online adaptation of the prior (e.g., adapting toward observed
+    /// market kappa for new/unfamiliar assets). The posterior is recomputed from
+    /// the new prior combined with existing sufficient statistics.
+    ///
+    /// # Arguments
+    /// * `new_mean` - New prior mean for kappa
+    /// * `new_strength` - New prior strength (effective pseudo-observations)
+    ///
+    /// # Safety
+    /// Both `new_mean` and `new_strength` must be > 0. Values are clamped internally.
+    pub(crate) fn update_prior(&mut self, new_mean: f64, new_strength: f64) {
+        let safe_mean = new_mean.clamp(100.0, 50000.0);
+        let safe_strength = new_strength.clamp(1.0, 50.0);
+
+        self.prior_alpha = safe_strength;
+        self.prior_beta = safe_strength / safe_mean;
+
+        // Recompute posterior from new prior + existing data
+        let posterior_alpha = self.prior_alpha + self.observation_count as f64;
+        let posterior_beta = self.prior_beta + self.sum_distances;
+        self.kappa_posterior_mean = posterior_alpha / posterior_beta;
+        self.kappa_posterior_var = posterior_alpha / (posterior_beta * posterior_beta);
+        self.kappa_posterior_std = self.kappa_posterior_var.sqrt();
+
+        // Recompute credible interval
+        let (ci_lower, ci_upper) =
+            Self::compute_credible_interval_static(posterior_alpha, posterior_beta, 0.95);
+        self.ci_95_lower = ci_lower;
+        self.ci_95_upper = ci_upper;
+    }
+
+    /// Get the current prior mean (alpha / beta).
+    pub(crate) fn prior_mean(&self) -> f64 {
+        self.prior_alpha / self.prior_beta
+    }
+
+    /// Get the current prior strength (alpha).
+    #[allow(dead_code)]
+    pub(crate) fn prior_strength(&self) -> f64 {
+        self.prior_alpha
+    }
+
     // === Checkpoint persistence ===
 
     /// Extract sufficient statistics for checkpoint persistence.

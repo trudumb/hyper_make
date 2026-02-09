@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::market_maker::checkpoint::types::KillSwitchCheckpoint;
 use crate::market_maker::MarginMode;
 
 /// Configuration for the kill switch.
@@ -732,6 +733,74 @@ impl KillSwitch {
             cascade_severity: state.cascade_severity,
         }
     }
+
+    /// Capture current kill switch state as a checkpoint.
+    pub fn to_checkpoint(&self) -> KillSwitchCheckpoint {
+        let state = self.state.lock().unwrap();
+        let reasons = self.trigger_reasons.lock().unwrap();
+        let triggered = self.is_triggered();
+
+        let triggered_at_ms = if triggered {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        KillSwitchCheckpoint {
+            triggered,
+            trigger_reasons: reasons.iter().map(|r| r.to_string()).collect(),
+            daily_pnl: state.daily_pnl,
+            peak_pnl: state.peak_pnl,
+            triggered_at_ms,
+        }
+    }
+
+    /// Restore kill switch state from a checkpoint.
+    ///
+    /// Re-triggers the kill switch if the checkpoint was triggered within
+    /// the last 24 hours. Stale triggers (>24h) are ignored to avoid
+    /// blocking trading after extended maintenance windows.
+    pub fn restore_from_checkpoint(&self, checkpoint: &KillSwitchCheckpoint) {
+        // Restore P&L state regardless of trigger status
+        {
+            let mut state = self.state.lock().unwrap();
+            state.daily_pnl = checkpoint.daily_pnl;
+            state.peak_pnl = checkpoint.peak_pnl;
+        }
+
+        if !checkpoint.triggered {
+            return;
+        }
+
+        // Check if the trigger is within 24 hours
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        const TWENTY_FOUR_HOURS_MS: u64 = 24 * 60 * 60 * 1000;
+        let age_ms = now_ms.saturating_sub(checkpoint.triggered_at_ms);
+
+        if age_ms > TWENTY_FOUR_HOURS_MS {
+            // Stale trigger — don't re-trigger after extended maintenance
+            return;
+        }
+
+        // Re-trigger with the saved reasons
+        self.triggered.store(true, Ordering::SeqCst);
+        let mut reasons = self.trigger_reasons.lock().unwrap();
+        for reason_str in &checkpoint.trigger_reasons {
+            let reason = KillReason::Manual {
+                reason: format!("restored from checkpoint: {reason_str}"),
+            };
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1104,5 +1173,132 @@ mod tests {
         assert_eq!(summary.daily_pnl, 80.0);
         assert!((summary.drawdown_pct - 20.0).abs() < 0.1);
         assert_eq!(summary.position_value, 25000.0);
+    }
+
+    // === Checkpoint persistence tests ===
+
+    #[test]
+    fn test_kill_switch_checkpoint_roundtrip() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.update_pnl(50.0);
+        ks.trigger_manual("test trigger".to_string());
+
+        let checkpoint = ks.to_checkpoint();
+        assert!(checkpoint.triggered);
+        assert_eq!(checkpoint.daily_pnl, 50.0);
+        assert_eq!(checkpoint.peak_pnl, 50.0);
+        assert!(checkpoint.triggered_at_ms > 0);
+        assert!(!checkpoint.trigger_reasons.is_empty());
+
+        // Restore into a fresh kill switch
+        let ks2 = KillSwitch::new(KillSwitchConfig::default());
+        ks2.restore_from_checkpoint(&checkpoint);
+
+        assert!(ks2.is_triggered());
+        let state = ks2.state();
+        assert_eq!(state.daily_pnl, 50.0);
+        assert_eq!(state.peak_pnl, 50.0);
+    }
+
+    #[test]
+    fn test_kill_switch_checkpoint_triggered_state_persists() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+        // Trigger via MaxLoss check
+        let state = KillSwitchState {
+            daily_pnl: -600.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        ks.check(&state);
+        assert!(ks.is_triggered());
+
+        let checkpoint = ks.to_checkpoint();
+        assert!(checkpoint.triggered);
+
+        let ks2 = KillSwitch::new(KillSwitchConfig::default());
+        ks2.restore_from_checkpoint(&checkpoint);
+        assert!(ks2.is_triggered());
+    }
+
+    #[test]
+    fn test_kill_switch_checkpoint_reasons_preserved() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.trigger_manual("reason one".to_string());
+        // Trigger a second reason via cascade check
+        let state = KillSwitchState {
+            cascade_severity: 6.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        ks.check(&state);
+
+        let checkpoint = ks.to_checkpoint();
+        assert!(checkpoint.trigger_reasons.len() >= 2);
+
+        // Verify reasons contain both triggers
+        let reasons_joined = checkpoint.trigger_reasons.join("; ");
+        assert!(reasons_joined.contains("reason one"));
+        assert!(reasons_joined.contains("cascade"));
+    }
+
+    #[test]
+    fn test_kill_switch_restore_from_default_does_not_trigger() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+        let default_checkpoint = KillSwitchCheckpoint::default();
+
+        ks.restore_from_checkpoint(&default_checkpoint);
+        assert!(!ks.is_triggered());
+    }
+
+    #[test]
+    fn test_kill_switch_restore_expired_trigger_ignored() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        // Create a checkpoint that was triggered 25 hours ago
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let twenty_five_hours_ago = now_ms.saturating_sub(25 * 60 * 60 * 1000);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec!["old trigger".to_string()],
+            daily_pnl: -100.0,
+            peak_pnl: 50.0,
+            triggered_at_ms: twenty_five_hours_ago,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+        // Should NOT re-trigger because trigger is >24h old
+        assert!(!ks.is_triggered());
+        // But P&L state should still be restored
+        let state = ks.state();
+        assert_eq!(state.daily_pnl, -100.0);
+        assert_eq!(state.peak_pnl, 50.0);
+    }
+
+    #[test]
+    fn test_kill_switch_restore_triggered_blocks_trading() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        // Create a recent triggered checkpoint
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec!["Max daily loss exceeded: $600.00 > $500.00".to_string()],
+            daily_pnl: -600.0,
+            peak_pnl: 0.0,
+            triggered_at_ms: now_ms,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+        assert!(ks.is_triggered());
+        // The kill switch being triggered means is_triggered() returns true,
+        // which blocks all trading in the event loop
     }
 }

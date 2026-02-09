@@ -44,6 +44,9 @@ pub struct CheckpointBundle {
     /// RL agent Q-table for policy persistence
     #[serde(default)]
     pub rl_q_table: RLCheckpoint,
+    /// Kill switch state for persistence across restarts
+    #[serde(default)]
+    pub kill_switch: KillSwitchCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -448,6 +451,41 @@ pub struct RLCheckpoint {
     /// Whether this checkpoint used compact 3D state space.
     #[serde(default)]
     pub use_compact_state: bool,
+    /// Hash of the RewardConfig used when this checkpoint was created.
+    /// Used to detect incompatible reward config changes on restore.
+    /// 0 = legacy checkpoint (pre-hash), skip validation.
+    #[serde(default)]
+    pub reward_config_hash: u64,
+}
+
+/// Kill switch state for checkpoint persistence.
+///
+/// Allows restoring triggered state after restart so the system
+/// doesn't accidentally resume trading after an emergency shutdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KillSwitchCheckpoint {
+    /// Whether the kill switch was triggered
+    pub triggered: bool,
+    /// Reasons for triggering (may have multiple)
+    pub trigger_reasons: Vec<String>,
+    /// Daily P&L at checkpoint time
+    pub daily_pnl: f64,
+    /// Peak P&L for drawdown calculation
+    pub peak_pnl: f64,
+    /// Timestamp when kill switch was triggered (ms since epoch), 0 if not triggered
+    pub triggered_at_ms: u64,
+}
+
+impl Default for KillSwitchCheckpoint {
+    fn default() -> Self {
+        Self {
+            triggered: false,
+            trigger_reasons: Vec::new(),
+            daily_pnl: 0.0,
+            peak_pnl: 0.0,
+            triggered_at_ms: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +569,14 @@ mod tests {
                 total_observations: 15,
                 action_space_version: 1,
                 use_compact_state: false,
+                reward_config_hash: 0,
+            },
+            kill_switch: KillSwitchCheckpoint {
+                triggered: true,
+                trigger_reasons: vec!["Max daily loss exceeded".to_string()],
+                daily_pnl: -100.0,
+                peak_pnl: 50.0,
+                triggered_at_ms: 1700000000000,
             },
         };
 
@@ -566,6 +612,12 @@ mod tests {
         assert_eq!(restored.rl_q_table.q_entries[0].action_index, 2);
         assert_eq!(restored.rl_q_table.q_entries[0].mu_n, 1.5);
         assert_eq!(restored.rl_q_table.q_entries[0].n, 10);
+        // Kill switch round-trip
+        assert!(restored.kill_switch.triggered);
+        assert_eq!(restored.kill_switch.trigger_reasons.len(), 1);
+        assert_eq!(restored.kill_switch.daily_pnl, -100.0);
+        assert_eq!(restored.kill_switch.peak_pnl, 50.0);
+        assert_eq!(restored.kill_switch.triggered_at_ms, 1700000000000);
     }
 
     #[test]
@@ -579,5 +631,54 @@ mod tests {
 
         let momentum = MomentumCheckpoint::default();
         assert_eq!(momentum.prior_continuation, 0.5);
+    }
+
+    #[test]
+    fn test_checkpoint_bundle_backward_compat_no_kill_switch() {
+        // Simulate a checkpoint JSON from before kill_switch was added.
+        // The kill_switch field should default to KillSwitchCheckpoint::default().
+        let bundle = CheckpointBundle {
+            metadata: CheckpointMetadata {
+                version: 1,
+                timestamp_ms: 1700000000000,
+                asset: "ETH".to_string(),
+                session_duration_s: 100.0,
+            },
+            learned_params: LearnedParameters::default(),
+            pre_fill: PreFillCheckpoint::default(),
+            enhanced: EnhancedCheckpoint::default(),
+            vol_filter: VolFilterCheckpoint::default(),
+            regime_hmm: RegimeHMMCheckpoint::default(),
+            informed_flow: InformedFlowCheckpoint::default(),
+            fill_rate: FillRateCheckpoint::default(),
+            kappa_own: KappaCheckpoint::default(),
+            kappa_bid: KappaCheckpoint::default(),
+            kappa_ask: KappaCheckpoint::default(),
+            momentum: MomentumCheckpoint::default(),
+            kelly_tracker: KellyTrackerCheckpoint::default(),
+            ensemble_weights: EnsembleWeightsCheckpoint::default(),
+            rl_q_table: RLCheckpoint::default(),
+            kill_switch: KillSwitchCheckpoint::default(),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&bundle).expect("serialize");
+
+        // Remove the kill_switch field to simulate an old checkpoint
+        let json_without_ks: serde_json::Value =
+            serde_json::from_str(&json).expect("parse");
+        let mut map = json_without_ks.as_object().unwrap().clone();
+        map.remove("kill_switch");
+        let old_json = serde_json::to_string(&map).expect("re-serialize");
+
+        // Deserialize — should use default for missing kill_switch field
+        let restored: CheckpointBundle =
+            serde_json::from_str(&old_json).expect("deserialize old format");
+
+        assert!(!restored.kill_switch.triggered);
+        assert!(restored.kill_switch.trigger_reasons.is_empty());
+        assert_eq!(restored.kill_switch.daily_pnl, 0.0);
+        assert_eq!(restored.kill_switch.peak_pnl, 0.0);
+        assert_eq!(restored.kill_switch.triggered_at_ms, 0);
     }
 }

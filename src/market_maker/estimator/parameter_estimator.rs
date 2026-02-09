@@ -133,6 +133,14 @@ pub struct ParameterEstimator {
     last_trade_time_ms: u64,
     /// Force warmup complete (set by timeout fallback)
     warmup_override: bool,
+
+    // === Adaptive Kappa Prior ===
+    /// Adapted kappa prior mean, initialized from config and slowly blended
+    /// toward observed market kappa. Used by `dynamic_kappa_floor()` and
+    /// propagated to BayesianKappaEstimator priors.
+    adapted_kappa_prior: f64,
+    /// Number of times `adapt_kappa_prior()` has been called (for strength growth).
+    prior_adaptation_count: usize,
 }
 
 impl ParameterEstimator {
@@ -229,6 +237,9 @@ impl ParameterEstimator {
         // Multi-timeframe trend tracker (30s + 5min windows, underwater P&L tracking)
         let trend_tracker = TrendPersistenceTracker::new(TrendConfig::default());
 
+        // Capture prior mean before config is moved into Self
+        let initial_kappa_prior = config.kappa_prior_mean;
+
         Self {
             config,
             bucket_accumulator,
@@ -271,6 +282,9 @@ impl ParameterEstimator {
             edge_surface: EdgeSurface::default_config(),
             last_trade_time_ms: 0,
             warmup_override: false,
+            // Adaptive kappa prior — starts at config value, adapts toward market
+            adapted_kappa_prior: initial_kappa_prior,
+            prior_adaptation_count: 0,
         }
     }
 
@@ -734,7 +748,7 @@ impl ParameterEstimator {
     /// Dynamic kappa floor value. Higher floor = tighter GLFT spreads.
     pub fn dynamic_kappa_floor(&self) -> f64 {
         let conf = self.own_kappa.confidence().clamp(0.0, 1.0);
-        let prior = self.config.kappa_prior_mean;
+        let prior = self.adapted_kappa_prior;
 
         // During warmup (low confidence): use prior mean with slight discount
         // The 0.8 factor provides conservatism - we'd rather quote slightly wider
@@ -1626,6 +1640,94 @@ impl ParameterEstimator {
         MarketCondition::from_state(sigma_bps, regime, hour_utc, self.flow_imbalance())
     }
 
+    // === Adaptive Kappa Prior ===
+
+    /// Adapt kappa prior toward observed market kappa.
+    ///
+    /// Called periodically (every ~5 minutes via `periodic_maintenance`).
+    /// Uses hierarchical posterior mean as new prior center.
+    /// Only adapts when confidence is sufficient and we have enough data.
+    ///
+    /// # Safety bounds
+    /// - Prior mean clamped to [100, 50000] (reasonable range for all markets)
+    /// - Prior strength capped at 20.0 (prevents over-concentration)
+    /// - Learning rate 0.1 (intentionally slow to avoid wild swings)
+    pub fn adapt_kappa_prior(&mut self) {
+        // Guard 1: market kappa confidence must be > 0.5
+        let market_conf = self.market_kappa.confidence();
+        if market_conf < 0.5 {
+            return;
+        }
+
+        // Guard 2: need at least 100 observations for reliable market kappa
+        let obs_count = self.market_kappa.observation_count();
+        if obs_count < 100 {
+            return;
+        }
+
+        // Get current market kappa as adaptation target.
+        // Use market_kappa (fed by all market trades) since it has the most data
+        // and is the best proxy for the true market fill rate during warmup/adaptation.
+        let market_kappa = self.market_kappa.posterior_mean();
+
+        // Blend toward market kappa with slow learning rate (0.1)
+        // new_prior = 0.9 * current_prior + 0.1 * market_kappa
+        let new_prior = 0.9 * self.adapted_kappa_prior + 0.1 * market_kappa;
+        let clamped_prior = new_prior.clamp(100.0, 50000.0);
+
+        // Compute prior strength: grows logarithmically with observation count
+        // At 100 obs: strength = 5.0
+        // At 1000 obs: strength ~= 7.3
+        // At 10000 obs: strength ~= 9.6
+        // Capped at 20.0 to prevent over-concentration
+        let strength = (5.0 + (obs_count as f64 / 100.0).ln()).min(20.0);
+
+        self.adapted_kappa_prior = clamped_prior;
+        self.prior_adaptation_count += 1;
+
+        // Propagate to the kappa orchestrator (which propagates to its own_kappa estimator)
+        self.kappa_orchestrator
+            .update_prior_kappa(clamped_prior, strength);
+
+        // Also update the standalone BayesianKappaEstimator priors
+        self.own_kappa.update_prior(clamped_prior, strength);
+        self.own_kappa_bid.update_prior(clamped_prior, strength);
+        self.own_kappa_ask.update_prior(clamped_prior, strength);
+        // market_kappa keeps its original prior (it's the data source, not the target)
+
+        // Update hierarchical kappa prior as well
+        self.hierarchical_kappa
+            .update_market_prior(clamped_prior, strength);
+
+        debug!(
+            adapted_prior = %format!("{:.0}", clamped_prior),
+            prior_strength = %format!("{:.1}", strength),
+            market_kappa = %format!("{:.0}", market_kappa),
+            market_conf = %format!("{:.2}", market_conf),
+            obs_count = obs_count,
+            adaptation_count = self.prior_adaptation_count,
+            "kappa prior adapted"
+        );
+    }
+
+    /// Get the current adapted kappa prior mean.
+    pub fn adapted_kappa_prior(&self) -> f64 {
+        self.adapted_kappa_prior
+    }
+
+    /// Get the number of prior adaptations performed.
+    pub fn prior_adaptation_count(&self) -> usize {
+        self.prior_adaptation_count
+    }
+
+    /// Periodic maintenance — call every ~5 minutes (aligned with sync interval).
+    ///
+    /// Currently performs:
+    /// - Kappa prior adaptation toward observed market kappa
+    pub fn periodic_maintenance(&mut self) {
+        self.adapt_kappa_prior();
+    }
+
     // === Checkpoint persistence ===
 
     /// Extract checkpoint state from all sub-estimators.
@@ -1663,6 +1765,14 @@ impl ParameterEstimator {
         self.own_kappa_bid.restore_checkpoint(&bundle.kappa_bid);
         self.own_kappa_ask.restore_checkpoint(&bundle.kappa_ask);
         self.momentum_model.restore_checkpoint(&bundle.momentum);
+
+        // Recover adapted kappa prior from the own_kappa checkpoint.
+        // The prior_alpha/prior_beta in the checkpoint reflect any prior adaptation
+        // that occurred before the checkpoint was saved.
+        let restored_prior_mean = self.own_kappa.prior_mean();
+        if restored_prior_mean > 0.0 {
+            self.adapted_kappa_prior = restored_prior_mean;
+        }
     }
 }
 
@@ -2045,5 +2155,267 @@ mod tests {
         filter.filter(100.1);
         assert!(filter.fair_price() > 100.0);
         assert!(filter.fair_price() < 100.1); // Should be smoothed
+    }
+
+    // =========================================================================
+    // Adaptive Kappa Prior Tests
+    // =========================================================================
+
+    #[test]
+    fn test_kappa_prior_adapts_toward_market_kappa() {
+        let mut config = make_config();
+        config.kappa_prior_mean = 2500.0;
+        config.kappa_prior_strength = 10.0;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Initial adapted prior should equal config value
+        assert!(
+            (estimator.adapted_kappa_prior() - 2500.0).abs() < 1e-6,
+            "Initial adapted prior should be 2500, got {}",
+            estimator.adapted_kappa_prior()
+        );
+
+        // Feed enough observations to market_kappa to pass guards.
+        // Observations near kappa=500 (distance ~20 bps = 0.002)
+        for i in 0..200 {
+            estimator
+                .market_kappa
+                .on_trade(i as u64 * 100, 100.0 + 0.2, 1.0, 100.0);
+        }
+
+        // Verify market kappa is roughly 500 (1/0.002 = 500)
+        let market_k = estimator.market_kappa.posterior_mean();
+        assert!(
+            market_k > 200.0 && market_k < 1500.0,
+            "Market kappa should be near 500, got {market_k}"
+        );
+
+        // Verify guards pass
+        assert!(estimator.market_kappa.confidence() > 0.5);
+        assert!(estimator.market_kappa.observation_count() >= 100);
+
+        // Adapt the prior
+        estimator.adapt_kappa_prior();
+
+        // Prior should have moved toward market kappa
+        let adapted = estimator.adapted_kappa_prior();
+        assert!(
+            adapted < 2500.0,
+            "Adapted prior should be less than initial 2500, got {adapted}"
+        );
+        // With 0.1 learning rate: new = 0.9 * 2500 + 0.1 * market_k
+        // Should be roughly 2250 + 0.1*market_k
+        assert!(
+            adapted > 200.0,
+            "Adapted prior should not collapse below 200, got {adapted}"
+        );
+        assert_eq!(estimator.prior_adaptation_count(), 1);
+    }
+
+    #[test]
+    fn test_kappa_prior_stays_fixed_during_low_confidence() {
+        let mut config = make_config();
+        config.kappa_prior_mean = 2500.0;
+        config.kappa_prior_strength = 10.0;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Don't feed any observations — confidence will be low
+        assert!(estimator.market_kappa.confidence() < 0.5 || estimator.market_kappa.observation_count() < 100);
+
+        estimator.adapt_kappa_prior();
+
+        // Prior should not change
+        assert!(
+            (estimator.adapted_kappa_prior() - 2500.0).abs() < 1e-6,
+            "Prior should not change with low confidence, got {}",
+            estimator.adapted_kappa_prior()
+        );
+        assert_eq!(estimator.prior_adaptation_count(), 0);
+    }
+
+    #[test]
+    fn test_kappa_prior_clamped_to_reasonable_range() {
+        let mut config = make_config();
+        config.kappa_prior_mean = 2500.0;
+        config.kappa_prior_strength = 10.0;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Force adapted_kappa_prior near upper bound then adapt toward extreme market kappa
+        estimator.adapted_kappa_prior = 49000.0;
+
+        // Feed observations suggesting extremely high kappa (distance ~0.1 bps = 0.00001)
+        for i in 0..200 {
+            estimator
+                .market_kappa
+                .on_trade(i as u64 * 100, 100.001, 1.0, 100.0);
+        }
+
+        estimator.adapt_kappa_prior();
+
+        // Prior should be clamped to 50000 max
+        assert!(
+            estimator.adapted_kappa_prior() <= 50000.0,
+            "Adapted prior should be clamped to 50000, got {}",
+            estimator.adapted_kappa_prior()
+        );
+
+        // Now test lower bound: start near zero, adapt toward very low kappa
+        estimator.adapted_kappa_prior = 150.0;
+
+        // Feed observations suggesting very low kappa (distance ~500 bps = 0.05)
+        let mut low_kappa_est = BayesianKappaEstimator::new(150.0, 10.0, 300_000);
+        for i in 0..200 {
+            low_kappa_est.on_trade(i as u64 * 100, 105.0, 1.0, 100.0);
+        }
+        // Replace market_kappa with our low-kappa estimator by feeding directly
+        estimator.market_kappa = low_kappa_est;
+
+        estimator.adapt_kappa_prior();
+
+        assert!(
+            estimator.adapted_kappa_prior() >= 100.0,
+            "Adapted prior should be clamped to minimum 100, got {}",
+            estimator.adapted_kappa_prior()
+        );
+    }
+
+    #[test]
+    fn test_kappa_prior_strength_grows_logarithmically() {
+        let mut config = make_config();
+        config.kappa_prior_mean = 2500.0;
+        config.kappa_prior_strength = 10.0;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // The strength formula is: min(20.0, 5.0 + ln(obs_count / 100))
+        // At 100 obs: 5.0 + ln(1) = 5.0
+        let s100 = (5.0_f64 + (100.0 / 100.0_f64).ln()).min(20.0);
+        assert!((s100 - 5.0).abs() < 1e-6, "At 100 obs strength should be 5.0, got {s100}");
+
+        // At 1000 obs: 5.0 + ln(10) ≈ 7.30
+        let s1000 = (5.0 + (1000.0 / 100.0_f64).ln()).min(20.0);
+        assert!((s1000 - 7.302).abs() < 0.01, "At 1000 obs strength should be ~7.3, got {s1000}");
+
+        // At 10000 obs: 5.0 + ln(100) ≈ 9.61
+        let s10000 = (5.0 + (10000.0 / 100.0_f64).ln()).min(20.0);
+        assert!((s10000 - 9.605).abs() < 0.01, "At 10000 obs strength should be ~9.6, got {s10000}");
+
+        // Strength is capped at 20.0 even at extreme counts
+        let s_huge = (5.0 + (10_000_000.0 / 100.0_f64).ln()).min(20.0);
+        assert!((s_huge - 16.51).abs() < 0.1, "At 10M obs strength should be ~16.5, got {s_huge}");
+
+        // Verify the cap actually works by computing beyond the max
+        let s_extreme = (5.0 + (1e15_f64 / 100.0).ln()).min(20.0);
+        assert!(
+            (s_extreme - 20.0).abs() < 1e-6,
+            "Strength should be capped at 20.0, got {s_extreme}"
+        );
+
+        // Now verify it integrates correctly: feed 1000 observations and adapt
+        for i in 0..1000 {
+            estimator
+                .market_kappa
+                .on_trade(i as u64 * 100, 100.0 + 0.2, 1.0, 100.0);
+        }
+        estimator.adapt_kappa_prior();
+
+        // After adaptation, the own_kappa prior strength should reflect
+        // the logarithmic formula. We can check via prior_strength().
+        let adapted_strength = estimator.own_kappa.prior_strength();
+        // At 1000 obs: clamped strength = min(20.0, 5.0 + ln(10)) ≈ 7.3
+        // But update_prior clamps to [1, 50], so the value should be ~7.3
+        assert!(
+            adapted_strength > 5.0 && adapted_strength < 20.0,
+            "Adapted strength should be in (5, 20) for 1000 obs, got {adapted_strength}"
+        );
+    }
+
+    #[test]
+    fn test_kappa_prior_doesnt_overshoot_with_high_market_kappa() {
+        let mut config = make_config();
+        config.kappa_prior_mean = 2500.0;
+        config.kappa_prior_strength = 10.0;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Feed market trades suggesting kappa=40000 (very tight market)
+        // Distance ~0.25 bps = 0.000025
+        for i in 0..200 {
+            estimator.market_kappa.on_trade(
+                i as u64 * 100,
+                100.0025, // ~0.25 bps from mid
+                1.0,
+                100.0,
+            );
+        }
+
+        let market_k = estimator.market_kappa.posterior_mean();
+        assert!(
+            market_k > 5000.0,
+            "Market kappa should be high, got {market_k}"
+        );
+
+        // Single adaptation step
+        estimator.adapt_kappa_prior();
+
+        let adapted = estimator.adapted_kappa_prior();
+        // With 0.1 learning rate from 2500: new = 0.9*2500 + 0.1*market_k
+        // Even if market_k=40000, adapted = 2250 + 4000 = 6250
+        // Not 40000 — the slow learning rate prevents overshooting
+        assert!(
+            adapted < market_k,
+            "Adapted prior ({adapted}) should be much less than market kappa ({market_k})"
+        );
+        // Should only move 10% of the gap
+        let expected_move = 0.1 * (market_k - 2500.0);
+        let actual_move = adapted - 2500.0;
+        assert!(
+            (actual_move - expected_move).abs() / expected_move < 0.01,
+            "Movement should be ~10% of gap: expected {expected_move}, got {actual_move}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_kappa_floor_uses_adapted_prior() {
+        // Use weak prior so confidence is low (< 0.3), triggering the prior * 0.8 path.
+        // With prior_strength=1, alpha=1, beta=1/2500, var=alpha/beta^2=2500^2,
+        // std=2500, CV=1.0, confidence=0.5. Still too high.
+        // Use prior_strength=0.5 to push confidence below 0.3.
+        // Actually, let's just use a very high prior_mean with very low strength.
+        let mut config = make_config();
+        config.kappa_prior_mean = 2500.0;
+        // Use default strength (10.0) — with no observations, confidence from prior alone
+        // will be moderate. The dynamic_kappa_floor path depends on own_kappa.confidence().
+        config.kappa_prior_strength = 10.0;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Record the initial floor value (whatever path it takes)
+        let floor_before = estimator.dynamic_kappa_floor();
+
+        // The floor should be derived from the adapted_kappa_prior (initially 2500)
+        // Regardless of which path (low/medium/high confidence), the prior value
+        // feeds into the computation.
+        assert!(
+            floor_before > 0.0,
+            "Initial floor should be positive, got {floor_before}"
+        );
+
+        // Now halve the adapted_kappa_prior to simulate adaptation toward a lower market
+        estimator.adapted_kappa_prior = 1250.0;
+        // Also update the own_kappa prior so the CI-based path is consistent
+        estimator.own_kappa.update_prior(1250.0, 10.0);
+
+        let floor_after = estimator.dynamic_kappa_floor();
+
+        // Floor should decrease proportionally since adapted prior decreased
+        assert!(
+            floor_after < floor_before,
+            "Floor should decrease after prior adaptation: before={floor_before}, after={floor_after}"
+        );
+
+        // The ratio should roughly reflect the prior ratio (1250/2500 = 0.5)
+        let ratio = floor_after / floor_before;
+        assert!(
+            ratio > 0.3 && ratio < 0.9,
+            "Floor ratio should reflect prior reduction, got {ratio}"
+        );
     }
 }

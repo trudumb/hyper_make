@@ -695,6 +695,119 @@ impl IrDiagnostics {
 unsafe impl Send for InformationRatioTracker {}
 unsafe impl Sync for InformationRatioTracker {}
 
+/// Exponentially-weighted Information Ratio tracker.
+///
+/// Unlike the flat `InformationRatioTracker`, this uses EWMA decay
+/// so recent observations have more influence. Detects regime shifts
+/// within ~200 samples vs ~500 for the flat tracker.
+///
+/// IR = EWMA(returns) / sqrt(EWMA(returns^2) - EWMA(returns)^2)
+///
+/// Here "return" is the prediction error: `actual - predicted`.
+#[derive(Debug, Clone)]
+pub struct ExponentialIRTracker {
+    /// Decay factor per observation (default 0.998 ~ 500 effective samples)
+    decay: f64,
+    /// EWMA of returns (numerator of IR)
+    ewma_return: f64,
+    /// EWMA of squared returns (for variance calculation)
+    ewma_return_sq: f64,
+    /// Effective sample size: sum of weights = 1/(1-decay) at steady state
+    effective_n: f64,
+    /// Total observations seen
+    total_observations: usize,
+}
+
+impl ExponentialIRTracker {
+    /// Create a new exponential IR tracker with specified decay.
+    ///
+    /// # Arguments
+    /// * `decay` - Decay factor per observation, must be in (0, 1).
+    ///   0.998 ~ 500 effective samples, 0.99 ~ 100 effective samples.
+    ///
+    /// # Panics
+    /// Panics if `decay` is not in (0, 1).
+    pub fn new(decay: f64) -> Self {
+        assert!(
+            decay > 0.0 && decay < 1.0,
+            "decay must be in (0, 1), got {decay}",
+        );
+        Self {
+            decay,
+            ewma_return: 0.0,
+            ewma_return_sq: 0.0,
+            effective_n: 0.0,
+            total_observations: 0,
+        }
+    }
+
+    /// Add an observation (prediction error = actual - predicted).
+    ///
+    /// Each update decays prior weights by `decay` and adds the new
+    /// observation at weight `1 - decay`.
+    pub fn update(&mut self, predicted: f64, actual: f64) {
+        let ret = actual - predicted;
+        let alpha = 1.0 - self.decay;
+
+        self.ewma_return = self.decay * self.ewma_return + alpha * ret;
+        self.ewma_return_sq = self.decay * self.ewma_return_sq + alpha * ret * ret;
+        self.effective_n = self.decay * self.effective_n + 1.0;
+        self.total_observations += 1;
+    }
+
+    /// Compute the exponentially-weighted Information Ratio.
+    ///
+    /// IR = mean / std where mean and variance are EWMA-weighted.
+    /// Returns 0.0 if effective sample size < 10 (insufficient data).
+    pub fn information_ratio(&self) -> f64 {
+        if self.effective_n < 10.0 {
+            return 0.0;
+        }
+
+        let mean = self.ewma_return;
+        let var = (self.ewma_return_sq - mean * mean).max(0.0);
+        let std = var.sqrt();
+
+        if std < 1e-12 {
+            return 0.0;
+        }
+
+        mean / std
+    }
+
+    /// Get the effective sample size (sum of decayed weights).
+    ///
+    /// At steady state, converges to `1 / (1 - decay)`.
+    /// For decay=0.998, steady-state effective_n ~ 500.
+    pub fn effective_sample_size(&self) -> f64 {
+        self.effective_n
+    }
+
+    /// Get total observations seen (unweighted count).
+    pub fn total_observations(&self) -> usize {
+        self.total_observations
+    }
+
+    /// Reset all state to zero.
+    pub fn reset(&mut self) {
+        self.ewma_return = 0.0;
+        self.ewma_return_sq = 0.0;
+        self.effective_n = 0.0;
+        self.total_observations = 0;
+    }
+}
+
+impl Default for ExponentialIRTracker {
+    /// Default decay = 0.998 (~ 500 effective samples at steady state).
+    fn default() -> Self {
+        Self::new(0.998)
+    }
+}
+
+// ExponentialIRTracker is Send + Sync because it only contains owned primitive data
+unsafe impl Send for ExponentialIRTracker {}
+unsafe impl Sync for ExponentialIRTracker {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1156,5 +1269,172 @@ mod tests {
             assert!((p_back - p).abs() < 0.02,
                 "Φ(Φ⁻¹({})) = {} should be ~{}", p, p_back, p);
         }
+    }
+
+    // ========================================================================
+    // ExponentialIRTracker Tests
+    // ========================================================================
+
+    #[test]
+    fn test_exponential_ir_empty_returns_zero() {
+        let tracker = ExponentialIRTracker::default();
+        assert_eq!(tracker.information_ratio(), 0.0);
+        assert_eq!(tracker.effective_sample_size(), 0.0);
+        assert_eq!(tracker.total_observations(), 0);
+    }
+
+    #[test]
+    fn test_exponential_ir_basic_calibration() {
+        let mut tracker = ExponentialIRTracker::new(0.99);
+
+        // Feed known distribution: predicted=0.5, actual drawn from N(0.5 + 0.1, 0.05)
+        // Mean prediction error = 0.1, std ~ 0.05 => IR ~ 2.0
+        for i in 0..1000 {
+            let actual = 0.6 + 0.05 * ((i as f64 * 0.1).sin());
+            tracker.update(0.5, actual);
+        }
+
+        let ir = tracker.information_ratio();
+        // With mean error ~0.1 and std ~small, IR should be positive and significant
+        assert!(ir > 0.5, "IR should be positive for consistent bias, got {}", ir);
+    }
+
+    #[test]
+    fn test_exponential_ir_regime_shift_detected_within_200_samples() {
+        // The exp IR tracker measures mean(error)/std(error). A consistent
+        // positive bias (actual > predicted) yields high IR.
+        // We verify that after injecting noise, the exp IR drops quickly.
+        let mut exp_tracker = ExponentialIRTracker::new(0.99); // ~100 effective samples
+
+        // Phase 1: 500 samples with consistent positive bias
+        // predicted=0.3, actual~0.7 => error~+0.4 consistently
+        for i in 0..500 {
+            let noise = 0.05 * ((i as f64 * 0.3).sin());
+            exp_tracker.update(0.3, 0.7 + noise);
+        }
+
+        let exp_ir_good = exp_tracker.information_ratio();
+        assert!(exp_ir_good > 1.0,
+            "Exp IR should be strong after consistent bias: {}", exp_ir_good);
+
+        // Phase 2: 200 samples of noise (zero-mean error, high variance)
+        for i in 0..200 {
+            let noise = 0.3 * ((i as f64 * 0.7).sin());
+            exp_tracker.update(0.5, 0.5 + noise);
+        }
+
+        let exp_ir_after_noise = exp_tracker.information_ratio();
+
+        // Exponential IR should drop substantially from the good phase value
+        // With decay=0.99, 200 new samples heavily dilute the old signal
+        assert!(exp_ir_after_noise < exp_ir_good * 0.5,
+            "Exp IR should degrade after noise: {} vs good phase {}",
+            exp_ir_after_noise, exp_ir_good);
+    }
+
+    #[test]
+    fn test_exponential_ir_old_data_decays_properly() {
+        let mut tracker = ExponentialIRTracker::new(0.99); // ~100 eff samples
+
+        // Feed 1000 good observations (consistent positive error)
+        for _ in 0..1000 {
+            tracker.update(0.3, 0.7);
+        }
+
+        let ir_after_good = tracker.information_ratio();
+        assert!(ir_after_good.abs() > 1.0,
+            "IR should be strong after 1000 good obs: {}", ir_after_good);
+
+        // Feed 500 bad observations (zero-mean noise)
+        for i in 0..500 {
+            let noise = 0.01 * ((i as f64 * 0.3).sin());
+            tracker.update(0.5, 0.5 + noise);
+        }
+
+        let ir_after_bad = tracker.information_ratio();
+
+        // Old good data should have decayed substantially
+        assert!(ir_after_bad.abs() < ir_after_good.abs() * 0.5,
+            "IR should decay after bad data: {} vs original {}",
+            ir_after_bad, ir_after_good);
+    }
+
+    #[test]
+    fn test_exponential_ir_matches_simple_ir_no_regime_change() {
+        // With consistent data, the exp tracker should show stable IR.
+        // Feed the same consistent bias for the entire window; verify IR
+        // is approximately the same at the halfway point as at the end.
+        let mut exp_tracker = ExponentialIRTracker::new(0.998);
+
+        // Consistent positive bias: predicted=0.3, actual~0.7+noise
+        for i in 0..500 {
+            let noise = 0.05 * ((i as f64 * 0.3).sin());
+            exp_tracker.update(0.3, 0.7 + noise);
+        }
+        let ir_mid = exp_tracker.information_ratio();
+
+        for i in 500..1000 {
+            let noise = 0.05 * ((i as f64 * 0.3).sin());
+            exp_tracker.update(0.3, 0.7 + noise);
+        }
+        let ir_end = exp_tracker.information_ratio();
+
+        // Both should be significant and positive (no regime change = same sign)
+        assert!(ir_mid > 1.0, "Exp IR should be significant at midpoint: {}", ir_mid);
+        assert!(ir_end > 1.0, "Exp IR should be significant at end: {}", ir_end);
+        // IR should not reverse direction or collapse without a regime change
+        // (it can strengthen as EWMA warms up, but shouldn't drop to zero)
+        assert!(ir_end >= ir_mid * 0.5,
+            "IR should not collapse without regime change: mid={}, end={}", ir_mid, ir_end);
+    }
+
+    #[test]
+    fn test_exponential_ir_effective_sample_size_correct() {
+        let mut tracker = ExponentialIRTracker::new(0.998);
+
+        // After 1000 observations with decay=0.998:
+        // effective_n = sum_{i=0}^{999} 0.998^i = (1 - 0.998^1000) / (1 - 0.998)
+        // = (1 - ~0.135) / 0.002 ~ 432.5
+        // Steady state = 1/0.002 = 500
+        for _ in 0..1000 {
+            tracker.update(0.5, 0.5);
+        }
+
+        let eff_n = tracker.effective_sample_size();
+        // Should be close to 500 (the steady-state value for decay=0.998)
+        assert!(eff_n > 400.0 && eff_n < 510.0,
+            "Effective n after 1000 obs with decay=0.998 should be ~430-500, got {}",
+            eff_n);
+        assert_eq!(tracker.total_observations(), 1000);
+    }
+
+    #[test]
+    fn test_exponential_ir_reset() {
+        let mut tracker = ExponentialIRTracker::new(0.99);
+
+        for _ in 0..100 {
+            tracker.update(0.3, 0.7);
+        }
+
+        assert!(tracker.total_observations() > 0);
+        assert!(tracker.effective_sample_size() > 0.0);
+
+        tracker.reset();
+
+        assert_eq!(tracker.total_observations(), 0);
+        assert_eq!(tracker.effective_sample_size(), 0.0);
+        assert_eq!(tracker.information_ratio(), 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "decay must be in (0, 1)")]
+    fn test_exponential_ir_invalid_decay_zero() {
+        ExponentialIRTracker::new(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "decay must be in (0, 1)")]
+    fn test_exponential_ir_invalid_decay_one() {
+        ExponentialIRTracker::new(1.0);
     }
 }

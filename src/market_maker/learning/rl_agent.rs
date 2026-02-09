@@ -920,6 +920,22 @@ impl Default for RewardConfig {
     }
 }
 
+impl RewardConfig {
+    /// Compute a deterministic hash of all reward config fields.
+    /// Used to detect incompatible reward config changes across checkpoint save/restore.
+    pub fn config_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.edge_weight.to_bits().hash(&mut hasher);
+        self.inventory_penalty_weight.to_bits().hash(&mut hasher);
+        self.volatility_penalty_weight.to_bits().hash(&mut hasher);
+        self.inventory_change_weight.to_bits().hash(&mut hasher);
+        self.gamma.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// Reward signal from a transition.
 ///
 /// Literature (Falces Marin 2022): reward = spread_capture - realized_AS - fees.
@@ -1617,6 +1633,7 @@ impl QLearningAgent {
             total_observations,
             action_space_version: if self.config.use_parameter_actions { 2 } else { 1 },
             use_compact_state: self.config.use_compact_state,
+            reward_config_hash: self.config.reward_config.config_hash(),
         }
     }
 
@@ -1646,6 +1663,17 @@ impl QLearningAgent {
             self.episodes = ckpt.episodes;
             self.total_reward = ckpt.total_reward;
             return;
+        }
+
+        // Check reward config compatibility (warn only, don't hard fail)
+        let current_hash = self.config.reward_config.config_hash();
+        if ckpt.reward_config_hash != 0 && ckpt.reward_config_hash != current_hash {
+            eprintln!(
+                "[RL] WARNING: RewardConfig changed since checkpoint was saved \
+                 (checkpoint hash={}, current hash={}). \
+                 Q-values may be stale — consider resetting.",
+                ckpt.reward_config_hash, current_hash
+            );
         }
 
         self.episodes = ckpt.episodes;
@@ -1843,19 +1871,17 @@ fn sample_gamma(alpha: f64, beta: f64) -> f64 {
 
 /// Sample from uniform distribution [0, 1).
 fn sample_uniform() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Simple LCG for sampling (replace with proper RNG in production)
-    static mut SEED: u64 = 0;
-    unsafe {
-        if SEED == 0 {
-            SEED = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(12345);
-        }
-        SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (SEED >> 33) as f64 / (1u64 << 31) as f64
+    use rand::Rng;
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
+
+    thread_local! {
+        static RNG: std::cell::RefCell<SmallRng> = std::cell::RefCell::new(
+            SmallRng::from_entropy()
+        );
     }
+
+    RNG.with(|rng| rng.borrow_mut().gen::<f64>())
 }
 
 // ============================================================================

@@ -112,6 +112,46 @@ pub struct MarketMakerConfig {
     pub fee_bps: f64,
 }
 
+impl MarketMakerConfig {
+    /// Validate invariants that would cause runtime panics or incorrect behavior.
+    ///
+    /// Must be called before constructing MarketMaker. Returns a descriptive error
+    /// for the first violated invariant.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.risk_aversion <= 0.0 {
+            return Err(format!(
+                "risk_aversion (gamma) must be > 0.0, got {}. GLFT formula diverges at zero.",
+                self.risk_aversion
+            ));
+        }
+        if self.max_position <= 0.0 {
+            return Err(format!(
+                "max_position must be > 0.0, got {}",
+                self.max_position
+            ));
+        }
+        if self.target_liquidity <= 0.0 {
+            return Err(format!(
+                "target_liquidity must be > 0.0, got {}",
+                self.target_liquidity
+            ));
+        }
+        if self.fee_bps < 0.0 || self.fee_bps >= 100.0 {
+            return Err(format!(
+                "fee_bps must be in [0.0, 100.0), got {}",
+                self.fee_bps
+            ));
+        }
+        if self.max_position_usd < 0.0 {
+            return Err(format!(
+                "max_position_usd must be >= 0.0, got {}",
+                self.max_position_usd
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration passed to strategy for quote calculation.
 #[derive(Debug, Clone, Copy)]
 pub struct QuoteConfig {
@@ -164,5 +204,78 @@ impl Default for MonitoringConfig {
             metrics_port: 9090,
             enable_http_metrics: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_maker::config::ImpulseControlConfig;
+    use crate::market_maker::config::runtime::AssetRuntimeConfig;
+    use crate::market_maker::config::stochastic::StochasticConfig;
+    use crate::market_maker::tracking::ReconcileConfig;
+    use crate::meta::CollateralInfo;
+
+    /// Create a valid MarketMakerConfig for testing.
+    fn test_valid_config() -> MarketMakerConfig {
+        MarketMakerConfig {
+            asset: Arc::from("ETH"),
+            target_liquidity: 1.0,
+            risk_aversion: 0.3,
+            max_bps_diff: 10,
+            max_position: 5.0,
+            max_position_usd: 10_000.0,
+            decimals: 2,
+            sz_decimals: 3,
+            multi_asset: false,
+            stochastic: StochasticConfig::default(),
+            smart_reconcile: true,
+            reconcile: ReconcileConfig::default(),
+            runtime: AssetRuntimeConfig::default(),
+            initial_isolated_margin: 1000.0,
+            dex: None,
+            collateral: CollateralInfo::default(),
+            impulse_control: ImpulseControlConfig::default(),
+            spread_profile: SpreadProfile::Default,
+            fee_bps: 1.5,
+        }
+    }
+
+    #[test]
+    fn test_config_validate_accepts_valid_config() {
+        let cfg = test_valid_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_rejects_zero_gamma() {
+        let mut cfg = test_valid_config();
+        cfg.risk_aversion = 0.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("risk_aversion"), "error should mention risk_aversion: {err}");
+    }
+
+    #[test]
+    fn test_config_validate_rejects_negative_max_position() {
+        let mut cfg = test_valid_config();
+        cfg.max_position = -1.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("max_position"), "error should mention max_position: {err}");
+    }
+
+    #[test]
+    fn test_config_validate_rejects_zero_target_liquidity() {
+        let mut cfg = test_valid_config();
+        cfg.target_liquidity = 0.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("target_liquidity"), "error should mention target_liquidity: {err}");
+    }
+
+    #[test]
+    fn test_config_validate_rejects_negative_fee() {
+        let mut cfg = test_valid_config();
+        cfg.fee_bps = -0.5;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("fee_bps"), "error should mention fee_bps: {err}");
     }
 }

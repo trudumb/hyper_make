@@ -17,7 +17,7 @@ Comprehensive audit of all risk systems for production readiness.
 5. **DrawdownMonitor threshold BUG**: FIXED. Removed `/ 100.0` from
    `DrawdownMonitor::new(config.max_drawdown)`. Was 100x too sensitive (0.02% vs 2%).
 6. **Reentry manager**: Well-implemented with production preset.
-7. **Kill switch persistence**: NOT in CheckpointBundle. Kill switch state lost on restart.
+7. **Kill switch persistence**: FIXED (2026-02-09). Now in CheckpointBundle with 24h expiry.
 
 ### Key Architecture Notes
 
@@ -28,4 +28,4 @@ Comprehensive audit of all risk systems for production readiness.
 - `cascade_severity()` in liquidation.rs:436: `((ratio - 1.0) / (threshold - 1.0)).clamp(0,1)`
 - `cascade_active` flag: intensity > 3x baseline (separate from severity normalization)
 - Kill switch has dual protection: KillSwitch::check() AND RiskAggregator monitors
-- CheckpointBundle only saves model parameters, not safety state
+- CheckpointBundle saves model parameters + kill switch state (since 2026-02-09)

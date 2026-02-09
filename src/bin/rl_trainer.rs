@@ -60,11 +60,11 @@ fn main() {
     for file_path in &cli.experience_files {
         match read_experience_file(file_path) {
             Ok(records) => {
-                println!("  Read {} experiences from {}", records.len(), file_path);
+                println!("  Read {} experiences from {file_path}", records.len());
                 all_experiences.extend(records);
             }
             Err(e) => {
-                eprintln!("  Error reading {}: {}", file_path, e);
+                eprintln!("  Error reading {file_path}: {e}");
             }
         }
     }
@@ -87,15 +87,15 @@ fn main() {
 
     // Create trainer (with optional prior)
     let mut trainer = if let Some(prior_path) = &cli.prior {
-        println!("Loading prior checkpoint from: {}", prior_path);
+        println!("Loading prior checkpoint from: {prior_path}");
         let prior_json = std::fs::read_to_string(prior_path)
             .unwrap_or_else(|e| {
-                eprintln!("Error reading prior checkpoint: {}", e);
+                eprintln!("Error reading prior checkpoint: {e}");
                 std::process::exit(1);
             });
         let prior: RLCheckpoint = serde_json::from_str(&prior_json)
             .unwrap_or_else(|e| {
-                eprintln!("Error parsing prior checkpoint: {}", e);
+                eprintln!("Error parsing prior checkpoint: {e}");
                 std::process::exit(1);
             });
         println!(
@@ -144,7 +144,7 @@ fn main() {
     let checkpoint = trainer.to_checkpoint();
     let json = serde_json::to_string_pretty(&checkpoint).unwrap();
     std::fs::write(&cli.output, &json).unwrap_or_else(|e| {
-        eprintln!("Error writing output: {}", e);
+        eprintln!("Error writing output: {e}");
         std::process::exit(1);
     });
 

@@ -90,7 +90,7 @@ use hyperliquid_rust_sdk::market_maker::risk::monitors::*;
 use hyperliquid_rust_sdk::round_to_significant_and_decimal;
 use hyperliquid_rust_sdk::market_maker::checkpoint::{
     CheckpointBundle, CheckpointManager, CheckpointMetadata,
-    EnsembleWeightsCheckpoint, KellyTrackerCheckpoint,
+    EnsembleWeightsCheckpoint, KellyTrackerCheckpoint, KillSwitchCheckpoint,
 };
 use hyperliquid_rust_sdk::market_maker::learning::{
     ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource,
@@ -1635,6 +1635,7 @@ impl SimulationState {
             },
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: self.rl_agent.to_checkpoint(),
+            kill_switch: KillSwitchCheckpoint::default(),
         }
     }
 

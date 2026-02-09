@@ -1092,4 +1092,330 @@ mod tests {
             quiet_spread
         );
     }
+
+    // =========================================================================
+    // Safety Integration Tests — Cross-Component Escalation
+    // =========================================================================
+
+    #[test]
+    fn test_cascade_triggers_circuit_breaker_then_kill_switch() {
+        // Verifies the full escalation chain:
+        // moderate cascade -> WidenSpreads -> high cascade -> PullQuotes -> extreme -> Kill
+        use crate::market_maker::risk::{
+            RiskAction, RiskAggregator, RiskSeverity, RiskState,
+        };
+        use crate::market_maker::risk::monitors::CascadeMonitor;
+
+        // Build aggregator with a cascade monitor: pull at 0.8, kill at 5.0
+        let aggregator = RiskAggregator::new()
+            .with_monitor(Box::new(CascadeMonitor::new(0.8, 5.0)));
+
+        // Step 1: Moderate cascade (severity 0.5) -> should widen spreads
+        // Default widen_threshold = pull_threshold * 0.5 = 0.4
+        let state_moderate = RiskState {
+            cascade_severity: 0.5,
+            ..Default::default()
+        };
+        let result = aggregator.evaluate(&state_moderate);
+        assert!(
+            matches!(result.primary_action, RiskAction::WidenSpreads(_)),
+            "Moderate cascade should trigger WidenSpreads, got {:?}",
+            result.primary_action
+        );
+        assert!(
+            result.spread_factor > 1.0,
+            "Spread factor should be > 1.0 during moderate cascade, got {}",
+            result.spread_factor
+        );
+        assert!(
+            !result.should_kill(),
+            "Moderate cascade should not trigger kill"
+        );
+
+        // Step 2: High cascade (severity 0.95) -> should pull quotes
+        let state_high = RiskState {
+            cascade_severity: 0.95,
+            ..Default::default()
+        };
+        let result = aggregator.evaluate(&state_high);
+        assert!(
+            result.pull_quotes,
+            "High cascade (0.95) should trigger PullQuotes"
+        );
+        assert_eq!(
+            result.max_severity,
+            RiskSeverity::High,
+            "High cascade should be High severity"
+        );
+
+        // Step 3: Extreme cascade (severity 6.0) -> should trigger kill
+        let state_extreme = RiskState {
+            cascade_severity: 6.0,
+            ..Default::default()
+        };
+        let result = aggregator.evaluate(&state_extreme);
+        assert!(
+            result.should_kill(),
+            "Extreme cascade should trigger kill switch"
+        );
+        assert_eq!(
+            result.max_severity,
+            RiskSeverity::Critical,
+            "Extreme cascade should be Critical severity"
+        );
+        assert!(
+            !result.kill_reasons.is_empty(),
+            "Kill reasons should contain cascade description"
+        );
+        let reasons_joined = result.kill_reasons.join("; ");
+        assert!(
+            reasons_joined.to_lowercase().contains("cascade"),
+            "Kill reasons should mention cascade: {}",
+            reasons_joined
+        );
+    }
+
+    #[test]
+    fn test_position_guard_blocks_while_circuit_breaker_widens() {
+        // Verifies that PositionGuard blocks position-increasing orders
+        // while allowing position-reducing orders, independent of whether
+        // the aggregator says WidenSpreads or PauseTrading.
+        use crate::market_maker::risk::{
+            OrderEntryCheck, PositionGuard, PositionGuardConfig,
+        };
+        use crate::market_maker::tracking::Side;
+
+        let guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 10.0,
+            hard_entry_threshold: 0.95, // Reject at > 9.5 worst case
+            ..Default::default()
+        });
+
+        // Position at 9.5 -- near the limit
+        let current_position = 9.5;
+
+        // Buying 0.6 would put worst-case at 10.1 > 9.5 limit -> REJECTED
+        let check_buy = guard.check_order_entry(current_position, 0.6, Side::Buy);
+        assert!(
+            !check_buy.is_allowed(),
+            "Position-increasing order should be rejected near limit"
+        );
+        if let OrderEntryCheck::Rejected { worst_case_position, hard_limit, .. } = &check_buy {
+            assert!(
+                *worst_case_position > *hard_limit,
+                "Worst case {} should exceed hard limit {}",
+                worst_case_position, hard_limit
+            );
+        }
+
+        // Selling (reducing position) should ALWAYS be allowed
+        let check_sell = guard.check_order_entry(current_position, 1.0, Side::Sell);
+        assert!(
+            check_sell.is_allowed(),
+            "Position-reducing order should always be allowed"
+        );
+
+        // Small buy that stays within limits -> still rejected at 9.5 + 0.01 = 9.51 > 9.5
+        let check_small_buy = guard.check_order_entry(current_position, 0.01, Side::Buy);
+        assert!(
+            !check_small_buy.is_allowed(),
+            "Even small buy at 9.5 + 0.01 = 9.51 > 9.5 limit should be rejected"
+        );
+
+        // From a lower position, buying should be fine
+        let check_ok_buy = guard.check_order_entry(5.0, 2.0, Side::Buy);
+        assert!(
+            check_ok_buy.is_allowed(),
+            "Buy that stays well within limits should be allowed (worst case = 7.0)"
+        );
+    }
+
+    #[test]
+    fn test_risk_aggregator_takes_max_severity_across_monitors() {
+        // Verifies the fundamental invariant: one Critical monitor overrides
+        // all Normal monitors, and the kill action propagates correctly.
+        use crate::market_maker::risk::{
+            RiskAggregator, RiskSeverity, RiskState,
+        };
+        use crate::market_maker::risk::monitors::{
+            CascadeMonitor, DrawdownMonitor, LossMonitor, PositionMonitor,
+        };
+
+        // Set up aggregator with multiple monitors
+        let aggregator = RiskAggregator::new()
+            .with_monitor(Box::new(LossMonitor::new(500.0)))       // max loss $500
+            .with_monitor(Box::new(DrawdownMonitor::new(0.05)))    // max 5% dd
+            .with_monitor(Box::new(PositionMonitor::new()))
+            .with_monitor(Box::new(CascadeMonitor::new(0.8, 5.0)));
+
+        // Create a state where everything is normal EXCEPT cascade is extreme.
+        // P&L: daily=10, peak=10 means 0% drawdown (at peak).
+        // Position: 30% utilized. Cascade: 6.0 (extreme).
+        let state = RiskState {
+            daily_pnl: 10.0,         // In profit
+            peak_pnl: 10.0,          // At peak, 0% drawdown
+            position: 0.3,           // Well within limits
+            max_position: 1.0,
+            position_value: 3000.0,
+            max_position_value: 10000.0,
+            cascade_severity: 6.0,   // EXTREME: above kill threshold of 5.0
+            ..Default::default()
+        };
+
+        let result = aggregator.evaluate(&state);
+
+        // Max severity should be Critical from the cascade monitor
+        assert_eq!(
+            result.max_severity,
+            RiskSeverity::Critical,
+            "One Critical monitor should dominate: max_severity = {:?}",
+            result.max_severity
+        );
+
+        // Kill switch should be triggered
+        assert!(
+            result.should_kill(),
+            "Critical cascade should trigger kill"
+        );
+
+        // Other monitors should be OK (profit, small drawdown, within position limits)
+        let non_critical_count = result.assessments.iter()
+            .filter(|a| a.severity == RiskSeverity::None)
+            .count();
+        assert!(
+            non_critical_count >= 3,
+            "At least 3 monitors should report None severity, got {}",
+            non_critical_count
+        );
+    }
+
+    #[test]
+    fn test_kill_switch_blocks_after_cascade() {
+        // Verifies that KillSwitch correctly triggers on extreme cascade severity
+        // and remains triggered on subsequent checks (latching behavior).
+        use crate::market_maker::risk::{KillReason, KillSwitch, KillSwitchConfig, KillSwitchState};
+        use std::time::Instant;
+
+        let config = KillSwitchConfig {
+            cascade_severity_threshold: 1.5, // Production-like threshold
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Not triggered initially
+        assert!(!ks.is_triggered());
+
+        // State with extreme cascade severity
+        let state = KillSwitchState {
+            cascade_severity: 2.0, // Above 1.5 threshold
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+
+        // Check should trigger CascadeDetected
+        let reason = ks.check(&state);
+        assert!(reason.is_some(), "Should trigger on cascade severity 2.0");
+        match reason.unwrap() {
+            KillReason::CascadeDetected { severity } => {
+                assert!(
+                    (severity - 2.0).abs() < f64::EPSILON,
+                    "Severity should be 2.0, got {}",
+                    severity
+                );
+            }
+            other => panic!("Expected CascadeDetected, got {:?}", other),
+        }
+
+        // Kill switch should now be triggered
+        assert!(ks.is_triggered(), "Kill switch should be triggered");
+
+        // Subsequent checks with calm state should still report triggered (latching)
+        let state_calm = KillSwitchState {
+            cascade_severity: 0.0, // Calm now
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        let _ = ks.check(&state_calm);
+        assert!(
+            ks.is_triggered(),
+            "Kill switch should remain triggered even after conditions improve"
+        );
+
+        // Trigger reasons should be preserved
+        let reasons = ks.trigger_reasons();
+        assert!(
+            !reasons.is_empty(),
+            "Trigger reasons should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_multiple_monitors_fire_simultaneously() {
+        // Verifies correct aggregation when MULTIPLE conditions are bad simultaneously:
+        // high drawdown + high position + elevated cascade.
+        // Max severity wins, spread_factor is maximum, reduce_only propagates.
+        use crate::market_maker::risk::{
+            RiskAggregator, RiskSeverity, RiskState,
+        };
+        use crate::market_maker::risk::monitors::{
+            CascadeMonitor, DrawdownMonitor, LossMonitor, PositionMonitor,
+        };
+
+        let aggregator = RiskAggregator::new()
+            .with_monitor(Box::new(LossMonitor::new(50.0)))        // $50 limit
+            .with_monitor(Box::new(DrawdownMonitor::new(0.05)))    // 5% dd limit
+            .with_monitor(Box::new(PositionMonitor::new()))
+            .with_monitor(Box::new(
+                CascadeMonitor::new(0.8, 5.0).with_widen_threshold(0.4, 0.5),
+            ));
+
+        // State where MULTIPLE conditions are bad:
+        // - Drawdown: peak=100, current pnl implies 20% drawdown > 5% limit -> Critical
+        // - Loss: $40 loss is 80% of $50 limit -> Warning
+        // - Position: 90% of value limit -> Warning
+        // - Cascade: 0.5 severity -> WidenSpreads (above 0.4 widen threshold)
+        let state = RiskState {
+            daily_pnl: -40.0,
+            peak_pnl: 100.0,
+            position: 0.9,
+            max_position: 1.0,
+            position_value: 9000.0,
+            max_position_value: 10000.0,
+            cascade_severity: 0.5,
+            ..Default::default()
+        };
+
+        let result = aggregator.evaluate(&state);
+
+        // Drawdown monitor fires Critical (peak=100, pnl=-40 -> drawdown=140%), max severity
+        assert_eq!(
+            result.max_severity,
+            RiskSeverity::Critical,
+            "Max severity should be Critical from drawdown, got {:?}",
+            result.max_severity
+        );
+
+        // Kill should be triggered from drawdown
+        assert!(
+            result.should_kill(),
+            "Drawdown exceeding limit should trigger kill"
+        );
+
+        // Spread factor should be > 1.0 from the cascade monitor
+        assert!(
+            result.spread_factor > 1.0,
+            "Spread factor should be elevated from cascade, got {}",
+            result.spread_factor
+        );
+
+        // Multiple assessments should be actionable
+        let actionable_count = result.assessments.iter()
+            .filter(|a| a.is_actionable())
+            .count();
+        assert!(
+            actionable_count >= 2,
+            "Multiple monitors should fire simultaneously, got {} actionable",
+            actionable_count
+        );
+    }
 }

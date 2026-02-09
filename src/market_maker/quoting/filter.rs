@@ -50,6 +50,9 @@ pub struct ReduceOnlyResult {
     /// True when reduce-only mode is active but exchange has no capacity
     /// to place reducing limit orders.
     pub needs_escalation: bool,
+    /// Close urgency: 0.0 = at threshold, 1.0 = maximum urgency.
+    /// Used to tighten the closing side spread to attract fills that reduce position.
+    pub close_urgency: f64,
 }
 
 impl ReduceOnlyResult {
@@ -60,6 +63,7 @@ impl ReduceOnlyResult {
             filtered_bids: false,
             filtered_asks: false,
             needs_escalation: false,
+            close_urgency: 0.0,
         }
     }
 
@@ -70,6 +74,7 @@ impl ReduceOnlyResult {
             filtered_bids: true,
             filtered_asks: false,
             needs_escalation: false,
+            close_urgency: 0.0,
         }
     }
 
@@ -80,6 +85,7 @@ impl ReduceOnlyResult {
             filtered_bids: false,
             filtered_asks: true,
             needs_escalation: false,
+            close_urgency: 0.0,
         }
     }
 
@@ -90,6 +96,7 @@ impl ReduceOnlyResult {
             filtered_bids: true,
             filtered_asks: false,
             needs_escalation: true,
+            close_urgency: 0.0,
         }
     }
 
@@ -100,7 +107,38 @@ impl ReduceOnlyResult {
             filtered_bids: false,
             filtered_asks: true,
             needs_escalation: true,
+            close_urgency: 0.0,
         }
+    }
+
+    /// Compute close urgency based on how far we are over the limit.
+    ///
+    /// Factors:
+    /// 1. Excess position ratio: (|position| - max_position) / max_position
+    /// 2. Unrealized PnL (more urgency when underwater)
+    ///
+    /// Result is clamped to [0.0, 1.0].
+    pub fn compute_urgency(
+        position_abs: f64,
+        max_position: f64,
+        unrealized_pnl: f64,
+    ) -> f64 {
+        if position_abs <= max_position {
+            return 0.0;
+        }
+
+        // Base urgency from excess position
+        let excess_ratio = (position_abs - max_position) / max_position.max(1e-9);
+        let base_urgency = excess_ratio.min(1.0);
+
+        // Increase urgency when underwater (losing money on position)
+        let pnl_factor = if unrealized_pnl < 0.0 {
+            1.0 + (-unrealized_pnl / 100.0).min(0.5) // Up to 50% boost when underwater
+        } else {
+            1.0
+        };
+
+        (base_urgency * pnl_factor).clamp(0.0, 1.0)
     }
 }
 
@@ -244,6 +282,7 @@ impl QuoteFilter {
                     filtered_bids: true,
                     filtered_asks: false,
                     needs_escalation: false,
+                    close_urgency: 0.0,
                 };
             } else {
                 // Short and underwater: clear asks (don't add to losing position)
@@ -263,6 +302,7 @@ impl QuoteFilter {
                     filtered_bids: false,
                     filtered_asks: true,
                     needs_escalation: false,
+                    close_urgency: 0.0,
                 };
             }
         }
@@ -365,6 +405,7 @@ impl QuoteFilter {
                     filtered_bids: true,
                     filtered_asks: false,
                     needs_escalation: false,
+                    close_urgency: 0.0,
                 };
             } else {
                 *ask = None;
@@ -380,6 +421,7 @@ impl QuoteFilter {
                     filtered_bids: false,
                     filtered_asks: true,
                     needs_escalation: false,
+                    close_urgency: 0.0,
                 };
             }
         }
@@ -523,6 +565,7 @@ impl QuoteFilter {
                     filtered_bids: true,
                     filtered_asks: false,
                     needs_escalation: false,
+                    close_urgency: 0.0,
                 };
             } else {
                 asks.clear();
@@ -538,6 +581,7 @@ impl QuoteFilter {
                     filtered_bids: false,
                     filtered_asks: true,
                     needs_escalation: false,
+                    close_urgency: 0.0,
                 };
             }
         }
@@ -662,6 +706,50 @@ impl QuoteFilter {
                 );
             }
         }
+    }
+}
+
+/// Apply close bias to tighten the closing side spread.
+///
+/// When we're long and need to reduce: tighten ask (sell) side
+/// When we're short and need to reduce: tighten bid (buy) side
+///
+/// INVARIANT: Never crosses mid price. The tightened price is always
+/// on the correct side of mid.
+///
+/// # Arguments
+/// * `bid_price` - Current bid price
+/// * `ask_price` - Current ask price
+/// * `mid_price` - Current mid price
+/// * `position` - Current position (positive = long)
+/// * `urgency` - Close urgency [0.0, 1.0]
+///
+/// # Returns
+/// (adjusted_bid, adjusted_ask)
+pub fn apply_close_bias(
+    bid_price: f64,
+    ask_price: f64,
+    mid_price: f64,
+    position: f64,
+    urgency: f64,
+) -> (f64, f64) {
+    if urgency <= 0.0 || urgency > 1.0 {
+        return (bid_price, ask_price);
+    }
+
+    let half_spread = (ask_price - bid_price) / 2.0;
+    let tightening = urgency * 0.5 * half_spread; // Max 50% of half-spread
+
+    if position > 0.0 {
+        // Long position: tighten ask (sell side) to attract buyers
+        let new_ask = (ask_price - tightening).max(mid_price + 1e-10); // Never cross mid
+        (bid_price, new_ask)
+    } else if position < 0.0 {
+        // Short position: tighten bid (buy side) to attract sellers
+        let new_bid = (bid_price + tightening).min(mid_price - 1e-10); // Never cross mid
+        (new_bid, ask_price)
+    } else {
+        (bid_price, ask_price)
     }
 }
 
@@ -871,5 +959,97 @@ mod tests {
         assert_eq!(result.reason, Some(ReduceOnlyReason::OverPositionLimit));
         assert!(result.filtered_bids);
         assert!(!result.filtered_asks);
+    }
+
+    // === Close Urgency Tests ===
+
+    #[test]
+    fn test_reduce_only_close_urgency_zero_at_threshold() {
+        // Position exactly at max -> urgency = 0.0
+        let urgency = ReduceOnlyResult::compute_urgency(10.0, 10.0, 0.0);
+        assert_eq!(urgency, 0.0);
+    }
+
+    #[test]
+    fn test_reduce_only_close_urgency_increases_with_excess() {
+        // Position = 1.5 * max -> excess_ratio = 0.5 -> urgency = 0.5
+        let urgency = ReduceOnlyResult::compute_urgency(15.0, 10.0, 0.0);
+        assert!((urgency - 0.5).abs() < 1e-9, "Expected 0.5, got {urgency}");
+
+        // Position = 2.0 * max -> excess_ratio = 1.0 -> urgency = 1.0
+        let urgency = ReduceOnlyResult::compute_urgency(20.0, 10.0, 0.0);
+        assert!((urgency - 1.0).abs() < 1e-9, "Expected 1.0, got {urgency}");
+    }
+
+    #[test]
+    fn test_reduce_only_close_urgency_increases_when_underwater() {
+        // Same excess (1.5x) but underwater
+        let urgency_dry = ReduceOnlyResult::compute_urgency(15.0, 10.0, 100.0);
+        let urgency_wet = ReduceOnlyResult::compute_urgency(15.0, 10.0, -50.0);
+        assert!(urgency_wet > urgency_dry, "Underwater should increase urgency: wet={urgency_wet} dry={urgency_dry}");
+    }
+
+    #[test]
+    fn test_reduce_only_close_urgency_capped_at_one() {
+        // Extreme position (10x max) + very underwater
+        let urgency = ReduceOnlyResult::compute_urgency(100.0, 10.0, -10000.0);
+        assert_eq!(urgency, 1.0, "Urgency must be capped at 1.0");
+    }
+
+    // === Close Bias Tests ===
+
+    #[test]
+    fn test_reduce_only_close_bias_tightens_correct_side_long() {
+        let mid = 50000.0;
+        let bid = 49990.0;
+        let ask = 50010.0;
+        let urgency = 0.5;
+
+        let (new_bid, new_ask) = apply_close_bias(bid, ask, mid, 5.0, urgency);
+        // Long: ask should decrease (tighten sell side), bid unchanged
+        assert_eq!(new_bid, bid);
+        assert!(new_ask < ask, "Ask should tighten: new_ask={new_ask} < old_ask={ask}");
+        assert!(new_ask > mid, "Ask must stay above mid: new_ask={new_ask} > mid={mid}");
+    }
+
+    #[test]
+    fn test_reduce_only_close_bias_tightens_correct_side_short() {
+        let mid = 50000.0;
+        let bid = 49990.0;
+        let ask = 50010.0;
+        let urgency = 0.5;
+
+        let (new_bid, new_ask) = apply_close_bias(bid, ask, mid, -5.0, urgency);
+        // Short: bid should increase (tighten buy side), ask unchanged
+        assert_eq!(new_ask, ask);
+        assert!(new_bid > bid, "Bid should tighten: new_bid={new_bid} > old_bid={bid}");
+        assert!(new_bid < mid, "Bid must stay below mid: new_bid={new_bid} < mid={mid}");
+    }
+
+    #[test]
+    fn test_reduce_only_close_bias_no_effect_at_zero_urgency() {
+        let mid = 50000.0;
+        let bid = 49990.0;
+        let ask = 50010.0;
+
+        let (new_bid, new_ask) = apply_close_bias(bid, ask, mid, 5.0, 0.0);
+        assert_eq!(new_bid, bid);
+        assert_eq!(new_ask, ask);
+    }
+
+    #[test]
+    fn test_reduce_only_close_bias_never_crosses_mid() {
+        let mid = 50000.0;
+        // Very tight spread to test boundary
+        let bid = 49999.0;
+        let ask = 50001.0;
+
+        // Long with max urgency
+        let (_, new_ask) = apply_close_bias(bid, ask, mid, 5.0, 1.0);
+        assert!(new_ask > mid, "Ask must never cross mid: new_ask={new_ask} > mid={mid}");
+
+        // Short with max urgency
+        let (new_bid, _) = apply_close_bias(bid, ask, mid, -5.0, 1.0);
+        assert!(new_bid < mid, "Bid must never cross mid: new_bid={new_bid} < mid={mid}");
     }
 }

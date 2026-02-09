@@ -3,7 +3,26 @@
     "allow": [
       "mcp__sequential-thinking__sequentialthinking",
       "Bash(git rm:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "mcp__serena__get_symbols_overview",
+      "mcp__serena__list_dir",
+      "mcp__serena__activate_project",
+      "mcp__serena__read_file",
+      "mcp__serena__search_for_pattern",
+      "mcp__serena__list_memories",
+      "mcp__serena__think_about_collected_information",
+      "Bash(rustc:*)",
+      "Bash(cargo clean:*)",
+      "mcp__serena__find_symbol",
+      "mcp__serena__find_referencing_symbols",
+      "mcp__serena__think_about_task_adherence",
+      "mcp__serena__replace_content",
+      "mcp__serena__replace_symbol_body",
+      "mcp__serena__think_about_whether_you_are_done",
+      "mcp__serena__insert_after_symbol",
+      "mcp__serena__find_file",
+      "mcp__serena__create_text_file",
+      "Bash(cargo check:*)"
     ]
   }
 }

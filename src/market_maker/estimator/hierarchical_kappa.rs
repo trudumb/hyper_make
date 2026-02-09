@@ -152,6 +152,24 @@ impl HierarchicalKappa {
         }
     }
 
+    /// Update the hierarchical prior parameters (mean and concentration).
+    ///
+    /// Called by adaptive kappa prior when the prior center shifts toward
+    /// observed market kappa. Updates both the prior alpha (concentration)
+    /// and the default market kappa, then recomputes the posterior.
+    pub(crate) fn update_market_prior(&mut self, new_prior_mean: f64, new_prior_strength: f64) {
+        let safe_mean = new_prior_mean.clamp(100.0, 50000.0);
+        let safe_strength = new_prior_strength.clamp(1.0, 50.0);
+
+        self.prior_alpha = safe_strength;
+        self.default_market_kappa = safe_mean;
+        // Also update market_kappa if it hasn't been set from external data yet
+        if self.market_kappa_conf < 0.1 {
+            self.market_kappa = safe_mean;
+        }
+        self.update_posterior();
+    }
+
     /// Record a fill from one of our orders.
     ///
     /// # Arguments

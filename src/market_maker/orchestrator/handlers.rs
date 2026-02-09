@@ -880,6 +880,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
             self.last_l2_update_time = std::time::Instant::now();
 
+            // Update BBO in data quality monitor for quote gating crossed-book check.
+            if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
+                self.infra.data_quality.update_bbo(&self.config.asset, best_bid, best_ask);
+            }
+
             // Record book snapshot for dashboard unconditionally
             // This ensures dashboard shows data even during warmup
             self.infra

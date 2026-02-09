@@ -68,4 +68,68 @@ impl DynamicRiskConfig {
         self.max_leverage = max_leverage;
         self
     }
+
+    /// Validate invariants for dynamic risk parameters.
+    ///
+    /// All parameters are derived from Kelly criterion and Bayesian principles —
+    /// invalid values cause nonsensical risk limits.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.risk_fraction <= 0.0 || self.risk_fraction > 1.0 {
+            return Err(format!(
+                "risk_fraction must be in (0.0, 1.0], got {}",
+                self.risk_fraction
+            ));
+        }
+        if self.num_sigmas <= 0.0 {
+            return Err(format!(
+                "num_sigmas must be > 0.0, got {}",
+                self.num_sigmas
+            ));
+        }
+        if self.sigma_prior <= 0.0 {
+            return Err(format!(
+                "sigma_prior must be > 0.0, got {}",
+                self.sigma_prior
+            ));
+        }
+        if self.max_leverage <= 0.0 {
+            return Err(format!(
+                "max_leverage must be > 0.0, got {}",
+                self.max_leverage
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_risk_config_validate_accepts_defaults() {
+        let cfg = DynamicRiskConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_risk_config_validate_rejects_zero_risk_fraction() {
+        let cfg = DynamicRiskConfig::default().with_risk_fraction(0.0);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("risk_fraction"), "error should mention risk_fraction: {err}");
+    }
+
+    #[test]
+    fn test_risk_config_validate_rejects_excessive_risk_fraction() {
+        let cfg = DynamicRiskConfig::default().with_risk_fraction(1.5);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("risk_fraction"), "error should mention risk_fraction: {err}");
+    }
+
+    #[test]
+    fn test_risk_config_validate_rejects_zero_max_leverage() {
+        let cfg = DynamicRiskConfig::default().with_max_leverage(0.0);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("max_leverage"), "error should mention max_leverage: {err}");
+    }
 }

@@ -67,6 +67,33 @@ impl fmt::Display for AnomalyType {
     }
 }
 
+/// Reason for gating (blocking) quotes due to data quality issues.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuoteGateReason {
+    /// No data has been received for this asset yet
+    NoDataReceived,
+    /// Data is stale (age exceeds threshold)
+    StaleData { age_ms: u64, threshold_ms: u64 },
+    /// Book is crossed (best bid >= best ask)
+    CrossedBook { best_bid: f64, best_ask: f64 },
+}
+
+impl fmt::Display for QuoteGateReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuoteGateReason::NoDataReceived => write!(f, "no_data_received"),
+            QuoteGateReason::StaleData {
+                age_ms,
+                threshold_ms,
+            } => write!(f, "stale_data(age={age_ms}ms, threshold={threshold_ms}ms)"),
+            QuoteGateReason::CrossedBook {
+                best_bid,
+                best_ask,
+            } => write!(f, "crossed_book(bid={best_bid}, ask={best_ask})"),
+        }
+    }
+}
+
 /// Data quality monitoring and validation.
 #[derive(Debug)]
 pub struct DataQualityMonitor {
@@ -78,6 +105,10 @@ pub struct DataQualityMonitor {
     anomaly_counts: HashMap<AnomalyType, u64>,
     /// Last update time per symbol
     last_update_times: HashMap<String, Instant>,
+    /// Cached best bid per asset (for quote gating crossed-book check)
+    last_best_bid: HashMap<String, f64>,
+    /// Cached best ask per asset (for quote gating crossed-book check)
+    last_best_ask: HashMap<String, f64>,
     /// Total sequence gaps detected
     total_sequence_gaps: u64,
     /// Total crossed book incidents
@@ -96,6 +127,8 @@ impl DataQualityMonitor {
             last_timestamps: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
             anomaly_counts: HashMap::with_capacity(8), // ~8 anomaly types
             last_update_times: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
+            last_best_bid: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
+            last_best_ask: HashMap::with_capacity(DATA_QUALITY_CHANNELS),
             total_sequence_gaps: 0,
             total_crossed_books: 0,
             config,
@@ -234,6 +267,56 @@ impl DataQualityMonitor {
         }
     }
 
+    /// Update cached BBO (best bid/ask) for the given asset.
+    ///
+    /// Called from L2 book handler to keep BBO in sync for quote gating.
+    pub fn update_bbo(&mut self, asset: &str, best_bid: f64, best_ask: f64) {
+        self.last_best_bid.insert(asset.to_string(), best_bid);
+        self.last_best_ask.insert(asset.to_string(), best_ask);
+    }
+
+    /// Check if quotes should be gated (blocked) for the given asset.
+    ///
+    /// Returns `Some(reason)` if quotes should NOT be placed.
+    /// Returns `None` if data is fresh and valid — safe to quote.
+    ///
+    /// Checks (in order):
+    /// 1. Whether any data has been received for this asset
+    /// 2. Whether data is stale (age exceeds `max_data_age_ms`)
+    /// 3. Whether the book is crossed (best bid >= best ask)
+    pub fn should_gate_quotes(&self, asset: &str) -> Option<QuoteGateReason> {
+        // 1. Check if we've ever received data for this asset
+        let last_time = match self.last_update_times.get(asset) {
+            Some(t) => t,
+            None => return Some(QuoteGateReason::NoDataReceived),
+        };
+
+        // 2. Check if data is stale
+        let age_ms = last_time.elapsed().as_millis() as u64;
+        if age_ms > self.config.max_data_age_ms {
+            return Some(QuoteGateReason::StaleData {
+                age_ms,
+                threshold_ms: self.config.max_data_age_ms,
+            });
+        }
+
+        // 3. Check for crossed book (if enabled and we have cached BBO)
+        if self.config.check_crossed_books {
+            if let (Some(&best_bid), Some(&best_ask)) =
+                (self.last_best_bid.get(asset), self.last_best_ask.get(asset))
+            {
+                if Self::is_crossed(best_bid, best_ask) {
+                    return Some(QuoteGateReason::CrossedBook {
+                        best_bid,
+                        best_ask,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
     /// Get the count of a specific anomaly type.
     pub fn anomaly_count(&self, anomaly: &AnomalyType) -> u64 {
         *self.anomaly_counts.get(anomaly).unwrap_or(&0)
@@ -272,6 +355,8 @@ impl DataQualityMonitor {
         self.last_timestamps.clear();
         self.anomaly_counts.clear();
         self.last_update_times.clear();
+        self.last_best_bid.clear();
+        self.last_best_ask.clear();
         self.total_sequence_gaps = 0;
         self.total_crossed_books = 0;
     }
@@ -808,5 +893,131 @@ mod tests {
         assert_eq!(format!("{}", AnomalyType::SequenceGap(5)), "sequence_gap_5");
         assert_eq!(format!("{}", AnomalyType::CrossedBook), "crossed_book");
         assert_eq!(format!("{}", AnomalyType::StaleData), "stale_data");
+    }
+
+    // ================================================================
+    // Quote Gate Tests
+    // ================================================================
+
+    #[test]
+    fn test_should_gate_quotes_no_data_received() {
+        let monitor = DataQualityMonitor::default();
+        let result = monitor.should_gate_quotes("BTC");
+        assert_eq!(result, Some(QuoteGateReason::NoDataReceived));
+    }
+
+    #[test]
+    fn test_should_gate_quotes_stale_data_gates() {
+        let mut monitor = DataQualityMonitor::new(DataQualityConfig {
+            max_data_age_ms: 100, // 100ms for fast test
+            ..Default::default()
+        });
+
+        // Receive data
+        let _ = monitor.check_l2_book("BTC", 0, 99.0, 100.0);
+        monitor.update_bbo("BTC", 99.0, 100.0);
+
+        // Wait for staleness
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let result = monitor.should_gate_quotes("BTC");
+        assert!(
+            matches!(result, Some(QuoteGateReason::StaleData { .. })),
+            "Expected StaleData gate, got {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_should_gate_quotes_fresh_data_allows() {
+        let mut monitor = DataQualityMonitor::default();
+
+        // Receive data (default max_data_age_ms = 30s, plenty of time)
+        let _ = monitor.check_l2_book("BTC", 0, 99.0, 100.0);
+        monitor.update_bbo("BTC", 99.0, 100.0);
+
+        let result = monitor.should_gate_quotes("BTC");
+        assert_eq!(result, None, "Fresh data should not gate quotes");
+    }
+
+    #[test]
+    fn test_should_gate_quotes_crossed_book_gates() {
+        let mut monitor = DataQualityMonitor::default();
+
+        // Receive valid data first (to update last_update_times)
+        let _ = monitor.check_l2_book("BTC", 0, 99.0, 100.0);
+
+        // Then set BBO to crossed state
+        monitor.update_bbo("BTC", 100.0, 99.0);
+
+        let result = monitor.should_gate_quotes("BTC");
+        assert_eq!(
+            result,
+            Some(QuoteGateReason::CrossedBook {
+                best_bid: 100.0,
+                best_ask: 99.0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_should_gate_quotes_threshold_boundary() {
+        // Data exactly at threshold should NOT gate (<= is not stale)
+        let mut monitor = DataQualityMonitor::new(DataQualityConfig {
+            max_data_age_ms: 200,
+            ..Default::default()
+        });
+
+        // Receive data
+        let _ = monitor.check_l2_book("BTC", 0, 99.0, 100.0);
+        monitor.update_bbo("BTC", 99.0, 100.0);
+
+        // Immediately check — age ~0ms which is well under 200ms threshold
+        let result = monitor.should_gate_quotes("BTC");
+        assert_eq!(result, None, "Data at/under threshold should not gate");
+    }
+
+    #[test]
+    fn test_data_quality_gate_resets_after_fresh_update() {
+        let mut monitor = DataQualityMonitor::new(DataQualityConfig {
+            max_data_age_ms: 100,
+            ..Default::default()
+        });
+
+        // Receive data
+        let _ = monitor.check_l2_book("BTC", 0, 99.0, 100.0);
+        monitor.update_bbo("BTC", 99.0, 100.0);
+
+        // Wait for staleness
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            matches!(monitor.should_gate_quotes("BTC"), Some(QuoteGateReason::StaleData { .. })),
+            "Should be gated while stale",
+        );
+
+        // Fresh update arrives
+        let _ = monitor.check_l2_book("BTC", 0, 99.0, 100.0);
+        monitor.update_bbo("BTC", 99.0, 100.0);
+
+        let result = monitor.should_gate_quotes("BTC");
+        assert_eq!(result, None, "Should no longer be gated after fresh update");
+    }
+
+    #[test]
+    fn test_quote_gate_reason_display() {
+        assert_eq!(
+            format!("{}", QuoteGateReason::NoDataReceived),
+            "no_data_received",
+        );
+        let stale = QuoteGateReason::StaleData {
+            age_ms: 20000,
+            threshold_ms: 15000,
+        };
+        assert!(format!("{stale}").contains("20000"));
+        let crossed = QuoteGateReason::CrossedBook {
+            best_bid: 100.5,
+            best_ask: 100.0,
+        };
+        assert!(format!("{crossed}").contains("100.5"));
     }
 }

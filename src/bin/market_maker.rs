@@ -1789,6 +1789,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconciliation_config = ReconciliationConfig::default();
     let rate_limit_config = RejectionRateLimitConfig::default();
 
+    // Validate config before constructing MarketMaker
+    mm_config
+        .validate()
+        .map_err(|e| format!("Invalid MarketMakerConfig: {e}"))
+        .expect("config validation failed");
+
     // Create and start market maker
     let mut market_maker = MarketMaker::new(
         mm_config,

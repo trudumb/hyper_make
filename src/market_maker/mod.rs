@@ -646,6 +646,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 total_updates: self.learning.ensemble_total_updates(),
             },
             rl_q_table: self.stochastic.rl_agent.to_checkpoint(),
+            kill_switch: self.safety.kill_switch.to_checkpoint(),
         }
     }
 
@@ -667,6 +668,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.stochastic
             .rl_agent
             .restore_from_checkpoint(&bundle.rl_q_table);
+        self.safety
+            .kill_switch
+            .restore_from_checkpoint(&bundle.kill_switch);
     }
 
     // =========================================================================

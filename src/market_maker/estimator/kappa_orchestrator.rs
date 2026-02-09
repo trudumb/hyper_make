@@ -610,6 +610,26 @@ impl KappaOrchestrator {
     pub(crate) fn robust_kappa_obs_count(&self) -> u64 {
         self.robust_kappa.observation_count()
     }
+
+    /// Update the prior kappa used for regularization.
+    ///
+    /// Propagates the new prior to the own-fill estimator and updates
+    /// the config for future warmup blending.
+    ///
+    /// # Arguments
+    /// * `new_prior_mean` - New prior mean, clamped to [100, 50000]
+    /// * `new_prior_strength` - New prior strength, clamped to [1, 20]
+    pub(crate) fn update_prior_kappa(&mut self, new_prior_mean: f64, new_prior_strength: f64) {
+        let clamped_mean = new_prior_mean.clamp(100.0, 50000.0);
+        let clamped_strength = new_prior_strength.clamp(1.0, 20.0);
+
+        self.prior_kappa = clamped_mean;
+        self.config.prior_kappa = clamped_mean;
+        self.config.prior_strength = clamped_strength;
+
+        // Propagate to own-fill estimator so its Bayesian posterior reflects the new prior
+        self.own_kappa.update_prior(clamped_mean, clamped_strength);
+    }
 }
 
 #[cfg(test)]

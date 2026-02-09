@@ -27,6 +27,7 @@ mod information_ratio;
 pub mod model_gating;
 pub mod parameter_learner;
 mod prediction_log;
+pub mod meta_calibration;
 pub mod signal_decay;
 
 pub use adaptive_binning::AdaptiveBinner;
@@ -43,7 +44,8 @@ pub use derived_constants::{
 pub use historical_calibrator::{
     CalibrationSummary, FillRecord, HistoricalCalibrator, MarketSnapshot, PowerAnalysis, TradeRecord,
 };
-pub use information_ratio::{BinStats, InformationRatioTracker, IrDiagnostics};
+pub use meta_calibration::{MetaCalibrationTracker, ModelCalibrationTracker};
+pub use information_ratio::{BinStats, ExponentialIRTracker, InformationRatioTracker, IrDiagnostics};
 pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
 pub use parameter_learner::{BayesianParam, CalibrationStatus, LearnedParameters, PriorFamily};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};
