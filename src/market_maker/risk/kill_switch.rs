@@ -47,6 +47,16 @@ pub struct KillSwitchConfig {
     /// Cascade severity threshold for kill switch (default 5.0, production 1.5)
     pub cascade_severity_threshold: f64,
 
+    /// Minimum peak PnL (USD) before drawdown check activates.
+    ///
+    /// Drawdown from peak is only statistically meaningful when the peak
+    /// represents a significant sample of fills, not spread noise.
+    /// Below this threshold, `check_daily_loss()` provides the safety net.
+    ///
+    /// Default: $1.00 (roughly 40 fills at 5 bps capture on $50 notional).
+    /// Production: `max(1.0, max_position_value * 0.02)`.
+    pub min_peak_for_drawdown: f64,
+
     /// Enable/disable the kill switch (for testing)
     pub enabled: bool,
 }
@@ -63,6 +73,7 @@ impl Default for KillSwitchConfig {
             stale_data_threshold: Duration::from_secs(30),
             max_rate_limit_errors: 3,
             cascade_severity_threshold: 5.0,
+            min_peak_for_drawdown: 1.0,
             enabled: true,
         }
     }
@@ -92,6 +103,11 @@ impl KillSwitchConfig {
             stale_data_threshold: Duration::from_secs(10),
             max_rate_limit_errors: 2,
             cascade_severity_threshold: 1.5,
+            // Drawdown is meaningless when peak is spread noise.
+            // min_peak = max(1.0, 2% of max position notional).
+            // With max_position_usd=$1000: min_peak=$20 (~800 fills to activate).
+            // check_daily_loss ($50) still protects against catastrophic loss.
+            min_peak_for_drawdown: 1.0_f64.max(max_position_usd * 0.02),
             enabled: true,
         }
     }
@@ -139,6 +155,7 @@ impl KillSwitchConfig {
             max_daily_loss,
             max_drawdown,
             max_position_value,
+            min_peak_for_drawdown: 1.0_f64.max(max_position_value * 0.02),
             ..Default::default()
         }
     }
@@ -271,7 +288,10 @@ impl std::fmt::Display for KillReason {
                 write!(f, "Max position value exceeded: ${value:.2} > ${limit:.2}")
             }
             KillReason::PositionRunaway { contracts, limit } => {
-                write!(f, "Position runaway: {contracts:.6} contracts > {limit:.6} (2x limit)")
+                write!(
+                    f,
+                    "Position runaway: {contracts:.6} contracts > {limit:.6} (2x limit)"
+                )
             }
             KillReason::StaleData { elapsed, threshold } => {
                 let el = elapsed.as_secs_f64();
@@ -555,6 +575,14 @@ impl KillSwitch {
             return None; // No peak to draw down from
         }
 
+        // Skip drawdown check when peak is below the noise floor.
+        // Percentage drawdown from a tiny peak (e.g., $0.02 from one fill) is
+        // statistically meaningless — any tick against you looks like 100%+ drawdown.
+        // The absolute daily loss check still protects against catastrophic losses.
+        if state.peak_pnl < config.min_peak_for_drawdown {
+            return None;
+        }
+
         let drawdown = (state.peak_pnl - state.daily_pnl) / state.peak_pnl;
         if drawdown > config.max_drawdown {
             return Some(KillReason::MaxDrawdown {
@@ -728,6 +756,8 @@ mod tests {
         assert_eq!(config.stale_data_threshold, Duration::from_secs(10));
         assert_eq!(config.max_rate_limit_errors, 2);
         assert_eq!(config.cascade_severity_threshold, 1.5);
+        // min_peak = max(1.0, 1000 * 0.02) = 20.0
+        assert_eq!(config.min_peak_for_drawdown, 20.0);
         assert!(config.enabled);
     }
 
@@ -818,6 +848,108 @@ mod tests {
             }
             _ => panic!("Expected MaxDrawdown reason"),
         }
+    }
+
+    #[test]
+    fn test_drawdown_skipped_when_peak_below_threshold() {
+        // Reproduces the real incident: 1 fill for $0.02, price moves against,
+        // drawdown = (0.02 - (-0.0168)) / 0.02 = 184% — but peak is noise.
+        let config = KillSwitchConfig {
+            max_drawdown: 0.02,         // 2% threshold
+            min_peak_for_drawdown: 1.0, // $1 minimum peak
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        let state = KillSwitchState {
+            daily_pnl: -0.0168,
+            peak_pnl: 0.02, // Single fill spread capture — below $1 threshold
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+
+        // Drawdown is 184% but peak is below threshold → should NOT trigger
+        let reason = ks.check(&state);
+        assert!(
+            reason.is_none(),
+            "Drawdown should not fire when peak_pnl ({:.4}) < min_peak_for_drawdown (1.0)",
+            state.peak_pnl
+        );
+        assert!(!ks.is_triggered());
+    }
+
+    #[test]
+    fn test_drawdown_fires_when_peak_above_threshold() {
+        // Same drawdown percentage, but peak is above the noise floor → fires correctly
+        let config = KillSwitchConfig {
+            max_drawdown: 0.10,         // 10% threshold
+            min_peak_for_drawdown: 1.0, // $1 minimum peak
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        let state = KillSwitchState {
+            daily_pnl: 0.80,
+            peak_pnl: 1.50, // Above $1 threshold — drawdown is meaningful
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+
+        // Drawdown = (1.50 - 0.80) / 1.50 = 46.7% > 10% → should trigger
+        let reason = ks.check(&state);
+        assert!(reason.is_some());
+        match reason.unwrap() {
+            KillReason::MaxDrawdown { drawdown, limit } => {
+                assert!((drawdown - 0.467).abs() < 0.01);
+                assert_eq!(limit, 0.10);
+            }
+            _ => panic!("Expected MaxDrawdown reason"),
+        }
+    }
+
+    #[test]
+    fn test_daily_loss_fires_even_when_drawdown_relaxed() {
+        // Defense in depth: when peak is below threshold (drawdown relaxed),
+        // the absolute daily loss check still catches catastrophic losses.
+        let config = KillSwitchConfig {
+            max_daily_loss: 50.0,
+            max_drawdown: 0.02,
+            min_peak_for_drawdown: 100.0, // High threshold → drawdown never fires
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        let state = KillSwitchState {
+            daily_pnl: -75.0, // $75 loss exceeds $50 limit
+            peak_pnl: 5.0,    // Below min_peak → drawdown check skipped
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+
+        let reason = ks.check(&state);
+        assert!(reason.is_some());
+        match reason.unwrap() {
+            KillReason::MaxLoss { loss, limit } => {
+                assert_eq!(loss, 75.0);
+                assert_eq!(limit, 50.0);
+            }
+            _ => panic!("Expected MaxLoss (defense in depth), not drawdown"),
+        }
+    }
+
+    #[test]
+    fn test_default_min_peak_for_drawdown() {
+        let config = KillSwitchConfig::default();
+        assert_eq!(config.min_peak_for_drawdown, 1.0);
+    }
+
+    #[test]
+    fn test_kelly_config_min_peak_derived() {
+        // from_account_kelly should derive min_peak from max_position_value
+        let config = KillSwitchConfig::from_account_kelly(10_000.0, 0.25, 0.02, 10.0);
+        // max_position_value = 10000 * 10 = 100000
+        // min_peak = max(1.0, 100000 * 0.02) = 2000.0
+        assert_eq!(config.min_peak_for_drawdown, 2000.0);
     }
 
     #[test]

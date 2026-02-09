@@ -90,6 +90,11 @@ impl PrometheusMetrics {
         self.inner.modify_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a quote cycle skipped due to BBO crossing detection.
+    pub fn record_bbo_crossing_skip(&self) {
+        self.inner.bbo_crossing_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
     // === Market Updates ===
 
     /// Update market metrics.

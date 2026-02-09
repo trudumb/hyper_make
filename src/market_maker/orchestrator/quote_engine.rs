@@ -25,25 +25,53 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Update quotes based on current market state.
     #[tracing::instrument(name = "quote_cycle", skip_all, fields(asset = %self.config.asset))]
     pub(crate) async fn update_quotes(&mut self) -> Result<()> {
-        // Don't place orders until estimator is warmed up
+        // Don't place orders until estimator is warmed up (or timeout reached)
         if !self.estimator.is_warmed_up() {
-            // Log warmup status every 10 seconds to help diagnose why orders aren't placed
-            let should_log = match self.last_warmup_block_log {
-                None => true,
-                Some(last) => last.elapsed() >= std::time::Duration::from_secs(10),
-            };
-            if should_log {
+            // Check warmup timeout: with informative Bayesian priors, we can safely
+            // quote before all data thresholds are met. Spread floors and kill switches
+            // provide protection. The estimator continues refining as data arrives.
+            let max_warmup = self.estimator.max_warmup_secs();
+            let elapsed = self.session_start_time.elapsed();
+            if max_warmup > 0 && elapsed >= std::time::Duration::from_secs(max_warmup) {
                 let (vol_ticks, min_vol, trade_obs, min_trades) = self.estimator.warmup_progress();
                 warn!(
+                    elapsed_secs = elapsed.as_secs(),
+                    max_warmup_secs = max_warmup,
                     volume_ticks = vol_ticks,
                     volume_ticks_required = min_vol,
                     trade_observations = trade_obs,
                     trade_observations_required = min_trades,
-                    "Warmup incomplete - no orders placed (waiting for market data)"
+                    "Warmup timeout reached, starting with Bayesian prior parameters \
+                     (kappa prior, config sigma). Estimation continues in background."
                 );
-                self.last_warmup_block_log = Some(std::time::Instant::now());
+                self.estimator.force_warmup_complete();
+                // Fall through to normal quoting
+            } else {
+                // Log warmup status every 10 seconds to help diagnose why orders aren't placed
+                let should_log = match self.last_warmup_block_log {
+                    None => true,
+                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(10),
+                };
+                if should_log {
+                    let (vol_ticks, min_vol, trade_obs, min_trades) =
+                        self.estimator.warmup_progress();
+                    let remaining = if max_warmup > 0 {
+                        max_warmup.saturating_sub(elapsed.as_secs())
+                    } else {
+                        0
+                    };
+                    warn!(
+                        volume_ticks = vol_ticks,
+                        volume_ticks_required = min_vol,
+                        trade_observations = trade_obs,
+                        trade_observations_required = min_trades,
+                        timeout_remaining_secs = remaining,
+                        "Warmup incomplete - no orders placed (waiting for market data)"
+                    );
+                    self.last_warmup_block_log = Some(std::time::Instant::now());
+                }
+                return Ok(());
             }
-            return Ok(());
         }
 
         // === Circuit Breaker Checks ===
@@ -226,6 +254,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 );
                 return Ok(());
             }
+        }
+
+        // === RL HOT-RELOAD: Check for updated Q-table every 100 cycles ===
+        self.rl_reload_cycle_count += 1;
+        if self.rl_reload_cycle_count.is_multiple_of(100) {
+            self.check_rl_reload();
         }
 
         // === LEARNING MODULE: Periodic model health logging ===
@@ -1269,9 +1303,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // - Current drawdown
         // - Model disagreement
         let decision_size_fraction = if self.learning.use_decision_filter() {
-            // Get current drawdown from risk state
+            // Get current drawdown from risk state, but suppress when peak is noise.
+            // Drawdown is meaningless when peak PnL is from a single fill's spread capture
+            // (e.g. $0.02). Without this guard the decision engine blocks ALL quoting
+            // at 5% drawdown even when the "peak" is spread noise.
             let risk_state = self.build_risk_state();
-            let current_drawdown = risk_state.drawdown();
+            let min_peak = self.safety.kill_switch.config().min_peak_for_drawdown;
+            let current_drawdown = if risk_state.peak_pnl < min_peak {
+                0.0
+            } else {
+                risk_state.drawdown()
+            };
 
             // Evaluate decision
             let decision = self.learning.evaluate_decision(
@@ -1665,9 +1707,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Previously this was only computed inside the controller block, but Quote Gate
         // needs it for better decision making.
         let l2_output = if self.learning.is_enabled() {
-            // Calculate drawdown from PnL summary
+            // Calculate drawdown from PnL summary, suppressing when peak is noise.
             let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
-            let current_drawdown = if pnl_summary.peak_pnl > 0.0 {
+            let min_peak = self.safety.kill_switch.config().min_peak_for_drawdown;
+            let current_drawdown = if pnl_summary.peak_pnl < min_peak {
+                0.0 // Drawdown meaningless when peak is spread noise
+            } else if pnl_summary.peak_pnl > 0.0 {
                 (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl
             } else {
                 0.0

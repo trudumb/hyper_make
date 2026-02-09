@@ -1,5 +1,20 @@
 # Strategy Agent Memory
 
+## Per-Order Size Cap (2026-02-08)
+
+### Problem: HYPE Incident
+Concentration fallback collapsed 25 levels into 1 order at 100% max position (1.51 HYPE = full $50 limit). One fill maxed inventory with zero recovery capacity.
+
+### Fix: MAX_SINGLE_ORDER_FRACTION = 0.25
+- `ladder_strat.rs` step 8b: per-level cap after entropy optimizer
+- `ladder_strat.rs` concentration fallback: bid/ask capped
+- `generator.rs` 6 fallback paths capped (allocate_sizes x2, build_raw_ladder x2, build_asymmetric_ladder x2)
+- Floor = max(min_meaningful_size or min_notional*1.01/price, 25%*max_position) to survive truncation
+- Test: `test_no_single_order_exceeds_25pct_max_position` covers all 4 scenarios
+
+### Key Insight
+`truncate_float()` rounds DOWN — when computing min_size_for_notional, must use 1.01x buffer or the truncated size * price < min_notional at boundary
+
 ## Edge Prediction Overshoot Analysis (2026-02-07)
 
 ### 40x Overshoot Root Cause (predicted 58.4 bps, realized 1.44 bps)

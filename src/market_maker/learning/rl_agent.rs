@@ -62,6 +62,18 @@ impl InventoryBucket {
 
     /// Number of buckets.
     pub const COUNT: usize = 5;
+
+    /// Reconstruct from bucket index (0-4).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Short,
+            1 => Self::SmallShort,
+            2 => Self::Neutral,
+            3 => Self::SmallLong,
+            4 => Self::Long,
+            _ => Self::Neutral,
+        }
+    }
 }
 
 /// Discretized order book imbalance bucket.
@@ -104,6 +116,18 @@ impl ImbalanceBucket {
 
     /// Number of buckets.
     pub const COUNT: usize = 5;
+
+    /// Reconstruct from bucket index (0-4).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Sell,
+            1 => Self::WeakSell,
+            2 => Self::Neutral,
+            3 => Self::WeakBuy,
+            4 => Self::Buy,
+            _ => Self::Neutral,
+        }
+    }
 }
 
 /// Discretized volatility regime.
@@ -138,6 +162,16 @@ impl VolatilityBucket {
 
     /// Number of buckets.
     pub const COUNT: usize = 3;
+
+    /// Reconstruct from bucket index (0-2).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Low,
+            1 => Self::Normal,
+            2 => Self::High,
+            _ => Self::Normal,
+        }
+    }
 }
 
 /// Discretized adverse selection posterior belief.
@@ -172,6 +206,16 @@ impl AdverseBucket {
 
     /// Number of buckets.
     pub const COUNT: usize = 3;
+
+    /// Reconstruct from bucket index (0-2).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Low,
+            1 => Self::Moderate,
+            2 => Self::High,
+            _ => Self::Moderate,
+        }
+    }
 }
 
 /// Discretized Hawkes excitation level.
@@ -206,6 +250,16 @@ impl ExcitationBucket {
 
     /// Number of buckets.
     pub const COUNT: usize = 3;
+
+    /// Reconstruct from bucket index (0-2).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Normal,
+            1 => Self::Elevated,
+            2 => Self::High,
+            _ => Self::Normal,
+        }
+    }
 }
 
 /// Complete discretized MDP state.
@@ -259,6 +313,31 @@ impl MDPState {
         * VolatilityBucket::COUNT
         * AdverseBucket::COUNT
         * ExcitationBucket::COUNT;
+
+    /// Reconstruct an MDPState from a flat index (inverse of `to_index()`).
+    ///
+    /// Uses modular arithmetic to extract each dimension in reverse order
+    /// of how `to_index()` encodes them.
+    pub fn from_index(idx: usize) -> Self {
+        let mut remaining = idx;
+        let excitation_idx = remaining % ExcitationBucket::COUNT;
+        remaining /= ExcitationBucket::COUNT;
+        let adverse_idx = remaining % AdverseBucket::COUNT;
+        remaining /= AdverseBucket::COUNT;
+        let volatility_idx = remaining % VolatilityBucket::COUNT;
+        remaining /= VolatilityBucket::COUNT;
+        let imbalance_idx = remaining % ImbalanceBucket::COUNT;
+        remaining /= ImbalanceBucket::COUNT;
+        let inventory_idx = remaining % InventoryBucket::COUNT;
+
+        Self {
+            inventory: InventoryBucket::from_index(inventory_idx),
+            imbalance: ImbalanceBucket::from_index(imbalance_idx),
+            volatility: VolatilityBucket::from_index(volatility_idx),
+            adverse: AdverseBucket::from_index(adverse_idx),
+            excitation: ExcitationBucket::from_index(excitation_idx),
+        }
+    }
 }
 
 impl Default for MDPState {
@@ -1626,6 +1705,52 @@ mod tests {
         assert!(idx2 < MDPState::STATE_COUNT);
         assert_eq!(MDPState::STATE_COUNT, 675);
         assert_ne!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_mdp_state_from_index_round_trip() {
+        // Test every possible state round-trips through to_index → from_index
+        for idx in 0..MDPState::STATE_COUNT {
+            let state = MDPState::from_index(idx);
+            assert_eq!(
+                state.to_index(),
+                idx,
+                "Round-trip failed for index {idx}: got {:?} which maps to {}",
+                state,
+                state.to_index()
+            );
+        }
+    }
+
+    #[test]
+    fn test_mdp_state_from_index_specific() {
+        // Default state (Neutral everything) should be in the middle
+        let default_state = MDPState::default();
+        let default_idx = default_state.to_index();
+        let reconstructed = MDPState::from_index(default_idx);
+        assert_eq!(reconstructed, default_state);
+
+        // All-max state
+        let max_state = MDPState {
+            inventory: InventoryBucket::Long,
+            imbalance: ImbalanceBucket::Buy,
+            volatility: VolatilityBucket::High,
+            adverse: AdverseBucket::High,
+            excitation: ExcitationBucket::High,
+        };
+        let max_idx = max_state.to_index();
+        assert_eq!(MDPState::from_index(max_idx), max_state);
+        assert_eq!(max_idx, MDPState::STATE_COUNT - 1);
+
+        // All-min state
+        let min_state = MDPState {
+            inventory: InventoryBucket::Short,
+            imbalance: ImbalanceBucket::Sell,
+            volatility: VolatilityBucket::Low,
+            adverse: AdverseBucket::Low,
+            excitation: ExcitationBucket::Normal,
+        };
+        assert_eq!(MDPState::from_index(0), min_state);
     }
 
     #[test]

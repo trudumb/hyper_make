@@ -378,6 +378,12 @@ pub struct EstimatorConfig {
     /// Minimum trade observations before kappa is valid
     /// (Note: Originally named min_l2_updates, but actually counts trades via market_kappa)
     pub min_trade_observations: usize,
+    /// Maximum warmup duration in seconds before force-starting with prior parameters.
+    /// For illiquid assets (e.g., HIP-3), trades may be very infrequent, causing
+    /// warmup to block quoting for minutes. With informative Bayesian priors on kappa
+    /// and sigma, we can safely quote from the start — spread floors and kill switches
+    /// provide downside protection. Set to 0 to disable the timeout.
+    pub max_warmup_secs: u64,
 
     // === Defaults ===
     /// Default sigma during warmup (per-second volatility)
@@ -443,6 +449,7 @@ impl Default for EstimatorConfig {
             // Warmup - reasonable for testnet/low-activity
             min_volume_ticks: 10,
             min_trade_observations: 5,
+            max_warmup_secs: 30, // Force-start after 30s with Bayesian priors
 
             // Defaults
             // BTC mainnet typically runs 0.0002-0.0003 per-second volatility.

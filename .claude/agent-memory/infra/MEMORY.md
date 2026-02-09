@@ -25,6 +25,21 @@
 - `depth_from_mid = |fill_price - mid| / mid`
 - `fill_pnl = -as_realized` (negative AS = profit)
 
+## BBO Crossing Validation (2026-02-08)
+- Production bug: bid at 32.992 crossed BBO ask at 32.992 → "Post only would have immediately matched" rejection
+- One side rejected, other placed → one-sided directional exposure (opposite of market making)
+- Root cause: no pre-placement BBO validation; mid shift between quote calc and placement
+- Fix: 3-layer defense-in-depth BBO validation:
+  1. `reconcile_ladder_smart()` — validates ALL quotes against cached BBO, skips BOTH sides if any would cross
+  2. `place_bulk_ladder_orders()` — per-order filter against BBO (catches modify fallback paths)
+  3. `place_new_order()` — single-order mode BBO guard
+- Added `cached_best_bid`, `cached_best_ask`, `last_l2_update_time` fields to MarketMaker struct
+- Updated `handle_l2_book()` to populate BBO cache on each L2 update
+- Book staleness gate: skip quote cycle if L2 data > 5 seconds old
+- Staleness buffer: widen validation margin by 1 tick/second when book age > 2 seconds
+- Tick proxy: `mid_price * 0.0001` (1 bps) — conservative for most assets
+- Also filters modify specs that would cross BBO before sending to exchange
+
 ## Serena Tool Notes
 - `find_symbol` requires `name_path_pattern` not `name_path` parameter
 - Paper trader methods not always found by Serena's symbol tools -- use Grep as fallback

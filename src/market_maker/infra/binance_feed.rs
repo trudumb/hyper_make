@@ -204,6 +204,71 @@ impl BinanceFeedConfig {
     }
 }
 
+/// Resolve a Hyperliquid asset name to its Binance Futures symbol.
+///
+/// Returns `Some("btcusdt")` for assets with a meaningful Binance equivalent,
+/// `None` for Hyperliquid-native tokens (HYPE, PURR, etc.) where cross-venue
+/// signals would be pure noise.
+///
+/// # Priority
+/// 1. Explicit `override_symbol` (from CLI `--binance-symbol`)
+/// 2. Known asset mapping (BTC→btcusdt, ETH→ethusdt, etc.)
+/// 3. `None` → caller should disable Binance feed
+pub fn resolve_binance_symbol(asset: &str, override_symbol: Option<&str>) -> Option<String> {
+    // Explicit override takes priority
+    if let Some(sym) = override_symbol {
+        return Some(sym.to_lowercase());
+    }
+
+    // Strip DEX prefix (e.g., "hyna:BTC" → "BTC")
+    let base_asset = asset.split(':').next_back().unwrap_or(asset);
+
+    // Map known assets to their Binance Futures USDT perpetual symbols.
+    // Only include assets with genuine cross-venue price discovery on Binance.
+    match base_asset.to_uppercase().as_str() {
+        // Major pairs — strong lead-lag signal
+        "BTC" => Some("btcusdt".to_string()),
+        "ETH" => Some("ethusdt".to_string()),
+        // Large-cap alts — moderate lead-lag signal
+        "SOL" => Some("solusdt".to_string()),
+        "DOGE" => Some("dogeusdt".to_string()),
+        "AVAX" => Some("avaxusdt".to_string()),
+        "LINK" => Some("linkusdt".to_string()),
+        "MATIC" | "POL" => Some("maticusdt".to_string()),
+        "ARB" => Some("arbusdt".to_string()),
+        "OP" => Some("opusdt".to_string()),
+        "SUI" => Some("suiusdt".to_string()),
+        "APT" => Some("aptusdt".to_string()),
+        "WIF" => Some("wifusdt".to_string()),
+        "PEPE" => Some("pepeusdt".to_string()),
+        "SEI" => Some("seiusdt".to_string()),
+        "TIA" => Some("tiausdt".to_string()),
+        "INJ" => Some("injusdt".to_string()),
+        "JUP" => Some("jupusdt".to_string()),
+        "RENDER" | "RNDR" => Some("renderusdt".to_string()),
+        "FET" => Some("fetusdt".to_string()),
+        "STX" => Some("stxusdt".to_string()),
+        "NEAR" => Some("nearusdt".to_string()),
+        "FIL" => Some("filusdt".to_string()),
+        "ATOM" => Some("atomusdt".to_string()),
+        "DOT" => Some("dotusdt".to_string()),
+        "ADA" => Some("adausdt".to_string()),
+        "XRP" => Some("xrpusdt".to_string()),
+        "LTC" => Some("ltcusdt".to_string()),
+        "BCH" => Some("bchusdt".to_string()),
+        "UNI" => Some("uniusdt".to_string()),
+        "AAVE" => Some("aaveusdt".to_string()),
+        "MKR" => Some("mkrusdt".to_string()),
+        "CRV" => Some("crvusdt".to_string()),
+        "LDO" => Some("ldousdt".to_string()),
+        "BONK" => Some("bonkusdt".to_string()),
+        // Hyperliquid-native tokens — NO Binance equivalent
+        // HYPE, PURR, JEFF, and other HL-native tokens return None.
+        // Feeding BTC data for these would inject noise into the lead-lag estimator.
+        _ => None,
+    }
+}
+
 /// Binance price feed for lead-lag signal.
 pub struct BinanceFeed {
     config: BinanceFeedConfig,
@@ -672,5 +737,50 @@ mod tests {
         );
         assert!(signal_high_stability.is_actionable);
         assert!(signal_high_stability.stability_confidence > 0.5);
+    }
+
+    #[test]
+    fn test_resolve_binance_symbol_known_assets() {
+        assert_eq!(resolve_binance_symbol("BTC", None), Some("btcusdt".to_string()));
+        assert_eq!(resolve_binance_symbol("ETH", None), Some("ethusdt".to_string()));
+        assert_eq!(resolve_binance_symbol("SOL", None), Some("solusdt".to_string()));
+        assert_eq!(resolve_binance_symbol("DOGE", None), Some("dogeusdt".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_binance_symbol_case_insensitive() {
+        // Asset names should work regardless of case
+        assert_eq!(resolve_binance_symbol("btc", None), Some("btcusdt".to_string()));
+        assert_eq!(resolve_binance_symbol("Eth", None), Some("ethusdt".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_binance_symbol_hl_native() {
+        // Hyperliquid-native tokens have no Binance equivalent
+        assert_eq!(resolve_binance_symbol("HYPE", None), None);
+        assert_eq!(resolve_binance_symbol("PURR", None), None);
+        assert_eq!(resolve_binance_symbol("JEFF", None), None);
+    }
+
+    #[test]
+    fn test_resolve_binance_symbol_dex_prefix_stripped() {
+        // HIP-3 DEX-prefixed assets should strip prefix
+        assert_eq!(resolve_binance_symbol("hyna:BTC", None), Some("btcusdt".to_string()));
+        assert_eq!(resolve_binance_symbol("hyna:ETH", None), Some("ethusdt".to_string()));
+        assert_eq!(resolve_binance_symbol("hyna:HYPE", None), None);
+    }
+
+    #[test]
+    fn test_resolve_binance_symbol_override() {
+        // Explicit override takes priority over mapping
+        assert_eq!(
+            resolve_binance_symbol("HYPE", Some("btcusdt")),
+            Some("btcusdt".to_string()),
+        );
+        // Override lowercases
+        assert_eq!(
+            resolve_binance_symbol("BTC", Some("ETHUSDT")),
+            Some("ethusdt".to_string()),
+        );
     }
 }

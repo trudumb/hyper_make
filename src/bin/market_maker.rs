@@ -27,7 +27,7 @@ use hyperliquid_rust_sdk::{
     MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
     QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
     RejectionRateLimitConfig, RiskConfig, SpreadConfig, SpreadProfile, StochasticConfig,
-    SymmetricStrategy, market_maker::BinanceFeed,
+    SymmetricStrategy, market_maker::{BinanceFeed, resolve_binance_symbol},
 };
 
 // ============================================================================
@@ -309,9 +309,11 @@ struct Cli {
     #[arg(long)]
     disable_binance_feed: bool,
 
-    /// Binance symbol to subscribe to for lead-lag signal (default: btcusdt).
-    #[arg(long, default_value = "btcusdt")]
-    binance_symbol: String,
+    /// Binance symbol override for lead-lag signal (e.g., btcusdt, ethusdt).
+    /// If not set, auto-derived from the trading asset. Assets without a
+    /// Binance equivalent (HYPE, PURR, etc.) will have the feed disabled.
+    #[arg(long)]
+    binance_symbol: Option<String>,
 
     // === RL Agent (Sim-to-Real Transfer) ===
     /// Path to paper trader checkpoint directory for loading Q-table as prior.
@@ -326,6 +328,13 @@ struct Cli {
     /// accumulating enough real fills (default 20).
     #[arg(long)]
     enable_rl: bool,
+
+    /// Path to RL checkpoint file to watch for hot-reload.
+    /// When the offline trainer writes a new checkpoint, the live RL agent
+    /// blends the updated Q-table into its current state (weight 0.3).
+    /// Example: --rl-watch data/checkpoints/paper/BTC/latest/checkpoint.json
+    #[arg(long)]
+    rl_watch: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1740,6 +1749,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stale_data_threshold: std::time::Duration::from_secs(ks_toml.stale_data_threshold_secs),
         max_rate_limit_errors: ks_toml.max_rate_limit_errors,
         cascade_severity_threshold: ks_toml.cascade_severity_threshold,
+        // Drawdown is meaningless when peak is spread noise ($0.02).
+        // min_peak = max(1.0, 2% of max position notional).
+        // check_daily_loss still protects against catastrophic loss.
+        min_peak_for_drawdown: {
+            let pos_val = if let Some(usd_limit) = max_position_usd_override {
+                usd_limit
+            } else {
+                ks_toml.max_position_value
+            };
+            1.0_f64.max(pos_val * 0.02)
+        },
         enabled: ks_toml.enabled,
     };
     info!(
@@ -1809,20 +1829,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Wire Binance feed for cross-exchange lead-lag signal
-    // Binance feed is enabled by default (core alpha source)
+    // Wire Binance feed for cross-exchange lead-lag signal.
+    // Auto-derive Binance symbol from asset; disable for HL-native tokens.
     if !cli.disable_binance_feed {
-        let (tx, rx) = tokio::sync::mpsc::channel(1000);
-        let feed = BinanceFeed::for_symbol(&cli.binance_symbol, tx);
-        tokio::spawn(async move {
-            feed.run().await;
-            tracing::warn!("Binance feed task terminated");
-        });
-        market_maker = market_maker.with_binance_receiver(rx);
-        tracing::info!(
-            symbol = %cli.binance_symbol,
-            "Binance lead-lag feed active"
+        let binance_symbol = resolve_binance_symbol(
+            &asset,
+            cli.binance_symbol.as_deref(),
         );
+        if let Some(ref sym) = binance_symbol {
+            let (tx, rx) = tokio::sync::mpsc::channel(1000);
+            let feed = BinanceFeed::for_symbol(sym, tx);
+            tokio::spawn(async move {
+                feed.run().await;
+                tracing::warn!("Binance feed task terminated");
+            });
+            market_maker = market_maker.with_binance_receiver(rx);
+            tracing::info!(
+                asset = %asset,
+                binance_symbol = %sym,
+                "Binance lead-lag feed active (auto-derived from asset)"
+            );
+        } else {
+            tracing::warn!(
+                asset = %asset,
+                "No Binance equivalent for asset — cross-venue signal disabled. \
+                 Use --binance-symbol to override if a correlated pair exists."
+            );
+        }
     } else {
         tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
     }
@@ -1860,6 +1893,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.enable_rl {
         market_maker.set_rl_enabled(true);
         tracing::info!("RL agent ENABLED for action control");
+    }
+
+    // === RL Hot-Reload: Watch checkpoint file for offline trainer updates ===
+    if let Some(ref rl_watch_path) = cli.rl_watch {
+        let (rl_watch_tx, rl_watch_rx) = tokio::sync::watch::channel(None);
+        market_maker = market_maker.with_rl_reload(rl_watch_rx, 0.3);
+
+        let watch_path = std::path::PathBuf::from(rl_watch_path);
+        tokio::spawn(async move {
+            let mut last_modified = None;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if let Ok(metadata) = tokio::fs::metadata(&watch_path).await {
+                    if let Ok(modified) = metadata.modified() {
+                        if last_modified.as_ref() != Some(&modified) {
+                            last_modified = Some(modified);
+                            if let Ok(contents) = tokio::fs::read_to_string(&watch_path).await {
+                                if let Ok(checkpoint) = serde_json::from_str::<
+                                    hyperliquid_rust_sdk::market_maker::checkpoint::types::RLCheckpoint,
+                                >(&contents) {
+                                    let _ = rl_watch_tx.send(Some(checkpoint));
+                                    tracing::info!(
+                                        path = %watch_path.display(),
+                                        "RL checkpoint file changed, sent for hot-reload"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // Sync open orders

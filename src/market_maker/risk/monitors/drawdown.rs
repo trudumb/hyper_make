@@ -8,6 +8,10 @@ pub struct DrawdownMonitor {
     max_drawdown: f64,
     /// Warning threshold (fraction of limit)
     warning_threshold: f64,
+    /// Minimum peak PnL (USD) before drawdown check activates.
+    /// Drawdown from peak is only meaningful when the peak represents
+    /// a significant sample of fills, not spread noise.
+    min_peak_for_drawdown: f64,
 }
 
 impl DrawdownMonitor {
@@ -20,6 +24,7 @@ impl DrawdownMonitor {
         Self {
             max_drawdown: max_drawdown.clamp(0.0, 1.0),
             warning_threshold: 0.7,
+            min_peak_for_drawdown: 1.0,
         }
     }
 
@@ -28,12 +33,24 @@ impl DrawdownMonitor {
         self.warning_threshold = threshold.clamp(0.0, 1.0);
         self
     }
+
+    /// Set minimum peak PnL before drawdown monitoring activates.
+    pub fn with_min_peak(mut self, min_peak: f64) -> Self {
+        self.min_peak_for_drawdown = min_peak;
+        self
+    }
 }
 
 impl RiskMonitor for DrawdownMonitor {
     fn evaluate(&self, state: &RiskState) -> RiskAssessment {
         // No drawdown if no peak or at peak
         if state.peak_pnl <= 0.0 || state.daily_pnl >= state.peak_pnl {
+            return RiskAssessment::ok(self.name());
+        }
+
+        // Drawdown is meaningless when peak is spread noise (e.g., $0.02 from one fill).
+        // check_daily_loss (LossMonitor) still protects against catastrophic losses.
+        if state.peak_pnl < self.min_peak_for_drawdown {
             return RiskAssessment::ok(self.name());
         }
 

@@ -93,15 +93,16 @@ use hyperliquid_rust_sdk::market_maker::checkpoint::{
     EnsembleWeightsCheckpoint, KellyTrackerCheckpoint,
 };
 use hyperliquid_rust_sdk::market_maker::learning::{
-    ExplorationStrategy, MDPState, QLearningAgent, QLearningConfig, RLPolicyRecommendation,
-    Reward,
+    ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource,
+    ExplorationStrategy, MDPState, QLearningAgent, QLearningConfig,
+    RLPolicyRecommendation, Reward,
 };
 use hyperliquid_rust_sdk::market_maker::stochastic::{
     StochasticControlBuilder, StochasticControlConfig,
 };
 use hyperliquid_rust_sdk::market_maker::calibration::LearnedParameters;
 use hyperliquid_rust_sdk::market_maker::{CalibrationController, CalibrationControllerConfig};
-use hyperliquid_rust_sdk::market_maker::{BinanceFeed, BinanceTradeUpdate, BinanceUpdate};
+use hyperliquid_rust_sdk::market_maker::{BinanceFeed, BinanceTradeUpdate, BinanceUpdate, resolve_binance_symbol};
 use hyperliquid_rust_sdk::market_maker::analytics::{
     SharpeTracker, PerSignalSharpeTracker, SignalPnLAttributor,
     EdgeTracker, EdgeSnapshot, AnalyticsLogger, CycleContributions, SignalContribution,
@@ -175,9 +176,11 @@ struct Cli {
     #[arg(long)]
     disable_binance_feed: bool,
 
-    /// Binance symbol to subscribe to (default: btcusdt)
-    #[arg(long, default_value = "btcusdt")]
-    binance_symbol: String,
+    /// Binance symbol override for lead-lag signal (e.g., btcusdt, ethusdt).
+    /// If not set, auto-derived from the trading asset. Assets without a
+    /// Binance equivalent (HYPE, PURR, etc.) will have the feed disabled.
+    #[arg(long)]
+    binance_symbol: Option<String>,
 
     /// Checkpoint directory for warm-starting models (default: data/checkpoints/paper/{asset})
     #[arg(long)]
@@ -444,6 +447,12 @@ struct SimulationState {
     /// Q-Learning agent for adaptive quoting policy.
     /// Paper trader uses Thompson sampling exploration for aggressive learning.
     rl_agent: QLearningAgent,
+
+    // === Experience Logging ===
+    /// JSONL experience logger for offline RL training.
+    experience_logger: Option<ExperienceLogger>,
+    /// Session identifier for experience records.
+    session_id: String,
 }
 
 impl SimulationState {
@@ -529,6 +538,8 @@ impl SimulationState {
             EstimatorConfig::default()
         };
 
+        let session_id = uuid::Uuid::new_v4().to_string();
+
         Self {
             asset,
             mid_price: 0.0,
@@ -609,6 +620,12 @@ impl SimulationState {
                 min_observations: 5, // Lower threshold for paper — explore more
                 ..Default::default()
             }),
+            // Experience logging for offline RL training
+            experience_logger: {
+                ExperienceLogger::new("logs/experience", ExperienceSource::Paper, &session_id)
+                    .ok()
+            },
+            session_id,
         }
     }
 
@@ -1421,6 +1438,38 @@ impl SimulationState {
             // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
             while let Some((state, action)) = self.rl_agent.take_next_state_action() {
                 self.rl_agent.update(state, action, reward, fill_state, false);
+
+                // Log experience for offline RL training
+                if let Some(ref mut logger) = self.experience_logger {
+                    let regime_probs = self.regime_hmm.regime_probabilities();
+                    let regime_label = if regime_probs[3] > 0.3 {
+                        "Cascade"
+                    } else if regime_probs[2] > 0.3 {
+                        "Volatile"
+                    } else if regime_probs[1] > 0.3 {
+                        "Trending"
+                    } else {
+                        "Quiet"
+                    };
+                    let record = ExperienceRecord::from_params(ExperienceParams {
+                        state,
+                        action,
+                        reward,
+                        next_state: fill_state,
+                        done: false,
+                        timestamp_ms,
+                        session_id: self.session_id.clone(),
+                        source: ExperienceSource::Paper,
+                        side: if is_buy { "buy".to_string() } else { "sell".to_string() },
+                        fill_price: fill.fill_price,
+                        mid_price: self.mid_price,
+                        fill_size: fill.fill_size,
+                        inventory: self.inventory,
+                        regime: regime_label.to_string(),
+                    });
+                    let _ = logger.log(&record);
+                }
+
                 tracing::debug!(
                     realized_edge_bps = %format!("{:.2}", realized_edge_bps),
                     inventory_risk = %format!("{:.3}", inventory_risk),
@@ -1973,17 +2022,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Spawn Binance feed for cross-exchange lead-lag signal
+    // Spawn Binance feed for cross-exchange lead-lag signal.
+    // Auto-derive Binance symbol from asset; disable for HL-native tokens.
     let mut binance_rx: Option<tokio::sync::mpsc::Receiver<BinanceUpdate>> =
         if !cli.disable_binance_feed {
-            let (btx, brx) = tokio::sync::mpsc::channel(1000);
-            let feed = BinanceFeed::for_symbol(&cli.binance_symbol, btx);
-            tokio::spawn(async move {
-                feed.run().await;
-                warn!("Binance feed task terminated");
-            });
-            info!(symbol = %cli.binance_symbol, "Binance lead-lag feed active");
-            Some(brx)
+            let binance_symbol = resolve_binance_symbol(
+                &cli.asset,
+                cli.binance_symbol.as_deref(),
+            );
+            if let Some(ref sym) = binance_symbol {
+                let (btx, brx) = tokio::sync::mpsc::channel(1000);
+                let feed = BinanceFeed::for_symbol(sym, btx);
+                tokio::spawn(async move {
+                    feed.run().await;
+                    warn!("Binance feed task terminated");
+                });
+                info!(
+                    asset = %cli.asset,
+                    binance_symbol = %sym,
+                    "Binance lead-lag feed active (auto-derived from asset)"
+                );
+                Some(brx)
+            } else {
+                warn!(
+                    asset = %cli.asset,
+                    "No Binance equivalent for asset — cross-venue signal disabled. \
+                     Use --binance-symbol to override if a correlated pair exists."
+                );
+                None
+            }
         } else {
             warn!("Binance feed DISABLED - no cross-exchange signal");
             None
@@ -2959,6 +3026,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => info!("Final checkpoint saved on shutdown"),
             Err(e) => warn!("Final checkpoint save failed: {e}"),
         }
+    }
+
+    // Flush experience logger on shutdown
+    if let Some(ref mut logger) = state.experience_logger {
+        let _ = logger.flush();
+        info!("Experience logger flushed on shutdown");
     }
 
     // Compute final statistics

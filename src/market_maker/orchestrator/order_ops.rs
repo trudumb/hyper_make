@@ -140,6 +140,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     pub(crate) async fn place_new_order(&mut self, side: Side, quote: &Quote) -> Result<()> {
         let is_buy = side == Side::Buy;
 
+        // === BBO Crossing Guard (defense-in-depth) ===
+        // Prevent post-only rejections that cause one-sided exposure
+        {
+            let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
+            if bbo_valid && self.latest_mid > 0.0 {
+                let tick_proxy = self.latest_mid * 0.0001; // 1 bps
+                if is_buy && quote.price >= self.cached_best_ask - tick_proxy {
+                    warn!(
+                        side = %side_str(side),
+                        bid_price = %format!("{:.6}", quote.price),
+                        exchange_ask = %format!("{:.6}", self.cached_best_ask),
+                        "Blocking order: bid would cross exchange best ask"
+                    );
+                    return Ok(());
+                }
+                if !is_buy && quote.price <= self.cached_best_bid + tick_proxy {
+                    warn!(
+                        side = %side_str(side),
+                        ask_price = %format!("{:.6}", quote.price),
+                        exchange_bid = %format!("{:.6}", self.cached_best_bid),
+                        "Blocking order: ask would cross exchange best bid"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         // === Position Guard Hard Entry Gate ===
         // Reject orders that would push worst-case position beyond hard limit
         let entry_check = self.safety.position_guard.check_order_entry(

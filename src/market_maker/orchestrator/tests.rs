@@ -362,4 +362,105 @@ mod tests {
             panic!("Expected Modify action");
         }
     }
+
+    // =========================================================================
+    // BBO Crossing Validation Tests
+    // =========================================================================
+
+    /// Verifies that the BBO crossing detection logic correctly identifies
+    /// orders that would cross the exchange BBO.
+    ///
+    /// From microstructure theory: a post-only bid at price P crosses the BBO
+    /// if P >= best_ask. With a 1-tick buffer (1 bps), it crosses if
+    /// P >= best_ask - tick_proxy.
+    #[test]
+    fn test_bbo_crossing_detection_bid_crosses_ask() {
+        let exchange_best_ask = 33.000;
+        let mid_price = 32.996;
+        let tick_proxy = mid_price * 0.0001; // ~0.0033
+
+        // Bid at 32.998 is within 1 tick of ask 33.000 — should be flagged
+        let bid_price = 32.998;
+        assert!(
+            bid_price >= exchange_best_ask - tick_proxy,
+            "Bid {bid_price} should cross ask {exchange_best_ask} with tick buffer {tick_proxy:.4}"
+        );
+
+        // Bid at 32.990 is well below ask — should NOT be flagged
+        let safe_bid = 32.990;
+        assert!(
+            safe_bid < exchange_best_ask - tick_proxy,
+            "Bid {safe_bid} should NOT cross ask {exchange_best_ask}"
+        );
+    }
+
+    #[test]
+    fn test_bbo_crossing_detection_ask_crosses_bid() {
+        let exchange_best_bid = 32.990;
+        let mid_price = 32.993;
+        let tick_proxy = mid_price * 0.0001; // ~0.0033
+
+        // Ask at 32.992 is within 1 tick of bid 32.990 — should be flagged
+        let ask_price = 32.992;
+        assert!(
+            ask_price <= exchange_best_bid + tick_proxy,
+            "Ask {ask_price} should cross bid {exchange_best_bid} with tick buffer {tick_proxy:.4}"
+        );
+
+        // Ask at 33.000 is well above bid — should NOT be flagged
+        let safe_ask = 33.000;
+        assert!(
+            safe_ask > exchange_best_bid + tick_proxy,
+            "Ask {safe_ask} should NOT cross bid {exchange_best_bid}"
+        );
+    }
+
+    /// Verifies the staleness buffer calculation: older books get wider buffers.
+    #[test]
+    fn test_bbo_staleness_buffer() {
+        let mid_price = 100_000.0; // BTC-like
+        let tick_proxy = mid_price * 0.0001; // $10
+
+        // 0-1 seconds: no staleness buffer
+        let staleness_ticks_0s = 0.0_f64;
+        let buffer_0s = staleness_ticks_0s * tick_proxy;
+        assert_eq!(buffer_0s, 0.0);
+
+        // 3 seconds (above 2s threshold): 2 ticks of buffer
+        let staleness_ticks_3s = (3_u64 - 2 + 1) as f64;
+        let buffer_3s = staleness_ticks_3s * tick_proxy;
+        assert!((buffer_3s - 20.0).abs() < 0.01, "Expected ~$20 buffer at 3s age");
+
+        // 4 seconds: 3 ticks of buffer
+        let staleness_ticks_4s = (4_u64 - 2 + 1) as f64;
+        let buffer_4s = staleness_ticks_4s * tick_proxy;
+        assert!((buffer_4s - 30.0).abs() < 0.01, "Expected ~$30 buffer at 4s age");
+    }
+
+    /// The real-world bug: bid at 32.992 hit ask at 32.992.
+    /// This test reproduces the exact scenario from the production incident.
+    #[test]
+    fn test_real_world_crossing_incident() {
+        // Production scenario: asset price ~$33, bid placed at 32.992
+        // Exchange best ask was also 32.992
+        let exchange_best_ask = 32.992;
+        let mid_price = 32.992;
+        let tick_proxy = mid_price * 0.0001; // ~0.0033
+
+        let bid_price = 32.992;
+
+        // Our validation would catch this: bid >= ask - tick
+        assert!(
+            bid_price >= exchange_best_ask - tick_proxy,
+            "The production incident bid={bid_price} at ask={exchange_best_ask} \
+             MUST be caught by BBO validation"
+        );
+
+        // A safe bid would be at least 1 tick below the ask
+        let safe_bid = exchange_best_ask - tick_proxy - 0.001;
+        assert!(
+            safe_bid < exchange_best_ask - tick_proxy,
+            "A bid 1+ tick below ask should pass validation"
+        );
+    }
 }

@@ -72,6 +72,10 @@ path = "src/bin/health_dashboard.rs"
 name = "calibration_report"
 path = "src/bin/calibration_report.rs"
 
+[[bin]]
+name = "rl_trainer"
+path = "src/bin/rl_trainer.rs"
+
 # Fast release builds (for dev iteration)
 [profile.release]
 incremental = true

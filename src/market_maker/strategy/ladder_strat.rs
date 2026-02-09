@@ -17,6 +17,14 @@ use super::{
     RiskModelConfig,
 };
 
+/// Maximum fraction of effective_max_position allowed in a single resting order.
+///
+/// GLFT inventory theory: a single fill at max position creates reservation price
+/// adjustment = q * gamma * sigma^2 * T, which swings maximally and prevents recovery.
+/// Capping at 25% ensures at least 4 fills are needed to reach max inventory,
+/// giving the gamma/skew feedback loop time to widen spreads defensively.
+const MAX_SINGLE_ORDER_FRACTION: f64 = 0.25;
+
 /// GLFT Ladder Strategy - multi-level quoting with depth-dependent sizing.
 ///
 /// Generates K levels per side with:
@@ -1518,6 +1526,38 @@ impl LadderStrategy {
                 }
             }
 
+            // 8b. PER-LEVEL SIZE CAP: No single resting order may exceed 25% of the USER'S
+            // risk-based max position (not the margin-based quoting capacity).
+            // GLFT inventory theory: if a single fill can push q to max, the reservation
+            // price adjustment q*gamma*sigma^2*T swings maximally and the MM cannot recover.
+            // This cap guarantees at least 4 fills are needed to reach max inventory,
+            // giving the gamma/skew feedback loop time to widen spreads defensively.
+            //
+            // We cap against max_position (the $50 USD-derived risk limit = 1.58 contracts),
+            // NOT effective_max_position (margin-based quoting capacity = 51 contracts).
+            // The risk limit is what matters for inventory blowup prevention.
+            let per_level_cap = truncate_float(
+                (max_position * MAX_SINGLE_ORDER_FRACTION).max(min_meaningful_size),
+                config.sz_decimals,
+                false,
+            );
+            let mut any_capped = false;
+            for level in ladder.bids.iter_mut().chain(ladder.asks.iter_mut()) {
+                if level.size > per_level_cap {
+                    any_capped = true;
+                    level.size = per_level_cap;
+                }
+            }
+            if any_capped {
+                info!(
+                    per_level_cap = %format!("{:.6}", per_level_cap),
+                    risk_max_position = %format!("{:.6}", max_position),
+                    fraction = %format!("{:.0}%", MAX_SINGLE_ORDER_FRACTION * 100.0),
+                    "Per-level size cap applied: no single order exceeds {}% of risk max position",
+                    (MAX_SINGLE_ORDER_FRACTION * 100.0) as u32,
+                );
+            }
+
             // 9. Filter out levels below minimum notional (exchange will reject them anyway)
             // Use a slightly lower threshold (0.8x) to avoid edge cases near the boundary
             let min_size_for_exchange = config.min_notional * 0.8 / market_params.microprice;
@@ -1534,8 +1574,17 @@ impl LadderStrategy {
 
             // Bid concentration fallback
             if bids_before > 0 && ladder.bids.is_empty() {
-                // Total available size for bids
-                let total_bid_size = truncate_float(available_for_bids, config.sz_decimals, false);
+                // Total available size for bids, capped at 25% of the USER'S risk-based
+                // max position per order (not margin-based quoting capacity).
+                // GLFT inventory theory: one fill at max position creates maximal reservation
+                // price swing q*gamma*sigma^2*T with zero recovery capacity.
+                let per_order_cap = (max_position * MAX_SINGLE_ORDER_FRACTION)
+                    .max(min_meaningful_size);
+                let total_bid_size = truncate_float(
+                    available_for_bids.min(per_order_cap),
+                    config.sz_decimals,
+                    false,
+                );
                 let bid_notional = total_bid_size * market_params.microprice;
 
                 // FIX: Removed redundant `total_bid_size > min_size_for_order` check.
@@ -1562,7 +1611,8 @@ impl LadderStrategy {
                         notional = %format!("{:.2}", bid_notional),
                         depth_bps = %format!("{:.2}", tightest_depth_bps),
                         levels_before = bids_before,
-                        "Bid concentration fallback: collapsed to single order at tightest depth"
+                        per_order_cap = %format!("{:.6}", per_order_cap),
+                        "Bid concentration fallback: single order at tightest depth (size-capped)"
                     );
                 } else {
                     warn!(
@@ -1579,8 +1629,15 @@ impl LadderStrategy {
 
             // Ask concentration fallback
             if asks_before > 0 && ladder.asks.is_empty() {
-                // Total available size for asks
-                let total_ask_size = truncate_float(available_for_asks, config.sz_decimals, false);
+                // Total available size for asks, capped at 25% of the USER'S risk-based
+                // max position per order (not margin-based quoting capacity).
+                let per_order_cap = (max_position * MAX_SINGLE_ORDER_FRACTION)
+                    .max(min_meaningful_size);
+                let total_ask_size = truncate_float(
+                    available_for_asks.min(per_order_cap),
+                    config.sz_decimals,
+                    false,
+                );
                 let ask_notional = total_ask_size * market_params.microprice;
 
                 // FIX: Same as bid side - use only notional check to avoid precision issues
@@ -1605,7 +1662,8 @@ impl LadderStrategy {
                         notional = %format!("{:.2}", ask_notional),
                         depth_bps = %format!("{:.2}", tightest_depth_bps),
                         levels_before = asks_before,
-                        "Ask concentration fallback: collapsed to single order at tightest depth"
+                        per_order_cap = %format!("{:.6}", per_order_cap),
+                        "Ask concentration fallback: single order at tightest depth (size-capped)"
                     );
                 } else {
                     warn!(

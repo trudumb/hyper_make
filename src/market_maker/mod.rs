@@ -190,6 +190,16 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Cached L2 ask sizes (top 5 levels) for EnhancedFlowContext depth imbalance.
     /// Updated by handle_l2_book().
     cached_ask_sizes: Vec<f64>,
+
+    // === BBO Cache (for pre-placement crossing validation) ===
+    /// Best bid price from latest L2 book update.
+    /// Used to validate orders don't cross the BBO before placement.
+    cached_best_bid: f64,
+    /// Best ask price from latest L2 book update.
+    /// Used to validate orders don't cross the BBO before placement.
+    cached_best_ask: f64,
+    /// Timestamp of the last L2 book update for staleness detection.
+    last_l2_update_time: std::time::Instant,
     /// Recent trades buffer for EnhancedFlowContext momentum calculation.
     /// Stores (size, is_buy, timestamp_ms). Updated by handle_trades().
     /// Bounded to MAX_CACHED_TRADES entries.
@@ -240,6 +250,23 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     rl_min_real_fills: usize,
     /// Auto-disable RL if mean reward < 0 after this many fills
     rl_auto_disable_fills: usize,
+
+    // === RL Hot-Reload ===
+    /// Watch channel receiver for Q-table hot-reload from an offline trainer.
+    /// When the trainer writes a new checkpoint, the file watcher sends it here.
+    q_table_reload_rx:
+        Option<tokio::sync::watch::Receiver<Option<checkpoint::types::RLCheckpoint>>>,
+    /// Blend weight for hot-reloaded Q-table (0.0 = ignore, 1.0 = replace).
+    q_table_reload_weight: f64,
+    /// Quote cycle counter for gating periodic RL reload checks.
+    rl_reload_cycle_count: usize,
+
+    // === Experience Logging ===
+    /// JSONL logger for RL experience records (SARSA tuples + metadata).
+    /// Enabled via `with_experience_logging()`. Writes to `logs/experience/`.
+    experience_logger: Option<learning::experience::ExperienceLogger>,
+    /// Unique session identifier for correlating experience records.
+    experience_session_id: String,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -364,6 +391,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // L2 book & trade cache for EnhancedFlowContext
             cached_bid_sizes: Vec::with_capacity(5),
             cached_ask_sizes: Vec::with_capacity(5),
+            // BBO cache for pre-placement crossing validation
+            cached_best_bid: 0.0,
+            cached_best_ask: 0.0,
+            last_l2_update_time: std::time::Instant::now(),
             cached_trades: std::collections::VecDeque::with_capacity(500),
             // Event-driven churn reduction
             event_accumulator: orchestrator::EventAccumulator::default_config(),
@@ -383,6 +414,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             rl_enabled: false,
             rl_min_real_fills: 20,
             rl_auto_disable_fills: 100,
+            // RL hot-reload (disabled by default, enabled via with_rl_reload)
+            q_table_reload_rx: None,
+            q_table_reload_weight: 0.3,
+            rl_reload_cycle_count: 0,
+            // Experience logging (disabled by default, enabled via with_experience_logging)
+            experience_logger: None,
+            experience_session_id: format!(
+                "live_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ),
         }
     }
 
@@ -466,6 +510,43 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self
     }
 
+    /// Enable Q-table hot-reload from an offline trainer via a watch channel.
+    ///
+    /// The file watcher task sends new `RLCheckpoint` values through the channel
+    /// whenever the checkpoint file changes. The live RL agent blends the new
+    /// Q-table with its current state using `weight` (0.0 = ignore, 1.0 = replace).
+    pub fn with_rl_reload(
+        mut self,
+        rx: tokio::sync::watch::Receiver<Option<checkpoint::types::RLCheckpoint>>,
+        weight: f64,
+    ) -> Self {
+        self.q_table_reload_rx = Some(rx);
+        self.q_table_reload_weight = weight;
+        info!(weight, "RL Q-table hot-reload enabled");
+        self
+    }
+
+    /// Check for a new Q-table from the hot-reload watch channel.
+    ///
+    /// Called periodically from the quote cycle (every 100 cycles).
+    /// If the watch channel has a new value, loads it as a prior into the RL agent.
+    pub fn check_rl_reload(&mut self) {
+        if let Some(ref mut rx) = self.q_table_reload_rx {
+            if rx.has_changed().unwrap_or(false) {
+                let checkpoint_opt = rx.borrow_and_update().clone();
+                if let Some(ref checkpoint) = checkpoint_opt {
+                    let n_states =
+                        self.load_paper_rl_prior(checkpoint, self.q_table_reload_weight);
+                    info!(
+                        n_states,
+                        weight = self.q_table_reload_weight,
+                        "RL Q-table hot-reloaded"
+                    );
+                }
+            }
+        }
+    }
+
     /// Enable or disable RL agent control of quoting actions (builder).
     pub fn with_rl_enabled(mut self, enabled: bool) -> Self {
         self.rl_enabled = enabled;
@@ -475,6 +556,35 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Enable or disable RL agent control of quoting actions (setter).
     pub fn set_rl_enabled(&mut self, enabled: bool) {
         self.rl_enabled = enabled;
+    }
+
+    /// Enable experience logging for RL SARSA tuples.
+    ///
+    /// Creates a JSONL file writer in the specified directory. Each fill
+    /// produces one experience record containing state, action, reward,
+    /// next_state, and market context metadata.
+    ///
+    /// # Arguments
+    /// * `output_dir` - Directory for experience JSONL files (e.g., `logs/experience`)
+    pub fn with_experience_logging(mut self, output_dir: &str) -> Self {
+        match learning::experience::ExperienceLogger::new(
+            output_dir,
+            learning::experience::ExperienceSource::Live,
+            &self.experience_session_id,
+        ) {
+            Ok(logger) => {
+                self.experience_logger = Some(logger);
+                info!(
+                    session_id = %self.experience_session_id,
+                    output_dir,
+                    "Experience logging enabled (live)"
+                );
+            }
+            Err(e) => {
+                warn!("Failed to initialize experience logger: {e}");
+            }
+        }
+        self
     }
 
     /// Load a paper trader's Q-table as a discounted prior for the live RL agent.
@@ -774,7 +884,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         risk::RiskAggregator::new()
             .with_monitor(Box::new(LossMonitor::new(config.max_daily_loss)))
-            .with_monitor(Box::new(DrawdownMonitor::new(config.max_drawdown)))
+            .with_monitor(Box::new(
+                DrawdownMonitor::new(config.max_drawdown)
+                    .with_min_peak(config.min_peak_for_drawdown),
+            ))
             .with_monitor(Box::new(PositionMonitor::new()))
             .with_monitor(Box::new(DataStalenessMonitor::new(
                 config.stale_data_threshold,

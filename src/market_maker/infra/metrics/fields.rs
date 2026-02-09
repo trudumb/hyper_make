@@ -48,6 +48,8 @@ pub(super) struct MetricsInner {
     pub orders_modified: AtomicU64,
     /// Total modify fallbacks (modify failed, fell back to cancel+place)
     pub modify_fallbacks: AtomicU64,
+    /// Quote cycles skipped due to BBO crossing detection
+    pub bbo_crossing_skips: AtomicU64,
     /// Total fill volume (base asset)
     pub fill_volume: AtomicF64,
     /// Buy fill volume
@@ -252,6 +254,7 @@ impl MetricsInner {
             orders_cancelled: AtomicU64::new(0),
             orders_modified: AtomicU64::new(0),
             modify_fallbacks: AtomicU64::new(0),
+            bbo_crossing_skips: AtomicU64::new(0),
             fill_volume: AtomicF64::new(0.0),
             buy_volume: AtomicF64::new(0.0),
             sell_volume: AtomicF64::new(0.0),

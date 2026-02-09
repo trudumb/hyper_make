@@ -583,6 +583,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Update Q-values from fill outcome
                 {
                     use crate::market_maker::learning::{MDPState, MDPAction, Reward, MarketEvent};
+                    use crate::market_maker::learning::experience::{
+                        ExperienceRecord, ExperienceParams, ExperienceSource,
+                    };
 
                     // Build current MDP state from fill conditions
                     let book_imbalance = self.estimator.book_imbalance();
@@ -625,6 +628,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
                     let mut updated = false;
+                    let regime_str = self.stochastic.position_decision.current_regime().to_string();
                     while let Some((state, action)) = self.stochastic.rl_agent.take_next_state_action()
                     {
                         self.stochastic.rl_agent.update(
@@ -635,6 +639,27 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             false, // not done
                         );
                         updated = true;
+
+                        // === Experience Logging ===
+                        if let Some(ref mut logger) = self.experience_logger {
+                            let record = ExperienceRecord::from_params(ExperienceParams {
+                                state,
+                                action,
+                                reward,
+                                next_state: current_state,
+                                done: false,
+                                timestamp_ms: fill.time,
+                                session_id: self.experience_session_id.clone(),
+                                source: ExperienceSource::Live,
+                                side: if is_buy { "buy".to_string() } else { "sell".to_string() },
+                                fill_price,
+                                mid_price: self.latest_mid,
+                                fill_size,
+                                inventory: self.position.position(),
+                                regime: regime_str.clone(),
+                            });
+                            let _ = logger.log(&record);
+                        }
 
                         debug!(
                             realized_edge_bps = %format!("{:.2}", realized_edge_bps),
@@ -656,6 +681,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             current_state,
                             false,
                         );
+
+                        // === Experience Logging (fallback) ===
+                        if let Some(ref mut logger) = self.experience_logger {
+                            let record = ExperienceRecord::from_params(ExperienceParams {
+                                state: current_state,
+                                action,
+                                reward,
+                                next_state: current_state,
+                                done: false,
+                                timestamp_ms: fill.time,
+                                session_id: self.experience_session_id.clone(),
+                                source: ExperienceSource::Live,
+                                side: if is_buy { "buy".to_string() } else { "sell".to_string() },
+                                fill_price,
+                                mid_price: self.latest_mid,
+                                fill_size,
+                                inventory: self.position.position(),
+                                regime: regime_str.clone(),
+                            });
+                            let _ = logger.log(&record);
+                        }
+
                         debug!(
                             realized_edge_bps = %format!("{:.2}", realized_edge_bps),
                             inventory_risk = %format!("{:.3}", inventory_risk),
@@ -818,6 +865,17 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // This enables depth imbalance calculation in the quote engine
             self.cached_bid_sizes = bids.iter().take(5).map(|(_, sz)| *sz).collect();
             self.cached_ask_sizes = asks.iter().take(5).map(|(_, sz)| *sz).collect();
+
+            // Cache BBO prices and timestamp for pre-placement crossing validation.
+            // This prevents "Post only would have immediately matched" rejections
+            // that cause one-sided exposure.
+            if let Some(&(best_bid, _)) = bids.first() {
+                self.cached_best_bid = best_bid;
+            }
+            if let Some(&(best_ask, _)) = asks.first() {
+                self.cached_best_ask = best_ask;
+            }
+            self.last_l2_update_time = std::time::Instant::now();
 
             // Record book snapshot for dashboard unconditionally
             // This ensures dashboard shows data even during warmup

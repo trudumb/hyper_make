@@ -32,3 +32,12 @@
 - LeadLag MI significance test - correctly gates on null distribution
 - CrossVenue flow analysis - properly wired via `on_binance_trade()`
 - VPIN blending - correctly integrated with EM toxicity
+
+### Cross-Venue Signal / Binance Feed Fix (2026-02-08)
+- **Bug**: `--binance-symbol` defaulted to `btcusdt` for ALL assets. Trading HYPE fed BTC noise into lead-lag + cross-venue.
+- **Fix**: Added `resolve_binance_symbol()` in `infra/binance_feed.rs` — maps assets to Binance Futures symbols.
+- Known assets (BTC, ETH, SOL, etc.) auto-resolve; HL-native (HYPE, PURR) return None → feed disabled.
+- Explicit `--binance-symbol` override still available for custom mappings.
+- Graceful degradation: `CrossVenueFeatures::default()` = neutral (0.0 confidence, 1.0 spread mult), `LeadLagSignal::default()` = not actionable.
+- Changed CLI args in `market_maker.rs`, `paper_trader.rs`, `prediction_validator.rs` from `String` to `Option<String>`.
+- 5 new tests, all 16 existing binance_feed tests pass.

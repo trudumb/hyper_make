@@ -714,6 +714,105 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             })
             .collect();
 
+        // === PRE-PLACEMENT BBO CROSSING VALIDATION ===
+        // From microstructure theory: GLFT quotes are derived from mid price at time T.
+        // If the actual BBO shifts between quote calculation and placement, a post-only
+        // bid can cross the exchange ask (or vice versa), causing rejection. The surviving
+        // side then creates one-sided directional exposure — the opposite of market making.
+        //
+        // Defense: Validate ALL quotes against the LATEST cached BBO. If any quote would
+        // cross, skip the ENTIRE quote cycle (both sides) to prevent asymmetric exposure.
+        {
+            let book_age = self.last_l2_update_time.elapsed();
+            let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
+
+            // Maximum acceptable L2 book age before we refuse to quote
+            const MAX_BOOK_AGE_SECS: u64 = 5;
+            // Staleness buffer: widen validation margin when book is aging (2+ seconds)
+            const STALENESS_BUFFER_SECS: u64 = 2;
+
+            if bbo_valid {
+                // Book staleness gate: if L2 data is too old, skip entire quote cycle
+                if book_age.as_secs() >= MAX_BOOK_AGE_SECS {
+                    warn!(
+                        book_age_ms = book_age.as_millis() as u64,
+                        max_age_ms = MAX_BOOK_AGE_SECS * 1000,
+                        "Skipping quote cycle: L2 book data too stale for safe order placement"
+                    );
+                    return Ok(());
+                }
+
+                // Calculate staleness buffer: 1 tick per second of book age beyond threshold
+                // For a $33 asset with 5 sig figs, tick = $0.001. For $100k BTC, tick = $1.
+                // We use 1 bps of mid price as a tick proxy (conservative for most assets).
+                let tick_proxy = self.latest_mid * 0.0001; // 1 bps
+                let staleness_ticks = if book_age.as_secs() >= STALENESS_BUFFER_SECS {
+                    (book_age.as_secs() - STALENESS_BUFFER_SECS + 1) as f64
+                } else {
+                    0.0
+                };
+                let staleness_buffer = staleness_ticks * tick_proxy;
+
+                // Validate: bid must be strictly below exchange best ask (with buffer)
+                let effective_ask_limit = self.cached_best_ask - tick_proxy - staleness_buffer;
+                // Validate: ask must be strictly above exchange best bid (with buffer)
+                let effective_bid_limit = self.cached_best_bid + tick_proxy + staleness_buffer;
+
+                let mut would_cross = false;
+
+                // Check all bid quotes against exchange best ask
+                for level in &bid_levels {
+                    if level.price >= effective_ask_limit {
+                        warn!(
+                            bid_price = %format!("{:.6}", level.price),
+                            exchange_best_ask = %format!("{:.6}", self.cached_best_ask),
+                            effective_limit = %format!("{:.6}", effective_ask_limit),
+                            staleness_buffer = %format!("{:.6}", staleness_buffer),
+                            book_age_ms = book_age.as_millis() as u64,
+                            "BBO crossing detected: bid would cross exchange ask"
+                        );
+                        would_cross = true;
+                        break;
+                    }
+                }
+
+                // Check all ask quotes against exchange best bid
+                if !would_cross {
+                    for level in &ask_levels {
+                        if level.price <= effective_bid_limit {
+                            warn!(
+                                ask_price = %format!("{:.6}", level.price),
+                                exchange_best_bid = %format!("{:.6}", self.cached_best_bid),
+                                effective_limit = %format!("{:.6}", effective_bid_limit),
+                                staleness_buffer = %format!("{:.6}", staleness_buffer),
+                                book_age_ms = book_age.as_millis() as u64,
+                                "BBO crossing detected: ask would cross exchange bid"
+                            );
+                            would_cross = true;
+                            break;
+                        }
+                    }
+                }
+
+                if would_cross {
+                    // CRITICAL: Skip BOTH sides to prevent one-sided exposure.
+                    // Missing a quote cycle is cheap; directional exposure from
+                    // one-sided quoting can cause large losses.
+                    warn!(
+                        cached_best_bid = %format!("{:.6}", self.cached_best_bid),
+                        cached_best_ask = %format!("{:.6}", self.cached_best_ask),
+                        latest_mid = %format!("{:.6}", self.latest_mid),
+                        book_age_ms = book_age.as_millis() as u64,
+                        bid_levels = bid_levels.len(),
+                        ask_levels = ask_levels.len(),
+                        "Skipping ENTIRE quote cycle: BBO crossing would cause one-sided exposure"
+                    );
+                    self.infra.prometheus.record_bbo_crossing_skip();
+                    return Ok(());
+                }
+            }
+        }
+
         // Log quote positions relative to market mid for diagnosing fill issues
         // Shows where our quotes are placed vs the exchange mid price
         if !bid_levels.is_empty() && !ask_levels.is_empty() && self.latest_mid > 0.0 {
@@ -1230,7 +1329,37 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Execute modifies (preserves queue position)
         // RATE LIMIT FIX: Check modify debounce before executing
-        let all_modifies: Vec<ModifySpec> = bid_modifies.into_iter().chain(ask_modifies).collect();
+        // Filter modify specs that would cross the BBO (defense-in-depth)
+        let tick_proxy = if self.latest_mid > 0.0 { self.latest_mid * 0.0001 } else { 0.0 };
+        let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
+        let all_modifies: Vec<ModifySpec> = bid_modifies
+            .into_iter()
+            .chain(ask_modifies)
+            .filter(|spec| {
+                if !bbo_valid {
+                    return true; // Can't validate without BBO
+                }
+                if spec.is_buy && spec.new_price >= self.cached_best_ask - tick_proxy {
+                    warn!(
+                        oid = spec.oid,
+                        new_price = %format!("{:.6}", spec.new_price),
+                        exchange_ask = %format!("{:.6}", self.cached_best_ask),
+                        "Filtering modify: bid would cross exchange ask"
+                    );
+                    return false;
+                }
+                if !spec.is_buy && spec.new_price <= self.cached_best_bid + tick_proxy {
+                    warn!(
+                        oid = spec.oid,
+                        new_price = %format!("{:.6}", spec.new_price),
+                        exchange_bid = %format!("{:.6}", self.cached_best_bid),
+                        "Filtering modify: ask would cross exchange bid"
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect();
         if !all_modifies.is_empty() {
             // Check if we're rate limited or modify interval hasn't passed
             if self.infra.proactive_rate_tracker.is_rate_limited() {
@@ -1658,6 +1787,32 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         for (price, size) in orders {
             if size <= 0.0 {
                 continue;
+            }
+
+            // Defense-in-depth BBO crossing check per order.
+            // The reconcile-level check catches most cases, but this catches
+            // any order that slips through (e.g., from modify fallback paths).
+            {
+                let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
+                if bbo_valid {
+                    let tick_proxy = self.latest_mid * 0.0001; // 1 bps
+                    if is_buy && price >= self.cached_best_ask - tick_proxy {
+                        warn!(
+                            bid_price = %format!("{:.6}", price),
+                            exchange_ask = %format!("{:.6}", self.cached_best_ask),
+                            "Filtering bid order: would cross exchange best ask"
+                        );
+                        continue;
+                    }
+                    if !is_buy && price <= self.cached_best_bid + tick_proxy {
+                        warn!(
+                            ask_price = %format!("{:.6}", price),
+                            exchange_bid = %format!("{:.6}", self.cached_best_bid),
+                            "Filtering ask order: would cross exchange best bid"
+                        );
+                        continue;
+                    }
+                }
             }
 
             // Apply margin check

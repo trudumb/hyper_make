@@ -55,6 +55,7 @@ use hyperliquid_rust_sdk::market_maker::regime_hmm::{Observation as RegimeObserv
 use hyperliquid_rust_sdk::market_maker::{
     BinanceFeed, BinanceFlowConfig, BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate,
     FlowFeatureVec, LagAnalyzerConfig, SignalIntegrator, SignalIntegratorConfig,
+    resolve_binance_symbol,
 };
 
 // Import logging infrastructure
@@ -1942,27 +1943,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.warmup_samples,
     );
 
-    // Auto-derive Binance symbol from asset if not explicitly provided
-    let binance_symbol = cli.binance_symbol.clone().unwrap_or_else(|| {
-        format!("{}usdt", cli.asset.to_lowercase())
-    });
-
-    // Spawn Binance feed for lead-lag validation (enabled by default)
+    // Auto-derive Binance symbol from asset using the canonical mapping.
+    // HL-native tokens (HYPE, PURR, etc.) will get None and skip the feed.
     let mut binance_receiver: Option<tokio::sync::mpsc::Receiver<BinanceUpdate>> = None;
     if !cli.disable_binance_feed {
-        let (tx, rx) = tokio::sync::mpsc::channel(1000);
-        let feed = BinanceFeed::for_symbol(&binance_symbol, tx);
-        tokio::spawn(async move {
-            feed.run().await;
-            tracing::warn!("Binance feed task terminated");
-        });
-        binance_receiver = Some(rx);
-        validator.enable_binance_feed(&cli.asset);
-        info!(
-            symbol = %binance_symbol,
-            asset = %cli.asset,
-            "Binance lead-lag feed active (auto-derived from asset)"
+        let binance_symbol = resolve_binance_symbol(
+            &cli.asset,
+            cli.binance_symbol.as_deref(),
         );
+        if let Some(ref sym) = binance_symbol {
+            let (tx, rx) = tokio::sync::mpsc::channel(1000);
+            let feed = BinanceFeed::for_symbol(sym, tx);
+            tokio::spawn(async move {
+                feed.run().await;
+                tracing::warn!("Binance feed task terminated");
+            });
+            binance_receiver = Some(rx);
+            validator.enable_binance_feed(&cli.asset);
+            info!(
+                asset = %cli.asset,
+                binance_symbol = %sym,
+                "Binance lead-lag feed active (auto-derived from asset)"
+            );
+        } else {
+            warn!(
+                asset = %cli.asset,
+                "No Binance equivalent for asset — LeadLag model will not be validated. \
+                 Use --binance-symbol to override."
+            );
+        }
     } else {
         warn!("Binance lead-lag feed DISABLED - LeadLag model will not be validated");
     }
@@ -2044,7 +2053,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     BinanceUpdate::Price(price_update) => {
                         validator.on_binance_price(&price_update);
                         if cli.verbose {
-                            debug!("Binance: {} mid=${:.2}", binance_symbol, price_update.mid_price);
+                            debug!("Binance: mid=${:.2}", price_update.mid_price);
                         }
                     }
                     BinanceUpdate::Trade(trade_update) => {

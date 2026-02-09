@@ -20,6 +20,13 @@ use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 use super::{Ladder, LadderConfig, LadderLevel, LadderLevels, LadderParams};
 use crate::market_maker::infra::capacity::DEPTH_INLINE_CAPACITY;
 
+/// Maximum fraction of total_size allowed in a single resting order.
+///
+/// Prevents concentration fallbacks from dumping the entire position budget into
+/// one order. With this cap, at least 4 fills are needed to reach max inventory,
+/// giving the GLFT gamma/skew feedback loop time to widen spreads.
+const MAX_SINGLE_ORDER_FRACTION: f64 = 0.25;
+
 /// Type alias for depth values using SmallVec for stack allocation
 type DepthVec = SmallVec<[f64; DEPTH_INLINE_CAPACITY]>;
 
@@ -454,11 +461,16 @@ pub(crate) fn allocate_sizes(
             let mut result = DepthVec::new();
             result.resize(marginal_values.len(), 0.0);
             if !result.is_empty() {
-                result[0] = total_size; // Concentrate on tightest level
+                // Cap per-order size: no single order exceeds 25% of total_size.
+                // Distribute remainder equally across additional levels if possible.
+                let capped_size = total_size.min(total_size * MAX_SINGLE_ORDER_FRACTION)
+                    .max(min_size);
+                result[0] = capped_size;
                 tracing::info!(
                     levels = result.len(),
                     total_size = %format!("{:.6}", total_size),
-                    "Ladder allocate_sizes: MV=0 fallback, concentrating on tightest level"
+                    capped_size = %format!("{:.6}", capped_size),
+                    "Ladder allocate_sizes: MV=0 fallback, capped concentration on tightest level"
                 );
             }
             return result;
@@ -483,15 +495,18 @@ pub(crate) fn allocate_sizes(
         .collect();
 
     // Check if all sizes were filtered out due to min_size
-    // Use concentration fallback: put all size on first level (tightest depth)
+    // Use concentration fallback: cap per-order at 25% of total to prevent max-position fills
     let all_filtered = result.iter().all(|&s| s < EPSILON);
     if all_filtered && total_size >= min_size {
-        result[0] = total_size;
+        let capped_size = total_size.min(total_size * MAX_SINGLE_ORDER_FRACTION)
+            .max(min_size);
+        result[0] = capped_size;
         tracing::info!(
             levels = result.len(),
             total_size = %format!("{:.6}", total_size),
+            capped_size = %format!("{:.6}", capped_size),
             min_size = %format!("{:.6}", min_size),
-            "Ladder allocate_sizes: min_size fallback, concentrating on tightest level"
+            "Ladder allocate_sizes: min_size fallback, capped concentration on tightest level"
         );
     }
 
@@ -573,25 +588,34 @@ pub(crate) fn build_raw_ladder(
     }
 
     // Concentration fallback: if all levels filtered by min_notional,
-    // but total size meets min_notional, create single level at tightest depth
+    // but total size meets min_notional, create single level at tightest depth.
+    // Cap per-order size at 25% of total to prevent max-position fills.
     if bids.is_empty() && !depths.is_empty() && !sizes.is_empty() {
         let total_size: f64 = sizes.iter().sum();
-        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = depths.first() {
             let offset = bid_base * (tightest_depth / 10000.0);
             let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
 
-            if bid_price * total_size_truncated >= min_notional {
+            // Floor: enough to meet min_notional at the actual bid price
+            // 1.01x buffer to survive truncation rounding down
+            let min_size_for_notional = (min_notional * 1.01) / bid_price.max(EPSILON);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
+                .max(min_size_for_notional);
+            let capped_size_truncated =
+                truncate_float(capped_size.min(total_size), sz_decimals, false);
+
+            if bid_price * capped_size_truncated >= min_notional {
                 tracing::info!(
-                    total_size = %format!("{:.6}", total_size_truncated),
+                    total_size = %format!("{:.6}", total_size),
+                    capped_size = %format!("{:.6}", capped_size_truncated),
                     price = %format!("{:.4}", bid_price),
-                    notional = %format!("{:.2}", bid_price * total_size_truncated),
+                    notional = %format!("{:.2}", bid_price * capped_size_truncated),
                     depth_bps = %format!("{:.2}", tightest_depth),
-                    "Bid concentration fallback: single order at tightest depth"
+                    "Bid concentration fallback: size-capped order at tightest depth"
                 );
                 bids.push(LadderLevel {
                     price: bid_price,
-                    size: total_size_truncated,
+                    size: capped_size_truncated,
                     depth_bps: tightest_depth,
                 });
             }
@@ -600,22 +624,30 @@ pub(crate) fn build_raw_ladder(
 
     if asks.is_empty() && !depths.is_empty() && !sizes.is_empty() {
         let total_size: f64 = sizes.iter().sum();
-        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = depths.first() {
             let offset = ask_base * (tightest_depth / 10000.0);
             let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
 
-            if ask_price * total_size_truncated >= min_notional {
+            // Floor: enough to meet min_notional at the actual ask price
+            // 1.01x buffer to survive truncation rounding down
+            let min_size_for_notional = (min_notional * 1.01) / ask_price.max(EPSILON);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
+                .max(min_size_for_notional);
+            let capped_size_truncated =
+                truncate_float(capped_size.min(total_size), sz_decimals, false);
+
+            if ask_price * capped_size_truncated >= min_notional {
                 tracing::info!(
-                    total_size = %format!("{:.6}", total_size_truncated),
+                    total_size = %format!("{:.6}", total_size),
+                    capped_size = %format!("{:.6}", capped_size_truncated),
                     price = %format!("{:.4}", ask_price),
-                    notional = %format!("{:.2}", ask_price * total_size_truncated),
+                    notional = %format!("{:.2}", ask_price * capped_size_truncated),
                     depth_bps = %format!("{:.2}", tightest_depth),
-                    "Ask concentration fallback: single order at tightest depth"
+                    "Ask concentration fallback: size-capped order at tightest depth"
                 );
                 asks.push(LadderLevel {
                     price: ask_price,
-                    size: total_size_truncated,
+                    size: capped_size_truncated,
                     depth_bps: tightest_depth,
                 });
             }
@@ -707,50 +739,64 @@ pub(crate) fn build_asymmetric_ladder(
         }
     }
 
-    // Concentration fallback for bids (asymmetric)
+    // Concentration fallback for bids (asymmetric), size-capped at 25% of total
     if bids.is_empty() && !bid_depths.is_empty() && !bid_sizes.is_empty() {
         let total_size: f64 = bid_sizes.iter().sum();
-        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = bid_depths.first() {
             let offset = bid_base * (tightest_depth / 10000.0);
             let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
 
-            if bid_price * total_size_truncated >= min_notional {
+            // 1.01x buffer to survive truncation rounding down
+            let min_size_for_notional = (min_notional * 1.01) / bid_price.max(EPSILON);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
+                .max(min_size_for_notional);
+            let capped_size_truncated =
+                truncate_float(capped_size.min(total_size), sz_decimals, false);
+
+            if bid_price * capped_size_truncated >= min_notional {
                 tracing::info!(
-                    total_size = %format!("{:.6}", total_size_truncated),
+                    total_size = %format!("{:.6}", total_size),
+                    capped_size = %format!("{:.6}", capped_size_truncated),
                     price = %format!("{:.4}", bid_price),
-                    notional = %format!("{:.2}", bid_price * total_size_truncated),
+                    notional = %format!("{:.2}", bid_price * capped_size_truncated),
                     depth_bps = %format!("{:.2}", tightest_depth),
-                    "Bid concentration fallback (asymmetric): single order at tightest depth"
+                    "Bid concentration fallback (asymmetric): size-capped order at tightest depth"
                 );
                 bids.push(LadderLevel {
                     price: bid_price,
-                    size: total_size_truncated,
+                    size: capped_size_truncated,
                     depth_bps: tightest_depth,
                 });
             }
         }
     }
 
-    // Concentration fallback for asks (asymmetric)
+    // Concentration fallback for asks (asymmetric), size-capped at 25% of total
     if asks.is_empty() && !ask_depths.is_empty() && !ask_sizes.is_empty() {
         let total_size: f64 = ask_sizes.iter().sum();
-        let total_size_truncated = truncate_float(total_size, sz_decimals, false);
         if let Some(&tightest_depth) = ask_depths.first() {
             let offset = ask_base * (tightest_depth / 10000.0);
             let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
 
-            if ask_price * total_size_truncated >= min_notional {
+            // 1.01x buffer to survive truncation rounding down
+            let min_size_for_notional = (min_notional * 1.01) / ask_price.max(EPSILON);
+            let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
+                .max(min_size_for_notional);
+            let capped_size_truncated =
+                truncate_float(capped_size.min(total_size), sz_decimals, false);
+
+            if ask_price * capped_size_truncated >= min_notional {
                 tracing::info!(
-                    total_size = %format!("{:.6}", total_size_truncated),
+                    total_size = %format!("{:.6}", total_size),
+                    capped_size = %format!("{:.6}", capped_size_truncated),
                     price = %format!("{:.4}", ask_price),
-                    notional = %format!("{:.2}", ask_price * total_size_truncated),
+                    notional = %format!("{:.2}", ask_price * capped_size_truncated),
                     depth_bps = %format!("{:.2}", tightest_depth),
-                    "Ask concentration fallback (asymmetric): single order at tightest depth"
+                    "Ask concentration fallback (asymmetric): size-capped order at tightest depth"
                 );
                 asks.push(LadderLevel {
                     price: ask_price,
-                    size: total_size_truncated,
+                    size: capped_size_truncated,
                     depth_bps: tightest_depth,
                 });
             }
@@ -1454,11 +1500,17 @@ mod tests {
             1,
             "Small total_size should trigger concentration fallback to 1 level"
         );
-        // The single order should use total size
+        // The single order should be capped at 25% of total (or min exchange size, whichever is larger)
         let total_bid_size: f64 = ladder_small.bids.iter().map(|l| l.size).sum();
+        // Bid price is offset by tightest depth (10 bps for this test)
+        let tightest_test_bps = 10.0;
+        let bid_price_approx = mid * (1.0 - tightest_test_bps / 10000.0);
+        let expected_cap = (small_total_size * MAX_SINGLE_ORDER_FRACTION)
+            .max(min_notional / bid_price_approx);
         assert!(
-            (total_bid_size - small_total_size).abs() < 0.01,
-            "Concentration fallback should use full total_size"
+            total_bid_size <= expected_cap + 0.01,
+            "Concentration fallback size {:.4} should be capped at {:.4}",
+            total_bid_size, expected_cap,
         );
 
         // Scenario 2: Large total_size (like effective_max_position = 66 HYPE)
@@ -1683,5 +1735,118 @@ mod tests {
         assert!(ladder.bids[0].price < 100.0, "Bid must stay below mid: {}", ladder.bids[0].price);
         // Safety guard: ask should not go below market_mid * 1.0001
         assert!(ladder.asks[0].price > 100.0, "Ask must stay above mid: {}", ladder.asks[0].price);
+    }
+
+    /// Test that no single order exceeds 25% of total_size in concentration fallback paths.
+    ///
+    /// This is the critical safety test for the HYPE incident: the concentration
+    /// fallback collapsed 25 levels into a SINGLE order at 100% of max position
+    /// (1.51 HYPE = full $50 limit). One fill maxed inventory with zero recovery.
+    ///
+    /// GLFT inventory theory: q at max creates reservation price adjustment
+    /// = q * gamma * sigma^2 * T which swings maximally and prevents recovery.
+    ///
+    /// Note: The per-level cap in the general path (after entropy optimizer) is
+    /// enforced by `ladder_strat.rs`, not by these low-level generator functions.
+    /// This test verifies the concentration fallback caps in the generator.
+    #[test]
+    fn test_no_single_order_exceeds_25pct_max_position() {
+        // === Scenario 1: Concentration fallback in build_raw_ladder ===
+        // Small per-level sizes that all fail min_notional → concentration fallback
+        let mid = 33.0; // HYPE-like price
+        let min_notional = 10.0;
+        let total_size = 1.51; // Full $50 limit at $33
+
+        // With 10 levels: per-level = 0.151 HYPE, notional = $4.98 < $10 → all fail
+        let depths: Vec<f64> = (0..10).map(|i| 5.0 + i as f64 * 3.0).collect();
+        let sizes: Vec<f64> = vec![total_size / 10.0; 10];
+
+        let ladder = build_raw_ladder(&depths, &sizes, mid, mid, 2, 4, min_notional);
+
+        // Should have a fallback order, but capped at 25% of total_size
+        // (or min exchange size at actual bid_price, whichever is larger)
+        // Bid price is offset from mid by tightest depth (5 bps)
+        let tightest_bps = 5.0;
+        let bid_price_approx = mid * (1.0 - tightest_bps / 10000.0);
+        let cap = (total_size * MAX_SINGLE_ORDER_FRACTION)
+            .max(min_notional / bid_price_approx);
+        for level in &ladder.bids {
+            assert!(
+                level.size <= cap + 0.001,
+                "Bid size {:.6} exceeds cap {:.6} (was {:.6} total)",
+                level.size, cap, total_size
+            );
+        }
+        for level in &ladder.asks {
+            assert!(
+                level.size <= cap + 0.001,
+                "Ask size {:.6} exceeds cap {:.6} (was {:.6} total)",
+                level.size, cap, total_size
+            );
+        }
+
+        // === Scenario 2: allocate_sizes MV=0 fallback ===
+        // When ALL marginal values are zero (total <= EPSILON), the MV=0 fallback fires
+        let intensities_zero = vec![1.0, 1.0, 1.0];
+        let spreads_all_neg = vec![-0.0001, -2.0, -3.0]; // First level ~zero → total MV ≈ 0
+        let alloc = allocate_sizes(&intensities_zero, &spreads_all_neg, total_size, 0.0);
+        // All negative spreads → MV all clamped to 0.0 → total ≈ 0 → fallback
+        // Since all MVs are 0, all sizes should be 0 (no positive spread)
+        for (i, &size) in alloc.iter().enumerate() {
+            assert!(
+                size <= total_size * MAX_SINGLE_ORDER_FRACTION + 0.001,
+                "MV=0 fallback level {} size {:.6} exceeds 25% cap",
+                i, size
+            );
+        }
+
+        // === Scenario 3: allocate_sizes min_size fallback ===
+        let intensities = vec![0.01, 0.01, 0.01]; // Very small intensities
+        let spreads = vec![1.0, 1.0, 1.0]; // Positive spreads
+        // min_size = 0.6, which is larger than per-level = 1.51/3 ≈ 0.503 → all filtered
+        let min_size = 0.6;
+        let alloc = allocate_sizes(&intensities, &spreads, total_size, min_size);
+
+        // The effective cap is max(25% * total, min_size) because we can't go below min_size
+        let effective_cap = (total_size * MAX_SINGLE_ORDER_FRACTION).max(min_size);
+        for (i, &size) in alloc.iter().enumerate() {
+            assert!(
+                size <= effective_cap + 0.001,
+                "min_size fallback level {} size {:.6} exceeds effective cap {:.6}",
+                i, size, effective_cap
+            );
+        }
+        // Critically: should NOT be full total_size (was 1.51 before the fix)
+        assert!(
+            alloc[0] < total_size - 0.01,
+            "min_size fallback should NOT concentrate full total_size ({:.4}), got {:.4}",
+            total_size, alloc[0]
+        );
+
+        // === Scenario 4: Asymmetric ladder concentration fallback ===
+        // Use 10 levels so per-level is small enough to fail min_notional
+        let asym_depths = vec![5.0, 8.0, 11.0, 14.0, 17.0, 20.0, 23.0, 26.0, 29.0, 32.0];
+        let asym_sizes = vec![total_size / 10.0; 10]; // 0.151 each, notional = $4.98 < $10
+
+        let ladder = build_asymmetric_ladder(
+            &asym_depths, &asym_sizes,
+            &asym_depths, &asym_sizes,
+            mid, mid, 2, 4, min_notional,
+        );
+
+        for level in &ladder.bids {
+            assert!(
+                level.size <= cap + 0.001,
+                "Asymmetric bid size {:.6} exceeds cap {:.6}",
+                level.size, cap
+            );
+        }
+        for level in &ladder.asks {
+            assert!(
+                level.size <= cap + 0.001,
+                "Asymmetric ask size {:.6} exceeds cap {:.6}",
+                level.size, cap
+            );
+        }
     }
 }

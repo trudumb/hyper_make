@@ -31,6 +31,8 @@ pub mod confidence;
 pub mod decision;
 pub mod ensemble;
 pub mod execution;
+pub mod experience;
+pub mod offline_trainer;
 pub mod rl_agent;
 pub mod types;
 
@@ -44,6 +46,7 @@ pub use rl_agent::{
     MDPAction, MDPState, QLearningAgent, QLearningConfig, RLPolicyRecommendation,
     Reward, RewardConfig, ExplorationStrategy, SimToRealConfig,
 };
+pub use experience::{ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource};
 pub use competitor_model::{
     CompetitorModel, CompetitorModelConfig, CompetitorSummary,
     MarketEvent, Side, BayesianGamma, SnipeTracker,

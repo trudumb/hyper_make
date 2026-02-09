@@ -131,6 +131,8 @@ pub struct ParameterEstimator {
     edge_surface: EdgeSurface,
     /// Timestamp of last trade for inter-arrival calculation
     last_trade_time_ms: u64,
+    /// Force warmup complete (set by timeout fallback)
+    warmup_override: bool,
 }
 
 impl ParameterEstimator {
@@ -268,6 +270,7 @@ impl ParameterEstimator {
             joint_dynamics: JointDynamics::default_config(),
             edge_surface: EdgeSurface::default_config(),
             last_trade_time_ms: 0,
+            warmup_override: false,
         }
     }
 
@@ -1335,8 +1338,24 @@ impl ParameterEstimator {
     /// Uses market_kappa for warmup since it receives trade tape data
     /// immediately, while own_kappa needs actual fills to accumulate.
     pub fn is_warmed_up(&self) -> bool {
-        self.multi_scale.tick_count() >= self.config.min_volume_ticks
-            && self.market_kappa.update_count() >= self.config.min_trade_observations
+        self.warmup_override
+            || (self.multi_scale.tick_count() >= self.config.min_volume_ticks
+                && self.market_kappa.update_count() >= self.config.min_trade_observations)
+    }
+
+    /// Force warmup complete, allowing quoting with Bayesian prior parameters.
+    /// Called when max_warmup_secs timeout is reached. Safe because:
+    /// - Kappa uses informative Gamma prior (mean=2500, strength=5)
+    /// - Sigma falls back to config default_sigma (0.025%/s for BTC)
+    /// - Spread floors and kill switches provide downside protection
+    /// - Estimator continues refining in background as data arrives
+    pub fn force_warmup_complete(&mut self) {
+        self.warmup_override = true;
+    }
+
+    /// Maximum warmup duration in seconds (0 = no timeout).
+    pub fn max_warmup_secs(&self) -> u64 {
+        self.config.max_warmup_secs
     }
 
     /// Get confidence in sigma estimate (0.0 to 1.0).
@@ -1979,6 +1998,34 @@ mod tests {
         assert!(sigma > 0.0, "sigma should be positive");
         assert!(kappa > 1.0, "kappa should be > 1");
         assert!(ratio > 0.0, "jump_ratio should be positive");
+    }
+
+    #[test]
+    fn test_warmup_timeout_override() {
+        let config = make_config();
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Should not be warmed up with zero data
+        assert!(!estimator.is_warmed_up());
+
+        // Force warmup complete (simulates timeout)
+        estimator.force_warmup_complete();
+        assert!(estimator.is_warmed_up());
+
+        // Params should return prior defaults, not panic
+        let kappa = estimator.kappa();
+        assert!(kappa > 0.0, "kappa should use prior after force warmup");
+        let sigma = estimator.sigma();
+        assert!(sigma > 0.0, "sigma should use default after force warmup");
+    }
+
+    #[test]
+    fn test_max_warmup_secs_config() {
+        let config = EstimatorConfig::default();
+        assert_eq!(config.max_warmup_secs, 30, "default warmup timeout should be 30s");
+
+        let estimator = ParameterEstimator::new(config);
+        assert_eq!(estimator.max_warmup_secs(), 30);
     }
 
     #[test]
