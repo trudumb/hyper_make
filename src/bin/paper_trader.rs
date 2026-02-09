@@ -419,6 +419,8 @@ struct SimulationState {
     cached_trades: VecDeque<(f64, bool, u64)>,
     /// Last trade timestamp for inter-arrival computation
     last_trade_ms: u64,
+    /// Last computed book imbalance for RL state (updated on each trade)
+    last_book_imbalance: f64,
 
     // === Signal health logging ===
     last_signal_log: Instant,
@@ -582,6 +584,7 @@ impl SimulationState {
             cached_ask_sizes: Vec::new(),
             cached_trades: VecDeque::new(),
             last_trade_ms: 0,
+            last_book_imbalance: 0.0,
             // Signal health logging
             last_signal_log: Instant::now(),
             // Checkpoint persistence
@@ -774,6 +777,8 @@ impl SimulationState {
             } else {
                 0.0
             };
+            // Cache for RL state at fill time
+            self.last_book_imbalance = book_imbalance;
             // Price impact: how much the mid moved since last trade (crude proxy)
             let price_impact_bps = if self.prev_mid > 0.0 {
                 ((self.mid_price - self.prev_mid) / self.prev_mid).abs() * 10_000.0
@@ -989,7 +994,7 @@ impl SimulationState {
             );
             // Always explore in paper trading
             let rl_rec = RLPolicyRecommendation::from_agent(&mut self.rl_agent, &mdp_state, true);
-            self.rl_agent.set_last_state_action(mdp_state, rl_rec.action);
+            self.rl_agent.push_state_action(mdp_state, rl_rec.action);
 
             // Store RL recommendations in market_params for logging
             market_params.rl_spread_delta_bps = rl_rec.spread_delta_bps;
@@ -1382,19 +1387,24 @@ impl SimulationState {
         {
             let vol_ratio = self.estimator.sigma() / self.estimator.sigma_clean().max(0.0001);
             let inventory_risk = (self.inventory.abs() / self.max_position.max(1.0)).clamp(0.0, 1.0);
-            let as_realized = if self.mid_price > 0.0 {
-                let dir = if is_buy { 1.0 } else { -1.0 };
-                (self.mid_price - fill.fill_price) * dir / fill.fill_price
+
+            // FIX P0-1: Reward uses spread capture (positive = good), not negated AS
+            // spread_capture_bps = how far from mid we filled, converted to bps
+            let notional = fill.fill_price * fill.fill_size;
+            let spread_capture_bps = if notional > 0.0 {
+                (spread_capture / notional) * 10_000.0
             } else {
                 0.0
             };
-            let was_adverse = as_realized > 0.0;
-            let realized_edge_bps = -as_realized * 10_000.0;
+            const MAKER_FEE_BPS: f64 = 1.5;
+            let realized_edge_bps = spread_capture_bps - MAKER_FEE_BPS;
+            let was_adverse = realized_edge_bps < 0.0;
 
+            // FIX P0-2: Use cached book_imbalance instead of hardcoded 0.0
             let fill_state = MDPState::from_continuous(
                 self.inventory,
                 self.max_position,
-                0.0, // book_imbalance not easily available here
+                self.last_book_imbalance,
                 vol_ratio,
                 self.adverse_selection.best_horizon_as_bps() / 10.0, // normalize to ~[0,1]
                 self.hawkes.intensity_percentile(),
@@ -1408,14 +1418,63 @@ impl SimulationState {
                 was_adverse,
             );
 
-            if let Some((state, action)) = self.rl_agent.take_last_state_action() {
+            // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
+            while let Some((state, action)) = self.rl_agent.take_next_state_action() {
                 self.rl_agent.update(state, action, reward, fill_state, false);
                 tracing::debug!(
                     realized_edge_bps = %format!("{:.2}", realized_edge_bps),
                     inventory_risk = %format!("{:.3}", inventory_risk),
                     reward_total = %format!("{:.3}", reward.total),
+                    book_imbalance = %format!("{:.3}", self.last_book_imbalance),
                     "Paper RL agent updated from simulated fill"
                 );
+            }
+        }
+
+        // === FIX P0-3: Update Learned Parameters from fill data ===
+        // Mirrors event_loop.rs:690-738 — transfers AS classifications to Bayesian params
+        if self.stochastic_config.use_learned_parameters {
+            let (informed, uninformed) = self.adverse_selection.take_informed_counts();
+            if informed > 0 || uninformed > 0 {
+                self.learned_params.alpha_touch.observe_beta(informed, uninformed);
+                tracing::debug!(
+                    informed = informed,
+                    uninformed = uninformed,
+                    total_obs = self.learned_params.alpha_touch.n_observations,
+                    alpha_touch = %format!("{:.4}", self.learned_params.alpha_touch.estimate()),
+                    "Paper trader: updated learned alpha_touch from AS classifier"
+                );
+            }
+
+            // Kappa update from fill rate (mirrors components.rs:739-748)
+            let session_secs = self.session_start.elapsed().as_secs_f64();
+            let avg_spread_bps = self.spread_tracker.current_spread_bps();
+            let total_fills = self.total_fill_count as usize;
+            if total_fills >= 10 && session_secs > 60.0 && avg_spread_bps > 0.0 {
+                let fill_rate = total_fills as f64 / session_secs;
+                let kappa_obs = fill_rate / (avg_spread_bps / 10_000.0);
+                if kappa_obs > 100.0 && kappa_obs < 100_000.0 {
+                    let exposure = session_secs * (avg_spread_bps / 10_000.0);
+                    self.learned_params.kappa.observe_gamma_poisson(total_fills, exposure);
+                }
+            }
+            self.learned_params.total_fills_observed = total_fills;
+        }
+
+        // === FIX P1-3: Wire Kelly tracker from fill outcomes ===
+        // LadderStrategy.record_win/record_loss feeds WinLossTracker for Kelly sizing.
+        // Without this, n_wins=0/n_losses=0 → odds_ratio always returns prior (1.5).
+        {
+            let notional = fill.fill_price * fill.fill_size;
+            let edge_for_kelly = if notional > 0.0 {
+                (spread_capture / notional) * 10_000.0 - 1.5 // MAKER_FEE_BPS
+            } else {
+                0.0
+            };
+            if edge_for_kelly > 0.0 {
+                self.strategy.record_win(edge_for_kelly);
+            } else if edge_for_kelly < 0.0 {
+                self.strategy.record_loss(-edge_for_kelly);
             }
         }
     }
@@ -1515,7 +1574,16 @@ impl SimulationState {
             kappa_bid,
             kappa_ask,
             momentum,
-            kelly_tracker: KellyTrackerCheckpoint::default(),
+            kelly_tracker: {
+                let wlt = &self.strategy.kelly_sizer.win_loss_tracker;
+                KellyTrackerCheckpoint {
+                    ewma_wins: wlt.avg_win(),
+                    n_wins: (wlt.total_trades() as f64 * wlt.win_rate()) as u64,
+                    ewma_losses: wlt.avg_loss(),
+                    n_losses: (wlt.total_trades() as f64 * (1.0 - wlt.win_rate())) as u64,
+                    decay: 0.99, // matches WinLossTracker default
+                }
+            },
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: self.rl_agent.to_checkpoint(),
         }
@@ -1531,6 +1599,16 @@ impl SimulationState {
         self.regime_hmm.restore_checkpoint(&bundle.regime_hmm);
         self.learned_params = bundle.learned_params.clone();
         self.rl_agent.restore_from_checkpoint(&bundle.rl_q_table);
+
+        // Restore Kelly tracker state from checkpoint
+        let kt = &bundle.kelly_tracker;
+        self.strategy.kelly_sizer.win_loss_tracker.restore_from_checkpoint(
+            kt.ewma_wins,
+            kt.n_wins,
+            kt.ewma_losses,
+            kt.n_losses,
+            kt.decay,
+        );
     }
 }
 

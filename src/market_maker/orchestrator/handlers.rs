@@ -601,11 +601,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         hawkes_excitation,
                     );
 
-                    // Was this fill adverse? (positive AS means we lost)
-                    let was_adverse = as_realized > 0.0;
-
-                    // Compute realized edge in bps
-                    let realized_edge_bps = fill_pnl * 10000.0;
+                    // FIX P0-1: Use depth_from_mid (spread capture) minus fee as reward
+                    // Previously: fill_pnl * 10000 = -as_realized * 10000, which negates profitable fills
+                    // Correct: depth_bps - fee = spread we captured minus cost
+                    const RL_MAKER_FEE_BPS: f64 = 1.5;
+                    let depth_bps_rl = depth_from_mid * 10_000.0;
+                    let realized_edge_bps = depth_bps_rl - RL_MAKER_FEE_BPS;
+                    let was_adverse = realized_edge_bps < 0.0;
 
                     // Inventory risk: |position| / max_position
                     let inventory_risk = (self.position.position().abs()
@@ -621,11 +623,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         was_adverse,
                     );
 
-                    // Get the actual state-action pair that was used when quoting
-                    // This enables proper credit assignment for Q-learning
-                    if let Some((state, action)) = self.stochastic.rl_agent.take_last_state_action()
+                    // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
+                    let mut updated = false;
+                    while let Some((state, action)) = self.stochastic.rl_agent.take_next_state_action()
                     {
-                        // Update Q-values with the transition using the ACTUAL action
                         self.stochastic.rl_agent.update(
                             state,
                             action,
@@ -633,6 +634,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             current_state,
                             false, // not done
                         );
+                        updated = true;
 
                         debug!(
                             realized_edge_bps = %format!("{:.2}", realized_edge_bps),
@@ -643,7 +645,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             action_skew = %format!("{:.1}", action.skew.bid_skew_bps()),
                             "RL agent updated from fill (actual action)"
                         );
-                    } else {
+                    }
+                    if !updated {
                         // Fallback: no stored action (shouldn't happen normally)
                         let action = MDPAction::default();
                         self.stochastic.rl_agent.update(

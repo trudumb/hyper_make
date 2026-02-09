@@ -1597,7 +1597,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         );
 
         // Store state-action pair for credit assignment when fill occurs
-        self.stochastic.rl_agent.set_last_state_action(
+        self.stochastic.rl_agent.push_state_action(
             mdp_state,
             rl_recommendation.action,
         );

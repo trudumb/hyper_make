@@ -9,7 +9,7 @@
 //! Theory: Frame quoting as an MDP where the agent learns optimal policies
 //! by exploring via Thompson sampling on Bayesian Q-value posteriors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tracing::debug;
 
 use crate::market_maker::checkpoint::types::{QTableEntry, RLCheckpoint};
@@ -21,20 +21,16 @@ use crate::market_maker::checkpoint::types::{QTableEntry, RLCheckpoint};
 /// Discretized inventory bucket for state representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InventoryBucket {
-    /// Large short position (< -50% of max)
-    LargeShort,
-    /// Moderate short position (-50% to -20%)
-    ModerateShort,
+    /// Short position (< -20% of max)
+    Short,
     /// Small short position (-20% to -5%)
     SmallShort,
     /// Neutral position (-5% to +5%)
     Neutral,
     /// Small long position (+5% to +20%)
     SmallLong,
-    /// Moderate long position (+20% to +50%)
-    ModerateLong,
-    /// Large long position (> +50%)
-    LargeLong,
+    /// Long position (> +20%)
+    Long,
 }
 
 impl InventoryBucket {
@@ -45,207 +41,171 @@ impl InventoryBucket {
         }
         let ratio = position / max_position;
         match ratio {
-            r if r < -0.5 => Self::LargeShort,
-            r if r < -0.2 => Self::ModerateShort,
+            r if r < -0.2 => Self::Short,
             r if r < -0.05 => Self::SmallShort,
             r if r < 0.05 => Self::Neutral,
             r if r < 0.2 => Self::SmallLong,
-            r if r < 0.5 => Self::ModerateLong,
-            _ => Self::LargeLong,
+            _ => Self::Long,
         }
     }
 
-    /// Get bucket index (0-6).
+    /// Get bucket index (0-4).
     pub fn index(&self) -> usize {
         match self {
-            Self::LargeShort => 0,
-            Self::ModerateShort => 1,
-            Self::SmallShort => 2,
-            Self::Neutral => 3,
-            Self::SmallLong => 4,
-            Self::ModerateLong => 5,
-            Self::LargeLong => 6,
+            Self::Short => 0,
+            Self::SmallShort => 1,
+            Self::Neutral => 2,
+            Self::SmallLong => 3,
+            Self::Long => 4,
         }
     }
 
     /// Number of buckets.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 5;
 }
 
 /// Discretized order book imbalance bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImbalanceBucket {
-    /// Strong sell pressure (< -0.4)
-    StrongSell,
-    /// Moderate sell pressure (-0.4 to -0.15)
-    ModerateSell,
+    /// Sell pressure (< -0.15)
+    Sell,
     /// Weak sell pressure (-0.15 to -0.05)
     WeakSell,
     /// Neutral (-0.05 to +0.05)
     Neutral,
     /// Weak buy pressure (+0.05 to +0.15)
     WeakBuy,
-    /// Moderate buy pressure (+0.15 to +0.4)
-    ModerateBuy,
-    /// Strong buy pressure (> +0.4)
-    StrongBuy,
+    /// Buy pressure (> +0.15)
+    Buy,
 }
 
 impl ImbalanceBucket {
     /// Convert continuous imbalance to bucket.
     pub fn from_imbalance(imbalance: f64) -> Self {
         match imbalance {
-            i if i < -0.4 => Self::StrongSell,
-            i if i < -0.15 => Self::ModerateSell,
+            i if i < -0.15 => Self::Sell,
             i if i < -0.05 => Self::WeakSell,
             i if i < 0.05 => Self::Neutral,
             i if i < 0.15 => Self::WeakBuy,
-            i if i < 0.4 => Self::ModerateBuy,
-            _ => Self::StrongBuy,
+            _ => Self::Buy,
         }
     }
 
-    /// Get bucket index (0-6).
+    /// Get bucket index (0-4).
     pub fn index(&self) -> usize {
         match self {
-            Self::StrongSell => 0,
-            Self::ModerateSell => 1,
-            Self::WeakSell => 2,
-            Self::Neutral => 3,
-            Self::WeakBuy => 4,
-            Self::ModerateBuy => 5,
-            Self::StrongBuy => 6,
+            Self::Sell => 0,
+            Self::WeakSell => 1,
+            Self::Neutral => 2,
+            Self::WeakBuy => 3,
+            Self::Buy => 4,
         }
     }
 
     /// Number of buckets.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 5;
 }
 
 /// Discretized volatility regime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VolatilityBucket {
-    /// Very low volatility (< 0.5x baseline)
-    VeryLow,
-    /// Low volatility (0.5x to 0.8x baseline)
+    /// Low volatility (< 0.8x baseline)
     Low,
     /// Normal volatility (0.8x to 1.2x baseline)
     Normal,
-    /// High volatility (1.2x to 2x baseline)
+    /// High volatility (> 1.2x baseline)
     High,
-    /// Very high volatility (> 2x baseline)
-    VeryHigh,
 }
 
 impl VolatilityBucket {
     /// Convert volatility ratio to bucket.
     pub fn from_vol_ratio(vol_ratio: f64) -> Self {
         match vol_ratio {
-            r if r < 0.5 => Self::VeryLow,
             r if r < 0.8 => Self::Low,
             r if r < 1.2 => Self::Normal,
-            r if r < 2.0 => Self::High,
-            _ => Self::VeryHigh,
+            _ => Self::High,
         }
     }
 
-    /// Get bucket index (0-4).
+    /// Get bucket index (0-2).
     pub fn index(&self) -> usize {
         match self {
-            Self::VeryLow => 0,
-            Self::Low => 1,
-            Self::Normal => 2,
-            Self::High => 3,
-            Self::VeryHigh => 4,
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
         }
     }
 
     /// Number of buckets.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 3;
 }
 
 /// Discretized adverse selection posterior belief.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdverseBucket {
-    /// Very low adverse risk (< 0.1)
-    VeryLow,
-    /// Low adverse risk (0.1 to 0.2)
+    /// Low adverse risk (< 0.2)
     Low,
     /// Moderate adverse risk (0.2 to 0.35)
     Moderate,
-    /// High adverse risk (0.35 to 0.5)
+    /// High adverse risk (> 0.35)
     High,
-    /// Very high adverse risk (> 0.5)
-    VeryHigh,
 }
 
 impl AdverseBucket {
     /// Convert posterior mean to bucket.
     pub fn from_posterior_mean(mean: f64) -> Self {
         match mean {
-            m if m < 0.1 => Self::VeryLow,
             m if m < 0.2 => Self::Low,
             m if m < 0.35 => Self::Moderate,
-            m if m < 0.5 => Self::High,
-            _ => Self::VeryHigh,
+            _ => Self::High,
         }
     }
 
-    /// Get bucket index (0-4).
+    /// Get bucket index (0-2).
     pub fn index(&self) -> usize {
         match self {
-            Self::VeryLow => 0,
-            Self::Low => 1,
-            Self::Moderate => 2,
-            Self::High => 3,
-            Self::VeryHigh => 4,
+            Self::Low => 0,
+            Self::Moderate => 1,
+            Self::High => 2,
         }
     }
 
     /// Number of buckets.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 3;
 }
 
 /// Discretized Hawkes excitation level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExcitationBucket {
-    /// Calm (branching ratio < 0.3)
-    Calm,
-    /// Normal (0.3 to 0.6)
+    /// Normal excitation (branching ratio < 0.6)
     Normal,
-    /// Elevated (0.6 to 0.8)
+    /// Elevated excitation (0.6 to 0.8)
     Elevated,
-    /// High (0.8 to 0.9)
+    /// High excitation (> 0.8)
     High,
-    /// Critical (> 0.9)
-    Critical,
 }
 
 impl ExcitationBucket {
     /// Convert branching ratio to bucket.
     pub fn from_branching_ratio(ratio: f64) -> Self {
         match ratio {
-            r if r < 0.3 => Self::Calm,
             r if r < 0.6 => Self::Normal,
             r if r < 0.8 => Self::Elevated,
-            r if r < 0.9 => Self::High,
-            _ => Self::Critical,
+            _ => Self::High,
         }
     }
 
-    /// Get bucket index (0-4).
+    /// Get bucket index (0-2).
     pub fn index(&self) -> usize {
         match self {
-            Self::Calm => 0,
-            Self::Normal => 1,
-            Self::Elevated => 2,
-            Self::High => 3,
-            Self::Critical => 4,
+            Self::Normal => 0,
+            Self::Elevated => 1,
+            Self::High => 2,
         }
     }
 
     /// Number of buckets.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 3;
 }
 
 /// Complete discretized MDP state.
@@ -283,7 +243,7 @@ impl MDPState {
     }
 
     /// Convert to flat state index for Q-table lookup.
-    /// Total states = 7 * 7 * 5 * 5 * 5 = 6,125
+    /// Total states = 5 * 5 * 3 * 3 * 3 = 675
     pub fn to_index(&self) -> usize {
         let mut idx = self.inventory.index();
         idx = idx * ImbalanceBucket::COUNT + self.imbalance.index();
@@ -312,6 +272,9 @@ impl Default for MDPState {
         }
     }
 }
+
+/// Maximum number of pending state-action pairs in the FIFO queue.
+const STATE_ACTION_QUEUE_CAPACITY: usize = 8;
 
 // ============================================================================
 // Action Space
@@ -1081,8 +1044,9 @@ pub struct QLearningAgent {
     total_reward: f64,
     /// Recent rewards for monitoring
     recent_rewards: Vec<f64>,
-    /// Last state-action for TD update
-    last_state_action: Option<(MDPState, MDPAction)>,
+    /// FIFO queue of pending state-action pairs awaiting reward updates.
+    /// Supports clustered fills where multiple quotes are outstanding.
+    pending_state_actions: VecDeque<(MDPState, MDPAction)>,
 }
 
 impl QLearningAgent {
@@ -1094,7 +1058,7 @@ impl QLearningAgent {
             episodes: 0,
             total_reward: 0.0,
             recent_rewards: Vec::with_capacity(1000),
-            last_state_action: None,
+            pending_state_actions: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
         }
     }
 
@@ -1222,7 +1186,7 @@ impl QLearningAgent {
     /// Record start of a new episode.
     pub fn start_episode(&mut self, _initial_state: MDPState) {
         self.episodes += 1;
-        self.last_state_action = None;
+        self.pending_state_actions.clear();
     }
 
     /// Get the greedy action (exploitation only).
@@ -1281,14 +1245,36 @@ impl QLearningAgent {
         &self.config.reward_config
     }
 
-    /// Record the last state-action pair (for delayed reward updates).
-    pub fn set_last_state_action(&mut self, state: MDPState, action: MDPAction) {
-        self.last_state_action = Some((state, action));
+    /// Push a state-action pair onto the pending queue (FIFO).
+    ///
+    /// If the queue exceeds capacity, the oldest entry is dropped.
+    pub fn push_state_action(&mut self, state: MDPState, action: MDPAction) {
+        if self.pending_state_actions.len() >= STATE_ACTION_QUEUE_CAPACITY {
+            self.pending_state_actions.pop_front();
+        }
+        self.pending_state_actions.push_back((state, action));
     }
 
-    /// Get and clear the last state-action pair.
+    /// Pop the next (oldest) pending state-action pair for reward update.
+    pub fn take_next_state_action(&mut self) -> Option<(MDPState, MDPAction)> {
+        self.pending_state_actions.pop_front()
+    }
+
+    /// Number of pending state-action pairs awaiting reward updates.
+    pub fn pending_action_count(&self) -> usize {
+        self.pending_state_actions.len()
+    }
+
+    /// Record the last state-action pair (for delayed reward updates).
+    /// Prefer `push_state_action()` for new code — this delegates to it.
+    pub fn set_last_state_action(&mut self, state: MDPState, action: MDPAction) {
+        self.push_state_action(state, action);
+    }
+
+    /// Get and clear the oldest pending state-action pair.
+    /// Prefer `take_next_state_action()` for new code — this delegates to it.
     pub fn take_last_state_action(&mut self) -> Option<(MDPState, MDPAction)> {
-        self.last_state_action.take()
+        self.take_next_state_action()
     }
 
     /// Export the Q-table for checkpoint persistence or sim-to-real transfer.
@@ -1570,11 +1556,11 @@ mod tests {
     fn test_inventory_bucket_from_position() {
         assert_eq!(
             InventoryBucket::from_position(-60.0, 100.0),
-            InventoryBucket::LargeShort
+            InventoryBucket::Short
         );
         assert_eq!(
             InventoryBucket::from_position(-30.0, 100.0),
-            InventoryBucket::ModerateShort
+            InventoryBucket::Short
         );
         assert_eq!(
             InventoryBucket::from_position(-10.0, 100.0),
@@ -1590,11 +1576,11 @@ mod tests {
         );
         assert_eq!(
             InventoryBucket::from_position(30.0, 100.0),
-            InventoryBucket::ModerateLong
+            InventoryBucket::Long
         );
         assert_eq!(
             InventoryBucket::from_position(60.0, 100.0),
-            InventoryBucket::LargeLong
+            InventoryBucket::Long
         );
     }
 
@@ -1602,11 +1588,11 @@ mod tests {
     fn test_imbalance_bucket_from_imbalance() {
         assert_eq!(
             ImbalanceBucket::from_imbalance(-0.5),
-            ImbalanceBucket::StrongSell
+            ImbalanceBucket::Sell
         );
         assert_eq!(
             ImbalanceBucket::from_imbalance(-0.25),
-            ImbalanceBucket::ModerateSell
+            ImbalanceBucket::Sell
         );
         assert_eq!(
             ImbalanceBucket::from_imbalance(0.0),
@@ -1614,11 +1600,11 @@ mod tests {
         );
         assert_eq!(
             ImbalanceBucket::from_imbalance(0.25),
-            ImbalanceBucket::ModerateBuy
+            ImbalanceBucket::Buy
         );
         assert_eq!(
             ImbalanceBucket::from_imbalance(0.5),
-            ImbalanceBucket::StrongBuy
+            ImbalanceBucket::Buy
         );
     }
 
@@ -1626,11 +1612,11 @@ mod tests {
     fn test_mdp_state_to_index() {
         let state1 = MDPState::default();
         let state2 = MDPState {
-            inventory: InventoryBucket::LargeLong,
-            imbalance: ImbalanceBucket::StrongBuy,
-            volatility: VolatilityBucket::VeryHigh,
-            adverse: AdverseBucket::VeryHigh,
-            excitation: ExcitationBucket::Critical,
+            inventory: InventoryBucket::Long,
+            imbalance: ImbalanceBucket::Buy,
+            volatility: VolatilityBucket::High,
+            adverse: AdverseBucket::High,
+            excitation: ExcitationBucket::High,
         };
 
         let idx1 = state1.to_index();
@@ -1638,6 +1624,7 @@ mod tests {
 
         assert!(idx1 < MDPState::STATE_COUNT);
         assert!(idx2 < MDPState::STATE_COUNT);
+        assert_eq!(MDPState::STATE_COUNT, 675);
         assert_ne!(idx1, idx2);
     }
 
