@@ -48,6 +48,23 @@ Full report: [audit-report-2026-02-09.md](audit-report-2026-02-09.md)
 - `/src/market_maker/control/mod.rs` -- assess_learning_trust
 - `/src/market_maker/mod.rs` -- hot-reload mechanism
 
+## Profitability Fixes Audit (2026-02-09)
+
+**Verdict**: PASS -- all 5 fixes correct.
+
+| Fix | Verdict | Notes |
+|-----|---------|-------|
+| Cold-start staleness guards | PASS | observation_count > 0 on all 4 signal staleness checks. Types verified. |
+| Ladder fees 3.5->1.5 | PASS | Correct HL maker fee. Stale comment in ladder_strat.rs:334 (says 3.5). |
+| Dedup merge levels | PASS | EPSILON=1e-9 fine for rounded prices. Edge cases handled. After sort. |
+| Log-additive gamma (hip3) | PASS | risk_model_blend=1.0 bypasses multiplicative explosion. KellySizer disabled. |
+| AS threshold 2*sigma*sqrt(tau) | PASS | Units correct: sigma is per-second fraction, * 10000 = bps, * sqrt(5) = bps over 5s. |
+
+Key learnings:
+- `estimator.sigma()` returns fractional per-second sigma (not per-sqrt-second). Must * 10000 for bps.
+- `observation_counts()` on lag_analyzer returns `(usize, usize)` -- tuple comparison `!= (0, 0)` is valid Rust.
+- `fees_bps` flows through 5+ downstream calculations; changing the default affects spread floor.
+
 ## Phase 8 RL Strategy Audit (2026-02-09)
 
 ### CRITICAL: RL Agent is Observe-Only (Not Controlling Live Quotes)

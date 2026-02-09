@@ -331,7 +331,7 @@ impl LadderStrategy {
             linear_step_bps: 3.0, // 3bp steps for linear
             maker_fee_rate: ladder_config.fees_bps / 10000.0, // Convert bps to fraction
             // Spread floor = fees + buffer to ensure profitability
-            // With fees_bps=3.5, floor=4.5bp means we capture at least 1bp after fees
+            // With fees_bps=1.5, floor=2.5bp means we capture at least 1bp after fees
             min_spread_floor_bps: spread_floor,
             enable_asymmetric: true, // Enable asymmetric bid/ask depths
             // DISABLED: Trust GLFT optimal spreads from first principles
