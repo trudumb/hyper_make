@@ -48,6 +48,18 @@ pub struct KillSwitchConfig {
     /// Cascade severity threshold for kill switch (default 5.0, production 1.5)
     pub cascade_severity_threshold: f64,
 
+    /// Price velocity threshold (fraction/second) for pulling quotes.
+    /// Default: 0.05 (5% per second). At BTC $100k, that's $5k/s.
+    pub price_velocity_threshold: f64,
+
+    /// Fraction of max_position that constitutes a "jump" for liquidation detection.
+    /// Default: 0.20 (20%). If position changes by >20% of max with no recent fill, possible liquidation.
+    pub liquidation_position_jump_fraction: f64,
+
+    /// Time window (seconds) within which a fill must have occurred to explain a position jump.
+    /// Default: 5 seconds.
+    pub liquidation_fill_timeout_s: u64,
+
     /// Minimum peak PnL (USD) before drawdown check activates.
     ///
     /// Drawdown from peak is only statistically meaningful when the peak
@@ -74,6 +86,9 @@ impl Default for KillSwitchConfig {
             stale_data_threshold: Duration::from_secs(30),
             max_rate_limit_errors: 3,
             cascade_severity_threshold: 5.0,
+            price_velocity_threshold: 0.05,
+            liquidation_position_jump_fraction: 0.20,
+            liquidation_fill_timeout_s: 5,
             min_peak_for_drawdown: 1.0,
             enabled: true,
         }
@@ -104,6 +119,9 @@ impl KillSwitchConfig {
             stale_data_threshold: Duration::from_secs(10),
             max_rate_limit_errors: 2,
             cascade_severity_threshold: 1.5,
+            price_velocity_threshold: 0.05,
+            liquidation_position_jump_fraction: 0.20,
+            liquidation_fill_timeout_s: 5,
             // Drawdown is meaningless when peak is spread noise.
             // min_peak = max(1.0, 2% of max position notional).
             // With max_position_usd=$1000: min_peak=$20 (~800 fills to activate).
@@ -272,6 +290,11 @@ pub enum KillReason {
     CascadeDetected { severity: f64 },
     /// Manual shutdown triggered by operator
     Manual { reason: String },
+    /// Possible liquidation detected: position jumped without a corresponding local fill
+    LiquidationDetected {
+        position_delta: f64,
+        max_position: f64,
+    },
 }
 
 impl std::fmt::Display for KillReason {
@@ -307,6 +330,16 @@ impl std::fmt::Display for KillReason {
             }
             KillReason::Manual { reason } => {
                 write!(f, "Manual shutdown: {reason}")
+            }
+            KillReason::LiquidationDetected {
+                position_delta,
+                max_position,
+            } => {
+                write!(
+                    f,
+                    "Possible liquidation detected: position jump {position_delta:.6} (>{:.0}% of max {max_position:.6})",
+                    20.0 // display the threshold percentage
+                )
             }
         }
     }
@@ -367,6 +400,9 @@ pub struct KillSwitch {
     /// Max position value limit - atomic for lock-free hot path reads.
     /// Uses portable_atomic::AtomicF64 for cross-platform f64 atomics.
     atomic_max_position_value: AtomicF64,
+    /// Timestamp of last own fill, for liquidation self-detection.
+    /// If position jumps without a recent fill, it may be a liquidation.
+    last_fill_time: Mutex<Option<Instant>>,
 }
 
 impl KillSwitch {
@@ -379,6 +415,7 @@ impl KillSwitch {
             config: Mutex::new(config),
             state: Mutex::new(KillSwitchState::default()),
             atomic_max_position_value: AtomicF64::new(initial_max_position_value),
+            last_fill_time: Mutex::new(None),
         }
     }
 
@@ -480,12 +517,80 @@ impl KillSwitch {
         }
     }
 
-    /// Update position and mid price.
+    /// Update position and mid price, with liquidation self-detection.
+    ///
+    /// If position jumps by more than `liquidation_position_jump_fraction` of
+    /// `max_position_contracts` and no fill was recorded in the last
+    /// `liquidation_fill_timeout_s` seconds, trigger kill switch.
     pub fn update_position(&self, position: f64, mid_price: f64) {
-        let mut state = self.state.lock().unwrap();
-        state.position = position;
-        state.mid_price = mid_price;
-        state.last_data_time = Instant::now();
+        let old_position;
+        {
+            let mut state = self.state.lock().unwrap();
+            old_position = state.position;
+            state.position = position;
+            state.mid_price = mid_price;
+            state.last_data_time = Instant::now();
+        }
+
+        // Liquidation self-detection: check for unexplained position jumps
+        let config = self.config.lock().unwrap();
+        if config.enabled {
+            if let Some(reason) = self.check_liquidation(old_position, position, &config) {
+                self.trigger(reason);
+            }
+        }
+    }
+
+    /// Record that we executed an own fill. Updates the fill timestamp used
+    /// for liquidation self-detection.
+    pub fn record_own_fill(&self) {
+        let mut last_fill = self.last_fill_time.lock().unwrap();
+        *last_fill = Some(Instant::now());
+    }
+
+    /// Check for possible liquidation: position jumped without a corresponding fill.
+    fn check_liquidation(
+        &self,
+        old_position: f64,
+        new_position: f64,
+        config: &KillSwitchConfig,
+    ) -> Option<KillReason> {
+        let position_delta = (new_position - old_position).abs();
+        let max_pos = config.max_position_contracts;
+
+        // Skip if max_position not meaningful (e.g., f64::MAX during startup)
+        if max_pos <= 0.0 || max_pos >= f64::MAX / 2.0 {
+            return None;
+        }
+
+        let jump_threshold = max_pos * config.liquidation_position_jump_fraction;
+        if position_delta <= jump_threshold {
+            return None; // Small change, not suspicious
+        }
+
+        // Large position jump — check if a recent fill explains it
+        let last_fill = self.last_fill_time.lock().unwrap();
+        let fill_timeout = Duration::from_secs(config.liquidation_fill_timeout_s);
+
+        // If we haven't recorded any fill yet, we're in startup/initialization.
+        // Position changes during startup (from exchange sync) are expected.
+        if last_fill.is_none() {
+            return None;
+        }
+
+        let has_recent_fill = last_fill
+            .map(|t| t.elapsed() < fill_timeout)
+            .unwrap_or(false);
+
+        if has_recent_fill {
+            return None; // Position jump is explained by a recent fill
+        }
+
+        // Defense first: position jumped with no recent fill — possible liquidation
+        Some(KillReason::LiquidationDetected {
+            position_delta,
+            max_position: max_pos,
+        })
     }
 
     /// Record a rate limit error.
@@ -1300,5 +1405,92 @@ mod tests {
         assert!(ks.is_triggered());
         // The kill switch being triggered means is_triggered() returns true,
         // which blocks all trading in the event loop
+    }
+
+    // === Liquidation self-detection tests ===
+
+    #[test]
+    fn test_liquidation_normal_fill_no_trigger() {
+        let config = KillSwitchConfig {
+            max_position_contracts: 1.0,
+            liquidation_position_jump_fraction: 0.20,
+            liquidation_fill_timeout_s: 5,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Record a recent fill
+        ks.record_own_fill();
+
+        // Position update within the jump threshold + recent fill
+        ks.update_position(0.15, 50000.0); // 15% of max — below 20% threshold
+        assert!(!ks.is_triggered());
+    }
+
+    #[test]
+    fn test_liquidation_position_jump_no_fill_triggers() {
+        let config = KillSwitchConfig {
+            max_position_contracts: 1.0,
+            liquidation_position_jump_fraction: 0.20,
+            liquidation_fill_timeout_s: 5,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Set initial position (startup — no trigger because no fill recorded yet)
+        ks.update_position(0.0, 50000.0);
+        assert!(!ks.is_triggered());
+
+        // Record a fill to leave startup state, then make it old (expired)
+        {
+            let mut last_fill = ks.last_fill_time.lock().unwrap();
+            *last_fill = Some(Instant::now() - Duration::from_secs(10));
+        }
+
+        // Position jumps by 30% of max with no recent fill (>5s ago)
+        ks.update_position(0.3, 50000.0);
+        assert!(ks.is_triggered());
+
+        let reasons = ks.trigger_reasons();
+        assert!(reasons.iter().any(|r| matches!(r, KillReason::LiquidationDetected { .. })));
+    }
+
+    #[test]
+    fn test_liquidation_jump_with_recent_fill_safe() {
+        let config = KillSwitchConfig {
+            max_position_contracts: 1.0,
+            liquidation_position_jump_fraction: 0.20,
+            liquidation_fill_timeout_s: 5,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Set initial position
+        ks.update_position(0.0, 50000.0);
+
+        // Record a fill — this explains the coming position jump
+        ks.record_own_fill();
+
+        // Position jumps by 30% of max, but we have a recent fill
+        ks.update_position(0.3, 50000.0);
+        assert!(!ks.is_triggered());
+    }
+
+    #[test]
+    fn test_liquidation_small_change_ignored() {
+        let config = KillSwitchConfig {
+            max_position_contracts: 1.0,
+            liquidation_position_jump_fraction: 0.20,
+            liquidation_fill_timeout_s: 5,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Set initial position
+        ks.update_position(0.1, 50000.0);
+
+        // Small position change (5% of max) — no fill needed
+        ks.update_position(0.15, 50000.0);
+        assert!(!ks.is_triggered());
     }
 }

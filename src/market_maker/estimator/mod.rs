@@ -103,7 +103,7 @@ pub use jump::{JumpEstimator, JumpEstimatorConfig};
 pub use kalman::{KalmanPriceFilter, NoiseFilter};
 pub use mock::MockEstimator;
 pub use momentum::MomentumModel;
-pub use parameter_estimator::ParameterEstimator;
+pub use parameter_estimator::{KappaStagnationAlert, ParameterEstimator};
 pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
 pub use volatility::{StochasticVolParams, VolatilityRegime};
 pub use volatility_filter::{VolFilterConfig, VolParticle, VolRegimeParams, VolatilityFilter};
@@ -406,6 +406,12 @@ pub struct EstimatorConfig {
     /// When set, this value is used instead of dynamic model-driven ceiling.
     /// When None, the system uses dynamic ceiling from fill rate controller + market p80.
     pub max_spread_ceiling_bps: Option<f64>,
+
+    // === Sigma Cap ===
+    /// Maximum sigma as a multiple of `default_sigma`.
+    /// Prevents pathological spread widening during extreme cascades.
+    /// E.g. 10.0 means sigma is capped at 10x the configured default.
+    pub max_sigma_multiplier: f64,
 }
 
 impl Default for EstimatorConfig {
@@ -463,6 +469,9 @@ impl Default for EstimatorConfig {
 
             // Max spread ceiling - disabled by default (use dynamic model-driven ceiling)
             max_spread_ceiling_bps: None,
+
+            // Sigma cap - 10x default prevents pathological widening
+            max_sigma_multiplier: 10.0,
         }
     }
 }

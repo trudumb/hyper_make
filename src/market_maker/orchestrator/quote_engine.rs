@@ -119,8 +119,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
                 return Ok(());
             }
-            Some(CircuitBreakerAction::WidenSpreads { .. }) => {
-                // Will apply multiplier below
+            Some(CircuitBreakerAction::WidenSpreads { multiplier }) => {
+                info!(
+                    multiplier = %format!("{:.2}x", multiplier),
+                    "Circuit breaker: widening spreads"
+                );
+                // Multiplier is applied below via spread_multiplier composition
             }
             None => {}
         }

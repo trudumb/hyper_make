@@ -105,6 +105,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 self.stochastic.threshold_kappa.update(return_bps);
             }
 
+            // === Price Velocity Tracking (Flash Crash Detection) ===
+            // Compute abs(delta_mid / mid) per second for flash crash detection.
+            if self.last_mid_for_velocity > 0.0 && self.latest_mid > 0.0 {
+                let elapsed = self.last_mid_velocity_time.elapsed();
+                let elapsed_s = elapsed.as_secs_f64();
+                if elapsed_s > 0.01 {
+                    // Avoid division by tiny elapsed times
+                    let velocity = ((self.latest_mid - self.last_mid_for_velocity)
+                        / self.last_mid_for_velocity)
+                        .abs()
+                        / elapsed_s;
+                    self.price_velocity_1s = velocity;
+                    self.last_mid_for_velocity = self.latest_mid;
+                    self.last_mid_velocity_time = std::time::Instant::now();
+                }
+            } else if self.latest_mid > 0.0 {
+                // First valid mid — seed the velocity tracker
+                self.last_mid_for_velocity = self.latest_mid;
+                self.last_mid_velocity_time = std::time::Instant::now();
+                self.price_velocity_1s = 0.0;
+            }
+
             // === Cross-Exchange Signal Integration: Feed HL price ===
             // Update SignalIntegrator with Hyperliquid mid price for lead-lag calculation.
             // This pairs with Binance prices from handle_binance_price_update().
@@ -390,6 +412,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &mut fill_state,
         )?;
 
+        // Record own fill timestamp for liquidation self-detection.
+        // If position later jumps without a recent fill, it may be a liquidation.
+        if result.fills_processed > 0 {
+            self.safety.kill_switch.record_own_fill();
+        }
+
         // Process fills through WsOrderStateManager for additional state tracking
         // This provides secondary deduplication and state consistency
         for fill in &user_fills.data.fills {
@@ -604,13 +632,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         hawkes_excitation,
                     );
 
-                    // FIX P0-1: Use depth_from_mid (spread capture) minus fee as reward
-                    // Previously: fill_pnl * 10000 = -as_realized * 10000, which negates profitable fills
-                    // Correct: depth_bps - fee = spread we captured minus cost
+                    // FIX P0-1: Use depth_from_mid (spread capture) minus AS minus fee as reward
+                    // Previously: depth_bps - fee only, ignoring adverse selection cost
+                    // Correct: depth_bps - realized_as_bps - fee = true realized edge
                     const RL_MAKER_FEE_BPS: f64 = 1.5;
                     let depth_bps_rl = depth_from_mid * 10_000.0;
-                    let realized_edge_bps = depth_bps_rl - RL_MAKER_FEE_BPS;
-                    let was_adverse = realized_edge_bps < 0.0;
+                    let as_realized_bps_rl = as_realized * 10_000.0;
+                    let realized_edge_bps = depth_bps_rl - as_realized_bps_rl - RL_MAKER_FEE_BPS;
+                    let was_adverse = as_realized_bps_rl > 3.0; // Consistent with AS threshold used elsewhere
 
                     // Inventory risk: |position| / max_position
                     let inventory_risk = (self.position.position().abs()

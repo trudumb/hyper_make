@@ -1271,6 +1271,8 @@ pub const UNIFIED_ACTION_COUNT: usize = 25;
 pub struct QLearningAgent {
     /// Configuration
     config: QLearningConfig,
+    /// Sim-to-real transfer configuration
+    sim_to_real_config: SimToRealConfig,
     /// Q-table: state_index -> [action Q-values]
     q_table: HashMap<usize, Vec<BayesianQValue>>,
     /// Episode count
@@ -1289,6 +1291,20 @@ impl QLearningAgent {
     pub fn new(config: QLearningConfig) -> Self {
         Self {
             config,
+            sim_to_real_config: SimToRealConfig::default(),
+            q_table: HashMap::new(),
+            episodes: 0,
+            total_reward: 0.0,
+            recent_rewards: Vec::with_capacity(1000),
+            pending_state_actions: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
+        }
+    }
+
+    /// Create a new Q-learning agent with sim-to-real configuration.
+    pub fn with_sim_to_real(config: QLearningConfig, sim_to_real_config: SimToRealConfig) -> Self {
+        Self {
+            config,
+            sim_to_real_config,
             q_table: HashMap::new(),
             episodes: 0,
             total_reward: 0.0,
@@ -1317,13 +1333,34 @@ impl QLearningAgent {
     /// Select action index using the configured exploration strategy.
     ///
     /// Returns a flat action index (0..24). Caller converts to MDPAction or ParameterAction.
+    /// Enforces SimToRealConfig safety guards:
+    /// - Returns neutral action if insufficient real fills
+    /// - Clips actions within action_bound_sigma of paper mean
+    /// - Auto-disables RL on persistent negative reward
     pub fn select_action_idx(&mut self, state_idx: StateIndex) -> ActionIndex {
+        let neutral_idx = ParameterAction::neutral().to_index();
+
+        // Guard 1: Not enough real fills — observation only, return neutral
+        let total_updates = self.total_updates();
+        if total_updates < self.sim_to_real_config.min_real_fills as u64 {
+            return neutral_idx;
+        }
+
+        // Guard 2: Auto-disable on persistent negative reward
+        if total_updates > self.sim_to_real_config.auto_disable_after_fills as u64
+            && self.mean_recent_reward() < 0.0
+        {
+            return neutral_idx;
+        }
+
         // Copy config values to avoid borrow issues
         let min_observations = self.config.min_observations;
         let exploration = self.config.exploration;
         let ucb_c = self.config.ucb_c;
         let episodes = self.episodes;
         let min_exploration_rate = self.config.min_exploration_rate;
+        let action_bound_sigma = self.sim_to_real_config.action_bound_sigma;
+        let use_parameter_actions = self.config.use_parameter_actions;
 
         let q_values = self.get_q_values_by_idx(state_idx);
 
@@ -1376,7 +1413,35 @@ impl QLearningAgent {
             }
         };
 
-        action_idx.min(UNIFIED_ACTION_COUNT - 1)
+        let action_idx = action_idx.min(UNIFIED_ACTION_COUNT - 1);
+
+        // Guard 3: Clip parameter actions within action_bound_sigma of neutral
+        // For parameter actions, ensure gamma/omega indices stay within bounds
+        if use_parameter_actions && action_bound_sigma > 0.0 {
+            let selected = ParameterAction::from_index(action_idx);
+            let neutral = ParameterAction::neutral();
+
+            let gamma_dist = (selected.gamma.index() as f64 - neutral.gamma.index() as f64).abs();
+            let omega_dist = (selected.omega.index() as f64 - neutral.omega.index() as f64).abs();
+
+            if gamma_dist > action_bound_sigma || omega_dist > action_bound_sigma {
+                // Clip to nearest action within bounds
+                let clamp = |idx: usize, center: usize| -> usize {
+                    let low = (center as f64 - action_bound_sigma).round().max(0.0) as usize;
+                    let high = (center as f64 + action_bound_sigma).round().min(4.0) as usize;
+                    idx.clamp(low, high)
+                };
+                let clamped_gamma = GammaAction::from_index(
+                    clamp(selected.gamma.index(), neutral.gamma.index()),
+                );
+                let clamped_omega = OmegaAction::from_index(
+                    clamp(selected.omega.index(), neutral.omega.index()),
+                );
+                return ParameterAction::new(clamped_gamma, clamped_omega).to_index();
+            }
+        }
+
+        action_idx
     }
 
     /// Legacy: Select action using the configured exploration strategy.
@@ -1568,6 +1633,10 @@ impl QLearningAgent {
     }
 
     /// Import a paper trading Q-table as a discounted prior for live trading.
+    ///
+    /// Only overwrites Q-values for cold-start states (n == 0). States with
+    /// live observations (n > 0) are preserved — real experience is more
+    /// valuable than simulated experience.
     pub fn import_q_table_as_prior(
         &mut self,
         paper_q: &HashMap<usize, Vec<BayesianQValue>>,
@@ -1579,9 +1648,11 @@ impl QLearningAgent {
                 .entry(state_idx)
                 .or_insert_with(|| vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT]);
             for (i, paper_qv) in paper_values.iter().enumerate() {
-                if i < live_values.len() {
+                if i < live_values.len() && live_values[i].count() == 0 {
+                    // Only import paper prior for cold-start states (no live data)
                     live_values[i] = BayesianQValue::with_discounted_prior(paper_qv, weight);
                 }
+                // States with live data (n > 0) are preserved untouched
             }
         }
     }
@@ -1710,6 +1781,13 @@ impl QLearningAgent {
 impl Default for QLearningAgent {
     fn default() -> Self {
         Self::new(QLearningConfig::default())
+    }
+}
+
+impl QLearningAgent {
+    /// Get the sim-to-real configuration.
+    pub fn sim_to_real_config(&self) -> &SimToRealConfig {
+        &self.sim_to_real_config
     }
 }
 
@@ -2057,6 +2135,50 @@ mod tests {
     }
 
     #[test]
+    fn test_reward_with_adverse_selection_subtracted() {
+        // Validates that the RL reward uses realized_edge = depth - AS - fee,
+        // matching the edge tracker formula in handlers.rs.
+        let config = RewardConfig::default();
+
+        // Scenario: fill at 5 bps depth, 2 bps AS realized, 1.5 bps fee
+        let depth_bps = 5.0;
+        let as_realized_bps = 2.0;
+        let fee_bps = 1.5;
+        let realized_edge_with_as = depth_bps - as_realized_bps - fee_bps; // 1.5
+
+        // Without AS subtraction (the old incorrect formula)
+        let realized_edge_without_as = depth_bps - fee_bps; // 3.5
+
+        let reward_correct = Reward::compute(&config, realized_edge_with_as, 0.3, 1.0, 0.3);
+        let reward_inflated = Reward::compute(&config, realized_edge_without_as, 0.3, 1.0, 0.3);
+
+        // The correct reward (with AS) should be lower than the inflated one
+        assert!(reward_correct.total < reward_inflated.total,
+            "Reward with AS subtracted ({:.4}) should be less than without ({:.4})",
+            reward_correct.total, reward_inflated.total);
+
+        // With AS, the edge is still positive (1.5 bps)
+        assert!(reward_correct.edge_component > 0.0,
+            "Edge should be positive when depth > AS + fee");
+    }
+
+    #[test]
+    fn test_reward_adverse_fill_has_negative_edge() {
+        // When AS exceeds depth, the edge is negative (bad fill)
+        let config = RewardConfig::default();
+
+        // Scenario: fill at 3 bps depth, 6 bps AS (price moved against us), 1.5 bps fee
+        let depth_bps = 3.0;
+        let as_realized_bps = 6.0;
+        let fee_bps = 1.5;
+        let realized_edge = depth_bps - as_realized_bps - fee_bps; // -4.5
+
+        let reward = Reward::compute(&config, realized_edge, 0.3, 1.0, 0.3);
+        assert!(reward.edge_component < 0.0,
+            "Edge should be negative when AS > depth + fee");
+    }
+
+    #[test]
     fn test_reward_inventory_change_penalty() {
         let config = RewardConfig::default();
         // Inventory increased from 20% to 50% → should be penalized
@@ -2264,5 +2386,312 @@ mod tests {
         assert_eq!(state.inventory, InventoryBucket::Neutral);
         assert_eq!(state.volatility, VolatilityBucket::Normal);
         assert_eq!(state.imbalance, ImbalanceBucketCompact::Neutral);
+    }
+
+    // ================================================================
+    // Task 9: import_q_table_as_prior blend tests
+    // ================================================================
+
+    #[test]
+    fn test_import_q_table_cold_state_gets_paper_prior() {
+        let mut agent = QLearningAgent::default();
+        let state_idx = 0usize;
+
+        // Create a paper Q-table with known values
+        let mut paper_q = HashMap::new();
+        let mut paper_values = vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT];
+        // Give paper action 5 some updates so it has a meaningful posterior
+        for _ in 0..10 {
+            paper_values[5].update(2.0);
+        }
+        paper_q.insert(state_idx, paper_values);
+
+        // Agent has no data for this state (cold start)
+        agent.import_q_table_as_prior(&paper_q, 0.3);
+
+        // Cold state should receive the paper prior
+        let q_vals = agent.get_q_values_by_idx(state_idx);
+        // The paper prior should be applied — mu_n should reflect paper's posterior mean
+        assert!(q_vals[5].mean() > 0.5, "Cold state should get paper prior mean");
+        // n should be 0 (discounted prior, no real observations)
+        assert_eq!(q_vals[5].count(), 0, "Discounted prior should have n=0");
+    }
+
+    #[test]
+    fn test_import_q_table_warm_state_preserved() {
+        let mut agent = QLearningAgent::default();
+        let state_idx = 0usize;
+
+        // Give the live agent real observations at state 0, action 3
+        let reward = Reward {
+            total: 5.0,
+            edge_component: 5.0,
+            inventory_penalty: 0.0,
+            volatility_penalty: 0.0,
+            inventory_change_penalty: 0.0,
+        };
+        agent.update_idx(state_idx, 3, reward, 1, false);
+        let live_mean_before = agent.get_q_values_by_idx(state_idx)[3].mean();
+        let live_count_before = agent.get_q_values_by_idx(state_idx)[3].count();
+        assert!(live_count_before > 0, "Should have live data");
+
+        // Create paper Q-table with different values
+        let mut paper_q = HashMap::new();
+        let mut paper_values = vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT];
+        for _ in 0..10 {
+            paper_values[3].update(-10.0); // very different from live
+        }
+        paper_q.insert(state_idx, paper_values);
+
+        // Import — should NOT overwrite warm states
+        agent.import_q_table_as_prior(&paper_q, 0.3);
+
+        let q_vals = agent.get_q_values_by_idx(state_idx);
+        assert_eq!(q_vals[3].count(), live_count_before, "Live count must be preserved");
+        assert!(
+            (q_vals[3].mean() - live_mean_before).abs() < 1e-10,
+            "Live mean must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_import_q_table_observation_count_preserved() {
+        let mut agent = QLearningAgent::default();
+        let state_idx = 2usize;
+
+        // Give live agent 5 observations at action 0
+        for _ in 0..5 {
+            let reward = Reward {
+                total: 1.0,
+                edge_component: 1.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, 0, reward, 3, false);
+        }
+        assert_eq!(agent.get_q_values_by_idx(state_idx)[0].count(), 5);
+
+        let mut paper_q = HashMap::new();
+        let mut paper_values = vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT];
+        for _ in 0..20 {
+            paper_values[0].update(0.5);
+        }
+        paper_q.insert(state_idx, paper_values);
+
+        agent.import_q_table_as_prior(&paper_q, 0.3);
+
+        // n must still be 5, not reset to 0
+        assert_eq!(
+            agent.get_q_values_by_idx(state_idx)[0].count(),
+            5,
+            "Observation count must not be reset by import"
+        );
+    }
+
+    #[test]
+    fn test_import_q_table_mixed_cold_warm() {
+        let mut agent = QLearningAgent::default();
+        let state_idx = 0usize;
+
+        // Warm up action 2 only
+        let reward = Reward {
+            total: 3.0,
+            edge_component: 3.0,
+            inventory_penalty: 0.0,
+            volatility_penalty: 0.0,
+            inventory_change_penalty: 0.0,
+        };
+        agent.update_idx(state_idx, 2, reward, 1, false);
+        let warm_count = agent.get_q_values_by_idx(state_idx)[2].count();
+        assert!(warm_count > 0);
+
+        // Paper Q-table has data for actions 2 and 7
+        let mut paper_q = HashMap::new();
+        let mut paper_values = vec![BayesianQValue::new(); UNIFIED_ACTION_COUNT];
+        for _ in 0..10 {
+            paper_values[2].update(10.0);
+            paper_values[7].update(5.0);
+        }
+        paper_q.insert(state_idx, paper_values);
+
+        agent.import_q_table_as_prior(&paper_q, 0.3);
+
+        // Action 2 (warm) should be untouched
+        assert_eq!(
+            agent.get_q_values_by_idx(state_idx)[2].count(),
+            warm_count,
+            "Warm action should be preserved"
+        );
+        // Action 7 (cold) should get paper prior
+        let q7 = &agent.get_q_values_by_idx(state_idx)[7];
+        assert_eq!(q7.count(), 0, "Cold action should get discounted prior (n=0)");
+        assert!(q7.mean() > 1.0, "Cold action should have paper mean");
+    }
+
+    // ================================================================
+    // Task 11: SimToRealConfig safety guard tests
+    // ================================================================
+
+    #[test]
+    fn test_sim_to_real_guards_block_early_actions() {
+        // Agent with min_real_fills=20 and no updates should return neutral
+        let sim_config = SimToRealConfig {
+            min_real_fills: 20,
+            action_bound_sigma: 2.0,
+            auto_disable_after_fills: 100,
+            ..Default::default()
+        };
+        let mut agent = QLearningAgent::with_sim_to_real(
+            QLearningConfig::default(),
+            sim_config,
+        );
+        let state_idx = MDPStateCompact::default().to_index();
+        let neutral_idx = ParameterAction::neutral().to_index();
+
+        // With 0 total updates, should always return neutral
+        for _ in 0..20 {
+            let action = agent.select_action_idx(state_idx);
+            assert_eq!(
+                action, neutral_idx,
+                "Must return neutral when total_updates < min_real_fills"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sim_to_real_actions_clipped() {
+        // With action_bound_sigma=1.0, only actions within 1 step of neutral
+        // should be allowed (gamma index 1..3, omega index 1..3)
+        let sim_config = SimToRealConfig {
+            min_real_fills: 0, // disable min fills guard
+            action_bound_sigma: 1.0,
+            auto_disable_after_fills: 100_000, // disable auto-disable
+            ..Default::default()
+        };
+        let config = QLearningConfig {
+            min_observations: 0, // allow immediate exploitation
+            min_exploration_rate: 0.0, // no random exploration
+            exploration: ExplorationStrategy::EpsilonGreedy { epsilon: 0.0, decay: 1.0 },
+            use_parameter_actions: true,
+            ..Default::default()
+        };
+        let mut agent = QLearningAgent::with_sim_to_real(config, sim_config);
+        let state_idx = 0usize;
+
+        // Make action at index for VeryAggressive gamma (idx=4) + MinimalSkew omega (idx=4)
+        // extremely attractive so the agent wants to pick it
+        let extreme_action_idx = ParameterAction::new(
+            GammaAction::VeryAggressive,
+            OmegaAction::MinimalSkew,
+        ).to_index();
+        // Need some observations first
+        for _ in 0..50 {
+            let reward = Reward {
+                total: 100.0,
+                edge_component: 100.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, extreme_action_idx, reward, state_idx, false);
+        }
+
+        // Select action — should be clipped
+        let action_idx = agent.select_action_idx(state_idx);
+        let action = ParameterAction::from_index(action_idx);
+        let neutral = ParameterAction::neutral();
+
+        let gamma_dist = (action.gamma.index() as f64 - neutral.gamma.index() as f64).abs();
+        let omega_dist = (action.omega.index() as f64 - neutral.omega.index() as f64).abs();
+
+        assert!(
+            gamma_dist <= 1.0,
+            "Gamma must be clipped within 1 sigma of neutral, got dist={}",
+            gamma_dist
+        );
+        assert!(
+            omega_dist <= 1.0,
+            "Omega must be clipped within 1 sigma of neutral, got dist={}",
+            omega_dist
+        );
+    }
+
+    #[test]
+    fn test_sim_to_real_auto_disable_on_negative_reward() {
+        let sim_config = SimToRealConfig {
+            min_real_fills: 0,
+            action_bound_sigma: 10.0, // wide bounds, don't clip
+            auto_disable_after_fills: 5,
+            ..Default::default()
+        };
+        let mut agent = QLearningAgent::with_sim_to_real(
+            QLearningConfig::default(),
+            sim_config,
+        );
+        let state_idx = 0usize;
+        let neutral_idx = ParameterAction::neutral().to_index();
+
+        // Give agent negative rewards to trigger auto-disable
+        for i in 0..10 {
+            let reward = Reward {
+                total: -2.0,
+                edge_component: -2.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, i % UNIFIED_ACTION_COUNT, reward, state_idx, false);
+        }
+
+        // total_updates > 5 and mean_reward < 0 => should return neutral
+        assert!(agent.total_updates() > 5);
+        assert!(agent.mean_recent_reward() < 0.0);
+        let action = agent.select_action_idx(state_idx);
+        assert_eq!(
+            action, neutral_idx,
+            "Must return neutral when auto-disable triggers"
+        );
+    }
+
+    #[test]
+    fn test_sim_to_real_guards_pass_after_sufficient_positive_fills() {
+        let sim_config = SimToRealConfig {
+            min_real_fills: 5,
+            action_bound_sigma: 10.0, // wide bounds
+            auto_disable_after_fills: 1000,
+            ..Default::default()
+        };
+        let config = QLearningConfig {
+            min_observations: 0,
+            min_exploration_rate: 0.0,
+            exploration: ExplorationStrategy::EpsilonGreedy { epsilon: 0.0, decay: 1.0 },
+            ..Default::default()
+        };
+        let mut agent = QLearningAgent::with_sim_to_real(config, sim_config);
+        let state_idx = 0usize;
+
+        // Give 10 positive fills — should exceed min_real_fills threshold
+        for _ in 0..10 {
+            let reward = Reward {
+                total: 5.0,
+                edge_component: 5.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, 0, reward, state_idx, false);
+        }
+
+        assert!(agent.total_updates() >= 5);
+        assert!(agent.mean_recent_reward() > 0.0);
+
+        // Should NOT be forced to neutral — the agent can now pick freely
+        // With epsilon=0.0 and all updates at action 0, greedy should pick action 0
+        let action = agent.select_action_idx(state_idx);
+        let neutral_action = ParameterAction::neutral().to_index();
+        // The agent should be able to pick action 0 (not forced to neutral=12)
+        assert_ne!(action, neutral_action, "Agent should NOT be forced to neutral after sufficient positive fills");
+        assert_eq!(action, 0, "Agent should exploit best action after sufficient fills");
     }
 }

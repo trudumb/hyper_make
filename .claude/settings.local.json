@@ -22,7 +22,10 @@
       "mcp__serena__insert_after_symbol",
       "mcp__serena__find_file",
       "mcp__serena__create_text_file",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "mcp__serena__read_memory",
+      "Bash(cargo metadata:*)",
+      "Bash(python3:*)"
     ]
   }
 }

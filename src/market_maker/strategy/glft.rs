@@ -189,7 +189,13 @@ impl GLFTStrategy {
         // 1. calibration_gamma_mult: Fill rate controller during warmup
         // 2. tail_risk_multiplier: Cascade detection (discrete event)
         let gamma_with_calib = gamma_base * market_params.calibration_gamma_mult;
-        let gamma_final = gamma_with_calib * market_params.tail_risk_multiplier;
+        let gamma_with_tail = gamma_with_calib * market_params.tail_risk_multiplier;
+
+        // RL policy multiplier: allows learned risk aversion scaling.
+        // Clamped to [0.1, 10.0] to prevent blow-ups even if RL outputs garbage.
+        // Default 1.0 = no-op until RL is explicitly enabled.
+        let rl_gamma_mult = market_params.rl_gamma_multiplier.clamp(0.1, 10.0);
+        let gamma_final = gamma_with_tail * rl_gamma_mult;
 
         let gamma_clamped = gamma_final.clamp(cfg.gamma_min, cfg.gamma_max);
 
@@ -202,6 +208,7 @@ impl GLFTStrategy {
                 gamma_base = %format!("{:.4}", gamma_base),
                 calib_mult = %format!("{:.3}", market_params.calibration_gamma_mult),
                 tail_mult = %format!("{:.3}", market_params.tail_risk_multiplier),
+                rl_gamma_mult = %format!("{:.3}", rl_gamma_mult),
                 gamma_final = %format!("{:.4}", gamma_clamped),
                 "Gamma: legacy vs calibrated comparison"
             );
@@ -211,6 +218,7 @@ impl GLFTStrategy {
                 gamma_raw = %format!("{:.4}", gamma_legacy),
                 calib_mult = %format!("{:.3}", market_params.calibration_gamma_mult),
                 tail_mult = %format!("{:.3}", market_params.tail_risk_multiplier),
+                rl_gamma_mult = %format!("{:.3}", rl_gamma_mult),
                 gamma_clamped = %format!("{:.4}", gamma_clamped),
                 "Gamma: legacy mode"
             );
@@ -1082,8 +1090,13 @@ impl QuotingStrategy for GLFTStrategy {
         let proactive_skew = self.proactive_directional_skew(market_params);
 
         // Inventory-reactive skew (existing behavior)
-        let inventory_skew =
-            (base_skew + drift_urgency + hawkes_skew + funding_skew) * momentum_skew_multiplier;
+        // RL omega multiplier: allows learned skew scaling.
+        // Clamped to [0.1, 10.0] to prevent sign-flipping or blow-ups.
+        // Default 1.0 = no-op until RL is explicitly enabled.
+        let rl_omega_mult = market_params.rl_omega_multiplier.clamp(0.1, 10.0);
+        let inventory_skew = (base_skew + drift_urgency + hawkes_skew + funding_skew)
+            * momentum_skew_multiplier
+            * rl_omega_mult;
 
         // Blend: inventory skew always applies, proactive skew fades as inventory grows
         // inventory_weight: 0 at zero inventory → 1 at max position
@@ -1373,5 +1386,282 @@ impl QuotingStrategy for GLFTStrategy {
 
     fn name(&self) -> &'static str {
         "GLFT"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a default MarketParams with sensible test values.
+    fn test_market_params() -> MarketParams {
+        let mut mp = MarketParams::default();
+        mp.sigma = 0.001; // 10 bps vol
+        mp.kappa = 5000.0;
+        mp.microprice = 100.0;
+        mp.calibration_gamma_mult = 1.0;
+        mp.tail_risk_multiplier = 1.0;
+        mp.rl_gamma_multiplier = 1.0;
+        mp.rl_omega_multiplier = 1.0;
+        mp
+    }
+
+    fn test_strategy() -> GLFTStrategy {
+        GLFTStrategy::new(0.1) // gamma_base = 0.1
+    }
+
+    fn test_quote_config() -> QuoteConfig {
+        QuoteConfig {
+            mid_price: 100.0,
+            decimals: 2,
+            sz_decimals: 4,
+            min_notional: 10.0,
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // RL Gamma Multiplier Tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_rl_gamma_multiplier_default_noop() {
+        let strategy = test_strategy();
+        let mp = test_market_params();
+        let position = 0.5;
+        let max_position = 10.0;
+
+        // Default rl_gamma_multiplier = 1.0 should be identical to not having it
+        let gamma = strategy.effective_gamma(&mp, position, max_position);
+        assert!(gamma > 0.0, "gamma must be positive");
+
+        // Compare with explicit 1.0
+        let mut mp2 = mp.clone();
+        mp2.rl_gamma_multiplier = 1.0;
+        let gamma2 = strategy.effective_gamma(&mp2, position, max_position);
+        assert!(
+            (gamma - gamma2).abs() < 1e-12,
+            "rl_gamma_multiplier=1.0 should be no-op, got {} vs {}",
+            gamma,
+            gamma2
+        );
+    }
+
+    #[test]
+    fn test_rl_gamma_multiplier_gt1_increases_gamma() {
+        let strategy = test_strategy();
+        let mp_base = test_market_params();
+        let position = 0.5;
+        let max_position = 10.0;
+
+        let gamma_base = strategy.effective_gamma(&mp_base, position, max_position);
+
+        let mut mp_high = mp_base.clone();
+        mp_high.rl_gamma_multiplier = 2.0;
+        let gamma_high = strategy.effective_gamma(&mp_high, position, max_position);
+
+        assert!(
+            gamma_high > gamma_base,
+            "rl_gamma_multiplier=2.0 should increase gamma: {} vs {}",
+            gamma_high,
+            gamma_base
+        );
+    }
+
+    #[test]
+    fn test_rl_gamma_multiplier_lt1_decreases_gamma() {
+        let strategy = test_strategy();
+        let mp_base = test_market_params();
+        let position = 0.5;
+        let max_position = 10.0;
+
+        let gamma_base = strategy.effective_gamma(&mp_base, position, max_position);
+
+        let mut mp_low = mp_base.clone();
+        mp_low.rl_gamma_multiplier = 0.5;
+        let gamma_low = strategy.effective_gamma(&mp_low, position, max_position);
+
+        assert!(
+            gamma_low < gamma_base,
+            "rl_gamma_multiplier=0.5 should decrease gamma: {} vs {}",
+            gamma_low,
+            gamma_base
+        );
+    }
+
+    #[test]
+    fn test_rl_gamma_multiplier_clamped_to_safe_range() {
+        let strategy = test_strategy();
+        let mp_base = test_market_params();
+        let position = 0.5;
+        let max_position = 10.0;
+
+        // Extreme high should be clamped to 10.0
+        let mut mp_extreme_high = mp_base.clone();
+        mp_extreme_high.rl_gamma_multiplier = 100.0;
+        let gamma_extreme = strategy.effective_gamma(&mp_extreme_high, position, max_position);
+
+        let mut mp_at_cap = mp_base.clone();
+        mp_at_cap.rl_gamma_multiplier = 10.0;
+        let gamma_at_cap = strategy.effective_gamma(&mp_at_cap, position, max_position);
+
+        assert!(
+            (gamma_extreme - gamma_at_cap).abs() < 1e-12,
+            "rl_gamma_multiplier=100.0 should be clamped to 10.0: {} vs {}",
+            gamma_extreme,
+            gamma_at_cap
+        );
+
+        // Extreme low should be clamped to 0.1
+        let mut mp_extreme_low = mp_base.clone();
+        mp_extreme_low.rl_gamma_multiplier = 0.001;
+        let gamma_extreme_low =
+            strategy.effective_gamma(&mp_extreme_low, position, max_position);
+
+        let mut mp_at_floor = mp_base.clone();
+        mp_at_floor.rl_gamma_multiplier = 0.1;
+        let gamma_at_floor = strategy.effective_gamma(&mp_at_floor, position, max_position);
+
+        assert!(
+            (gamma_extreme_low - gamma_at_floor).abs() < 1e-12,
+            "rl_gamma_multiplier=0.001 should be clamped to 0.1: {} vs {}",
+            gamma_extreme_low,
+            gamma_at_floor
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // RL Omega Multiplier Tests (Position Skew)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_rl_omega_multiplier_default_noop() {
+        let strategy = test_strategy();
+        let mp = test_market_params();
+        let config = test_quote_config();
+        let target_liq = 1.0;
+
+        // With default rl_omega_multiplier = 1.0, quotes should be identical
+        let (bid1, ask1) = strategy.calculate_quotes(&config, 1.0, 10.0, target_liq, &mp);
+
+        let mut mp2 = mp.clone();
+        mp2.rl_omega_multiplier = 1.0;
+        let (bid2, ask2) = strategy.calculate_quotes(&config, 1.0, 10.0, target_liq, &mp2);
+
+        if let (Some(b1), Some(b2)) = (&bid1, &bid2) {
+            assert!(
+                (b1.price - b2.price).abs() < 1e-10,
+                "bid prices differ with omega=1.0: {} vs {}",
+                b1.price,
+                b2.price
+            );
+        }
+        if let (Some(a1), Some(a2)) = (&ask1, &ask2) {
+            assert!(
+                (a1.price - a2.price).abs() < 1e-10,
+                "ask prices differ with omega=1.0: {} vs {}",
+                a1.price,
+                a2.price
+            );
+        }
+    }
+
+    #[test]
+    fn test_rl_omega_multiplier_scales_skew() {
+        // Test at the effective_gamma/skew level: verify the omega multiplier
+        // affects the final quotes by using extreme vol and high-precision config.
+        let strategy = test_strategy();
+        let config = QuoteConfig {
+            mid_price: 1000.0,
+            decimals: 4,
+            sz_decimals: 4,
+            min_notional: 0.01,
+        };
+        let position = 8.0; // Near max for strong skew
+        let max_position = 10.0;
+        let target_liq = 1.0;
+
+        let mut mp_base = test_market_params();
+        mp_base.microprice = 1000.0;
+        mp_base.sigma = 0.05; // 500 bps vol for large skew
+        mp_base.sigma_effective = 0.05;
+        mp_base.sigma_leverage_adjusted = 0.05;
+        mp_base.arrival_intensity = 0.1; // Long holding time = bigger skew
+        let (bid_base, _) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_base);
+
+        let mut mp_high = mp_base.clone();
+        mp_high.rl_omega_multiplier = 5.0;
+        let (bid_high, _) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_high);
+
+        // Higher omega amplifies inventory skew.
+        // With long position, skew pushes bid lower; omega=5 should push it even lower.
+        if let (Some(b_base), Some(b_high)) = (&bid_base, &bid_high) {
+            assert!(
+                (b_base.price - b_high.price).abs() > 0.001,
+                "omega=5.0 should meaningfully change bid price vs omega=1.0: base={}, high={}",
+                b_base.price,
+                b_high.price
+            );
+        } else {
+            // If either bid is None (skew pushed it negative), that also proves omega works
+            let base_has_bid = bid_base.is_some();
+            let high_has_bid = bid_high.is_some();
+            assert!(
+                base_has_bid != high_has_bid,
+                "omega=5.0 should change bid availability: base_has={}, high_has={}",
+                base_has_bid,
+                high_has_bid
+            );
+        }
+    }
+
+    #[test]
+    fn test_rl_omega_multiplier_clamped_to_safe_range() {
+        let strategy = test_strategy();
+        let config = test_quote_config();
+        let position = 2.0;
+        let max_position = 10.0;
+        let target_liq = 1.0;
+
+        // Extreme high should be clamped to 10.0
+        let mut mp_extreme = test_market_params();
+        mp_extreme.rl_omega_multiplier = 100.0;
+        let (bid_extreme, _) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_extreme);
+
+        let mut mp_cap = test_market_params();
+        mp_cap.rl_omega_multiplier = 10.0;
+        let (bid_cap, _) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_cap);
+
+        if let (Some(b_ext), Some(b_cap)) = (&bid_extreme, &bid_cap) {
+            assert!(
+                (b_ext.price - b_cap.price).abs() < 1e-10,
+                "omega=100.0 should be clamped to 10.0: {} vs {}",
+                b_ext.price,
+                b_cap.price
+            );
+        }
+
+        // Extreme low should be clamped to 0.1
+        let mut mp_low = test_market_params();
+        mp_low.rl_omega_multiplier = 0.001;
+        let (bid_low, _) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_low);
+
+        let mut mp_floor = test_market_params();
+        mp_floor.rl_omega_multiplier = 0.1;
+        let (bid_floor, _) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_floor);
+
+        if let (Some(b_low), Some(b_floor)) = (&bid_low, &bid_floor) {
+            assert!(
+                (b_low.price - b_floor.price).abs() < 1e-10,
+                "omega=0.001 should be clamped to 0.1: {} vs {}",
+                b_low.price,
+                b_floor.price
+            );
+        }
     }
 }

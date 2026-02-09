@@ -44,6 +44,10 @@ pub struct RiskState {
     /// Is market in toxic regime?
     pub is_toxic_regime: bool,
 
+    // === Price Velocity ===
+    /// Absolute price velocity over 1 second: abs(mid_delta / mid) / elapsed_s
+    pub price_velocity_1s: f64,
+
     // === Cascade/Tail Risk Metrics ===
     /// Liquidation cascade severity (0.0 = calm, 1.0+ = cascade)
     pub cascade_severity: f64,
@@ -122,6 +126,7 @@ impl RiskState {
             sigma_confidence: 1.0,
             jump_ratio: 1.0,
             is_toxic_regime: false,
+            price_velocity_1s: 0.0,
             cascade_severity,
             tail_risk_multiplier: 1.0,
             should_pull_quotes: false,
@@ -176,6 +181,12 @@ impl RiskState {
     /// Builder-style method to set rate limit errors.
     pub fn with_rate_limit_errors(mut self, errors: u32) -> Self {
         self.rate_limit_errors = errors;
+        self
+    }
+
+    /// Builder-style method to set price velocity.
+    pub fn with_price_velocity(mut self, velocity_1s: f64) -> Self {
+        self.price_velocity_1s = velocity_1s;
         self
     }
 
@@ -315,6 +326,7 @@ impl Default for RiskState {
             sigma_confidence: 0.0,
             jump_ratio: 1.0,
             is_toxic_regime: false,
+            price_velocity_1s: 0.0,
             cascade_severity: 0.0,
             tail_risk_multiplier: 1.0,
             should_pull_quotes: false,

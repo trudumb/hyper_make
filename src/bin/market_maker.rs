@@ -1749,6 +1749,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stale_data_threshold: std::time::Duration::from_secs(ks_toml.stale_data_threshold_secs),
         max_rate_limit_errors: ks_toml.max_rate_limit_errors,
         cascade_severity_threshold: ks_toml.cascade_severity_threshold,
+        price_velocity_threshold: 0.05, // 5%/s — default from KillSwitchConfig
+        liquidation_position_jump_fraction: 0.20, // 20% of max position
+        liquidation_fill_timeout_s: 5,
         // Drawdown is meaningless when peak is spread noise ($0.02).
         // min_peak = max(1.0, 2% of max position notional).
         // check_daily_loss still protects against catastrophic loss.

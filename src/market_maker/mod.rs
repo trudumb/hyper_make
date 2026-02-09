@@ -224,6 +224,14 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Consumers read via snapshot() for consistent point-in-time views.
     central_beliefs: CentralBeliefState,
 
+    // === Price Velocity Tracking (Flash Crash Detection) ===
+    /// Previous mid price for velocity computation.
+    last_mid_for_velocity: f64,
+    /// Timestamp of last mid price used for velocity computation.
+    last_mid_velocity_time: std::time::Instant,
+    /// Current price velocity (abs(delta_mid / mid) per second).
+    price_velocity_1s: f64,
+
     // === Signal Diagnostics Cache (Phase 1) ===
     /// Cached market params from last quote cycle.
     /// Used by fill handler to capture signal state at fill time.
@@ -403,6 +411,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_beliefs_update: None,
             // Centralized belief state (single source of truth)
             central_beliefs: CentralBeliefState::new(CentralBeliefConfig::default()),
+            // Price velocity tracking for flash crash detection
+            last_mid_for_velocity: 0.0,
+            last_mid_velocity_time: std::time::Instant::now(),
+            price_velocity_1s: 0.0,
             // Signal diagnostics cache (updated each quote cycle)
             cached_market_params: None,
             // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
@@ -787,6 +799,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 == crate::market_maker::infra::ConnectionState::Failed,
         )
         .with_rate_limit_errors(self.safety.kill_switch.state().rate_limit_errors)
+        .with_price_velocity(self.price_velocity_1s)
     }
 
     /// Get current session time as fraction [0, 1].
@@ -902,6 +915,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             )))
             .with_monitor(Box::new(RateLimitMonitor::new(
                 config.max_rate_limit_errors,
+            )))
+            .with_monitor(Box::new(PriceVelocityMonitor::new(
+                config.price_velocity_threshold,
+                config.price_velocity_threshold * 3.0, // Kill at 3x pull threshold
             )))
     }
 

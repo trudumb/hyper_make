@@ -29,6 +29,28 @@ use crate::market_maker::latent::{
 };
 
 // ============================================================================
+// Kappa Stagnation Alert
+// ============================================================================
+
+/// Minimum runtime before stagnation alert can fire (1 hour in ms).
+const KAPPA_STAGNATION_MIN_RUNTIME_MS: u64 = 3_600_000;
+
+/// Alert emitted when kappa estimation has been running long enough
+/// but own-fill confidence remains low, indicating the estimator
+/// is relying on priors rather than real fill data.
+#[derive(Debug, Clone)]
+pub struct KappaStagnationAlert {
+    /// Seconds since the estimator started receiving updates.
+    pub time_since_start_s: f64,
+    /// Number of own fills received so far.
+    pub own_fill_count: u64,
+    /// Own-fill kappa confidence [0, 1].
+    pub confidence: f64,
+    /// Current blended kappa value.
+    pub blended_kappa: f64,
+}
+
+// ============================================================================
 // ParameterEstimator
 // ============================================================================
 
@@ -141,6 +163,17 @@ pub struct ParameterEstimator {
     adapted_kappa_prior: f64,
     /// Number of times `adapt_kappa_prior()` has been called (for strength growth).
     prior_adaptation_count: usize,
+
+    // === Sigma Cap ===
+    /// Maximum allowed sigma = max_sigma_multiplier * default_sigma.
+    /// Prevents pathological spread widening during extreme cascades.
+    max_sigma: f64,
+
+    // === Kappa Stagnation Detection ===
+    /// Timestamp of the first update (trade or mid), used for stagnation detection.
+    first_update_time_ms: Option<u64>,
+    /// Count of own fills received (for stagnation alert threshold).
+    own_fill_count: u64,
 }
 
 impl ParameterEstimator {
@@ -239,6 +272,8 @@ impl ParameterEstimator {
 
         // Capture prior mean before config is moved into Self
         let initial_kappa_prior = config.kappa_prior_mean;
+        // Pre-compute sigma cap: multiplier * default_sigma
+        let max_sigma = config.max_sigma_multiplier * config.default_sigma;
 
         Self {
             config,
@@ -285,6 +320,11 @@ impl ParameterEstimator {
             // Adaptive kappa prior — starts at config value, adapts toward market
             adapted_kappa_prior: initial_kappa_prior,
             prior_adaptation_count: 0,
+            // Sigma cap
+            max_sigma,
+            // Kappa stagnation detection
+            first_update_time_ms: None,
+            own_fill_count: 0,
         }
     }
 
@@ -310,6 +350,10 @@ impl ParameterEstimator {
         is_buy_aggressor: Option<bool>,
     ) {
         self.current_time_ms = timestamp_ms;
+        // Record first update time for stagnation detection
+        if self.first_update_time_ms.is_none() {
+            self.first_update_time_ms = Some(timestamp_ms);
+        }
 
         // Track trade flow if we know aggressor side
         if let Some(is_buy) = is_buy_aggressor {
@@ -504,6 +548,8 @@ impl ParameterEstimator {
         fill_size: f64,
         is_buy: bool,
     ) {
+        self.own_fill_count += 1;
+
         // Feed ALL fills into aggregate kappa (for backward compatibility)
         self.own_kappa
             .record_fill_distance(timestamp_ms, placement_price, fill_price, fill_size);
@@ -663,29 +709,39 @@ impl ParameterEstimator {
 
     // === Volatility Accessors ===
 
+    /// Cap sigma to prevent pathological spread widening.
+    /// Returns `sigma.min(max_sigma)` where max_sigma = multiplier * default_sigma.
+    #[inline]
+    fn cap_sigma(&self, sigma: f64) -> f64 {
+        sigma.min(self.max_sigma)
+    }
+
     /// Get clean volatility (σ_clean) - per-second, NOT annualized.
     /// Based on Bipower Variation, robust to jumps.
     /// Use for base spread pricing (continuous risk).
+    /// Capped at max_sigma_multiplier * default_sigma.
     pub fn sigma(&self) -> f64 {
-        self.multi_scale.sigma_clean()
+        self.cap_sigma(self.multi_scale.sigma_clean())
     }
 
     /// Get clean volatility - alias for sigma()
     pub fn sigma_clean(&self) -> f64 {
-        self.multi_scale.sigma_clean()
+        self.cap_sigma(self.multi_scale.sigma_clean())
     }
 
     /// Get total volatility (σ_total) - includes jumps.
     /// Based on Realized Variance, captures full price risk.
+    /// Capped at max_sigma_multiplier * default_sigma.
     pub fn sigma_total(&self) -> f64 {
-        self.multi_scale.sigma_total()
+        self.cap_sigma(self.multi_scale.sigma_total())
     }
 
     /// Get effective volatility (σ_effective) - blended.
     /// Blends clean and total based on jump regime.
     /// Use for inventory skew (reacts appropriately to jumps).
+    /// Capped at max_sigma_multiplier * default_sigma.
     pub fn sigma_effective(&self) -> f64 {
-        self.multi_scale.sigma_effective()
+        self.cap_sigma(self.multi_scale.sigma_effective())
     }
 
     /// Get leverage-adjusted effective volatility.
@@ -705,7 +761,7 @@ impl ParameterEstimator {
         // Only apply leverage effect when:
         // 1. Momentum is negative (falling market)
         // 2. ρ is negative (leverage effect exists)
-        if momentum_bps < 0.0 && rho < 0.0 {
+        let raw = if momentum_bps < 0.0 && rho < 0.0 {
             // Scale adjustment by momentum magnitude (capped at 50bps)
             let momentum_factor = (momentum_bps.abs() / 50.0).clamp(0.0, 1.0);
             // Adjustment = |ρ| × 0.2 × momentum_factor
@@ -714,7 +770,8 @@ impl ParameterEstimator {
             base_sigma * (1.0 + adjustment)
         } else {
             base_sigma
-        }
+        };
+        self.cap_sigma(raw)
     }
 
     // === Order Book Accessors ===
@@ -858,6 +915,34 @@ impl ParameterEstimator {
     /// Get market kappa confidence [0, 1].
     pub fn kappa_market_confidence(&self) -> f64 {
         self.market_kappa.confidence()
+    }
+
+    // === Kappa Stagnation Detection ===
+
+    /// Check whether kappa estimation is stagnant (running >1 hour with low fill confidence).
+    ///
+    /// Returns `Some(alert)` when:
+    /// - Time since first update exceeds 1 hour (3_600_000 ms)
+    /// - Own-fill kappa confidence is below 0.5 (still relying heavily on priors/market data)
+    ///
+    /// Callers should invoke this periodically (e.g. every 60s in maintenance) and
+    /// emit a `warn!` log when the alert fires.
+    pub fn check_kappa_stagnation(&self, now_ms: u64) -> Option<KappaStagnationAlert> {
+        let start_ms = self.first_update_time_ms?;
+        let elapsed_ms = now_ms.saturating_sub(start_ms);
+        if elapsed_ms < KAPPA_STAGNATION_MIN_RUNTIME_MS {
+            return None;
+        }
+        let confidence = self.own_kappa.confidence();
+        if confidence >= 0.5 {
+            return None;
+        }
+        Some(KappaStagnationAlert {
+            time_since_start_s: elapsed_ms as f64 / 1000.0,
+            own_fill_count: self.own_fill_count,
+            confidence,
+            blended_kappa: self.kappa(),
+        })
     }
 
     // === V3 Robust Kappa Orchestrator Accessors ===
@@ -2417,5 +2502,158 @@ mod tests {
             ratio > 0.3 && ratio < 0.9,
             "Floor ratio should reflect prior reduction, got {ratio}"
         );
+    }
+
+    // ======================================================================
+    // Sigma Cap Tests
+    // ======================================================================
+
+    #[test]
+    fn test_sigma_cap_normal_sigma_passes_through() {
+        // Normal sigma below cap should pass through unchanged
+        let config = make_config();
+        let default_sigma = config.default_sigma; // 0.00025
+        let max_sigma = config.max_sigma_multiplier * default_sigma; // 10.0 * 0.00025 = 0.0025
+        let estimator = ParameterEstimator::new(config);
+
+        // Raw sigma starts at default_sigma during warmup — well below cap
+        let sigma = estimator.sigma();
+        assert!(
+            sigma <= max_sigma,
+            "Normal sigma {sigma} should be below cap {max_sigma}"
+        );
+        assert!(sigma > 0.0, "Sigma should be positive during warmup");
+    }
+
+    #[test]
+    fn test_sigma_cap_extreme_sigma_is_capped() {
+        let mut config = make_config();
+        config.max_sigma_multiplier = 5.0;
+        config.default_sigma = 0.001;
+        let estimator = ParameterEstimator::new(config);
+
+        let max_sigma = 5.0 * 0.001; // 0.005
+
+        // Directly verify capping via the cap_sigma helper:
+        // A value above max should be clamped
+        let extreme = 0.05; // 10x the cap
+        let capped = estimator.cap_sigma(extreme);
+        assert!(
+            (capped - max_sigma).abs() < 1e-12,
+            "Extreme sigma {extreme} should be capped to {max_sigma}, got {capped}"
+        );
+
+        // A value below max should pass through
+        let normal = 0.002;
+        let passed = estimator.cap_sigma(normal);
+        assert!(
+            (passed - normal).abs() < 1e-12,
+            "Normal sigma {normal} should pass through unchanged, got {passed}"
+        );
+    }
+
+    #[test]
+    fn test_sigma_cap_respects_custom_multiplier() {
+        let mut config = make_config();
+        config.max_sigma_multiplier = 3.0;
+        config.default_sigma = 0.0005;
+        let estimator = ParameterEstimator::new(config);
+
+        let expected_cap = 3.0 * 0.0005; // 0.0015
+        assert!(
+            (estimator.max_sigma - expected_cap).abs() < 1e-12,
+            "max_sigma should be multiplier * default_sigma = {expected_cap}, got {}",
+            estimator.max_sigma
+        );
+    }
+
+    // ======================================================================
+    // Kappa Stagnation Alert Tests
+    // ======================================================================
+
+    #[test]
+    fn test_kappa_stagnation_no_alert_during_warmup() {
+        // Use weak prior so confidence would trigger IF time threshold were met
+        let mut config = make_config();
+        config.kappa_prior_strength = 0.5;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Simulate a trade at t=0 to set first_update_time
+        estimator.on_trade(1_000_000, 100.0, 0.1, Some(true));
+
+        // Check after only 30 minutes — should NOT alert (< 1 hour)
+        let thirty_min_later = 1_000_000 + 30 * 60 * 1000;
+        let alert = estimator.check_kappa_stagnation(thirty_min_later);
+        assert!(
+            alert.is_none(),
+            "Should not alert before 1 hour of runtime"
+        );
+    }
+
+    #[test]
+    fn test_kappa_stagnation_alert_after_1hr_no_fills() {
+        // Use very weak prior so initial confidence is below 0.5 without own fills.
+        // With prior_strength=1: alpha=1, CV = sqrt(1)/1 = 1.0, confidence = 0.5 exactly.
+        // Use 0.5 to ensure confidence < 0.5 from prior alone.
+        let mut config = make_config();
+        config.kappa_prior_strength = 0.5;
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Simulate a trade at t=0 (feeds market_kappa, NOT own_kappa)
+        estimator.on_trade(1_000_000, 100.0, 0.1, Some(true));
+
+        // Verify own-fill confidence is indeed below threshold
+        let conf = estimator.kappa_confidence();
+        assert!(
+            conf < 0.5,
+            "With weak prior and no own fills, confidence should be < 0.5, got {conf}"
+        );
+
+        // Check after 2 hours with zero own fills → confidence stays low
+        let two_hours_later = 1_000_000 + 2 * 3_600_000;
+        let alert = estimator.check_kappa_stagnation(two_hours_later);
+        assert!(
+            alert.is_some(),
+            "Should alert after >1 hour with low fill confidence"
+        );
+
+        let alert = alert.unwrap();
+        assert_eq!(alert.own_fill_count, 0);
+        assert!(alert.confidence < 0.5);
+        assert!(alert.time_since_start_s > 3600.0);
+        assert!(alert.blended_kappa > 0.0, "Blended kappa must be positive");
+    }
+
+    #[test]
+    fn test_kappa_stagnation_no_alert_with_sufficient_fills() {
+        let config = make_config();
+        let mut estimator = ParameterEstimator::new(config);
+
+        // Simulate a trade to set first_update_time
+        estimator.on_trade(1_000_000, 100.0, 0.1, Some(true));
+
+        // Feed enough own fills to push confidence above 0.5
+        // BayesianKappaEstimator confidence = n / (n + prior_strength)
+        // With prior_strength=5 (default), need ~5 fills for confidence=0.5
+        for i in 0..20 {
+            let t = 1_000_000 + i * 1000;
+            estimator.on_own_fill(
+                t,
+                100.0,           // placement_price
+                100.0 + 0.001,   // fill_price (tiny distance = high kappa)
+                0.01,            // fill_size
+                true,            // is_buy
+            );
+        }
+
+        // Check after 2 hours
+        let two_hours_later = 1_000_000 + 2 * 3_600_000;
+        let alert = estimator.check_kappa_stagnation(two_hours_later);
+        assert!(
+            alert.is_none(),
+            "Should not alert when own-fill confidence is high (got {:?})",
+            alert
+        );
+        assert_eq!(estimator.own_fill_count, 20);
     }
 }
