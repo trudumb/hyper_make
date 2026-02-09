@@ -131,8 +131,9 @@ mod tests {
     fn test_small_drawdown() {
         let monitor = DrawdownMonitor::new(0.10); // 10% limit
         let state = RiskState {
+            account_value: 1000.0,
             peak_pnl: 1000.0,
-            daily_pnl: 980.0, // 2% drawdown
+            daily_pnl: 980.0, // drawdown = (1000-980)/1000 = 2%
             ..Default::default()
         };
 
@@ -144,8 +145,9 @@ mod tests {
     fn test_warning_drawdown() {
         let monitor = DrawdownMonitor::new(0.10).with_warning_threshold(0.7); // 10% limit
         let state = RiskState {
+            account_value: 1000.0,
             peak_pnl: 1000.0,
-            daily_pnl: 920.0, // 8% drawdown = 80% of limit
+            daily_pnl: 920.0, // drawdown = (1000-920)/1000 = 8% = 80% of 10% limit
             ..Default::default()
         };
 
@@ -157,8 +159,9 @@ mod tests {
     fn test_over_limit() {
         let monitor = DrawdownMonitor::new(0.05); // 5% limit
         let state = RiskState {
+            account_value: 1000.0,
             peak_pnl: 1000.0,
-            daily_pnl: 900.0, // 10% drawdown
+            daily_pnl: 900.0, // drawdown = (1000-900)/1000 = 10% > 5% limit
             ..Default::default()
         };
 

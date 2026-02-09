@@ -97,6 +97,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
             }
 
+            // === AS Outcome Feedback: Check 5-second markout on pending fills ===
+            // Drain fills older than 5 seconds: compute whether mid moved against us
+            // and feed outcome to pre-fill classifier + model gating.
+            self.check_pending_fill_outcomes(current_time_ms);
+
             // === First-Principles Gap 2: Update ThresholdKappa with return observation ===
             // Feed return_bps to ThresholdKappa for TAR model regime detection.
             // This determines whether we're in mean-reversion or momentum regime.
@@ -150,6 +155,65 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         } else {
             Ok(())
+        }
+    }
+
+    /// Check pending fill outcomes for 5-second adverse selection markout.
+    ///
+    /// For each fill older than 5 seconds, compute whether mid moved against us:
+    /// - Buy fill is adverse if mid dropped > 1 bps (we overpaid)
+    /// - Sell fill is adverse if mid rose > 1 bps (we undersold)
+    ///
+    /// Feeds outcomes to pre-fill classifier and model gating for calibration.
+    /// Mirrors paper_trader.rs `check_adverse_selection_outcomes()`.
+    fn check_pending_fill_outcomes(&mut self, now_ms: u64) {
+        const OUTCOME_DELAY_MS: u64 = 5_000; // 5-second markout window
+        const ADVERSE_THRESHOLD_BPS: f64 = 1.0; // 1 bps threshold for adverse classification
+
+        while let Some(front) = self.infra.pending_fill_outcomes.front() {
+            if now_ms.saturating_sub(front.timestamp_ms) < OUTCOME_DELAY_MS {
+                break; // Not old enough yet
+            }
+
+            let pending = self.infra.pending_fill_outcomes.pop_front().unwrap();
+            if self.latest_mid <= 0.0 || pending.mid_at_fill <= 0.0 {
+                continue;
+            }
+
+            // Compute adverse selection:
+            // Buy fill is adverse if mid dropped (we overpaid)
+            // Sell fill is adverse if mid rose (we undersold)
+            let mid_change_bps =
+                ((self.latest_mid - pending.mid_at_fill) / pending.mid_at_fill) * 10_000.0;
+            let was_adverse = if pending.is_buy {
+                mid_change_bps < -ADVERSE_THRESHOLD_BPS
+            } else {
+                mid_change_bps > ADVERSE_THRESHOLD_BPS
+            };
+            let magnitude_bps = mid_change_bps.abs();
+
+            // Feed outcome to pre-fill classifier for Bayesian AS learning
+            self.tier1.pre_fill_classifier.record_outcome(
+                pending.is_buy, // is_bid = is_buy (our bid was filled)
+                was_adverse,
+                Some(magnitude_bps),
+            );
+
+            // Feed outcome to model gating for AS prediction calibration
+            let predicted_as_prob = self.tier1.pre_fill_classifier.cached_toxicity();
+            self.stochastic
+                .signal_integrator
+                .update_as_prediction(predicted_as_prob, was_adverse);
+
+            if was_adverse {
+                tracing::info!(
+                    side = if pending.is_buy { "Buy" } else { "Sell" },
+                    magnitude_bps = %format!("{:.1}", magnitude_bps),
+                    mid_at_fill = %format!("{:.4}", pending.mid_at_fill),
+                    mid_now = %format!("{:.4}", self.latest_mid),
+                    "[AS OUTCOME] adverse fill detected via 5s markout"
+                );
+            }
         }
     }
 
@@ -515,10 +579,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // This updates fill rate tracking for fill-hungry mode
                 self.stochastic.calibration_controller.record_fill();
 
+                // === Kappa Learning: Feed own fills to parameter estimator ===
+                // This teaches the kappa estimator from our own fill intensity,
+                // mirroring paper_trader.rs on_simulated_fill() wiring.
+                let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
+                self.estimator.on_own_fill(
+                    fill.time,       // timestamp_ms
+                    fill_price,      // placement_price (best approximation)
+                    fill_price,      // fill_price
+                    fill_size,
+                    is_buy,
+                );
+
+                // === AS Outcome Queue: Record fill for 5-second markout ===
+                // After 5 seconds we check whether mid moved against us (adverse selection).
+                // Drained in handle_all_mids -> check_pending_fill_outcomes().
+                self.infra.pending_fill_outcomes.push_back(
+                    crate::market_maker::fills::PendingFillOutcome {
+                        timestamp_ms: fill.time,
+                        fill_price,
+                        is_buy,
+                        mid_at_fill: self.latest_mid,
+                    },
+                );
+
                 // === ModelGating Updates ===
                 // Feed fill data to SignalIntegrator's ModelGating tracker.
                 // This updates kappa IR tracking and regime-conditioned kappa estimation.
-                let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
                 self.stochastic.signal_integrator.on_fill(
                     fill.time,
                     fill_price,
@@ -552,7 +639,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         predicted_edge_bps: depth_bps - predicted_as_bps - MAKER_FEE_BPS,
                         realized_edge_bps: depth_bps - as_realized_bps - MAKER_FEE_BPS,
                     };
-                    self.tier2.edge_tracker.add_snapshot(snap);
+                    self.tier2.edge_tracker.add_snapshot(snap.clone());
+
+                    // === Live Analytics: Record fill for Sharpe/attribution tracking ===
+                    let fill_pnl_bps = snap.realized_edge_bps;
+                    self.live_analytics.record_fill(fill_pnl_bps, Some(&snap));
                 }
 
                 // === V2 INTEGRATION: BOCPD Kappa Relationship Update ===
@@ -1512,6 +1603,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 );
             }
         }
+
+        // === Live Analytics: Periodic summary (Sharpe, signal attribution) ===
+        let mean_edge = self.tier2.edge_tracker.mean_realized_edge();
+        let _ = self.live_analytics.maybe_log_summary(mean_edge);
 
         // Log current state for debugging
         trace!(

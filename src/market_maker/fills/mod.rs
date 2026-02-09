@@ -48,6 +48,23 @@ pub use processor::{
 
 use std::time::Instant;
 
+/// Pending fill outcome for adverse selection markout tracking.
+///
+/// After each fill, we record the mid price and wait 5 seconds.
+/// Then we check whether the mid moved against us (adverse selection)
+/// and feed the outcome to the pre-fill classifier and model gating.
+#[derive(Debug, Clone)]
+pub struct PendingFillOutcome {
+    /// Fill timestamp in milliseconds since epoch
+    pub timestamp_ms: u64,
+    /// Fill price
+    pub fill_price: f64,
+    /// Whether this was a buy fill (our bid was filled)
+    pub is_buy: bool,
+    /// Mid price at the time of fill
+    pub mid_at_fill: f64,
+}
+
 /// A unified fill event containing all data needed by modules.
 ///
 /// This is the single source of truth for fill data, passed to the FillProcessor.
@@ -297,5 +314,109 @@ mod tests {
         let result = FillResult::new_fill(5);
         assert!(result.is_new);
         assert_eq!(result.consumers_notified, 5);
+    }
+
+    #[test]
+    fn test_pending_fill_outcome_creation() {
+        let outcome = PendingFillOutcome {
+            timestamp_ms: 1_700_000_000_000,
+            fill_price: 50_000.0,
+            is_buy: true,
+            mid_at_fill: 50_005.0,
+        };
+        assert!(outcome.is_buy);
+        assert!((outcome.fill_price - 50_000.0).abs() < f64::EPSILON);
+        assert!((outcome.mid_at_fill - 50_005.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pending_fill_outcome_queue_drain() {
+        use std::collections::VecDeque;
+
+        let mut queue: VecDeque<PendingFillOutcome> = VecDeque::new();
+        let base_ms = 1_700_000_000_000u64;
+
+        // Push 3 outcomes: t=0, t=3s, t=6s
+        for i in 0..3 {
+            queue.push_back(PendingFillOutcome {
+                timestamp_ms: base_ms + i * 3_000,
+                fill_price: 50_000.0,
+                is_buy: i % 2 == 0,
+                mid_at_fill: 50_000.0,
+            });
+        }
+        assert_eq!(queue.len(), 3);
+
+        // At t=4.9s, only the first (t=0) should be expired (>= 5s not met)
+        let now_ms = base_ms + 4_999;
+        let expired: Vec<_> = std::iter::from_fn(|| {
+            if let Some(front) = queue.front() {
+                if now_ms.saturating_sub(front.timestamp_ms) >= 5_000 {
+                    return queue.pop_front();
+                }
+            }
+            None
+        })
+        .collect();
+        assert_eq!(expired.len(), 0);
+        assert_eq!(queue.len(), 3);
+
+        // At t=5s, the first outcome (t=0) should expire
+        let now_ms = base_ms + 5_000;
+        let expired: Vec<_> = std::iter::from_fn(|| {
+            if let Some(front) = queue.front() {
+                if now_ms.saturating_sub(front.timestamp_ms) >= 5_000 {
+                    return queue.pop_front();
+                }
+            }
+            None
+        })
+        .collect();
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].is_buy);
+        assert_eq!(queue.len(), 2);
+
+        // At t=11s, both remaining (t=3s and t=6s) should expire
+        let now_ms = base_ms + 11_000;
+        let expired: Vec<_> = std::iter::from_fn(|| {
+            if let Some(front) = queue.front() {
+                if now_ms.saturating_sub(front.timestamp_ms) >= 5_000 {
+                    return queue.pop_front();
+                }
+            }
+            None
+        })
+        .collect();
+        assert_eq!(expired.len(), 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_pending_fill_outcome_adverse_classification() {
+        let mid_at_fill = 50_000.0;
+
+        // Buy fill: mid dropped 2 bps -> adverse
+        let mid_now_buy_adverse = mid_at_fill * (1.0 - 2.0 / 10_000.0); // 49999.0
+        let mid_change_bps = ((mid_now_buy_adverse - mid_at_fill) / mid_at_fill) * 10_000.0;
+        let was_adverse_buy = mid_change_bps < -1.0; // Mid dropped > 1 bps
+        assert!(was_adverse_buy);
+
+        // Buy fill: mid rose 2 bps -> not adverse
+        let mid_now_buy_good = mid_at_fill * (1.0 + 2.0 / 10_000.0);
+        let mid_change_bps = ((mid_now_buy_good - mid_at_fill) / mid_at_fill) * 10_000.0;
+        let was_adverse_buy = mid_change_bps < -1.0;
+        assert!(!was_adverse_buy);
+
+        // Sell fill: mid rose 2 bps -> adverse
+        let mid_now_sell_adverse = mid_at_fill * (1.0 + 2.0 / 10_000.0);
+        let mid_change_bps = ((mid_now_sell_adverse - mid_at_fill) / mid_at_fill) * 10_000.0;
+        let was_adverse_sell = mid_change_bps > 1.0; // Mid rose > 1 bps
+        assert!(was_adverse_sell);
+
+        // Sell fill: mid dropped 2 bps -> not adverse
+        let mid_now_sell_good = mid_at_fill * (1.0 - 2.0 / 10_000.0);
+        let mid_change_bps = ((mid_now_sell_good - mid_at_fill) / mid_at_fill) * 10_000.0;
+        let was_adverse_sell = mid_change_bps > 1.0;
+        assert!(!was_adverse_sell);
     }
 }

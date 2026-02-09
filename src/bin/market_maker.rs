@@ -1864,6 +1864,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "No Binance equivalent for asset — cross-venue signal disabled. \
                  Use --binance-symbol to override if a correlated pair exists."
             );
+            market_maker.disable_binance_signals();
+            tracing::info!("Disabled Binance-dependent signals to prevent staleness widening");
         }
     } else {
         tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
@@ -1899,10 +1901,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if cli.enable_rl {
-        market_maker.set_rl_enabled(true);
-        tracing::info!("RL agent ENABLED for action control");
-    }
+    // RL is enabled by default; --enable-rl flag is now a no-op (kept for backward compat)
+    tracing::info!(
+        rl_enabled = true,
+        min_fills_gate = 20,
+        "RL agent enabled (actions gated until sufficient real fills)"
+    );
 
     // === RL Hot-Reload: Watch checkpoint file for offline trainer updates ===
     if let Some(ref rl_watch_path) = cli.rl_watch {

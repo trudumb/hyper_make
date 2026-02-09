@@ -237,13 +237,16 @@ impl RiskState {
         }
     }
 
-    /// Calculate drawdown from peak (0.0 to 1.0+).
+    /// Calculate drawdown from peak as fraction of account value (0.0 to 1.0+).
     pub fn drawdown(&self) -> f64 {
-        if self.peak_pnl > 0.0 {
-            (self.peak_pnl - self.daily_pnl) / self.peak_pnl
-        } else {
-            0.0
+        if self.account_value <= 0.0 {
+            return 0.0;
         }
+        if self.peak_pnl <= 0.0 {
+            // No profit yet — no drawdown from peak
+            return 0.0;
+        }
+        (self.peak_pnl - self.daily_pnl) / self.account_value
     }
 
     /// Is data stale (beyond threshold)?
@@ -373,13 +376,54 @@ mod tests {
     }
 
     #[test]
-    fn test_drawdown() {
+    fn test_drawdown_normal_case() {
+        // 10% drawdown on $1000 account: peak=$100, current=$0 => (100-0)/1000 = 0.10
         let state = RiskState {
-            daily_pnl: 80.0,
+            daily_pnl: 0.0,
             peak_pnl: 100.0,
+            account_value: 1000.0,
             ..Default::default()
         };
-        assert!((state.drawdown() - 0.2).abs() < f64::EPSILON);
+        assert!((state.drawdown() - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_drawdown_tiny_peak_no_explosion() {
+        // Bug case: peak=$0.001, loss to -$0.01 on $1000 account
+        // Old code: (0.001 - (-0.01)) / 0.001 = 11.0 (1100%!) -- blows up
+        // New code: (0.001 - (-0.01)) / 1000 = 0.000011 (~0.001%) -- correct
+        let state = RiskState {
+            daily_pnl: -0.01,
+            peak_pnl: 0.001,
+            account_value: 1000.0,
+            ..Default::default()
+        };
+        let dd = state.drawdown();
+        assert!(dd < 0.001, "drawdown should be tiny, got {dd}");
+        assert!(dd > 0.0, "drawdown should be positive");
+    }
+
+    #[test]
+    fn test_drawdown_zero_account_value_returns_zero() {
+        let state = RiskState {
+            daily_pnl: -10.0,
+            peak_pnl: 50.0,
+            account_value: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(state.drawdown(), 0.0);
+    }
+
+    #[test]
+    fn test_drawdown_no_profit_yet_returns_zero() {
+        // No profit yet (peak_pnl <= 0) -- drawdown should be 0
+        let state = RiskState {
+            daily_pnl: -5.0,
+            peak_pnl: 0.0,
+            account_value: 1000.0,
+            ..Default::default()
+        };
+        assert_eq!(state.drawdown(), 0.0);
     }
 
     #[test]

@@ -25,7 +25,12 @@
       "Bash(cargo check:*)",
       "mcp__serena__read_memory",
       "Bash(cargo metadata:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(test:*)",
+      "Bash(grep:*)",
+      "mcp__serena__insert_before_symbol",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo add:*)"
     ]
   }
 }

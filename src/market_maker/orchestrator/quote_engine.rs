@@ -789,6 +789,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // - Model gating (IR-based confidence)
         let signals = self.stochastic.signal_integrator.get_signals();
 
+        // Record signal contributions for analytics attribution
+        self.live_analytics.record_quote_cycle(&signals);
+
         if signals.lead_lag_actionable {
             // Real cross-exchange signal from Binance feed
             market_params.lead_lag_signal_bps = signals.combined_skew_bps;

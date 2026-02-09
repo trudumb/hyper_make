@@ -27,6 +27,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
 
+        // Flush analytics before shutdown
+        self.live_analytics.flush();
+
         // Log final state before cancelling
         let final_position = self.position.position();
         let final_mid = self.latest_mid;

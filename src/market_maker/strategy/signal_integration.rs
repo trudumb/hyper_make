@@ -969,6 +969,15 @@ impl SignalIntegrator {
         }
     }
 
+    /// Disable signals that depend on Binance/cross-venue data.
+    /// Call this when no Binance feed is available for the asset (e.g. HIP-3 DEX tokens).
+    /// Without this, `staleness_spread_multiplier()` permanently returns 2.0x
+    /// because lead_lag and cross_venue never receive data to warm up.
+    pub fn disable_binance_signals(&mut self) {
+        self.config.use_lead_lag = false;
+        self.config.use_cross_venue = false;
+    }
+
     /// Get lag analyzer status for diagnostics.
     pub fn lag_analyzer_status(&self) -> LagAnalyzerStatus<'_> {
         let (optimal_lag_ms, mi_bits) = self
@@ -1196,5 +1205,63 @@ mod tests {
         config_all.use_regime_kappa = true;
         let all_stale = SignalIntegrator::new(config_all);
         assert!((all_stale.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_disable_binance_signals_removes_staleness() {
+        // Use a config with ONLY Binance-dependent signals enabled.
+        // This way disabling them should drop staleness from 2.0x to 1.0x.
+        let mut config = SignalIntegratorConfig::disabled();
+        config.use_lead_lag = true;
+        config.use_cross_venue = true;
+        let mut integrator = SignalIntegrator::new(config);
+        let before = integrator.staleness_spread_multiplier();
+        assert!(
+            (before - 2.0).abs() < f64::EPSILON,
+            "lead_lag + cross_venue should be stale without data: {before}"
+        );
+
+        integrator.disable_binance_signals();
+        // After disabling, those two signals no longer count toward staleness.
+        let after = integrator.staleness_spread_multiplier();
+        assert!(
+            (after - 1.0).abs() < f64::EPSILON,
+            "staleness should be 1.0 after disabling Binance signals: {after}"
+        );
+    }
+
+    #[test]
+    fn test_staleness_only_counts_hl_native_signals_after_disable() {
+        // Start from disabled config, enable only Binance-dependent signals
+        let mut config = SignalIntegratorConfig::disabled();
+        config.use_lead_lag = true;
+        config.use_cross_venue = true;
+        let mut integrator = SignalIntegrator::new(config);
+
+        // Both stale => 2.0x
+        assert!((integrator.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
+
+        integrator.disable_binance_signals();
+
+        // Now no enabled signals are stale => 1.0x
+        assert!((integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_disable_binance_signals_idempotent() {
+        let mut integrator = SignalIntegrator::default_config();
+
+        integrator.disable_binance_signals();
+        let first = integrator.staleness_spread_multiplier();
+
+        integrator.disable_binance_signals();
+        let second = integrator.staleness_spread_multiplier();
+
+        assert!(
+            (first - second).abs() < f64::EPSILON,
+            "calling disable_binance_signals twice should be idempotent"
+        );
+        assert!(!integrator.config.use_lead_lag);
+        assert!(!integrator.config.use_cross_venue);
     }
 }

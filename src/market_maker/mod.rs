@@ -275,6 +275,9 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     experience_logger: Option<learning::experience::ExperienceLogger>,
     /// Unique session identifier for correlating experience records.
     experience_session_id: String,
+    /// Live analytics bundle (Sharpe, signal attribution, persistence).
+    /// Enabled by default — mirrors paper_trader's analytics scaffolding.
+    pub live_analytics: analytics::live::LiveAnalytics,
 }
 
 impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
@@ -422,8 +425,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
-            // RL agent control (disabled by default, enabled via with_rl_enabled)
-            rl_enabled: false,
+            // RL agent control (enabled by default, gated by min_real_fills)
+            rl_enabled: true,
             rl_min_real_fills: 20,
             rl_auto_disable_fills: 100,
             // RL hot-reload (disabled by default, enabled via with_rl_reload)
@@ -438,6 +441,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0)
+            ),
+            // Live analytics (enabled by default — Sharpe, signal attribution, logging)
+            live_analytics: analytics::live::LiveAnalytics::new(
+                Some(std::path::PathBuf::from("data/analytics")),
             ),
         }
     }
@@ -568,6 +575,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Enable or disable RL agent control of quoting actions (setter).
     pub fn set_rl_enabled(&mut self, enabled: bool) {
         self.rl_enabled = enabled;
+    }
+
+    /// Disable Binance-dependent signals (lead-lag, cross-venue).
+    /// Call when no Binance feed is available for the asset to prevent
+    /// permanent signal staleness widening.
+    pub fn disable_binance_signals(&mut self) {
+        self.stochastic.signal_integrator.disable_binance_signals();
     }
 
     /// Enable experience logging for RL SARSA tuples.

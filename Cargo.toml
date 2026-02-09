@@ -87,3 +87,6 @@ inherits = "release"
 incremental = false
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3.25.0"

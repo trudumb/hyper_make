@@ -40,6 +40,14 @@
 - Tick proxy: `mid_price * 0.0001` (1 bps) — conservative for most assets
 - Also filters modify specs that would cross BBO before sending to exchange
 
+## Learning Loops Wired in Live (2026-02-09)
+- `estimator.on_own_fill()` now called in handlers.rs fill loop (was missing)
+- `PendingFillOutcome` struct added to fills/mod.rs for 5s AS markout
+- VecDeque field on InfraComponents (core/components.rs) -- avoids editing lead-owned mod.rs
+- `check_pending_fill_outcomes()` method in handlers.rs, called from handle_all_mids
+- calibration_controller.record_fill() and signal_integrator.on_fill() were already wired
+- Key: when adding state to MarketMaker but can't edit mod.rs, put it on a component bundle (InfraComponents, Tier1, etc.)
+
 ## Serena Tool Notes
 - `find_symbol` requires `name_path_pattern` not `name_path` parameter
 - Paper trader methods not always found by Serena's symbol tools -- use Grep as fallback

@@ -1375,8 +1375,9 @@ mod tests {
         // - Position: 90% of value limit -> Warning
         // - Cascade: 0.5 severity -> WidenSpreads (above 0.4 widen threshold)
         let state = RiskState {
+            account_value: 1000.0,
             daily_pnl: -40.0,
-            peak_pnl: 100.0,
+            peak_pnl: 100.0, // drawdown = (100 - (-40)) / 1000 = 14% > 5% limit -> Critical
             position: 0.9,
             max_position: 1.0,
             position_value: 9000.0,

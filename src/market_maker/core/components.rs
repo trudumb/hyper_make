@@ -261,6 +261,10 @@ pub struct InfraComponents {
     pub fill_tracker: FillTracker,
     /// Order lifecycle tracker
     pub order_lifecycle: OrderLifecycleTracker,
+    /// Pending fill outcomes for 5-second adverse selection markout.
+    /// Fills are pushed here; on each mid update, expired entries are drained
+    /// and fed to the pre-fill classifier and model gating.
+    pub pending_fill_outcomes: std::collections::VecDeque<crate::market_maker::fills::PendingFillOutcome>,
 }
 
 /// Cached exchange rate limit with timestamp.
@@ -416,6 +420,7 @@ impl InfraComponents {
             dashboard: DashboardState::default(),
             fill_tracker: FillTracker::new(1000),
             order_lifecycle: OrderLifecycleTracker::new(1000),
+            pending_fill_outcomes: std::collections::VecDeque::with_capacity(64),
         }
     }
 }
