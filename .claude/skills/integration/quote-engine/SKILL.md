@@ -1,6 +1,7 @@
 ---
 name: Quote Engine Integration
 description: Wire together all model components into a coherent quote generation pipeline
+user-invocable: false
 ---
 
 # Quote Engine Integration Skill

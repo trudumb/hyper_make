@@ -1,6 +1,60 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
-  "teammateMode": "in-process"
+  "teammateMode": "in-process",
+  "alwaysThinkingEnabled": true,
+  "showTurnDuration": true,
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Edit(./src/**)",
+      "Edit(./.claude/**)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo build *)",
+      "Bash(cargo check *)",
+      "Bash(cargo run --bin calibration_report *)",
+      "Bash(cargo run --bin health_dashboard *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git branch *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(git fetch *)",
+      "Bash(gh pr *)",
+      "Bash(gh issue *)",
+      "Bash(gh run *)",
+      "Bash(gh release *)",
+      "Bash(wc *)",
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(find *)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git reset *)",
+      "Bash(cargo run --bin market_maker *)",
+      "Bash(cargo run --bin paper_trader *)",
+      "Bash(cargo run --bin parameter_estimator *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./**/private_key*)",
+      "Read(./**/credentials*)",
+      "Read(./**/*.pem)",
+      "Read(~/.aws/**)",
+      "Bash(rm -rf *)"
+    ]
+  }
 }

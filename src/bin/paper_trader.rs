@@ -94,7 +94,7 @@ use hyperliquid_rust_sdk::market_maker::checkpoint::{
 };
 use hyperliquid_rust_sdk::market_maker::learning::{
     ExperienceLogger, ExperienceParams, ExperienceRecord, ExperienceSource,
-    ExplorationStrategy, MDPState, QLearningAgent, QLearningConfig,
+    ExplorationStrategy, MDPAction, MDPState, QLearningAgent, QLearningConfig,
     RLPolicyRecommendation, Reward,
 };
 use hyperliquid_rust_sdk::market_maker::stochastic::{
@@ -1010,8 +1010,8 @@ impl SimulationState {
                 market_params.hawkes_branching_ratio,
             );
             // Always explore in paper trading
-            let rl_rec = RLPolicyRecommendation::from_agent(&mut self.rl_agent, &mdp_state, true);
-            self.rl_agent.push_state_action(mdp_state, rl_rec.action);
+            let rl_rec = RLPolicyRecommendation::from_agent(&mut self.rl_agent, mdp_state.to_index(), true);
+            self.rl_agent.push_state_action_idx(rl_rec.state_idx, rl_rec.action_idx);
 
             // Store RL recommendations in market_params for logging
             market_params.rl_spread_delta_bps = rl_rec.spread_delta_bps;
@@ -1415,7 +1415,7 @@ impl SimulationState {
             };
             const MAKER_FEE_BPS: f64 = 1.5;
             let realized_edge_bps = spread_capture_bps - MAKER_FEE_BPS;
-            let was_adverse = realized_edge_bps < 0.0;
+            let _was_adverse = realized_edge_bps < 0.0;
 
             // FIX P0-2: Use cached book_imbalance instead of hardcoded 0.0
             let fill_state = MDPState::from_continuous(
@@ -1432,12 +1432,12 @@ impl SimulationState {
                 realized_edge_bps,
                 inventory_risk,
                 vol_ratio,
-                was_adverse,
+                inventory_risk, // prev_inventory_risk approximated by current
             );
 
             // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
-            while let Some((state, action)) = self.rl_agent.take_next_state_action() {
-                self.rl_agent.update(state, action, reward, fill_state, false);
+            while let Some((state_idx, action_idx)) = self.rl_agent.take_next_state_action() {
+                self.rl_agent.update_idx(state_idx, action_idx, reward, fill_state.to_index(), false);
 
                 // Log experience for offline RL training
                 if let Some(ref mut logger) = self.experience_logger {
@@ -1452,8 +1452,8 @@ impl SimulationState {
                         "Quiet"
                     };
                     let record = ExperienceRecord::from_params(ExperienceParams {
-                        state,
-                        action,
+                        state: MDPState::from_index(state_idx),
+                        action: MDPAction::from_index(action_idx),
                         reward,
                         next_state: fill_state,
                         done: false,

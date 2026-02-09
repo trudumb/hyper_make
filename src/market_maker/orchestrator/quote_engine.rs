@@ -1634,14 +1634,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let explore = !self.stochastic.calibrated_edge.is_useful();
         let rl_recommendation = crate::market_maker::learning::RLPolicyRecommendation::from_agent(
             &mut self.stochastic.rl_agent,
-            &mdp_state,
+            mdp_state.to_index(),
             explore,
         );
 
         // Store state-action pair for credit assignment when fill occurs
-        self.stochastic.rl_agent.push_state_action(
-            mdp_state,
-            rl_recommendation.action,
+        self.stochastic.rl_agent.push_state_action_idx(
+            rl_recommendation.state_idx,
+            rl_recommendation.action_idx,
         );
 
         // Populate MarketParams with RL recommendations

@@ -1,7 +1,8 @@
 ---
 name: risk
-description: Owns risk/, safety/, and monitoring/ modules with defense-first mandate. Requires plan approval.
+description: "Owns risk/, safety/, and monitoring/ modules with defense-first mandate. Requires plan approval. Use this agent when modifying risk monitors, circuit breakers, kill switch, position guards, drawdown limits, safety auditor, or alerting/dashboard/postmortem infrastructure."
 model: inherit
+maxTurns: 25
 permissionMode: plan
 skills:
   - risk-management

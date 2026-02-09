@@ -1,7 +1,8 @@
 ---
 name: infra
-description: Owns orchestrator/, infra/, messages/, core/, fills/, execution/, and events/ modules. Requires plan approval for orchestrator/ changes.
+description: "Owns orchestrator/, infra/, messages/, core/, fills/, execution/, and events/ modules. Requires plan approval for orchestrator/ changes. Use this agent when modifying the event loop, WebSocket handling, rate limiting, reconnection, fill processing, order execution, or data quality gates."
 model: inherit
+maxTurns: 25
 permissionMode: plan
 skills:
   - infrastructure-ops

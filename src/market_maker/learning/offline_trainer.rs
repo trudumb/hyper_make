@@ -268,7 +268,7 @@ mod tests {
             edge_component: reward,
             inventory_penalty: 0.0,
             volatility_penalty: 0.0,
-            adverse_penalty: 0.0,
+            inventory_change_penalty: 0.0,
             next_state_idx,
             done: false,
             timestamp_ms: 0,

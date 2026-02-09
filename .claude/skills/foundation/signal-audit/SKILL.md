@@ -1,6 +1,7 @@
 ---
 name: Signal Audit
 description: Systematically measure the predictive information content of all available signals before building models
+user-invocable: false
 ---
 
 # Signal Audit Skill

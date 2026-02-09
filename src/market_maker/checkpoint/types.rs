@@ -529,6 +529,8 @@ mod tests {
                 episodes: 50,
                 total_reward: 12.5,
                 total_observations: 15,
+                action_space_version: 1,
+                use_compact_state: false,
             },
         };
 

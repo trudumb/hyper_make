@@ -1,7 +1,8 @@
 ---
 name: strategy
-description: Owns strategy/, quoting/, process_models/, stochastic/, and control/ modules. Exclusive editor of signal_integration.rs.
+description: "Owns strategy/, quoting/, process_models/, stochastic/, and control/ modules. Exclusive editor of signal_integration.rs. Use this agent when modifying GLFT spread computation, inventory skew, signal integration, stochastic control, or value function optimization."
 model: inherit
+maxTurns: 25
 skills:
   - quote-engine
   - stochastic-controller

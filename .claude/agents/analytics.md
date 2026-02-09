@@ -1,7 +1,8 @@
 ---
 name: analytics
-description: Owns analytics/, learning/, tracking/, simulation/, checkpoint/, and adaptive/ modules.
+description: "Owns analytics/, learning/, tracking/, simulation/, checkpoint/, and adaptive/ modules. Use this agent when modifying PnL attribution, Sharpe calculation, edge metrics, adaptive ensembles, fill simulation, checkpoint persistence, blended kappa/gamma, or calibration tracking."
 model: inherit
+maxTurns: 25
 skills:
   - calibration-analysis
   - daily-calibration-report

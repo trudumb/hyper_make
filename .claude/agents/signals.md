@@ -1,7 +1,8 @@
 ---
 name: signals
-description: Owns estimator/, adverse_selection/, calibration/, and edge/ modules. Use for signal development, feature engineering, and calibration work.
+description: "Owns estimator/, adverse_selection/, calibration/, and edge/ modules. Use this agent when adding or modifying signals, parameter estimators (kappa, sigma, regime), adverse selection classifiers, calibration metrics, or edge monitoring."
 model: inherit
+maxTurns: 25
 skills:
   - measurement-infrastructure
   - signal-audit

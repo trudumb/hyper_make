@@ -623,28 +623,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         realized_edge_bps,
                         inventory_risk,
                         vol_ratio,
-                        was_adverse,
+                        inventory_risk, // prev_inventory_risk approximated by current
                     );
 
                     // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
                     let mut updated = false;
                     let regime_str = self.stochastic.position_decision.current_regime().to_string();
-                    while let Some((state, action)) = self.stochastic.rl_agent.take_next_state_action()
+                    while let Some((state_idx, action_idx)) = self.stochastic.rl_agent.take_next_state_action()
                     {
-                        self.stochastic.rl_agent.update(
-                            state,
-                            action,
+                        self.stochastic.rl_agent.update_idx(
+                            state_idx,
+                            action_idx,
                             reward,
-                            current_state,
+                            current_state.to_index(),
                             false, // not done
                         );
                         updated = true;
 
                         // === Experience Logging ===
                         if let Some(ref mut logger) = self.experience_logger {
+                            let mdp_state = MDPState::from_index(state_idx);
+                            let mdp_action = MDPAction::from_index(action_idx);
                             let record = ExperienceRecord::from_params(ExperienceParams {
-                                state,
-                                action,
+                                state: mdp_state,
+                                action: mdp_action,
                                 reward,
                                 next_state: current_state,
                                 done: false,
@@ -661,13 +663,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             let _ = logger.log(&record);
                         }
 
+                        let mdp_action_log = MDPAction::from_index(action_idx);
                         debug!(
                             realized_edge_bps = %format!("{:.2}", realized_edge_bps),
                             inventory_risk = %format!("{:.3}", inventory_risk),
                             reward_total = %format!("{:.3}", reward.total),
                             was_adverse = was_adverse,
-                            action_spread = %format!("{:.1}", action.spread.delta_bps()),
-                            action_skew = %format!("{:.1}", action.skew.bid_skew_bps()),
+                            action_spread = %format!("{:.1}", mdp_action_log.spread.delta_bps()),
+                            action_skew = %format!("{:.1}", mdp_action_log.skew.bid_skew_bps()),
                             "RL agent updated from fill (actual action)"
                         );
                     }

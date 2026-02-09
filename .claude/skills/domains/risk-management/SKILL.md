@@ -1,6 +1,7 @@
 ---
 name: Risk Management
 description: Layered risk system with monitors, circuit breakers, kill switch, and position guards. Read when working on risk/, safety/, or monitoring/ modules, or when debugging position limits, emergency shutdowns, or spread widening.
+user-invocable: false
 ---
 
 # Risk Management Skill

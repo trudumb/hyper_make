@@ -1,6 +1,7 @@
 ---
 name: Stochastic Controller
 description: Layer 3 optimal sequential decision-making with Bayesian belief tracking, HJB value functions, and changepoint detection. Read when working on control/, stochastic/, or process_models/ modules.
+user-invocable: false
 ---
 
 # Stochastic Controller Skill

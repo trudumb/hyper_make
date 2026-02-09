@@ -1,6 +1,7 @@
 ---
 name: Infrastructure Operations
 description: WebSocket management, event loop, rate limiting, reconnection, recovery, metrics, and execution infrastructure. Read when working on orchestrator/, infra/, messages/, core/, fills/, or execution/ modules.
+user-invocable: false
 ---
 
 # Infrastructure Operations Skill
