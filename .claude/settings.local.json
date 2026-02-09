@@ -31,7 +31,8 @@
       "mcp__serena__insert_before_symbol",
       "Bash(cargo clippy:*)",
       "Bash(cargo add:*)",
-      "Bash(sort:*)"
+      "Bash(sort:*)",
+      "mcp__serena__write_memory"
     ]
   }
 }
