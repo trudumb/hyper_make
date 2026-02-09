@@ -20,6 +20,29 @@ use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 use super::{Ladder, LadderConfig, LadderLevel, LadderLevels, LadderParams};
 use crate::market_maker::infra::capacity::DEPTH_INLINE_CAPACITY;
 
+/// Deduplicate ladder levels with the same price, merging their sizes.
+///
+/// After rounding to exchange tick size, multiple levels may collapse to the same price.
+/// This merges them (summing sizes) to avoid wasting API rate limit on duplicate orders.
+/// Levels must be sorted by price before calling.
+fn dedup_merge_levels(levels: &mut LadderLevels) {
+    if levels.len() <= 1 {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..levels.len() {
+        if (levels[read].price - levels[write].price).abs() < EPSILON {
+            levels[write].size += levels[read].size;
+        } else {
+            write += 1;
+            if write != read {
+                levels[write] = levels[read];
+            }
+        }
+    }
+    levels.truncate(write + 1);
+}
+
 /// Maximum fraction of total_size allowed in a single resting order.
 ///
 /// Prevents concentration fallbacks from dumping the entire position budget into
@@ -666,6 +689,10 @@ pub(crate) fn build_raw_ladder(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Merge levels with identical prices (from rounding to exchange tick size)
+    dedup_merge_levels(&mut bids);
+    dedup_merge_levels(&mut asks);
+
     Ladder { bids, asks }
 }
 
@@ -814,6 +841,10 @@ pub(crate) fn build_asymmetric_ladder(
             .partial_cmp(&b.price)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Merge levels with identical prices (from rounding to exchange tick size)
+    dedup_merge_levels(&mut bids);
+    dedup_merge_levels(&mut asks);
 
     Ladder { bids, asks }
 }
@@ -1846,6 +1877,69 @@ mod tests {
                 level.size <= cap + 0.001,
                 "Asymmetric ask size {:.6} exceeds cap {:.6}",
                 level.size, cap
+            );
+        }
+    }
+
+    #[test]
+    fn test_dedup_merge_levels() {
+        let mut levels: LadderLevels = smallvec![
+            LadderLevel { price: 100.0, size: 0.5, depth_bps: 2.0 },
+            LadderLevel { price: 100.0, size: 0.3, depth_bps: 3.0 },
+            LadderLevel { price: 101.0, size: 0.2, depth_bps: 5.0 },
+            LadderLevel { price: 101.0, size: 0.1, depth_bps: 6.0 },
+            LadderLevel { price: 102.0, size: 0.4, depth_bps: 8.0 },
+        ];
+        dedup_merge_levels(&mut levels);
+
+        assert_eq!(levels.len(), 3, "should merge to 3 unique prices");
+        assert!((levels[0].size - 0.8).abs() < 1e-9, "100.0: 0.5+0.3=0.8");
+        assert!((levels[1].size - 0.3).abs() < 1e-9, "101.0: 0.2+0.1=0.3");
+        assert!((levels[2].size - 0.4).abs() < 1e-9, "102.0: 0.4");
+    }
+
+    #[test]
+    fn test_dedup_merge_levels_single_and_empty() {
+        // Empty
+        let mut empty: LadderLevels = smallvec![];
+        dedup_merge_levels(&mut empty);
+        assert!(empty.is_empty());
+
+        // Single
+        let mut single: LadderLevels = smallvec![
+            LadderLevel { price: 50.0, size: 1.0, depth_bps: 5.0 },
+        ];
+        dedup_merge_levels(&mut single);
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn test_hype_price_no_duplicates() {
+        // HYPE at ~$31.61 with geometric spacing produces sub-$0.001 differences
+        // that collapse after rounding. Verify dedup removes them.
+        let depths = vec![2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0];
+        let sizes = vec![0.1; 8];
+        let mid = 31.61;
+        let market_mid = 31.61;
+        let decimals = 4; // HYPE uses 4 decimal places
+        let sz_decimals = 1;
+        let min_notional = 10.0;
+
+        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, decimals, sz_decimals, min_notional);
+
+        // Check no duplicate prices on either side
+        for i in 1..ladder.bids.len() {
+            assert!(
+                (ladder.bids[i].price - ladder.bids[i - 1].price).abs() > EPSILON,
+                "duplicate bid price at index {}: {:.4}",
+                i, ladder.bids[i].price
+            );
+        }
+        for i in 1..ladder.asks.len() {
+            assert!(
+                (ladder.asks[i].price - ladder.asks[i - 1].price).abs() > EPSILON,
+                "duplicate ask price at index {}: {:.4}",
+                i, ladder.asks[i].price
             );
         }
     }

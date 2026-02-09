@@ -30,7 +30,8 @@
       "Bash(grep:*)",
       "mcp__serena__insert_before_symbol",
       "Bash(cargo clippy:*)",
-      "Bash(cargo add:*)"
+      "Bash(cargo add:*)",
+      "Bash(sort:*)"
     ]
   }
 }

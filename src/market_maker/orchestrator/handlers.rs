@@ -168,7 +168,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// Mirrors paper_trader.rs `check_adverse_selection_outcomes()`.
     fn check_pending_fill_outcomes(&mut self, now_ms: u64) {
         const OUTCOME_DELAY_MS: u64 = 5_000; // 5-second markout window
-        const ADVERSE_THRESHOLD_BPS: f64 = 1.0; // 1 bps threshold for adverse classification
+        // Volatility-scaled threshold: 2σ × √τ prevents noise misclassification.
+        // Random walk E[|ΔP|] = σ × √τ. At 2σ, only ~5% of noise moves are misclassified.
+        // BTC (σ≈2bps/√s): threshold ≈ 8.9 bps. HYPE (σ≈1bps/√s): threshold ≈ 4.5 bps.
+        const ADVERSE_NOISE_MULT: f64 = 2.0;
+        const MIN_ADVERSE_THRESHOLD_BPS: f64 = 1.0;
+        const MARKOUT_SECONDS: f64 = OUTCOME_DELAY_MS as f64 / 1000.0;
+
+        let sigma_bps = self.estimator.sigma() * 10_000.0;
+        let adverse_threshold_bps =
+            (ADVERSE_NOISE_MULT * sigma_bps * MARKOUT_SECONDS.sqrt()).max(MIN_ADVERSE_THRESHOLD_BPS);
 
         while let Some(front) = self.infra.pending_fill_outcomes.front() {
             if now_ms.saturating_sub(front.timestamp_ms) < OUTCOME_DELAY_MS {
@@ -186,9 +195,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let mid_change_bps =
                 ((self.latest_mid - pending.mid_at_fill) / pending.mid_at_fill) * 10_000.0;
             let was_adverse = if pending.is_buy {
-                mid_change_bps < -ADVERSE_THRESHOLD_BPS
+                mid_change_bps < -adverse_threshold_bps
             } else {
-                mid_change_bps > ADVERSE_THRESHOLD_BPS
+                mid_change_bps > adverse_threshold_bps
             };
             let magnitude_bps = mid_change_bps.abs();
 

@@ -26,7 +26,8 @@ use hyperliquid_rust_sdk::{
     LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker,
     MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
     QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
-    RejectionRateLimitConfig, RiskConfig, SpreadConfig, SpreadProfile, StochasticConfig,
+    RejectionRateLimitConfig, RiskConfig, RiskModelConfig, SpreadConfig, SpreadProfile,
+    StochasticConfig,
     SymmetricStrategy, market_maker::{BinanceFeed, resolve_binance_symbol},
 };
 
@@ -1615,6 +1616,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            // Use log-additive risk model for Hip3 to prevent gamma explosion
+            let risk_model_cfg = match spread_profile {
+                SpreadProfile::Hip3 | SpreadProfile::Aggressive => {
+                    info!(
+                        risk_model_blend = 1.0,
+                        "Using log-additive CalibratedRiskModel (no multiplicative gamma explosion)"
+                    );
+                    RiskModelConfig::hip3()
+                }
+                SpreadProfile::Default => RiskModelConfig::default(),
+            };
+
             info!(
                 gamma_base = risk_cfg.gamma_base,
                 num_levels = ladder_cfg.num_levels,
@@ -1622,9 +1635,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_depth_bps = ladder_cfg.max_depth_bps,
                 geometric_spacing = ladder_cfg.geometric_spacing,
                 max_spread_per_side_bps = ladder_cfg.max_spread_per_side_bps,
+                risk_model_blend = risk_model_cfg.risk_model_blend,
                 "Using LadderStrategy (multi-level GLFT)"
             );
-            Box::new(LadderStrategy::with_config(risk_cfg, ladder_cfg))
+            Box::new(LadderStrategy::with_full_config(
+                risk_cfg,
+                ladder_cfg,
+                risk_model_cfg,
+                Default::default(), // KellySizer
+            ))
         }
     };
 

@@ -130,11 +130,10 @@ impl Default for LadderConfig {
             // Exchange min notional is $10, so for BTC we need min_size ≈ $10/$90k ≈ 0.000111.
             // Set to 0.00012 to provide a small buffer above exchange minimum.
             min_level_size: 0.00012,
-            // Hyperliquid fees: maker ~1-2bp, taker ~3.5bp
-            // Round-trip = maker + taker ≈ 4.5-5.5bp
-            // We use 3.5bp as spread capture fee (half of round-trip)
-            // to account for adverse fill (we get maker, they get taker)
-            fees_bps: 3.5,
+            // Hyperliquid maker fee: 1.5 bps.
+            // Adverse selection is modeled separately via DepthDecayAS —
+            // do NOT double-count it here or we create a dead zone filtering profitable levels.
+            fees_bps: 1.5,
             as_decay_bps: 10.0,
             dynamic_depths: None,
             max_spread_per_side_bps: 0.0, // Disabled by default

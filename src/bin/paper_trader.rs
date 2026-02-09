@@ -1535,6 +1535,12 @@ impl SimulationState {
             .unwrap()
             .as_nanos() as u64;
         let outcome_delay_ns = 5_000_000_000u64; // 5 seconds
+        let markout_s: f64 = 5.0; // Must match outcome_delay_ns / 1e9
+
+        // Volatility-scaled threshold: 2σ × √τ prevents noise misclassification.
+        // Random walk E[|ΔP|] = σ × √τ. At 2σ, only ~5% of noise moves are misclassified.
+        let sigma_bps = self.estimator.sigma() * 10_000.0;
+        let adverse_threshold_bps = (2.0 * sigma_bps * markout_s.sqrt()).max(1.0);
 
         while let Some(front) = self.pending_fill_outcomes.front() {
             if now_ns.saturating_sub(front.timestamp_ns) < outcome_delay_ns {
@@ -1551,9 +1557,9 @@ impl SimulationState {
             // Sell fill is adverse if mid rose (we undersold)
             let mid_change_bps = ((self.mid_price - pending.mid_at_fill) / pending.mid_at_fill) * 10_000.0;
             let was_adverse = if pending.is_buy {
-                mid_change_bps < -1.0 // Mid dropped > 1 bps after we bought
+                mid_change_bps < -adverse_threshold_bps
             } else {
-                mid_change_bps > 1.0  // Mid rose > 1 bps after we sold
+                mid_change_bps > adverse_threshold_bps
             };
             let magnitude_bps = mid_change_bps.abs();
 

@@ -142,6 +142,7 @@ pub use market_maker::{
     // Phase 5: Rejection Rate Limiting
     RejectionRateLimiter,
     RiskConfig,
+    RiskModelConfig,
     Side,
     SizingResult,
     // Tier 2: Spread Process

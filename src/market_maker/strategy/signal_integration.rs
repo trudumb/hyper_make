@@ -949,16 +949,30 @@ impl SignalIntegrator {
     pub fn staleness_spread_multiplier(&self) -> f64 {
         let mut stale_count = 0;
 
-        if self.config.use_lead_lag && !self.lag_analyzer.is_ready() {
+        // Only count a signal as stale if it HAD data and lost it (observation_count > 0).
+        // Cold-start (never received data) should not penalize — use safe priors instead.
+        if self.config.use_lead_lag
+            && !self.lag_analyzer.is_ready()
+            && self.lag_analyzer.observation_counts() != (0, 0)
+        {
             stale_count += 1;
         }
-        if self.config.use_cross_venue && !self.binance_flow.is_warmed_up() {
+        if self.config.use_cross_venue
+            && !self.binance_flow.is_warmed_up()
+            && self.binance_flow.trade_count() > 0
+        {
             stale_count += 1;
         }
-        if self.config.use_informed_flow && !self.informed_flow.is_warmed_up() {
+        if self.config.use_informed_flow
+            && !self.informed_flow.is_warmed_up()
+            && self.informed_flow.observation_count() > 0
+        {
             stale_count += 1;
         }
-        if self.config.use_regime_kappa && !self.regime_kappa.is_warmed_up() {
+        if self.config.use_regime_kappa
+            && !self.regime_kappa.is_warmed_up()
+            && self.regime_kappa.total_fills() > 0
+        {
             stale_count += 1;
         }
 
@@ -1184,45 +1198,93 @@ mod tests {
         let disabled = SignalIntegrator::new(SignalIntegratorConfig::disabled());
         assert!((disabled.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON);
 
-        // Enable one signal that hasn't warmed up => 1.5x
+        // Enable signals that haven't warmed up AND have zero observations (cold start)
+        // Cold start should NOT count as stale => 1.0
         let mut config_one = SignalIntegratorConfig::disabled();
         config_one.use_lead_lag = true;
-        let one_stale = SignalIntegrator::new(config_one);
-        assert!((one_stale.staleness_spread_multiplier() - 1.5).abs() < f64::EPSILON);
+        let one_cold = SignalIntegrator::new(config_one);
+        assert!(
+            (one_cold.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON,
+            "cold-start lead_lag (0 observations) should not count as stale"
+        );
 
-        // Enable two signals that haven't warmed up => 2.0x
-        let mut config_two = SignalIntegratorConfig::disabled();
-        config_two.use_lead_lag = true;
-        config_two.use_cross_venue = true;
-        let two_stale = SignalIntegrator::new(config_two);
-        assert!((two_stale.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
-
-        // Enable all four tracked signals => 2.0x (capped)
+        // Enable all four tracked signals with 0 observations => all cold start => 1.0
         let mut config_all = SignalIntegratorConfig::disabled();
         config_all.use_lead_lag = true;
         config_all.use_cross_venue = true;
         config_all.use_informed_flow = true;
         config_all.use_regime_kappa = true;
-        let all_stale = SignalIntegrator::new(config_all);
-        assert!((all_stale.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
+        let all_cold = SignalIntegrator::new(config_all);
+        assert!(
+            (all_cold.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON,
+            "all cold-start signals (0 observations) should not count as stale"
+        );
+    }
+
+    #[test]
+    fn test_staleness_cold_start_not_penalized() {
+        // Enabled signals with 0 observations => cold start => mult = 1.0
+        let mut config = SignalIntegratorConfig::disabled();
+        config.use_informed_flow = true;
+        config.use_regime_kappa = true;
+        let integrator = SignalIntegrator::new(config);
+
+        let mult = integrator.staleness_spread_multiplier();
+        assert!(
+            (mult - 1.0).abs() < f64::EPSILON,
+            "cold-start (0 obs) should give mult=1.0, got {mult}"
+        );
+    }
+
+    #[test]
+    fn test_staleness_after_data_then_not_warmed() {
+        use crate::market_maker::estimator::informed_flow::TradeFeatures;
+
+        // Signal HAD data (observation_count > 0) but is NOT warmed up => actually stale
+        let mut config = SignalIntegratorConfig::disabled();
+        config.use_informed_flow = true;
+        config.informed_flow_config.min_observations = 100; // Need 100 to warm up
+        let mut integrator = SignalIntegrator::new(config);
+
+        // Feed a few observations (not enough to warm up, but > 0)
+        for i in 0..5 {
+            integrator.informed_flow.on_trade(&TradeFeatures {
+                timestamp_ms: i as u64 * 1000,
+                size: 0.1,
+                price_impact_bps: 1.0,
+                book_imbalance: 0.0,
+                is_buy: true,
+                inter_arrival_ms: 1000,
+            });
+        }
+
+        assert!(!integrator.informed_flow.is_warmed_up(), "should not be warmed up with only 5 obs");
+        assert!(integrator.informed_flow.observation_count() > 0, "should have observations");
+
+        let mult = integrator.staleness_spread_multiplier();
+        assert!(
+            (mult - 1.5).abs() < f64::EPSILON,
+            "had data but not warmed up => stale => 1.5x, got {mult}"
+        );
     }
 
     #[test]
     fn test_disable_binance_signals_removes_staleness() {
-        // Use a config with ONLY Binance-dependent signals enabled.
-        // This way disabling them should drop staleness from 2.0x to 1.0x.
+        // Cold-start Binance signals (0 observations) are no longer counted as stale.
+        // After disabling, they remain 1.0x (the disable is still useful to prevent
+        // future staleness if data was received then lost).
         let mut config = SignalIntegratorConfig::disabled();
         config.use_lead_lag = true;
         config.use_cross_venue = true;
         let mut integrator = SignalIntegrator::new(config);
         let before = integrator.staleness_spread_multiplier();
         assert!(
-            (before - 2.0).abs() < f64::EPSILON,
-            "lead_lag + cross_venue should be stale without data: {before}"
+            (before - 1.0).abs() < f64::EPSILON,
+            "cold-start Binance signals should NOT be counted as stale: {before}"
         );
 
         integrator.disable_binance_signals();
-        // After disabling, those two signals no longer count toward staleness.
+        // After disabling, still 1.0x
         let after = integrator.staleness_spread_multiplier();
         assert!(
             (after - 1.0).abs() < f64::EPSILON,
@@ -1238,12 +1300,15 @@ mod tests {
         config.use_cross_venue = true;
         let mut integrator = SignalIntegrator::new(config);
 
-        // Both stale => 2.0x
-        assert!((integrator.staleness_spread_multiplier() - 2.0).abs() < f64::EPSILON);
+        // Both cold-start (0 observations) => NOT stale => 1.0x
+        assert!(
+            (integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON,
+            "cold-start Binance signals should not be counted as stale"
+        );
 
         integrator.disable_binance_signals();
 
-        // Now no enabled signals are stale => 1.0x
+        // After disabling, still 1.0x (no change since they weren't stale anyway)
         assert!((integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON);
     }
 

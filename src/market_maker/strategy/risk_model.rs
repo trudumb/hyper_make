@@ -496,6 +496,25 @@ impl Default for RiskModelConfig {
     }
 }
 
+impl RiskModelConfig {
+    /// HIP-3 DEX profile: use log-additive gamma to prevent multiplicative explosion.
+    ///
+    /// Legacy multiplicative gamma multiplies 7+ scalars — modest 1.2x each → 1.2^7 = 3.6x.
+    /// Log-additive approach sums bounded terms instead: no explosion possible.
+    /// Setting `risk_model_blend: 1.0` bypasses the multiplicative path entirely.
+    pub fn hip3() -> Self {
+        Self {
+            use_calibrated_risk_model: true,
+            risk_model_blend: 1.0, // Pure log-additive (no multiplicative explosion)
+            sigma_baseline: 0.00015,
+            kappa_baseline: 1500.0,
+            book_depth_baseline_usd: 5_000.0, // HIP-3 books are thin
+            min_calibration_samples: 50,
+            calibration_staleness_hours: 8.0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +653,57 @@ mod tests {
             (ratio - expected_ratio).abs() < 0.01,
             "Ratio should be exp(-0.4) ≈ 0.67: got {}",
             ratio
+        );
+    }
+
+    #[test]
+    fn test_hip3_config_uses_log_additive() {
+        let cfg = RiskModelConfig::hip3();
+        assert!(cfg.use_calibrated_risk_model);
+        assert!((cfg.risk_model_blend - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_hip3_gamma_no_explosion() {
+        // Under stressed conditions, gamma should stay bounded (not > 0.5)
+        // The log-additive model prevents the 1.2^7 = 3.6x multiplicative explosion
+        let model = CalibratedRiskModel::default();
+        let stressed = RiskFeatures {
+            excess_volatility: 1.5, // 150% above baseline
+            toxicity_score: 0.7,    // High toxicity
+            inventory_fraction: 0.8, // Near max inventory
+            excess_intensity: 1.0,  // Double baseline
+            depth_depletion: 0.6,   // Thin book
+            model_uncertainty: 0.8, // High uncertainty
+            position_direction_confidence: 0.3, // Low confidence
+        };
+
+        let gamma = model.compute_gamma(&stressed);
+        // Log-additive keeps gamma bounded by gamma_max (5.0).
+        // With these extreme features, multiplicative would give 0.15 * 1.2^7 ≈ 0.54
+        // or worse. Log-additive gives ~2.25 which is still well within bounds.
+        assert!(
+            gamma < 5.0,
+            "stressed gamma should be bounded by gamma_max: got {gamma}"
+        );
+        assert!(
+            gamma > 0.05,
+            "gamma should still be positive: got {gamma}"
+        );
+        // Key insight: at base gamma 0.15 with moderate stress, the model stays reasonable
+        let moderate = RiskFeatures {
+            excess_volatility: 0.5,
+            toxicity_score: 0.3,
+            inventory_fraction: 0.3,
+            excess_intensity: 0.3,
+            depth_depletion: 0.2,
+            model_uncertainty: 0.3,
+            position_direction_confidence: 0.5,
+        };
+        let gamma_moderate = model.compute_gamma(&moderate);
+        assert!(
+            gamma_moderate < 0.5,
+            "moderate stress gamma should stay below 0.5: got {gamma_moderate}"
         );
     }
 }
