@@ -297,11 +297,15 @@ impl EventAccumulator {
 
         let elapsed = self.last_reconcile.elapsed();
         if elapsed >= self.config.fallback_interval {
-            // Only trigger if there's something pending
-            if self.affected.bids_affected || self.affected.asks_affected || !self.events.is_empty() {
-                let event = QuoteUpdateEvent::FallbackTimer { elapsed };
-                return Some(self.record_event(event, self.affected.to_scope()));
-            }
+            // Unconditionally trigger after fallback interval to guarantee minimum quote frequency.
+            // Even without accumulated events, we must ensure quotes exist on the book.
+            let scope = if self.affected.bids_affected || self.affected.asks_affected || !self.events.is_empty() {
+                self.affected.to_scope()
+            } else {
+                ReconcileScope::Full
+            };
+            let event = QuoteUpdateEvent::FallbackTimer { elapsed };
+            return Some(self.record_event(event, scope));
         }
 
         None

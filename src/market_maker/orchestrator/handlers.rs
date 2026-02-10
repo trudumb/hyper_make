@@ -433,6 +433,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "Microstructure update: VPIN bucket completed"
                 );
             }
+
         }
 
         // === Phase 2/3 Component Updates ===
@@ -1754,8 +1755,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
-        // Check if we should trigger based on accumulated events
-        if let Some(trigger) = self.event_accumulator.should_trigger() {
+        // Check event-driven triggers first, then fallback timer.
+        // The fallback guarantees minimum quote frequency even without accumulated events.
+        let trigger = self.event_accumulator.should_trigger()
+            .or_else(|| self.event_accumulator.check_fallback());
+
+        if let Some(trigger) = trigger {
             debug!(
                 event = ?trigger.event,
                 scope = ?trigger.scope,
@@ -1780,17 +1785,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "Event accumulator stats (churn reduction)"
                 );
             }
-        }
-
-        // Also check fallback timer (ensures quotes don't become stale)
-        if let Some(fallback_trigger) = self.event_accumulator.check_fallback() {
-            debug!(
-                event = ?fallback_trigger.event,
-                "Event accumulator: fallback timer triggered"
-            );
-
-            self.update_quotes().await?;
-            self.event_accumulator.reset();
         }
 
         Ok(())

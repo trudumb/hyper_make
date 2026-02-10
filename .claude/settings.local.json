@@ -42,7 +42,8 @@
       "WebFetch(domain:hyperliquid.gitbook.io)",
       "Bash(curl:*)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(bash:*)"
     ]
   }
 }

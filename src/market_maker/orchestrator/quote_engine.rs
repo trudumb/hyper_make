@@ -247,7 +247,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Phase 6: Rate limit throttling - respect minimum requote interval
         if !self.infra.proactive_rate_tracker.can_requote() {
-            debug!("Skipping requote: minimum interval not elapsed");
+            info!("Skipping requote: minimum interval not elapsed");
             return Ok(());
         }
 
@@ -261,37 +261,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Mark that we're doing a requote
         self.infra.proactive_rate_tracker.mark_requote();
-
-        // === KAPPA-BASED CYCLE SKIPPING (API Budget Conservation) ===
-        // When kappa is high (thick book, many fills expected), skip some cycles
-        // to let fills accumulate rather than churning through API budget.
-        // This is a stochastic skip - higher kappa = higher skip probability.
-        const HIGH_KAPPA_THRESHOLD: f64 = 5000.0; // fills/second - thick book
-        const MIN_KAPPA_CONFIDENCE: f64 = 0.7; // Only skip if confident in kappa estimate
-
-        let kappa = self.estimator.kappa();
-        let kappa_confidence = self.estimator.kappa_confidence();
-
-        if kappa > HIGH_KAPPA_THRESHOLD && kappa_confidence > MIN_KAPPA_CONFIDENCE {
-            // Skip probability increases with kappa (more fills expected = skip more cycles)
-            // At threshold: skip 0%, at 2x threshold: skip ~25%, at 3x: ~33%
-            let skip_prob = ((kappa - HIGH_KAPPA_THRESHOLD) / kappa) * 0.5;
-
-            // Use deterministic skip based on time to avoid randomness issues
-            // Skip if current second modulo pattern matches
-            let now = std::time::Instant::now();
-            let should_skip = (now.elapsed().as_millis() as f64 / 1000.0) % 1.0 < skip_prob;
-
-            if should_skip {
-                debug!(
-                    kappa = %format!("{:.0}", kappa),
-                    kappa_confidence = %format!("{:.2}", kappa_confidence),
-                    skip_prob = %format!("{:.2}", skip_prob),
-                    "Skipping quote cycle: high kappa - letting fills accumulate"
-                );
-                return Ok(());
-            }
-        }
 
         // === RL HOT-RELOAD: Check for updated Q-table every 100 cycles ===
         self.rl_reload_cycle_count += 1;
@@ -319,6 +288,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Phase 3: Check recovery state and handle IOC recovery if needed
         if let Some(action) = self.check_and_handle_recovery().await? {
             if action.skip_normal_quoting {
+                info!("Recovery manager: skip_normal_quoting=true, returning early");
                 return Ok(());
             }
         }
@@ -1535,7 +1505,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             use crate::market_maker::control::Action;
             match action {
                 Action::NoQuote { reason } => {
-                    debug!(reason = ?reason, "Layer 3: not quoting");
+                    info!(reason = ?reason, "Layer 3: not quoting");
                     return Ok(());
                 }
                 Action::WaitToLearn {
@@ -1545,27 +1515,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     debug!(
                         info_gain = %format!("{:.4}", expected_info_gain),
                         wait_cycles = suggested_wait_cycles,
-                        "Layer 3: waiting to learn"
+                        "Layer 3: WaitToLearn signal (proceeding with quoting — learning requires fills)"
                     );
-                    // Cancel all resting orders when waiting to learn
-                    // This prevents stale orders from sitting on the book while we gather information
-                    let bid_orders = self.orders.get_all_by_side(Side::Buy);
-                    let ask_orders = self.orders.get_all_by_side(Side::Sell);
-                    let resting_oids: Vec<u64> = bid_orders
-                        .iter()
-                        .chain(ask_orders.iter())
-                        .map(|o| o.oid)
-                        .collect();
-                    if !resting_oids.is_empty() {
-                        info!(
-                            count = resting_oids.len(),
-                            "WaitToLearn: cancelling resting orders to prevent stale quotes"
-                        );
-                        self.executor
-                            .cancel_bulk_orders(&self.config.asset, resting_oids)
-                            .await;
-                    }
-                    return Ok(());
+                    // Continue with normal quoting: you can't learn without fills,
+                    // and blocking quotes creates a cold-start deadlock.
                 }
                 Action::DumpInventory { urgency, .. } => {
                     debug!(urgency = %format!("{:.2}", urgency), "Layer 3: dump inventory mode");
@@ -1576,7 +1529,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     // Continue with normal quoting
                 }
                 Action::Quote { expected_value, .. } => {
-                    debug!(expected_value = %format!("{:.4}", expected_value), "Layer 3: normal quote");
+                    info!(expected_value = %format!("{:.4}", expected_value), "Layer 3: normal quote");
                     // Continue with normal quoting
                 }
             }
@@ -2166,7 +2119,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
             }
 
-            debug!(
+            info!(
                 bid_levels = bid_quotes.len(),
                 ask_levels = ask_quotes.len(),
                 best_bid = ?bid_quotes.first().map(|q| (q.price, q.size)),
@@ -2249,6 +2202,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
 
             // Reconcile ladder quotes
+            info!(
+                smart_reconcile = self.config.smart_reconcile,
+                "Submitting ladder quotes to reconciler"
+            );
             if self.config.smart_reconcile {
                 // Smart reconciliation with ORDER MODIFY for queue preservation
                 self.reconcile_ladder_smart(bid_quotes, ask_quotes).await?;

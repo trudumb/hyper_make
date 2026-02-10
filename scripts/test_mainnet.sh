@@ -5,6 +5,7 @@
 # Examples:
 #   ./scripts/test_mainnet.sh BTC 60             # 1 minute test
 #   ./scripts/test_mainnet.sh BTC 14400          # 4 hour test
+#   ./scripts/test_mainnet.sh HYPE 14400         # 4 hour test
 #   ./scripts/test_mainnet.sh SOL 3600           # 1 hour test
 #   ./scripts/test_mainnet.sh BTC 300 --dashboard # With live dashboard
 #   ./scripts/test_mainnet.sh BTC 300 --capture   # With dashboard + screenshot capture
