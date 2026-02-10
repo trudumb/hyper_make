@@ -1045,9 +1045,9 @@ impl LadderStrategy {
 
             // === MARGIN RESERVE BUFFER ===
             // Only use a fraction of available margin for quoting to maintain safety buffer.
-            // 50% total utilization = 25% per side when flat.
-            // GLFT model handles risk through gamma scaling, so we can use more margin.
-            const MAX_MARGIN_UTILIZATION: f64 = 0.50; // Use 50% of available margin
+            // 70% total utilization = 35% per side when flat.
+            // GLFT model handles risk through gamma scaling; reduce-only at 80% provides safety buffer.
+            const MAX_MARGIN_UTILIZATION: f64 = 0.70; // Use 70% of available margin (GLFT gamma handles risk)
             let usable_margin = available_margin * MAX_MARGIN_UTILIZATION;
 
             // === TWO-SIDED MARGIN ALLOCATION (STOCHASTIC-WEIGHTED) ===
@@ -1359,13 +1359,12 @@ impl LadderStrategy {
             // to avoid placing many sub-minimum orders that would be rejected.
             //
             // Formula: max_levels = available_capacity / min_meaningful_size
-            // where min_meaningful_size = 1.05 × (min_notional / price) to ensure each order
+            // where min_meaningful_size = 1.01 × (min_notional / price) to ensure each order
             // is slightly above exchange minimum notional requirements.
             //
-            // CHANGED: Reduced from 1.5× to 1.05× to allow more levels with small capital.
-            // The 1.05× buffer handles rounding/slippage while enabling distribution.
-            // The entropy optimizer's notional constraints provide additional protection.
-            let min_meaningful_size = (config.min_notional * 1.05) / market_params.microprice;
+            // CHANGED: Reduced to 1.01× — build_raw_ladder applies its own rounding buffer,
+            // so the capacity check doesn't need additional margin. This gains ~1 more level.
+            let min_meaningful_size = (config.min_notional * 1.01) / market_params.microprice;
 
             let max_bid_levels = if available_for_bids > EPSILON {
                 ((available_for_bids / min_meaningful_size).floor() as usize).max(1)

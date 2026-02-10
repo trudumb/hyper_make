@@ -556,8 +556,8 @@ impl Default for StochasticConfig {
 
             // Entropy-Based Distribution (always enabled)
             // CHANGED: Increased defaults to enforce better distribution with small capital
-            entropy_min_entropy: 2.0,      // At least ~7.4 effective levels (was 1.5 → ~4.5)
-            entropy_base_temperature: 1.2, // Slightly more uniform (was 1.0)
+            entropy_min_entropy: 2.2,      // At least ~9.0 effective levels to keep most of 10 active
+            entropy_base_temperature: 1.5, // More uniform → fewer levels filtered by min notional
             entropy_min_allocation_floor: 0.04, // 4% minimum per level (was 2%)
             entropy_thompson_samples: 5,   // Moderate stochasticity
 

@@ -121,7 +121,7 @@ pub struct LadderConfig {
 impl Default for LadderConfig {
     fn default() -> Self {
         Self {
-            num_levels: 25, // Increased from 5 to 25 (max capacity) to let entropy/stochastics dictate effective levels
+            num_levels: 10, // Matched to capital capacity (~8 HYPE / 0.35 min ≈ 11); 10 keeps all levels above min notional
             min_depth_bps: 2.0,
             max_depth_bps: 200.0,
             geometric_spacing: true,
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = LadderConfig::default();
-        assert_eq!(config.num_levels, 25); // Default 25 levels (max capacity)
+        assert_eq!(config.num_levels, 10); // Default 10 levels (matched to capital capacity)
         assert!((config.min_depth_bps - 2.0).abs() < 0.01);
         assert!((config.max_depth_bps - 200.0).abs() < 0.01);
         assert!(config.geometric_spacing);
