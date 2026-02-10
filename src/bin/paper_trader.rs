@@ -2312,15 +2312,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Analytics: track predicted vs realized edge
                             let predicted_as = state.adverse_selection.best_horizon_as_bps();
+                            let realized_as = fill_depth_bps.min(predicted_as);
                             let edge_snap = EdgeSnapshot {
                                 timestamp_ns: fill_timestamp_ns,
                                 predicted_spread_bps: fill_depth_bps * 2.0,
                                 realized_spread_bps: fill_depth_bps * 2.0,
                                 predicted_as_bps: predicted_as,
-                                realized_as_bps: fill_depth_bps.min(predicted_as),
+                                realized_as_bps: realized_as,
                                 fee_bps: 1.5,
                                 predicted_edge_bps: fill_depth_bps * 2.0 - predicted_as - 1.5,
                                 realized_edge_bps: fill_pnl_bps - 1.5,
+                                gross_edge_bps: fill_depth_bps * 2.0 - realized_as,
                             };
                             edge_tracker.add_snapshot(edge_snap.clone());
 

@@ -177,6 +177,7 @@ mod tests {
                 fee_bps: 1.5,
                 predicted_edge_bps: 2.5,
                 realized_edge_bps: 2.0,
+                gross_edge_bps: 3.5,
             };
             logger.log_edge(&snap).unwrap();
             logger.flush().unwrap();
@@ -194,6 +195,7 @@ mod tests {
                 fee_bps: 1.5,
                 predicted_edge_bps: 3.5,
                 realized_edge_bps: 3.0,
+                gross_edge_bps: 4.5,
             };
             logger.log_edge(&snap).unwrap();
             logger.flush().unwrap();

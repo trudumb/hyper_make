@@ -736,6 +736,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         fee_bps: MAKER_FEE_BPS,
                         predicted_edge_bps: depth_bps - predicted_as_bps - MAKER_FEE_BPS,
                         realized_edge_bps: depth_bps - as_realized_bps - MAKER_FEE_BPS,
+                        gross_edge_bps: depth_bps - as_realized_bps,
                     };
                     self.tier2.edge_tracker.add_snapshot(snap.clone());
 

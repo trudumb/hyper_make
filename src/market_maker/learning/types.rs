@@ -201,6 +201,8 @@ pub struct ModelHealth {
     pub fill_rate: Health,
     /// Edge prediction health
     pub edge: Health,
+    /// Edge calibration ratio (|mean_bias| / prediction_rmse), 0.0 when insufficient data
+    pub edge_calibration_ratio: f64,
     /// Overall health (most conservative)
     pub overall: Health,
 }

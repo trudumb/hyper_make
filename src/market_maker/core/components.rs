@@ -8,7 +8,7 @@ use crate::market_maker::{
         AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EnhancedASClassifier,
         PreFillASClassifier,
     },
-    analytics::EdgeTracker,
+    analytics::{EdgeTracker, MarketToxicityComposite, MarketToxicityConfig},
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{
         CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
@@ -135,6 +135,8 @@ pub struct Tier2Components {
     pub pnl_tracker: PnLTracker,
     /// Edge validation tracker (predicted vs realized edge)
     pub edge_tracker: EdgeTracker,
+    /// Proactive market toxicity composite scorer
+    pub toxicity: MarketToxicityComposite,
 }
 
 impl Tier2Components {
@@ -151,6 +153,7 @@ impl Tier2Components {
             spread_tracker: SpreadProcessEstimator::new(spread_config),
             pnl_tracker: PnLTracker::new(pnl_config),
             edge_tracker: EdgeTracker::new(),
+            toxicity: MarketToxicityComposite::new(MarketToxicityConfig::default()),
         }
     }
 }

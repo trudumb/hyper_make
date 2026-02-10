@@ -11,10 +11,15 @@ pub mod attribution;
 pub mod drift_calibration;
 pub mod edge_metrics;
 pub mod live;
+pub mod market_toxicity;
 pub mod persistence;
 pub mod sharpe;
 
 pub use drift_calibration::DriftCalibrationTracker;
+pub use market_toxicity::{
+    MarketToxicityComposite, MarketToxicityConfig, ToxicityAssessment, ToxicityComponents,
+    ToxicityInput,
+};
 pub use attribution::{CycleContributions, SignalContribution, SignalPnLAttributor};
 pub use edge_metrics::{EdgeSnapshot, EdgeTracker};
 pub use live::{LiveAnalytics, LiveAnalyticsSummary};

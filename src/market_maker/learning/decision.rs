@@ -116,10 +116,17 @@ impl DecisionEngine {
     ) -> QuoteDecision {
         // === HARD GATES (the only reasons to stop quoting) ===
 
-        // 1. Model health gate
+        // 1. Model health gate — degraded models quote defensively, never stop
         if model_health.overall == Health::Degraded {
-            return QuoteDecision::NoQuote {
-                reason: "Model degraded".into(),
+            // Scale size by calibration ratio: worse calibration → smaller presence
+            // ratio near 0.7 (threshold) → size ~0.15, ratio near 1.0 → size 0.05
+            let ratio = model_health.edge_calibration_ratio;
+            let size = (0.2 - 0.15 * ((ratio - 0.7) / 0.3).clamp(0.0, 1.0)).max(0.05);
+            return QuoteDecision::Quote {
+                size_fraction: size,
+                confidence: 0.0,       // Zero confidence → max defensive widening downstream
+                expected_edge: 0.0,
+                reservation_shift: 0.0,
             };
         }
 
@@ -456,10 +463,11 @@ mod tests {
     // which is now handled by kappa_ci_width → uncertainty_scalar in GLFT.
 
     #[test]
-    fn test_no_quote_degraded_model() {
+    fn test_defensive_quote_degraded_model() {
         let engine = DecisionEngine::default();
         let mut health = ModelHealth::default();
         health.overall = Health::Degraded;
+        health.edge_calibration_ratio = 0.85; // Mid-range degradation
 
         let prediction = EnsemblePrediction {
             mean: 5.0,
@@ -471,10 +479,61 @@ mod tests {
         let decision = engine.should_quote(&prediction, &health, 0.0, TEST_SIGMA);
 
         match decision {
-            QuoteDecision::NoQuote { reason } => {
-                assert!(reason.contains("degraded"));
+            QuoteDecision::Quote {
+                size_fraction,
+                confidence,
+                expected_edge,
+                reservation_shift,
+            } => {
+                // Size should be scaled by calibration ratio
+                assert!(
+                    size_fraction >= 0.05 && size_fraction <= 0.2,
+                    "Defensive size_fraction should be in [0.05, 0.2], got {}",
+                    size_fraction
+                );
+                // Confidence should be zero for maximum defensive widening
+                assert_eq!(confidence, 0.0);
+                assert_eq!(expected_edge, 0.0);
+                assert_eq!(reservation_shift, 0.0);
             }
-            _ => panic!("Expected NoQuote due to degraded model"),
+            _ => panic!("Expected defensive Quote, not NoQuote, for degraded model"),
+        }
+    }
+
+    #[test]
+    fn test_defensive_quote_size_scales_with_ratio() {
+        let engine = DecisionEngine::default();
+
+        // Mildly degraded (ratio near 0.7 threshold) → larger size (~0.2)
+        let mut health_mild = ModelHealth::default();
+        health_mild.overall = Health::Degraded;
+        health_mild.edge_calibration_ratio = 0.7;
+
+        // Severely degraded (ratio near 1.0) → smaller size (~0.05)
+        let mut health_severe = ModelHealth::default();
+        health_severe.overall = Health::Degraded;
+        health_severe.edge_calibration_ratio = 1.0;
+
+        let prediction = EnsemblePrediction::default();
+
+        let decision_mild = engine.should_quote(&prediction, &health_mild, 0.0, TEST_SIGMA);
+        let decision_severe = engine.should_quote(&prediction, &health_severe, 0.0, TEST_SIGMA);
+
+        match (decision_mild, decision_severe) {
+            (
+                QuoteDecision::Quote { size_fraction: s_mild, .. },
+                QuoteDecision::Quote { size_fraction: s_severe, .. },
+            ) => {
+                assert!(
+                    s_mild > s_severe,
+                    "Mild degradation should have larger size than severe: {} vs {}",
+                    s_mild,
+                    s_severe
+                );
+                assert!((s_mild - 0.2).abs() < 0.01, "Mild should be ~0.2, got {}", s_mild);
+                assert!((s_severe - 0.05).abs() < 0.01, "Severe should be ~0.05, got {}", s_severe);
+            }
+            _ => panic!("Expected both to be defensive Quote decisions"),
         }
     }
 

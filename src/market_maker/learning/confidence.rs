@@ -13,12 +13,14 @@ use super::types::{CalibrationScore, Health, ModelHealth, RingBuffer};
 
 /// Tracks edge prediction bias to detect systematic miscalibration.
 ///
-/// This is a SAFETY NET: when the system is consistently losing money
-/// (predicted edge - realized edge < -2 bps on average), halt quoting.
+/// Uses EWMA (exponential weighted moving average) as the primary signal
+/// for detecting bias, with a VecDeque window retained for std computation
+/// and backward compatibility.
 ///
-/// # Why This Matters
-/// IR can be > 1.0 (directionally correct) while still losing money if
-/// the magnitude calibration is wrong. This tracker catches that case.
+/// Instead of halting quotes (which creates a cold-start deadlock),
+/// this tracker provides a recalibration signal: when bias exceeds 1.5 bps
+/// (fee-aligned threshold), `should_recalibrate()` returns Some(bias) so
+/// downstream can subtract the bias from future predictions.
 ///
 /// # Example
 /// - Predicted: +0.02 bps edge
@@ -26,14 +28,22 @@ use super::types::{CalibrationScore, Health, ModelHealth, RingBuffer};
 /// - Bias: 0.02 - (-16.78) = 16.8 bps overestimate (dangerous!)
 #[derive(Debug, Clone)]
 pub struct EdgeBiasTracker {
-    /// Recent bias values (predicted - realized)
+    /// Recent bias values (predicted - realized) — kept for std computation
     recent_bias: VecDeque<f64>,
     /// Window size for tracking
     window_size: usize,
-    /// Minimum samples before halting can be triggered
+    /// Minimum samples before recalibration can be triggered
     min_samples_for_halt: usize,
-    /// Bias threshold in bps (more negative = worse)
+    /// Bias threshold in bps (legacy, kept for backward compat)
     halt_threshold_bps: f64,
+    /// EWMA of bias (primary signal for recalibration)
+    ewma_bias: f64,
+    /// EWMA of squared bias (for variance computation)
+    ewma_sq_bias: f64,
+    /// Decay factor per observation (0.95 = recent fills count more)
+    decay_alpha: f64,
+    /// Total number of observations (not windowed)
+    n_observations: usize,
 }
 
 impl Default for EdgeBiasTracker {
@@ -43,33 +53,37 @@ impl Default for EdgeBiasTracker {
 }
 
 impl EdgeBiasTracker {
-    /// Create a new edge bias tracker.
-    ///
-    /// # Arguments
-    /// * `window_size` - Number of recent fills to track
-    /// * `min_samples_for_halt` - Minimum samples before halt can trigger
-    /// * `halt_threshold_bps` - Mean bias threshold for halting (negative = losing)
     pub fn new(window_size: usize, min_samples_for_halt: usize, halt_threshold_bps: f64) -> Self {
         Self {
             recent_bias: VecDeque::with_capacity(window_size),
             window_size,
             min_samples_for_halt,
             halt_threshold_bps,
+            ewma_bias: 0.0,
+            ewma_sq_bias: 0.0,
+            decay_alpha: 0.95,
+            n_observations: 0,
         }
     }
 
-    /// Record a new edge prediction/realization pair.
-    ///
-    /// # Arguments
-    /// * `predicted_edge_bps` - The predicted edge at fill time
-    /// * `realized_edge_bps` - The realized edge after measurement horizon
     pub fn record(&mut self, predicted_edge_bps: f64, realized_edge_bps: f64) {
         let bias = predicted_edge_bps - realized_edge_bps;
 
+        // VecDeque window for std computation
         if self.recent_bias.len() >= self.window_size {
             self.recent_bias.pop_front();
         }
         self.recent_bias.push_back(bias);
+
+        // EWMA update — primary signal for recalibration
+        if self.n_observations == 0 {
+            self.ewma_bias = bias;
+            self.ewma_sq_bias = bias * bias;
+        } else {
+            self.ewma_bias = self.decay_alpha * self.ewma_bias + (1.0 - self.decay_alpha) * bias;
+            self.ewma_sq_bias = self.decay_alpha * self.ewma_sq_bias + (1.0 - self.decay_alpha) * bias * bias;
+        }
+        self.n_observations += 1;
     }
 
     /// Get the mean bias over the recent window.
@@ -95,23 +109,35 @@ impl EdgeBiasTracker {
         variance.sqrt()
     }
 
-    /// Check if quoting should be halted due to systematic edge overestimation.
-    ///
-    /// Returns true if:
-    /// 1. We have enough samples (>= min_samples_for_halt)
-    /// 2. Mean bias > -halt_threshold_bps (i.e., we're overestimating edge)
-    ///
-    /// Note: Large POSITIVE bias means we predict higher edge than realized,
-    /// which means we're systematically losing money.
     pub fn should_halt_quoting(&self) -> bool {
-        if self.recent_bias.len() < self.min_samples_for_halt {
-            return false;
+        // Never halt quoting — halting creates a cold-start deadlock where
+        // we can't learn without quoting. Use should_recalibrate() instead
+        // to get a bias correction signal for downstream consumers.
+        false
+    }
+
+    /// Check if the edge model needs recalibration due to persistent bias.
+    ///
+    /// Returns `Some(ewma_bias)` when:
+    /// 1. We have enough observations (>= min_samples_for_halt)
+    /// 2. EWMA bias exceeds 1.5 bps (fee-aligned threshold)
+    ///
+    /// The returned value is the bias to subtract from future predictions.
+    /// Returns `None` if not enough data or bias is within tolerance.
+    pub fn should_recalibrate(&self) -> Option<f64> {
+        if self.n_observations < self.min_samples_for_halt {
+            return None;
         }
 
-        // Positive mean_bias means: predicted > realized, so we're overestimating
-        // We halt when overestimate is severe (mean_bias > |halt_threshold_bps|)
-        // Since halt_threshold_bps is negative (-2.0), we check if bias > 2.0
-        self.mean_bias() > -self.halt_threshold_bps
+        // 1.5 bps threshold: aligned with maker fee (1.5 bps on Hyperliquid)
+        // If we're overestimating edge by more than the fee, we need to recalibrate
+        const RECALIBRATE_THRESHOLD_BPS: f64 = 1.5;
+
+        if self.ewma_bias.abs() > RECALIBRATE_THRESHOLD_BPS {
+            Some(self.ewma_bias)
+        } else {
+            None
+        }
     }
 
     /// Check if the edge bias is in warning territory (close to halt).
@@ -128,20 +154,31 @@ impl EdgeBiasTracker {
         self.recent_bias.len()
     }
 
-    /// Get summary for logging.
+    /// Get the total number of observations ever recorded (not windowed).
+    pub fn total_observations(&self) -> usize {
+        self.n_observations
+    }
+
+    /// Get the EWMA bias value.
+    pub fn ewma_bias(&self) -> f64 {
+        self.ewma_bias
+    }
+
     pub fn summary(&self) -> EdgeBiasSummary {
         EdgeBiasSummary {
             mean_bias_bps: self.mean_bias(),
             bias_std_bps: self.bias_std(),
             sample_count: self.recent_bias.len(),
-            should_halt: self.should_halt_quoting(),
+            should_halt: false,
             is_warning: self.is_warning(),
         }
     }
 
-    /// Clear all tracked bias data.
     pub fn clear(&mut self) {
         self.recent_bias.clear();
+        self.ewma_bias = 0.0;
+        self.ewma_sq_bias = 0.0;
+        self.n_observations = 0;
     }
 }
 
@@ -397,8 +434,6 @@ pub struct ModelConfidenceTracker {
     max_as_bias_warning: f64,
     /// Maximum AS bias before degraded (bps)
     max_as_bias_degraded: f64,
-    /// Maximum edge calibration error (bps)
-    max_edge_error: f64,
 }
 
 impl Default for ModelConfidenceTracker {
@@ -425,7 +460,6 @@ impl ModelConfidenceTracker {
             edge_bias_tracker: EdgeBiasTracker::new(50, 20, -2.0),
             max_as_bias_warning: 0.5,  // 0.5 bps
             max_as_bias_degraded: 1.0, // 1.0 bps
-            max_edge_error: 0.5,       // 0.5 bps
         }
     }
 
@@ -474,19 +508,19 @@ impl ModelConfidenceTracker {
         // Update edge bias safety net tracker
         self.edge_bias_tracker.record(predicted_edge_bps, realized_pnl_bps);
 
-        // Log warning if bias is getting bad
-        let bias_summary = self.edge_bias_tracker.summary();
-        if bias_summary.should_halt {
-            tracing::error!(
-                mean_bias_bps = %format!("{:.2}", bias_summary.mean_bias_bps),
-                sample_count = bias_summary.sample_count,
-                "EDGE BIAS CRITICAL: Systematic edge overestimation - halting quotes recommended"
+        // Log recalibration signal if bias is significant
+        if let Some(bias_bps) = self.edge_bias_tracker.should_recalibrate() {
+            tracing::warn!(
+                ewma_bias_bps = %format!("{:.2}", bias_bps),
+                n_observations = self.edge_bias_tracker.total_observations(),
+                "Edge bias recalibration needed: EWMA bias exceeds fee threshold"
             );
-        } else if bias_summary.is_warning {
+        } else if self.edge_bias_tracker.is_warning() {
+            let bias_summary = self.edge_bias_tracker.summary();
             tracing::warn!(
                 mean_bias_bps = %format!("{:.2}", bias_summary.mean_bias_bps),
                 sample_count = bias_summary.sample_count,
-                "Edge bias warning: Approaching halt threshold"
+                "Edge bias warning: Approaching recalibration threshold"
             );
         }
     }
@@ -647,17 +681,29 @@ impl ModelConfidenceTracker {
             };
         }
 
-        // === Edge health ===
+        // === Edge health (calibration ratio: |mean_bias| / prediction_rmse) ===
         if self.edge_predictions.len() < 50 {
             health.edge = Health::Good; // Not enough data
+            health.edge_calibration_ratio = 0.0;
         } else {
-            health.edge = if self.edge_calibration.error < self.max_edge_error {
-                Health::Good
-            } else if self.edge_calibration.error < self.max_edge_error * 2.0 {
-                Health::Warning
+            let rmse = self.edge_calibration.error;
+            let mean_bias = self.edge_calibration.bias.abs();
+
+            // Guard: tiny RMSE means insufficient data to distinguish bias from noise
+            if rmse < 0.1 {
+                health.edge = Health::Good;
+                health.edge_calibration_ratio = 0.0;
             } else {
-                Health::Degraded
-            };
+                let ratio = mean_bias / rmse;
+                health.edge_calibration_ratio = ratio;
+                health.edge = if ratio < 0.5 {
+                    Health::Good
+                } else if ratio < 0.7 {
+                    Health::Warning
+                } else {
+                    Health::Degraded
+                };
+            }
         }
 
         // Compute overall
@@ -702,12 +748,9 @@ impl ModelConfidenceTracker {
 
     // === Edge Bias Safety Net ===
 
-    /// Check if quoting should be halted due to systematic edge overestimation.
-    ///
-    /// This is a SAFETY NET: returns true when the system is consistently
-    /// losing money (predicted - realized > 2 bps on average).
     pub fn should_halt_quoting(&self) -> bool {
-        self.edge_bias_tracker.should_halt_quoting()
+        // Never halt quoting — use edge_bias_tracker().should_recalibrate() instead
+        false
     }
 
     /// Check if edge bias is in warning territory.
@@ -904,9 +947,14 @@ mod tests {
             tracker.record(5.0, -10.0);
         }
 
-        // Mean bias = +15, which exceeds threshold of +2 (abs of -2)
+        // Mean bias = +15, which exceeds threshold
         assert!(tracker.mean_bias() > 2.0);
-        assert!(tracker.should_halt_quoting());
+        // should_halt_quoting() always returns false now
+        assert!(!tracker.should_halt_quoting());
+        // But should_recalibrate() returns the EWMA bias (~15.0)
+        let recal = tracker.should_recalibrate();
+        assert!(recal.is_some());
+        assert!(recal.unwrap() > 10.0); // EWMA converges toward 15.0
     }
 
     #[test]
@@ -922,6 +970,8 @@ mod tests {
         // Mean bias should be close to 0
         assert!(tracker.mean_bias().abs() < 1.0);
         assert!(!tracker.should_halt_quoting());
+        // No recalibration needed — bias is small
+        assert!(tracker.should_recalibrate().is_none());
     }
 
     #[test]
@@ -947,7 +997,10 @@ mod tests {
         for _ in 0..10 {
             tracker.record(10.0, 0.0); // Bias = +10
         }
-        assert!(tracker.should_halt_quoting());
+        // should_halt_quoting always false now
+        assert!(!tracker.should_halt_quoting());
+        // But recalibration should trigger (bias ~10.0)
+        assert!(tracker.should_recalibrate().is_some());
 
         // Now add good predictions to push out bad ones
         for _ in 0..10 {
@@ -957,6 +1010,9 @@ mod tests {
         // Window should now only have good predictions
         assert!(tracker.mean_bias().abs() < 1.0);
         assert!(!tracker.should_halt_quoting());
+        // EWMA decays: after 10 zero-bias observations, EWMA should have decayed
+        // significantly. With alpha=0.95, after 10 steps: 10.0 * 0.95^10 ≈ 5.99
+        // Still above 1.5 threshold, but much reduced
     }
 
     #[test]
@@ -968,11 +1024,110 @@ mod tests {
             tracker.record_edge_prediction(5.0, 1.0, -10.0); // Big overestimate
         }
 
-        // Should trigger halt
-        assert!(tracker.should_halt_quoting());
+        // should_halt_quoting() always returns false now
+        assert!(!tracker.should_halt_quoting());
 
         let summary = tracker.edge_bias_summary();
         assert!(summary.mean_bias_bps > 10.0); // +15 bps bias
-        assert!(summary.should_halt);
+        assert!(!summary.should_halt); // Always false
+
+        // But recalibration signal should fire
+        let recal = tracker.edge_bias_tracker().should_recalibrate();
+        assert!(recal.is_some());
+        assert!(recal.unwrap() > 10.0);
+    }
+
+    #[test]
+    fn test_edge_bias_ewma_convergence() {
+        let mut tracker = EdgeBiasTracker::new(50, 10, -2.0);
+
+        // Insufficient samples → no recalibration yet
+        for _ in 0..5 {
+            tracker.record(5.0, 0.0); // Bias = +5.0
+        }
+        assert!(tracker.should_recalibrate().is_none()); // Only 5 obs, need 10
+
+        // Add more to exceed min_samples_for_halt
+        for _ in 0..15 {
+            tracker.record(5.0, 0.0); // Bias = +5.0
+        }
+        // 20 total observations, bias converging toward 5.0
+        let recal = tracker.should_recalibrate();
+        assert!(recal.is_some());
+        let bias = recal.unwrap();
+        // EWMA with alpha=0.95: converges toward 5.0
+        // After 20 steps of constant bias=5.0:
+        // ewma = 5.0 * (1 - 0.95^20) ≈ 5.0 * 0.642 = 3.21 at minimum
+        assert!(bias > 3.0, "EWMA bias should converge toward 5.0, got {}", bias);
+        assert!(bias < 5.1, "EWMA bias should not exceed input, got {}", bias);
+
+        // Verify EWMA getter works
+        assert!((tracker.ewma_bias() - bias).abs() < f64::EPSILON);
+
+        // Verify total_observations counts all, not just window
+        assert_eq!(tracker.total_observations(), 20);
+    }
+
+    // =============================================================================
+    // Edge Calibration Ratio Tests
+    // =============================================================================
+
+    #[test]
+    fn test_edge_health_low_rmse_guard() {
+        let mut tracker = ModelConfidenceTracker::new();
+
+        // Add 60 edge predictions with tiny error (RMSE < 0.1)
+        // Predicted and realized are nearly identical → tiny RMSE, but tiny bias too
+        for i in 0..60 {
+            let predicted = 1.0 + (i % 3) as f64 * 0.01;
+            let realized = predicted + 0.001; // Negligible difference
+            tracker.record_edge_prediction(predicted, 0.5, realized);
+        }
+
+        let health = tracker.model_health();
+        // Low RMSE guard should produce Good with ratio = 0.0
+        assert_eq!(health.edge, Health::Good);
+        assert!((health.edge_calibration_ratio - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_edge_health_calibration_ratio_output() {
+        let mut tracker = ModelConfidenceTracker::new();
+
+        // Add 100 predictions with known bias and noise
+        // Predicted = 5.0, realized varies with systematic negative bias
+        // bias = predicted - realized, so positive bias = overestimation
+        for i in 0..100 {
+            let noise = ((i % 5) as f64 - 2.0) * 0.5; // -1.0 to 1.0
+            let predicted = 5.0;
+            let realized = predicted - 3.0 + noise; // systematic -3.0 bps bias
+            tracker.record_edge_prediction(predicted, 0.5, realized);
+        }
+
+        let health = tracker.model_health();
+        // RMSE should be well above 0.1, and |bias| / RMSE should be high (> 0.7)
+        // because bias dominates noise
+        assert!(health.edge_calibration_ratio > 0.7);
+        assert_eq!(health.edge, Health::Degraded);
+    }
+
+    #[test]
+    fn test_edge_health_calibration_ratio_good_when_noise_dominates() {
+        let mut tracker = ModelConfidenceTracker::new();
+
+        // Predictions with large random noise but near-zero mean bias
+        // Alternating positive and negative errors cancel out bias
+        for i in 0..100 {
+            let predicted = 5.0;
+            // Alternating +-2.0 errors: mean bias ≈ 0, RMSE ≈ 2.0
+            let error = if i % 2 == 0 { 2.0 } else { -2.0 };
+            let realized = predicted - error;
+            tracker.record_edge_prediction(predicted, 0.5, realized);
+        }
+
+        let health = tracker.model_health();
+        // |mean_bias| ≈ 0, RMSE ≈ 2.0, ratio ≈ 0 → Good
+        assert!(health.edge_calibration_ratio < 0.5);
+        assert_eq!(health.edge, Health::Good);
     }
 }

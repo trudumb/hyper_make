@@ -20,6 +20,10 @@ pub struct EdgeSnapshot {
     pub predicted_edge_bps: f64,
     /// Realized edge: realized_spread - realized_as - fees.
     pub realized_edge_bps: f64,
+    /// Gross edge: spread_capture - adverse_selection (pre-fee).
+    /// Measures model accuracy without fee drag.
+    #[serde(default)]
+    pub gross_edge_bps: f64,
 }
 
 /// Tracks edge snapshots and computes aggregate statistics.
@@ -52,13 +56,42 @@ impl EdgeTracker {
         sum / self.snapshots.len() as f64
     }
 
-    /// Mean realized edge in basis points.
+    /// Mean realized edge in basis points (net of fees).
     pub fn mean_realized_edge(&self) -> f64 {
         if self.snapshots.is_empty() {
             return 0.0;
         }
         let sum: f64 = self.snapshots.iter().map(|s| s.realized_edge_bps).sum();
         sum / self.snapshots.len() as f64
+    }
+
+    /// Mean gross edge in basis points (pre-fee: spread capture minus AS).
+    ///
+    /// This measures model accuracy without fee drag. A fill at mid with zero AS
+    /// has gross_edge=0 (neutral), not -1.5 (alarm from net edge).
+    pub fn mean_gross_edge(&self) -> f64 {
+        if self.snapshots.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.snapshots.iter().map(|s| s.gross_edge_bps).sum();
+        sum / self.snapshots.len() as f64
+    }
+
+    /// Variance of gross edge in basis points squared.
+    ///
+    /// High variance with neutral mean indicates uncertain model performance.
+    pub fn gross_edge_variance(&self) -> f64 {
+        let n = self.snapshots.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let mean = self.mean_gross_edge();
+        let n_f = n as f64;
+        self.snapshots
+            .iter()
+            .map(|s| (s.gross_edge_bps - mean).powi(2))
+            .sum::<f64>()
+            / (n_f - 1.0)
     }
 
     /// Mean prediction error: mean(predicted - realized).
@@ -118,16 +151,19 @@ impl EdgeTracker {
         t_stat > T_CRITICAL_95
     }
 
-    /// Returns an alarm multiplier if mean realized edge is negative.
+    /// Returns an alarm multiplier if mean gross edge is negative.
     ///
-    /// - `None` if fewer than 10 fills or edge is non-negative.
-    /// - `Some(2.0)` if mean realized edge < -1 bps (strongly negative).
-    /// - `Some(1.5)` if mean realized edge < 0 (mildly negative).
+    /// Uses gross edge (pre-fee) so that fills at mid with zero AS don't trigger
+    /// false alarms from fee drag alone.
+    ///
+    /// - `None` if fewer than 10 fills or gross edge is non-negative.
+    /// - `Some(2.0)` if mean gross edge < -1 bps (strongly negative).
+    /// - `Some(1.5)` if mean gross edge < 0 (mildly negative).
     pub fn negative_edge_alarm(&self) -> Option<f64> {
         if self.snapshots.len() < 10 {
             return None;
         }
-        let mean = self.mean_realized_edge();
+        let mean = self.mean_gross_edge();
         if mean >= 0.0 {
             return None;
         }
@@ -138,14 +174,27 @@ impl EdgeTracker {
         }
     }
 
-    /// Whether trading should be paused due to consistently negative edge.
+    /// Whether trading should be paused due to negative edge.
     ///
-    /// Returns `true` if 20+ fills and mean realized edge < -2 bps.
+    /// Always returns `false` — never stop quoting from edge data alone.
+    /// Use `max_defensive_multiplier()` for graduated spread widening instead.
     pub fn should_pause_trading(&self) -> bool {
-        if self.snapshots.len() < 20 {
-            return false;
+        false
+    }
+
+    /// Smooth defensive spread multiplier based on gross edge.
+    ///
+    /// Returns a multiplier in `[1.0, 5.0]`:
+    /// - 1.0 when `mean_gross_edge >= 0` (no widening needed)
+    /// - Linear ramp to 5.0 when `mean_gross_edge <= -3 bps`
+    ///
+    /// Avoids cliff effects from binary alarm thresholds.
+    pub fn max_defensive_multiplier(&self) -> f64 {
+        if self.snapshots.len() < 10 {
+            return 1.0;
         }
-        self.mean_realized_edge() < -2.0
+        let gross = self.mean_gross_edge();
+        1.0 + 4.0 * (-gross / 3.0).clamp(0.0, 1.0)
     }
 
     /// Bootstrapped confidence interval for mean realized edge in basis points.
@@ -196,10 +245,11 @@ impl EdgeTracker {
         };
 
         format!(
-            "Edge Metrics (n={}):\n  Predicted: {:.2} bps\n  Realized:  {:.2} bps\n  Error:     {:.2} bps\n  Significant at 95%: {}",
+            "Edge Metrics (n={}):\n  Predicted: {:.2} bps\n  Realized:  {:.2} bps\n  Gross:     {:.2} bps\n  Error:     {:.2} bps\n  Significant at 95%: {}",
             self.edge_count(),
             self.mean_predicted_edge(),
             self.mean_realized_edge(),
+            self.mean_gross_edge(),
             self.edge_prediction_error(),
             sig,
         )
@@ -217,6 +267,10 @@ mod tests {
     use super::*;
 
     fn make_snapshot(predicted_bps: f64, realized_bps: f64) -> EdgeSnapshot {
+        make_snapshot_with_gross(predicted_bps, realized_bps, realized_bps + 1.5)
+    }
+
+    fn make_snapshot_with_gross(predicted_bps: f64, realized_bps: f64, gross_bps: f64) -> EdgeSnapshot {
         EdgeSnapshot {
             timestamp_ns: 0,
             predicted_spread_bps: predicted_bps + 1.5,
@@ -226,6 +280,7 @@ mod tests {
             fee_bps: 1.5,
             predicted_edge_bps: predicted_bps,
             realized_edge_bps: realized_bps,
+            gross_edge_bps: gross_bps,
         }
     }
 
@@ -330,9 +385,9 @@ mod tests {
     #[test]
     fn test_negative_edge_alarm_mild_negative() {
         let mut tracker = EdgeTracker::new();
-        // Mean realized edge = -0.5 bps (negative but > -1 bps)
+        // Mean gross edge = -0.5 bps (negative but > -1 bps)
         for _ in 0..10 {
-            tracker.add_snapshot(make_snapshot(5.0, -0.5));
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, -2.0, -0.5));
         }
         assert_eq!(tracker.negative_edge_alarm(), Some(1.5));
     }
@@ -340,28 +395,27 @@ mod tests {
     #[test]
     fn test_negative_edge_alarm_strong_negative() {
         let mut tracker = EdgeTracker::new();
-        // Mean realized edge = -3.0 bps (< -1 bps)
+        // Mean gross edge = -3.0 bps (< -1 bps)
         for _ in 0..10 {
-            tracker.add_snapshot(make_snapshot(5.0, -3.0));
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, -4.5, -3.0));
         }
         assert_eq!(tracker.negative_edge_alarm(), Some(2.0));
     }
 
     #[test]
-    fn test_should_pause_trading() {
+    fn test_should_pause_trading_always_false() {
         let mut tracker = EdgeTracker::new();
 
-        // Fewer than 20 fills — never pause
-        for _ in 0..19 {
-            tracker.add_snapshot(make_snapshot(5.0, -5.0));
+        // Empty tracker — never pause
+        assert!(!tracker.should_pause_trading());
+
+        // Even with strongly negative edge and many fills — still never pause
+        for _ in 0..30 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, -5.0, -3.5));
         }
         assert!(!tracker.should_pause_trading());
 
-        // Add one more to hit 20 fills with mean edge = -5.0 bps (< -2 bps)
-        tracker.add_snapshot(make_snapshot(5.0, -5.0));
-        assert!(tracker.should_pause_trading());
-
-        // Tracker with mild negative edge (> -2 bps) should NOT pause
+        // Mild negative — also never pause
         let mut mild_tracker = EdgeTracker::new();
         for _ in 0..25 {
             mild_tracker.add_snapshot(make_snapshot(5.0, -1.0));
@@ -410,5 +464,99 @@ mod tests {
         assert!((point - 3.0).abs() < 1e-10);
         assert_eq!(lower, point);
         assert_eq!(upper, point);
+    }
+
+    #[test]
+    fn test_mean_gross_edge() {
+        let mut tracker = EdgeTracker::new();
+        assert_eq!(tracker.mean_gross_edge(), 0.0);
+
+        // gross_edge = realized + fee = 4.0 + 1.5 = 5.5, 2.0 + 1.5 = 3.5, 6.0 + 1.5 = 7.5
+        tracker.add_snapshot(make_snapshot(5.0, 4.0)); // gross=5.5
+        tracker.add_snapshot(make_snapshot(3.0, 2.0)); // gross=3.5
+        tracker.add_snapshot(make_snapshot(7.0, 6.0)); // gross=7.5
+
+        let expected = (5.5 + 3.5 + 7.5) / 3.0;
+        assert!((tracker.mean_gross_edge() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gross_edge_separate_from_net() {
+        let mut tracker = EdgeTracker::new();
+        // Set gross_edge independently from realized_edge
+        tracker.add_snapshot(make_snapshot_with_gross(5.0, -2.0, 1.0));
+        tracker.add_snapshot(make_snapshot_with_gross(5.0, -1.0, 2.0));
+
+        // Net edge is negative
+        assert!(tracker.mean_realized_edge() < 0.0);
+        // Gross edge is positive
+        assert!(tracker.mean_gross_edge() > 0.0);
+    }
+
+    #[test]
+    fn test_defensive_multiplier_positive_gross() {
+        let mut tracker = EdgeTracker::new();
+        // Fewer than 10 fills — returns 1.0
+        for _ in 0..5 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, 3.0, 2.0));
+        }
+        assert!((tracker.max_defensive_multiplier() - 1.0).abs() < 1e-10);
+
+        // 10+ fills with positive gross edge — returns 1.0
+        for _ in 0..5 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, 3.0, 2.0));
+        }
+        assert!((tracker.max_defensive_multiplier() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_defensive_multiplier_ramp() {
+        // gross = -1.5 bps → mult = 1 + 4*(1.5/3.0) = 1 + 2.0 = 3.0
+        let mut tracker = EdgeTracker::new();
+        for _ in 0..15 {
+            tracker.add_snapshot(make_snapshot_with_gross(5.0, -3.0, -1.5));
+        }
+        assert!((tracker.max_defensive_multiplier() - 3.0).abs() < 1e-10);
+
+        // gross = -3.0 bps → mult = 1 + 4*(3.0/3.0).clamp = 1 + 4 = 5.0
+        let mut tracker2 = EdgeTracker::new();
+        for _ in 0..15 {
+            tracker2.add_snapshot(make_snapshot_with_gross(5.0, -4.5, -3.0));
+        }
+        assert!((tracker2.max_defensive_multiplier() - 5.0).abs() < 1e-10);
+
+        // gross = -6.0 bps → clamped to 5.0
+        let mut tracker3 = EdgeTracker::new();
+        for _ in 0..15 {
+            tracker3.add_snapshot(make_snapshot_with_gross(5.0, -7.5, -6.0));
+        }
+        assert!((tracker3.max_defensive_multiplier() - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gross_edge_variance() {
+        let mut tracker = EdgeTracker::new();
+        // Fewer than 2 — returns 0.0
+        assert_eq!(tracker.gross_edge_variance(), 0.0);
+        tracker.add_snapshot(make_snapshot_with_gross(5.0, 3.0, 2.0));
+        assert_eq!(tracker.gross_edge_variance(), 0.0);
+
+        // Constant gross edge — variance = 0
+        let mut const_tracker = EdgeTracker::new();
+        for _ in 0..10 {
+            const_tracker.add_snapshot(make_snapshot_with_gross(5.0, 3.0, 2.0));
+        }
+        assert!(const_tracker.gross_edge_variance().abs() < 1e-10);
+
+        // Known variance: values 1.0 and 3.0 alternating → mean=2.0, var=1.0 (sample)
+        // Actually with n=2: var = ((1-2)^2 + (3-2)^2) / (2-1) = 2/1 = 2.0
+        // With n=10 (5 each): var = (5*1 + 5*1) / 9 = 10/9 ≈ 1.111
+        let mut var_tracker = EdgeTracker::new();
+        for i in 0..10 {
+            let gross = if i % 2 == 0 { 1.0 } else { 3.0 };
+            var_tracker.add_snapshot(make_snapshot_with_gross(5.0, 0.0, gross));
+        }
+        let var = var_tracker.gross_edge_variance();
+        assert!((var - 10.0 / 9.0).abs() < 1e-10, "Expected 10/9, got {var}");
     }
 }

@@ -15,6 +15,7 @@ use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
+use crate::market_maker::analytics::ToxicityInput;
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 use crate::market_maker::strategy::action_to_inventory_ratio;
 
@@ -393,33 +394,12 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         };
 
         // Update momentum EWMA signals for smoothing (reduces whipsawing)
-        if trend_signal.is_warmed_up
-            && (effective_momentum - momentum_bps).abs() > 0.01
-        {
-            // Blended momentum already incorporates multi-timeframe smoothing.
-            // Bypass EWMA to avoid double-smoothing lag.
-            let drift_rate = (effective_momentum / 10000.0) / 0.5; // per-second drift
-            // Update other state (history, continuation, variance multiplier)
-            // using original short-term momentum
-            self.stochastic.hjb_controller.update_momentum_signals(
-                momentum_bps,
-                p_continuation,
-                position,
-                self.config.max_position,
-            );
-            // Override drift_ewma with the blended value (bypass EWMA smoothing)
-            self.stochastic
-                .hjb_controller
-                .set_drift_directly(drift_rate);
-        } else {
-            // Short-term path: normal EWMA smoothing
-            self.stochastic.hjb_controller.update_momentum_signals(
-                effective_momentum,
-                p_continuation,
-                position,
-                self.config.max_position,
-            );
-        }
+        self.stochastic.hjb_controller.update_momentum_signals(
+            effective_momentum,
+            p_continuation,
+            position,
+            self.config.max_position,
+        );
 
         // Update HJB controller's funding-cycle horizon and terminal penalty
         {
@@ -989,34 +969,74 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             );
         }
 
-        // === NEGATIVE EDGE ALARM: Widen when realized edge is negative ===
-        if let Some(edge_alarm_mult) = self.tier2.edge_tracker.negative_edge_alarm() {
-            spread_multiplier *= edge_alarm_mult;
-            warn!(
-                edge_alarm_mult = %format!("{:.2}", edge_alarm_mult),
-                mean_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_realized_edge()),
-                fills = self.tier2.edge_tracker.edge_count(),
-                "Negative edge alarm: widening spreads defensively"
+        // === PROACTIVE TOXICITY: Widen based on public-data signals ===
+        let toxicity_input = ToxicityInput {
+            vpin: {
+                let v = signals.hl_vpin;
+                if v > 0.0 && v <= 1.0 { Some(v) } else { None }
+            },
+            vpin_velocity: {
+                let v = signals.hl_vpin_velocity;
+                if v.is_finite() { Some(v) } else { None }
+            },
+            p_informed: signals.p_informed,
+            trend_long_bps: if trend_signal.is_warmed_up {
+                Some(trend_signal.long_momentum_bps)
+            } else {
+                None
+            },
+            trend_agreement: if trend_signal.is_warmed_up {
+                Some(trend_signal.timeframe_agreement)
+            } else {
+                None
+            },
+            book_imbalance: market_params.book_imbalance,
+            price_velocity_1s: self.price_velocity_1s,
+        };
+        let toxicity = self.tier2.toxicity.evaluate(&toxicity_input);
+        let toxicity_mult = toxicity.spread_multiplier;
+
+        if toxicity_mult > 1.01 {
+            spread_multiplier *= toxicity_mult;
+            debug!(
+                toxicity_score = %format!("{:.2}", toxicity.composite_score),
+                toxicity_mult = %format!("{:.2}", toxicity_mult),
+                cold_start = toxicity.cold_start,
+                vpin = %format!("{:.2}", toxicity.components.vpin),
+                informed = %format!("{:.2}", toxicity.components.informed),
+                trend = %format!("{:.2}", toxicity.components.trend),
+                book = %format!("{:.2}", toxicity.components.book_imbalance),
+                velocity = %format!("{:.2}", toxicity.components.velocity),
+                "Proactive toxicity widening"
             );
         }
 
-        // === EDGE KILL: Pause trading if consistently losing money per fill ===
-        if self.tier2.edge_tracker.should_pause_trading() {
-            warn!(
-                mean_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_realized_edge()),
+        // === DEFENSIVE EDGE MULTIPLIER: Fill-based supplementary defense ===
+        let defensive_mult = self.tier2.edge_tracker.max_defensive_multiplier();
+        if defensive_mult > 1.01 {
+            spread_multiplier *= defensive_mult;
+            debug!(
+                defensive_mult = %format!("{:.2}", defensive_mult),
+                mean_gross_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_gross_edge()),
                 fills = self.tier2.edge_tracker.edge_count(),
-                "EDGE KILL: consistently negative realized edge, pausing quotes"
+                "Defensive edge multiplier: supplementary fill-based defense"
             );
-            return Ok(());
         }
+
+        // === GLOBAL SPREAD CAP: Prevent infinite widening ===
+        let max_composed = self.tier2.toxicity.config().max_composed_spread_mult;
+        spread_multiplier = spread_multiplier.min(max_composed);
 
         // Apply composed spread multiplier to market params
         if spread_multiplier > 1.0 {
             market_params.spread_widening_mult *= spread_multiplier;
             debug!(
-                multiplier = %format!("{:.2}", spread_multiplier),
-                total_widening = %format!("{:.2}", market_params.spread_widening_mult),
-                "Spread widening active (circuit breaker + threshold kappa + model gating + staleness + edge)"
+                toxicity = %format!("{:.2}x", toxicity_mult),
+                defensive = %format!("{:.2}x", defensive_mult),
+                staleness = %format!("{:.2}x", staleness_mult),
+                model_gating = %format!("{:.2}x", model_gating_mult),
+                total = %format!("{:.2}x", spread_multiplier),
+                "Spread composition breakdown"
             );
         }
 
@@ -1695,7 +1715,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             market_params.sigma / market_params.sigma_effective.max(0.0001), // vol ratio
             self.stochastic.theoretical_edge.bayesian_adverse(),
             market_params.hawkes_branching_ratio,
-            0.0, // momentum_bps: drift bucket wired by lead when ready
+            market_params.drift_rate_per_sec * 1e4, // drift_rate_per_sec (fractional) → momentum_bps
         );
 
         // Get RL policy recommendation (exploration during bootstrap, exploitation after)
@@ -1798,16 +1818,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             None
         };
 
-        // Extract L2 values for Quote Gate, with safety net check
+        // Extract L2 values for Quote Gate, with recalibration adjustment
         let (l2_p_positive, l2_health_score) = if let Some(ref output) = l2_output {
-            // Check edge bias safety net - if bias is critical, don't trust L2
-            let bias_summary = self.learning.confidence_tracker().edge_bias_summary();
-            if bias_summary.should_halt {
-                warn!(
-                    mean_bias_bps = %format!("{:.2}", bias_summary.mean_bias_bps),
-                    "L2 edge bias critical - setting l2_model_health to 0"
+            // Check if edge model needs recalibration (persistent bias > 1.5 bps)
+            let tracker = self.learning.confidence_tracker();
+            if let Some(recal_bias) = tracker.edge_bias_tracker().should_recalibrate() {
+                // Adjust prediction mean by subtracting the bias and recompute p_positive_edge
+                let adjusted_mean = output.edge_prediction.mean - recal_bias;
+                let sigma_mu = output.edge_prediction.std.max(0.001);
+                let z = adjusted_mean / sigma_mu;
+                let adjusted_p = crate::market_maker::control::types::normal_cdf(z);
+                debug!(
+                    original_p = %format!("{:.3}", output.p_positive_edge),
+                    adjusted_p = %format!("{:.3}", adjusted_p),
+                    bias_bps = %format!("{:.2}", recal_bias),
+                    "Edge bias recalibration: adjusting p_positive_edge"
                 );
-                (Some(output.p_positive_edge), 0.0) // Keep p_positive but zero health
+                (Some(adjusted_p), output.model_health.to_score())
             } else {
                 (Some(output.p_positive_edge), output.model_health.to_score())
             }
@@ -2522,7 +2549,6 @@ fn apply_emergency_pull(pull_urgency: f64, increasing_quotes: &mut Vec<Quote>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market_maker::process_models::{HJBConfig, HJBInventoryController};
 
     // ---------------------------------------------------------------
     // Test 1: Graduated urgency — low inventory + moderate momentum
@@ -2657,78 +2683,5 @@ mod tests {
         let urgency = compute_pull_urgency(false, 0.9, 50.0, &mut active);
         assert!((urgency - 0.0).abs() < 1e-10, "No pull when not opposed");
         assert!(!active, "Should not activate");
-    }
-
-    // ---------------------------------------------------------------
-    // Test: Blended momentum bypasses EWMA — drift_ewma is set directly
-    // (mirrors the quote_engine logic when effective_momentum != momentum_bps)
-    // ---------------------------------------------------------------
-    #[test]
-    fn test_blended_momentum_bypasses_ewma() {
-        let mut controller = HJBInventoryController::default_config();
-
-        // Simulate the blended path: first call update_momentum_signals with
-        // short-term momentum (for history/variance state), then override drift
-        let short_term_momentum_bps = 5.0;
-        let blended_momentum_bps = 20.0; // long-term dominated blend
-        let p_continuation = 0.7;
-        let position = 0.0;
-        let max_position = 10.0;
-
-        // Step 1: Update with short-term momentum (side-effects: history, variance)
-        controller.update_momentum_signals(
-            short_term_momentum_bps,
-            p_continuation,
-            position,
-            max_position,
-        );
-
-        // Step 2: Override drift with blended value (bypass EWMA)
-        let blended_drift_rate = (blended_momentum_bps / 10000.0) / 0.5;
-        controller.set_drift_directly(blended_drift_rate);
-
-        // Drift should be exactly the blended value, not EWMA-smoothed short-term
-        assert!(
-            (controller.smoothed_drift() - blended_drift_rate).abs() < 1e-15,
-            "Blended path should bypass EWMA: got {}, expected {blended_drift_rate}",
-            controller.smoothed_drift()
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Test: Short-term momentum uses EWMA smoothing — drift does NOT
-    // jump instantly to a new value (unlike set_drift_directly)
-    // ---------------------------------------------------------------
-    #[test]
-    fn test_short_term_momentum_uses_ewma_smoothing() {
-        // Use legacy EWMA path (not OU) for deterministic sub-ms test behavior
-        let mut config = HJBConfig::default();
-        config.use_ou_drift = false;
-        let mut controller = HJBInventoryController::new(config);
-        let p_continuation = 0.7;
-        let position = 0.0;
-        let max_position = 10.0;
-
-        // Feed a large momentum through the normal EWMA path
-        let momentum_bps = 50.0;
-        let raw_drift = (momentum_bps / 10000.0) / 0.5; // 0.01
-
-        controller.update_momentum_signals(momentum_bps, p_continuation, position, max_position);
-
-        // After a single EWMA update from zero, drift = alpha * raw_drift
-        // which is strictly less than raw_drift. This confirms smoothing is applied.
-        let drift = controller.smoothed_drift();
-        assert!(
-            drift.abs() > 1e-10,
-            "Drift should be nonzero after update"
-        );
-        assert!(
-            (drift - raw_drift).abs() > 1e-6,
-            "Normal EWMA path should NOT produce exact raw drift: got {drift}, raw would be {raw_drift}"
-        );
-        assert!(
-            drift < raw_drift,
-            "First EWMA step from zero should be less than raw: got {drift}, raw={raw_drift}"
-        );
     }
 }
