@@ -266,8 +266,10 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     pub(crate) rl_enabled: bool,
     /// Minimum real fills before RL controls actions
     rl_min_real_fills: usize,
-    /// Auto-disable RL if mean reward < 0 after this many fills
+    /// Auto-disable RL if mean reward < threshold after this many fills
     rl_auto_disable_fills: usize,
+    /// Threshold for RL auto-disable (default: -1.5 bps, matching maker fee)
+    rl_auto_disable_threshold_bps: f64,
 
     // === RL Hot-Reload ===
     /// Watch channel receiver for Q-table hot-reload from an offline trainer.
@@ -443,6 +445,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             rl_enabled: true,
             rl_min_real_fills: 20,
             rl_auto_disable_fills: 100,
+            rl_auto_disable_threshold_bps: -1.5,
             // RL hot-reload (disabled by default, enabled via with_rl_reload)
             q_table_reload_rx: None,
             q_table_reload_weight: 0.3,

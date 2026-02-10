@@ -1021,8 +1021,8 @@ impl SignalIntegrator {
     pub fn staleness_spread_multiplier(&self) -> f64 {
         let mut stale_count = 0;
 
-        // Only count a signal as stale if it HAD data and lost it (observation_count > 0).
-        // Cold-start (never received data) should not penalize — use safe priors instead.
+        // Only count a signal as stale if it WAS warmed up and then lost readiness.
+        // Cold-start (never reached warmup) should not penalize — use safe priors instead.
         if self.config.use_lead_lag
             && !self.lag_analyzer.is_ready()
             && self.lag_analyzer.observation_counts() != (0, 0)
@@ -1037,13 +1037,13 @@ impl SignalIntegrator {
         }
         if self.config.use_informed_flow
             && !self.informed_flow.is_warmed_up()
-            && self.informed_flow.observation_count() > 0
+            && self.informed_flow.was_ever_warmed_up()
         {
             stale_count += 1;
         }
         if self.config.use_regime_kappa
             && !self.regime_kappa.is_warmed_up()
-            && self.regime_kappa.total_fills() > 0
+            && self.regime_kappa.was_ever_warmed_up()
         {
             stale_count += 1;
         }
@@ -1309,34 +1309,38 @@ mod tests {
     }
 
     #[test]
-    fn test_staleness_after_data_then_not_warmed() {
-        use crate::market_maker::estimator::informed_flow::TradeFeatures;
+    fn test_staleness_after_warmup_then_data_loss() {
+        use crate::market_maker::estimator::VolatilityRegime;
 
-        // Signal HAD data (observation_count > 0) but is NOT warmed up => actually stale
+        // Scenario: regime_kappa warmed up in Normal, then regime changes to Extreme
+        // (no fills in Extreme yet). was_ever_warmed_up()=true but is_warmed_up()=false.
         let mut config = SignalIntegratorConfig::disabled();
-        config.use_informed_flow = true;
-        config.informed_flow_config.min_observations = 100; // Need 100 to warm up
+        config.use_regime_kappa = true;
         let mut integrator = SignalIntegrator::new(config);
 
-        // Feed a few observations (not enough to warm up, but > 0)
-        for i in 0..5 {
-            integrator.informed_flow.on_trade(&TradeFeatures {
-                timestamp_ms: i as u64 * 1000,
-                size: 0.1,
-                price_impact_bps: 1.0,
-                book_imbalance: 0.0,
-                is_buy: true,
-                inter_arrival_ms: 1000,
-            });
+        // Warm up regime_kappa in Normal regime (need min_regime_observations fills)
+        integrator.regime_kappa.set_regime(VolatilityRegime::Normal);
+        let price = 100.0;
+        let mid = 100.0;
+        for i in 0..20 {
+            integrator.regime_kappa.on_fill(i * 1000, price, 1.0, mid);
         }
+        assert!(integrator.regime_kappa.is_warmed_up(), "should be warmed up after 20 fills");
+        assert!(integrator.regime_kappa.was_ever_warmed_up());
+        assert!(
+            (integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON,
+            "warmed up and ready => no staleness => 1.0x"
+        );
 
-        assert!(!integrator.informed_flow.is_warmed_up(), "should not be warmed up with only 5 obs");
-        assert!(integrator.informed_flow.observation_count() > 0, "should have observations");
+        // Switch regime: now is_warmed_up()=false but was_ever_warmed_up()=true
+        integrator.regime_kappa.set_regime(VolatilityRegime::Extreme);
+        assert!(!integrator.regime_kappa.is_warmed_up(), "Extreme regime has no fills");
+        assert!(integrator.regime_kappa.was_ever_warmed_up(), "was warmed in Normal");
 
         let mult = integrator.staleness_spread_multiplier();
         assert!(
             (mult - 1.5).abs() < f64::EPSILON,
-            "had data but not warmed up => stale => 1.5x, got {mult}"
+            "was warmed then lost readiness => stale => 1.5x, got {mult}"
         );
     }
 
@@ -1492,6 +1496,70 @@ mod tests {
         assert!(
             (staleness - 1.0).abs() < f64::EPSILON,
             "staleness should be separate from additive total_spread_mult"
+        );
+    }
+
+    #[test]
+    fn test_staleness_warmup_phase_no_penalty() {
+        use crate::market_maker::estimator::informed_flow::TradeFeatures;
+
+        // During warmup: some observations but not enough to warm up.
+        // was_ever_warmed_up()=false => staleness should be 1.0 (no penalty).
+        let mut config = SignalIntegratorConfig::disabled();
+        config.use_informed_flow = true;
+        config.informed_flow_config.min_observations = 100;
+        let mut integrator = SignalIntegrator::new(config);
+
+        // Feed 5 observations (not enough for warmup of 100)
+        for i in 0..5 {
+            integrator.informed_flow.on_trade(&TradeFeatures {
+                timestamp_ms: i as u64 * 1000,
+                size: 0.1,
+                price_impact_bps: 1.0,
+                book_imbalance: 0.0,
+                is_buy: true,
+                inter_arrival_ms: 1000,
+            });
+        }
+
+        assert!(!integrator.informed_flow.is_warmed_up());
+        assert!(integrator.informed_flow.observation_count() > 0, "has some data");
+        assert!(!integrator.informed_flow.was_ever_warmed_up(), "never reached warmup");
+
+        let mult = integrator.staleness_spread_multiplier();
+        assert!(
+            (mult - 1.0).abs() < f64::EPSILON,
+            "during warmup (never fully warmed) => no staleness => 1.0x, got {mult}"
+        );
+    }
+
+    #[test]
+    fn test_staleness_after_full_warmup_then_regime_change() {
+        use crate::market_maker::estimator::VolatilityRegime;
+
+        // Verify: warmed in one regime, switch regime => staleness triggers
+        let mut config = SignalIntegratorConfig::disabled();
+        config.use_regime_kappa = true;
+        let mut integrator = SignalIntegrator::new(config);
+
+        // Warm up in Normal
+        integrator.regime_kappa.set_regime(VolatilityRegime::Normal);
+        for i in 0..20 {
+            integrator.regime_kappa.on_fill(i * 1000, 100.0, 1.0, 100.0);
+        }
+        assert!(integrator.regime_kappa.was_ever_warmed_up());
+        assert!(integrator.regime_kappa.is_warmed_up());
+        assert!((integrator.staleness_spread_multiplier() - 1.0).abs() < f64::EPSILON);
+
+        // Switch regime => data loss
+        integrator.regime_kappa.set_regime(VolatilityRegime::Extreme);
+        assert!(!integrator.regime_kappa.is_warmed_up());
+        assert!(integrator.regime_kappa.was_ever_warmed_up());
+
+        let mult = integrator.staleness_spread_multiplier();
+        assert!(
+            (mult - 1.5).abs() < f64::EPSILON,
+            "was warmed then regime changed => stale => 1.5x, got {mult}"
         );
     }
 

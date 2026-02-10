@@ -1441,7 +1441,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Step 4: Remove stale orders from ws_state
         let mut removed_count = 0usize;
         for oid in &stale_oids {
-            if self.ws_state.remove_order(*oid).is_some() {
+            if let Some(order) = self.ws_state.remove_order(*oid) {
+                self.safety.fill_processor.record_cancelled_order(
+                    *oid, order.side, order.price, order.size,
+                );
                 removed_count += 1;
                 debug!(
                     oid = oid,
@@ -1720,6 +1723,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 );
             }
         }
+
+        // === Tombstone cleanup: expire cancelled-order tombstones older than TTL ===
+        self.safety.fill_processor.cleanup_tombstones();
 
         // === Live Analytics: Periodic summary (Sharpe, signal attribution) ===
         let mean_edge = self.tier2.edge_tracker.mean_realized_edge();

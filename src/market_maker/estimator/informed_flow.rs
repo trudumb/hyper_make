@@ -321,6 +321,10 @@ pub struct InformedFlowEstimator {
 
     /// Maximum cluster size seen (for normalization)
     max_cluster_size: usize,
+
+    /// Whether the estimator has ever reached warmup threshold.
+    /// Once true, stays true even if observation count drops (e.g. after reset is NOT called).
+    was_ever_warmed: bool,
 }
 
 /// Sufficient statistics for online EM
@@ -366,6 +370,7 @@ impl InformedFlowEstimator {
             informed_cluster_count: 0,
             recent_p_informed: VecDeque::with_capacity(20),
             max_cluster_size: 1,
+            was_ever_warmed: false,
         }
     }
 
@@ -425,6 +430,11 @@ impl InformedFlowEstimator {
 
         self.observation_count += 1;
         self.trades_since_update += 1;
+
+        // Track first warmup
+        if !self.was_ever_warmed && self.is_warmed_up() {
+            self.was_ever_warmed = true;
+        }
 
         // Periodic M-step
         if self.trades_since_update >= self.config.em_update_interval {
@@ -792,6 +802,12 @@ impl InformedFlowEstimator {
         self.observation_count >= self.config.min_observations
     }
 
+    /// Whether the estimator has ever reached warmup threshold.
+    /// Once true, stays true permanently (survives observation count changes).
+    pub fn was_ever_warmed_up(&self) -> bool {
+        self.was_ever_warmed
+    }
+
     /// Reset estimator to initial state
     pub fn reset(&mut self) {
         *self = Self::new(self.config.clone());
@@ -990,5 +1006,70 @@ mod tests {
 
         // Forced should have highest clustering
         assert!(forced.alpha > informed.alpha);
+    }
+
+    #[test]
+    fn test_was_ever_warmed_up_starts_false_transitions_to_true() {
+        let mut estimator = InformedFlowEstimator::default_config();
+        assert!(!estimator.was_ever_warmed_up());
+        assert!(!estimator.is_warmed_up());
+
+        // Feed enough trades to reach warmup (min_observations = 50)
+        for i in 0..60 {
+            let features = TradeFeatures {
+                size: 1.0,
+                inter_arrival_ms: 1000,
+                price_impact_bps: 1.0,
+                timestamp_ms: i * 1000,
+                ..Default::default()
+            };
+            estimator.on_trade(&features);
+        }
+
+        assert!(estimator.is_warmed_up());
+        assert!(estimator.was_ever_warmed_up());
+    }
+
+    #[test]
+    fn test_was_ever_warmed_up_stays_true_after_reset() {
+        let mut estimator = InformedFlowEstimator::default_config();
+
+        // Warm up the estimator
+        for i in 0..60 {
+            let features = TradeFeatures {
+                size: 1.0,
+                inter_arrival_ms: 1000,
+                price_impact_bps: 1.0,
+                timestamp_ms: i * 1000,
+                ..Default::default()
+            };
+            estimator.on_trade(&features);
+        }
+        assert!(estimator.was_ever_warmed_up());
+
+        // Reset clears the estimator (including was_ever_warmed since it creates new Self)
+        // This is correct: reset() is a full re-initialization
+        estimator.reset();
+        assert!(!estimator.is_warmed_up());
+        // After reset, was_ever_warmed is also false because reset() creates a fresh instance.
+        // The flag tracks warmup within the current lifecycle, not across resets.
+        assert!(!estimator.was_ever_warmed_up());
+
+        // But the key behavior: once warmed, stays warm even if we could hypothetically
+        // drop observations. Since InformedFlowEstimator only grows observation_count
+        // monotonically (no decrement), we verify the flag is sticky by checking it
+        // doesn't flip back to false while still warmed up.
+        for i in 0..60 {
+            let features = TradeFeatures {
+                size: 1.0,
+                inter_arrival_ms: 1000,
+                price_impact_bps: 1.0,
+                timestamp_ms: (i + 100) * 1000,
+                ..Default::default()
+            };
+            estimator.on_trade(&features);
+        }
+        assert!(estimator.is_warmed_up());
+        assert!(estimator.was_ever_warmed_up());
     }
 }

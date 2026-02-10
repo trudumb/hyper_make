@@ -243,31 +243,9 @@ impl StochasticController {
             &control_state,
         );
 
-        // 6. Information value check: should we wait?
-        // Skip WaitToLearn during L3 warmup - we need data first before making wait decisions
-        // Using myopic actions during warmup allows position building and calibration
-        let should_check_wait = self.changepoint.is_warmed_up();
-
-        if should_check_wait && self.info_value.should_wait(&control_state, &action) {
-            self.wait_cycles += 1;
-
-            if self.wait_cycles <= self.config.information.max_wait_cycles {
-                let info_gain = self.info_value.expected_info_gain(&control_state);
-                debug!(
-                    wait_cycles = self.wait_cycles,
-                    info_gain = %format!("{:.4}", info_gain),
-                    uncertainty = %format!("{:.2}", control_state.edge_uncertainty()),
-                    "Waiting to learn"
-                );
-
-                return Action::WaitToLearn {
-                    expected_info_gain: info_gain,
-                    suggested_wait_cycles: self.info_value.recommended_wait_cycles(&control_state),
-                };
-            }
-        } else if should_check_wait {
-            self.wait_cycles = 0;
-        }
+        // 6. WaitToLearn removed: cold-start deadlock — can only learn by quoting.
+        // The InformationValue module is kept but no longer overrides actions.
+        self.wait_cycles = 0;
 
         // 7. Log periodically
         if self.should_log() {

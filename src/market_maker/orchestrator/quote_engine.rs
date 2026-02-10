@@ -1750,7 +1750,8 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let mean_reward = self.stochastic.rl_agent.mean_recent_reward();
 
             let should_apply = total_rl_updates >= self.rl_min_real_fills as u64
-                && (total_rl_updates < self.rl_auto_disable_fills as u64 || mean_reward >= 0.0);
+                && (total_rl_updates < self.rl_auto_disable_fills as u64
+                    || mean_reward >= self.rl_auto_disable_threshold_bps);
 
             if should_apply {
                 // Apply spread delta with safety floor: cannot go negative
@@ -1781,8 +1782,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             } else {
                 warn!(
                     mean_reward = %format!("{:.3}", mean_reward),
+                    threshold = %format!("{:.1}", self.rl_auto_disable_threshold_bps),
                     total_updates = total_rl_updates,
-                    "RL auto-disabled (negative mean reward)"
+                    "RL auto-disabled (mean reward below threshold)"
                 );
             }
         }

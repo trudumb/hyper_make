@@ -1340,6 +1340,9 @@ pub struct SimToRealConfig {
     pub action_bound_sigma: f64,
     /// Auto-disable RL if mean reward < 0 after this many fills
     pub auto_disable_after_fills: usize,
+    /// Reward threshold (bps) below which RL auto-disables.
+    /// Default -1.5 bps (maker fee) so fee drag alone does not trigger disable.
+    pub auto_disable_threshold_bps: f64,
 }
 
 impl Default for SimToRealConfig {
@@ -1349,6 +1352,7 @@ impl Default for SimToRealConfig {
             min_real_fills: 20,
             action_bound_sigma: 1.5,
             auto_disable_after_fills: 100,
+            auto_disable_threshold_bps: -1.5,
         }
     }
 }
@@ -1454,10 +1458,16 @@ impl QLearningAgent {
             return neutral_idx;
         }
 
-        // Guard 2: Auto-disable on persistent negative reward
+        // Guard 2: Auto-disable on persistent negative reward (below threshold, not just < 0)
+        let threshold = self.sim_to_real_config.auto_disable_threshold_bps;
         if total_updates > self.sim_to_real_config.auto_disable_after_fills as u64
-            && self.mean_recent_reward() < 0.0
+            && self.mean_recent_reward() < threshold
         {
+            debug!(
+                mean_reward = %format!("{:.3}", self.mean_recent_reward()),
+                threshold_bps = %format!("{:.1}", threshold),
+                "RL auto-disabled: mean reward below threshold"
+            );
             return neutral_idx;
         }
 
@@ -1904,6 +1914,9 @@ impl QLearningAgent {
 
         self.episodes = ckpt.episodes;
         self.total_reward = ckpt.total_reward;
+
+        // Clear stale reward history so previous session doesn't poison auto-disable
+        self.recent_rewards.clear();
 
         // Clear and rebuild q_table from checkpoint entries
         self.q_table.clear();
@@ -2858,6 +2871,129 @@ mod tests {
         // The agent should be able to pick action 0 (not forced to neutral=12)
         assert_ne!(action, neutral_action, "Agent should NOT be forced to neutral after sufficient positive fills");
         assert_eq!(action, 0, "Agent should exploit best action after sufficient fills");
+    }
+
+    #[test]
+    fn test_auto_disable_threshold_not_triggered_by_fee_drag() {
+        // Fee drag of -1.0 bps should NOT trigger auto-disable with threshold at -1.5 bps
+        let sim_config = SimToRealConfig {
+            min_real_fills: 0,
+            action_bound_sigma: 10.0,
+            auto_disable_after_fills: 5,
+            auto_disable_threshold_bps: -1.5,
+            ..Default::default()
+        };
+        let config = QLearningConfig {
+            min_observations: 0,
+            min_exploration_rate: 0.0,
+            exploration: ExplorationStrategy::EpsilonGreedy { epsilon: 0.0, decay: 1.0 },
+            ..Default::default()
+        };
+        let mut agent = QLearningAgent::with_sim_to_real(config, sim_config);
+        let state_idx = 0usize;
+        let neutral_idx = ParameterAction::neutral().to_index();
+
+        // Simulate fee-drag-only rewards: mean = -1.0 bps (above -1.5 threshold)
+        for _ in 0..10 {
+            let reward = Reward {
+                total: -1.0,
+                edge_component: -1.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, 0, reward, state_idx, false);
+        }
+
+        assert!(agent.total_updates() > 5);
+        // Mean reward is -1.0, which is above the -1.5 threshold
+        assert!(agent.mean_recent_reward() > -1.5);
+
+        let action = agent.select_action_idx(state_idx);
+        // Agent should NOT be forced to neutral — fee drag alone doesn't disable RL
+        assert_ne!(
+            action, neutral_idx,
+            "Fee-drag-only reward (-1.0 bps) should not trigger auto-disable at -1.5 threshold"
+        );
+    }
+
+    #[test]
+    fn test_auto_disable_triggers_below_threshold() {
+        // Reward of -2.0 bps should trigger auto-disable with threshold at -1.5 bps
+        let sim_config = SimToRealConfig {
+            min_real_fills: 0,
+            action_bound_sigma: 10.0,
+            auto_disable_after_fills: 5,
+            auto_disable_threshold_bps: -1.5,
+            ..Default::default()
+        };
+        let mut agent = QLearningAgent::with_sim_to_real(
+            QLearningConfig::default(),
+            sim_config,
+        );
+        let state_idx = 0usize;
+        let neutral_idx = ParameterAction::neutral().to_index();
+
+        // Rewards well below threshold
+        for i in 0..10 {
+            let reward = Reward {
+                total: -2.0,
+                edge_component: -2.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, i % UNIFIED_ACTION_COUNT, reward, state_idx, false);
+        }
+
+        assert!(agent.total_updates() > 5);
+        assert!(agent.mean_recent_reward() < -1.5);
+
+        let action = agent.select_action_idx(state_idx);
+        assert_eq!(
+            action, neutral_idx,
+            "Reward below threshold (-2.0 < -1.5) must trigger auto-disable"
+        );
+    }
+
+    #[test]
+    fn test_recent_rewards_cleared_on_checkpoint_restore() {
+        let mut agent = QLearningAgent::new(QLearningConfig::default());
+        let state_idx = 0usize;
+
+        // Accumulate negative rewards from a previous session
+        for _ in 0..20 {
+            let reward = Reward {
+                total: -5.0,
+                edge_component: -5.0,
+                inventory_penalty: 0.0,
+                volatility_penalty: 0.0,
+                inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
+            };
+            agent.update_idx(state_idx, 0, reward, state_idx, false);
+        }
+
+        assert!(agent.mean_recent_reward() < -1.5);
+        assert!(!agent.recent_rewards.is_empty());
+
+        // Save and restore from checkpoint
+        let ckpt = agent.to_checkpoint();
+        agent.restore_from_checkpoint(&ckpt);
+
+        // Recent rewards must be cleared — fresh session starts clean
+        assert!(
+            agent.recent_rewards.is_empty(),
+            "recent_rewards must be cleared on checkpoint restore"
+        );
+        // mean_recent_reward returns 0.0 for empty rewards, which is above any negative threshold
+        assert_eq!(
+            agent.mean_recent_reward(),
+            0.0,
+            "mean_recent_reward must be 0.0 after restore (empty history)"
+        );
     }
 
     // ==========================================================================

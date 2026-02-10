@@ -585,6 +585,28 @@ pub struct FillState<'a> {
     pub market_params: Option<&'a MarketParams>,
 }
 
+
+/// A record of a recently cancelled order, used to handle the cancel-fill race condition.
+///
+/// When an order is cancelled but a fill arrives after (the exchange filled it before
+/// processing our cancel), we can match the fill to this tombstone instead of logging
+/// an "untracked order" warning. This allows proper attribution of the fill.
+#[derive(Debug, Clone)]
+pub struct TombstoneOrder {
+    /// Side of the cancelled order
+    pub side: Side,
+    /// Limit price of the cancelled order
+    pub price: f64,
+    /// Original size of the cancelled order
+    pub size: f64,
+    /// When the cancellation was recorded
+    pub cancelled_at: Instant,
+}
+
+/// Time-to-live for tombstone entries (2 seconds).
+/// Fills arriving after this window are truly unexpected.
+const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Fill processor - coordinates fill handling across modules.
 ///
 /// Provides centralized fill deduplication and orchestrates updates to all
@@ -603,6 +625,12 @@ pub struct FillProcessor {
     /// For partial immediate fills: register partial size, WS fills decrement
     /// until remaining reaches 0, then subsequent fills update position normally.
     immediate_fill_amounts: std::collections::HashMap<u64, f64>,
+    /// Tombstone records for recently cancelled orders.
+    ///
+    /// When an order is cancelled, we record its metadata here so that if a fill
+    /// arrives for it (cancel-fill race), we can match and attribute correctly
+    /// instead of logging an "untracked order" warning.
+    recently_cancelled: std::collections::HashMap<u64, TombstoneOrder>,
 }
 
 impl FillProcessor {
@@ -611,6 +639,7 @@ impl FillProcessor {
         Self {
             deduplicator: FillDeduplicator::new(),
             immediate_fill_amounts: std::collections::HashMap::new(),
+            recently_cancelled: std::collections::HashMap::new(),
         }
     }
 
@@ -619,6 +648,7 @@ impl FillProcessor {
         Self {
             deduplicator: FillDeduplicator::with_capacity(capacity),
             immediate_fill_amounts: std::collections::HashMap::new(),
+            recently_cancelled: std::collections::HashMap::new(),
         }
     }
 
@@ -791,8 +821,21 @@ impl FillProcessor {
                         "Fill matched to pending order by price (fallback lookup)"
                     );
                     Some(pending.price)
+                } else if let Some(tombstone) = self.recently_cancelled.remove(&fill.oid) {
+                    // Cancel-fill race: order was cancelled but exchange filled it first.
+                    // Use tombstone data for attribution.
+                    info!(
+                        "[Fill] Fill matched to recently cancelled order: oid={} tid={} side={:?} price={} size={} | tombstone age={:?}",
+                        fill.oid,
+                        fill.tid,
+                        tombstone.side,
+                        tombstone.price,
+                        fill.size,
+                        tombstone.cancelled_at.elapsed(),
+                    );
+                    Some(tombstone.price)
                 } else {
-                    // Truly untracked - not in orders, not by CLOID, not by price
+                    // Truly untracked - not in orders, not by CLOID, not by price, not in tombstones
                     warn!(
                         "[Fill] Untracked order filled: oid={} tid={} cloid={:?} {} {} {} | position updated to {}",
                         fill.oid,
@@ -1153,6 +1196,37 @@ impl FillProcessor {
     /// Use with caution - could cause double-processing.
     pub fn clear_dedup_cache(&mut self) {
         self.deduplicator.clear();
+    }
+
+    /// Record a recently cancelled order as a tombstone.
+    ///
+    /// Called when an order is cancelled so that if a fill arrives for this OID
+    /// within the TTL window (cancel-fill race condition), we can match and
+    /// attribute it correctly instead of logging an "untracked order" warning.
+    pub fn record_cancelled_order(&mut self, oid: u64, side: Side, price: f64, size: f64) {
+        self.recently_cancelled.insert(
+            oid,
+            TombstoneOrder {
+                side,
+                price,
+                size,
+                cancelled_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Remove tombstone entries older than the TTL (2 seconds).
+    ///
+    /// Should be called periodically (e.g. each quote cycle) to prevent unbounded growth.
+    pub fn cleanup_tombstones(&mut self) {
+        let now = Instant::now();
+        self.recently_cancelled
+            .retain(|_, tombstone| now.duration_since(tombstone.cancelled_at) < TOMBSTONE_TTL);
+    }
+
+    /// Number of active tombstone entries (for diagnostics).
+    pub fn tombstone_count(&self) -> usize {
+        self.recently_cancelled.len()
     }
 }
 
@@ -1727,5 +1801,166 @@ mod tests {
             "Position was {}, expected 1.0",
             position.position()
         );
+    }
+
+    #[test]
+    fn test_tombstone_records_order() {
+        let mut processor = FillProcessor::new();
+        assert_eq!(processor.tombstone_count(), 0);
+
+        processor.record_cancelled_order(100, Side::Buy, 50000.0, 1.0);
+        assert_eq!(processor.tombstone_count(), 1);
+
+        processor.record_cancelled_order(200, Side::Sell, 51000.0, 0.5);
+        assert_eq!(processor.tombstone_count(), 2);
+
+        // Verify tombstone data is correct
+        let tombstone = processor.recently_cancelled.get(&100).unwrap();
+        assert_eq!(tombstone.side, Side::Buy);
+        assert!((tombstone.price - 50000.0).abs() < f64::EPSILON);
+        assert!((tombstone.size - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_tombstone_expires_after_ttl() {
+        let mut processor = FillProcessor::new();
+
+        // Insert a tombstone with an artificially old timestamp
+        processor.recently_cancelled.insert(
+            100,
+            TombstoneOrder {
+                side: Side::Buy,
+                price: 50000.0,
+                size: 1.0,
+                cancelled_at: Instant::now() - std::time::Duration::from_secs(3),
+            },
+        );
+        assert_eq!(processor.tombstone_count(), 1);
+
+        // Insert a fresh tombstone
+        processor.record_cancelled_order(200, Side::Sell, 51000.0, 0.5);
+        assert_eq!(processor.tombstone_count(), 2);
+
+        // Cleanup should remove the expired one, keep the fresh one
+        processor.cleanup_tombstones();
+        assert_eq!(processor.tombstone_count(), 1);
+        assert!(processor.recently_cancelled.contains_key(&200));
+        assert!(!processor.recently_cancelled.contains_key(&100));
+    }
+
+    #[test]
+    fn test_fill_matches_tombstone() {
+        let mut processor = FillProcessor::new();
+        let mut position = PositionTracker::new(0.0);
+        let mut orders = OrderManager::new();
+        let mut adverse_selection =
+            AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
+        let mut depth_decay_as = DepthDecayAS::default();
+        let mut queue_tracker = QueuePositionTracker::new(QueueConfig::default());
+        let mut estimator = ParameterEstimator::new(EstimatorConfig::default());
+        let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
+        let mut prometheus = PrometheusMetrics::new();
+        let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
+        let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
+
+        // Record a tombstone for OID 100 (simulating a cancelled order)
+        processor.record_cancelled_order(100, Side::Buy, 49950.0, 1.0);
+
+        let mut state = make_test_state(
+            &mut position,
+            &mut orders,
+            &mut adverse_selection,
+            &mut depth_decay_as,
+            &mut queue_tracker,
+            &mut pre_fill_classifier,
+            &mut enhanced_classifier,
+            &mut estimator,
+            &mut pnl_tracker,
+            &mut prometheus,
+            &metrics,
+            &mut learning,
+            &mut stochastic_controller,
+            &mut position_pnl,
+            &mut theoretical_edge,
+            &mut model_calibration,
+            &mut signal_store,
+        );
+
+        // Fill arrives for the cancelled order (cancel-fill race)
+        let fill = make_fill(1, 100, 1.0, 50000.0, true);
+        let result = processor.process(&fill, &mut state);
+
+        // Fill should be processed and matched to tombstone
+        assert!(result.fill_result.is_new);
+        // Placement price should come from the tombstone
+        assert_eq!(result.placement_price, Some(49950.0));
+        // Tombstone should be consumed (removed)
+        assert_eq!(processor.tombstone_count(), 0);
+        // Position should be updated
+        assert!((position.position() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_fill_without_tombstone_still_warns() {
+        let mut processor = FillProcessor::new();
+        let mut position = PositionTracker::new(0.0);
+        let mut orders = OrderManager::new();
+        let mut adverse_selection =
+            AdverseSelectionEstimator::new(AdverseSelectionConfig::default());
+        let mut depth_decay_as = DepthDecayAS::default();
+        let mut queue_tracker = QueuePositionTracker::new(QueueConfig::default());
+        let mut estimator = ParameterEstimator::new(EstimatorConfig::default());
+        let mut pnl_tracker = PnLTracker::new(PnLConfig::default());
+        let mut prometheus = PrometheusMetrics::new();
+        let metrics: MetricsRecorder = None;
+        let mut learning = crate::market_maker::learning::LearningModule::default();
+        let mut stochastic_controller = StochasticController::default();
+        let mut position_pnl = PositionPnLTracker::default();
+        let mut theoretical_edge = crate::market_maker::control::TheoreticalEdgeEstimator::new();
+        let mut model_calibration = ModelCalibrationOrchestrator::default();
+        let mut signal_store = FillSignalStore::new();
+        let mut pre_fill_classifier = PreFillASClassifier::default();
+        let mut enhanced_classifier = EnhancedASClassifier::default_config();
+
+        // No tombstone recorded — this is a truly untracked fill
+
+        let mut state = make_test_state(
+            &mut position,
+            &mut orders,
+            &mut adverse_selection,
+            &mut depth_decay_as,
+            &mut queue_tracker,
+            &mut pre_fill_classifier,
+            &mut enhanced_classifier,
+            &mut estimator,
+            &mut pnl_tracker,
+            &mut prometheus,
+            &metrics,
+            &mut learning,
+            &mut stochastic_controller,
+            &mut position_pnl,
+            &mut theoretical_edge,
+            &mut model_calibration,
+            &mut signal_store,
+        );
+
+        // Fill arrives for unknown OID (no tombstone, no tracked order)
+        let fill = make_fill(1, 999, 1.0, 50000.0, true);
+        let result = processor.process(&fill, &mut state);
+
+        // Fill should still be processed (position updated)
+        assert!(result.fill_result.is_new);
+        assert!((position.position() - 1.0).abs() < f64::EPSILON);
+        // But placement price should be None (untracked)
+        assert_eq!(result.placement_price, None);
+        // No tombstones should exist
+        assert_eq!(processor.tombstone_count(), 0);
     }
 }

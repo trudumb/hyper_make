@@ -166,6 +166,10 @@ pub struct RegimeKappaEstimator {
 
     /// Fills per regime (for diagnostics).
     fills_per_regime: [u64; NUM_KAPPA_REGIMES],
+
+    /// Whether the estimator has ever reached warmup threshold.
+    /// Once true, stays true even if regime changes reduce observation counts.
+    was_ever_warmed: bool,
 }
 
 impl RegimeKappaEstimator {
@@ -201,6 +205,7 @@ impl RegimeKappaEstimator {
             current_regime: 1,
             total_fills: 0,
             fills_per_regime: [0; NUM_KAPPA_REGIMES],
+            was_ever_warmed: false,
         }
     }
 
@@ -264,6 +269,11 @@ impl RegimeKappaEstimator {
         self.total_fills += 1;
         self.fills_per_regime[regime] += 1;
 
+        // Track first warmup
+        if !self.was_ever_warmed && self.is_warmed_up() {
+            self.was_ever_warmed = true;
+        }
+
         // Periodic logging
         if self.total_fills.is_multiple_of(50) {
             self.log_status();
@@ -286,6 +296,11 @@ impl RegimeKappaEstimator {
         self.regime_estimators[regime].on_trade(timestamp_ms, price, size, mid);
         self.total_fills += 1;
         self.fills_per_regime[regime] += 1;
+
+        // Track first warmup
+        if !self.was_ever_warmed && self.is_warmed_up() {
+            self.was_ever_warmed = true;
+        }
     }
 
     /// Get effective kappa using regime-probability blending.
@@ -363,6 +378,12 @@ impl RegimeKappaEstimator {
         // Warmed up if dominant regime has enough observations
         self.regime_estimators[self.current_regime].observation_count()
             >= self.config.min_regime_observations
+    }
+
+    /// Whether the estimator has ever reached warmup threshold.
+    /// Once true, stays true permanently (survives regime changes).
+    pub fn was_ever_warmed_up(&self) -> bool {
+        self.was_ever_warmed
     }
 
     /// Get confidence in the estimate (based on observation counts).
@@ -556,5 +577,45 @@ mod tests {
 
         estimator.set_regime(VolatilityRegime::Low);
         assert_eq!(estimator.current_regime(), 0);
+    }
+
+    #[test]
+    fn test_was_ever_warmed_up_starts_false_transitions_to_true() {
+        let mut estimator = RegimeKappaEstimator::default_config();
+        assert!(!estimator.was_ever_warmed_up());
+        assert!(!estimator.is_warmed_up());
+
+        // Set to Normal regime and feed enough fills (min_regime_observations = 10)
+        estimator.set_regime(VolatilityRegime::Normal);
+        for i in 0..15 {
+            let mid = 50000.0;
+            let price = mid * (1.0 + 0.0005);
+            estimator.on_fill(i * 1000, price, 1.0, mid);
+        }
+
+        assert!(estimator.is_warmed_up());
+        assert!(estimator.was_ever_warmed_up());
+    }
+
+    #[test]
+    fn test_was_ever_warmed_up_stays_true_after_regime_change() {
+        let mut estimator = RegimeKappaEstimator::default_config();
+
+        // Warm up in Normal regime
+        estimator.set_regime(VolatilityRegime::Normal);
+        for i in 0..15 {
+            let mid = 50000.0;
+            let price = mid * (1.0 + 0.0005);
+            estimator.on_fill(i * 1000, price, 1.0, mid);
+        }
+        assert!(estimator.is_warmed_up());
+        assert!(estimator.was_ever_warmed_up());
+
+        // Switch to Extreme regime (no fills there yet)
+        estimator.set_regime(VolatilityRegime::Extreme);
+        // is_warmed_up() may be false now (Extreme regime has 0 observations)
+        assert!(!estimator.is_warmed_up());
+        // But was_ever_warmed_up() stays true
+        assert!(estimator.was_ever_warmed_up());
     }
 }

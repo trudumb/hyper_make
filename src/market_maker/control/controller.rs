@@ -251,13 +251,8 @@ impl OptimalController {
             });
         }
 
-        // 6. Consider waiting if high uncertainty
-        if state.edge_uncertainty() > state.expected_edge().abs() {
-            candidates.push(Action::WaitToLearn {
-                expected_info_gain: 0.1,
-                suggested_wait_cycles: 5,
-            });
-        }
+        // 6. WaitToLearn removed: cold-start deadlock — can only learn by quoting.
+        // The Action::WaitToLearn variant is kept for checkpoint backward compat but never generated.
 
         candidates
     }
@@ -265,7 +260,7 @@ impl OptimalController {
     /// Reconcile optimal action with Layer 2's myopic decision.
     pub fn reconcile_with_myopic(
         &self,
-        optimal: Action,
+        _optimal: Action,
         myopic: &QuoteDecision,
         state: &ControlState,
     ) -> Action {
@@ -288,18 +283,7 @@ impl OptimalController {
             return self.conservative_action(myopic, state);
         }
 
-        // 4. Information value - prefer waiting
-        if matches!(optimal, Action::WaitToLearn { .. })
-            && !matches!(myopic, QuoteDecision::NoQuote { .. })
-        {
-            // Check if waiting is actually valuable
-            let wait_value = self.value_of_waiting(state);
-            let act_value = self.value_of_acting(state, myopic);
-
-            if wait_value > act_value {
-                return optimal;
-            }
-        }
+        // 4. WaitToLearn removed: cold-start deadlock — can only learn by quoting.
 
         // 5. Position limits - Layer 2 might not account for sequential effects
         if self.would_exceed_position(myopic, state) {
@@ -370,30 +354,6 @@ impl OptimalController {
             QuoteDecision::NoQuote { reason: _ } => Action::NoQuote {
                 reason: NoQuoteReason::ModelDegraded,
             },
-        }
-    }
-
-    /// Value of waiting to learn.
-    fn value_of_waiting(&self, state: &ControlState) -> f64 {
-        // Expected reduction in uncertainty
-        let current_uncertainty = state.edge_uncertainty();
-        let expected_uncertainty = current_uncertainty * 0.9; // Assume 10% reduction
-
-        // Value of uncertainty reduction
-        let info_value = (current_uncertainty - expected_uncertainty) * state.expected_edge().abs();
-
-        // Minus opportunity cost
-        let opportunity_cost = state.expected_edge().max(0.0) * 0.01;
-
-        info_value - opportunity_cost
-    }
-
-    /// Value of acting now.
-    fn value_of_acting(&self, state: &ControlState, myopic: &QuoteDecision) -> f64 {
-        match myopic {
-            QuoteDecision::Quote { expected_edge, .. } => *expected_edge * 0.1,
-            QuoteDecision::ReducedSize { fraction, .. } => state.expected_edge() * fraction * 0.1,
-            QuoteDecision::NoQuote { .. } => 0.0,
         }
     }
 

@@ -1339,9 +1339,13 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let all_cancels: Vec<u64> = bid_cancels.into_iter().chain(ask_cancels).collect();
         if !all_cancels.is_empty() {
             self.initiate_bulk_cancel(all_cancels.clone()).await;
-            // Sync ws_state by removing cancelled orders
+            // Sync ws_state by removing cancelled orders, recording tombstones for fill attribution
             for oid in &all_cancels {
-                self.ws_state.remove_order(*oid);
+                if let Some(order) = self.ws_state.remove_order(*oid) {
+                    self.safety.fill_processor.record_cancelled_order(
+                        *oid, order.side, order.price, order.size,
+                    );
+                }
             }
         }
 

@@ -43,7 +43,7 @@ pub use consumer::{FillConsumer, FillConsumerBox};
 pub use dedup::FillDeduplicator;
 pub use processor::{
     FillProcessingResult, FillProcessor, FillSignalSnapshot, FillSignalStore, FillState,
-    PendingMarkout,
+    PendingMarkout, TombstoneOrder,
 };
 
 use std::time::Instant;

@@ -412,7 +412,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         self.infra.orphan_tracker.clear_orphan(oid);
 
                         // Force remove from WS State (Fix synchronization)
-                        if self.ws_state.remove_order(oid).is_some() {
+                        if let Some(order) = self.ws_state.remove_order(oid) {
+                            self.safety.fill_processor.record_cancelled_order(
+                                oid, order.side, order.price, order.size,
+                            );
                             warn!(oid = oid, "[SafetySync] Ghost order removed from ws_state (Verified gone via WS Snapshot)");
                         }
                     }
@@ -444,11 +447,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                     // CRITICAL FIX: If the order is confirmed gone (Cancelled OR AlreadyFilled),
                     // we MUST remove it from ws_state.
-                    if result.order_is_gone() && self.ws_state.remove_order(*oid).is_some() {
-                        warn!(
-                            oid = oid,
-                            "Forced removal from ws_state to correct synchronization (cancel confirmed/filled)"
-                        );
+                    if result.order_is_gone() {
+                        if let Some(order) = self.ws_state.remove_order(*oid) {
+                            self.safety.fill_processor.record_cancelled_order(
+                                *oid, order.side, order.price, order.size,
+                            );
+                            warn!(
+                                oid = oid,
+                                "Forced removal from ws_state to correct synchronization (cancel confirmed/filled)"
+                            );
+                        }
                     }
                 }
             } else if !ghost_orphans.is_empty() {
