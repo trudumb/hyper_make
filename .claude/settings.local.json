@@ -32,7 +32,8 @@
       "Bash(cargo clippy:*)",
       "Bash(cargo add:*)",
       "Bash(sort:*)",
-      "mcp__serena__write_memory"
+      "mcp__serena__write_memory",
+      "mcp__serena__check_onboarding_performed"
     ]
   }
 }

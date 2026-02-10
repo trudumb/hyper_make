@@ -77,6 +77,19 @@ pub struct HJBConfig {
     /// Range: [1.0, 4.0], Default: 2.0
     pub ou_reconcile_k: f64,
 
+    // === Funding Horizon ===
+    /// Use funding-cycle time horizon instead of fixed session duration.
+    /// When true, `time_remaining()` uses time-to-next-funding-settlement
+    /// (8h cycle) when available, falling back to `session_duration_secs`.
+    /// This creates natural urgency near funding settlement since inventory
+    /// matters for funding P&L.
+    pub use_funding_horizon: bool,
+
+    /// Calibrate terminal penalty from observed market spread.
+    /// When true, terminal_penalty = expected_spread_to_cross / 10000 + overnight_vol_cost.
+    /// When false, uses the static `terminal_penalty` value.
+    pub calibrate_terminal_penalty: bool,
+
     // === Queue Value Parameters ===
     /// Enable HJB queue value preservation.
     /// When true, considers queue position value before cancelling orders.
@@ -120,6 +133,9 @@ impl Default for HJBConfig {
             use_ou_drift: true,
             ou_theta: 0.5,           // ~1.4s half-life
             ou_reconcile_k: 2.0,     // 2σ threshold
+            // Funding horizon (enabled by default — perpetuals settle every 8h)
+            use_funding_horizon: true,
+            calibrate_terminal_penalty: true,
             // Queue value parameters
             use_queue_value: true,
             queue_alpha: 0.1,

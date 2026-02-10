@@ -214,6 +214,14 @@ pub struct TradingState {
     pub drawdown: f64,
     /// Is in reduce-only mode
     pub reduce_only: bool,
+    /// Rate limit headroom fraction [0, 1]
+    pub rate_limit_headroom: f64,
+    /// Last realized edge from a fill (bps). Updated after each fill.
+    /// Used by the controller as the TD reward signal for Quote actions.
+    pub last_realized_edge_bps: f64,
+    /// Current market spread (bps). Used by the controller to compute
+    /// spread crossing cost for DumpInventory actions.
+    pub market_spread_bps: f64,
 }
 
 impl Default for TradingState {
@@ -227,6 +235,9 @@ impl Default for TradingState {
             predicted_funding: 0.0,
             drawdown: 0.0,
             reduce_only: false,
+            rate_limit_headroom: 1.0,
+            last_realized_edge_bps: 0.0,
+            market_spread_bps: 0.0,
         }
     }
 }

@@ -52,6 +52,18 @@ pub struct ControlState {
 
     /// Current drawdown
     pub drawdown: f64,
+
+    /// Rate limit headroom fraction [0, 1]
+    pub rate_limit_headroom: f64,
+
+    /// Last realized edge from a fill (bps). Updated after each fill.
+    /// Used as the TD reward signal for Quote actions instead of
+    /// synthetic expected_value from the action itself.
+    pub last_realized_edge_bps: f64,
+
+    /// Current market spread (bps). Used to compute spread crossing
+    /// cost for DumpInventory actions.
+    pub market_spread_bps: f64,
 }
 
 impl Default for ControlState {
@@ -69,6 +81,9 @@ impl Default for ControlState {
             model_health: ModelHealth::default(),
             reduce_only: false,
             drawdown: 0.0,
+            rate_limit_headroom: 1.0,
+            last_realized_edge_bps: 0.0,
+            market_spread_bps: 0.0,
         }
     }
 }
@@ -89,6 +104,9 @@ impl ControlState {
             model_health: ModelHealth::default(),
             reduce_only: trading.reduce_only,
             drawdown: trading.drawdown,
+            rate_limit_headroom: trading.rate_limit_headroom,
+            last_realized_edge_bps: trading.last_realized_edge_bps,
+            market_spread_bps: trading.market_spread_bps,
         }
     }
 
@@ -336,6 +354,10 @@ impl ObservableState for ControlState {
 
     fn learning_trust(&self) -> f64 {
         self.learning_trust
+    }
+
+    fn rate_limit_headroom(&self) -> f64 {
+        self.rate_limit_headroom
     }
 }
 

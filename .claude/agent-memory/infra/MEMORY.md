@@ -48,6 +48,17 @@
 - calibration_controller.record_fill() and signal_integrator.on_fill() were already wired
 - Key: when adding state to MarketMaker but can't edit mod.rs, put it on a component bundle (InfraComponents, Tier1, etc.)
 
+## HJB Funding Horizon (2026-02-09)
+- Added funding-cycle (8h) time horizon to HJB controller, replacing fixed 24h session
+- `effective_horizon()` returns (elapsed, duration) -- funding cycle when fresh, session fallback otherwise
+- Staleness guard: 60s timeout on `funding_settlement_last_updated`
+- Adjust for age: `ttf - age_since_last_update` to prevent drift between updates
+- Terminal penalty calibrated from: `spread_bps/10000 + sigma * sqrt(28800)`, clamped [0.00005, 0.01]
+- Wired in quote_engine.rs alongside existing momentum_signals update block
+- `update_funding()` was NOT wired in live path before -- now called per quote cycle
+- HJB controller is in process_models/hjb/ (NOT stochastic/hjb/ as task description said)
+- `self.config.terminal_penalty` replaced with `self.effective_terminal_penalty()` in 4 places in skew.rs
+
 ## Serena Tool Notes
 - `find_symbol` requires `name_path_pattern` not `name_path` parameter
 - Paper trader methods not always found by Serena's symbol tools -- use Grep as fallback

@@ -296,6 +296,7 @@ impl ParameterAggregator {
             competitor_snipe_prob: 0.1,          // Default 10% baseline
             competitor_spread_factor: 1.0,       // Default no adjustment
             competitor_count: 3.0,               // Default 3 competitors
+            market_share: 0.0,                   // Unknown until observed
 
             // === Tier 2: Funding Rate ===
             funding_rate: sources.funding.current_rate(),
@@ -605,6 +606,7 @@ impl ParameterAggregator {
 
             // === Phase 9: Rate Limit Death Spiral Prevention ===
             rate_limit_headroom_pct: 1.0, // Full budget available by default, updated by caller
+            quota_shadow_spread_bps: 0.0, // Computed by quote engine from quota state
 
             // === Predictive Bias (A-S Extension) ===
             // Phase 5: Use centralized beliefs when available

@@ -393,6 +393,28 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             self.config.max_position,
         );
 
+        // Update HJB controller's funding-cycle horizon and terminal penalty
+        {
+            // Wire funding settlement time into HJB controller for natural urgency
+            if let Some(ttf) = self.tier2.funding.time_to_next_funding() {
+                self.stochastic
+                    .hjb_controller
+                    .update_funding_settlement(ttf.as_secs_f64());
+            }
+
+            // Update HJB funding rate from estimator
+            let funding_rate_8h = self.tier2.funding.current_rate();
+            self.stochastic
+                .hjb_controller
+                .update_funding(funding_rate_8h);
+
+            // Calibrate terminal penalty from observed market spread
+            let market_spread_bps = self.tier2.spread_tracker.current_spread_bps();
+            self.stochastic
+                .hjb_controller
+                .calibrate_terminal_penalty(market_spread_bps);
+        }
+
         // Get multi-timeframe trend signal for enhanced opposition detection
         // Position value for underwater severity calculation
         let position_value = (position.abs() * self.latest_mid).max(1.0);
@@ -1446,6 +1468,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 predicted_funding: self.tier2.funding.ewma_rate() * 10000.0, // Convert to bps
                 drawdown: risk_state.drawdown(),
                 reduce_only: risk_state.should_reduce_only(),
+                rate_limit_headroom: self
+                    .infra
+                    .cached_rate_limit
+                    .as_ref()
+                    .map(|c| c.headroom_pct())
+                    .unwrap_or(1.0),
+                last_realized_edge_bps: self.tier2.edge_tracker.last_realized_edge_bps(),
+                market_spread_bps: market_params.market_spread_bps,
             };
 
             // Get Layer 2 output for the controller
@@ -1949,6 +1979,23 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Update market_params with the widening multiplier and changepoint_prob
                 market_params.spread_widening_mult = *multiplier;
                 market_params.changepoint_prob = *changepoint_prob;
+            }
+        }
+
+        // === QUOTA SHADOW SPREAD: Continuous penalty for low API headroom ===
+        // Replaces discrete tier cliffs with smooth shadow pricing.
+        // At 50% headroom: ~1 bps (mild). At 5% headroom: ~10 bps (aggressive).
+        // This naturally widens spreads as quota depletes, reducing order churn.
+        {
+            let headroom = market_params.rate_limit_headroom_pct;
+            let shadow_bps = self.stochastic.quote_gate.continuous_shadow_spread_bps(headroom);
+            market_params.quota_shadow_spread_bps = shadow_bps;
+            if shadow_bps > 1.0 {
+                tracing::info!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    shadow_spread_bps = %format!("{:.2}", shadow_bps),
+                    "Quota shadow spread applied (continuous pricing)"
+                );
             }
         }
 

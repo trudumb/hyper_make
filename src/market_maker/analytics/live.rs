@@ -409,6 +409,7 @@ mod tests {
             vpin_active: true,
             buy_pressure_skew_bps: 0.5,
             buy_pressure_active: true,
+            ..Default::default()
         });
 
         analytics.record_quote_cycle(&signals);
@@ -447,6 +448,7 @@ mod tests {
             vpin_active: true,
             buy_pressure_skew_bps: -0.5,
             buy_pressure_active: true,
+            ..Default::default()
         };
 
         let contribs = build_cycle_contributions(42, 1234567890, &record, 1.15, 1.0);

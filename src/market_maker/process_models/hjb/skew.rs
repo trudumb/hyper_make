@@ -43,7 +43,7 @@ impl HJBInventoryController {
         // 2. Terminal penalty: increases skew as session end approaches
         // penalty × q × urgency, where urgency = 1 - time_remaining/session_duration
         let urgency = self.terminal_urgency();
-        let terminal_skew = self.config.terminal_penalty * q * urgency;
+        let terminal_skew = self.effective_terminal_penalty() * q * urgency;
 
         // Cap terminal contribution
         let terminal_skew_capped = terminal_skew
@@ -533,14 +533,14 @@ impl HJBInventoryController {
     ///
     /// Returns target as fraction of max_position.
     pub fn optimal_inventory_target(&self) -> f64 {
-        if self.config.terminal_penalty.abs() < 1e-10 {
+        if self.effective_terminal_penalty().abs() < 1e-10 {
             return 0.0;
         }
 
         let funding_per_second = self.funding_rate_ewma / (365.0 * 24.0 * 3600.0);
 
         // Target = -funding / (2 × penalty)
-        let target = -funding_per_second / (2.0 * self.config.terminal_penalty);
+        let target = -funding_per_second / (2.0 * self.effective_terminal_penalty());
 
         // Clamp to reasonable range
         target.clamp(-0.5, 0.5)
@@ -586,7 +586,7 @@ impl HJBInventoryController {
 
         // The gradient captures the marginal cost of inventory
         let inventory_cost = 2.0 * gamma * sigma.powi(2) * q * time_remaining;
-        let terminal_cost = 2.0 * self.config.terminal_penalty * q * urgency;
+        let terminal_cost = 2.0 * self.effective_terminal_penalty() * q * urgency;
         let funding_benefit = self.funding_rate_ewma / (365.0 * 24.0 * 3600.0) * time_remaining;
 
         // Negative of costs (value decreases with costs)
@@ -611,6 +611,8 @@ impl HJBInventoryController {
             funding_rate_ewma: self.funding_rate_ewma,
             optimal_inventory_target: self.optimal_inventory_target(),
             sigma: self.sigma,
+            funding_horizon_active: self.is_funding_horizon_active(),
+            effective_terminal_penalty: self.effective_terminal_penalty(),
         }
     }
 

@@ -69,6 +69,18 @@ pub struct HJBInventoryController {
 
     /// Timestamp of last OU update (milliseconds)
     pub(super) last_ou_update_ms: u64,
+
+    // === Funding Horizon ===
+    /// Time to next funding settlement (seconds).
+    /// When set and `use_funding_horizon` is true, replaces `session_duration_secs`
+    /// for `time_remaining()` and `terminal_urgency()` calculations.
+    pub(super) time_to_funding_settlement_s: Option<f64>,
+
+    /// Last time `time_to_funding_settlement_s` was updated (for staleness detection).
+    pub(super) funding_settlement_last_updated: Option<Instant>,
+
+    /// Calibrated terminal penalty from market spread (overrides config when set).
+    pub(super) calibrated_terminal_penalty: Option<f64>,
 }
 
 impl HJBInventoryController {
@@ -112,6 +124,10 @@ impl HJBInventoryController {
             ou_drift,
             last_ou_result: None,
             last_ou_update_ms: 0,
+            // Funding horizon
+            time_to_funding_settlement_s: None,
+            funding_settlement_last_updated: None,
+            calibrated_terminal_penalty: None,
         }
     }
 
@@ -145,6 +161,61 @@ impl HJBInventoryController {
                 + (1.0 - self.funding_alpha) * self.funding_rate_ewma;
         } else {
             self.funding_rate_ewma = annualized;
+        }
+    }
+
+    /// Update the time to next funding settlement.
+    ///
+    /// Should be called on each quote cycle or whenever funding time is known.
+    /// The 8-hour funding cycle on perpetual futures creates a natural horizon
+    /// for inventory management — inventory matters for funding P&L at settlement.
+    ///
+    /// # Arguments
+    /// * `time_to_settlement_s` - Seconds until next funding settlement (0..28800)
+    pub fn update_funding_settlement(&mut self, time_to_settlement_s: f64) {
+        // Clamp to valid range: 0 to 8 hours
+        const MAX_FUNDING_PERIOD_S: f64 = 28800.0; // 8 hours
+        let clamped = time_to_settlement_s.clamp(0.0, MAX_FUNDING_PERIOD_S);
+        self.time_to_funding_settlement_s = Some(clamped);
+        self.funding_settlement_last_updated = Some(Instant::now());
+    }
+
+    /// Calibrate terminal penalty from observed market spread.
+    ///
+    /// The terminal penalty should reflect the cost of crossing the spread
+    /// to close out inventory at settlement time:
+    /// ```text
+    /// terminal_penalty = expected_spread_to_cross_bps / 10000 + overnight_vol_cost
+    /// ```
+    ///
+    /// # Arguments
+    /// * `market_spread_bps` - Observed market spread in basis points
+    pub fn calibrate_terminal_penalty(&mut self, market_spread_bps: f64) {
+        if !self.config.calibrate_terminal_penalty {
+            return;
+        }
+
+        // Cost of crossing spread to close position (one side = half spread)
+        let spread_cost = market_spread_bps / 10000.0;
+
+        // Overnight vol cost: sigma * sqrt(funding_period) as fraction of price
+        // Captures risk of holding through settlement
+        const FUNDING_PERIOD_S: f64 = 28800.0;
+        let vol_cost = self.sigma * FUNDING_PERIOD_S.sqrt();
+
+        // Terminal penalty = spread crossing cost + vol holding cost
+        // Clamp to reasonable range to avoid extreme behavior
+        let penalty = (spread_cost + vol_cost).clamp(0.00005, 0.01);
+        self.calibrated_terminal_penalty = Some(penalty);
+    }
+
+    /// Get the effective terminal penalty (calibrated or configured).
+    pub fn effective_terminal_penalty(&self) -> f64 {
+        if self.config.calibrate_terminal_penalty {
+            self.calibrated_terminal_penalty
+                .unwrap_or(self.config.terminal_penalty)
+        } else {
+            self.config.terminal_penalty
         }
     }
 
@@ -345,15 +416,66 @@ impl HJBInventoryController {
         }
     }
 
-    /// Get time remaining in current session (seconds).
-    pub fn time_remaining(&self) -> f64 {
+    /// Get the effective session duration based on configuration.
+    ///
+    /// When `use_funding_horizon` is true and a recent funding settlement time
+    /// is available, returns the current funding cycle position as the effective
+    /// session duration (8h max). Otherwise falls back to `session_duration_secs`.
+    ///
+    /// Staleness guard: if the funding settlement time hasn't been updated in
+    /// 60 seconds, falls back to session duration to avoid stale data.
+    fn effective_horizon(&self) -> (f64, f64) {
+        if self.config.use_funding_horizon {
+            if let Some(ttf) = self.time_to_funding_settlement_s {
+                // Check staleness: funding settlement info should be refreshed frequently
+                let is_fresh = self
+                    .funding_settlement_last_updated
+                    .map(|t| t.elapsed().as_secs_f64() < 60.0)
+                    .unwrap_or(false);
+
+                if is_fresh {
+                    // Compute elapsed since the funding cycle started
+                    // funding_cycle_duration = 8h, time_remaining = ttf
+                    const FUNDING_PERIOD_S: f64 = 28800.0;
+                    // Adjust for update staleness: ttf was set some time ago
+                    let age = self
+                        .funding_settlement_last_updated
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    let adjusted_ttf = (ttf - age).max(0.0);
+
+                    let elapsed = FUNDING_PERIOD_S - adjusted_ttf;
+                    return (elapsed, FUNDING_PERIOD_S);
+                }
+            }
+        }
+
+        // Fallback: session-based timing
         let elapsed = self.session_start.elapsed().as_secs_f64();
-        (self.config.session_duration_secs - elapsed).max(self.config.min_time_remaining)
+        (elapsed, self.config.session_duration_secs)
+    }
+
+    /// Get time remaining in current session/funding cycle (seconds).
+    pub fn time_remaining(&self) -> f64 {
+        let (elapsed, duration) = self.effective_horizon();
+        (duration - elapsed).max(self.config.min_time_remaining)
     }
 
     /// Get terminal urgency factor (0 = start of session, 1 = end of session).
     pub fn terminal_urgency(&self) -> f64 {
-        let elapsed = self.session_start.elapsed().as_secs_f64();
-        (elapsed / self.config.session_duration_secs).clamp(0.0, 1.0)
+        let (elapsed, duration) = self.effective_horizon();
+        (elapsed / duration).clamp(0.0, 1.0)
+    }
+
+    /// Check whether the funding horizon is active (as opposed to session fallback).
+    pub fn is_funding_horizon_active(&self) -> bool {
+        if !self.config.use_funding_horizon {
+            return false;
+        }
+        self.time_to_funding_settlement_s.is_some()
+            && self
+                .funding_settlement_last_updated
+                .map(|t| t.elapsed().as_secs_f64() < 60.0)
+                .unwrap_or(false)
     }
 }

@@ -146,10 +146,64 @@ pub struct RiskConfig {
     /// Decays linearly to 1.0 as warmup completes.
     /// 1.1 means 10% higher γ during early warmup.
     pub max_warmup_gamma_mult: f64,
+
+    // ==================== Log-Odds AS Integration ====================
+    // FIRST PRINCIPLES: The theoretically correct way to integrate adverse
+    // selection probability into the spread is via the log-odds ratio, not
+    // multiplicative scaling. From Bayesian market maker theory:
+    //   as_adjustment = (1/γ) × ln(p_informed / p_noise) (when p_informed > p_noise)
+    // This gives a convex, principled mapping from toxicity to spread widening.
+    /// Enable log-odds additive AS integration.
+    /// When true, pre-fill toxicity is converted to an additive spread
+    /// adjustment via the log-odds ratio. When false, uses the legacy
+    /// multiplicative spread multiplier path.
+    #[serde(default = "default_true")]
+    pub use_log_odds_as: bool,
+
+    /// Maximum AS adjustment in basis points when using log-odds mode.
+    /// Caps the adjustment to prevent blow-up when p_informed -> 1.0.
+    /// Default 15 bps: at typical gamma=0.15 this caps around p_informed=0.85.
+    #[serde(default = "default_max_as_adjustment_bps")]
+    pub max_as_adjustment_bps: f64,
+
+    /// Enable monopolist LP pricing for illiquid tokens.
+    /// When true and competitor_count < 1.5, applies an additive markup
+    /// based on estimated taker price elasticity.
+    /// Default: false (opt-in for illiquid tokens only).
+    #[serde(default)]
+    pub use_monopolist_pricing: bool,
+
+    /// Maximum monopolist markup in basis points.
+    /// Caps the elasticity-derived markup to prevent excessive spreads.
+    /// Default: 5.0 bps.
+    #[serde(default = "default_monopolist_markup_cap_bps")]
+    pub monopolist_markup_cap_bps: f64,
+
+    /// Minimum observations for taker elasticity estimation.
+    /// Below this count, the estimator returns a conservative default.
+    /// Default: 50.
+    #[serde(default = "default_min_observations_for_elasticity")]
+    pub min_observations_for_elasticity: usize,
+}
+
+fn default_monopolist_markup_cap_bps() -> f64 {
+    5.0
+}
+
+fn default_min_observations_for_elasticity() -> usize {
+    50
 }
 
 fn default_toxic_hours() -> Vec<u32> {
     vec![6, 7, 14] // London open (06-08) and US afternoon (14-15)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_as_adjustment_bps() -> f64 {
+    15.0
 }
 
 impl RiskConfig {
@@ -372,6 +426,14 @@ impl Default for RiskConfig {
             // Funding skew sensitivity: 1.0 = full economic impact
             // At extreme funding (10 bps/hour), produces ~0.17 bps skew over 60s horizon
             funding_skew_sensitivity: 1.0,
+            // Log-odds AS: ENABLED by default (theoretically correct integration)
+            // Converts pre-fill toxicity probability to additive spread via log-odds ratio
+            use_log_odds_as: true,
+            max_as_adjustment_bps: 15.0, // Cap at 15 bps to prevent blow-up
+            // Monopolist pricing: DISABLED by default (opt-in for illiquid tokens)
+            use_monopolist_pricing: false,
+            monopolist_markup_cap_bps: 5.0,
+            min_observations_for_elasticity: 50,
         }
     }
 }
@@ -417,6 +479,13 @@ impl RiskConfig {
             max_warmup_gamma_mult: 1.05, // Minimal warmup penalty (5% vs 10%)
             // Funding skew sensitivity: same as default
             funding_skew_sensitivity: 1.0,
+            // Log-odds AS: same as default
+            use_log_odds_as: true,
+            max_as_adjustment_bps: 15.0,
+            // Monopolist pricing: ENABLED for HIP-3 (typically sole LP)
+            use_monopolist_pricing: true,
+            monopolist_markup_cap_bps: 5.0,
+            min_observations_for_elasticity: 50,
         }
     }
 }

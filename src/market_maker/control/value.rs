@@ -51,7 +51,7 @@ pub struct BasisConfig {
 impl Default for BasisConfig {
     fn default() -> Self {
         Self {
-            n_basis: 15, // Number of basis functions
+            n_basis: 18, // Number of basis functions (15 original + 3 quota)
             gamma: 0.99,
             initial_lr: 0.01,
             lr_decay: 0.9999,
@@ -122,6 +122,13 @@ impl ValueFunction {
             // === Regime features ===
             // 14: Regime entropy (uncertainty about volatility)
             state.regime_entropy(),
+            // === Quota features ===
+            // 15: Rate limit headroom (linear)
+            state.rate_limit_headroom,
+            // 16: Rate limit headroom squared (nonlinear value of quota)
+            state.rate_limit_headroom.powi(2),
+            // 17: Headroom × |position| (quota matters more with inventory)
+            state.rate_limit_headroom * state.position.abs(),
         ];
 
         features
@@ -389,7 +396,7 @@ mod tests {
         let state = ControlState::default();
         let basis = ValueFunction::compute_basis(&state);
 
-        assert_eq!(basis.len(), 15);
+        assert_eq!(basis.len(), 18);
         assert!((basis[0] - 1.0).abs() < 1e-10); // Constant term
     }
 
@@ -421,5 +428,63 @@ mod tests {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-10);
         assert!(sigmoid(10.0) > 0.99);
         assert!(sigmoid(-10.0) < 0.01);
+    }
+
+    #[test]
+    fn test_quota_basis_functions_respond_to_headroom() {
+        let mut state = ControlState::default();
+
+        // Full headroom (default = 1.0)
+        let basis_full = ValueFunction::compute_basis(&state);
+        assert_eq!(basis_full.len(), 18);
+        assert!((basis_full[15] - 1.0).abs() < 1e-10); // linear
+        assert!((basis_full[16] - 1.0).abs() < 1e-10); // quadratic
+
+        // Low headroom
+        state.rate_limit_headroom = 0.1;
+        let basis_low = ValueFunction::compute_basis(&state);
+        assert!((basis_low[15] - 0.1).abs() < 1e-10);
+        assert!((basis_low[16] - 0.01).abs() < 1e-10);
+
+        // Basis functions should decrease with lower headroom
+        assert!(basis_low[15] < basis_full[15]);
+        assert!(basis_low[16] < basis_full[16]);
+    }
+
+    #[test]
+    fn test_quota_cross_term_with_position() {
+        let mut state = ControlState::default();
+
+        // No position: cross-term should be zero regardless of headroom
+        state.rate_limit_headroom = 0.5;
+        state.position = 0.0;
+        let basis_no_pos = ValueFunction::compute_basis(&state);
+        assert!((basis_no_pos[17] - 0.0).abs() < 1e-10);
+
+        // With position: cross-term = headroom * |position|
+        state.position = 2.0;
+        let basis_with_pos = ValueFunction::compute_basis(&state);
+        assert!((basis_with_pos[17] - 1.0).abs() < 1e-10); // 0.5 * 2.0
+
+        // Negative position: cross-term uses abs
+        state.position = -3.0;
+        let basis_neg_pos = ValueFunction::compute_basis(&state);
+        assert!((basis_neg_pos[17] - 1.5).abs() < 1e-10); // 0.5 * 3.0
+
+        // Low headroom + large position = large cross-term indicates urgency
+        state.rate_limit_headroom = 0.05;
+        state.position = 5.0;
+        let basis_critical = ValueFunction::compute_basis(&state);
+        assert!((basis_critical[17] - 0.25).abs() < 1e-10); // 0.05 * 5.0
+    }
+
+    #[test]
+    fn test_value_function_18_dimensions() {
+        let config = BasisConfig::default();
+        assert_eq!(config.n_basis, 18);
+
+        let vf = ValueFunction::new(config);
+        assert_eq!(vf.weights.len(), 18);
+        assert_eq!(vf.n_basis, 18);
     }
 }

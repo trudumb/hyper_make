@@ -101,6 +101,11 @@ pub trait ObservableState {
 
     /// Trust in learning module [0, 1]
     fn learning_trust(&self) -> f64;
+
+    /// Rate limit headroom fraction [0, 1]
+    fn rate_limit_headroom(&self) -> f64 {
+        1.0 // Default: no rate limit pressure
+    }
 }
 
 /// Provides access to Bayesian belief state.

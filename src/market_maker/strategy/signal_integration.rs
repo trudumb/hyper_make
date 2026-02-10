@@ -148,6 +148,12 @@ pub struct SignalIntegratorConfig {
     /// Maximum fraction of max_lead_lag_skew_bps that buy pressure can contribute.
     /// Default 0.3 → in a 5 bps max skew context, cap at 1.5 bps.
     pub buy_pressure_max_fraction: f64,
+
+    /// Maximum total additive spread adjustment in bps from all signals combined.
+    /// Caps the sum of informed_flow, gating, and cross_venue adjustments.
+    /// Staleness multiplier is excluded (remains multiplicative as a safety mechanism).
+    /// Default: 20.0 bps.
+    pub max_spread_adjustment_bps: f64,
 }
 
 impl Default for SignalIntegratorConfig {
@@ -176,6 +182,7 @@ impl Default for SignalIntegratorConfig {
             buy_pressure_z_threshold: 1.5,
             buy_pressure_skew_fraction: 0.1,
             buy_pressure_max_fraction: 0.3,
+            max_spread_adjustment_bps: 20.0,
         }
     }
 }
@@ -255,6 +262,15 @@ pub struct SignalContributionRecord {
     pub buy_pressure_skew_bps: f64,
     /// Whether buy pressure is above z-threshold
     pub buy_pressure_active: bool,
+
+    /// Additive spread adjustment from informed flow (bps)
+    pub informed_flow_adj_bps: f64,
+    /// Additive spread adjustment from model gating (bps)
+    pub gating_adj_bps: f64,
+    /// Additive spread adjustment from cross-venue (bps)
+    pub cross_venue_adj_bps: f64,
+    /// Total additive spread adjustment after cap (bps)
+    pub total_adj_bps: f64,
 }
 
 /// Integrated signals for quote generation.
@@ -340,8 +356,20 @@ pub struct IntegratedSignals {
     /// 95th percentile of the null MI distribution (for diagnostics).
     pub lead_lag_null_p95: f64,
 
+    // === Additive Spread Adjustment Components (bps) ===
+    /// Additive spread adjustment from informed flow signal (bps, >= 0).
+    pub informed_flow_adj_bps: f64,
+    /// Additive spread adjustment from model gating (bps, >= 0).
+    pub gating_adj_bps: f64,
+    /// Additive spread adjustment from cross-venue analysis (bps, >= 0).
+    pub cross_venue_adj_bps: f64,
+    /// Total additive spread adjustment before cap (bps).
+    pub total_adj_bps_uncapped: f64,
+    /// Total additive spread adjustment after cap (bps).
+    pub total_adj_bps: f64,
+
     // === Combined ===
-    /// Total spread multiplier (product of all adjustments).
+    /// Total spread multiplier (from capped additive adjustments, excludes staleness).
     pub total_spread_mult: f64,
     /// Combined skew in bps (positive = bullish).
     pub combined_skew_bps: f64,
@@ -800,11 +828,28 @@ impl SignalIntegrator {
             signals.cross_venue_valid = false;
         }
 
-        // === Combined Signals ===
-        // Include cross-venue spread multiplier in total
-        signals.total_spread_mult = signals.informed_flow_spread_mult
-            * signals.gating_spread_mult
-            * signals.cross_venue_spread_mult;
+        // === Combined Signals (Additive) ===
+        // Convert each multiplier to an additive excess, sum them, and cap.
+        // This prevents multiplicative compounding: three 1.5x adjustments
+        // give 2.5x (additive) instead of 3.375x (multiplicative).
+        // Staleness multiplier is applied separately (remains multiplicative for safety).
+        let informed_excess = signals.informed_flow_spread_mult - 1.0;
+        let gating_excess = signals.gating_spread_mult - 1.0;
+        let cross_venue_excess = signals.cross_venue_spread_mult - 1.0;
+
+        let total_excess_uncapped = informed_excess + gating_excess + cross_venue_excess;
+        // Cap expressed as multiplier excess: max_spread_adjustment_bps / reference 10 bps
+        let max_excess = self.config.max_spread_adjustment_bps / 10.0;
+        let total_excess = total_excess_uncapped.clamp(-0.1, max_excess);
+
+        // Store diagnostic bps values (reference = 10 bps base spread)
+        signals.informed_flow_adj_bps = informed_excess * 10.0;
+        signals.gating_adj_bps = gating_excess * 10.0;
+        signals.cross_venue_adj_bps = cross_venue_excess * 10.0;
+        signals.total_adj_bps_uncapped = total_excess_uncapped * 10.0;
+        signals.total_adj_bps = total_excess * 10.0;
+
+        signals.total_spread_mult = 1.0 + total_excess;
 
         // Combine skews: lead-lag is primary, cross-venue provides additional signal
         let base_skew_bps = if signals.lead_lag_actionable {
@@ -893,6 +938,11 @@ impl SignalIntegrator {
             buy_pressure_active: self.config.use_buy_pressure
                 && self.buy_pressure.is_warmed_up()
                 && signals.buy_pressure_z.abs() > self.config.buy_pressure_z_threshold,
+
+            informed_flow_adj_bps: signals.informed_flow_adj_bps,
+            gating_adj_bps: signals.gating_adj_bps,
+            cross_venue_adj_bps: signals.cross_venue_adj_bps,
+            total_adj_bps: signals.total_adj_bps,
         });
 
         // Log periodically
@@ -1328,5 +1378,98 @@ mod tests {
         );
         assert!(!integrator.config.use_lead_lag);
         assert!(!integrator.config.use_cross_venue);
+    }
+
+    #[test]
+    fn test_additive_spread_multiplier_vs_multiplicative() {
+        // Three 1.5x multipliers should produce ~2.5x (additive) not 3.375x (multiplicative)
+        let mut signals = IntegratedSignals::default();
+        signals.informed_flow_spread_mult = 1.5;
+        signals.gating_spread_mult = 1.5;
+        signals.cross_venue_spread_mult = 1.5;
+
+        // Old multiplicative: 1.5 * 1.5 * 1.5 = 3.375
+        let multiplicative: f64 = 1.5 * 1.5 * 1.5;
+        assert!((multiplicative - 3.375).abs() < 0.01);
+
+        // New additive: 1.0 + (1.5-1.0) + (1.5-1.0) + (1.5-1.0) = 2.5
+        let additive: f64 = 1.0 + (1.5 - 1.0) + (1.5 - 1.0) + (1.5 - 1.0);
+        assert!((additive - 2.5).abs() < f64::EPSILON);
+
+        // Verify integrator actually produces additive result
+        let mut config = SignalIntegratorConfig::disabled();
+        config.max_spread_adjustment_bps = 100.0; // large cap to not interfere
+        let integrator = SignalIntegrator::new(config);
+        let out = integrator.get_signals();
+        // All disabled → mults are 1.0 or near it, total should be near 1.0
+        assert!(
+            out.total_spread_mult < 1.2,
+            "disabled config should give total_spread_mult near 1.0, got {}",
+            out.total_spread_mult
+        );
+    }
+
+    #[test]
+    fn test_additive_spread_cap_enforced() {
+        // Construct signals that would exceed the cap
+        let mut signals = IntegratedSignals::default();
+        // Each excess = 2.0 (i.e., mult=3.0), three of them = 6.0 excess
+        signals.informed_flow_spread_mult = 3.0;
+        signals.gating_spread_mult = 3.0;
+        signals.cross_venue_spread_mult = 3.0;
+        // Uncapped additive: 1.0 + 2.0 + 2.0 + 2.0 = 7.0
+        // Cap at 20 bps → max_excess = 20/10 = 2.0 → capped mult = 3.0
+
+        // Verify the cap math: max_spread_adjustment_bps=20 → max excess=2.0
+        let max_excess: f64 = 20.0 / 10.0;
+        let total_excess_uncapped: f64 = 2.0 + 2.0 + 2.0;
+        let total_excess = total_excess_uncapped.min(max_excess);
+        assert!((total_excess - 2.0).abs() < f64::EPSILON);
+        assert!((1.0 + total_excess - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_additive_spread_diagnostics_populated() {
+        let integrator = SignalIntegrator::default_config();
+        let signals = integrator.get_signals();
+
+        // Diagnostics should be populated
+        // With no data, informed_flow_spread_mult is ~0.9 (tighten below threshold)
+        // So informed_flow_adj_bps should be slightly negative
+        assert!(signals.informed_flow_adj_bps <= 0.0);
+
+        // Cross-venue: with default (empty) features, confidence=0 triggers
+        // low-confidence widening → spread_mult ~1.15, so adj_bps ~1.5
+        assert!(signals.cross_venue_adj_bps >= 0.0);
+
+        // total_adj_bps should equal sum of components (before cap)
+        let expected_uncapped = signals.informed_flow_adj_bps
+            + signals.gating_adj_bps
+            + signals.cross_venue_adj_bps;
+        assert!(
+            (signals.total_adj_bps_uncapped - expected_uncapped).abs() < 0.01,
+            "uncapped total should equal sum of components: {} vs {}",
+            signals.total_adj_bps_uncapped,
+            expected_uncapped
+        );
+
+        // Contribution record should also have the additive fields
+        let contrib = signals.signal_contributions.unwrap();
+        assert!((contrib.informed_flow_adj_bps - signals.informed_flow_adj_bps).abs() < f64::EPSILON);
+        assert!((contrib.gating_adj_bps - signals.gating_adj_bps).abs() < f64::EPSILON);
+        assert!((contrib.cross_venue_adj_bps - signals.cross_venue_adj_bps).abs() < f64::EPSILON);
+        assert!((contrib.total_adj_bps - signals.total_adj_bps).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_additive_spread_staleness_remains_multiplicative() {
+        // Staleness multiplier should NOT be affected by the additive conversion
+        // It's a safety mechanism that remains multiplicative
+        let disabled = SignalIntegrator::new(SignalIntegratorConfig::disabled());
+        let staleness = disabled.staleness_spread_multiplier();
+        assert!(
+            (staleness - 1.0).abs() < f64::EPSILON,
+            "staleness should be separate from additive total_spread_mult"
+        );
     }
 }

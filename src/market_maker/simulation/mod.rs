@@ -34,7 +34,7 @@ pub use calibration::{
     BrierDecomposition, CalibrationAnalyzer, CalibrationCurve, ConditionalSlice,
 };
 pub use executor::SimulationExecutor;
-pub use fill_sim::{FillSimulator, FillSimulatorConfig, SimulatedFill};
+pub use fill_sim::{FillSimulator, FillSimulatorConfig, QueuePositionEstimator, SimulatedFill};
 pub use outcome::{CycleAttribution, OutcomeTracker, PnLDecomposition};
 pub use prediction::{
     FillOutcome, LevelPrediction, MarketStateSnapshot, ModelPredictions, ObservedOutcomes,

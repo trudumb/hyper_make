@@ -696,7 +696,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         // Convert Quote to LadderLevel for reconciliation
-        let bid_levels: Vec<LadderLevel> = bid_quotes
+        let mut bid_levels: Vec<LadderLevel> = bid_quotes
             .iter()
             .map(|q| LadderLevel {
                 price: q.price,
@@ -705,7 +705,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             })
             .collect();
 
-        let ask_levels: Vec<LadderLevel> = ask_quotes
+        let mut ask_levels: Vec<LadderLevel> = ask_quotes
             .iter()
             .map(|q| LadderLevel {
                 price: q.price,
@@ -925,9 +925,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 return Ok(());
             }
 
-            if headroom < 0.05 {
-                // CRITICAL: Quota exhausted - do NOT try to recover
-                // Record exhaustion and enter backoff
+            if headroom < 0.01 {
+                // CRITICAL: Quota truly exhausted (<1%) - hard block
+                // Continuous shadow pricing handles 1-10% naturally, so only block
+                // at the absolute minimum. This prevents the death spiral without
+                // the cliff effect of the old 5% threshold.
                 let backoff = self
                     .infra
                     .proactive_rate_tracker
@@ -935,7 +937,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 warn!(
                     headroom_pct = %format!("{:.1}%", headroom * 100.0),
                     backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
-                    "EMPTY LADDER but quota exhausted - entering conservation mode with backoff"
+                    "EMPTY LADDER but quota truly exhausted (<1%) - entering conservation mode"
                 );
                 return Ok(());
             }
@@ -946,26 +948,24 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let mut ask_places: Vec<(f64, f64)> =
                 ask_levels.iter().map(|l| (l.price, l.size)).collect();
 
-            if headroom < 0.20 {
-                // LOW QUOTA: Place minimal presence only (1-2 levels per side)
-                // This restores quoting without burning through remaining budget
-                let max_levels = 2;
-                bid_places.truncate(max_levels);
-                ask_places.truncate(max_levels);
-                warn!(
-                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
-                    bid_levels = bid_places.len(),
-                    ask_levels = ask_places.len(),
-                    "EMPTY LADDER with low quota - placing minimal levels only"
-                );
-            } else {
-                warn!(
-                    target_bids = bid_levels.len(),
-                    target_asks = ask_levels.len(),
-                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
-                    "EMPTY LADDER DETECTED - forcing immediate replenishment"
-                );
-            }
+            // CONTINUOUS LADDER DENSITY: Smoothly scale levels based on headroom.
+            // Replaces hard tier cliff (was: <20% → 2 levels, >=20% → full).
+            // Uses sqrt scaling: at 25% headroom → ~half levels, at 4% → ~1/5th.
+            let max_target_levels = bid_places.len().max(ask_places.len());
+            let allowed_levels = self
+                .stochastic
+                .quote_gate
+                .continuous_ladder_levels(max_target_levels, headroom);
+            bid_places.truncate(allowed_levels);
+            ask_places.truncate(allowed_levels);
+            warn!(
+                headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                max_target_levels = max_target_levels,
+                allowed_levels = allowed_levels,
+                bid_levels = bid_places.len(),
+                ask_levels = ask_places.len(),
+                "EMPTY LADDER recovery - continuous ladder density applied"
+            );
 
             // Delegate to place_bulk_ladder_orders for proper CLOID tracking
             // This prevents orphan orders by using the pending registration flow
@@ -1112,14 +1112,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
             }
 
-            // Only throttle if headroom < 5% AND cache is fresh
+            // Only hard-throttle if headroom < 1% AND cache is fresh.
+            // Previously was 5%, but continuous shadow pricing + ladder density
+            // now handles 1-10% headroom smoothly without cliff effects.
             // If cache is stale (>60s), proceed anyway to refresh it - this prevents deadlock
             // where no requests → stale cache → perpetual throttle
             if let Some(ref cache) = self.infra.cached_rate_limit {
                 let headroom = cache.headroom_pct();
                 let stale = cache.is_stale(std::time::Duration::from_secs(60));
 
-                if headroom < 0.05 {
+                if headroom < 0.01 {
                     if stale {
                         info!(
                             headroom_pct = %format!("{:.1}%", headroom * 100.0),
@@ -1134,7 +1136,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             headroom_pct = %format!("{:.1}%", headroom * 100.0),
                             used = cache.n_requests_used,
                             cap = cache.n_requests_cap,
-                            "Exchange rate limit low (<5% headroom) - throttling reconciliation"
+                            "Exchange rate limit truly exhausted (<1%) - hard throttling reconciliation"
                         );
                         return Ok(());
                     }
@@ -1156,6 +1158,34 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             impulse_enabled = impulse_enabled,
             "[Reconcile] Checkpoint: passed drift and impulse checks"
         );
+
+        // === CONTINUOUS LADDER DENSITY ===
+        // Smoothly scale ladder levels based on rate limit headroom.
+        // At high headroom: full levels. At low headroom: fewer levels.
+        // This replaces discrete tier cliffs with smooth sqrt scaling.
+        {
+            let headroom = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .map(|c| c.headroom_pct())
+                .unwrap_or(1.0);
+            let max_target = bid_levels.len().max(ask_levels.len());
+            let allowed = self
+                .stochastic
+                .quote_gate
+                .continuous_ladder_levels(max_target, headroom);
+            if allowed < max_target {
+                bid_levels.truncate(allowed);
+                ask_levels.truncate(allowed);
+                debug!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    max_target = max_target,
+                    allowed = allowed,
+                    "Continuous ladder density: reduced levels for quota conservation"
+                );
+            }
+        }
 
         // === PRIORITY-BASED MATCHING (DEFAULT) ===
         // Uses stochastic optimal spread to derive matching thresholds

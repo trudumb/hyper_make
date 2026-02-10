@@ -79,6 +79,16 @@ impl EdgeTracker {
         self.snapshots.len()
     }
 
+    /// Most recent realized edge in basis points, or 0.0 if no fills yet.
+    ///
+    /// Used by the stochastic controller as a TD reward signal for Quote actions.
+    pub fn last_realized_edge_bps(&self) -> f64 {
+        self.snapshots
+            .last()
+            .map(|s| s.realized_edge_bps)
+            .unwrap_or(0.0)
+    }
+
     /// Whether mean realized edge is positive at 95% confidence (one-sided t-test).
     ///
     /// Uses t-statistic: `t = mean / (std / sqrt(n))`, rejects if `t > 1.645`.
@@ -322,5 +332,23 @@ mod tests {
             mild_tracker.add_snapshot(make_snapshot(5.0, -1.0));
         }
         assert!(!mild_tracker.should_pause_trading());
+    }
+
+    #[test]
+    fn test_last_realized_edge_empty() {
+        let tracker = EdgeTracker::new();
+        assert!((tracker.last_realized_edge_bps() - 0.0).abs() < 1e-10,
+            "Empty tracker should return 0.0");
+    }
+
+    #[test]
+    fn test_last_realized_edge_returns_most_recent() {
+        let mut tracker = EdgeTracker::new();
+        tracker.add_snapshot(make_snapshot(5.0, 2.0));
+        assert!((tracker.last_realized_edge_bps() - 2.0).abs() < 1e-10);
+
+        tracker.add_snapshot(make_snapshot(5.0, -1.5));
+        assert!((tracker.last_realized_edge_bps() - (-1.5)).abs() < 1e-10,
+            "Should return most recent, not average");
     }
 }

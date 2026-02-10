@@ -42,6 +42,10 @@ pub struct HJBSummary {
     pub funding_rate_ewma: f64,
     pub optimal_inventory_target: f64,
     pub sigma: f64,
+    /// Whether using funding-cycle horizon (true) or session-based fallback (false).
+    pub funding_horizon_active: bool,
+    /// Effective terminal penalty (calibrated or configured).
+    pub effective_terminal_penalty: f64,
 }
 
 /// Momentum statistics for diagnostics and confidence estimation.

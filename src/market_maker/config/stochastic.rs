@@ -756,6 +756,8 @@ impl StochasticConfig {
             // Pre-fill AS toxicity gating - enabled by default
             toxicity_gate_threshold: 0.75, // 75% toxicity = skip quoting
             enable_toxicity_gate: true,
+            // Quota shadow pricing - use defaults
+            quota_shadow: crate::market_maker::control::quote_gate::QuotaShadowConfig::default(),
         }
     }
 }

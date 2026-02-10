@@ -115,7 +115,18 @@ impl OptimalController {
     /// Compute immediate reward for taking action in state.
     fn immediate_reward(&self, state: &ControlState, action: &Action) -> f64 {
         match action {
-            Action::Quote { expected_value, .. } => *expected_value,
+            Action::Quote { expected_value, .. } => {
+                // Use realized edge from last fill as the reward signal when available.
+                // This grounds the TD learning in actual P&L rather than synthetic
+                // expected_value estimates that may be miscalibrated.
+                // Fallback to expected_value when no fill has been observed yet.
+                if state.last_realized_edge_bps != 0.0 {
+                    // Convert bps to fraction for consistency with other rewards
+                    state.last_realized_edge_bps / 10000.0
+                } else {
+                    *expected_value
+                }
+            }
 
             Action::NoQuote { reason } => {
                 // Small negative reward for not acting (opportunity cost)
@@ -131,9 +142,15 @@ impl OptimalController {
             }
 
             Action::DumpInventory { urgency, .. } => {
-                // Negative reward proportional to urgency (forced action is costly)
-                let position_risk = state.position.powi(2) / (self.config.max_position.powi(2));
-                -0.05 * urgency * (1.0 - position_risk) // Less costly if position is risky anyway
+                // Negative reward = spread crossing cost scaled by urgency.
+                // Uses actual market spread instead of arbitrary -0.05 constant.
+                // The spread cost is the price of immediacy when dumping.
+                let spread_cost = if state.market_spread_bps > 0.0 {
+                    state.market_spread_bps / 10000.0
+                } else {
+                    0.0005 // Fallback: 5 bps if no market data
+                };
+                -spread_cost * urgency
             }
 
             Action::BuildInventory { target, .. } => {
@@ -143,11 +160,11 @@ impl OptimalController {
                 funding_value - 0.01 * position_delta
             }
 
-            Action::WaitToLearn {
-                expected_info_gain, ..
-            } => {
-                // Value of information minus opportunity cost
-                expected_info_gain * 0.1 - 0.02
+            Action::WaitToLearn { .. } => {
+                // Zero immediate reward: the true opportunity cost of waiting
+                // is captured by the discount factor in the TD update.
+                // No arbitrary constants needed.
+                0.0
             }
         }
     }
@@ -575,6 +592,9 @@ impl OptimalController {
             },
             reduce_only: provider.reduce_only(),
             drawdown: provider.drawdown(),
+            rate_limit_headroom: provider.rate_limit_headroom(),
+            last_realized_edge_bps: 0.0, // Set from TradingState path, not provider
+            market_spread_bps: 0.0,      // Set from TradingState path, not provider
         }
     }
 }
@@ -631,5 +651,95 @@ mod tests {
         let q = controller.q_value(&state, &action);
         // Q-value should be finite
         assert!(q.is_finite());
+    }
+
+    #[test]
+    fn test_quote_reward_uses_realized_edge() {
+        let controller = OptimalController::default();
+        let mut state = ControlState::default();
+        // Set realized edge from last fill: +3 bps
+        state.last_realized_edge_bps = 3.0;
+
+        let action = Action::Quote {
+            ladder: Box::new(crate::market_maker::quoting::Ladder::default()),
+            expected_value: 0.1, // This should be ignored when realized edge is available
+        };
+
+        let reward = controller.immediate_reward(&state, &action);
+        // Should use realized edge: 3 bps = 0.0003
+        assert!((reward - 0.0003).abs() < 1e-8,
+            "Quote reward should use realized edge (0.0003), got {}", reward);
+    }
+
+    #[test]
+    fn test_quote_reward_falls_back_to_expected_value() {
+        let controller = OptimalController::default();
+        let state = ControlState::default(); // last_realized_edge_bps = 0.0
+
+        let action = Action::Quote {
+            ladder: Box::new(crate::market_maker::quoting::Ladder::default()),
+            expected_value: 0.05,
+        };
+
+        let reward = controller.immediate_reward(&state, &action);
+        // No realized edge → should use expected_value
+        assert!((reward - 0.05).abs() < 1e-8,
+            "Quote reward should fall back to expected_value (0.05), got {}", reward);
+    }
+
+    #[test]
+    fn test_dump_inventory_reward_uses_market_spread() {
+        let controller = OptimalController::default();
+        let mut state = ControlState::default();
+        state.position = 5.0;
+        state.market_spread_bps = 10.0; // 10 bps spread
+
+        let action = Action::DumpInventory {
+            urgency: 1.0,
+            target_position: 0.0,
+        };
+
+        let reward = controller.immediate_reward(&state, &action);
+        // Should be: -(10/10000) * 1.0 = -0.001
+        assert!((reward - (-0.001)).abs() < 1e-8,
+            "Dump reward should be -spread_cost * urgency = -0.001, got {}", reward);
+    }
+
+    #[test]
+    fn test_dump_inventory_reward_scales_with_urgency() {
+        let controller = OptimalController::default();
+        let mut state = ControlState::default();
+        state.position = 5.0;
+        state.market_spread_bps = 10.0;
+
+        let low_urgency = Action::DumpInventory {
+            urgency: 0.5,
+            target_position: 0.0,
+        };
+        let high_urgency = Action::DumpInventory {
+            urgency: 2.0,
+            target_position: 0.0,
+        };
+
+        let low_reward = controller.immediate_reward(&state, &low_urgency);
+        let high_reward = controller.immediate_reward(&state, &high_urgency);
+
+        assert!(high_reward < low_reward,
+            "Higher urgency should be more costly: low={}, high={}", low_reward, high_reward);
+    }
+
+    #[test]
+    fn test_wait_to_learn_reward_is_zero() {
+        let controller = OptimalController::default();
+        let state = ControlState::default();
+
+        let action = Action::WaitToLearn {
+            expected_info_gain: 0.5,
+            suggested_wait_cycles: 3,
+        };
+
+        let reward = controller.immediate_reward(&state, &action);
+        assert!((reward - 0.0).abs() < 1e-10,
+            "WaitToLearn reward should be exactly 0.0, got {}", reward);
     }
 }

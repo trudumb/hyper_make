@@ -1875,15 +1875,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default mode uses conservative probabilities (30% touch, 50% queue).
     let fill_config = if cli.paper_mode {
         FillSimulatorConfig {
-            touch_fill_probability: 0.5,   // Realistic fill rate (was 0.9)
-            queue_position_factor: 0.6,    // Back-of-book position (was 0.9)
+            touch_fill_probability: 0.3,   // Conservative fill rate (was 0.5)
+            queue_position_factor: 0.4,    // Back-of-book position (was 0.6)
             ignore_book_depth: true,       // Sim orders aren't in real book
             ..Default::default()
         }
     } else {
         FillSimulatorConfig {
             touch_fill_probability: 0.3,
-            queue_position_factor: 0.5,
+            queue_position_factor: 0.4,    // More conservative (was 0.5)
             ignore_book_depth: true,
             ..Default::default()
         }

@@ -18,12 +18,14 @@
 //! - `estimator`: Main adverse selection estimator (post-fill measurement)
 //! - `pre_fill_classifier`: Pre-fill toxicity prediction
 
+mod cancel_race;
 mod depth_decay;
 mod enhanced_classifier;
 mod estimator;
 pub mod microstructure_features;
 mod pre_fill_classifier;
 
+pub use cancel_race::{CancelRaceConfig, CancelRaceSummary, CancelRaceTracker};
 pub use depth_decay::{DepthDecayAS, DepthDecayASSummary, FillWithDepth};
 pub use enhanced_classifier::{
     EnhancedASClassifier, EnhancedClassifierConfig, EnhancedClassifierDiagnostics,

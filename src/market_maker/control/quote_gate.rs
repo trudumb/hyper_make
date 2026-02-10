@@ -183,6 +183,42 @@ pub struct QuoteGateConfig {
     /// When true, toxic flow prediction can stop quoting entirely.
     /// Default: true
     pub enable_toxicity_gate: bool,
+
+    /// Continuous shadow pricing configuration for quota-aware spread adjustment.
+    pub quota_shadow: QuotaShadowConfig,
+}
+
+/// Configuration for continuous quota shadow pricing.
+///
+/// Instead of hard tier cutoffs, shadow pricing smoothly adjusts spreads
+/// based on rate limit headroom. The shadow spread is:
+///   shadow_spread_bps = lambda_shadow_bps / headroom_pct.max(0.01)
+///
+/// At 100% headroom: 0.5 bps (negligible)
+/// At 50% headroom: 1.0 bps (mild)
+/// At 10% headroom: 5.0 bps (significant)
+/// At 5% headroom: 10.0 bps (aggressive)
+/// At 1% headroom: 50.0 bps (prohibitive)
+#[derive(Debug, Clone)]
+pub struct QuotaShadowConfig {
+    /// Base shadow price lambda (bps). Higher = more spread at low headroom.
+    pub lambda_shadow_bps: f64,
+    /// Headroom threshold below which ladder density is reduced.
+    /// At full headroom: all levels. At zero: 1 level.
+    /// Scaling: levels = max(1, (max_levels * headroom.sqrt()) as usize)
+    pub min_headroom_for_full_ladder: f64,
+    /// Maximum shadow spread in bps (cap to prevent blowup at headroom -> 0)
+    pub max_shadow_spread_bps: f64,
+}
+
+impl Default for QuotaShadowConfig {
+    fn default() -> Self {
+        Self {
+            lambda_shadow_bps: 0.5,
+            min_headroom_for_full_ladder: 0.20,
+            max_shadow_spread_bps: 50.0,
+        }
+    }
 }
 
 /// Configuration for active probing to generate learning data.
@@ -238,6 +274,7 @@ impl Default for QuoteGateConfig {
             market_regime: MarketRegime::ThinDex, // Conservative default for DEX
             toxicity_gate_threshold: 0.75,        // 75% toxicity = skip quoting
             enable_toxicity_gate: true,           // Enable toxicity gating by default
+            quota_shadow: QuotaShadowConfig::default(),
         }
     }
 }
@@ -831,6 +868,46 @@ impl QuoteGate {
         expected_edge_bps > shadow_price
     }
 
+    /// Compute continuous shadow spread adjustment in basis points.
+    ///
+    /// Instead of hard-blocking at low headroom, this returns a spread addition
+    /// that smoothly increases as headroom decreases. The GLFT spread absorbs
+    /// this cost, naturally reducing quoting frequency at low headroom without
+    /// cliff effects.
+    ///
+    /// Formula: shadow_spread = lambda / headroom.max(0.01), capped at max_bps.
+    ///
+    /// At 100% headroom: 0.5 bps (negligible)
+    /// At 50% headroom:  1.0 bps (mild)
+    /// At 20% headroom:  2.5 bps (noticeable)
+    /// At 10% headroom:  5.0 bps (significant)
+    /// At 5% headroom:   10.0 bps (aggressive)
+    pub fn continuous_shadow_spread_bps(&self, headroom_pct: f64) -> f64 {
+        let config = &self.config.quota_shadow;
+        let effective_headroom = headroom_pct.max(0.01);
+        let raw = config.lambda_shadow_bps / effective_headroom;
+        raw.min(config.max_shadow_spread_bps)
+    }
+
+    /// Compute continuous ladder density based on headroom.
+    ///
+    /// Smoothly scales ladder levels from 1 to max_levels based on headroom.
+    /// Uses sqrt scaling so levels drop gradually, not in cliff steps.
+    ///
+    /// At 100% headroom: max_levels
+    /// At 25% headroom:  max_levels/2
+    /// At 4% headroom:   max_levels/5
+    /// At 1% headroom:   1 level
+    pub fn continuous_ladder_levels(&self, max_levels: usize, headroom_pct: f64) -> usize {
+        let min_headroom = self.config.quota_shadow.min_headroom_for_full_ladder;
+        if headroom_pct >= min_headroom {
+            return max_levels;
+        }
+        // Scale by sqrt(headroom / min_headroom) for smooth reduction
+        let scale = (headroom_pct / min_headroom).sqrt();
+        (max_levels as f64 * scale).round().max(1.0) as usize
+    }
+
     // =========================================================================
     // Bistability Escape Mechanisms
     // =========================================================================
@@ -899,13 +976,15 @@ impl QuoteGate {
     /// True if we should override NoEdgeFlat and force a quote
     ///
     /// # ε Schedule
-    /// - Only probe when headroom > 30% (must have quota budget)
+    /// - Only probe when headroom > 10% (lowered from 30% to allow escape at low quota)
     /// - ε increases with time stuck in no-quote state
     /// - After 60s: ε = 0.02 (2% chance per cycle)
     /// - After 300s: ε = 0.10 (10% chance per cycle)
     pub fn should_epsilon_probe(&self, input: &QuoteGateInput) -> bool {
         // Only probe when we have quota budget
-        if input.rate_limit_headroom_pct < 0.30 {
+        // Threshold lowered from 30% to 10% so the system can escape NoQuote
+        // even at low quota — wide two-sided quoting handles the quota conservation
+        if input.rate_limit_headroom_pct < 0.10 {
             return false;
         }
 
@@ -936,21 +1015,28 @@ impl QuoteGate {
         probe
     }
 
-    /// Check if we should enter inventory-forcing mode.
+    /// Check if we should enter wide two-sided quoting mode at low quota.
     ///
-    /// When quota is nearly exhausted AND we have a position, use remaining
-    /// quota ONLY for reduce-only orders. This:
-    /// 1. Preserves quota for risk-reducing fills
-    /// 2. Generates fills that restore quota
-    /// 3. Reduces exposure when we can't actively manage risk
+    /// When quota headroom is critically low AND we have a position, instead of
+    /// forcing one-sided quoting (which causes position whipsaw death spirals),
+    /// quote BOTH sides with widened spreads and position-reducing skew.
+    ///
+    /// The spread multiplier scales inversely with sqrt(headroom):
+    ///   multiplier = (1.0 / headroom_pct.sqrt()).min(max_quota_spread_multiplier)
+    ///
+    /// This eliminates the whipsaw pattern because:
+    /// 1. Both sides remain quoted (can capture spread in either direction)
+    /// 2. Wide spreads naturally reduce fill rate (conserving quota)
+    /// 3. Position skew is handled by the existing quote engine skew mechanism
+    /// 4. Any fill restores quota, helping escape the low-headroom state
     ///
     /// # Arguments
     /// * `input` - Contains rate_limit_headroom_pct and position
     ///
     /// # Returns
-    /// Some(QuoteDecision) if we should quote only one side for position reduction,
-    /// None if inventory-forcing mode is not triggered
-    pub fn inventory_forcing_decision(&self, input: &QuoteGateInput) -> Option<QuoteDecision> {
+    /// Some(QuoteDecision::WidenSpreads) with quota-derived multiplier if activated,
+    /// None if wide two-sided mode is not triggered
+    pub fn wide_two_sided_decision(&self, input: &QuoteGateInput) -> Option<QuoteDecision> {
         // Only activate when quota is critically low
         if input.rate_limit_headroom_pct >= 0.10 {
             return None;
@@ -962,24 +1048,25 @@ impl QuoteGate {
             return None;
         }
 
-        // Determine which side reduces position
-        // High urgency (1.0) because quota is exhausted
-        let (reduce_decision, side_name) = if input.position > 0.0 {
-            // Long → quote asks to sell and reduce
-            (QuoteDecision::QuoteOnlyAsks { urgency: 1.0 }, "asks")
-        } else {
-            // Short → quote bids to buy and reduce
-            (QuoteDecision::QuoteOnlyBids { urgency: 1.0 }, "bids")
-        };
+        // Spread multiplier: inversely proportional to sqrt(headroom)
+        // At 7% headroom: 1/sqrt(0.07) ≈ 3.78x
+        // At 3% headroom: 1/sqrt(0.03) ≈ 5.77x → capped at 5.0x
+        // At 1% headroom: 1/sqrt(0.01) = 10x → capped at 5.0x
+        const MAX_QUOTA_SPREAD_MULTIPLIER: f64 = 5.0;
+        let headroom = input.rate_limit_headroom_pct.max(0.01); // floor to avoid division by zero
+        let multiplier = (1.0 / headroom.sqrt()).min(MAX_QUOTA_SPREAD_MULTIPLIER);
 
         warn!(
             position = %format!("{:.4}", input.position),
             headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
-            reduce_side = %side_name,
-            "Quota exhausted with position - entering inventory-forcing mode"
+            spread_multiplier = %format!("{:.2}x", multiplier),
+            "Low quota with position - wide two-sided quoting (not one-sided forcing)"
         );
 
-        Some(reduce_decision)
+        Some(QuoteDecision::WidenSpreads {
+            multiplier,
+            changepoint_prob: 0.0, // Not from changepoint - quota-driven widening
+        })
     }
 
     /// Compute hierarchical P(correct) by fusing L1/L2/L3 beliefs.
@@ -1996,33 +2083,34 @@ impl QuoteGate {
             input.vol_regime,
         );
 
-        // 1. Inventory forcing: when quota is critically low AND we have position,
-        //    use remaining quota ONLY for reduce-only orders.
+        // 1. Wide two-sided quoting: when quota is critically low AND we have position,
+        //    quote BOTH sides with widened spreads instead of one-sided forcing.
         //    CRITICAL: This runs BEFORE shadow price veto because:
-        //    - Holding position with no orders is strictly worse than reduce-only orders
-        //    - Reduce-only orders help portfolio risk regardless of quota
-        //    - Each fill contributes to quota recharge, helping escape death spiral
-        //    - Defense-first: reducing exposure takes priority over quota conservation
-        if let Some(forcing_decision) = self.inventory_forcing_decision(input) {
+        //    - Holding position with no orders is strictly worse than wide two-sided
+        //    - Wide spreads conserve quota naturally (fewer fills) while maintaining presence
+        //    - Any fill contributes to quota recharge, helping escape low-headroom state
+        //    - Position skew handled by quote engine, not by killing one side
+        //    - Defense-first: maintaining two-sided avoids whipsaw death spiral
+        if let Some(wide_decision) = self.wide_two_sided_decision(input) {
             info!(
                 headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
                 shadow_price_bps = %format!("{:.1}", shadow_price),
                 position = %format!("{:.4}", input.position),
-                "Inventory forcing overrides quota exhaustion - placing reduce-only orders"
+                "Wide two-sided quoting overrides quota exhaustion - both sides with widened spreads"
             );
             self.record_quote_placed();
-            return forcing_decision;
+            return wide_decision;
         }
 
-        // 2. Shadow price check: veto all quoting when quota exhausted
-        //    This internalizes request cost and prevents burning budget on low-edge situations
-        //    Only blocks new position-building; inventory forcing already handled above
-        if shadow_price >= 100.0 {
+        // 2. Shadow price check: only hard-veto at truly exhausted quota (<1% headroom)
+        //    For moderate quota pressure, continuous shadow spread (added to GLFT spread)
+        //    naturally reduces quoting frequency without cliff effects.
+        if input.rate_limit_headroom_pct < 0.01 {
             warn!(
                 headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
                 shadow_price_bps = %format!("{:.1}", shadow_price),
                 position = %format!("{:.4}", input.position),
-                "Rate limit shadow price infinite - quota exhausted (no position to unwind)"
+                "Rate limit quota truly exhausted (<1% headroom) - hard veto"
             );
             self.record_no_quote_cycle();
             return QuoteDecision::NoQuote {
@@ -3105,76 +3193,292 @@ mod tests {
     }
 
     #[test]
-    fn test_inventory_forcing_overrides_quota_exhaustion() {
-        // Regression test: inventory-forcing mode MUST work even when shadow price
-        // would normally veto all quoting. This prevents the death spiral where:
-        // 1. Bot holds position
-        // 2. Quota exhausted (headroom <= 5%)
-        // 3. Shadow price veto blocks ALL quoting
-        // 4. Bot sits with position and 0 open orders, unable to unwind
+    fn test_wide_two_sided_at_low_quota_with_long_position() {
+        // Regression test: at low quota with position, we should get WidenSpreads
+        // (both sides) instead of one-sided forcing that causes whipsaw.
         let gate = QuoteGate::default();
 
-        // Scenario: 3% headroom (shadow price would be >= 100.0) with meaningful position
+        // Scenario: 3% headroom with meaningful long position
         let input = QuoteGateInput {
             rate_limit_headroom_pct: 0.03, // 3% - shadow price is prohibitive
             position: 5.0,                  // Long position (5% of max)
             max_position: 100.0,
-            vol_regime: 1,                  // Normal volatility
+            vol_regime: 1,
             ..default_input()
         };
 
-        // Inventory forcing should activate and return reduce-only decision
-        let decision = gate.inventory_forcing_decision(&input);
+        let decision = gate.wide_two_sided_decision(&input);
         assert!(
             decision.is_some(),
-            "Inventory forcing should activate at 3% headroom with position"
+            "Wide two-sided should activate at 3% headroom with position"
         );
-        assert!(
-            matches!(decision.unwrap(), QuoteDecision::QuoteOnlyAsks { urgency } if urgency == 1.0),
-            "Long position should trigger QuoteOnlyAsks with urgency 1.0"
-        );
+        match decision.unwrap() {
+            QuoteDecision::WidenSpreads { multiplier, changepoint_prob } => {
+                // At 3% headroom: 1/sqrt(0.03) ≈ 5.77 → capped at 5.0
+                assert!((multiplier - 5.0).abs() < 0.01, "Multiplier should be capped at 5.0, got {}", multiplier);
+                assert_eq!(changepoint_prob, 0.0, "changepoint_prob should be 0.0 for quota-driven widening");
+            }
+            other => panic!("Expected WidenSpreads, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_quota_exhausted_no_position_returns_no_quote() {
-        // When quota is exhausted AND no position to unwind, should return NoQuote
+    fn test_wide_two_sided_at_7pct_headroom() {
+        // At 7% headroom (our live scenario), multiplier should be ~3.78x
         let gate = QuoteGate::default();
 
         let input = QuoteGateInput {
-            rate_limit_headroom_pct: 0.03, // 3% - shadow price is prohibitive
-            position: 0.0,                  // No position
+            rate_limit_headroom_pct: 0.07,
+            position: 5.0,
             max_position: 100.0,
             vol_regime: 1,
             ..default_input()
         };
 
-        // Inventory forcing should NOT activate (no position to unwind)
-        let decision = gate.inventory_forcing_decision(&input);
-        assert!(
-            decision.is_none(),
-            "Inventory forcing should not activate with no position"
-        );
-
-        // Shadow price check would then return QuotaExhausted in decide_with_theoretical_fallback
+        let decision = gate.wide_two_sided_decision(&input);
+        assert!(decision.is_some(), "Should activate at 7% headroom with position");
+        match decision.unwrap() {
+            QuoteDecision::WidenSpreads { multiplier, .. } => {
+                // 1/sqrt(0.07) ≈ 3.78
+                assert!(multiplier > 3.5 && multiplier < 4.0,
+                    "At 7% headroom multiplier should be ~3.78, got {}", multiplier);
+            }
+            other => panic!("Expected WidenSpreads, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_inventory_forcing_short_position() {
-        // Test inventory forcing with short position returns QuoteOnlyBids
+    fn test_wide_two_sided_not_triggered_above_10pct() {
+        // Above 10% headroom, wide two-sided should NOT activate
         let gate = QuoteGate::default();
 
         let input = QuoteGateInput {
-            rate_limit_headroom_pct: 0.05, // 5% headroom
-            position: -10.0,                // Short position
+            rate_limit_headroom_pct: 0.15, // 15% - above threshold
+            position: 5.0,
             max_position: 100.0,
             vol_regime: 1,
             ..default_input()
         };
 
-        let decision = gate.inventory_forcing_decision(&input);
-        assert!(
-            matches!(decision, Some(QuoteDecision::QuoteOnlyBids { urgency }) if urgency == 1.0),
-            "Short position should trigger QuoteOnlyBids with urgency 1.0"
-        );
+        let decision = gate.wide_two_sided_decision(&input);
+        assert!(decision.is_none(), "Should not activate above 10% headroom");
+    }
+
+    #[test]
+    fn test_wide_two_sided_no_position_returns_none() {
+        // When quota is low but no position, should return None
+        // (shadow price will then handle the NoQuote decision)
+        let gate = QuoteGate::default();
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.03,
+            position: 0.0, // No position
+            max_position: 100.0,
+            vol_regime: 1,
+            ..default_input()
+        };
+
+        let decision = gate.wide_two_sided_decision(&input);
+        assert!(decision.is_none(), "Should not activate with no position");
+    }
+
+    #[test]
+    fn test_wide_two_sided_short_position() {
+        // Short position should also get WidenSpreads (not one-sided)
+        let gate = QuoteGate::default();
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.05,
+            position: -10.0, // Short position
+            max_position: 100.0,
+            vol_regime: 1,
+            ..default_input()
+        };
+
+        let decision = gate.wide_two_sided_decision(&input);
+        assert!(decision.is_some(), "Should activate at 5% headroom with short position");
+        match decision.unwrap() {
+            QuoteDecision::WidenSpreads { multiplier, .. } => {
+                // 1/sqrt(0.05) ≈ 4.47
+                assert!(multiplier > 4.0 && multiplier < 5.0,
+                    "At 5% headroom multiplier should be ~4.47, got {}", multiplier);
+            }
+            other => panic!("Expected WidenSpreads, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_wide_two_sided_multiplier_capped_at_5x() {
+        // At very low headroom, multiplier should be capped at 5.0
+        let gate = QuoteGate::default();
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.01, // 1% - extremely low
+            position: 5.0,
+            max_position: 100.0,
+            vol_regime: 1,
+            ..default_input()
+        };
+
+        let decision = gate.wide_two_sided_decision(&input);
+        match decision.unwrap() {
+            QuoteDecision::WidenSpreads { multiplier, .. } => {
+                assert!((multiplier - 5.0).abs() < 0.01, "Multiplier should be capped at 5.0, got {}", multiplier);
+            }
+            other => panic!("Expected WidenSpreads, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_epsilon_probe_works_at_low_headroom() {
+        // After lowering epsilon probe threshold from 30% to 10%,
+        // probes should be possible at 15% headroom
+        let mut gate = QuoteGate::default();
+        // Set last_quote_time to 300s ago to ensure time threshold is met
+        gate.last_quote_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(300));
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.15, // 15% - was blocked before, should work now
+            ..default_input()
+        };
+
+        // Run many probes - with ε up to 0.10, at least one should trigger in 200 tries
+        let mut triggered = false;
+        for _ in 0..200 {
+            if gate.should_epsilon_probe(&input) {
+                triggered = true;
+                break;
+            }
+        }
+        assert!(triggered, "Epsilon probe should be possible at 15% headroom (threshold lowered to 10%)");
+    }
+
+    #[test]
+    fn test_epsilon_probe_blocked_below_10pct() {
+        // Below 10% headroom, epsilon probes should still be blocked
+        let mut gate = QuoteGate::default();
+        gate.last_quote_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(300));
+
+        let input = QuoteGateInput {
+            rate_limit_headroom_pct: 0.05, // 5% - below new threshold
+            ..default_input()
+        };
+
+        // Should never trigger
+        let mut triggered = false;
+        for _ in 0..200 {
+            if gate.should_epsilon_probe(&input) {
+                triggered = true;
+                break;
+            }
+        }
+        assert!(!triggered, "Epsilon probe should be blocked below 10% headroom");
+    }
+
+    // ========================================================================
+    // Continuous Shadow Pricing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_continuous_shadow_spread_at_full_headroom() {
+        let gate = QuoteGate::default();
+        // At 100% headroom: lambda / 1.0 = 0.5 bps (negligible)
+        let shadow = gate.continuous_shadow_spread_bps(1.0);
+        assert!((shadow - 0.5).abs() < 0.01, "At 100% headroom shadow should be ~0.5 bps, got {}", shadow);
+    }
+
+    #[test]
+    fn test_continuous_shadow_spread_at_10pct_headroom() {
+        let gate = QuoteGate::default();
+        // At 10% headroom: 0.5 / 0.10 = 5.0 bps (significant)
+        let shadow = gate.continuous_shadow_spread_bps(0.10);
+        assert!((shadow - 5.0).abs() < 0.01, "At 10% headroom shadow should be ~5.0 bps, got {}", shadow);
+    }
+
+    #[test]
+    fn test_continuous_shadow_spread_at_5pct_headroom() {
+        let gate = QuoteGate::default();
+        // At 5% headroom: 0.5 / 0.05 = 10.0 bps (aggressive)
+        let shadow = gate.continuous_shadow_spread_bps(0.05);
+        assert!((shadow - 10.0).abs() < 0.01, "At 5% headroom shadow should be ~10.0 bps, got {}", shadow);
+    }
+
+    #[test]
+    fn test_continuous_shadow_spread_capped_at_max() {
+        let gate = QuoteGate::default();
+        // At 0.1% headroom: 0.5 / 0.001 = 500 bps → capped at 50.0 bps
+        let shadow = gate.continuous_shadow_spread_bps(0.001);
+        assert!((shadow - 50.0).abs() < 0.01, "Shadow should be capped at 50 bps, got {}", shadow);
+    }
+
+    #[test]
+    fn test_continuous_shadow_spread_smooth_increase() {
+        // Verify no cliff effects: shadow spread increases monotonically as headroom decreases
+        let gate = QuoteGate::default();
+        let headrooms = [1.0, 0.5, 0.3, 0.2, 0.1, 0.07, 0.05, 0.03, 0.01];
+        let mut prev_shadow = 0.0;
+        for &h in &headrooms {
+            let shadow = gate.continuous_shadow_spread_bps(h);
+            assert!(shadow >= prev_shadow,
+                "Shadow spread should increase as headroom decreases: at {:.0}% got {:.2} bps, prev {:.2} bps",
+                h * 100.0, shadow, prev_shadow);
+            prev_shadow = shadow;
+        }
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_at_full_headroom() {
+        let gate = QuoteGate::default();
+        // At 100% headroom: all levels
+        let levels = gate.continuous_ladder_levels(10, 1.0);
+        assert_eq!(levels, 10, "At full headroom should get all levels");
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_at_min_threshold() {
+        let gate = QuoteGate::default();
+        // At 20% headroom (min_headroom_for_full_ladder): all levels
+        let levels = gate.continuous_ladder_levels(10, 0.20);
+        assert_eq!(levels, 10, "At min_headroom_for_full_ladder should get all levels");
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_at_5pct() {
+        let gate = QuoteGate::default();
+        // At 5% headroom: sqrt(0.05/0.20) = sqrt(0.25) = 0.5 → 5 levels
+        let levels = gate.continuous_ladder_levels(10, 0.05);
+        assert_eq!(levels, 5, "At 5% headroom with 10 max should get ~5 levels, got {}", levels);
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_at_1pct() {
+        let gate = QuoteGate::default();
+        // At 1% headroom: sqrt(0.01/0.20) = sqrt(0.05) ≈ 0.224 → round(2.24) = 2 levels
+        let levels = gate.continuous_ladder_levels(10, 0.01);
+        assert!(levels >= 1 && levels <= 3,
+            "At 1% headroom with 10 max should get ~2 levels, got {}", levels);
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_floor_at_1() {
+        let gate = QuoteGate::default();
+        // Even at extremely low headroom, should always get at least 1 level
+        let levels = gate.continuous_ladder_levels(10, 0.001);
+        assert_eq!(levels, 1, "Should always get at least 1 level, got {}", levels);
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_smooth_decrease() {
+        // Verify no cliff effects: levels decrease smoothly as headroom drops
+        let gate = QuoteGate::default();
+        let headrooms = [0.20, 0.15, 0.10, 0.07, 0.05, 0.03, 0.01];
+        let mut prev_levels = 100;
+        for &h in &headrooms {
+            let levels = gate.continuous_ladder_levels(25, h);
+            assert!(levels <= prev_levels,
+                "Levels should not increase as headroom drops: at {:.0}% got {}, prev {}",
+                h * 100.0, levels, prev_levels);
+            prev_levels = levels;
+        }
     }
 }

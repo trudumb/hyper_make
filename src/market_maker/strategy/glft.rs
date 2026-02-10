@@ -11,6 +11,114 @@ use super::{
     RiskModelConfig,
 };
 
+/// Taker price elasticity estimator for monopolist LP pricing.
+///
+/// Tracks (spread_width, fill_rate) pairs over a rolling window and
+/// regresses: ln(fill_rate) = alpha - eta * ln(spread_bps)
+/// where eta is the price elasticity of demand for liquidity.
+///
+/// Higher elasticity means takers are more price-sensitive (less markup possible).
+/// Lower elasticity means takers are price-insensitive (more markup possible).
+#[derive(Debug, Clone)]
+pub struct TakerElasticityEstimator {
+    /// Rolling window of (ln_spread_bps, ln_fill_rate) observations.
+    observations: Vec<(f64, f64)>,
+    /// Maximum window size.
+    max_observations: usize,
+    /// Cached elasticity estimate (eta).
+    cached_eta: f64,
+    /// Whether enough observations for a valid estimate.
+    is_valid: bool,
+}
+
+impl TakerElasticityEstimator {
+    /// Create a new estimator with the given window size.
+    pub fn new(max_observations: usize) -> Self {
+        Self {
+            observations: Vec::with_capacity(max_observations),
+            max_observations,
+            cached_eta: 1.0, // Conservative default: unit elastic
+            is_valid: false,
+        }
+    }
+
+    /// Record a (spread_bps, fill_rate_per_s) observation.
+    pub fn record(&mut self, spread_bps: f64, fill_rate_per_s: f64) {
+        if spread_bps <= 0.0 || fill_rate_per_s <= 0.0 {
+            return;
+        }
+        let ln_spread = spread_bps.ln();
+        let ln_fill_rate = fill_rate_per_s.ln();
+
+        if self.observations.len() >= self.max_observations {
+            self.observations.remove(0);
+        }
+        self.observations.push((ln_spread, ln_fill_rate));
+
+        // Recompute regression if we have enough data
+        if self.observations.len() >= 10 {
+            self.recompute();
+        }
+    }
+
+    /// Get the current elasticity estimate.
+    /// Returns eta > 0. Higher = more elastic takers (less markup).
+    pub fn elasticity(&self) -> f64 {
+        self.cached_eta
+    }
+
+    /// Whether the estimator has enough observations for a valid estimate.
+    pub fn is_valid(&self) -> bool {
+        self.is_valid
+    }
+
+    /// Number of observations recorded.
+    pub fn observation_count(&self) -> usize {
+        self.observations.len()
+    }
+
+    /// Simple OLS regression: ln(fill_rate) = alpha - eta * ln(spread_bps)
+    /// Solves for eta (should be positive: wider spread -> lower fill rate).
+    fn recompute(&mut self) {
+        let n = self.observations.len() as f64;
+        if n < 10.0 {
+            return;
+        }
+
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xy = 0.0;
+        let mut sum_xx = 0.0;
+
+        for &(x, y) in &self.observations {
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_xx += x * x;
+        }
+
+        let denom = n * sum_xx - sum_x * sum_x;
+        if denom.abs() < 1e-12 {
+            return;
+        }
+
+        // slope = (n * sum_xy - sum_x * sum_y) / denom
+        // We expect negative slope (higher spread -> lower fill rate)
+        // eta = -slope (so eta > 0)
+        let slope = (n * sum_xy - sum_x * sum_y) / denom;
+        let eta = (-slope).max(0.1); // Floor at 0.1 to prevent blow-up
+
+        self.cached_eta = eta;
+        self.is_valid = true;
+    }
+}
+
+impl Default for TakerElasticityEstimator {
+    fn default() -> Self {
+        Self::new(200)
+    }
+}
+
 /// GLFT (Guéant-Lehalle-Fernandez-Tapia) optimal market making strategy.
 ///
 /// Implements the **infinite-horizon** GLFT model with **dynamic risk aversion**.
@@ -56,6 +164,9 @@ pub struct GLFTStrategy {
 
     /// Kelly criterion position sizer
     pub kelly_sizer: KellySizer,
+
+    /// Taker elasticity estimator for monopolist LP pricing.
+    pub elasticity_estimator: TakerElasticityEstimator,
 }
 
 impl GLFTStrategy {
@@ -72,15 +183,18 @@ impl GLFTStrategy {
             risk_model: CalibratedRiskModel::with_gamma_base(gamma_base),
             risk_model_config: RiskModelConfig::default(),
             kelly_sizer: KellySizer::default(),
+            elasticity_estimator: TakerElasticityEstimator::default(),
         }
     }
 
     /// Create a new GLFT strategy with full risk configuration.
     pub fn with_config(risk_config: RiskConfig) -> Self {
+        let max_obs = risk_config.min_observations_for_elasticity.max(50) * 4;
         Self {
             risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
             risk_model_config: RiskModelConfig::default(),
             kelly_sizer: KellySizer::default(),
+            elasticity_estimator: TakerElasticityEstimator::new(max_obs),
             risk_config,
         }
     }
@@ -91,8 +205,10 @@ impl GLFTStrategy {
         risk_model_config: RiskModelConfig,
         kelly_sizer: KellySizer,
     ) -> Self {
+        let max_obs = risk_config.min_observations_for_elasticity.max(50) * 4;
         Self {
             risk_model: CalibratedRiskModel::with_gamma_base(risk_config.gamma_base),
+            elasticity_estimator: TakerElasticityEstimator::new(max_obs),
             risk_config,
             risk_model_config,
             kelly_sizer,
@@ -117,6 +233,17 @@ impl GLFTStrategy {
     /// Record a losing trade for Kelly sizing.
     pub fn record_loss(&mut self, loss_bps: f64) {
         self.kelly_sizer.record_loss(loss_bps);
+    }
+
+    /// Record a (spread, fill_rate) observation for taker elasticity estimation.
+    /// Call this periodically with the current quoted spread and observed fill rate.
+    pub fn record_elasticity_observation(&mut self, spread_bps: f64, fill_rate_per_s: f64) {
+        self.elasticity_estimator.record(spread_bps, fill_rate_per_s);
+    }
+
+    /// Get the current taker elasticity estimator (for diagnostics).
+    pub fn elasticity_estimator(&self) -> &TakerElasticityEstimator {
+        &self.elasticity_estimator
     }
 
     /// Check if Kelly sizer is warmed up.
@@ -672,22 +799,62 @@ impl QuotingStrategy for GLFTStrategy {
         // Each side is widened independently based on its predicted toxicity.
         // This is PROACTIVE protection before fills, complementing the reactive AS adjustment.
         //
-        // The pre-fill multipliers are [1.0, 3.0] where 1.0 = no additional widening.
-        // We scale widening by current half-spread to maintain proportionality.
-        {
+        // Two modes (gated by risk_config.use_log_odds_as):
+        // 1. Log-odds additive (default): as_adj = (1/gamma) * ln(p_informed / p_noise).max(0)
+        //    Theoretically correct Bayesian integration, convex in toxicity.
+        // 2. Legacy multiplicative: spread *= pre_fill_spread_mult (fallback)
+        if self.risk_config.use_log_odds_as {
+            // Log-odds additive path: convert toxicity probability to additive spread
+            let max_adj = self.risk_config.max_as_adjustment_bps / 10000.0;
+            let bid_tox = market_params.pre_fill_toxicity_bid;
+            let ask_tox = market_params.pre_fill_toxicity_ask;
+
+            // Only apply if there's meaningful toxicity signal
+            if bid_tox > 0.01 || ask_tox > 0.01 {
+                let safe_gamma = gamma.max(0.01); // Prevent division by zero
+
+                // Bid side: log-odds of informed vs noise
+                let bid_adj = if bid_tox > 0.01 {
+                    let p_noise_bid = (1.0 - bid_tox).max(0.01);
+                    let log_odds_bid = (bid_tox / p_noise_bid).ln().max(0.0);
+                    ((1.0 / safe_gamma) * log_odds_bid).min(max_adj)
+                } else {
+                    0.0
+                };
+
+                // Ask side: log-odds of informed vs noise
+                let ask_adj = if ask_tox > 0.01 {
+                    let p_noise_ask = (1.0 - ask_tox).max(0.01);
+                    let log_odds_ask = (ask_tox / p_noise_ask).ln().max(0.0);
+                    ((1.0 / safe_gamma) * log_odds_ask).min(max_adj)
+                } else {
+                    0.0
+                };
+
+                half_spread_bid += bid_adj;
+                half_spread_ask += ask_adj;
+                half_spread += (bid_adj + ask_adj) / 2.0;
+
+                debug!(
+                    bid_tox = %format!("{:.3}", bid_tox),
+                    ask_tox = %format!("{:.3}", ask_tox),
+                    bid_adj_bps = %format!("{:.2}", bid_adj * 10000.0),
+                    ask_adj_bps = %format!("{:.2}", ask_adj * 10000.0),
+                    max_adj_bps = %format!("{:.1}", self.risk_config.max_as_adjustment_bps),
+                    "Pre-fill toxicity log-odds AS adjustment applied"
+                );
+            }
+        } else {
+            // Legacy multiplicative path (fallback)
             let bid_mult = market_params.pre_fill_spread_mult_bid;
             let ask_mult = market_params.pre_fill_spread_mult_ask;
 
-            // Only apply if either side needs widening (mult > 1.0)
             if bid_mult > 1.01 || ask_mult > 1.01 {
-                // Use current half-spreads as base - this maintains proportionality
-                // The multiplier widens the already-computed spread from GLFT
                 let bid_add = half_spread_bid * (bid_mult - 1.0);
                 let ask_add = half_spread_ask * (ask_mult - 1.0);
 
                 half_spread_bid += bid_add;
                 half_spread_ask += ask_add;
-                // Symmetric spread uses average widening
                 half_spread += (bid_add + ask_add) / 2.0;
 
                 debug!(
@@ -697,7 +864,7 @@ impl QuotingStrategy for GLFTStrategy {
                     ask_mult = %format!("{:.2}", ask_mult),
                     bid_add_bps = %format!("{:.2}", bid_add * 10000.0),
                     ask_add_bps = %format!("{:.2}", ask_add * 10000.0),
-                    "Pre-fill toxicity asymmetric widening applied"
+                    "Pre-fill toxicity multiplicative widening applied (legacy)"
                 );
             }
         }
@@ -719,6 +886,45 @@ impl QuotingStrategy for GLFTStrategy {
                 kalman_fair_price = %format!("{:.4}", market_params.kalman_fair_price),
                 "Kalman uncertainty spread widening applied"
             );
+        }
+
+        // === 2a''. MONOPOLIST LP PRICING (Illiquid Tokens) ===
+        // When we're the sole/dominant LP, GLFT's competitive assumption understates edge.
+        // Apply a markup inversely proportional to taker price elasticity, scaled by market share.
+        // Formula: markup_bps = min(cap, (1/eta) * market_share)
+        // where eta is price elasticity of demand for liquidity.
+        if self.risk_config.use_monopolist_pricing
+            && market_params.competitor_count < 1.5
+        {
+            let eta = if self.elasticity_estimator.is_valid()
+                && self.elasticity_estimator.observation_count()
+                    >= self.risk_config.min_observations_for_elasticity
+            {
+                self.elasticity_estimator.elasticity()
+            } else {
+                1.0 // Conservative default: unit elastic
+            };
+
+            let market_share = market_params.market_share.clamp(0.0, 1.0);
+            let markup_bps = ((1.0 / eta.max(0.1)) * market_share)
+                .min(self.risk_config.monopolist_markup_cap_bps);
+            let markup_frac = markup_bps / 10000.0;
+
+            if markup_frac > 1e-8 {
+                half_spread_bid += markup_frac;
+                half_spread_ask += markup_frac;
+                half_spread += markup_frac;
+
+                debug!(
+                    competitor_count = %format!("{:.1}", market_params.competitor_count),
+                    market_share = %format!("{:.2}", market_share),
+                    elasticity = %format!("{:.2}", eta),
+                    markup_bps = %format!("{:.2}", markup_bps),
+                    est_valid = %self.elasticity_estimator.is_valid(),
+                    est_obs = %self.elasticity_estimator.observation_count(),
+                    "Monopolist LP markup applied"
+                );
+            }
         }
 
         // === 2b. JUMP PREMIUM (First-Principles) ===
@@ -1663,5 +1869,360 @@ mod tests {
                 b_floor.price
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Log-Odds AS Integration Tests
+    // ---------------------------------------------------------------
+
+    /// Helper: create a strategy with specific risk config for AS tests.
+    fn test_strategy_with_log_odds(use_log_odds: bool, max_bps: f64) -> GLFTStrategy {
+        let mut risk_config = RiskConfig::default();
+        risk_config.use_log_odds_as = use_log_odds;
+        risk_config.max_as_adjustment_bps = max_bps;
+        GLFTStrategy::with_config(risk_config)
+    }
+
+    #[test]
+    fn test_log_odds_as_low_toxicity() {
+        // p_informed = 0.1 → log_odds = ln(0.1/0.9) = ln(0.111) < 0 → clamped to 0
+        // At low toxicity, log-odds adjustment should be zero (noise dominates)
+        let strategy = test_strategy_with_log_odds(true, 15.0);
+        let config = test_quote_config();
+        let mut mp = test_market_params();
+        mp.pre_fill_toxicity_bid = 0.1;
+        mp.pre_fill_toxicity_ask = 0.1;
+        mp.pre_fill_spread_mult_bid = 1.0;
+        mp.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_with_tox, _ask_with_tox) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        // Zero toxicity baseline
+        let mut mp_zero = test_market_params();
+        mp_zero.pre_fill_toxicity_bid = 0.0;
+        mp_zero.pre_fill_toxicity_ask = 0.0;
+        mp_zero.pre_fill_spread_mult_bid = 1.0;
+        mp_zero.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_no_tox, _ask_no_tox) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
+
+        // At p=0.1, log-odds is negative → clamped to 0 → no widening
+        if let (Some(b_tox), Some(b_no)) = (&bid_with_tox, &bid_no_tox) {
+            let mid = config.mid_price;
+            let spread_diff_bps = ((b_no.price - b_tox.price) / mid) * 10000.0;
+            assert!(
+                spread_diff_bps.abs() < 1.0,
+                "Low toxicity (0.1) should produce near-zero log-odds adjustment, got {:.2} bps",
+                spread_diff_bps
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_odds_as_moderate_toxicity() {
+        // p_informed = 0.5 → log_odds = ln(0.5/0.5) = ln(1) = 0
+        // At p=0.5, log-odds is exactly zero
+        // p_informed = 0.7 → log_odds = ln(0.7/0.3) = ln(2.33) = 0.847
+        // adj = (1/gamma) * 0.847, with gamma ~0.15 → adj = 5.6 → ~5.6 bps
+        let strategy = test_strategy_with_log_odds(true, 15.0);
+        let config = test_quote_config();
+
+        let mut mp = test_market_params();
+        mp.pre_fill_toxicity_bid = 0.7;
+        mp.pre_fill_toxicity_ask = 0.7;
+        mp.pre_fill_spread_mult_bid = 1.0;
+        mp.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_tox, _) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        let mut mp_zero = test_market_params();
+        mp_zero.pre_fill_toxicity_bid = 0.0;
+        mp_zero.pre_fill_toxicity_ask = 0.0;
+        mp_zero.pre_fill_spread_mult_bid = 1.0;
+        mp_zero.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_no, _) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
+
+        // Bid price should be lower (wider spread) with toxicity
+        if let (Some(b_tox), Some(b_no)) = (&bid_tox, &bid_no) {
+            let mid = config.mid_price;
+            let widening_bps = ((b_no.price - b_tox.price) / mid) * 10000.0;
+            assert!(
+                widening_bps > 1.0,
+                "Moderate toxicity (0.7) should widen spread by >1 bps, got {:.2} bps",
+                widening_bps
+            );
+            assert!(
+                widening_bps < 15.0,
+                "Moderate toxicity (0.7) should not hit cap, got {:.2} bps",
+                widening_bps
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_odds_as_high_toxicity_capped() {
+        // p_informed = 0.95 → log_odds = ln(0.95/0.05) = ln(19) = 2.944
+        // adj = (1/0.15) * 2.944 = 19.6 bps → capped at 15 bps
+        let strategy = test_strategy_with_log_odds(true, 15.0);
+        let config = test_quote_config();
+
+        let mut mp = test_market_params();
+        mp.pre_fill_toxicity_bid = 0.95;
+        mp.pre_fill_toxicity_ask = 0.95;
+        mp.pre_fill_spread_mult_bid = 1.0;
+        mp.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_tox, _) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        let mut mp_zero = test_market_params();
+        mp_zero.pre_fill_toxicity_bid = 0.0;
+        mp_zero.pre_fill_toxicity_ask = 0.0;
+        mp_zero.pre_fill_spread_mult_bid = 1.0;
+        mp_zero.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_no, _) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
+
+        if let (Some(b_tox), Some(b_no)) = (&bid_tox, &bid_no) {
+            let mid = config.mid_price;
+            let widening_bps = ((b_no.price - b_tox.price) / mid) * 10000.0;
+            // Should be capped at 15 bps (the max_as_adjustment_bps)
+            assert!(
+                widening_bps <= 16.0, // small tolerance for rounding
+                "High toxicity (0.95) should be capped near 15 bps, got {:.2} bps",
+                widening_bps
+            );
+            assert!(
+                widening_bps > 10.0,
+                "High toxicity (0.95) should produce significant widening, got {:.2} bps",
+                widening_bps
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_odds_as_fallback_multiplicative() {
+        // When use_log_odds_as = false, should use legacy multiplicative path
+        let strategy = test_strategy_with_log_odds(false, 15.0);
+        let config = test_quote_config();
+
+        let mut mp = test_market_params();
+        mp.pre_fill_toxicity_bid = 0.5;
+        mp.pre_fill_toxicity_ask = 0.5;
+        mp.pre_fill_spread_mult_bid = 2.0; // 2x multiplier
+        mp.pre_fill_spread_mult_ask = 2.0;
+
+        let (bid_mult, _) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        let mut mp_no = test_market_params();
+        mp_no.pre_fill_toxicity_bid = 0.0;
+        mp_no.pre_fill_toxicity_ask = 0.0;
+        mp_no.pre_fill_spread_mult_bid = 1.0;
+        mp_no.pre_fill_spread_mult_ask = 1.0;
+
+        let (bid_no, _) =
+            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_no);
+
+        // Multiplicative path: spread roughly doubles from 2x multiplier
+        if let (Some(b_mult), Some(b_no)) = (&bid_mult, &bid_no) {
+            let mid = config.mid_price;
+            let widening_bps = ((b_no.price - b_mult.price) / mid) * 10000.0;
+            assert!(
+                widening_bps > 0.5,
+                "Legacy multiplicative (2x mult) should widen spread, got {:.2} bps",
+                widening_bps
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Taker Elasticity Estimator Tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_elasticity_estimator_empty() {
+        let est = TakerElasticityEstimator::new(100);
+        assert!(!est.is_valid());
+        assert_eq!(est.observation_count(), 0);
+        // Default elasticity = 1.0 (conservative)
+        assert!((est.elasticity() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_elasticity_estimator_synthetic_data() {
+        let mut est = TakerElasticityEstimator::new(200);
+
+        // Generate synthetic data: fill_rate = 100 * spread^(-1.5)
+        // This means eta = 1.5 (elasticity)
+        let eta_true = 1.5_f64;
+        for i in 0..100 {
+            let spread_bps = 5.0 + (i as f64) * 0.3; // 5 to 35 bps
+            let fill_rate = 100.0 * spread_bps.powf(-eta_true);
+            est.record(spread_bps, fill_rate);
+        }
+
+        assert!(est.is_valid());
+        assert_eq!(est.observation_count(), 100);
+
+        // Elasticity should be close to 1.5
+        let eta_est = est.elasticity();
+        assert!(
+            (eta_est - eta_true).abs() < 0.2,
+            "Estimated eta={:.3} should be close to true eta={:.1}",
+            eta_est,
+            eta_true
+        );
+    }
+
+    #[test]
+    fn test_elasticity_estimator_rejects_invalid() {
+        let mut est = TakerElasticityEstimator::new(100);
+
+        // Zero/negative inputs should be rejected
+        est.record(0.0, 1.0);
+        est.record(5.0, 0.0);
+        est.record(-1.0, 1.0);
+        est.record(5.0, -1.0);
+
+        assert_eq!(est.observation_count(), 0);
+    }
+
+    #[test]
+    fn test_elasticity_estimator_rolling_window() {
+        let mut est = TakerElasticityEstimator::new(20);
+
+        // Fill window
+        for i in 0..30 {
+            est.record(10.0 + i as f64, 1.0);
+        }
+
+        // Should not exceed max_observations
+        assert_eq!(est.observation_count(), 20);
+    }
+
+    // ---------------------------------------------------------------
+    // Monopolist LP Pricing Tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_monopolist_pricing_applied_when_sole_lp() {
+        let mut risk_config = RiskConfig::default();
+        risk_config.use_monopolist_pricing = true;
+        risk_config.monopolist_markup_cap_bps = 5.0;
+        let strategy = GLFTStrategy::with_config(risk_config);
+        let config = test_quote_config();
+
+        // Sole LP: competitor_count = 0, market_share = 0.8
+        let mut mp = test_market_params();
+        mp.competitor_count = 0.0;
+        mp.market_share = 0.8;
+
+        let (bid_mono, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        // Baseline: same params but many competitors (no markup)
+        let mut mp_comp = test_market_params();
+        mp_comp.competitor_count = 5.0;
+        mp_comp.market_share = 0.2;
+
+        let (bid_comp, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_comp);
+
+        // Monopolist should have wider spread (lower bid price)
+        if let (Some(b_mono), Some(b_comp)) = (&bid_mono, &bid_comp) {
+            let mid = config.mid_price;
+            let extra_bps = ((b_comp.price - b_mono.price) / mid) * 10000.0;
+            assert!(
+                extra_bps > 0.1,
+                "Monopolist should widen spread vs competitive, got {:.3} bps",
+                extra_bps
+            );
+        }
+    }
+
+    #[test]
+    fn test_monopolist_pricing_not_applied_with_competitors() {
+        let mut risk_config = RiskConfig::default();
+        risk_config.use_monopolist_pricing = true;
+        let strategy = GLFTStrategy::with_config(risk_config);
+        let config = test_quote_config();
+
+        // Many competitors: monopolist pricing should NOT apply
+        let mut mp = test_market_params();
+        mp.competitor_count = 3.0;
+        mp.market_share = 0.3;
+
+        let (bid_with, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        // Disable monopolist pricing
+        let mut risk_config_off = RiskConfig::default();
+        risk_config_off.use_monopolist_pricing = false;
+        let strategy_off = GLFTStrategy::with_config(risk_config_off);
+
+        let (bid_without, _) = strategy_off.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        // With 3 competitors, result should be same whether monopolist is enabled or not
+        if let (Some(b_with), Some(b_without)) = (&bid_with, &bid_without) {
+            let mid = config.mid_price;
+            let diff_bps = ((b_with.price - b_without.price) / mid).abs() * 10000.0;
+            assert!(
+                diff_bps < 0.1,
+                "With competitors, monopolist flag should not change spread: {:.3} bps diff",
+                diff_bps
+            );
+        }
+    }
+
+    #[test]
+    fn test_monopolist_markup_capped() {
+        let mut risk_config = RiskConfig::default();
+        risk_config.use_monopolist_pricing = true;
+        risk_config.monopolist_markup_cap_bps = 3.0; // Tight cap
+        let strategy = GLFTStrategy::with_config(risk_config);
+        let config = test_quote_config();
+
+        // Sole LP with maximum market share
+        let mut mp = test_market_params();
+        mp.competitor_count = 0.0;
+        mp.market_share = 1.0; // 100% market share
+
+        let (bid_mono, _) = strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        // Baseline with no monopolist
+        let mut risk_off = RiskConfig::default();
+        risk_off.use_monopolist_pricing = false;
+        let strat_off = GLFTStrategy::with_config(risk_off);
+
+        let (bid_base, _) = strat_off.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
+
+        if let (Some(b_mono), Some(b_base)) = (&bid_mono, &bid_base) {
+            let mid = config.mid_price;
+            let markup_bps = ((b_base.price - b_mono.price) / mid) * 10000.0;
+            // Markup should be capped at 3 bps
+            assert!(
+                markup_bps <= 3.5, // Small tolerance
+                "Monopolist markup should be capped at 3 bps, got {:.2} bps",
+                markup_bps
+            );
+        }
+    }
+
+    #[test]
+    fn test_monopolist_disabled_by_default() {
+        // Default RiskConfig should NOT enable monopolist pricing
+        let strategy = GLFTStrategy::with_config(RiskConfig::default());
+        assert!(!strategy.risk_config.use_monopolist_pricing);
+    }
+
+    #[test]
+    fn test_monopolist_enabled_for_hip3() {
+        // HIP-3 config SHOULD enable monopolist pricing
+        let strategy = GLFTStrategy::with_config(RiskConfig::hip3());
+        assert!(strategy.risk_config.use_monopolist_pricing);
     }
 }

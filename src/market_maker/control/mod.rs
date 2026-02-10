@@ -226,6 +226,9 @@ impl StochasticController {
             model_health: learning_output.model_health.clone(),
             reduce_only: trading_state.reduce_only,
             drawdown: trading_state.drawdown,
+            rate_limit_headroom: trading_state.rate_limit_headroom,
+            last_realized_edge_bps: trading_state.last_realized_edge_bps,
+            market_spread_bps: trading_state.market_spread_bps,
         };
 
         // 4. Compute optimal action
@@ -355,6 +358,9 @@ impl StochasticController {
                 reduce_only: prev_state.reduce_only,
                 belief: self.belief.clone(),
                 model_health: learning_output.model_health.clone(),
+                rate_limit_headroom: prev_state.rate_limit_headroom,
+                last_realized_edge_bps: realized_edge, // Fresh from this fill
+                market_spread_bps: prev_state.market_spread_bps, // Carry forward
             };
 
             // Create state transition for TD learning

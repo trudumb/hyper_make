@@ -432,4 +432,218 @@ mod tests {
         );
         assert!(low_quality.is_noisy(), "Low quality signal should be noisy");
     }
+
+    // ==========================================================================
+    // Funding Horizon Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_funding_horizon_uses_settlement_time() {
+        let config = HJBConfig {
+            session_duration_secs: 86400.0, // 24h fallback
+            terminal_penalty: 0.001,
+            gamma_base: 0.3,
+            use_funding_horizon: true,
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001);
+
+        // Without funding settlement, time_remaining uses session duration
+        let tr_session = ctrl.time_remaining();
+        assert!(
+            tr_session > 86000.0,
+            "Without funding settlement, should use ~86400s session: {}",
+            tr_session,
+        );
+        assert!(!ctrl.is_funding_horizon_active());
+
+        // Set funding settlement to 2 hours from now
+        ctrl.update_funding_settlement(7200.0);
+
+        // Now time_remaining should reflect funding cycle (8h period)
+        // With 2h remaining in the cycle, time_remaining ≈ 7200
+        let tr_funding = ctrl.time_remaining();
+        assert!(
+            tr_funding < 8000.0,
+            "With funding settlement set to 2h, time_remaining should be ~7200s: {}",
+            tr_funding,
+        );
+        assert!(ctrl.is_funding_horizon_active());
+
+        // Terminal urgency should reflect 75% through the 8h cycle (6h elapsed, 2h remaining)
+        let urgency = ctrl.terminal_urgency();
+        assert!(
+            urgency > 0.7 && urgency < 0.85,
+            "With 2h remaining of 8h cycle, urgency should be ~0.75: {}",
+            urgency,
+        );
+    }
+
+    #[test]
+    fn test_funding_horizon_gamma_increases_near_settlement() {
+        let config = HJBConfig {
+            session_duration_secs: 86400.0,
+            terminal_penalty: 0.001,
+            gamma_base: 0.3,
+            use_funding_horizon: true,
+            max_terminal_multiplier: 5.0,
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001);
+
+        // Early in cycle (7h remaining of 8h) → low urgency
+        ctrl.update_funding_settlement(25200.0); // 7h
+        let gamma_early = ctrl.gamma_multiplier();
+
+        // Late in cycle (30 min remaining) → high urgency
+        ctrl.update_funding_settlement(1800.0); // 30 min
+        let gamma_late = ctrl.gamma_multiplier();
+
+        assert!(
+            gamma_late > gamma_early,
+            "Gamma should increase near settlement: early={}, late={}",
+            gamma_early,
+            gamma_late,
+        );
+
+        // Late should show significant urgency (>80% through cycle)
+        let urgency_late = ctrl.terminal_urgency();
+        assert!(
+            urgency_late > 0.9,
+            "30 min remaining in 8h cycle should show high urgency: {}",
+            urgency_late,
+        );
+    }
+
+    #[test]
+    fn test_funding_horizon_disabled_uses_session() {
+        let config = HJBConfig {
+            session_duration_secs: 100.0,
+            terminal_penalty: 0.001,
+            gamma_base: 0.3,
+            use_funding_horizon: false, // Disabled
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001);
+
+        // Even with funding settlement set, should use session duration
+        ctrl.update_funding_settlement(3600.0);
+
+        let tr = ctrl.time_remaining();
+        assert!(
+            tr < 110.0,
+            "With use_funding_horizon=false, should use session duration: {}",
+            tr,
+        );
+        assert!(!ctrl.is_funding_horizon_active());
+    }
+
+    #[test]
+    fn test_calibrate_terminal_penalty_from_spread() {
+        let config = HJBConfig {
+            terminal_penalty: 0.0005,
+            calibrate_terminal_penalty: true,
+            gamma_base: 0.3,
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001); // 1 bp/sec
+
+        // Before calibration, uses config default
+        assert!(
+            (ctrl.effective_terminal_penalty() - 0.0005).abs() < 1e-6,
+            "Before calibration should use config value: {}",
+            ctrl.effective_terminal_penalty(),
+        );
+
+        // Calibrate with 20 bps market spread
+        ctrl.calibrate_terminal_penalty(20.0);
+
+        let penalty = ctrl.effective_terminal_penalty();
+        // spread_cost = 20/10000 = 0.002
+        // vol_cost = 0.0001 * sqrt(28800) ≈ 0.017
+        // total ≈ 0.019, clamped to [0.00005, 0.01] → 0.01
+        assert!(
+            penalty > 0.0005,
+            "Calibrated penalty should differ from default: {}",
+            penalty,
+        );
+        assert!(
+            penalty <= 0.01,
+            "Calibrated penalty should be clamped to max 0.01: {}",
+            penalty,
+        );
+    }
+
+    #[test]
+    fn test_calibrate_terminal_penalty_disabled() {
+        let config = HJBConfig {
+            terminal_penalty: 0.0005,
+            calibrate_terminal_penalty: false, // Disabled
+            gamma_base: 0.3,
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001);
+
+        ctrl.calibrate_terminal_penalty(20.0);
+
+        assert!(
+            (ctrl.effective_terminal_penalty() - 0.0005).abs() < 1e-6,
+            "With calibration disabled, should use config value: {}",
+            ctrl.effective_terminal_penalty(),
+        );
+    }
+
+    #[test]
+    fn test_funding_settlement_clamped_to_valid_range() {
+        let config = HJBConfig {
+            use_funding_horizon: true,
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+
+        // Negative time should be clamped to 0
+        ctrl.update_funding_settlement(-100.0);
+        assert_eq!(ctrl.time_to_funding_settlement_s, Some(0.0));
+
+        // Over 8h should be clamped to 28800
+        ctrl.update_funding_settlement(50000.0);
+        assert_eq!(ctrl.time_to_funding_settlement_s, Some(28800.0));
+    }
+
+    #[test]
+    fn test_funding_horizon_summary_fields() {
+        let config = HJBConfig {
+            use_funding_horizon: true,
+            calibrate_terminal_penalty: true,
+            ..Default::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.start_session();
+        ctrl.update_sigma(0.0001);
+        ctrl.update_funding_settlement(3600.0);
+        ctrl.calibrate_terminal_penalty(15.0);
+
+        let summary = ctrl.summary();
+
+        assert!(
+            summary.funding_horizon_active,
+            "Summary should report funding horizon active"
+        );
+        assert!(
+            summary.effective_terminal_penalty > 0.0,
+            "Summary should include effective terminal penalty: {}",
+            summary.effective_terminal_penalty,
+        );
+    }
 }
