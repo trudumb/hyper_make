@@ -819,6 +819,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         vol_ratio,
                         adverse_prob,
                         hawkes_excitation,
+                        0.0, // momentum_bps: drift bucket wired by lead when ready
                     );
 
                     // FIX P0-1: Use depth_from_mid (spread capture) minus AS minus fee as reward

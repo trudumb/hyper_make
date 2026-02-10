@@ -17,6 +17,20 @@
 //! The `spread_multiplier()` output should be fed into GLFT's `tox` variable
 //! to widen spreads when toxic flow is predicted.
 
+/// Number of base signals (imbalance, flow, regime, funding, changepoint).
+const NUM_BASE_SIGNALS: usize = 5;
+/// Total signals including trend opposition.
+const NUM_SIGNALS: usize = 6;
+/// Human-readable signal names for diagnostics.
+const SIGNAL_NAMES: [&str; NUM_SIGNALS] = [
+    "imbalance",
+    "flow",
+    "regime",
+    "funding",
+    "changepoint",
+    "trend",
+];
+
 /// Configuration for pre-fill AS classifier.
 #[derive(Debug, Clone)]
 pub struct PreFillClassifierConfig {
@@ -30,6 +44,9 @@ pub struct PreFillClassifierConfig {
     pub funding_weight: f64,
     /// Weight for BOCD changepoint probability (default: 0.10)
     pub changepoint_weight: f64,
+    /// Weight for trend opposition signal (default: 0.30).
+    /// Fills against strong price trends are more toxic (Kyle 1985).
+    pub trend_weight: f64,
 
     /// Maximum spread multiplier (caps toxicity impact)
     pub max_spread_multiplier: f64,
@@ -85,6 +102,7 @@ impl Default for PreFillClassifierConfig {
             regime_weight: 0.25,
             funding_weight: 0.10,
             changepoint_weight: 0.10,
+            trend_weight: 0.30,
 
             max_spread_multiplier: 3.0, // Cap at 3x base spread
 
@@ -103,6 +121,33 @@ impl Default for PreFillClassifierConfig {
 
             warmup_prior_toxicity: 0.35,
             warmup_prior_min_updates: 10,
+        }
+    }
+}
+
+impl PreFillClassifierConfig {
+    /// Return the config-default weights as an array of NUM_SIGNALS elements.
+    fn default_weights_array(&self) -> [f64; NUM_SIGNALS] {
+        [
+            self.imbalance_weight,
+            self.flow_weight,
+            self.regime_weight,
+            self.funding_weight,
+            self.changepoint_weight,
+            self.trend_weight,
+        ]
+    }
+
+    /// Return the prior weight for a given signal index.
+    fn prior_weight(&self, index: usize) -> f64 {
+        match index {
+            0 => self.imbalance_weight,
+            1 => self.flow_weight,
+            2 => self.regime_weight,
+            3 => self.funding_weight,
+            4 => self.changepoint_weight,
+            5 => self.trend_weight,
+            _ => 0.2,
         }
     }
 }
@@ -131,6 +176,11 @@ pub struct PreFillASClassifier {
     /// Current funding rate (8h rate as fraction)
     funding_rate: f64,
 
+    /// Long-term trend momentum in bps (positive = uptrend, negative = downtrend).
+    /// Fed externally via `update_trend()`. Used for drift conditioning:
+    /// fills against strong trends are more toxic (Kyle 1985).
+    trend_momentum_bps: f64,
+
     /// Cached toxicity prediction [0, 1]
     cached_toxicity: f64,
 
@@ -147,14 +197,14 @@ pub struct PreFillASClassifier {
     regime_updated_at_ms: u64,
 
     // === Online Learning State ===
-    /// Learned weights [imbalance, flow, regime, funding, changepoint]
-    learned_weights: [f64; 5],
+    /// Learned weights [imbalance, flow, regime, funding, changepoint, trend]
+    learned_weights: [f64; NUM_SIGNALS],
 
     /// Running sum of (signal_i * outcome) for each signal
-    signal_outcome_sum: [f64; 5],
+    signal_outcome_sum: [f64; NUM_SIGNALS],
 
     /// Running sum of signal_i^2 for each signal
-    signal_sq_sum: [f64; 5],
+    signal_sq_sum: [f64; NUM_SIGNALS],
 
     /// Number of learning samples processed
     learning_samples: usize,
@@ -234,13 +284,7 @@ impl PreFillASClassifier {
     /// Create with custom configuration.
     pub fn with_config(config: PreFillClassifierConfig) -> Self {
         // Initialize learned weights with config defaults
-        let learned_weights = [
-            config.imbalance_weight,
-            config.flow_weight,
-            config.regime_weight,
-            config.funding_weight,
-            config.changepoint_weight,
-        ];
+        let learned_weights = config.default_weights_array();
 
         let normalizer_alpha = config.normalizer_alpha;
         let normalizer_warmup = config.normalizer_warmup;
@@ -252,14 +296,15 @@ impl PreFillASClassifier {
             regime_trust: 1.0, // High trust initially
             changepoint_prob: 0.0, // No changepoint
             funding_rate: 0.0, // Neutral funding
+            trend_momentum_bps: 0.0, // No drift
             cached_toxicity: 0.0,
             update_count: 0,
             orderbook_updated_at_ms: 0,
             trade_flow_updated_at_ms: 0,
             regime_updated_at_ms: 0,
             learned_weights,
-            signal_outcome_sum: [0.0; 5],
-            signal_sq_sum: [0.0; 5],
+            signal_outcome_sum: [0.0; NUM_SIGNALS],
+            signal_sq_sum: [0.0; NUM_SIGNALS],
             learning_samples: 0,
             // Regime-conditional state
             current_regime: 1, // Start with Normal
@@ -297,11 +342,21 @@ impl PreFillASClassifier {
     // === Checkpoint persistence ===
 
     /// Extract learning state for checkpoint persistence.
+    ///
+    /// Note: checkpoint format stores the first 5 base signals only.
+    /// The 6th trend signal's learning state is ephemeral (relearned quickly).
     pub fn to_checkpoint(&self) -> crate::market_maker::checkpoint::PreFillCheckpoint {
+        let mut cp_weights = [0.0; NUM_BASE_SIGNALS];
+        cp_weights.copy_from_slice(&self.learned_weights[..NUM_BASE_SIGNALS]);
+        let mut cp_outcome = [0.0; NUM_BASE_SIGNALS];
+        cp_outcome.copy_from_slice(&self.signal_outcome_sum[..NUM_BASE_SIGNALS]);
+        let mut cp_sq = [0.0; NUM_BASE_SIGNALS];
+        cp_sq.copy_from_slice(&self.signal_sq_sum[..NUM_BASE_SIGNALS]);
+
         crate::market_maker::checkpoint::PreFillCheckpoint {
-            learned_weights: self.learned_weights,
-            signal_outcome_sum: self.signal_outcome_sum,
-            signal_sq_sum: self.signal_sq_sum,
+            learned_weights: cp_weights,
+            signal_outcome_sum: cp_outcome,
+            signal_sq_sum: cp_sq,
             learning_samples: self.learning_samples,
             regime_probs: self.regime_probs,
             // EWMA normalizer state
@@ -326,10 +381,14 @@ impl PreFillASClassifier {
     ///
     /// Ephemeral state (cached signals, timestamps) stays at defaults —
     /// they repopulate within seconds from live data.
+    /// The 6th trend signal's learning state resets to config default on restore.
     pub fn restore_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::PreFillCheckpoint) {
-        self.learned_weights = cp.learned_weights;
-        self.signal_outcome_sum = cp.signal_outcome_sum;
-        self.signal_sq_sum = cp.signal_sq_sum;
+        self.learned_weights[..NUM_BASE_SIGNALS].copy_from_slice(&cp.learned_weights);
+        self.learned_weights[NUM_BASE_SIGNALS] = self.config.trend_weight;
+        self.signal_outcome_sum[..NUM_BASE_SIGNALS].copy_from_slice(&cp.signal_outcome_sum);
+        self.signal_outcome_sum[NUM_BASE_SIGNALS] = 0.0;
+        self.signal_sq_sum[..NUM_BASE_SIGNALS].copy_from_slice(&cp.signal_sq_sum);
+        self.signal_sq_sum[NUM_BASE_SIGNALS] = 0.0;
         self.learning_samples = cp.learning_samples;
         self.regime_probs = cp.regime_probs;
         // EWMA normalizer state
@@ -525,23 +584,23 @@ impl PreFillASClassifier {
     /// - Normal: balanced weights
     /// - High: flow and changepoint matter more (momentum-driven)
     /// - Extreme/Cascade: changepoint and flow dominate (information asymmetry)
-    fn regime_weight_multipliers(&self) -> [f64; 5] {
-        // Weight multipliers for [imbalance, flow, regime, funding, changepoint]
+    fn regime_weight_multipliers(&self) -> [f64; NUM_SIGNALS] {
+        // Weight multipliers for [imbalance, flow, regime, funding, changepoint, trend]
         // Soft-blend based on regime probabilities
-        
-        let regime_weights: [[f64; 5]; 4] = [
-            // Low/Calm: imbalance matters, others matter less
-            [1.5, 0.8, 0.7, 1.0, 0.5],
+
+        let regime_weights: [[f64; NUM_SIGNALS]; 4] = [
+            // Low/Calm: imbalance matters, trend is strong signal in quiet markets
+            [1.5, 0.8, 0.7, 1.0, 0.5, 1.3],
             // Normal: balanced
-            [1.0, 1.0, 1.0, 1.0, 1.0],
-            // High: flow and changepoint matter more
-            [0.8, 1.3, 1.2, 0.9, 1.4],
-            // Extreme/Cascade: changepoint and flow dominate
-            [0.6, 1.5, 1.3, 0.8, 1.8],
+            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            // High: flow and changepoint matter more, trend less reliable
+            [0.8, 1.3, 1.2, 0.9, 1.4, 0.7],
+            // Extreme/Cascade: changepoint and flow dominate, trend unreliable
+            [0.6, 1.5, 1.3, 0.8, 1.8, 0.4],
         ];
 
         // Soft blend across regimes
-        let mut multipliers = [0.0; 5];
+        let mut multipliers = [0.0; NUM_SIGNALS];
         for (regime_idx, &prob) in self.regime_probs.iter().enumerate() {
             for (signal_idx, mult) in multipliers.iter_mut().enumerate() {
                 *mult += prob * regime_weights[regime_idx][signal_idx];
@@ -575,6 +634,24 @@ impl PreFillASClassifier {
         self.funding_ewma_var = v;
 
         self.update_cached_toxicity();
+    }
+
+    /// Update trend momentum signal for drift conditioning.
+    ///
+    /// Fills against strong price trends are more toxic (Kyle 1985):
+    /// a downtrend makes bid fills toxic, an uptrend makes ask fills toxic.
+    ///
+    /// # Arguments
+    /// * `long_momentum_bps` - Long-term price momentum in bps.
+    ///   Positive = uptrend, negative = downtrend.
+    pub fn update_trend(&mut self, long_momentum_bps: f64) {
+        self.trend_momentum_bps = long_momentum_bps;
+        self.update_cached_toxicity();
+    }
+
+    /// Get the current trend momentum in bps.
+    pub fn trend_momentum_bps(&self) -> f64 {
+        self.trend_momentum_bps
     }
 
     /// Set the blended toxicity from an external source (e.g., IntegratedSignals).
@@ -648,25 +725,19 @@ impl PreFillASClassifier {
     }
 
     /// Get the effective weights (learned or default, with regime conditioning)
-    fn effective_weights(&self) -> [f64; 5] {
+    fn effective_weights(&self) -> [f64; NUM_SIGNALS] {
         let base_weights = if self.config.enable_learning
             && self.learning_samples >= self.config.min_samples_for_learning
         {
             self.learned_weights
         } else {
-            [
-                self.config.imbalance_weight,
-                self.config.flow_weight,
-                self.config.regime_weight,
-                self.config.funding_weight,
-                self.config.changepoint_weight,
-            ]
+            self.config.default_weights_array()
         };
 
         // Apply regime-conditional multipliers
         let multipliers = self.regime_weight_multipliers();
-        let mut weights = [0.0; 5];
-        for i in 0..5 {
+        let mut weights = [0.0; NUM_SIGNALS];
+        for i in 0..weights.len() {
             weights[i] = base_weights[i] * multipliers[i];
         }
 
@@ -687,8 +758,8 @@ impl PreFillASClassifier {
     /// normalization through half_sigmoid for smooth [0,1] output distribution.
     /// Falls back to legacy threshold-based normalization during warmup.
     ///
-    /// Returns [imbalance, flow, regime, funding, changepoint] signals.
-    pub fn compute_signals(&self, is_bid: bool) -> [f64; 5] {
+    /// Returns [imbalance, flow, regime, funding, changepoint, trend] signals.
+    pub fn compute_signals(&self, is_bid: bool) -> [f64; NUM_SIGNALS] {
         // Use z-score normalization when warmed up
         if self.normalizer_obs_count >= self.normalizer_warmup {
             return self.compute_signals_zscore(is_bid);
@@ -728,12 +799,22 @@ impl PreFillASClassifier {
             (-self.funding_rate / self.config.funding_threshold).clamp(0.0, 1.0)
         };
 
+        // === Trend Opposition (Kyle 1985 drift conditioning) ===
+        // Downtrend (negative momentum) makes bids toxic, uptrend makes asks toxic.
+        // Normalized: 20 bps of opposing momentum = full toxicity signal.
+        let trend_signal = if is_bid {
+            (-self.trend_momentum_bps / 20.0).clamp(0.0, 1.0)
+        } else {
+            (self.trend_momentum_bps / 20.0).clamp(0.0, 1.0)
+        };
+
         [
             imbalance_signal,
             flow_signal,
             regime_signal,
             funding_signal,
             changepoint_signal,
+            trend_signal,
         ]
     }
 
@@ -742,7 +823,7 @@ impl PreFillASClassifier {
     /// Uses pre-computed z-scores (computed BEFORE EWMA update in update_* methods)
     /// so they reflect true deviations from the historical mean. Scaled by z_scale
     /// and passed through sigmoid for smooth (0,1) output centered at 0.5.
-    fn compute_signals_zscore(&self, is_bid: bool) -> [f64; 5] {
+    fn compute_signals_zscore(&self, is_bid: bool) -> [f64; NUM_SIGNALS] {
         let scale = self.config.z_scale;
 
         // === Orderbook Imbalance (pre-computed z-score) ===
@@ -768,12 +849,21 @@ impl PreFillASClassifier {
         // Non-directional: high changepoint probability is toxic for both sides
         let changepoint_signal = Self::sigmoid(self.changepoint_z * scale);
 
+        // === Trend Opposition (no z-score, already in bps) ===
+        // Uses same normalization as legacy path — already well-scaled.
+        let trend_signal = if is_bid {
+            (-self.trend_momentum_bps / 20.0).clamp(0.0, 1.0)
+        } else {
+            (self.trend_momentum_bps / 20.0).clamp(0.0, 1.0)
+        };
+
         [
             imbalance_signal,
             flow_signal,
             regime_signal,
             funding_signal,
             changepoint_signal,
+            trend_signal,
         ]
     }
 
@@ -823,7 +913,7 @@ impl PreFillASClassifier {
         let reg = self.config.regularization;
         let n = self.learning_samples as f64;
 
-        for i in 0..5 {
+        for i in 0..self.learned_weights.len() {
             // Compute gradient: E[signal * (target - prediction)]
             // Simplified: proportional to signal-outcome correlation
             let correlation = if self.signal_sq_sum[i] > 1e-9 {
@@ -833,14 +923,7 @@ impl PreFillASClassifier {
             };
 
             // Get prior weight (from config)
-            let prior = match i {
-                0 => self.config.imbalance_weight,
-                1 => self.config.flow_weight,
-                2 => self.config.regime_weight,
-                3 => self.config.funding_weight,
-                4 => self.config.changepoint_weight,
-                _ => 0.2,
-            };
+            let prior = self.config.prior_weight(i);
 
             // Update with regularization toward prior
             let target_weight = correlation.clamp(0.0, 1.0);
@@ -910,21 +993,13 @@ impl PreFillASClassifier {
 
     /// Get learning diagnostics
     pub fn learning_diagnostics(&self) -> LearningDiagnostics {
-        let default_weights = [
-            self.config.imbalance_weight,
-            self.config.flow_weight,
-            self.config.regime_weight,
-            self.config.funding_weight,
-            self.config.changepoint_weight,
-        ];
-
         LearningDiagnostics {
             samples: self.learning_samples,
             min_samples: self.config.min_samples_for_learning,
             is_using_learned: self.learning_samples >= self.config.min_samples_for_learning,
-            default_weights,
+            default_weights: self.config.default_weights_array(),
             learned_weights: self.learned_weights,
-            signal_names: ["imbalance", "flow", "regime", "funding", "changepoint"],
+            signal_names: SIGNAL_NAMES,
         }
     }
 
@@ -1044,6 +1119,7 @@ impl PreFillASClassifier {
             regime_trust: self.regime_trust,
             changepoint_prob: self.changepoint_prob,
             funding_rate: self.funding_rate,
+            trend_momentum_bps: self.trend_momentum_bps,
             bid_toxicity: self.predict_toxicity(true),
             ask_toxicity: self.predict_toxicity(false),
             bid_spread_mult: self.spread_multiplier(true),
@@ -1072,6 +1148,7 @@ pub struct PreFillSummary {
     pub regime_trust: f64,
     pub changepoint_prob: f64,
     pub funding_rate: f64,
+    pub trend_momentum_bps: f64,
     pub bid_toxicity: f64,
     pub ask_toxicity: f64,
     pub bid_spread_mult: f64,
@@ -1110,11 +1187,11 @@ pub struct LearningDiagnostics {
     /// Whether learned weights are currently being used
     pub is_using_learned: bool,
     /// Default weights from config
-    pub default_weights: [f64; 5],
+    pub default_weights: [f64; NUM_SIGNALS],
     /// Learned weights (may not be in use yet)
-    pub learned_weights: [f64; 5],
+    pub learned_weights: [f64; NUM_SIGNALS],
     /// Signal names for display
-    pub signal_names: [&'static str; 5],
+    pub signal_names: [&'static str; NUM_SIGNALS],
 }
 
 impl LearningDiagnostics {
@@ -1431,5 +1508,135 @@ mod tests {
             "Default prior mult ({}) should be <= high prior mult ({})", bid_mult, high_bid_mult);
         assert!(ask_mult <= high_bid_mult,
             "Default prior mult ({}) should be <= high prior mult ({})", ask_mult, high_bid_mult);
+    }
+
+    // === Trend Opposition Tests ===
+
+    #[test]
+    fn test_trend_bid_in_downtrend_high_toxicity() {
+        // A strong downtrend should make bid fills toxic (buying into falling market).
+        let mut classifier = PreFillASClassifier::new();
+        // Warm past the prior by updating enough times
+        for _ in 0..11 {
+            classifier.update_cached_toxicity();
+        }
+
+        let bid_tox_neutral = classifier.predict_toxicity(true);
+
+        // Apply strong downtrend: -30 bps momentum
+        classifier.update_trend(-30.0);
+
+        let bid_tox_downtrend = classifier.predict_toxicity(true);
+        let ask_tox_downtrend = classifier.predict_toxicity(false);
+
+        // Bids should be MORE toxic in a downtrend (buying into decline)
+        assert!(
+            bid_tox_downtrend > bid_tox_neutral,
+            "Downtrend should increase bid toxicity: neutral={:.4}, downtrend={:.4}",
+            bid_tox_neutral, bid_tox_downtrend
+        );
+        // Asks should NOT be more toxic from downtrend (selling into decline is safe)
+        assert!(
+            ask_tox_downtrend < bid_tox_downtrend,
+            "Downtrend should not make asks more toxic than bids: ask={:.4}, bid={:.4}",
+            ask_tox_downtrend, bid_tox_downtrend
+        );
+    }
+
+    #[test]
+    fn test_trend_bid_in_uptrend_zero_trend_toxicity() {
+        // An uptrend should NOT add toxicity to bid fills (buying into rising market is fine).
+        let mut classifier = PreFillASClassifier::new();
+        for _ in 0..11 {
+            classifier.update_cached_toxicity();
+        }
+
+        let bid_tox_neutral = classifier.predict_toxicity(true);
+
+        // Apply strong uptrend: +30 bps momentum
+        classifier.update_trend(30.0);
+
+        let bid_tox_uptrend = classifier.predict_toxicity(true);
+        let ask_tox_uptrend = classifier.predict_toxicity(false);
+
+        // Bids should NOT be more toxic in an uptrend
+        assert!(
+            (bid_tox_uptrend - bid_tox_neutral).abs() < 0.05,
+            "Uptrend should not increase bid toxicity: neutral={:.4}, uptrend={:.4}",
+            bid_tox_neutral, bid_tox_uptrend
+        );
+        // Asks SHOULD be more toxic in an uptrend (selling into rising market)
+        assert!(
+            ask_tox_uptrend > bid_tox_uptrend,
+            "Uptrend should make asks more toxic than bids: ask={:.4}, bid={:.4}",
+            ask_tox_uptrend, bid_tox_uptrend
+        );
+    }
+
+    #[test]
+    fn test_trend_neutral_momentum_zero_contribution() {
+        // Zero momentum should produce zero trend signal contribution.
+        let mut classifier = PreFillASClassifier::new();
+        for _ in 0..11 {
+            classifier.update_cached_toxicity();
+        }
+
+        classifier.update_trend(0.0);
+
+        let signals_bid = classifier.compute_signals(true);
+        let signals_ask = classifier.compute_signals(false);
+
+        // Trend signal (index 5) should be 0 when momentum is 0
+        assert!(
+            signals_bid[5].abs() < 1e-9,
+            "Zero momentum should produce zero bid trend signal, got {:.6}",
+            signals_bid[5]
+        );
+        assert!(
+            signals_ask[5].abs() < 1e-9,
+            "Zero momentum should produce zero ask trend signal, got {:.6}",
+            signals_ask[5]
+        );
+    }
+
+    #[test]
+    fn test_trend_learning_convergence_six_features() {
+        // Verify that the learning loop works correctly with 6 features.
+        let mut config = PreFillClassifierConfig::default();
+        config.min_samples_for_learning = 50; // Lower threshold for testing
+        let mut classifier = PreFillASClassifier::with_config(config);
+
+        // Apply a downtrend so trend signal is nonzero for bids
+        classifier.update_trend(-15.0);
+        classifier.update_orderbook(1.5, 1.0);
+        classifier.update_trade_flow(60.0, 40.0);
+
+        // Record many outcomes: bids in downtrend are always adverse
+        for _ in 0..100 {
+            classifier.record_outcome(true, true, Some(5.0));
+        }
+
+        let diag = classifier.learning_diagnostics();
+        assert_eq!(diag.samples, 100);
+        assert!(diag.is_using_learned, "Should be using learned weights after 100 samples");
+
+        // All 6 signal names should be present
+        assert_eq!(diag.signal_names.len(), 6);
+        assert_eq!(diag.signal_names[5], "trend");
+
+        // Learned weights should sum to 1.0 (normalized)
+        let sum: f64 = diag.learned_weights.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "Learned weights should sum to 1.0, got {:.4}",
+            sum
+        );
+
+        // Trend weight should be nonzero (it's contributing to adverse outcomes)
+        assert!(
+            diag.learned_weights[5] > 0.01,
+            "Trend learned weight should be nonzero after adverse outcomes, got {:.4}",
+            diag.learned_weights[5]
+        );
     }
 }

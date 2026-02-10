@@ -1008,6 +1008,7 @@ impl SimulationState {
                 vol_ratio,
                 self.adverse_selection.best_horizon_as_bps() / 10.0, // normalize to ~[0,1]
                 market_params.hawkes_branching_ratio,
+                0.0, // momentum_bps: drift bucket disabled in paper trader for now
             );
             // Always explore in paper trading
             let rl_rec = RLPolicyRecommendation::from_agent(&mut self.rl_agent, mdp_state.to_index(), true);
@@ -1428,6 +1429,7 @@ impl SimulationState {
                 vol_ratio,
                 self.adverse_selection.best_horizon_as_bps() / 10.0, // normalize to ~[0,1]
                 self.hawkes.intensity_percentile(),
+                0.0, // momentum_bps: drift bucket disabled in paper trader for now
             );
 
             let reward = Reward::compute(

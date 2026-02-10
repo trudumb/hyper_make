@@ -325,6 +325,18 @@ impl HJBInventoryController {
         self.drift_ewma
     }
 
+    /// Set drift directly, bypassing EWMA smoothing.
+    ///
+    /// Use when the caller already provides a blended/smoothed drift value
+    /// (e.g., from multi-timeframe momentum blend). Avoids double-smoothing.
+    pub fn set_drift_directly(&mut self, drift_rate: f64) {
+        self.drift_ewma = drift_rate;
+        // Mark as warmed up so the drift is used immediately
+        if self.drift_update_count < self.config.min_warmup_observations as u64 {
+            self.drift_update_count = self.config.min_warmup_observations as u64;
+        }
+    }
+
     /// Get smoothed variance multiplier.
     pub fn smoothed_variance_multiplier(&self) -> f64 {
         self.variance_mult_ewma
@@ -477,5 +489,49 @@ impl HJBInventoryController {
                 .funding_settlement_last_updated
                 .map(|t| t.elapsed().as_secs_f64() < 60.0)
                 .unwrap_or(false)
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_drift_directly_bypasses_ewma() {
+        let mut controller = HJBInventoryController::default_config();
+
+        // Initial smoothed_drift should be 0.0
+        assert!(
+            controller.smoothed_drift().abs() < 1e-15,
+            "initial smoothed_drift should be 0.0"
+        );
+
+        // Set drift directly
+        let target_drift = 0.00042;
+        controller.set_drift_directly(target_drift);
+        assert!(
+            (controller.smoothed_drift() - target_drift).abs() < 1e-15,
+            "smoothed_drift should be exactly the set value: got {}, expected {target_drift}",
+            controller.smoothed_drift()
+        );
+
+        // Set negative drift
+        let neg_drift = -0.00013;
+        controller.set_drift_directly(neg_drift);
+        assert!(
+            (controller.smoothed_drift() - neg_drift).abs() < 1e-15,
+            "smoothed_drift should accept negative values: got {}, expected {neg_drift}",
+            controller.smoothed_drift()
+        );
+
+        // Verify the value is exactly what was set (no smoothing applied)
+        let precise_value = 0.000123456789;
+        controller.set_drift_directly(precise_value);
+        assert!(
+            (controller.smoothed_drift() - precise_value).abs() < 1e-15,
+            "set_drift_directly should bypass EWMA: got {}, expected {precise_value}",
+            controller.smoothed_drift()
+        );
     }
 }

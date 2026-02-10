@@ -862,6 +862,12 @@ pub struct MarketParams {
     pub cached_best_bid: f64,
     /// Cached best ask from L2 book (for bounding inventory skew offset).
     pub cached_best_ask: f64,
+
+    // === Drift Rate (HJB / GLFT Drift Integration) ===
+    /// Smoothed price drift rate per second (fractional, not bps).
+    /// Positive = price rising. Used by GLFT half_spread_with_drift
+    /// for asymmetric bid/ask spread (classical μ·T term).
+    pub drift_rate_per_sec: f64,
 }
 
 impl Default for MarketParams {
@@ -1118,6 +1124,8 @@ impl Default for MarketParams {
             // Cached BBO (0.0 = not yet received from L2 book)
             cached_best_bid: 0.0,
             cached_best_ask: 0.0,
+            // Drift rate
+            drift_rate_per_sec: 0.0,
         }
     }
 }

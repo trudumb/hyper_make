@@ -484,6 +484,40 @@ impl GLFTStrategy {
         glft_spread + vol_compensation + self.risk_config.maker_fee_rate
     }
 
+    /// GLFT half-spread with classical drift (mu*T) asymmetry.
+    ///
+    /// Extends `half_spread()` with the Avellaneda-Stoikov drift term:
+    /// - Positive drift (price rising) widens bids, tightens asks
+    /// - Negative drift (price falling) tightens bids, widens asks
+    ///
+    /// Formula: `delta_bid = base + mu*T/2`, `delta_ask = base - mu*T/2`
+    ///
+    /// The drift adjustment is clamped so the half-spread never goes below
+    /// the maker fee rate (no negative-EV quotes).
+    #[allow(dead_code)] // Will be wired in signal_integration.rs
+    pub(crate) fn half_spread_with_drift(
+        &self,
+        gamma: f64,
+        kappa: f64,
+        sigma: f64,
+        time_horizon: f64,
+        drift_rate: f64,
+        is_bid: bool,
+    ) -> f64 {
+        let base = self.half_spread(gamma, kappa, sigma, time_horizon);
+        // Classical GLFT mu*T term: drift shifts spread asymmetrically
+        // Positive drift -> widen bids (buying into uptrend risky), tighten asks
+        let drift_adjustment = drift_rate * time_horizon / 2.0;
+        let adjusted = if is_bid {
+            base + drift_adjustment
+        } else {
+            base - drift_adjustment
+        };
+        // Floor at maker fee to avoid negative-EV quotes
+        adjusted.max(self.risk_config.maker_fee_rate)
+    }
+
+
     /// Proactive directional skew based on momentum predictions.
     ///
     /// **Key Insight:** This is the OPPOSITE of inventory skew:
@@ -2224,5 +2258,86 @@ mod tests {
         // HIP-3 config SHOULD enable monopolist pricing
         let strategy = GLFTStrategy::with_config(RiskConfig::hip3());
         assert!(strategy.risk_config.use_monopolist_pricing);
+    }
+
+    // ---------------------------------------------------------------
+    // GLFT Drift (mu*T) Tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_drift_widens_adverse_side() {
+        let strategy = test_strategy();
+        let gamma = 0.15;
+        let kappa = 5000.0;
+        let sigma = 0.001;
+        let time_horizon = 60.0;
+        let drift_rate = 0.0001; // positive drift = price rising
+
+        let bid_half = strategy.half_spread_with_drift(
+            gamma, kappa, sigma, time_horizon, drift_rate, true,
+        );
+        let ask_half = strategy.half_spread_with_drift(
+            gamma, kappa, sigma, time_horizon, drift_rate, false,
+        );
+        let base = strategy.half_spread(gamma, kappa, sigma, time_horizon);
+
+        // Positive drift: bid should be wider than base (buying into uptrend is risky)
+        assert!(
+            bid_half > base,
+            "bid half-spread should widen with positive drift: bid={bid_half}, base={base}"
+        );
+        // Positive drift: ask should be tighter than base (selling into uptrend is favorable)
+        assert!(
+            ask_half < base,
+            "ask half-spread should tighten with positive drift: ask={ask_half}, base={base}"
+        );
+    }
+
+    #[test]
+    fn test_drift_zero_is_symmetric() {
+        let strategy = test_strategy();
+        let gamma = 0.15;
+        let kappa = 5000.0;
+        let sigma = 0.001;
+        let time_horizon = 60.0;
+
+        let bid_half = strategy.half_spread_with_drift(
+            gamma, kappa, sigma, time_horizon, 0.0, true,
+        );
+        let ask_half = strategy.half_spread_with_drift(
+            gamma, kappa, sigma, time_horizon, 0.0, false,
+        );
+        let base = strategy.half_spread(gamma, kappa, sigma, time_horizon);
+
+        assert!(
+            (bid_half - base).abs() < 1e-15,
+            "zero drift bid should equal base: bid={bid_half}, base={base}"
+        );
+        assert!(
+            (ask_half - base).abs() < 1e-15,
+            "zero drift ask should equal base: ask={ask_half}, base={base}"
+        );
+    }
+
+    #[test]
+    fn test_drift_floor_at_maker_fee() {
+        let strategy = test_strategy();
+        let gamma = 0.15;
+        let kappa = 5000.0;
+        let sigma = 0.001;
+        let time_horizon = 60.0;
+        // Very large negative drift to try to push ask below fee
+        let drift_rate = -10.0;
+
+        let ask_half = strategy.half_spread_with_drift(
+            gamma, kappa, sigma, time_horizon, drift_rate, false,
+        );
+
+        // Should never go below maker fee rate
+        assert!(
+            ask_half >= strategy.risk_config.maker_fee_rate,
+            "half-spread must be floored at maker fee: ask={ask_half}, fee={}",
+            strategy.risk_config.maker_fee_rate
+        );
     }
 }

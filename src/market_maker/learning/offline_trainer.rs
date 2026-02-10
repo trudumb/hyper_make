@@ -141,6 +141,7 @@ impl OfflineTrainer {
                     inventory_penalty: exp.inventory_penalty,
                     volatility_penalty: exp.volatility_penalty,
                     inventory_change_penalty: exp.inventory_change_penalty,
+                    drift_penalty: 0.0,
                 };
                 let next_state = MDPState::from_index(exp.next_state_idx);
 
@@ -429,6 +430,7 @@ mod tests {
                 inventory_penalty: 0.0,
                 volatility_penalty: 0.0,
                 inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
             };
             agent.update_idx(state_idx, action_idx, reward, next_state_idx, false);
 

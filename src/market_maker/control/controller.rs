@@ -595,6 +595,8 @@ impl OptimalController {
             rate_limit_headroom: provider.rate_limit_headroom(),
             last_realized_edge_bps: 0.0, // Set from TradingState path, not provider
             market_spread_bps: 0.0,      // Set from TradingState path, not provider
+            drift_rate: 0.0,
+            ou_uncertainty: 0.0,
         }
     }
 }

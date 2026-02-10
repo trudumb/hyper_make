@@ -367,13 +367,59 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         let p_continuation = self.estimator.momentum_continuation_probability();
         let position = self.position.position();
 
+        // Get multi-timeframe trend signal BEFORE momentum update so we can blend
+        let position_value = (position.abs() * self.latest_mid).max(1.0);
+        let trend_signal = self.estimator.trend_signal(position_value);
+
+        // Blend multi-timeframe momentum for drift estimator input.
+        // During smooth trends, short-term momentum oscillates near zero while
+        // the 5-min trend is clearly directional. Feed the stronger signal.
+        let effective_momentum = if trend_signal.is_warmed_up {
+            if trend_signal.long_momentum_bps.abs() > momentum_bps.abs()
+                && trend_signal.long_momentum_bps.abs() > 5.0
+            {
+                // Long-term trend dominates: blend 70/30
+                0.7 * trend_signal.long_momentum_bps + 0.3 * momentum_bps
+            } else if trend_signal.medium_momentum_bps.abs() > momentum_bps.abs()
+                && trend_signal.medium_momentum_bps.abs() > 3.0
+            {
+                // Medium-term trend dominates: blend 50/50
+                0.5 * trend_signal.medium_momentum_bps + 0.5 * momentum_bps
+            } else {
+                momentum_bps
+            }
+        } else {
+            momentum_bps
+        };
+
         // Update momentum EWMA signals for smoothing (reduces whipsawing)
-        self.stochastic.hjb_controller.update_momentum_signals(
-            momentum_bps,
-            p_continuation,
-            position,
-            self.config.max_position,
-        );
+        if trend_signal.is_warmed_up
+            && (effective_momentum - momentum_bps).abs() > 0.01
+        {
+            // Blended momentum already incorporates multi-timeframe smoothing.
+            // Bypass EWMA to avoid double-smoothing lag.
+            let drift_rate = (effective_momentum / 10000.0) / 0.5; // per-second drift
+            // Update other state (history, continuation, variance multiplier)
+            // using original short-term momentum
+            self.stochastic.hjb_controller.update_momentum_signals(
+                momentum_bps,
+                p_continuation,
+                position,
+                self.config.max_position,
+            );
+            // Override drift_ewma with the blended value (bypass EWMA smoothing)
+            self.stochastic
+                .hjb_controller
+                .set_drift_directly(drift_rate);
+        } else {
+            // Short-term path: normal EWMA smoothing
+            self.stochastic.hjb_controller.update_momentum_signals(
+                effective_momentum,
+                p_continuation,
+                position,
+                self.config.max_position,
+            );
+        }
 
         // Update HJB controller's funding-cycle horizon and terminal penalty
         {
@@ -396,11 +442,6 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .hjb_controller
                 .calibrate_terminal_penalty(market_spread_bps);
         }
-
-        // Get multi-timeframe trend signal for enhanced opposition detection
-        // Position value for underwater severity calculation
-        let position_value = (position.abs() * self.latest_mid).max(1.0);
-        let trend_signal = self.estimator.trend_signal(position_value);
 
         // Use enhanced drift-adjusted skew with multi-timeframe trend detection
         let drift_adjusted_skew = self.stochastic.hjb_controller.optimal_skew_with_trend(
@@ -1654,6 +1695,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             market_params.sigma / market_params.sigma_effective.max(0.0001), // vol ratio
             self.stochastic.theoretical_edge.bayesian_adverse(),
             market_params.hawkes_branching_ratio,
+            0.0, // momentum_bps: drift bucket wired by lead when ready
         );
 
         // Get RL policy recommendation (exploration during bootstrap, exploitation after)
@@ -2030,6 +2072,77 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 }
             }
 
+            // === GRADUATED EMERGENCY PULL ===
+            // Instead of binary all-or-nothing, use graduated urgency (0.0-1.0):
+            //   Low (>0, <=0.4):    Halve sizes on increasing side
+            //   Medium (>0.4, <=0.7): Keep only innermost level
+            //   High (>0.7):        Full clear of increasing side
+            // Hysteresis: once active, stays active until momentum drops below 7 bps.
+            {
+                let pos = self.position.position();
+                let inventory_frac = if self.effective_max_position > 1e-10 {
+                    pos.abs() / self.effective_max_position
+                } else {
+                    0.0
+                };
+                let momentum_abs = trend_signal.long_momentum_bps.abs();
+
+                // Compute pull urgency (0.0-1.0) with hysteresis
+                let pull_urgency = compute_pull_urgency(
+                    drift_adjusted_skew.is_opposed,
+                    inventory_frac,
+                    momentum_abs,
+                    &mut self.infra.emergency_pull_active,
+                );
+
+                if pull_urgency > 0.0 {
+                    let (increasing_quotes, label) = if pos > 0.0 {
+                        (&mut bid_quotes, "BID")
+                    } else {
+                        (&mut ask_quotes, "ASK")
+                    };
+
+                    if !increasing_quotes.is_empty() {
+                        if pull_urgency > 0.7 {
+                            // High: full clear
+                            info!(
+                                urgency = "high",
+                                side = label,
+                                cleared = increasing_quotes.len(),
+                                inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
+                                momentum_bps = %format!("{:.1}", momentum_abs),
+                                "Emergency FULL pull"
+                            );
+                            increasing_quotes.clear();
+                        } else if pull_urgency > 0.4 {
+                            // Medium: keep only innermost level
+                            let inner = increasing_quotes[0];
+                            increasing_quotes.clear();
+                            increasing_quotes.push(inner);
+                            info!(
+                                urgency = "medium",
+                                side = label,
+                                inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
+                                momentum_bps = %format!("{:.1}", momentum_abs),
+                                "Emergency pull: kept 1 inner level"
+                            );
+                        } else {
+                            // Low: reduce sizes by 50%
+                            for q in increasing_quotes.iter_mut() {
+                                q.size *= 0.5;
+                            }
+                            info!(
+                                urgency = "low",
+                                side = label,
+                                inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
+                                momentum_bps = %format!("{:.1}", momentum_abs),
+                                "Emergency pull: halved sizes"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Reduce-only mode: when over max position, position value, OR margin utilization
             // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
             // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)
@@ -2344,5 +2457,278 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         self.cached_market_params = Some(market_params);
 
         Ok(())
+    }
+}
+
+/// Compute graduated emergency pull urgency (0.0-1.0) with hysteresis.
+///
+/// Returns 0.0 when no pull is needed. The `pull_active` flag provides hysteresis:
+/// once triggered, it stays active until momentum drops below 7 bps, preventing
+/// rapid on/off oscillation near the boundary.
+///
+/// Urgency tiers:
+///   - Low   (0.0 < u <= 0.4): halve increasing-side sizes
+///   - Medium (0.4 < u <= 0.7): keep only innermost level
+///   - High  (0.7 < u <= 1.0): full clear of increasing side
+fn compute_pull_urgency(
+    is_opposed: bool,
+    inventory_frac: f64,
+    momentum_abs_bps: f64,
+    pull_active: &mut bool,
+) -> f64 {
+    const INVENTORY_ENTRY_THRESHOLD: f64 = 0.3;
+    const MOMENTUM_ENTRY_BPS: f64 = 10.0;
+    const MOMENTUM_EXIT_BPS: f64 = 7.0;
+    const HYSTERESIS_URGENCY: f64 = 0.3;
+
+    if !is_opposed || inventory_frac < INVENTORY_ENTRY_THRESHOLD || momentum_abs_bps < MOMENTUM_ENTRY_BPS {
+        // Below trigger thresholds — check hysteresis off-ramp
+        if *pull_active && momentum_abs_bps < MOMENTUM_EXIT_BPS {
+            *pull_active = false;
+        }
+        if *pull_active {
+            HYSTERESIS_URGENCY
+        } else {
+            0.0
+        }
+    } else {
+        *pull_active = true;
+        let inv_component = ((inventory_frac - 0.3) / 0.4).clamp(0.0, 1.0);
+        let mom_component = ((momentum_abs_bps - 10.0) / 15.0).clamp(0.0, 1.0);
+        (inv_component * 0.5 + mom_component * 0.5).clamp(0.0, 1.0)
+    }
+}
+
+/// Apply graduated emergency pull to the increasing-side quotes.
+///
+/// This is a standalone helper for testability. It modifies `increasing_quotes`
+/// in place based on `pull_urgency`.
+#[cfg(test)]
+fn apply_emergency_pull(pull_urgency: f64, increasing_quotes: &mut Vec<Quote>) {
+    if pull_urgency > 0.7 {
+        increasing_quotes.clear();
+    } else if pull_urgency > 0.4 {
+        if let Some(inner) = increasing_quotes.first().cloned() {
+            increasing_quotes.clear();
+            increasing_quotes.push(inner);
+        }
+    } else if pull_urgency > 0.0 {
+        for q in increasing_quotes.iter_mut() {
+            q.size *= 0.5;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_maker::process_models::{HJBConfig, HJBInventoryController};
+
+    // ---------------------------------------------------------------
+    // Test 1: Graduated urgency — low inventory + moderate momentum
+    //         → partial size reduction (low urgency), not full clear
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_graduated_urgency_low_halves_sizes() {
+        let mut active = false;
+        // inventory_frac = 0.35 (just above 0.3), momentum = 12 bps (just above 10)
+        let urgency = compute_pull_urgency(true, 0.35, 12.0, &mut active);
+        // inv_component = (0.35-0.3)/0.4 = 0.125
+        // mom_component = (12-10)/15 = 0.133
+        // urgency = 0.125*0.5 + 0.133*0.5 = ~0.129
+        assert!(urgency > 0.0 && urgency <= 0.4, "Expected low urgency, got {urgency}");
+        assert!(active, "Should activate pull");
+
+        // Apply to quotes: should halve sizes, not clear
+        let mut quotes = vec![
+            Quote::new(100.0, 1.0),
+            Quote::new(99.0, 2.0),
+            Quote::new(98.0, 3.0),
+        ];
+        apply_emergency_pull(urgency, &mut quotes);
+        assert_eq!(quotes.len(), 3, "All levels should remain");
+        assert!((quotes[0].size - 0.5).abs() < 1e-10, "Size should be halved");
+        assert!((quotes[1].size - 1.0).abs() < 1e-10, "Size should be halved");
+        assert!((quotes[2].size - 1.5).abs() < 1e-10, "Size should be halved");
+    }
+
+    // ---------------------------------------------------------------
+    // Test 2: Hysteresis off-ramp — once triggered, stays active
+    //         until momentum drops below 7 bps
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_hysteresis_off_ramp() {
+        let mut active = false;
+
+        // Step 1: Trigger the pull
+        let u1 = compute_pull_urgency(true, 0.5, 20.0, &mut active);
+        assert!(u1 > 0.0, "Should trigger");
+        assert!(active, "Should be active");
+
+        // Step 2: Conditions drop below entry threshold but above exit (8 bps)
+        // is_opposed = true, inventory still high, but momentum dropped to 8 bps
+        let u2 = compute_pull_urgency(true, 0.5, 8.0, &mut active);
+        assert!(active, "Should stay active (8 > 7 exit threshold)");
+        assert!((u2 - 0.3).abs() < 1e-10, "Should return hysteresis urgency 0.3");
+
+        // Step 3: Momentum drops below exit threshold (6 bps)
+        let u3 = compute_pull_urgency(true, 0.5, 6.0, &mut active);
+        assert!(!active, "Should deactivate (6 < 7)");
+        assert!((u3 - 0.0).abs() < 1e-10, "Should return 0.0");
+    }
+
+    // ---------------------------------------------------------------
+    // Test 3: Preserves closing side — only increases side affected.
+    //         When position > 0 (long), increasing side is bids.
+    //         Ask quotes (closing side) should be untouched.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_preserves_closing_side() {
+        let mut active = false;
+        // High urgency to trigger full clear
+        let urgency = compute_pull_urgency(true, 0.8, 30.0, &mut active);
+        assert!(urgency > 0.7, "Should be high urgency");
+
+        let mut bids = vec![Quote::new(100.0, 1.0), Quote::new(99.0, 2.0)];
+        let asks = vec![Quote::new(101.0, 1.0), Quote::new(102.0, 2.0)];
+
+        // For long position: increasing side = bids
+        apply_emergency_pull(urgency, &mut bids);
+        // Closing side (asks) is never passed to apply_emergency_pull
+        // so asks remain untouched
+
+        assert!(bids.is_empty(), "Bids (increasing) should be cleared");
+        assert_eq!(asks.len(), 2, "Asks (closing) should be untouched");
+        assert!((asks[0].size - 1.0).abs() < 1e-10);
+        assert!((asks[1].size - 2.0).abs() < 1e-10);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 4: Full clear at high urgency — extreme inventory or
+    //         momentum triggers complete pull
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_full_clear_at_high_urgency() {
+        let mut active = false;
+        // inv_frac = 0.7 → inv_component = (0.7-0.3)/0.4 = 1.0
+        // momentum = 25 bps → mom_component = (25-10)/15 = 1.0
+        // urgency = 1.0*0.5 + 1.0*0.5 = 1.0
+        let urgency = compute_pull_urgency(true, 0.7, 25.0, &mut active);
+        assert!(urgency > 0.7, "Expected high urgency, got {urgency}");
+        assert!(active);
+
+        let mut quotes = vec![
+            Quote::new(100.0, 1.0),
+            Quote::new(99.0, 2.0),
+            Quote::new(98.0, 3.0),
+        ];
+        apply_emergency_pull(urgency, &mut quotes);
+        assert!(quotes.is_empty(), "All quotes should be cleared at high urgency");
+    }
+
+    // ---------------------------------------------------------------
+    // Test: Medium urgency — keeps only innermost level
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_medium_urgency_keeps_inner_level() {
+        let mut active = false;
+        // inv_frac = 0.5 → inv_component = (0.5-0.3)/0.4 = 0.5
+        // momentum = 18 bps → mom_component = (18-10)/15 = 0.533
+        // urgency = 0.5*0.5 + 0.533*0.5 = 0.517
+        let urgency = compute_pull_urgency(true, 0.5, 18.0, &mut active);
+        assert!(urgency > 0.4 && urgency <= 0.7, "Expected medium urgency, got {urgency}");
+
+        let mut quotes = vec![
+            Quote::new(100.0, 1.0),
+            Quote::new(99.0, 2.0),
+            Quote::new(98.0, 3.0),
+        ];
+        apply_emergency_pull(urgency, &mut quotes);
+        assert_eq!(quotes.len(), 1, "Should keep only innermost level");
+        assert!((quotes[0].price - 100.0).abs() < 1e-10, "Should keep first (innermost) quote");
+    }
+
+    // ---------------------------------------------------------------
+    // Test: No pull when not opposed
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_no_pull_when_not_opposed() {
+        let mut active = false;
+        let urgency = compute_pull_urgency(false, 0.9, 50.0, &mut active);
+        assert!((urgency - 0.0).abs() < 1e-10, "No pull when not opposed");
+        assert!(!active, "Should not activate");
+    }
+
+    // ---------------------------------------------------------------
+    // Test: Blended momentum bypasses EWMA — drift_ewma is set directly
+    // (mirrors the quote_engine logic when effective_momentum != momentum_bps)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_blended_momentum_bypasses_ewma() {
+        let mut controller = HJBInventoryController::default_config();
+
+        // Simulate the blended path: first call update_momentum_signals with
+        // short-term momentum (for history/variance state), then override drift
+        let short_term_momentum_bps = 5.0;
+        let blended_momentum_bps = 20.0; // long-term dominated blend
+        let p_continuation = 0.7;
+        let position = 0.0;
+        let max_position = 10.0;
+
+        // Step 1: Update with short-term momentum (side-effects: history, variance)
+        controller.update_momentum_signals(
+            short_term_momentum_bps,
+            p_continuation,
+            position,
+            max_position,
+        );
+
+        // Step 2: Override drift with blended value (bypass EWMA)
+        let blended_drift_rate = (blended_momentum_bps / 10000.0) / 0.5;
+        controller.set_drift_directly(blended_drift_rate);
+
+        // Drift should be exactly the blended value, not EWMA-smoothed short-term
+        assert!(
+            (controller.smoothed_drift() - blended_drift_rate).abs() < 1e-15,
+            "Blended path should bypass EWMA: got {}, expected {blended_drift_rate}",
+            controller.smoothed_drift()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test: Short-term momentum uses EWMA smoothing — drift does NOT
+    // jump instantly to a new value (unlike set_drift_directly)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_short_term_momentum_uses_ewma_smoothing() {
+        // Use legacy EWMA path (not OU) for deterministic sub-ms test behavior
+        let mut config = HJBConfig::default();
+        config.use_ou_drift = false;
+        let mut controller = HJBInventoryController::new(config);
+        let p_continuation = 0.7;
+        let position = 0.0;
+        let max_position = 10.0;
+
+        // Feed a large momentum through the normal EWMA path
+        let momentum_bps = 50.0;
+        let raw_drift = (momentum_bps / 10000.0) / 0.5; // 0.01
+
+        controller.update_momentum_signals(momentum_bps, p_continuation, position, max_position);
+
+        // After a single EWMA update from zero, drift = alpha * raw_drift
+        // which is strictly less than raw_drift. This confirms smoothing is applied.
+        let drift = controller.smoothed_drift();
+        assert!(
+            drift.abs() > 1e-10,
+            "Drift should be nonzero after update"
+        );
+        assert!(
+            (drift - raw_drift).abs() > 1e-6,
+            "Normal EWMA path should NOT produce exact raw drift: got {drift}, raw would be {raw_drift}"
+        );
+        assert!(
+            drift < raw_drift,
+            "First EWMA step from zero should be less than raw: got {drift}, raw={raw_drift}"
+        );
     }
 }

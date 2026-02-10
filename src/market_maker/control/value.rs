@@ -51,7 +51,7 @@ pub struct BasisConfig {
 impl Default for BasisConfig {
     fn default() -> Self {
         Self {
-            n_basis: 18, // Number of basis functions (15 original + 3 quota)
+            n_basis: 21, // Number of basis functions (15 original + 3 quota + 3 drift)
             gamma: 0.99,
             initial_lr: 0.01,
             lr_decay: 0.9999,
@@ -129,6 +129,13 @@ impl ValueFunction {
             state.rate_limit_headroom.powi(2),
             // 17: Headroom × |position| (quota matters more with inventory)
             state.rate_limit_headroom * state.position.abs(),
+            // === Drift features ===
+            // 18: Drift × position (penalizes positions opposing drift)
+            state.drift_rate * state.position * 100.0,
+            // 19: OU uncertainty (higher = less confident in drift estimate)
+            state.ou_uncertainty.min(1.0),
+            // 20: Drift × time_remaining (drift matters more with time left)
+            state.drift_rate * state.time_remaining() * 100.0,
         ];
 
         features
@@ -216,6 +223,9 @@ impl ValueFunction {
     }
 
     /// Set weights from slice.
+    ///
+    /// Handles checkpoint migration: if the slice is shorter than n_basis,
+    /// remaining weights are left at zero (from initialization).
     pub fn set_weights(&mut self, weights: &[f64]) {
         self.weights
             .iter_mut()
@@ -396,7 +406,7 @@ mod tests {
         let state = ControlState::default();
         let basis = ValueFunction::compute_basis(&state);
 
-        assert_eq!(basis.len(), 18);
+        assert_eq!(basis.len(), 21);
         assert!((basis[0] - 1.0).abs() < 1e-10); // Constant term
     }
 
@@ -436,7 +446,7 @@ mod tests {
 
         // Full headroom (default = 1.0)
         let basis_full = ValueFunction::compute_basis(&state);
-        assert_eq!(basis_full.len(), 18);
+        assert_eq!(basis_full.len(), 21);
         assert!((basis_full[15] - 1.0).abs() < 1e-10); // linear
         assert!((basis_full[16] - 1.0).abs() < 1e-10); // quadratic
 
@@ -479,12 +489,103 @@ mod tests {
     }
 
     #[test]
-    fn test_value_function_18_dimensions() {
+    fn test_value_function_21_dimensions() {
         let config = BasisConfig::default();
-        assert_eq!(config.n_basis, 18);
+        assert_eq!(config.n_basis, 21);
 
         let vf = ValueFunction::new(config);
-        assert_eq!(vf.weights.len(), 18);
-        assert_eq!(vf.n_basis, 18);
+        assert_eq!(vf.weights.len(), 21);
+        assert_eq!(vf.n_basis, 21);
+    }
+
+    #[test]
+    fn test_drift_position_sign() {
+        let mut state = ControlState::default();
+
+        // Long position + positive drift = positive feature (aligned, good)
+        state.position = 2.0;
+        state.drift_rate = 0.001;
+        let basis = ValueFunction::compute_basis(&state);
+        assert!(basis[18] > 0.0, "drift*position should be positive when aligned");
+
+        // Long position + negative drift = negative feature (opposing, bad)
+        state.drift_rate = -0.001;
+        let basis = ValueFunction::compute_basis(&state);
+        assert!(basis[18] < 0.0, "drift*position should be negative when opposing");
+
+        // Short position + negative drift = positive feature (aligned)
+        state.position = -2.0;
+        state.drift_rate = -0.001;
+        let basis = ValueFunction::compute_basis(&state);
+        assert!(basis[18] > 0.0, "drift*position should be positive when short + down");
+    }
+
+    #[test]
+    fn test_drift_features_bounded() {
+        let mut state = ControlState::default();
+
+        // Extreme drift values
+        state.drift_rate = 1.0;
+        state.ou_uncertainty = 100.0;
+        state.position = 10.0;
+        state.time = 0.0;
+
+        let basis = ValueFunction::compute_basis(&state);
+        for (i, &f) in basis.iter().enumerate() {
+            assert!(f.is_finite(), "Feature {} is not finite: {}", i, f);
+        }
+
+        // OU uncertainty is capped at 1.0
+        assert!(
+            (basis[19] - 1.0).abs() < 1e-10,
+            "OU uncertainty should be capped at 1.0"
+        );
+    }
+
+    #[test]
+    fn test_drift_time_remaining_interaction() {
+        let mut state = ControlState::default();
+        state.drift_rate = 0.001;
+
+        // Early in session: time_remaining = 1.0, drift matters most
+        state.time = 0.0;
+        let basis_early = ValueFunction::compute_basis(&state);
+
+        // Late in session: time_remaining = 0.05, drift matters less
+        state.time = 0.95;
+        let basis_late = ValueFunction::compute_basis(&state);
+
+        assert!(
+            basis_early[20].abs() > basis_late[20].abs(),
+            "Drift x time_remaining should decrease near session end"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_migration_18_to_21() {
+        let config = BasisConfig::default();
+        let mut vf = ValueFunction::new(config);
+
+        // Simulate loading old 18-weight checkpoint
+        let old_weights: Vec<f64> = (0..18).map(|i| (i as f64) * 0.1).collect();
+        vf.set_weights(&old_weights);
+
+        // First 18 weights should be set
+        for i in 0..18 {
+            assert!(
+                (vf.weights()[i] - (i as f64) * 0.1).abs() < 1e-10,
+                "Weight {} should be loaded from checkpoint",
+                i
+            );
+        }
+
+        // Last 3 weights should remain at zero (new drift features)
+        for i in 18..21 {
+            assert!(
+                (vf.weights()[i] - 0.0).abs() < 1e-10,
+                "Weight {} should be zero (new drift feature)",
+                i
+            );
+        }
     }
 }

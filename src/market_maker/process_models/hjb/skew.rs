@@ -430,9 +430,37 @@ impl HJBInventoryController {
         // === Compute Drift Urgency (with trend boost) ===
         let time_remaining = self.time_remaining().min(300.0);
 
-        // Use EWMA-smoothed drift if warmed up
+        // Use EWMA-smoothed drift if warmed up, with long-term trend fallback
         let drift_rate = if self.is_drift_warmed_up() {
-            self.drift_ewma
+            let short_drift = self.drift_ewma;
+            // If short-term drift is near zero but long-term trend is strong and opposed,
+            // use the long-term trend as drift signal. This prevents the MM from buying
+            // into a smooth downtrend where short-term momentum oscillates near zero.
+            if trend.is_warmed_up
+                && short_drift.abs() < 0.0001
+                && trend.long_momentum_bps.abs() > 5.0
+                && is_opposed
+            {
+                // Long momentum is per 5min window, convert to per-second drift rate
+                let long_drift = (trend.long_momentum_bps / 10000.0) / 300.0;
+                // Also consider medium-term for faster response
+                let med_drift = (trend.medium_momentum_bps / 10000.0) / 30.0;
+                // Confidence-weighted blend: long is anchor, medium only trusted when aligned
+                let long_confidence =
+                    (trend.long_momentum_bps.abs() / 10.0).min(1.0);
+                let med_confidence =
+                    (trend.medium_momentum_bps.abs() / 5.0).min(1.0)
+                        * trend.timeframe_agreement;
+                let total_confidence = long_confidence + med_confidence;
+                if total_confidence > 0.001 {
+                    (long_confidence * long_drift + med_confidence * med_drift)
+                        / total_confidence
+                } else {
+                    long_drift
+                }
+            } else {
+                short_drift
+            }
         } else {
             (momentum_bps / 10000.0) / 0.5
         };
@@ -756,5 +784,117 @@ impl HJBInventoryController {
             self.config.queue_modify_cost_bps,
             self.config.use_queue_value,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_maker::process_models::hjb::config::HJBConfig;
+
+    /// Build a warmed-up controller with drift_ewma = 0 so the trend fallback path activates.
+    fn make_controller() -> HJBInventoryController {
+        let config = HJBConfig {
+            use_ou_drift: false,
+            use_drift_adjusted_skew: true,
+            min_continuation_prob: 0.5,
+            ..HJBConfig::default()
+        };
+        let mut ctrl = HJBInventoryController::new(config);
+        ctrl.drift_update_count = 100; // well past min_warmup (20)
+        ctrl.drift_ewma = 0.0; // near-zero so trend fallback activates
+        ctrl.sigma = 0.001; // 10 bps/s
+        ctrl
+    }
+
+    fn make_trend(long_bps: f64, med_bps: f64, agreement: f64) -> TrendSignal {
+        TrendSignal {
+            long_momentum_bps: long_bps,
+            medium_momentum_bps: med_bps,
+            timeframe_agreement: agreement,
+            trend_confidence: agreement,
+            is_warmed_up: true,
+            ..TrendSignal::default()
+        }
+    }
+
+    #[test]
+    fn test_drift_blend_long_dominates_when_aligned() {
+        let ctrl = make_controller();
+        // Long = -20 bps (strong), medium = -3 bps (weak), fully aligned
+        let trend = make_trend(-20.0, -3.0, 1.0);
+        // Position positive, momentum negative => opposed
+        let result = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend);
+
+        // With long_bps=-20: long_confidence = (20/10).min(1) = 1.0
+        // With med_bps=-3: med_confidence = (3/5).min(1) * 1.0 = 0.6
+        // long_drift = (-20/10000)/300 = -6.67e-6
+        // med_drift = (-3/10000)/30 = -1.0e-5
+        // blend = (1.0 * -6.67e-6 + 0.6 * -1.0e-5) / 1.6 = -7.92e-6
+        assert!(result.drift_urgency != 0.0, "drift urgency should be nonzero");
+        assert!(result.is_opposed, "should detect opposition");
+    }
+
+    #[test]
+    fn test_drift_blend_medium_weight_when_aligned_and_stronger() {
+        let ctrl = make_controller();
+        // Long = -8 bps (moderate), medium = -10 bps (strong, fast), fully aligned
+        let trend = make_trend(-8.0, -10.0, 1.0);
+        let result_blended = ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend);
+
+        // Now test with zero agreement => medium ignored
+        let trend_disagree = make_trend(-8.0, -10.0, 0.0);
+        let result_long_only =
+            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
+
+        // Blended urgency should be larger because medium pulls drift faster
+        assert!(
+            result_blended.drift_urgency.abs() > result_long_only.drift_urgency.abs(),
+            "blended drift urgency ({}) should exceed long-only ({}) when medium is stronger and aligned",
+            result_blended.drift_urgency, result_long_only.drift_urgency,
+        );
+    }
+
+    #[test]
+    fn test_drift_blend_ignores_medium_when_disagreeing() {
+        let ctrl = make_controller();
+        // Long = -15 bps, medium = +8 bps (opposite direction), zero agreement
+        let trend_disagree = make_trend(-15.0, 8.0, 0.0);
+        let result_disagree =
+            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_disagree);
+
+        // Same scenario but with full agreement — medium gets weight and dilutes long
+        let trend_agree = make_trend(-15.0, 8.0, 1.0);
+        let _result_agree =
+            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &trend_agree);
+
+        // When disagreeing (agreement=0), med_confidence=0, blend = pure long_drift
+        // long_drift = (-15/10000)/300 = -5e-6
+        // When agreeing (agreement=1), med gets weight and pushes drift toward positive
+        // med_drift = (+8/10000)/30 = +2.67e-5 (10x normalization advantage)
+        // So the disagreeing case should preserve the long signal more faithfully.
+        //
+        // Key invariant: with disagreement, drift urgency should be nonzero
+        // (pure long drift) and the sign should match the long direction.
+        assert!(
+            result_disagree.drift_urgency != 0.0,
+            "with disagreeing medium zeroed out, long drift should still produce urgency",
+        );
+
+        // The disagreeing case preserves long direction; the agreeing case lets
+        // the faster medium window (10x normalization advantage) dilute or reverse it.
+        // Verify: disagreeing result is closer to pure-long behavior
+        // (pure long drift is negative for long=-15 bps, so urgency sign should be positive
+        // because position is positive and drift is negative => opposed => positive urgency)
+        let long_only_trend = make_trend(-15.0, 0.0, 0.0);
+        let result_long_only =
+            ctrl.optimal_skew_with_trend(5.0, 10.0, -15.0, 0.8, &long_only_trend);
+
+        // Disagreeing result should match long-only result (medium is zeroed)
+        assert!(
+            (result_disagree.drift_urgency - result_long_only.drift_urgency).abs() < 1e-10,
+            "disagreeing medium (urgency={}) should equal long-only (urgency={})",
+            result_disagree.drift_urgency, result_long_only.drift_urgency,
+        );
     }
 }

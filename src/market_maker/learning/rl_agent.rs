@@ -229,6 +229,51 @@ pub enum ExcitationBucket {
     High,
 }
 
+/// Discretized drift/momentum bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DriftBucket {
+    /// Bearish drift (momentum < -5 bps)
+    Bearish,
+    /// Neutral drift (-5 to +5 bps)
+    Neutral,
+    /// Bullish drift (momentum > +5 bps)
+    Bullish,
+}
+
+impl DriftBucket {
+    /// Convert continuous momentum (in bps) to a drift bucket.
+    pub fn from_momentum_bps(momentum_bps: f64) -> Self {
+        if momentum_bps < -5.0 {
+            Self::Bearish
+        } else if momentum_bps > 5.0 {
+            Self::Bullish
+        } else {
+            Self::Neutral
+        }
+    }
+
+    /// Get bucket index (0-2).
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Bearish => 0,
+            Self::Neutral => 1,
+            Self::Bullish => 2,
+        }
+    }
+
+    /// Number of buckets.
+    pub const COUNT: usize = 3;
+
+    /// Reconstruct from bucket index (0-2).
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Bearish,
+            2 => Self::Bullish,
+            _ => Self::Neutral,
+        }
+    }
+}
+
 impl ExcitationBucket {
     /// Convert branching ratio to bucket.
     pub fn from_branching_ratio(ratio: f64) -> Self {
@@ -275,10 +320,15 @@ pub struct MDPState {
     pub adverse: AdverseBucket,
     /// Hawkes excitation bucket
     pub excitation: ExcitationBucket,
+    /// Drift/momentum bucket
+    pub drift: DriftBucket,
 }
 
 impl MDPState {
     /// Create from continuous state values.
+    ///
+    /// `momentum_bps` is used for drift bucketing when `use_drift_bucket` is enabled.
+    /// Pass 0.0 when drift bucketing is disabled.
     pub fn from_continuous(
         position: f64,
         max_position: f64,
@@ -286,6 +336,7 @@ impl MDPState {
         vol_ratio: f64,
         adverse_posterior: f64,
         hawkes_branching: f64,
+        momentum_bps: f64,
     ) -> Self {
         Self {
             inventory: InventoryBucket::from_position(position, max_position),
@@ -293,17 +344,19 @@ impl MDPState {
             volatility: VolatilityBucket::from_vol_ratio(vol_ratio),
             adverse: AdverseBucket::from_posterior_mean(adverse_posterior),
             excitation: ExcitationBucket::from_branching_ratio(hawkes_branching),
+            drift: DriftBucket::from_momentum_bps(momentum_bps),
         }
     }
 
     /// Convert to flat state index for Q-table lookup.
-    /// Total states = 5 * 5 * 3 * 3 * 3 = 675
+    /// Total states = 5 * 5 * 3 * 3 * 3 * 3 = 2025
     pub fn to_index(&self) -> usize {
         let mut idx = self.inventory.index();
         idx = idx * ImbalanceBucket::COUNT + self.imbalance.index();
         idx = idx * VolatilityBucket::COUNT + self.volatility.index();
         idx = idx * AdverseBucket::COUNT + self.adverse.index();
         idx = idx * ExcitationBucket::COUNT + self.excitation.index();
+        idx = idx * DriftBucket::COUNT + self.drift.index();
         idx
     }
 
@@ -312,7 +365,8 @@ impl MDPState {
         * ImbalanceBucket::COUNT
         * VolatilityBucket::COUNT
         * AdverseBucket::COUNT
-        * ExcitationBucket::COUNT;
+        * ExcitationBucket::COUNT
+        * DriftBucket::COUNT;
 
     /// Reconstruct an MDPState from a flat index (inverse of `to_index()`).
     ///
@@ -320,6 +374,8 @@ impl MDPState {
     /// of how `to_index()` encodes them.
     pub fn from_index(idx: usize) -> Self {
         let mut remaining = idx;
+        let drift_idx = remaining % DriftBucket::COUNT;
+        remaining /= DriftBucket::COUNT;
         let excitation_idx = remaining % ExcitationBucket::COUNT;
         remaining /= ExcitationBucket::COUNT;
         let adverse_idx = remaining % AdverseBucket::COUNT;
@@ -336,6 +392,7 @@ impl MDPState {
             volatility: VolatilityBucket::from_index(volatility_idx),
             adverse: AdverseBucket::from_index(adverse_idx),
             excitation: ExcitationBucket::from_index(excitation_idx),
+            drift: DriftBucket::from_index(drift_idx),
         }
     }
 }
@@ -348,6 +405,7 @@ impl Default for MDPState {
             volatility: VolatilityBucket::Normal,
             adverse: AdverseBucket::Moderate,
             excitation: ExcitationBucket::Normal,
+            drift: DriftBucket::Neutral,
         }
     }
 }
@@ -953,6 +1011,8 @@ pub struct Reward {
     pub volatility_penalty: f64,
     /// Inventory change penalty (penalizes accumulation, always non-positive)
     pub inventory_change_penalty: f64,
+    /// Drift opposition penalty (penalizes holding against momentum, always non-positive)
+    pub drift_penalty: f64,
 }
 
 impl Reward {
@@ -961,12 +1021,33 @@ impl Reward {
     /// `realized_edge_bps` should be `spread_capture - AS_cost - fees` (P0-2).
     /// `prev_inventory_risk` is `|prev_position| / max_position` from the state
     /// at the time the action was chosen (available from pending state-action queue).
+    /// `momentum_bps` and `drift_penalty_weight` control the drift opposition penalty.
+    /// `position` is the signed inventory (needed for drift alignment check).
     pub fn compute(
         config: &RewardConfig,
         realized_edge_bps: f64,
         inventory_risk: f64,  // |position| / max_position (current)
         vol_ratio: f64,
         prev_inventory_risk: f64,  // |prev_position| / max_position
+    ) -> Self {
+        Self::compute_with_drift(config, realized_edge_bps, inventory_risk, vol_ratio, prev_inventory_risk, 0.0, 0.0, 0.0)
+    }
+
+    /// Compute reward with drift opposition penalty.
+    ///
+    /// `position` is the signed inventory (for drift alignment check).
+    /// `momentum_bps` is the current price drift in bps.
+    /// `drift_penalty_weight` controls the magnitude of the penalty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_with_drift(
+        config: &RewardConfig,
+        realized_edge_bps: f64,
+        inventory_risk: f64,  // |position| / max_position (current)
+        vol_ratio: f64,
+        prev_inventory_risk: f64,  // |prev_position| / max_position
+        position: f64,  // signed inventory
+        momentum_bps: f64,
+        drift_penalty_weight: f64,
     ) -> Self {
         let edge_component = config.edge_weight * realized_edge_bps;
 
@@ -985,7 +1066,17 @@ impl Reward {
         let inventory_change_penalty =
             -config.inventory_change_weight * (inventory_risk - prev_inventory_risk).abs() * 10.0;
 
-        let total = edge_component + inventory_penalty + volatility_penalty + inventory_change_penalty;
+        // Drift opposition penalty: penalize holding inventory against price drift
+        let drift_penalty = if drift_penalty_weight > 0.0 && position * momentum_bps < 0.0 {
+            // Position opposes drift direction
+            let alignment = (position * momentum_bps).abs().min(1.0);
+            -drift_penalty_weight * alignment * inventory_risk * 5.0
+        } else {
+            0.0
+        };
+
+        let total = edge_component + inventory_penalty + volatility_penalty
+            + inventory_change_penalty + drift_penalty;
 
         Self {
             total,
@@ -993,6 +1084,7 @@ impl Reward {
             inventory_penalty,
             volatility_penalty,
             inventory_change_penalty,
+            drift_penalty,
         }
     }
 }
@@ -1194,6 +1286,14 @@ pub struct QLearningConfig {
     /// BPS delta actions (SpreadAction x SkewAction = 25).
     /// Falces Marin (2022): "RL controls gamma and skew, NOT raw bid/ask prices."
     pub use_parameter_actions: bool,
+    /// Enable drift/momentum dimension in MDP state space.
+    /// When false, drift is always DriftBucket::Neutral (no state expansion).
+    /// Default false for safe rollout.
+    pub use_drift_bucket: bool,
+    /// Weight for drift opposition penalty in reward computation.
+    /// Penalizes holding inventory against price drift direction.
+    /// Only active when > 0.0. Default 0.3.
+    pub drift_penalty_weight: f64,
 }
 
 impl Default for QLearningConfig {
@@ -1208,6 +1308,8 @@ impl Default for QLearningConfig {
             min_exploration_rate: 0.05,
             use_compact_state: true,
             use_parameter_actions: true,
+            use_drift_bucket: false,
+            drift_penalty_weight: 0.3,
         }
     }
 }
@@ -1745,6 +1847,7 @@ impl QLearningAgent {
             action_space_version: if self.config.use_parameter_actions { 2 } else { 1 },
             use_compact_state: self.config.use_compact_state,
             reward_config_hash: self.config.reward_config.config_hash(),
+            use_drift_bucket: self.config.use_drift_bucket,
         }
     }
 
@@ -1770,6 +1873,18 @@ impl QLearningAgent {
                 checkpoint_compact = ckpt.use_compact_state,
                 config_compact = self.config.use_compact_state,
                 "State space mismatch — starting fresh Q-table"
+            );
+            self.episodes = ckpt.episodes;
+            self.total_reward = ckpt.total_reward;
+            return;
+        }
+
+        // Check drift bucket compatibility (675-state vs 2025-state)
+        if ckpt.use_drift_bucket != self.config.use_drift_bucket {
+            debug!(
+                checkpoint_drift = ckpt.use_drift_bucket,
+                config_drift = self.config.use_drift_bucket,
+                "Drift bucket mismatch — starting fresh Q-table"
             );
             self.episodes = ckpt.episodes;
             self.total_reward = ckpt.total_reward;
@@ -2075,6 +2190,7 @@ mod tests {
             volatility: VolatilityBucket::High,
             adverse: AdverseBucket::High,
             excitation: ExcitationBucket::High,
+            drift: DriftBucket::Bullish,
         };
 
         let idx1 = state1.to_index();
@@ -2082,7 +2198,7 @@ mod tests {
 
         assert!(idx1 < MDPState::STATE_COUNT);
         assert!(idx2 < MDPState::STATE_COUNT);
-        assert_eq!(MDPState::STATE_COUNT, 675);
+        assert_eq!(MDPState::STATE_COUNT, 2025);
         assert_ne!(idx1, idx2);
     }
 
@@ -2116,6 +2232,7 @@ mod tests {
             volatility: VolatilityBucket::High,
             adverse: AdverseBucket::High,
             excitation: ExcitationBucket::High,
+            drift: DriftBucket::Bullish,
         };
         let max_idx = max_state.to_index();
         assert_eq!(MDPState::from_index(max_idx), max_state);
@@ -2128,6 +2245,7 @@ mod tests {
             volatility: VolatilityBucket::Low,
             adverse: AdverseBucket::Low,
             excitation: ExcitationBucket::Normal,
+            drift: DriftBucket::Bearish,
         };
         assert_eq!(MDPState::from_index(0), min_state);
     }
@@ -2283,6 +2401,7 @@ mod tests {
             inventory_penalty: 0.0,
             volatility_penalty: 0.0,
             inventory_change_penalty: 0.0,
+            drift_penalty: 0.0,
         };
         let next_state = MDPState::default();
 
@@ -2469,6 +2588,7 @@ mod tests {
             inventory_penalty: 0.0,
             volatility_penalty: 0.0,
             inventory_change_penalty: 0.0,
+            drift_penalty: 0.0,
         };
         agent.update_idx(state_idx, 3, reward, 1, false);
         let live_mean_before = agent.get_q_values_by_idx(state_idx)[3].mean();
@@ -2507,6 +2627,7 @@ mod tests {
                 inventory_penalty: 0.0,
                 volatility_penalty: 0.0,
                 inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
             };
             agent.update_idx(state_idx, 0, reward, 3, false);
         }
@@ -2541,6 +2662,7 @@ mod tests {
             inventory_penalty: 0.0,
             volatility_penalty: 0.0,
             inventory_change_penalty: 0.0,
+            drift_penalty: 0.0,
         };
         agent.update_idx(state_idx, 2, reward, 1, false);
         let warm_count = agent.get_q_values_by_idx(state_idx)[2].count();
@@ -2633,6 +2755,7 @@ mod tests {
                 inventory_penalty: 0.0,
                 volatility_penalty: 0.0,
                 inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
             };
             agent.update_idx(state_idx, extreme_action_idx, reward, state_idx, false);
         }
@@ -2680,6 +2803,7 @@ mod tests {
                 inventory_penalty: 0.0,
                 volatility_penalty: 0.0,
                 inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
             };
             agent.update_idx(state_idx, i % UNIFIED_ACTION_COUNT, reward, state_idx, false);
         }
@@ -2719,6 +2843,7 @@ mod tests {
                 inventory_penalty: 0.0,
                 volatility_penalty: 0.0,
                 inventory_change_penalty: 0.0,
+                drift_penalty: 0.0,
             };
             agent.update_idx(state_idx, 0, reward, state_idx, false);
         }
@@ -2733,5 +2858,126 @@ mod tests {
         // The agent should be able to pick action 0 (not forced to neutral=12)
         assert_ne!(action, neutral_action, "Agent should NOT be forced to neutral after sufficient positive fills");
         assert_eq!(action, 0, "Agent should exploit best action after sufficient fills");
+    }
+
+    // ==========================================================================
+    // DriftBucket tests
+    // ==========================================================================
+
+    #[test]
+    fn test_drift_bucket_classification() {
+        // Bearish: momentum < -5 bps
+        assert_eq!(DriftBucket::from_momentum_bps(-10.0), DriftBucket::Bearish);
+        assert_eq!(DriftBucket::from_momentum_bps(-5.1), DriftBucket::Bearish);
+        // Neutral: -5 to +5 bps
+        assert_eq!(DriftBucket::from_momentum_bps(-5.0), DriftBucket::Neutral);
+        assert_eq!(DriftBucket::from_momentum_bps(0.0), DriftBucket::Neutral);
+        assert_eq!(DriftBucket::from_momentum_bps(5.0), DriftBucket::Neutral);
+        // Bullish: momentum > +5 bps
+        assert_eq!(DriftBucket::from_momentum_bps(5.1), DriftBucket::Bullish);
+        assert_eq!(DriftBucket::from_momentum_bps(20.0), DriftBucket::Bullish);
+        // Round-trip index
+        for i in 0..DriftBucket::COUNT {
+            assert_eq!(DriftBucket::from_index(i).index(), i);
+        }
+    }
+
+    #[test]
+    fn test_drift_state_count_2025() {
+        // 5 inventory * 5 imbalance * 3 volatility * 3 adverse * 3 excitation * 3 drift = 2025
+        assert_eq!(MDPState::STATE_COUNT, 2025);
+        assert_eq!(
+            InventoryBucket::COUNT
+                * ImbalanceBucket::COUNT
+                * VolatilityBucket::COUNT
+                * AdverseBucket::COUNT
+                * ExcitationBucket::COUNT
+                * DriftBucket::COUNT,
+            2025,
+        );
+    }
+
+    #[test]
+    fn test_drift_state_unique_indices() {
+        // Verify no collisions: states differing only in drift produce different indices
+        let base = MDPState {
+            inventory: InventoryBucket::Neutral,
+            imbalance: ImbalanceBucket::Neutral,
+            volatility: VolatilityBucket::Normal,
+            adverse: AdverseBucket::Moderate,
+            excitation: ExcitationBucket::Normal,
+            drift: DriftBucket::Bearish,
+        };
+        let neutral = MDPState { drift: DriftBucket::Neutral, ..base };
+        let bullish = MDPState { drift: DriftBucket::Bullish, ..base };
+
+        let idx_bear = base.to_index();
+        let idx_neut = neutral.to_index();
+        let idx_bull = bullish.to_index();
+
+        assert_ne!(idx_bear, idx_neut);
+        assert_ne!(idx_bear, idx_bull);
+        assert_ne!(idx_neut, idx_bull);
+        // All within range
+        assert!(idx_bear < MDPState::STATE_COUNT);
+        assert!(idx_neut < MDPState::STATE_COUNT);
+        assert!(idx_bull < MDPState::STATE_COUNT);
+        // Round-trip
+        assert_eq!(MDPState::from_index(idx_bear), base);
+        assert_eq!(MDPState::from_index(idx_neut), neutral);
+        assert_eq!(MDPState::from_index(idx_bull), bullish);
+    }
+
+    #[test]
+    fn test_drift_penalty_applied_when_opposing() {
+        let config = RewardConfig::default();
+        // Position is long (+5), drift is bearish (-10 bps): opposing
+        let reward = Reward::compute_with_drift(
+            &config,
+            2.0,   // realized_edge_bps
+            0.5,   // inventory_risk
+            1.0,   // vol_ratio
+            0.5,   // prev_inventory_risk
+            5.0,   // position (long)
+            -10.0, // momentum_bps (bearish)
+            0.3,   // drift_penalty_weight
+        );
+        assert!(reward.drift_penalty < 0.0, "Drift penalty should be negative when position opposes drift");
+        // Also verify total includes the penalty
+        let reward_no_drift = Reward::compute_with_drift(
+            &config, 2.0, 0.5, 1.0, 0.5, 5.0, -10.0, 0.0,
+        );
+        assert!(reward.total < reward_no_drift.total,
+            "Total reward with drift penalty ({:.4}) should be less than without ({:.4})",
+            reward.total, reward_no_drift.total);
+    }
+
+    #[test]
+    fn test_drift_no_penalty_when_aligned() {
+        let config = RewardConfig::default();
+        // Position is long (+5), drift is bullish (+10 bps): aligned
+        let reward = Reward::compute_with_drift(
+            &config,
+            2.0,  // realized_edge_bps
+            0.5,  // inventory_risk
+            1.0,  // vol_ratio
+            0.5,  // prev_inventory_risk
+            5.0,  // position (long)
+            10.0, // momentum_bps (bullish)
+            0.3,  // drift_penalty_weight
+        );
+        assert_eq!(reward.drift_penalty, 0.0, "No drift penalty when position aligned with drift");
+
+        // Also test: zero momentum means no penalty
+        let reward_zero = Reward::compute_with_drift(
+            &config, 2.0, 0.5, 1.0, 0.5, 5.0, 0.0, 0.3,
+        );
+        assert_eq!(reward_zero.drift_penalty, 0.0, "No drift penalty when momentum is zero");
+
+        // Also test: zero position means no penalty (position * momentum_bps = 0)
+        let reward_flat = Reward::compute_with_drift(
+            &config, 2.0, 0.0, 1.0, 0.0, 0.0, -10.0, 0.3,
+        );
+        assert_eq!(reward_flat.drift_penalty, 0.0, "No drift penalty when flat position");
     }
 }

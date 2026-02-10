@@ -43,7 +43,10 @@
       "Bash(curl:*)",
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "mcp__serena__initial_instructions",
+      "Bash(echo:*)",
+      "Bash(rustfmt --check:*)"
     ]
   }
 }

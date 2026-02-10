@@ -709,6 +709,8 @@ impl ParameterAggregator {
             learned_alpha_touch: sources.learned_params.map_or(0.25, |l| l.alpha_touch),
             learned_spread_floor_bps: sources.learned_params.map_or(5.0, |l| l.spread_floor_bps),
             learned_params_calibrated: sources.learned_params.is_some_and(|l| l.calibrated),
+            // Drift rate defaults to 0.0 (no drift); set by HJB controller
+            drift_rate_per_sec: 0.0,
         }
     }
 }

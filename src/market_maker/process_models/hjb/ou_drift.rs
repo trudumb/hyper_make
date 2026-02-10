@@ -343,6 +343,30 @@ impl OUDriftEstimator {
             reconcile_k: self.config.reconcile_k,
         }
     }
+
+    /// Adapt OU parameters to current market regime.
+    ///
+    /// Different regimes call for different mean-reversion speeds and noise filters:
+    /// - Normal: balanced defaults (theta=0.5, reconcile_k=2.0)
+    /// - Trending: trust trends longer with slower reversion (theta=0.2, reconcile_k=1.5)
+    /// - Cascade: fast mean reversion, high noise filter (theta=1.0, reconcile_k=3.0)
+    pub fn adapt_to_regime(&mut self, regime: &str) {
+        match regime {
+            "trending" => {
+                self.config.theta = 0.2;      // Trust trends longer (slower reversion)
+                self.config.reconcile_k = 1.5; // Lower filter threshold (more responsive)
+            }
+            "cascade" => {
+                self.config.theta = 1.0;      // Fast mean reversion (don't chase)
+                self.config.reconcile_k = 3.0; // High noise filter (only big innovations)
+            }
+            _ => {
+                // "normal" or any unrecognized regime -> safe defaults
+                self.config.theta = 0.5;
+                self.config.reconcile_k = 2.0;
+            }
+        }
+    }
 }
 
 /// Summary of OU drift estimator state for diagnostics.
@@ -425,5 +449,65 @@ mod tests {
 
         // Large innovation should exceed threshold
         assert!(estimator.threshold_exceeded(0.1, 0.1));
+    }
+
+    #[test]
+    fn test_regime_defaults_match_normal() {
+        let mut estimator = OUDriftEstimator::default_config();
+        let default_theta = estimator.config.theta;
+        let default_k = estimator.config.reconcile_k;
+
+        // Adapt to "normal" regime
+        estimator.adapt_to_regime("normal");
+        assert!(
+            (estimator.config.theta - 0.5).abs() < 1e-12,
+            "normal theta should be 0.5, got {}",
+            estimator.config.theta
+        );
+        assert!(
+            (estimator.config.reconcile_k - 2.0).abs() < 1e-12,
+            "normal reconcile_k should be 2.0, got {}",
+            estimator.config.reconcile_k
+        );
+
+        // Default config should also match normal regime values
+        assert!(
+            (default_theta - 0.5).abs() < 1e-12,
+            "default theta should be 0.5, got {default_theta}"
+        );
+        assert!(
+            (default_k - 2.0).abs() < 1e-12,
+            "default reconcile_k should be 2.0, got {default_k}"
+        );
+    }
+
+    #[test]
+    fn test_regime_cascade_params() {
+        let mut estimator = OUDriftEstimator::default_config();
+
+        estimator.adapt_to_regime("cascade");
+        assert!(
+            (estimator.config.theta - 1.0).abs() < 1e-12,
+            "cascade theta should be 1.0, got {}",
+            estimator.config.theta
+        );
+        assert!(
+            (estimator.config.reconcile_k - 3.0).abs() < 1e-12,
+            "cascade reconcile_k should be 3.0, got {}",
+            estimator.config.reconcile_k
+        );
+
+        // Verify trending works too
+        estimator.adapt_to_regime("trending");
+        assert!(
+            (estimator.config.theta - 0.2).abs() < 1e-12,
+            "trending theta should be 0.2, got {}",
+            estimator.config.theta
+        );
+        assert!(
+            (estimator.config.reconcile_k - 1.5).abs() < 1e-12,
+            "trending reconcile_k should be 1.5, got {}",
+            estimator.config.reconcile_k
+        );
     }
 }

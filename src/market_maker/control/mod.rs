@@ -229,6 +229,8 @@ impl StochasticController {
             rate_limit_headroom: trading_state.rate_limit_headroom,
             last_realized_edge_bps: trading_state.last_realized_edge_bps,
             market_spread_bps: trading_state.market_spread_bps,
+            drift_rate: 0.0,
+            ou_uncertainty: 0.0,
         };
 
         // 4. Compute optimal action
@@ -361,6 +363,8 @@ impl StochasticController {
                 rate_limit_headroom: prev_state.rate_limit_headroom,
                 last_realized_edge_bps: realized_edge, // Fresh from this fill
                 market_spread_bps: prev_state.market_spread_bps, // Carry forward
+                drift_rate: prev_state.drift_rate,               // Carry forward
+                ou_uncertainty: prev_state.ou_uncertainty,       // Carry forward
             };
 
             // Create state transition for TD learning

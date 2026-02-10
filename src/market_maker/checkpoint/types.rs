@@ -464,6 +464,10 @@ pub struct RLCheckpoint {
     /// 0 = legacy checkpoint (pre-hash), skip validation.
     #[serde(default)]
     pub reward_config_hash: u64,
+    /// Whether this checkpoint used the drift bucket dimension in state space.
+    /// When false, state indices are from the 675-state space; when true, 2025-state.
+    #[serde(default)]
+    pub use_drift_bucket: bool,
 }
 
 /// Kill switch state for checkpoint persistence.
@@ -578,6 +582,7 @@ mod tests {
                 action_space_version: 1,
                 use_compact_state: false,
                 reward_config_hash: 0,
+                use_drift_bucket: false,
             },
             kill_switch: KillSwitchCheckpoint {
                 triggered: true,

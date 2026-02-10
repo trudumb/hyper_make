@@ -31,6 +31,22 @@ pub struct TrendConfig {
 
     /// Number of consecutive underwater ticks before considering it significant.
     pub underwater_min_ticks: u32,
+
+    /// EWMA alpha for drift velocity smoothing (0.0 = slow, 1.0 = raw).
+    #[serde(default = "default_drift_velocity_alpha")]
+    pub drift_velocity_alpha: f64,
+
+    /// Capacity of the recent returns ring buffer for autocorrelation.
+    #[serde(default = "default_autocorrelation_window")]
+    pub autocorrelation_window: usize,
+}
+
+fn default_drift_velocity_alpha() -> f64 {
+    0.1
+}
+
+fn default_autocorrelation_window() -> usize {
+    50
 }
 
 impl Default for TrendConfig {
@@ -42,12 +58,14 @@ impl Default for TrendConfig {
             underwater_threshold_bps: 20.0, // 20 bps loss = underwater
             agreement_boost: 2.0,           // 2x urgency when timeframes agree
             underwater_min_ticks: 5,        // 5 ticks = ~500ms sustained
+            drift_velocity_alpha: 0.1,      // EWMA smoothing for drift velocity
+            autocorrelation_window: 50,     // ring buffer capacity for autocorrelation
         }
     }
 }
 
 /// Output signal from trend persistence analysis.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrendSignal {
     /// Short-term momentum in basis points (500ms window).
     pub short_momentum_bps: f64,
@@ -69,6 +87,22 @@ pub struct TrendSignal {
 
     /// Whether the trend tracker is warmed up (enough data in all windows).
     pub is_warmed_up: bool,
+
+    /// EWMA-smoothed rate of change of long momentum (bps per second).
+    #[serde(default)]
+    pub drift_velocity_bps_per_s: f64,
+
+    /// True when drift velocity has the same sign as long momentum AND |velocity| > 1.0 bps/s.
+    #[serde(default)]
+    pub drift_accelerating: bool,
+
+    /// EWMA-smoothed lag-1 return autocorrelation.
+    #[serde(default)]
+    pub return_autocorrelation: f64,
+
+    /// True when autocorrelation > 0.1 (genuine trending behavior).
+    #[serde(default)]
+    pub is_trending: bool,
 }
 
 /// Multi-timeframe trend persistence tracker.
@@ -94,11 +128,29 @@ pub struct TrendPersistenceTracker {
 
     /// Configuration.
     config: TrendConfig,
+
+    // --- Drift velocity state ---
+    /// Previous long-term momentum value (bps) for velocity computation.
+    prev_long_momentum_bps: f64,
+
+    /// Timestamp (ms) of the previous update (for dt computation).
+    prev_update_ms: u64,
+
+    /// EWMA-smoothed drift velocity (bps/s).
+    drift_velocity_bps_per_s: f64,
+
+    // --- Autocorrelation state ---
+    /// Ring buffer of recent log returns for lag-1 autocorrelation.
+    recent_returns: VecDeque<f64>,
+
+    /// EWMA-smoothed lag-1 autocorrelation.
+    autocorrelation_ewma: f64,
 }
 
 impl TrendPersistenceTracker {
     /// Create a new trend persistence tracker.
     pub fn new(config: TrendConfig) -> Self {
+        let autocorrelation_cap = config.autocorrelation_window;
         Self {
             medium_returns: VecDeque::with_capacity(1000),
             long_returns: VecDeque::with_capacity(5000),
@@ -106,6 +158,11 @@ impl TrendPersistenceTracker {
             current_unrealized_pnl: 0.0,
             underwater_ticks: 0,
             observation_count: 0,
+            prev_long_momentum_bps: 0.0,
+            prev_update_ms: 0,
+            drift_velocity_bps_per_s: 0.0,
+            recent_returns: VecDeque::with_capacity(autocorrelation_cap),
+            autocorrelation_ewma: 0.0,
             config,
         }
     }
@@ -122,8 +179,73 @@ impl TrendPersistenceTracker {
         self.medium_returns.push_back((timestamp_ms, log_return));
         self.long_returns.push_back((timestamp_ms, log_return));
 
+        // --- Drift velocity update ---
+        let current_long_bps =
+            self.momentum_bps(&self.long_returns, timestamp_ms, self.config.long_window_ms);
+        if self.prev_update_ms > 0 {
+            let dt_ms = timestamp_ms.saturating_sub(self.prev_update_ms);
+            if dt_ms > 0 {
+                let dt_s = dt_ms as f64 / 1000.0;
+                let raw_velocity = (current_long_bps - self.prev_long_momentum_bps) / dt_s;
+                let alpha = self.config.drift_velocity_alpha;
+                self.drift_velocity_bps_per_s =
+                    alpha * raw_velocity + (1.0 - alpha) * self.drift_velocity_bps_per_s;
+            }
+        }
+        self.prev_long_momentum_bps = current_long_bps;
+        self.prev_update_ms = timestamp_ms;
+
+        // --- Autocorrelation update ---
+        // Push return into ring buffer, cap at configured window
+        if self.recent_returns.len() >= self.config.autocorrelation_window {
+            self.recent_returns.pop_front();
+        }
+        self.recent_returns.push_back(log_return);
+        self.update_autocorrelation();
+
         // Expire old entries
         self.expire_old_returns(timestamp_ms);
+    }
+
+    /// Compute lag-1 autocorrelation from the recent returns buffer and EWMA smooth it.
+    fn update_autocorrelation(&mut self) {
+        let n = self.recent_returns.len();
+        if n < 3 {
+            return;
+        }
+
+        // Compute mean
+        let mean: f64 = self.recent_returns.iter().sum::<f64>() / n as f64;
+
+        // Compute variance
+        let var: f64 = self
+            .recent_returns
+            .iter()
+            .map(|r| (r - mean).powi(2))
+            .sum::<f64>()
+            / n as f64;
+
+        if var < 1e-30 {
+            // Near-zero variance — autocorrelation undefined, leave unchanged
+            return;
+        }
+
+        // Compute lag-1 covariance: cov(r_t, r_{t-1})
+        let cov: f64 = self
+            .recent_returns
+            .iter()
+            .skip(1)
+            .zip(self.recent_returns.iter())
+            .map(|(r_t, r_t1)| (r_t - mean) * (r_t1 - mean))
+            .sum::<f64>()
+            / (n - 1) as f64;
+
+        let raw_autocorr = (cov / var).clamp(-1.0, 1.0);
+
+        // EWMA smooth using the same alpha as drift velocity
+        let alpha = self.config.drift_velocity_alpha;
+        self.autocorrelation_ewma =
+            alpha * raw_autocorr + (1.0 - alpha) * self.autocorrelation_ewma;
     }
 
     /// Update unrealized P&L for underwater tracking.
@@ -184,6 +306,16 @@ impl TrendPersistenceTracker {
 
         let is_warmed_up = self.is_warmed_up();
 
+        // Drift velocity: accelerating if velocity same sign as long momentum and |v| > 1.0 bps/s
+        let drift_velocity_bps_per_s = self.drift_velocity_bps_per_s;
+        let drift_accelerating = drift_velocity_bps_per_s.signum() == long_momentum_bps.signum()
+            && long_momentum_bps.abs() > 1.0
+            && drift_velocity_bps_per_s.abs() > 1.0;
+
+        // Autocorrelation: trending if positively autocorrelated
+        let return_autocorrelation = self.autocorrelation_ewma;
+        let is_trending = return_autocorrelation > 0.1;
+
         TrendSignal {
             short_momentum_bps,
             medium_momentum_bps,
@@ -192,6 +324,10 @@ impl TrendPersistenceTracker {
             underwater_severity,
             trend_confidence,
             is_warmed_up,
+            drift_velocity_bps_per_s,
+            drift_accelerating,
+            return_autocorrelation,
+            is_trending,
         }
     }
 
@@ -458,5 +594,122 @@ mod tests {
         assert!(signal.is_warmed_up);
         assert!(signal.medium_momentum_bps > 0.0);
         assert!(signal.trend_confidence >= 0.0 && signal.trend_confidence <= 1.0);
+    }
+
+    #[test]
+    fn test_drift_acceleration_detection() {
+        let mut tracker = default_tracker();
+
+        // Feed increasing positive returns — momentum should accelerate.
+        // Phase 1: small positive returns to build baseline
+        for i in 0..40 {
+            let t = 1000 + i * 100; // 100ms apart
+            tracker.on_bucket(t, 0.0001); // +1 bps each
+        }
+
+        // Phase 2: larger positive returns — momentum increasing (accelerating)
+        for i in 0..20 {
+            let t = 5000 + i * 100;
+            tracker.on_bucket(t, 0.001); // +10 bps each
+        }
+
+        let now = 7000;
+        let signal = tracker.evaluate(now, 50.0, 1000.0);
+
+        // Velocity should be positive (momentum increasing in positive direction)
+        assert!(
+            signal.drift_velocity_bps_per_s > 0.0,
+            "Expected positive drift velocity, got {}",
+            signal.drift_velocity_bps_per_s
+        );
+        // Long momentum is positive and velocity is positive → accelerating
+        assert!(
+            signal.drift_accelerating,
+            "Expected drift_accelerating=true, velocity={}, long_mom={}",
+            signal.drift_velocity_bps_per_s, signal.long_momentum_bps
+        );
+    }
+
+    #[test]
+    fn test_drift_deceleration_detection() {
+        let mut tracker = default_tracker();
+
+        // Phase 1: strong positive returns
+        for i in 0..30 {
+            let t = 1000 + i * 100;
+            tracker.on_bucket(t, 0.001); // +10 bps each
+        }
+
+        // Phase 2: returns flip negative — momentum decelerating/reversing
+        for i in 0..30 {
+            let t = 4000 + i * 100;
+            tracker.on_bucket(t, -0.001); // -10 bps each
+        }
+
+        let now = 7000;
+        let signal = tracker.evaluate(now, -20.0, 1000.0);
+
+        // Velocity should be negative (momentum was positive, now decreasing)
+        assert!(
+            signal.drift_velocity_bps_per_s < 0.0,
+            "Expected negative drift velocity during deceleration, got {}",
+            signal.drift_velocity_bps_per_s
+        );
+    }
+
+    #[test]
+    fn test_positive_autocorrelation_sustained_trend() {
+        let mut tracker = default_tracker();
+
+        // Feed consistently positive returns with small random-walk noise.
+        // True trending: each return ≈ previous return (positive autocorrelation).
+        let mut ret = 0.0005;
+        for i in 0..60 {
+            let t = 1000 + i * 100;
+            // Small perturbation that preserves sign — simulates genuine trend
+            let noise = 0.00001 * ((i % 5) as f64 - 2.0); // ±0.00002
+            ret = (ret + noise).max(0.0001); // always positive, slowly drifting
+            tracker.on_bucket(t, ret);
+        }
+
+        let now = 7000;
+        let signal = tracker.evaluate(now, 20.0, 1000.0);
+
+        assert!(
+            signal.return_autocorrelation > 0.0,
+            "Expected positive autocorrelation in sustained trend, got {}",
+            signal.return_autocorrelation
+        );
+        assert!(
+            signal.is_trending,
+            "Expected is_trending=true for positive autocorrelation {}",
+            signal.return_autocorrelation
+        );
+    }
+
+    #[test]
+    fn test_negative_autocorrelation_choppy_market() {
+        let mut tracker = default_tracker();
+
+        // Feed alternating positive/negative returns — classic mean-reverting bounce.
+        for i in 0..60 {
+            let t = 1000 + i * 100;
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            tracker.on_bucket(t, sign * 0.001);
+        }
+
+        let now = 7000;
+        let signal = tracker.evaluate(now, 0.0, 1000.0);
+
+        assert!(
+            signal.return_autocorrelation < 0.0,
+            "Expected negative autocorrelation in choppy market, got {}",
+            signal.return_autocorrelation
+        );
+        assert!(
+            !signal.is_trending,
+            "Expected is_trending=false for negative autocorrelation {}",
+            signal.return_autocorrelation
+        );
     }
 }

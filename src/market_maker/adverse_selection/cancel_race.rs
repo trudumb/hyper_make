@@ -84,6 +84,23 @@ pub struct CancelRaceTracker {
     /// Configuration
     #[serde(default)]
     config: CancelRaceConfig,
+
+    // --- Drift-conditioned tracking ---
+    /// EWMA of AS (bps) for race fills that occurred during drift (|momentum| > 5 bps).
+    #[serde(default)]
+    drift_race_fill_as_bps: f64,
+    /// EWMA of AS (bps) for race fills that occurred without drift.
+    #[serde(default)]
+    no_drift_race_fill_as_bps: f64,
+    /// Count of race fills during drift.
+    #[serde(default)]
+    drift_race_fill_count: u64,
+    /// Count of race fills without drift.
+    #[serde(default)]
+    no_drift_race_fill_count: u64,
+    /// Current momentum (bps), updated externally via `update_momentum()`.
+    #[serde(default)]
+    current_momentum_bps: f64,
 }
 
 impl CancelRaceTracker {
@@ -101,6 +118,11 @@ impl CancelRaceTracker {
             normal_fill_count: 0,
             pending_cancels: HashMap::new(),
             config,
+            drift_race_fill_as_bps: 0.0,
+            no_drift_race_fill_as_bps: 0.0,
+            drift_race_fill_count: 0,
+            no_drift_race_fill_count: 0,
+            current_momentum_bps: 0.0,
         }
     }
 
@@ -131,6 +153,18 @@ impl CancelRaceTracker {
             self.race_fill_as_bps = alpha * as_abs + (1.0 - alpha) * self.race_fill_as_bps;
             self.race_fill_count += 1;
 
+            // Drift-conditioned classification: |momentum| > 5 bps threshold
+            const DRIFT_THRESHOLD_BPS: f64 = 5.0;
+            if self.current_momentum_bps.abs() > DRIFT_THRESHOLD_BPS {
+                self.drift_race_fill_as_bps =
+                    alpha * as_abs + (1.0 - alpha) * self.drift_race_fill_as_bps;
+                self.drift_race_fill_count += 1;
+            } else {
+                self.no_drift_race_fill_as_bps =
+                    alpha * as_abs + (1.0 - alpha) * self.no_drift_race_fill_as_bps;
+                self.no_drift_race_fill_count += 1;
+            }
+
             // Remove from pending cancels since it's been consumed
             self.pending_cancels.remove(&oid);
 
@@ -139,6 +173,7 @@ impl CancelRaceTracker {
                 as_bps = %format!("{:.2}", as_abs),
                 race_ewma_bps = %format!("{:.2}", self.race_fill_as_bps),
                 race_count = self.race_fill_count,
+                momentum_bps = %format!("{:.1}", self.current_momentum_bps),
                 "Cancel-race fill recorded"
             );
         } else {
@@ -199,6 +234,39 @@ impl CancelRaceTracker {
     /// Get the total normal fill count.
     pub fn normal_fill_count(&self) -> u64 {
         self.normal_fill_count
+    }
+
+    /// Update the current momentum used for drift classification of race fills.
+    pub fn update_momentum(&mut self, momentum_bps: f64) {
+        self.current_momentum_bps = momentum_bps;
+    }
+
+    /// Excess AS of race fills during drift vs race fills without drift (bps, clamped >= 0).
+    ///
+    /// Returns 0.0 if insufficient drift race fills or no-drift race fills.
+    pub fn excess_race_as_in_drift_bps(&self) -> f64 {
+        if self.drift_race_fill_count < self.config.min_race_fills
+            || self.no_drift_race_fill_count < self.config.min_race_fills
+        {
+            return 0.0;
+        }
+        (self.drift_race_fill_as_bps - self.no_drift_race_fill_as_bps).max(0.0)
+    }
+
+    /// Ratio of drift race AS / no-drift race AS (clamped >= 1.0).
+    ///
+    /// A ratio of 2.0 means race fills are 2x more toxic during drift.
+    /// Returns 1.0 if insufficient data or no-drift AS is near zero.
+    pub fn drift_excess_ratio(&self) -> f64 {
+        if self.drift_race_fill_count < self.config.min_race_fills
+            || self.no_drift_race_fill_count < self.config.min_race_fills
+        {
+            return 1.0;
+        }
+        if self.no_drift_race_fill_as_bps < 0.01 {
+            return 1.0;
+        }
+        (self.drift_race_fill_as_bps / self.no_drift_race_fill_as_bps).max(1.0)
     }
 
     /// Get a summary for logging.
@@ -487,5 +555,114 @@ mod tests {
         assert!((summary.normal_fill_as_bps - 3.0).abs() < 0.01);
         assert!((summary.excess_as_bps - 5.0).abs() < 0.01);
         assert!((summary.race_fill_rate - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_drift_race_fills_tracked_higher_as() {
+        let mut tracker = CancelRaceTracker::with_config(CancelRaceConfig {
+            cancel_latency_window_ms: 500,
+            ewma_alpha: 1.0,
+            min_race_fills: 1,
+            max_excess_as_bps: 20.0,
+        });
+
+        // Race fills during drift (|momentum| > 5 bps) — high AS
+        tracker.update_momentum(15.0);
+        for i in 0..5 {
+            let oid = 100 + i;
+            tracker.record_cancel_request(oid, 1000 + i * 200);
+            tracker.record_fill(oid, 12.0, 1050 + i * 200);
+        }
+
+        // Race fills without drift (|momentum| < 5 bps) — low AS
+        tracker.update_momentum(2.0);
+        for i in 0..5 {
+            let oid = 200 + i;
+            tracker.record_cancel_request(oid, 5000 + i * 200);
+            tracker.record_fill(oid, 4.0, 5050 + i * 200);
+        }
+
+        assert_eq!(tracker.drift_race_fill_count, 5);
+        assert_eq!(tracker.no_drift_race_fill_count, 5);
+        assert!(
+            (tracker.drift_race_fill_as_bps - 12.0).abs() < 0.01,
+            "Drift race AS should be ~12 bps, got {:.2}",
+            tracker.drift_race_fill_as_bps
+        );
+        assert!(
+            (tracker.no_drift_race_fill_as_bps - 4.0).abs() < 0.01,
+            "No-drift race AS should be ~4 bps, got {:.2}",
+            tracker.no_drift_race_fill_as_bps
+        );
+    }
+
+    #[test]
+    fn test_no_drift_baseline_separate() {
+        let mut tracker = CancelRaceTracker::with_config(CancelRaceConfig {
+            cancel_latency_window_ms: 500,
+            ewma_alpha: 1.0,
+            min_race_fills: 1,
+            max_excess_as_bps: 20.0,
+        });
+
+        // All race fills during no-drift
+        tracker.update_momentum(1.0);
+        for i in 0..5 {
+            let oid = 300 + i;
+            tracker.record_cancel_request(oid, 1000 + i * 200);
+            tracker.record_fill(oid, 6.0, 1050 + i * 200);
+        }
+
+        // Drift fills not populated → excess should be 0
+        assert_eq!(tracker.drift_race_fill_count, 0);
+        assert_eq!(tracker.no_drift_race_fill_count, 5);
+        assert!(
+            tracker.excess_race_as_in_drift_bps() == 0.0,
+            "Excess should be 0 when no drift fills exist"
+        );
+        assert!(
+            (tracker.drift_excess_ratio() - 1.0).abs() < f64::EPSILON,
+            "Ratio should be 1.0 when no drift fills exist"
+        );
+    }
+
+    #[test]
+    fn test_drift_excess_ratio_above_one() {
+        let mut tracker = CancelRaceTracker::with_config(CancelRaceConfig {
+            cancel_latency_window_ms: 500,
+            ewma_alpha: 1.0,
+            min_race_fills: 1,
+            max_excess_as_bps: 20.0,
+        });
+
+        // Drift race fills: 10 bps
+        tracker.update_momentum(20.0);
+        for i in 0..3 {
+            let oid = 400 + i;
+            tracker.record_cancel_request(oid, 1000 + i * 200);
+            tracker.record_fill(oid, 10.0, 1050 + i * 200);
+        }
+
+        // No-drift race fills: 4 bps
+        tracker.update_momentum(0.5);
+        for i in 0..3 {
+            let oid = 500 + i;
+            tracker.record_cancel_request(oid, 5000 + i * 200);
+            tracker.record_fill(oid, 4.0, 5050 + i * 200);
+        }
+
+        let excess = tracker.excess_race_as_in_drift_bps();
+        assert!(
+            (excess - 6.0).abs() < 0.01,
+            "Expected excess ~6.0 bps (10-4), got {:.2}",
+            excess
+        );
+
+        let ratio = tracker.drift_excess_ratio();
+        assert!(
+            (ratio - 2.5).abs() < 0.01,
+            "Expected ratio ~2.5 (10/4), got {:.2}",
+            ratio
+        );
     }
 }

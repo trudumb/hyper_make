@@ -8,11 +8,13 @@
 //! - **LiveAnalytics**: Bundled analytics for the live market maker
 
 pub mod attribution;
+pub mod drift_calibration;
 pub mod edge_metrics;
 pub mod live;
 pub mod persistence;
 pub mod sharpe;
 
+pub use drift_calibration::DriftCalibrationTracker;
 pub use attribution::{CycleContributions, SignalContribution, SignalPnLAttributor};
 pub use edge_metrics::{EdgeSnapshot, EdgeTracker};
 pub use live::{LiveAnalytics, LiveAnalyticsSummary};

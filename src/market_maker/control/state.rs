@@ -64,6 +64,14 @@ pub struct ControlState {
     /// Current market spread (bps). Used to compute spread crossing
     /// cost for DumpInventory actions.
     pub market_spread_bps: f64,
+
+    /// Current drift rate per second from OU process.
+    /// Positive = price trending up, negative = trending down.
+    pub drift_rate: f64,
+
+    /// OU process uncertainty (sqrt of posterior variance).
+    /// Higher values = less confident in drift estimate.
+    pub ou_uncertainty: f64,
 }
 
 impl Default for ControlState {
@@ -84,6 +92,8 @@ impl Default for ControlState {
             rate_limit_headroom: 1.0,
             last_realized_edge_bps: 0.0,
             market_spread_bps: 0.0,
+            drift_rate: 0.0,
+            ou_uncertainty: 0.0,
         }
     }
 }
@@ -107,6 +117,8 @@ impl ControlState {
             rate_limit_headroom: trading.rate_limit_headroom,
             last_realized_edge_bps: trading.last_realized_edge_bps,
             market_spread_bps: trading.market_spread_bps,
+            drift_rate: 0.0,
+            ou_uncertainty: 0.0,
         }
     }
 
