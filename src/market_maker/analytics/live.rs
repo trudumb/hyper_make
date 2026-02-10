@@ -159,11 +159,20 @@ impl LiveAnalytics {
         }
 
         let sharpe_summary = self.sharpe_tracker.summary();
+        let (sharpe_all, sharpe_lo, sharpe_hi) = self.sharpe_tracker.sharpe_with_confidence(0.90);
+        let data_quality = if self.sharpe_tracker.has_sufficient_data() {
+            ""
+        } else {
+            " (insufficient data)"
+        };
         info!(
-            "[ANALYTICS] Sharpe(1h)={:.2} Sharpe(24h)={:.2} Sharpe(all)={:.2} Fills={} Edge={:.1}bps",
+            "[ANALYTICS] Sharpe(1h)={:.2} Sharpe(24h)={:.2} Sharpe(all)={:.2} [{:.2}, {:.2}]{} Fills={} Edge={:.1}bps",
             sharpe_summary.sharpe_1h,
             sharpe_summary.sharpe_24h,
-            sharpe_summary.sharpe_all,
+            sharpe_all,
+            sharpe_lo,
+            sharpe_hi,
+            data_quality,
             sharpe_summary.count,
             mean_realized_edge_bps,
         );

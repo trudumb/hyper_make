@@ -1151,6 +1151,9 @@ impl SimulationState {
             use_dynamic_kappa_floor: true,
             use_dynamic_spread_ceiling: true,
             learned_params: None,
+            // Paper mode — derive BBO from mid price with wide spread
+            cached_best_bid: self.mid_price * 0.999,
+            cached_best_ask: self.mid_price * 1.001,
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
@@ -1873,20 +1876,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 50% touch probability models back-of-book queue position realistically
     // (our quotes are 15 bps from mid when top-of-book is 1-3 bps).
     // Default mode uses conservative probabilities (30% touch, 50% queue).
-    let fill_config = if cli.paper_mode {
-        FillSimulatorConfig {
-            touch_fill_probability: 0.3,   // Conservative fill rate (was 0.5)
-            queue_position_factor: 0.4,    // Back-of-book position (was 0.6)
-            ignore_book_depth: true,       // Sim orders aren't in real book
-            ..Default::default()
-        }
-    } else {
-        FillSimulatorConfig {
-            touch_fill_probability: 0.3,
-            queue_position_factor: 0.4,    // More conservative (was 0.5)
-            ignore_book_depth: true,
-            ..Default::default()
-        }
+    let fill_config = FillSimulatorConfig {
+        touch_fill_probability: 0.3,
+        queue_position_factor: 0.4,
+        ignore_book_depth: true,
+        ..Default::default()
     };
     let mut fill_simulator = FillSimulator::new(executor.clone(), fill_config);
 

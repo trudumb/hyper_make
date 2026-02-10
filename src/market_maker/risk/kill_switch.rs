@@ -70,6 +70,13 @@ pub struct KillSwitchConfig {
     /// Production: `max(1.0, max_position_value * 0.02)`.
     pub min_peak_for_drawdown: f64,
 
+    /// Position velocity threshold: max_position fraction per minute before action.
+    ///
+    /// Measures how fast position is changing. Detects rapid accumulation or whipsaws.
+    /// Default: 0.50 (50% of max_position per minute triggers warning).
+    /// Widen at 1x, pull quotes at 2x, kill at 4x.
+    pub position_velocity_threshold: f64,
+
     /// Enable/disable the kill switch (for testing)
     pub enabled: bool,
 }
@@ -90,6 +97,7 @@ impl Default for KillSwitchConfig {
             liquidation_position_jump_fraction: 0.20,
             liquidation_fill_timeout_s: 5,
             min_peak_for_drawdown: 1.0,
+            position_velocity_threshold: 0.50,
             enabled: true,
         }
     }
@@ -127,6 +135,7 @@ impl KillSwitchConfig {
             // With max_position_usd=$1000: min_peak=$20 (~800 fills to activate).
             // check_daily_loss ($50) still protects against catastrophic loss.
             min_peak_for_drawdown: 1.0_f64.max(max_position_usd * 0.02),
+            position_velocity_threshold: 0.50,
             enabled: true,
         }
     }
@@ -366,6 +375,12 @@ pub struct KillSwitchState {
     pub account_value: f64,
     /// Current leverage setting
     pub leverage: f64,
+    /// Maximum one-sided ladder depth in contracts, updated each quote cycle.
+    /// Position runaway threshold will be at least this x 1.5.
+    pub max_ladder_one_side_contracts: f64,
+    /// Position at startup (pre-existing). Used to exempt inherited positions from
+    /// the runaway check — reduce-only mode handles these, not the kill switch.
+    pub initial_position: f64,
 }
 
 impl Default for KillSwitchState {
@@ -380,6 +395,8 @@ impl Default for KillSwitchState {
             cascade_severity: 0.0,
             account_value: 0.0,
             leverage: 1.0,
+            max_ladder_one_side_contracts: 0.0,
+            initial_position: 0.0,
         }
     }
 }
@@ -618,6 +635,18 @@ impl KillSwitch {
         self.state.lock().unwrap().clone()
     }
 
+    /// Record the initial position at startup for runaway exemption.
+    /// Pre-existing positions are handled by reduce-only mode, not the kill switch.
+    pub fn set_initial_position(&self, position: f64) {
+        self.state.lock().unwrap().initial_position = position;
+    }
+
+    /// Update the maximum one-sided ladder depth for position runaway calculation.
+    /// Called by the quote engine after each ladder generation.
+    pub fn set_ladder_depth(&self, one_side_contracts: f64) {
+        self.state.lock().unwrap().max_ladder_one_side_contracts = one_side_contracts;
+    }
+
     /// Get configuration snapshot.
     pub fn config(&self) -> KillSwitchConfig {
         self.config.lock().unwrap().clone()
@@ -731,9 +760,14 @@ impl KillSwitch {
         let contracts = state.position.abs();
 
         // Skip runaway check if no valid price yet (startup condition)
-        // The reduce-only mode in update_quotes handles existing oversized positions.
-        // We only want to kill on RUNTIME runaway, not pre-existing positions at startup.
         if state.mid_price <= 0.0 {
+            return None;
+        }
+
+        // Exempt pre-existing positions: if position hasn't grown beyond what was
+        // inherited at startup, it's not a runaway — reduce-only mode handles these.
+        // Only trigger kill switch when position grows BEYOND initial + buffer.
+        if contracts <= state.initial_position.abs() + 0.001 {
             return None;
         }
 
@@ -746,8 +780,20 @@ impl KillSwitch {
             config.max_position_contracts
         };
 
-        // Runaway = 2× the effective limit
-        let hard_limit = margin_based_limit * 2.0;
+        // Ladder-aware floor: a full one-sided sweep is NORMAL, not runaway.
+        // Threshold must exceed max possible single-sweep exposure.
+        // 1.5× ladder depth = one full sweep + 50% buffer for partial refills.
+        let ladder_floor = state.max_ladder_one_side_contracts * 1.5;
+        let hard_limit = (margin_based_limit * 2.0).max(ladder_floor);
+
+        if ladder_floor > margin_based_limit * 2.0 {
+            tracing::debug!(
+                ladder_floor = %format!("{:.4}", ladder_floor),
+                margin_limit = %format!("{:.4}", margin_based_limit * 2.0),
+                "Position runaway using ladder floor (margin limit < ladder depth)"
+            );
+        }
+
         if contracts > hard_limit {
             return Some(KillReason::PositionRunaway {
                 contracts,
@@ -894,10 +940,29 @@ impl KillSwitch {
             return;
         }
 
-        // Re-trigger with the saved reasons
+        // Re-trigger with saved reasons, but skip transient ones.
+        // Position runaway is transient: the live check_position_runaway handles it
+        // correctly with initial_position exemption. Re-triggering on restore blocks
+        // startup when an inherited position exceeds current margin capacity.
+        // Only persistent reasons (daily loss, drawdown) should survive restart.
+        let persistent_reasons: Vec<_> = checkpoint
+            .trigger_reasons
+            .iter()
+            .filter(|r| !r.contains("Position runaway"))
+            .collect();
+
+        if persistent_reasons.is_empty() {
+            // All reasons were transient — don't re-trigger
+            tracing::info!(
+                "Checkpoint had kill switch trigger but all reasons were transient (position runaway), \
+                 not re-triggering. Live checks will re-evaluate."
+            );
+            return;
+        }
+
         self.triggered.store(true, Ordering::SeqCst);
         let mut reasons = self.trigger_reasons.lock().unwrap();
-        for reason_str in &checkpoint.trigger_reasons {
+        for reason_str in &persistent_reasons {
             let reason = KillReason::Manual {
                 reason: format!("restored from checkpoint: {reason_str}"),
             };
@@ -1492,5 +1557,112 @@ mod tests {
         // Small position change (5% of max) — no fill needed
         ks.update_position(0.15, 50000.0);
         assert!(!ks.is_triggered());
+    }
+
+    #[test]
+    fn test_runaway_ladder_aware() {
+        // Margin-derived hard_limit = 3.32 but ladder depth = 3.33
+        // A full sweep to 3.32 contracts should NOT trigger.
+        let config = KillSwitchConfig {
+            max_position_contracts: 10.0,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Margin-based limit: (account_value * leverage * 0.5) / mid_price
+        // We want margin_based_limit * 2.0 = 3.32
+        // => margin_based_limit = 1.66
+        // => (account_value * 1.0 * 0.5) / 100.0 = 1.66
+        // => account_value = 332.0
+        let state = KillSwitchState {
+            position: 3.32,
+            mid_price: 100.0,
+            account_value: 332.0,
+            leverage: 1.0,
+            last_data_time: Instant::now(),
+            max_ladder_one_side_contracts: 3.33,
+            ..Default::default()
+        };
+
+        // Without ladder awareness this would trigger (3.32 > 3.32 is false, but let's
+        // use 3.321 to be slightly above the margin limit).
+        let state_just_over = KillSwitchState {
+            position: 3.321,
+            ..state.clone()
+        };
+
+        // ladder_floor = 3.33 * 1.5 = 4.995, hard_limit = max(3.32, 4.995) = 4.995
+        // 3.321 < 4.995 => no trigger
+        let reason = ks.check(&state_just_over);
+        assert!(reason.is_none(), "Ladder-aware threshold should prevent false positive for full sweep");
+    }
+
+    #[test]
+    fn test_runaway_extreme_still_triggers() {
+        // Even with ladder awareness, truly extreme positions must trigger.
+        let config = KillSwitchConfig {
+            max_position_contracts: 10.0,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // ladder_floor = 3.33 * 1.5 = 4.995
+        // Position = 3.33 * 2.0 = 6.66 > 4.995 => triggers
+        let state = KillSwitchState {
+            position: 6.66,
+            mid_price: 100.0,
+            account_value: 332.0,
+            leverage: 1.0,
+            last_data_time: Instant::now(),
+            max_ladder_one_side_contracts: 3.33,
+            ..Default::default()
+        };
+
+        let reason = ks.check(&state);
+        assert!(reason.is_some(), "Extreme position should still trigger kill switch");
+        match reason.unwrap() {
+            KillReason::PositionRunaway { contracts, limit } => {
+                assert!((contracts - 6.66).abs() < 1e-6);
+                assert!((limit - 4.995).abs() < 1e-6);
+            }
+            other => panic!("Expected PositionRunaway, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_runaway_backward_compat() {
+        // With ladder_depth = 0.0 (default), behavior matches old code exactly.
+        let config = KillSwitchConfig {
+            max_position_contracts: 5.0,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Do NOT call set_ladder_depth — default is 0.0
+        // ladder_floor = 0.0 * 1.5 = 0.0, so hard_limit = max(margin*2, 0.0) = margin*2
+
+        // margin_based_limit = (200 * 1.0 * 0.5) / 100.0 = 1.0
+        // hard_limit = max(2.0, 0.0) = 2.0
+        let state_under = KillSwitchState {
+            position: 1.99,
+            mid_price: 100.0,
+            account_value: 200.0,
+            leverage: 1.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        assert!(ks.check(&state_under).is_none(), "Under limit should not trigger");
+
+        let state_over = KillSwitchState {
+            position: 2.01,
+            mid_price: 100.0,
+            account_value: 200.0,
+            leverage: 1.0,
+            last_data_time: Instant::now(),
+            ..Default::default()
+        };
+        let reason = ks.check(&state_over);
+        assert!(reason.is_some(), "Over margin-based limit should trigger with default ladder depth");
+        assert!(matches!(reason.unwrap(), KillReason::PositionRunaway { .. }));
     }
 }

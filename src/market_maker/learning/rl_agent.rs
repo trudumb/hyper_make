@@ -1279,11 +1279,15 @@ pub struct QLearningAgent {
     episodes: u64,
     /// Total reward accumulated
     total_reward: f64,
-    /// Recent rewards for monitoring
-    recent_rewards: Vec<f64>,
+    /// Recent rewards for monitoring (VecDeque for O(1) pop_front)
+    recent_rewards: VecDeque<f64>,
     /// FIFO queue of pending (state_index, action_index) pairs awaiting reward updates.
     /// Supports clustered fills where multiple quotes are outstanding.
     pending_state_actions: VecDeque<(StateIndex, ActionIndex)>,
+    /// Parallel queue storing inventory_risk at the time each action was chosen.
+    /// Used by `Reward::compute()` to correctly compute the inventory change penalty
+    /// instead of approximating prev_inventory_risk with the current value.
+    pending_inventory_risks: VecDeque<f64>,
 }
 
 impl QLearningAgent {
@@ -1295,8 +1299,9 @@ impl QLearningAgent {
             q_table: HashMap::new(),
             episodes: 0,
             total_reward: 0.0,
-            recent_rewards: Vec::with_capacity(1000),
+            recent_rewards: VecDeque::with_capacity(1000),
             pending_state_actions: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
+            pending_inventory_risks: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
         }
     }
 
@@ -1308,8 +1313,9 @@ impl QLearningAgent {
             q_table: HashMap::new(),
             episodes: 0,
             total_reward: 0.0,
-            recent_rewards: Vec::with_capacity(1000),
+            recent_rewards: VecDeque::with_capacity(1000),
             pending_state_actions: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
+            pending_inventory_risks: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
         }
     }
 
@@ -1487,9 +1493,9 @@ impl QLearningAgent {
 
         // Track rewards
         self.total_reward += reward.total;
-        self.recent_rewards.push(reward.total);
+        self.recent_rewards.push_back(reward.total);
         if self.recent_rewards.len() > 1000 {
-            self.recent_rewards.remove(0);
+            self.recent_rewards.pop_front();
         }
 
         debug!(
@@ -1519,6 +1525,7 @@ impl QLearningAgent {
     pub fn start_episode(&mut self) {
         self.episodes += 1;
         self.pending_state_actions.clear();
+        self.pending_inventory_risks.clear();
     }
 
     /// Get the greedy action index (exploitation only).
@@ -1596,8 +1603,30 @@ impl QLearningAgent {
     pub fn push_state_action_idx(&mut self, state_idx: StateIndex, action_idx: ActionIndex) {
         if self.pending_state_actions.len() >= STATE_ACTION_QUEUE_CAPACITY {
             self.pending_state_actions.pop_front();
+            self.pending_inventory_risks.pop_front();
         }
         self.pending_state_actions.push_back((state_idx, action_idx));
+        // Default to 0.0; callers should use push_state_action_with_risk for accurate prev_inventory_risk
+        self.pending_inventory_risks.push_back(0.0);
+    }
+
+    /// Push a state-action pair with the associated inventory risk at action time.
+    ///
+    /// `inventory_risk` is `|position| / max_position` at the time the action was chosen.
+    /// Stored so `Reward::compute()` can use the actual previous inventory risk
+    /// instead of approximating with the current value.
+    pub fn push_state_action_with_risk(
+        &mut self,
+        state_idx: StateIndex,
+        action_idx: ActionIndex,
+        inventory_risk: f64,
+    ) {
+        if self.pending_state_actions.len() >= STATE_ACTION_QUEUE_CAPACITY {
+            self.pending_state_actions.pop_front();
+            self.pending_inventory_risks.pop_front();
+        }
+        self.pending_state_actions.push_back((state_idx, action_idx));
+        self.pending_inventory_risks.push_back(inventory_risk);
     }
 
     /// Legacy: Push a state-action pair onto the pending queue (FIFO).
@@ -1606,8 +1635,19 @@ impl QLearningAgent {
     }
 
     /// Pop the next (oldest) pending state-action pair for reward update.
+    ///
+    /// Returns `(state_idx, action_idx)`.
     pub fn take_next_state_action(&mut self) -> Option<(StateIndex, ActionIndex)> {
         self.pending_state_actions.pop_front()
+    }
+
+    /// Pop the inventory risk associated with the next pending state-action.
+    ///
+    /// Must be called immediately after `take_next_state_action()` to stay in sync.
+    /// Returns the inventory risk at the time the action was chosen, for use
+    /// as `prev_inventory_risk` in `Reward::compute()`.
+    pub fn take_next_inventory_risk(&mut self) -> f64 {
+        self.pending_inventory_risks.pop_front().unwrap_or(0.0)
     }
 
     /// Number of pending state-action pairs awaiting reward updates.

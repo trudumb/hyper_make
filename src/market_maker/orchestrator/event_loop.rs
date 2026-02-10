@@ -142,6 +142,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .prometheus
             .update_position(self.position.position(), self.effective_max_position);
 
+        // Record initial position for kill switch runaway exemption
+        self.safety
+            .kill_switch
+            .set_initial_position(self.position.position());
+
         // Check if existing position exceeds configured limit - will enter reduce-only mode
         // Note: effective_max_position may be recalculated higher once price data arrives
         // (margin-based calculation vs static config.max_position fallback)

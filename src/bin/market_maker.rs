@@ -1271,20 +1271,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            // Validator perps: Get account value from perps clearinghouse
-            // NOTE: Use cross_margin_summary for cross margin accounts (default).
-            // margin_summary only has value for isolated margin positions.
-            match info_client.user_state(user_address).await {
-                Ok(state) => state
-                    .cross_margin_summary
-                    .account_value
-                    .parse()
-                    .unwrap_or(0.0),
+            // Validator perps: unified account value = perps clearinghouse + spot balances.
+            // Hyperliquid unified margin uses ALL collateral (perps + spot) for margin.
+            // cross_margin_summary.account_value only reflects the perps side.
+            let perps_value = match info_client.user_state(user_address).await {
+                Ok(state) => {
+                    let cross: f64 = state
+                        .cross_margin_summary
+                        .account_value
+                        .parse()
+                        .unwrap_or(0.0);
+                    let margin: f64 = state
+                        .margin_summary
+                        .account_value
+                        .parse()
+                        .unwrap_or(0.0);
+                    cross.max(margin)
+                }
                 Err(e) => {
                     warn!("Failed to query user state: {e}, using 0");
                     0.0
                 }
+            };
+
+            // Always check spot balances — unified margin counts all collateral
+            let spot_value = match info_client.user_token_balances(user_address).await {
+                Ok(balances) => {
+                    // Sum USDC + other stablecoin spot balances used as collateral
+                    let spot_usdc: f64 = balances
+                        .balances
+                        .iter()
+                        .filter(|b| b.coin == "USDC" || b.coin == "USDT" || b.coin == "USDE")
+                        .map(|b| b.total.parse::<f64>().unwrap_or(0.0))
+                        .sum();
+                    spot_usdc
+                }
+                Err(e) => {
+                    warn!("Failed to query spot balances: {e}, using 0");
+                    0.0
+                }
+            };
+
+            let total = perps_value + spot_value;
+            if total > 0.0 {
+                info!(
+                    perps_value = %format!("{:.2}", perps_value),
+                    spot_value = %format!("{:.2}", spot_value),
+                    total = %format!("{:.2}", total),
+                    "Unified account value (perps clearinghouse + spot collateral)"
+                );
+            } else {
+                warn!(
+                    "No funds found in perps clearinghouse or spot wallet. \
+                     Deposit USDC to trade."
+                );
             }
+            total
         };
 
         match asset_data_result {
@@ -1434,6 +1476,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_bps_diff,
         max_position,
         max_position_usd: max_position_usd_override.unwrap_or(0.0),
+        max_position_user_specified: max_position_usd_override.is_some()
+            || max_position_contracts_override.is_some(),
         decimals,
         sz_decimals,
         multi_asset: false, // Single-asset mode by default
@@ -1769,6 +1813,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_rate_limit_errors: ks_toml.max_rate_limit_errors,
         cascade_severity_threshold: ks_toml.cascade_severity_threshold,
         price_velocity_threshold: 0.05, // 5%/s — default from KillSwitchConfig
+        position_velocity_threshold: 0.50, // 50% of max_position/min — default
         liquidation_position_jump_fraction: 0.20, // 20% of max position
         liquidation_fill_timeout_s: 5,
         // Drawdown is meaningless when peak is spread noise ($0.02).

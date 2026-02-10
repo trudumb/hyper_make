@@ -148,6 +148,8 @@ impl Ladder {
             params.urgency_score,
             params.funding_rate,
             params.use_funding_skew,
+            params.cached_best_bid,
+            params.cached_best_ask,
         );
 
         // 6. Apply RL policy adjustments (spread delta + asymmetric skew)
@@ -273,6 +275,8 @@ impl Ladder {
             params.urgency_score,
             params.funding_rate,
             params.use_funding_skew,
+            params.cached_best_bid,
+            params.cached_best_ask,
         );
 
         // 7. Apply RL policy adjustments (spread delta + asymmetric skew)
@@ -874,6 +878,8 @@ pub(crate) fn apply_inventory_skew_with_drift(
     urgency_score: f64,
     funding_rate: f64,
     use_funding_skew: bool,
+    cached_best_bid: f64,
+    cached_best_ask: f64,
 ) {
     // === BASE INVENTORY SKEW (GLFT) ===
     // Reservation price offset: γσ²qT (as fraction of mid)
@@ -970,42 +976,36 @@ pub(crate) fn apply_inventory_skew_with_drift(
         }
     };
 
-    let offset = safe_mid * total_skew_fraction;
+    let raw_offset = safe_mid * total_skew_fraction;
 
-    // Shift all prices by combined offset and RE-ROUND to exchange precision
+    // === BOUND OFFSET BY ACTUAL BBO HALF-SPREAD ===
+    // The GLFT formula (γσ²qT) doesn't know about exchange BBO constraints.
+    // For moderate gamma+sigma, the offset easily exceeds the 2-3 bps exchange spread.
+    // Cap at 80% of half-spread so skew never pushes quotes past the opposing BBO.
+    let half_spread = (cached_best_ask - cached_best_bid) / 2.0;
+    let max_offset = if half_spread > 0.0 {
+        half_spread * 0.8
+    } else {
+        // Fallback: 1bp of mid if BBO is invalid/zero
+        safe_mid * 0.0001
+    };
+    let offset = raw_offset.clamp(-max_offset, max_offset);
+
+    if (raw_offset - offset).abs() > 1e-10 {
+        tracing::warn!(
+            raw_offset_bps = %format!("{:.2}", raw_offset / safe_mid * 10000.0),
+            capped_offset_bps = %format!("{:.2}", offset / safe_mid * 10000.0),
+            half_spread_bps = %format!("{:.2}", half_spread / safe_mid * 10000.0),
+            "Inventory skew offset capped by BBO half-spread"
+        );
+    }
+
+    // Shift all prices by bounded offset and RE-ROUND to exchange precision
     for level in &mut ladder.bids {
         level.price = round_to_significant_and_decimal(level.price - offset, 5, decimals);
     }
     for level in &mut ladder.asks {
         level.price = round_to_significant_and_decimal(level.price - offset, 5, decimals);
-    }
-
-    // === FINAL SAFETY CHECK: Prevent crossed quotes ===
-    // Use market_mid (actual exchange mid) NOT microprice for safety check
-    // This ensures quotes never cross the actual market spread
-    for level in &mut ladder.bids {
-        if level.price > market_mid {
-            tracing::error!(
-                bid_price = %format!("{:.4}", level.price),
-                market_mid = %format!("{:.4}", market_mid),
-                microprice = %format!("{:.4}", mid),
-                offset = %format!("{:.6}", offset),
-                "CRITICAL: Bid crossed market mid - adjusting to 1bp below"
-            );
-            level.price = round_to_significant_and_decimal(market_mid * 0.9999, 5, decimals);
-        }
-    }
-    for level in &mut ladder.asks {
-        if level.price < market_mid {
-            tracing::error!(
-                ask_price = %format!("{:.4}", level.price),
-                market_mid = %format!("{:.4}", market_mid),
-                microprice = %format!("{:.4}", mid),
-                offset = %format!("{:.6}", offset),
-                "CRITICAL: Ask crossed market mid - adjusting to 1bp above"
-            );
-            level.price = round_to_significant_and_decimal(market_mid * 1.0001, 5, decimals);
-        }
     }
 
     // Size skew: reduce side that increases position
@@ -1371,6 +1371,8 @@ mod tests {
             0.0,
             0.0,   // funding_rate
             false, // use_funding_skew
+            0.0,   // cached_best_bid (0 = fallback to market_mid)
+            0.0,   // cached_best_ask
         );
 
         assert!(ladder.bids[0].price < 100.0); // Price shifted down
@@ -1410,6 +1412,8 @@ mod tests {
             0.0,
             0.0,   // funding_rate
             false, // use_funding_skew
+            0.0,   // cached_best_bid
+            0.0,   // cached_best_ask
         );
 
         assert!(ladder.bids[0].price > 99.0); // Price shifted up
@@ -1449,6 +1453,8 @@ mod tests {
             0.0,
             0.0,   // funding_rate
             false, // use_funding_skew
+            0.0,   // cached_best_bid
+            0.0,   // cached_best_ask
         );
 
         assert!((ladder.bids[0].price - 100.0).abs() < EPSILON);
@@ -1489,6 +1495,8 @@ mod tests {
             0.0,
             0.0,   // funding_rate
             false, // use_funding_skew
+            0.0,   // cached_best_bid
+            0.0,   // cached_best_ask
         );
 
         // Prices should be integers (no fractional part)

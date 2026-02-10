@@ -921,6 +921,190 @@ impl LearnedParameters {
     }
 }
 
+/// Data from a resolved fill used to update all relevant Bayesian parameters.
+///
+/// Constructed by the fill handler and passed to `LearnedParameters::observe_fill()`.
+/// Each field feeds one or more conjugate prior updates.
+#[derive(Debug, Clone)]
+pub struct FillOutcome {
+    /// Whether the fill was informed (price moved against us beyond AS threshold).
+    pub was_informed: bool,
+    /// Realized adverse selection in bps (positive = price moved against us).
+    pub realized_as_bps: f64,
+    /// Fill distance from mid in bps (how far our quote was from fair value).
+    pub fill_distance_bps: f64,
+    /// PnL of this fill in base units (positive = profit).
+    pub realized_pnl: f64,
+    /// Time since last fill in seconds (for Hawkes intensity).
+    pub inter_arrival_s: Option<f64>,
+    /// Number of fills in the observation window (for kappa estimation).
+    pub fills_in_window: Option<usize>,
+    /// Duration of the observation window in spread-seconds (for kappa estimation).
+    pub window_exposure: Option<f64>,
+    /// Predicted AS in bps at time of fill (for bias tracking).
+    pub predicted_as_bps: Option<f64>,
+}
+
+impl LearnedParameters {
+    /// Update all relevant Bayesian parameters from a single fill outcome.
+    ///
+    /// This is the main entry point that handlers.rs should call after each
+    /// fill is resolved with its markout. Routes the fill data to all applicable
+    /// conjugate prior updates.
+    ///
+    /// # Parameters updated per fill
+    /// - `alpha_touch`: Beta update (informed vs uninformed classification)
+    /// - `spread_floor_bps`: Normal update from realized AS
+    /// - `gamma_base`: Gamma-exponential update from abs(PnL)
+    /// - `kappa`: Gamma-Poisson update from fill count/exposure (if provided)
+    /// - `fill_probability_width_bps`: Normal update from fill distance
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let outcome = FillOutcome {
+    ///     was_informed: true,
+    ///     realized_as_bps: 4.5,
+    ///     fill_distance_bps: 2.1,
+    ///     realized_pnl: -0.003,
+    ///     inter_arrival_s: Some(12.5),
+    ///     fills_in_window: None,
+    ///     window_exposure: None,
+    ///     predicted_as_bps: Some(9.1),
+    /// };
+    /// learned_params.observe_fill(&outcome);
+    /// ```
+    pub fn observe_fill(&mut self, outcome: &FillOutcome) {
+        self.total_fills_observed += 1;
+        self.last_calibration = Some(Instant::now());
+
+        // --- Tier 1: P&L Critical ---
+
+        // alpha_touch: fraction of fills that are informed
+        if outcome.was_informed {
+            self.alpha_touch.observe_beta(1, 0);
+        } else {
+            self.alpha_touch.observe_beta(0, 1);
+        }
+
+        // spread_floor_bps: learn minimum viable spread from realized AS
+        // Observation variance ~4 bps^2 (typical AS volatility)
+        self.spread_floor_bps
+            .observe_normal(outcome.realized_as_bps, 4.0);
+
+        // gamma_base: learn risk aversion from PnL magnitude
+        // Higher |PnL| per fill → need higher gamma to control risk
+        let pnl_magnitude = outcome.realized_pnl.abs();
+        if pnl_magnitude > 1e-10 {
+            self.gamma_base.observe_gamma_exponential(pnl_magnitude);
+        }
+
+        // fill_probability_width_bps: learn fill distance distribution
+        if outcome.fill_distance_bps > 0.0 {
+            self.fill_probability_width_bps
+                .observe_normal(outcome.fill_distance_bps, 1.0);
+        }
+
+        // --- Tier 3: Calibration ---
+
+        // kappa: fill intensity (fills per unit spread-time)
+        if let (Some(count), Some(exposure)) =
+            (outcome.fills_in_window, outcome.window_exposure)
+        {
+            if exposure > 0.0 {
+                self.kappa.observe_gamma_poisson(count, exposure);
+            }
+        }
+
+        // Hawkes inter-arrival: feeds mu (baseline) and beta (decay)
+        if let Some(dt_s) = outcome.inter_arrival_s {
+            if dt_s > 0.0 {
+                self.hawkes_mu.observe_gamma_exponential(dt_s);
+            }
+        }
+
+        if self.total_fills_observed.is_multiple_of(100) {
+            tracing::info!(
+                total_fills = self.total_fills_observed,
+                alpha_touch_n = self.alpha_touch.n_observations,
+                alpha_touch_est = format!("{:.4}", self.alpha_touch.estimate()),
+                spread_floor_n = self.spread_floor_bps.n_observations,
+                spread_floor_est = format!("{:.2}", self.spread_floor_bps.estimate()),
+                kappa_n = self.kappa.n_observations,
+                kappa_est = format!("{:.0}", self.kappa.estimate()),
+                "parameter_learner: milestone update"
+            );
+        }
+    }
+
+    /// Update regime-related parameters from an observed regime transition.
+    ///
+    /// Call this when the HMM detects a regime change (or confirms a stay).
+    ///
+    /// # Arguments
+    /// * `stayed_in_regime` - True if regime did not change, false if it transitioned
+    pub fn observe_regime_transition(&mut self, stayed_in_regime: bool) {
+        if stayed_in_regime {
+            self.regime_sticky_diagonal.observe_beta(1, 0);
+        } else {
+            self.regime_sticky_diagonal.observe_beta(0, 1);
+        }
+    }
+
+    /// Update BOCPD-related parameters from a changepoint detection event.
+    ///
+    /// # Arguments
+    /// * `samples_since_last_cp` - Number of samples observed since the last changepoint
+    /// * `was_changepoint` - Whether a changepoint was detected
+    pub fn observe_changepoint(&mut self, samples_since_last_cp: usize, was_changepoint: bool) {
+        if was_changepoint && samples_since_last_cp > 0 {
+            // Hazard rate = 1 / expected_run_length
+            let observed_rate = 1.0 / samples_since_last_cp as f64;
+            self.bocpd_hazard_rate
+                .observe_gamma_exponential(1.0 / observed_rate);
+        }
+
+        // Update changepoint detection threshold calibration
+        if was_changepoint {
+            self.bocpd_threshold.observe_beta(1, 0);
+        } else {
+            self.bocpd_threshold.observe_beta(0, 1);
+        }
+    }
+
+    /// Get the number of parameters that have at least one observation.
+    pub fn params_with_observations(&self) -> usize {
+        let params = [
+            &self.alpha_touch,
+            &self.gamma_base,
+            &self.spread_floor_bps,
+            &self.proactive_skew_sensitivity,
+            &self.quote_gate_edge_threshold,
+            &self.toxic_hour_gamma_mult,
+            &self.predictive_bias_sensitivity,
+            &self.max_daily_loss_fraction,
+            &self.max_drawdown,
+            &self.cascade_oi_threshold,
+            &self.bocpd_hazard_rate,
+            &self.bocpd_threshold,
+            &self.quote_latch_threshold_bps,
+            &self.kappa,
+            &self.hawkes_mu,
+            &self.hawkes_alpha,
+            &self.hawkes_beta,
+            &self.kappa_ewma_alpha,
+            &self.kelly_tracker_decay,
+            &self.regime_sticky_diagonal,
+            &self.kalman_q,
+            &self.kalman_r,
+            &self.momentum_normalizer_bps,
+            &self.depth_spacing_ratio,
+            &self.fill_probability_width_bps,
+            &self.microprice_decay,
+        ];
+        params.iter().filter(|p| p.n_observations > 0).count()
+    }
+}
+
 /// Calibration status summary.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CalibrationStatus {
@@ -1081,5 +1265,91 @@ mod tests {
     fn test_default_path() {
         let path = LearnedParameters::default_path("HYPE");
         assert!(path.to_str().unwrap().contains("hype_learned_params.json"));
+    }
+
+    #[test]
+    fn test_observe_fill_updates_parameters() {
+        let mut params = LearnedParameters::default();
+        assert_eq!(params.total_fills_observed, 0);
+        assert_eq!(params.params_with_observations(), 0);
+
+        let outcome = FillOutcome {
+            was_informed: true,
+            realized_as_bps: 4.5,
+            fill_distance_bps: 2.1,
+            realized_pnl: -0.003,
+            inter_arrival_s: Some(12.5),
+            fills_in_window: Some(5),
+            window_exposure: Some(0.01),
+            predicted_as_bps: Some(9.1),
+        };
+
+        params.observe_fill(&outcome);
+
+        assert_eq!(params.total_fills_observed, 1);
+        // alpha_touch, spread_floor_bps, gamma_base, fill_probability_width_bps,
+        // kappa, hawkes_mu should all have observations
+        assert!(params.alpha_touch.n_observations > 0);
+        assert!(params.spread_floor_bps.n_observations > 0);
+        assert!(params.gamma_base.n_observations > 0);
+        assert!(params.fill_probability_width_bps.n_observations > 0);
+        assert!(params.kappa.n_observations > 0);
+        assert!(params.hawkes_mu.n_observations > 0);
+        assert!(params.params_with_observations() >= 6);
+    }
+
+    #[test]
+    fn test_observe_fill_informed_vs_uninformed() {
+        let mut params = LearnedParameters::default();
+        let prior_alpha = params.alpha_touch.estimate();
+
+        // Feed 10 uninformed fills
+        for _ in 0..10 {
+            params.observe_fill(&FillOutcome {
+                was_informed: false,
+                realized_as_bps: 1.0,
+                fill_distance_bps: 1.5,
+                realized_pnl: 0.001,
+                inter_arrival_s: None,
+                fills_in_window: None,
+                window_exposure: None,
+                predicted_as_bps: None,
+            });
+        }
+
+        // alpha_touch should have moved below prior (fewer informed than expected)
+        assert!(params.alpha_touch.estimate() < prior_alpha);
+        assert_eq!(params.alpha_touch.n_observations, 10);
+    }
+
+    #[test]
+    fn test_observe_regime_transition() {
+        let mut params = LearnedParameters::default();
+        let prior_sticky = params.regime_sticky_diagonal.estimate();
+
+        // Feed 5 stays and 5 transitions
+        for _ in 0..5 {
+            params.observe_regime_transition(true);
+        }
+        for _ in 0..5 {
+            params.observe_regime_transition(false);
+        }
+
+        assert_eq!(params.regime_sticky_diagonal.n_observations, 10);
+        // 50% stay rate vs 95% prior → estimate should drop
+        assert!(params.regime_sticky_diagonal.estimate() < prior_sticky);
+    }
+
+    #[test]
+    fn test_observe_changepoint() {
+        let mut params = LearnedParameters::default();
+
+        params.observe_changepoint(100, true);
+        assert!(params.bocpd_hazard_rate.n_observations > 0);
+        assert!(params.bocpd_threshold.n_observations > 0);
+
+        params.observe_changepoint(0, false);
+        // Non-changepoint should still update threshold
+        assert_eq!(params.bocpd_threshold.n_observations, 2);
     }
 }

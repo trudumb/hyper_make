@@ -33,7 +33,16 @@
       "Bash(cargo add:*)",
       "Bash(sort:*)",
       "mcp__serena__write_memory",
-      "mcp__serena__check_onboarding_performed"
+      "mcp__serena__check_onboarding_performed",
+      "Bash(./scripts/test_mainnet.sh:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(cargo run:*)",
+      "WebSearch",
+      "WebFetch(domain:hyperliquid.gitbook.io)",
+      "Bash(curl:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)"
     ]
   }
 }

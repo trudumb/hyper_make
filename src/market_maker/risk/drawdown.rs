@@ -298,9 +298,12 @@ impl DrawdownTracker {
     }
 }
 
-// Ensure Send + Sync for thread safety
-unsafe impl Send for DrawdownTracker {}
-unsafe impl Sync for DrawdownTracker {}
+// Compile-time assertion: DrawdownTracker is Send + Sync because all fields are.
+// Previously used unsafe impl; this const assertion is the safe replacement.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<DrawdownTracker>();
+};
 
 /// Summary of drawdown state for reporting.
 #[derive(Debug, Clone)]

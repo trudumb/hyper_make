@@ -48,6 +48,11 @@ pub struct RiskState {
     /// Absolute price velocity over 1 second: abs(mid_delta / mid) / elapsed_s
     pub price_velocity_1s: f64,
 
+    // === Position Velocity ===
+    /// Position change rate: abs(position_delta) per minute.
+    /// Used by PositionVelocityMonitor to detect rapid accumulation or whipsaws.
+    pub position_velocity_1m: f64,
+
     // === Cascade/Tail Risk Metrics ===
     /// Liquidation cascade severity (0.0 = calm, 1.0+ = cascade)
     pub cascade_severity: f64,
@@ -127,6 +132,7 @@ impl RiskState {
             jump_ratio: 1.0,
             is_toxic_regime: false,
             price_velocity_1s: 0.0,
+            position_velocity_1m: 0.0,
             cascade_severity,
             tail_risk_multiplier: 1.0,
             should_pull_quotes: false,
@@ -187,6 +193,12 @@ impl RiskState {
     /// Builder-style method to set price velocity.
     pub fn with_price_velocity(mut self, velocity_1s: f64) -> Self {
         self.price_velocity_1s = velocity_1s;
+        self
+    }
+
+    /// Builder-style method to set position velocity (abs contracts per minute).
+    pub fn with_position_velocity(mut self, velocity_1m: f64) -> Self {
+        self.position_velocity_1m = velocity_1m;
         self
     }
 
@@ -330,6 +342,7 @@ impl Default for RiskState {
             jump_ratio: 1.0,
             is_toxic_regime: false,
             price_velocity_1s: 0.0,
+            position_velocity_1m: 0.0,
             cascade_severity: 0.0,
             tail_risk_multiplier: 1.0,
             should_pull_quotes: false,

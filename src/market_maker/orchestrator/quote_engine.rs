@@ -46,13 +46,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             return Ok(());
         }
 
+        // Track when first valid market data arrives (for warmup timeout).
+        // Using session_start_time includes WS connection time (~40s for HYPE),
+        // which defeats the 30s warmup timeout.
+        if self.first_data_time.is_none() {
+            info!(
+                session_age_s = self.session_start_time.elapsed().as_secs(),
+                "First market data received — warmup timeout starts now"
+            );
+            self.first_data_time = Some(std::time::Instant::now());
+        }
+
         // Don't place orders until estimator is warmed up (or timeout reached)
         if !self.estimator.is_warmed_up() {
             // Check warmup timeout: with informative Bayesian priors, we can safely
             // quote before all data thresholds are met. Spread floors and kill switches
             // provide protection. The estimator continues refining as data arrives.
             let max_warmup = self.estimator.max_warmup_secs();
-            let elapsed = self.session_start_time.elapsed();
+            let warmup_base = self.first_data_time.unwrap_or(self.session_start_time);
+            let elapsed = warmup_base.elapsed();
             if max_warmup > 0 && elapsed >= std::time::Duration::from_secs(max_warmup) {
                 let (vol_ticks, min_vol, trade_obs, min_trades) = self.estimator.warmup_progress();
                 warn!(
@@ -501,6 +513,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             max_position: self.config.max_position,
             latest_mid: self.latest_mid,
             risk_aversion: self.config.risk_aversion,
+            // Cached BBO from L2 book (same data reconciler validates against)
+            cached_best_bid: self.cached_best_bid,
+            cached_best_ask: self.cached_best_ask,
             // Exchange position limits
             exchange_limits_valid: exchange_limits.is_initialized(),
             exchange_effective_bid_limit: exchange_limits.effective_bid_limit(),
@@ -1696,10 +1711,14 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             explore,
         );
 
-        // Store state-action pair for credit assignment when fill occurs
-        self.stochastic.rl_agent.push_state_action_idx(
+        // Store state-action pair + inventory risk for credit assignment when fill occurs
+        let inventory_risk_at_action = (self.position.position().abs()
+            / self.effective_max_position.max(1.0))
+            .clamp(0.0, 1.0);
+        self.stochastic.rl_agent.push_state_action_with_risk(
             rl_recommendation.state_idx,
             rl_recommendation.action_idx,
+            inventory_risk_at_action,
         );
 
         // Populate MarketParams with RL recommendations
@@ -2009,6 +2028,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             &market_params,
         );
 
+        // Update kill switch with ladder depth for position runaway detection.
+        // Uses the larger side so the threshold reflects maximum one-sided exposure.
+        let max_one_side = ladder.total_ask_size().max(ladder.total_bid_size());
+        self.safety.kill_switch.set_ladder_depth(max_one_side);
+
         if !ladder.bids.is_empty() || !ladder.asks.is_empty() {
             // Multi-level ladder mode
             let mut bid_quotes: Vec<Quote> = ladder
@@ -2059,9 +2083,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let margin_state = self.infra.margin_sizer.state();
             // Get unrealized P&L for underwater position protection
             let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
+            // When user explicitly specified max_position (CLI/TOML), enforce as hard ceiling.
+            // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
+            let reduce_only_max = if self.config.max_position_user_specified {
+                self.effective_max_position.min(self.config.max_position)
+            } else {
+                self.effective_max_position
+            };
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
-                max_position: self.effective_max_position,
+                max_position: reduce_only_max,
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.to_string(),
@@ -2267,9 +2298,16 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             let margin_state = self.infra.margin_sizer.state();
             // Get unrealized P&L for underwater position protection
             let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
+            // When user explicitly specified max_position (CLI/TOML), enforce as hard ceiling.
+            // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
+            let reduce_only_max_single = if self.config.max_position_user_specified {
+                self.effective_max_position.min(self.config.max_position)
+            } else {
+                self.effective_max_position
+            };
             let reduce_only_config = quoting::ReduceOnlyConfig {
                 position: self.position.position(),
-                max_position: self.effective_max_position,
+                max_position: reduce_only_max_single,
                 mid_price: self.latest_mid,
                 max_position_value: self.safety.kill_switch.max_position_value(),
                 asset: self.config.asset.to_string(),

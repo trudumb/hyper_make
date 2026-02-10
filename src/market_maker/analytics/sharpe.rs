@@ -84,6 +84,52 @@ impl SharpeTracker {
         sum / self.returns.len() as f64
     }
 
+    /// Bootstrapped confidence interval for the all-time Sharpe ratio.
+    ///
+    /// Returns `(point_estimate, lower_ci, upper_ci)`.
+    /// Uses 1000 bootstrap resamples of the fill returns.
+    /// `confidence` should be in (0, 1), e.g., 0.90 for 90% CI.
+    pub fn sharpe_with_confidence(&self, confidence: f64) -> (f64, f64, f64) {
+        let point = self.sharpe_ratio();
+        let n = self.returns.len();
+        if n < 2 {
+            return (point, point, point);
+        }
+
+        const NUM_RESAMPLES: usize = 1000;
+        let mut resampled_sharpes = Vec::with_capacity(NUM_RESAMPLES);
+        let mut rng_state: u64 = 0x5DEE_CE66_D1A4_F681 ^ (n as u64);
+
+        for _ in 0..NUM_RESAMPLES {
+            let mut sample = Vec::with_capacity(n);
+            for _ in 0..n {
+                // Simple LCG PRNG (good enough for bootstrap index selection)
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let idx = ((rng_state >> 33) as usize) % n;
+                sample.push(self.returns[idx].clone());
+            }
+            // Sort by timestamp so elapsed_secs works correctly
+            sample.sort_by_key(|r| r.timestamp_ns);
+            resampled_sharpes.push(compute_sharpe(&sample));
+        }
+
+        resampled_sharpes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let alpha = (1.0 - confidence) / 2.0;
+        let lower_idx = ((alpha * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
+        let upper_idx = (((1.0 - alpha) * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
+
+        (point, resampled_sharpes[lower_idx], resampled_sharpes[upper_idx])
+    }
+
+    /// Whether n_fills is sufficient for meaningful Sharpe estimation.
+    ///
+    /// With fewer than 30 fills, the Sharpe estimate has very wide confidence intervals
+    /// and should be flagged as "insufficient data" in operator displays.
+    pub fn has_sufficient_data(&self) -> bool {
+        self.returns.len() >= 30
+    }
+
     /// Summary with Sharpe at multiple horizons.
     pub fn summary(&self) -> SharpeSummary {
         const SECS_1H: u64 = 3600;
@@ -322,5 +368,45 @@ mod tests {
         assert_eq!(tracker.signal_sharpe("missing"), None);
         assert!(tracker.all_sharpes().is_empty());
         assert_eq!(tracker.format_report(), "No signal data");
+    }
+
+    #[test]
+    fn test_sharpe_with_confidence() {
+        let mut tracker = SharpeTracker::new();
+        // 50 fills with positive drift and some variance
+        for i in 0..50 {
+            let ret = 3.0 + (i as f64 % 5.0) - 2.0; // returns: 1, 2, 3, 4, 5, 1, 2, ...
+            tracker.add_return(ret, (i as u64) * 1_000_000_000);
+        }
+        let (point, lower, upper) = tracker.sharpe_with_confidence(0.90);
+        // Point estimate should be positive (mean > 0)
+        assert!(point > 0.0, "Expected positive Sharpe, got {point}");
+        // CI should bracket the point estimate
+        assert!(lower <= point, "Lower CI {lower} > point {point}");
+        assert!(upper >= point, "Upper CI {upper} < point {point}");
+        // CI should be wider than zero
+        assert!(upper > lower, "CI has zero width: [{lower}, {upper}]");
+    }
+
+    #[test]
+    fn test_sharpe_with_confidence_insufficient_data() {
+        let mut tracker = SharpeTracker::new();
+        tracker.add_return(5.0, 1_000_000_000);
+        let (point, lower, upper) = tracker.sharpe_with_confidence(0.90);
+        assert_eq!(point, 0.0);
+        assert_eq!(lower, 0.0);
+        assert_eq!(upper, 0.0);
+    }
+
+    #[test]
+    fn test_has_sufficient_data() {
+        let mut tracker = SharpeTracker::new();
+        assert!(!tracker.has_sufficient_data());
+        for i in 0..29 {
+            tracker.add_return(1.0, (i as u64) * 1_000_000_000);
+        }
+        assert!(!tracker.has_sufficient_data());
+        tracker.add_return(1.0, 29_000_000_000);
+        assert!(tracker.has_sufficient_data());
     }
 }

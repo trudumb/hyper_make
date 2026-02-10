@@ -167,6 +167,56 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             }
         }
 
+        // === P1: HARD Position Limit Enforcement ===
+        // Absolute hard limit — reject any order that would increase position beyond max.
+        // When user explicitly specified max_position, enforce as hard ceiling.
+        // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
+        {
+            let current_pos = self.position.position();
+            let max_pos = if self.config.max_position_user_specified {
+                self.effective_max_position.min(self.config.max_position)
+            } else {
+                self.effective_max_position
+            };
+            let would_increase = (is_buy && current_pos >= 0.0) || (!is_buy && current_pos <= 0.0);
+            if would_increase && current_pos.abs() >= max_pos {
+                warn!(
+                    side = %side_str(side),
+                    position = %format!("{:.4}", current_pos),
+                    max_position = %format!("{:.4}", max_pos),
+                    effective_max = %format!("{:.4}", self.effective_max_position),
+                    config_max = %format!("{:.4}", self.config.max_position),
+                    "HARD LIMIT: rejecting order that would increase position beyond max"
+                );
+                return Ok(());
+            }
+        }
+
+        // === P1: Reduce-Only Enforcement ===
+        // When position exceeds a fraction of max, reject any position-increasing orders.
+        // Uses 95% of the effective limit as soft limit.
+        {
+            let current_pos = self.position.position();
+            let hard_max = if self.config.max_position_user_specified {
+                self.effective_max_position.min(self.config.max_position)
+            } else {
+                self.effective_max_position
+            };
+            let reduce_only_threshold = hard_max * 0.95;
+            if current_pos.abs() >= reduce_only_threshold {
+                let would_increase = (is_buy && current_pos >= 0.0) || (!is_buy && current_pos <= 0.0);
+                if would_increase {
+                    debug!(
+                        side = %side_str(side),
+                        position = %format!("{:.4}", current_pos),
+                        threshold = %format!("{:.4}", reduce_only_threshold),
+                        "Reduce-only: rejecting position-increasing order (position at 95%+ of limit)"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         // === Position Guard Hard Entry Gate ===
         // Reject orders that would push worst-case position beyond hard limit
         let entry_check = self.safety.position_guard.check_order_entry(

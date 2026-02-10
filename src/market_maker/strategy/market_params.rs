@@ -855,6 +855,13 @@ pub struct MarketParams {
     /// Whether learned parameters are calibrated (Tier 1 ready).
     /// True when alpha_touch has 50+ obs with CV < 0.5, etc.
     pub learned_params_calibrated: bool,
+
+    // === Cached BBO from L2 Book ===
+    /// Cached best bid from L2 book (for bounding inventory skew offset).
+    /// This is the actual exchange BBO, NOT derived from market_mid ± spread.
+    pub cached_best_bid: f64,
+    /// Cached best ask from L2 book (for bounding inventory skew offset).
+    pub cached_best_ask: f64,
 }
 
 impl Default for MarketParams {
@@ -1108,6 +1115,9 @@ impl Default for MarketParams {
             learned_alpha_touch: 0.25,          // Prior mean (25% informed)
             learned_spread_floor_bps: 5.0,      // Prior mean (5 bps)
             learned_params_calibrated: false,   // Not calibrated initially
+            // Cached BBO (0.0 = not yet received from L2 book)
+            cached_best_bid: 0.0,
+            cached_best_ask: 0.0,
         }
     }
 }

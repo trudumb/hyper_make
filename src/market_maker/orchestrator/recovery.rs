@@ -637,11 +637,25 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             } else {
                 // Validator perps: Get all values from perps clearinghouse
                 let user_state = self.info_client.user_state(self.user_address).await?;
-                let account_value: f64 = user_state
+                let cross_value: f64 = user_state
                     .cross_margin_summary
                     .account_value
                     .parse()
                     .unwrap_or(0.0);
+                let margin_value: f64 = user_state
+                    .margin_summary
+                    .account_value
+                    .parse()
+                    .unwrap_or(0.0);
+
+                // Unified margin: perps clearinghouse + spot stablecoin balances
+                let perps_value = cross_value.max(margin_value);
+                let spot_collateral: f64 = ["USDC", "USDT", "USDE"]
+                    .iter()
+                    .filter_map(|coin| self.spot_balance_cache.get(*coin).copied())
+                    .sum();
+                let account_value = perps_value + spot_collateral;
+
                 let margin_used: f64 = user_state
                     .cross_margin_summary
                     .total_margin_used

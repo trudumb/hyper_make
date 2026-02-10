@@ -48,6 +48,9 @@ pub struct MarketMakerConfig {
     /// Contracts value (`max_position`) is derived from this at startup.
     /// When zero, the system was configured via contracts directly (backward-compat).
     pub max_position_usd: f64,
+    /// Whether max_position was explicitly set by the user (CLI or TOML).
+    /// When false, max_position is margin-derived and should NOT cap effective_max_position.
+    pub max_position_user_specified: bool,
     /// Decimals for price rounding
     pub decimals: u32,
     /// Decimals for size rounding (from asset metadata)
@@ -225,6 +228,7 @@ mod tests {
             max_bps_diff: 10,
             max_position: 5.0,
             max_position_usd: 10_000.0,
+            max_position_user_specified: false,
             decimals: 2,
             sz_decimals: 3,
             multi_asset: false,

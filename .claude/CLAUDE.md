@@ -100,6 +100,15 @@ IMPORTANT — these are non-negotiable:
 - **Compaction**: When compacting, preserve the full list of modified files, test commands used, and any calibration metrics discussed
 - **Subagents**: Use for codebase exploration and investigation to keep main context clean
 
+## Memory Management
+
+Keep memory files continuously updated throughout every session — don't wait until the end.
+
+- **Auto memory** (`~/.claude/projects/.../memory/MEMORY.md`): Update after every significant milestone — commit, fix validated, architecture decision made, bug discovered, or live run completed. Keep the timeline table and "Current State" section current.
+- **Serena memories** (`.serena/memories/`): Write a session memory at the end of each session with: what changed, why, validation results, and open issues. Name format: `session_YYYY-MM-DD_<topic>`.
+- **What to record immediately**: bug root causes, parameter values that worked/failed, architectural decisions with rationale, test results, live run metrics, anything that cost time to figure out.
+- **Keep it honest**: Record actual commit hashes, real metrics, and ground truth — not aspirational numbers. If something is broken, say so.
+
 ---
 
 ## Common Gotchas

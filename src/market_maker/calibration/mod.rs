@@ -47,7 +47,7 @@ pub use historical_calibrator::{
 pub use meta_calibration::{MetaCalibrationTracker, ModelCalibrationTracker};
 pub use information_ratio::{BinStats, ExponentialIRTracker, InformationRatioTracker, IrDiagnostics};
 pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
-pub use parameter_learner::{BayesianParam, CalibrationStatus, LearnedParameters, PriorFamily};
+pub use parameter_learner::{BayesianParam, CalibrationStatus, FillOutcome, LearnedParameters, PriorFamily};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};
 pub use signal_decay::{
     LatencyStats, SignalDecayConfig, SignalDecayTracker, SignalEmission, SignalOutcome,

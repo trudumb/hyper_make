@@ -48,3 +48,30 @@ Comprehensive audit of all risk systems for production readiness.
 **Gotcha**: `update_position()` now triggers liquidation detection, so existing tests that call
 it without recording fills first may fail. Fixed `test_summary` by the startup guard (no trigger
 before first fill). New tests must set `last_fill_time` to expired instant for trigger tests.
+
+### PositionVelocityMonitor (2026-02-09)
+
+10. **PositionVelocityMonitor**: NEW monitor in `risk/monitors/position_velocity.rs`. Reads
+    `position_velocity_1m` from RiskState (abs position change per minute, normalized by max_position).
+    Three thresholds: warn (0.50, widen 1.5-3x), pull (1.00), kill (2.00). Priority 12.
+    Config: `position_velocity_threshold` on KillSwitchConfig (default 0.50).
+    Use `PositionVelocityMonitor::from_base_threshold(config.position_velocity_threshold)`.
+
+11. **unsafe impl Send/Sync FIXED**: Replaced with safe `const _: fn() = || { ... }` pattern
+    on DrawdownTracker, CircuitBreakerMonitor, and RiskChecker.
+
+### Full Audit (2026-02-09)
+
+**Overall: 8.5/10 production-ready.** 3 HIGH, 3 MEDIUM, 5 LOW, 3 INFORMATIONAL findings.
+
+**HIGH findings (status):**
+- Inventory breach: entry gate is pre-flight only, exchange sync + clustered fills bypass it
+- Reduce-only not hard-enforced: `check_reduce_only()` only logs, quote engine skew is soft
+- ~~No position velocity monitor~~ FIXED (2026-02-09): PositionVelocityMonitor added
+
+**MEDIUM findings (status):**
+- ~~`unsafe impl Send/Sync`~~ FIXED (2026-02-09): replaced with safe compile-time assertions
+- Drawdown denominator inconsistency: DrawdownMonitor uses account_value, KillSwitch uses peak_pnl
+- `effective_max_position` not propagated to PositionGuard (guard uses config.max_position)
+
+**All PASS items:** 7 monitors correct, action escalation chain complete, kill switch 9 triggers verified, checkpoint persistence with 24h expiry, PostMortemDump wired on kill, Alerter thread-safe with dedup, circuit breakers covering 5 conditions, reentry manager with multi-kill escalation.

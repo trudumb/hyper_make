@@ -247,6 +247,11 @@ pub struct LadderParams {
 
     /// Warmup progress [0.0, 1.0]. Used to gate RL adjustments (disabled when < 0.5).
     pub warmup_pct: f64,
+
+    /// Cached best bid from exchange BBO (derived from market_mid ± spread/2)
+    pub cached_best_bid: f64,
+    /// Cached best ask from exchange BBO (derived from market_mid ± spread/2)
+    pub cached_best_ask: f64,
 }
 
 #[cfg(test)]
@@ -308,6 +313,8 @@ mod tests {
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.0,
             warmup_pct: 1.0,
+            cached_best_bid: 99.99,
+            cached_best_ask: 100.01,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -364,6 +371,8 @@ mod tests {
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.0,
             warmup_pct: 1.0,
+            cached_best_bid: 999.9,
+            cached_best_ask: 1000.1,
         };
 
         let params_long = LadderParams {
@@ -434,6 +443,8 @@ mod tests {
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.0,
             warmup_pct: 1.0,
+            cached_best_bid: 99.99,
+            cached_best_ask: 100.01,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -494,6 +505,9 @@ mod tests {
             position_action: crate::market_maker::strategy::PositionAction::default(),
             effective_inventory_ratio: 0.3, // Matches inventory_ratio for REDUCE
             warmup_pct: 1.0,
+            // Wide BBO so drift skew offset (15.79 bps) isn't capped by half-spread bound
+            cached_best_bid: 99.80,
+            cached_best_ask: 100.20,
         };
 
         // Same params but WITHOUT drift adjustment

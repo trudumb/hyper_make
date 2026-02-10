@@ -811,6 +811,17 @@ impl LadderStrategy {
             position_action: market_params.position_action,
             effective_inventory_ratio: market_params.effective_inventory_ratio,
             warmup_pct: market_params.adaptive_warmup_progress,
+            // Use actual L2 book BBO when available; fall back to market_mid ± spread
+            cached_best_bid: if market_params.cached_best_bid > 0.0 {
+                market_params.cached_best_bid
+            } else {
+                market_params.market_mid * (1.0 - market_params.market_spread_bps / 20000.0)
+            },
+            cached_best_ask: if market_params.cached_best_ask > 0.0 {
+                market_params.cached_best_ask
+            } else {
+                market_params.market_mid * (1.0 + market_params.market_spread_bps / 20000.0)
+            },
         };
 
         // === SPREAD FLOOR: Adaptive vs Static ===
@@ -1057,9 +1068,10 @@ impl LadderStrategy {
             };
 
             // Component weights (sum to 1.0)
-            const INVENTORY_WEIGHT: f64 = 0.6; // Primary: inventory reduction
-            const MOMENTUM_WEIGHT: f64 = 0.3; // Secondary: follow flow direction
-            const URGENCY_WEIGHT: f64 = 0.1; // Amplifier: danger detection
+            const INVENTORY_WEIGHT: f64 = 0.50; // Primary: inventory reduction
+            const MOMENTUM_WEIGHT: f64 = 0.25; // Secondary: follow flow direction
+            const URGENCY_WEIGHT: f64 = 0.10; // Amplifier: danger detection
+            const DIRECTIONAL_WEIGHT: f64 = 0.15; // Directional: alpha + knife + flow
 
             // Sensitivity factors
             const INVENTORY_SENSITIVITY: f64 = 0.4; // How much inventory affects split
@@ -1123,10 +1135,32 @@ impl LadderStrategy {
                 0.0
             };
 
+            // 4. DIRECTIONAL COMPONENT: Use alpha + knife + flow for asymmetry
+            // When position is flat and cross-venue signals are unavailable,
+            // directional signals (alpha, knife, flow) still indicate where the market
+            // is headed. This component ensures we lean quotes toward the strong side.
+            let directional_signal = {
+                let knife_dir =
+                    market_params.rising_knife_score - market_params.falling_knife_score;
+                let knife_strength = knife_dir.abs().min(2.0) / 2.0;
+                // Alpha amplifies directional conviction — higher alpha = stronger lean
+                let alpha_amp = 1.0 + market_params.predicted_alpha.min(0.5) * 2.0;
+                const KNIFE_COMPONENT: f64 = 0.4;
+                const FLOW_COMPONENT: f64 = 0.4;
+                const LEAD_LAG_COMPONENT: f64 = 0.2;
+                const DIRECTIONAL_SENSITIVITY: f64 = 0.3;
+                let raw = (knife_dir.signum() * knife_strength * KNIFE_COMPONENT
+                    + market_params.flow_imbalance * FLOW_COMPONENT
+                    + market_params.lead_lag_signal_bps / 5.0 * LEAD_LAG_COMPONENT)
+                    * alpha_amp;
+                raw.clamp(-1.0, 1.0) * DIRECTIONAL_SENSITIVITY
+            };
+
             // Combine weighted components
             let combined_signal = inventory_signal * INVENTORY_WEIGHT
                 + momentum_signal * MOMENTUM_WEIGHT
-                + urgency_signal * URGENCY_WEIGHT;
+                + urgency_signal * URGENCY_WEIGHT
+                + directional_signal * DIRECTIONAL_WEIGHT;
 
             // Apply to base 0.5 split with wider clamp range [0.25, 0.75]
             // This allows stronger skew when signals are aligned
@@ -1143,6 +1177,7 @@ impl LadderStrategy {
                 flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
                 position_opposes = %market_params.position_opposes_momentum,
                 urgency_score = %format!("{:.2}", market_params.urgency_score),
+                directional = %format!("{:.3}", directional_signal),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
                 "Margin allocation (stochastic-weighted split)"
@@ -1156,6 +1191,7 @@ impl LadderStrategy {
                 momentum_severity = %format!("{:.2}", momentum_severity),
                 knife_opposes = %knife_opposes_position,
                 urgency_adj = %format!("{:.3}", urgency_score_adj),
+                directional = %format!("{:.3}", directional_signal),
                 kappa_used = %format!("{:.0}", kappa),
                 as_warmed_up = %market_params.as_warmed_up,
                 "[SIGNALS] signal contribution summary"
@@ -1864,5 +1900,167 @@ fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
     } else {
         // Legacy fallback: exponential decay with 10bp characteristic depth
         params.as_at_touch_bps * (-depth_bps / 10.0).exp()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compute the directional signal exactly as in `generate_ladder` margin split.
+    /// Extracted to a helper so we can unit test it without constructing a full ladder.
+    fn compute_directional_signal(market_params: &MarketParams) -> f64 {
+        let knife_dir = market_params.rising_knife_score - market_params.falling_knife_score;
+        let knife_strength = knife_dir.abs().min(2.0) / 2.0;
+        let alpha_amp = 1.0 + market_params.predicted_alpha.min(0.5) * 2.0;
+        const KNIFE_COMPONENT: f64 = 0.4;
+        const FLOW_COMPONENT: f64 = 0.4;
+        const LEAD_LAG_COMPONENT: f64 = 0.2;
+        const DIRECTIONAL_SENSITIVITY: f64 = 0.3;
+        let raw = (knife_dir.signum() * knife_strength * KNIFE_COMPONENT
+            + market_params.flow_imbalance * FLOW_COMPONENT
+            + market_params.lead_lag_signal_bps / 5.0 * LEAD_LAG_COMPONENT)
+            * alpha_amp;
+        raw.clamp(-1.0, 1.0) * DIRECTIONAL_SENSITIVITY
+    }
+
+    /// Compute the ask_margin_weight as in `generate_ladder` margin split,
+    /// using position=0 (flat) and no urgency.
+    fn compute_ask_margin_weight(market_params: &MarketParams) -> f64 {
+        const INVENTORY_WEIGHT: f64 = 0.50;
+        const MOMENTUM_WEIGHT: f64 = 0.25;
+        const URGENCY_WEIGHT: f64 = 0.10;
+        const DIRECTIONAL_WEIGHT: f64 = 0.15;
+        const MOMENTUM_SENSITIVITY: f64 = 0.3;
+
+        let inventory_signal = 0.0; // flat position
+        let inventory_flat_factor = 1.0; // flat means full momentum weight
+        let momentum_signal = market_params.flow_imbalance * MOMENTUM_SENSITIVITY * inventory_flat_factor;
+        let urgency_signal = 0.0; // no urgency when flat
+        let directional_signal = compute_directional_signal(market_params);
+
+        let combined_signal = inventory_signal * INVENTORY_WEIGHT
+            + momentum_signal * MOMENTUM_WEIGHT
+            + urgency_signal * URGENCY_WEIGHT
+            + directional_signal * DIRECTIONAL_WEIGHT;
+
+        (0.5 + combined_signal).clamp(0.25, 0.75)
+    }
+
+    #[test]
+    fn test_margin_split_bullish_no_binance() {
+        // Scenario: alpha=0.166, rising_knife=0.1, flow=0.083, position=0
+        // This is the exact scenario from the mainnet HYPE incident.
+        // Without the directional component, ask_margin_weight would be ~0.5.
+        // With it, bullish signals should push ask_margin_weight above 0.50.
+        let mut params = MarketParams::default();
+        params.predicted_alpha = 0.166;
+        params.rising_knife_score = 0.1;
+        params.falling_knife_score = 0.0;
+        params.flow_imbalance = 0.083;
+        params.lead_lag_signal_bps = 0.0; // No Binance
+
+        let ask_weight = compute_ask_margin_weight(&params);
+
+        assert!(
+            ask_weight > 0.50,
+            "Bullish signals (alpha=0.166, rising_knife=0.1, flow=0.083) should \
+             push ask_margin_weight above 0.50, got: {:.4}",
+            ask_weight
+        );
+    }
+
+    #[test]
+    fn test_margin_split_strong_bullish() {
+        // Scenario: strong bullish with alpha=0.5, rising_knife=1.5, flow=0.5
+        let mut params = MarketParams::default();
+        params.predicted_alpha = 0.5;
+        params.rising_knife_score = 1.5;
+        params.falling_knife_score = 0.0;
+        params.flow_imbalance = 0.5;
+        params.lead_lag_signal_bps = 0.0;
+
+        let ask_weight = compute_ask_margin_weight(&params);
+
+        assert!(
+            ask_weight > 0.53,
+            "Strong bullish signals should push ask_margin_weight above 0.53, got: {:.4}",
+            ask_weight
+        );
+    }
+
+    #[test]
+    fn test_directional_signal_symmetric() {
+        // Mirror bullish and bearish should produce symmetric results
+        let mut bullish = MarketParams::default();
+        bullish.rising_knife_score = 1.0;
+        bullish.falling_knife_score = 0.0;
+        bullish.flow_imbalance = 0.5;
+        bullish.predicted_alpha = 0.3;
+
+        let mut bearish = MarketParams::default();
+        bearish.rising_knife_score = 0.0;
+        bearish.falling_knife_score = 1.0;
+        bearish.flow_imbalance = -0.5;
+        bearish.predicted_alpha = 0.3;
+
+        let bull_signal = compute_directional_signal(&bullish);
+        let bear_signal = compute_directional_signal(&bearish);
+
+        assert!(
+            (bull_signal + bear_signal).abs() < 0.01,
+            "Symmetric bullish/bearish should cancel: bull={:.4}, bear={:.4}",
+            bull_signal,
+            bear_signal
+        );
+    }
+
+    #[test]
+    fn test_directional_signal_clamped() {
+        // Extreme values should be clamped to [-0.3, 0.3]
+        let mut extreme = MarketParams::default();
+        extreme.rising_knife_score = 5.0;
+        extreme.falling_knife_score = 0.0;
+        extreme.flow_imbalance = 1.0;
+        extreme.lead_lag_signal_bps = 50.0;
+        extreme.predicted_alpha = 1.0;
+
+        let signal = compute_directional_signal(&extreme);
+
+        assert!(
+            signal <= 0.3 + f64::EPSILON,
+            "Directional signal should be capped at 0.3, got: {:.4}",
+            signal
+        );
+        assert!(signal > 0.0, "Should be positive for bullish inputs");
+    }
+
+    #[test]
+    fn test_directional_signal_zero_when_neutral() {
+        // All neutral inputs should produce zero directional signal
+        let params = MarketParams::default();
+        let signal = compute_directional_signal(&params);
+
+        assert!(
+            signal.abs() < 0.01,
+            "Neutral inputs should produce near-zero signal, got: {:.4}",
+            signal
+        );
+    }
+
+    #[test]
+    fn test_weights_sum_to_one() {
+        // Verify the component weights sum to 1.0
+        const INVENTORY_WEIGHT: f64 = 0.50;
+        const MOMENTUM_WEIGHT: f64 = 0.25;
+        const URGENCY_WEIGHT: f64 = 0.10;
+        const DIRECTIONAL_WEIGHT: f64 = 0.15;
+
+        let sum = INVENTORY_WEIGHT + MOMENTUM_WEIGHT + URGENCY_WEIGHT + DIRECTIONAL_WEIGHT;
+        assert!(
+            (sum - 1.0).abs() < f64::EPSILON,
+            "Weights should sum to 1.0, got: {}",
+            sum
+        );
     }
 }

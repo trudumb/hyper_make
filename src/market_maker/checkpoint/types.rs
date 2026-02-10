@@ -113,6 +113,12 @@ pub struct PreFillCheckpoint {
     /// Number of normalizer observations
     #[serde(default)]
     pub normalizer_obs_count: usize,
+    /// AS bias correction EWMA in bps (predicted - realized)
+    #[serde(default)]
+    pub bias_correction_bps: f64,
+    /// Number of AS bias observations
+    #[serde(default)]
+    pub bias_observation_count: usize,
 }
 
 fn default_ewma_var() -> f64 {
@@ -144,6 +150,8 @@ impl Default for PreFillCheckpoint {
             changepoint_ewma_mean: 0.0,
             changepoint_ewma_var: 1.0,
             normalizer_obs_count: 0,
+            bias_correction_bps: 0.0,
+            bias_observation_count: 0,
         }
     }
 }

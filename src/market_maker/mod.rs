@@ -182,6 +182,10 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     // === Session Tracking ===
     /// Session start time for controller terminal condition handling
     session_start_time: std::time::Instant,
+    /// Time when first valid market data arrived (for warmup timeout).
+    /// `None` until the data quality gate first passes. Using session_start_time
+    /// includes WS connection time (~40s for HYPE), defeating the 30s warmup timeout.
+    first_data_time: Option<std::time::Instant>,
 
     // === L2 Book & Trade Cache (for EnhancedFlowContext) ===
     /// Cached L2 bid sizes (top 5 levels) for EnhancedFlowContext depth imbalance.
@@ -231,6 +235,12 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     last_mid_velocity_time: std::time::Instant,
     /// Current price velocity (abs(delta_mid / mid) per second).
     price_velocity_1s: f64,
+
+    // === Position Velocity Tracking (Rapid Accumulation Detection) ===
+    /// Rolling position history for velocity computation (Instant, position).
+    position_history: std::collections::VecDeque<(std::time::Instant, f64)>,
+    /// Current position velocity (abs change / max_position per minute).
+    position_velocity_1m: f64,
 
     // === Signal Diagnostics Cache (Phase 1) ===
     /// Cached market params from last quote cycle.
@@ -399,6 +409,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_high_risk_state: false,
             learning: learning::LearningModule::default(),
             session_start_time: std::time::Instant::now(),
+            first_data_time: None,
             // L2 book & trade cache for EnhancedFlowContext
             cached_bid_sizes: Vec::with_capacity(5),
             cached_ask_sizes: Vec::with_capacity(5),
@@ -418,6 +429,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             last_mid_for_velocity: 0.0,
             last_mid_velocity_time: std::time::Instant::now(),
             price_velocity_1s: 0.0,
+            // Position velocity tracking for rapid accumulation detection
+            position_history: std::collections::VecDeque::with_capacity(120),
+            position_velocity_1m: 0.0,
             // Signal diagnostics cache (updated each quote cycle)
             cached_market_params: None,
             // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
@@ -772,13 +786,18 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let position = self.position.position();
 
-        // HARMONIZED: Use effective_max_position for risk state calculations
-        // Use pnl_tracker's tracked peak_pnl for accurate drawdown calculation
+        // When user explicitly specified max_position (CLI/TOML), enforce as hard ceiling.
+        // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
+        let risk_max_position = if self.config.max_position_user_specified {
+            self.effective_max_position.min(self.config.max_position)
+        } else {
+            self.effective_max_position
+        };
         risk::RiskState::new(
             pnl_summary.total_pnl,
             pnl_summary.peak_pnl,
             position,
-            self.effective_max_position, // First-principles limit
+            risk_max_position, // min(effective, config) — user config is hard constraint
             self.latest_mid,
             self.safety.kill_switch.max_position_value(),
             self.infra.margin_sizer.state().account_value,
@@ -814,6 +833,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         )
         .with_rate_limit_errors(self.safety.kill_switch.state().rate_limit_errors)
         .with_price_velocity(self.price_velocity_1s)
+        .with_position_velocity(self.position_velocity_1m)
     }
 
     /// Get current session time as fraction [0, 1].
@@ -854,6 +874,10 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Capital-efficient: margin data for position runaway check
             account_value: margin_state.account_value,
             leverage: self.infra.margin_sizer.max_leverage(),
+            // Ladder depth updated separately via set_ladder_depth()
+            max_ladder_one_side_contracts: self.safety.kill_switch.state().max_ladder_one_side_contracts,
+            // Preserve initial position from startup for runaway exemption
+            initial_position: self.safety.kill_switch.state().initial_position,
         };
 
         // Update position in kill switch (for value calculation)
@@ -934,6 +958,9 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 config.price_velocity_threshold,
                 config.price_velocity_threshold * 3.0, // Kill at 3x pull threshold
             )))
+            .with_monitor(Box::new(PositionVelocityMonitor::from_base_threshold(
+                config.position_velocity_threshold,
+            )))
     }
 
     /// Evaluate risk using the unified RiskAggregator.
@@ -942,5 +969,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     pub fn evaluate_risk(&self) -> risk::AggregatedRisk {
         let state = self.build_risk_state();
         self.safety.risk_aggregator.evaluate(&state)
+    }
+
+    /// Update position velocity tracking after a fill or position change.
+    /// Computes abs(position_change) / max_position per minute over a 60s window.
+    pub fn update_position_velocity(&mut self) {
+        let now = std::time::Instant::now();
+        let current_pos = self.position.position();
+        self.position_history.push_back((now, current_pos));
+
+        // Prune entries older than 60 seconds
+        let window = std::time::Duration::from_secs(60);
+        while let Some(&(t, _)) = self.position_history.front() {
+            if now.duration_since(t) > window {
+                self.position_history.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Compute velocity: max position swing in window / max_position
+        if self.position_history.len() >= 2 {
+            let oldest_pos = self.position_history.front().map(|&(_, p)| p).unwrap_or(current_pos);
+            let max_pos = self.effective_max_position.max(0.001); // avoid div by zero
+            self.position_velocity_1m = (current_pos - oldest_pos).abs() / max_pos;
+        }
     }
 }

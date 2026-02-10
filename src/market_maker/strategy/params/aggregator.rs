@@ -102,6 +102,13 @@ pub struct ParameterSources<'a> {
     /// Learned parameters from Bayesian online learning.
     /// When calibrated and enabled, these replace static config values.
     pub learned_params: Option<LearnedParameterValues>,
+
+    // === Cached BBO from L2 Book ===
+    /// Cached best bid from L2 book (for bounding inventory skew offset).
+    /// Set from QuoteEngine's L2Book subscription — same data reconciler validates against.
+    pub cached_best_bid: f64,
+    /// Cached best ask from L2 book (for bounding inventory skew offset).
+    pub cached_best_ask: f64,
 }
 
 /// Learned parameter values for use in quoting calculations.
@@ -236,6 +243,8 @@ impl ParameterAggregator {
             // === Microprice: data-driven fair price ===
             microprice: est.microprice(),
             market_mid: sources.latest_mid, // Raw exchange mid for safety checks
+            cached_best_bid: sources.cached_best_bid,
+            cached_best_ask: sources.cached_best_ask,
             beta_book: est.beta_book(),
             beta_flow: est.beta_flow(),
 

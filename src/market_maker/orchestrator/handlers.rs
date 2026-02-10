@@ -208,6 +208,38 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 Some(magnitude_bps),
             );
 
+            // Feed outcome to enhanced microstructure classifier
+            self.tier1.enhanced_classifier.record_outcome(
+                pending.is_buy,
+                was_adverse,
+                Some(magnitude_bps),
+            );
+
+            // === P0: Feed fill outcome to Bayesian parameter learner ===
+            // This updates all 27 conjugate prior parameters from markout data.
+            {
+                use crate::market_maker::calibration::parameter_learner::FillOutcome;
+
+                let direction = if pending.is_buy { 1.0 } else { -1.0 };
+                let as_realized = (self.latest_mid - pending.fill_price) * direction / pending.fill_price;
+                let as_realized_bps = as_realized * 10_000.0;
+                let fill_distance_bps = ((pending.fill_price - pending.mid_at_fill).abs() / pending.mid_at_fill) * 10_000.0;
+                let fill_pnl = -as_realized; // Negative AS = profit
+                let predicted_as_bps_val = self.tier1.pre_fill_classifier.cached_toxicity() * 10_000.0;
+
+                let outcome = FillOutcome {
+                    was_informed: was_adverse,
+                    realized_as_bps: as_realized_bps,
+                    fill_distance_bps,
+                    realized_pnl: fill_pnl,
+                    inter_arrival_s: None, // Not tracked at markout time
+                    fills_in_window: None,
+                    window_exposure: None,
+                    predicted_as_bps: Some(predicted_as_bps_val),
+                };
+                self.stochastic.learned_params.observe_fill(&outcome);
+            }
+
             // Feed outcome to model gating for AS prediction calibration
             let predicted_as_prob = self.tier1.pre_fill_classifier.cached_toxicity();
             self.stochastic
@@ -302,6 +334,33 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Wire trade to buy pressure tracker in SignalIntegrator
             self.stochastic.signal_integrator.on_trade_for_pressure(size, is_buy);
 
+            // === P0: Wire trade features to SignalIntegrator for informed flow classification ===
+            {
+                use crate::market_maker::estimator::informed_flow::TradeFeatures;
+
+                // Compute inter-arrival from last cached trade
+                let inter_arrival_ms = self.cached_trades.back()
+                    .map(|&(_, _, prev_ts)| timestamp_ms.saturating_sub(prev_ts))
+                    .unwrap_or(1000); // Default 1s if no previous trade
+
+                // Price impact: |trade_price - mid| / mid * 10000 (bps)
+                let price_impact_bps = if self.latest_mid > 0.0 {
+                    ((trade_price - self.latest_mid).abs() / self.latest_mid) * 10_000.0
+                } else {
+                    0.0
+                };
+
+                let features = TradeFeatures {
+                    size,
+                    inter_arrival_ms,
+                    price_impact_bps,
+                    book_imbalance: self.estimator.book_imbalance(),
+                    is_buy,
+                    timestamp_ms,
+                };
+                self.stochastic.signal_integrator.on_trade(&features);
+            }
+
             if let Some(_vpin_value) = self.stochastic.vpin.on_trade(size, trade_price, self.latest_mid, timestamp_ms) {
                 // Bucket completed - publish microstructure update to central beliefs
                 let vpin = self.stochastic.vpin.vpin();
@@ -387,6 +446,11 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // Log regime state periodically (when not in normal regime)
         let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
+
+        // === P0: Forward HMM regime probabilities to SignalIntegrator ===
+        // This feeds the RegimeKappaEstimator for regime-blended kappa estimation.
+        self.stochastic.signal_integrator.set_regime_probabilities(regime_probs);
+
         if regime_probs[3] > 0.2 || regime_probs[2] > 0.4 {
             trace!(
                 sigma = %format!("{:.6}", self.estimator.sigma()),
@@ -419,6 +483,30 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "Position continuation: regime change detected"
             );
             self.stochastic.position_decision.reset_for_regime(continuation_regime);
+        }
+
+        // === P0: Forward HL flow features to SignalIntegrator for cross-venue comparison ===
+        // Construct FlowFeatureVec from HL-side estimators (VPIN, Hawkes, trade data).
+        {
+            use crate::market_maker::estimator::FlowFeatureVec;
+
+            let hl_flow = FlowFeatureVec {
+                vpin: self.stochastic.vpin.vpin(),
+                vpin_velocity: self.stochastic.vpin.vpin_velocity(),
+                imbalance_1s: self.tier2.hawkes.flow_imbalance(),
+                imbalance_5s: self.tier2.hawkes.flow_imbalance(), // Best available proxy
+                imbalance_30s: 0.0, // Not tracked at this horizon on HL side
+                imbalance_5m: 0.0,
+                intensity: self.tier2.hawkes.intensity_ratio(),
+                avg_buy_size: 0.0,  // Not tracked independently on HL side
+                avg_sell_size: 0.0,
+                size_ratio: 0.0,
+                order_flow_direction: self.stochastic.vpin.order_flow_direction(),
+                timestamp_ms: self.cached_trades.back().map(|t| t.2 as i64).unwrap_or(0),
+                trade_count: self.cached_trades.len() as u64,
+                confidence: if self.stochastic.vpin.is_valid() { 0.8 } else { 0.1 },
+            };
+            self.stochastic.signal_integrator.set_hl_flow_features(hl_flow);
         }
 
         Ok(())
@@ -746,20 +834,21 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         / self.effective_max_position.max(1.0))
                         .clamp(0.0, 1.0);
 
-                    // Compute reward
-                    let reward = Reward::compute(
-                        self.stochastic.rl_agent.reward_config(),
-                        realized_edge_bps,
-                        inventory_risk,
-                        vol_ratio,
-                        inventory_risk, // prev_inventory_risk approximated by current
-                    );
-
                     // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
                     let mut updated = false;
                     let regime_str = self.stochastic.position_decision.current_regime().to_string();
                     while let Some((state_idx, action_idx)) = self.stochastic.rl_agent.take_next_state_action()
                     {
+                        // Use stored prev_inventory_risk from when the action was chosen
+                        let prev_inventory_risk = self.stochastic.rl_agent.take_next_inventory_risk();
+                        let reward = Reward::compute(
+                            self.stochastic.rl_agent.reward_config(),
+                            realized_edge_bps,
+                            inventory_risk,
+                            vol_ratio,
+                            prev_inventory_risk,
+                        );
+
                         self.stochastic.rl_agent.update_idx(
                             state_idx,
                             action_idx,
@@ -805,11 +894,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     }
                     if !updated {
                         // Fallback: no stored action (shouldn't happen normally)
+                        // Use current inventory_risk as prev since no stored value
+                        let fallback_reward = Reward::compute(
+                            self.stochastic.rl_agent.reward_config(),
+                            realized_edge_bps,
+                            inventory_risk,
+                            vol_ratio,
+                            inventory_risk, // no stored prev, use current as approximation
+                        );
                         let action = MDPAction::default();
                         self.stochastic.rl_agent.update(
                             current_state,
                             action,
-                            reward,
+                            fallback_reward,
                             current_state,
                             false,
                         );
@@ -819,7 +916,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                             let record = ExperienceRecord::from_params(ExperienceParams {
                                 state: current_state,
                                 action,
-                                reward,
+                                reward: fallback_reward,
                                 next_state: current_state,
                                 done: false,
                                 timestamp_ms: fill.time,
@@ -838,7 +935,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         debug!(
                             realized_edge_bps = %format!("{:.2}", realized_edge_bps),
                             inventory_risk = %format!("{:.3}", inventory_risk),
-                            reward_total = %format!("{:.3}", reward.total),
+                            reward_total = %format!("{:.3}", fallback_reward.total),
                             was_adverse = was_adverse,
                             "RL agent updated from fill (default action - no stored state)"
                         );
@@ -1479,11 +1576,19 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         // 4. Update MarginSizer state
         // IMPORTANT: For HIP-3 DEXs, account_value comes from spot balances (Phase 3).
-        // WebData2's clearinghouseState reports the USDC clearinghouse (=0 for HIP-3 users).
-        // Only update margin for validator perps (non-HIP-3).
+        // WebData2's clearinghouseState reports the USDC clearinghouse only.
+        // Unified margin accounts have collateral split across perps + spot —
+        // always sum both to get the true account value.
         if self.config.dex.is_none() {
+            // Unified account: perps clearinghouse + spot stablecoin balances
+            let spot_collateral: f64 = ["USDC", "USDT", "USDE"]
+                .iter()
+                .filter_map(|coin| self.spot_balance_cache.get(*coin).copied())
+                .sum();
+            let effective_account_value = account_value + spot_collateral;
+
             self.infra.margin_sizer.update_state_with_liquidation(
-                account_value,
+                effective_account_value,
                 margin_used,
                 total_notional,
                 liquidation_price,
@@ -1493,7 +1598,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
             // Log occasionally
             debug!(
-                account_value = account_value,
+                account_value = effective_account_value,
                 margin_used = margin_used,
                 liquidation_price = ?liquidation_price,
                 "Margin state updated from WebData2"

@@ -758,56 +758,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 // Validate: ask must be strictly above exchange best bid (with buffer)
                 let effective_bid_limit = self.cached_best_bid + tick_proxy + staleness_buffer;
 
-                let mut would_cross = false;
+                // Filter crossing levels instead of skipping the entire cycle.
+                // Previously, ANY crossing level caused the whole cycle to be skipped,
+                // which with tight spreads (2-3 bps) meant 0 fills for minutes.
+                // Now we remove only the offending levels and continue with the rest.
+                let bid_count_before = bid_levels.len();
+                let ask_count_before = ask_levels.len();
 
-                // Check all bid quotes against exchange best ask
-                for level in &bid_levels {
-                    if level.price >= effective_ask_limit {
-                        warn!(
-                            bid_price = %format!("{:.6}", level.price),
-                            exchange_best_ask = %format!("{:.6}", self.cached_best_ask),
-                            effective_limit = %format!("{:.6}", effective_ask_limit),
-                            staleness_buffer = %format!("{:.6}", staleness_buffer),
-                            book_age_ms = book_age.as_millis() as u64,
-                            "BBO crossing detected: bid would cross exchange ask"
-                        );
-                        would_cross = true;
-                        break;
-                    }
+                bid_levels.retain(|l| l.price < effective_ask_limit);
+                ask_levels.retain(|l| l.price > effective_bid_limit);
+
+                let bids_filtered = bid_count_before - bid_levels.len();
+                let asks_filtered = ask_count_before - ask_levels.len();
+
+                if bids_filtered > 0 || asks_filtered > 0 {
+                    warn!(
+                        bids_filtered = bids_filtered,
+                        asks_filtered = asks_filtered,
+                        bids_remaining = bid_levels.len(),
+                        asks_remaining = ask_levels.len(),
+                        cached_best_bid = %format!("{:.6}", self.cached_best_bid),
+                        cached_best_ask = %format!("{:.6}", self.cached_best_ask),
+                        effective_bid_limit = %format!("{:.6}", effective_bid_limit),
+                        effective_ask_limit = %format!("{:.6}", effective_ask_limit),
+                        book_age_ms = book_age.as_millis() as u64,
+                        "BBO crossing: filtered crossing levels instead of skipping cycle"
+                    );
+                    self.infra.prometheus.record_bbo_crossing_skip();
                 }
 
-                // Check all ask quotes against exchange best bid
-                if !would_cross {
-                    for level in &ask_levels {
-                        if level.price <= effective_bid_limit {
-                            warn!(
-                                ask_price = %format!("{:.6}", level.price),
-                                exchange_best_bid = %format!("{:.6}", self.cached_best_bid),
-                                effective_limit = %format!("{:.6}", effective_bid_limit),
-                                staleness_buffer = %format!("{:.6}", staleness_buffer),
-                                book_age_ms = book_age.as_millis() as u64,
-                                "BBO crossing detected: ask would cross exchange bid"
-                            );
-                            would_cross = true;
-                            break;
-                        }
-                    }
-                }
-
-                if would_cross {
-                    // CRITICAL: Skip BOTH sides to prevent one-sided exposure.
-                    // Missing a quote cycle is cheap; directional exposure from
-                    // one-sided quoting can cause large losses.
+                // Only skip if BOTH sides are fully empty after filtering
+                if bid_levels.is_empty() && ask_levels.is_empty() {
                     warn!(
                         cached_best_bid = %format!("{:.6}", self.cached_best_bid),
                         cached_best_ask = %format!("{:.6}", self.cached_best_ask),
                         latest_mid = %format!("{:.6}", self.latest_mid),
                         book_age_ms = book_age.as_millis() as u64,
-                        bid_levels = bid_levels.len(),
-                        ask_levels = ask_levels.len(),
-                        "Skipping ENTIRE quote cycle: BBO crossing would cause one-sided exposure"
+                        "Skipping quote cycle: ALL levels filtered by BBO crossing"
                     );
-                    self.infra.prometheus.record_bbo_crossing_skip();
                     return Ok(());
                 }
             }
@@ -1808,6 +1796,44 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 "[PlaceBulk] Skipping ALL orders: no exchange capacity or limits not initialized"
             );
             return Ok(());
+        }
+
+        // === POSITION LIMIT / REDUCE-ONLY ENFORCEMENT (defense-in-depth) ===
+        // Same checks as place_new_order — prevents position-increasing orders
+        // from bypassing reduce-only mode via the bulk placement path.
+        {
+            let current_pos = self.position.position();
+            // When user explicitly specified max_position, enforce as hard ceiling.
+            // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
+            let max_pos = if self.config.max_position_user_specified {
+                self.effective_max_position.min(self.config.max_position)
+            } else {
+                self.effective_max_position
+            };
+            let would_increase = (is_buy && current_pos >= 0.0) || (!is_buy && current_pos <= 0.0);
+
+            // Hard limit: reject entire batch if position already at/above max
+            if would_increase && current_pos.abs() >= max_pos {
+                warn!(
+                    side = %side_str,
+                    position = %format!("{:.4}", current_pos),
+                    max_position = %format!("{:.4}", max_pos),
+                    "[PlaceBulk] HARD LIMIT: blocking position-increasing batch"
+                );
+                return Ok(());
+            }
+
+            // Reduce-only: reject if position at/above 95% of effective max
+            let reduce_only_threshold = max_pos * 0.95;
+            if would_increase && current_pos.abs() >= reduce_only_threshold {
+                warn!(
+                    side = %side_str,
+                    position = %format!("{:.4}", current_pos),
+                    threshold = %format!("{:.4}", reduce_only_threshold),
+                    "[PlaceBulk] Reduce-only: blocking position-increasing batch"
+                );
+                return Ok(());
+            }
         }
 
         let mut order_specs: Vec<OrderSpec> = Vec::new();

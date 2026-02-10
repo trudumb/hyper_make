@@ -535,9 +535,16 @@ impl WsOrderStateManager {
                 order.transition_to(OrderState::Filled);
                 order.filled = event.orig_size;
             }
-            "canceled" => {
-                // Only transition if not already in a terminal state
+            "canceled" | "marginCanceled" => {
+                // Only transition if not already in a terminal state.
+                // marginCanceled: exchange cancelled due to insufficient margin.
                 if !order.is_terminal() {
+                    if event.status == "marginCanceled" {
+                        warn!(
+                            oid = oid,
+                            "Order margin-cancelled by exchange — insufficient margin"
+                        );
+                    }
                     order.transition_to(OrderState::Cancelled);
                 }
             }

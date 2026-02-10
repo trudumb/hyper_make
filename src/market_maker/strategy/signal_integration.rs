@@ -178,7 +178,10 @@ impl Default for SignalIntegratorConfig {
             use_vpin_toxicity: true,
             vpin_widen_threshold: 0.6,
             vpin_blend_weight: 0.7,
-            use_buy_pressure: true,
+            // DISABLED: BuyPressure has -2.67 bps marginal contribution in paper testing
+            // (Run 2, 2026-02-08). Actively destructive — re-enable only after positive IR
+            // validation on a fresh paper run with corrected reward function.
+            use_buy_pressure: false,
             buy_pressure_z_threshold: 1.5,
             buy_pressure_skew_fraction: 0.1,
             buy_pressure_max_fraction: 0.3,
@@ -900,6 +903,25 @@ impl SignalIntegrator {
 
         signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps;
 
+        // === HL-Native Directional Skew Fallback ===
+        // When cross-venue signals are unavailable (no Binance feed for this asset),
+        // use HL-native flow imbalance to produce directional skew.
+        // This prevents symmetric quoting when HL flow data shows clear buying/selling pressure.
+        if !signals.lead_lag_actionable
+            && !signals.cross_venue_valid
+            && signals.combined_skew_bps.abs() < 0.01
+        {
+            // Blend short-term (5s) and medium-term (30s) imbalance for stability
+            const HL_IMBALANCE_SHORT_WEIGHT: f64 = 0.6;
+            const HL_IMBALANCE_MED_WEIGHT: f64 = 0.4;
+            const HL_NATIVE_SKEW_FRACTION: f64 = 0.3;
+            let flow_dir = self.latest_hl_flow.imbalance_5s * HL_IMBALANCE_SHORT_WEIGHT
+                + self.latest_hl_flow.imbalance_30s * HL_IMBALANCE_MED_WEIGHT;
+            let fallback_cap = self.config.max_lead_lag_skew_bps * HL_NATIVE_SKEW_FRACTION;
+            signals.combined_skew_bps =
+                (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
+        }
+
         // === Build per-signal contribution record for attribution ===
         let vpin_active = self.config.use_vpin_toxicity && self.vpin_valid
             && self.latest_hl_vpin > self.config.vpin_widen_threshold;
@@ -1471,5 +1493,60 @@ mod tests {
             (staleness - 1.0).abs() < f64::EPSILON,
             "staleness should be separate from additive total_spread_mult"
         );
+    }
+
+    #[test]
+    fn test_hl_native_skew_fallback_with_buy_pressure() {
+        use crate::market_maker::estimator::binance_flow::FlowFeatureVec;
+
+        let mut integrator = SignalIntegrator::default_config();
+
+        // Simulate HL-native buy pressure (no Binance/cross-venue data)
+        integrator.latest_hl_flow = FlowFeatureVec {
+            imbalance_5s: 0.6,  // Moderate buy pressure at 5s
+            imbalance_30s: 0.4, // Moderate buy pressure at 30s
+            confidence: 0.8,
+            ..Default::default()
+        };
+
+        let signals = integrator.get_signals();
+
+        // No cross-venue or lead-lag should be active
+        assert!(!signals.lead_lag_actionable);
+        assert!(!signals.cross_venue_valid);
+
+        // Fallback should produce positive (bullish) skew
+        assert!(
+            signals.combined_skew_bps > 0.0,
+            "HL-native fallback should produce bullish skew with buy pressure, got: {}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_hl_native_skew_fallback_capped() {
+        use crate::market_maker::estimator::binance_flow::FlowFeatureVec;
+
+        let mut integrator = SignalIntegrator::default_config();
+
+        // Extreme sell pressure
+        integrator.latest_hl_flow = FlowFeatureVec {
+            imbalance_5s: -1.0,
+            imbalance_30s: -1.0,
+            confidence: 1.0,
+            ..Default::default()
+        };
+
+        let signals = integrator.get_signals();
+
+        // Skew should be negative but capped at 30% of max_lead_lag_skew_bps
+        let max_skew = integrator.config.max_lead_lag_skew_bps * 0.3;
+        assert!(
+            signals.combined_skew_bps >= -max_skew - f64::EPSILON,
+            "HL-native fallback skew should be capped, got: {} vs max: {}",
+            signals.combined_skew_bps,
+            -max_skew
+        );
+        assert!(signals.combined_skew_bps < 0.0);
     }
 }

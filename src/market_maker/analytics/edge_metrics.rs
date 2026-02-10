@@ -148,6 +148,41 @@ impl EdgeTracker {
         self.mean_realized_edge() < -2.0
     }
 
+    /// Bootstrapped confidence interval for mean realized edge in basis points.
+    ///
+    /// Returns `(mean_edge_bps, lower_ci, upper_ci)`.
+    /// Uses 1000 bootstrap resamples of the realized edge observations.
+    /// `confidence` should be in (0, 1), e.g., 0.90 for 90% CI.
+    pub fn edge_with_confidence(&self, confidence: f64) -> (f64, f64, f64) {
+        let point = self.mean_realized_edge();
+        let n = self.snapshots.len();
+        if n < 2 {
+            return (point, point, point);
+        }
+
+        const NUM_RESAMPLES: usize = 1000;
+        let mut resampled_means = Vec::with_capacity(NUM_RESAMPLES);
+        let mut rng_state: u64 = 0xA1B2_C3D4_E5F6_7890 ^ (n as u64);
+
+        for _ in 0..NUM_RESAMPLES {
+            let mut sum = 0.0;
+            for _ in 0..n {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let idx = ((rng_state >> 33) as usize) % n;
+                sum += self.snapshots[idx].realized_edge_bps;
+            }
+            resampled_means.push(sum / n as f64);
+        }
+
+        resampled_means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let alpha = (1.0 - confidence) / 2.0;
+        let lower_idx = ((alpha * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
+        let upper_idx = (((1.0 - alpha) * NUM_RESAMPLES as f64) as usize).min(NUM_RESAMPLES - 1);
+
+        (point, resampled_means[lower_idx], resampled_means[upper_idx])
+    }
+
     /// Human-readable edge report.
     pub fn format_report(&self) -> String {
         if self.snapshots.is_empty() {
@@ -350,5 +385,30 @@ mod tests {
         tracker.add_snapshot(make_snapshot(5.0, -1.5));
         assert!((tracker.last_realized_edge_bps() - (-1.5)).abs() < 1e-10,
             "Should return most recent, not average");
+    }
+
+    #[test]
+    fn test_edge_with_confidence() {
+        let mut tracker = EdgeTracker::new();
+        // 50 fills with positive edge and some variance
+        for i in 0..50 {
+            let realized = 2.0 + (i as f64 % 4.0); // 2, 3, 4, 5, 2, 3, ...
+            tracker.add_snapshot(make_snapshot(5.0, realized));
+        }
+        let (point, lower, upper) = tracker.edge_with_confidence(0.90);
+        assert!(point > 0.0, "Expected positive edge, got {point}");
+        assert!(lower <= point, "Lower CI {lower} > point {point}");
+        assert!(upper >= point, "Upper CI {upper} < point {point}");
+        assert!(upper > lower, "CI has zero width: [{lower}, {upper}]");
+    }
+
+    #[test]
+    fn test_edge_with_confidence_insufficient_data() {
+        let mut tracker = EdgeTracker::new();
+        tracker.add_snapshot(make_snapshot(5.0, 3.0));
+        let (point, lower, upper) = tracker.edge_with_confidence(0.90);
+        assert!((point - 3.0).abs() < 1e-10);
+        assert_eq!(lower, point);
+        assert_eq!(upper, point);
     }
 }
