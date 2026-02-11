@@ -8,7 +8,7 @@ use crate::helpers::truncate_float;
 use crate::prelude::Result;
 
 use super::super::{
-    infra, CancelResult, MarketMaker, OrderExecutor, Quote, QuotingStrategy, Side, TrackedOrder,
+    infra, CancelResult, MarketMaker, TradingEnvironment, Quote, QuotingStrategy, Side, TrackedOrder,
 };
 use super::side_str;
 use super::RecoveryAction;
@@ -16,7 +16,7 @@ use super::RecoveryAction;
 /// Minimum order notional value in USD (Hyperliquid requirement)
 const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Initiate bulk cancel for multiple orders and update order states appropriately.
     ///
     /// RATE LIMIT OPTIMIZATION: Uses single bulk cancel API call instead of individual cancels.
@@ -49,7 +49,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
         let num_cancels = cancellable_oids.len() as u32;
         let results = self
-            .executor
+            .environment
             .cancel_bulk_orders(&self.config.asset, cancellable_oids.clone())
             .await;
 
@@ -283,7 +283,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         }
 
         let result = self
-            .executor
+            .environment
             .place_order(
                 &self.config.asset,
                 quote.price,
@@ -349,7 +349,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         max_attempts: u32,
     ) -> CancelResult {
         for attempt in 0..max_attempts {
-            let result = self.executor.cancel_order(asset, oid).await;
+            let result = self.environment.cancel_order(asset, oid).await;
 
             // If order is gone (any reason), stop retrying
             if result.order_is_gone() {
@@ -439,7 +439,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     self.infra.recovery_manager.record_ioc_sent();
 
                     let result = self
-                        .executor
+                        .environment
                         .place_ioc_reduce_order(
                             &self.config.asset,
                             reduce_size,

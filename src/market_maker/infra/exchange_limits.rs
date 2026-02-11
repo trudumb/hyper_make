@@ -92,6 +92,28 @@ impl ExchangePositionLimits {
         }
     }
 
+    /// Initialize limits for paper trading with synthetic capacity.
+    ///
+    /// In paper mode there is no exchange to query, so we set generous
+    /// limits derived from the paper balance and price.
+    pub fn initialize_for_paper(&self, max_position: f64) {
+        self.inner.max_long.store(max_position);
+        self.inner.max_short.store(max_position);
+        self.inner.available_buy.store(max_position);
+        self.inner.available_sell.store(max_position);
+        self.inner.effective_bid_limit.store(max_position);
+        self.inner.effective_ask_limit.store(max_position);
+        self.inner.local_max_position.store(max_position);
+        self.inner
+            .last_refresh_epoch_ms
+            .store(now_epoch_ms(), Ordering::Relaxed);
+
+        info!(
+            max_position = %format!("{:.6}", max_position),
+            "Exchange limits initialized for paper trading"
+        );
+    }
+
     /// Update limits from exchange API response.
     ///
     /// # Arguments

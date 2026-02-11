@@ -11,7 +11,7 @@ use crate::prelude::Result;
 use crate::EPSILON;
 
 use super::super::{
-    tracking, CancelResult, MarketMaker, ModifySpec, OrderExecutor, OrderSpec, OrderState, Quote,
+    tracking, CancelResult, MarketMaker, ModifySpec, TradingEnvironment, OrderSpec, OrderState, Quote,
     QuotingStrategy, Side, TrackedOrder,
 };
 use super::super::infra::RejectionErrorType;
@@ -25,7 +25,7 @@ pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 /// Set to 2.5 bps to significantly reduce the 86% cancellation rate.
 const QUOTE_LATCH_THRESHOLD_BPS: f64 = 2.5;
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Reconcile a single order per side (legacy single-order mode).
     pub(crate) async fn reconcile_side(
         &mut self,
@@ -329,7 +329,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // Place all orders in a single API call
             let num_orders = order_specs.len() as u32;
             let results = self
-                .executor
+                .environment
                 .place_bulk_orders(&self.config.asset, order_specs.clone())
                 .await;
 
@@ -1400,7 +1400,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                 let num_modifies = all_modifies.len() as u32;
                 let modify_results = self
-                    .executor
+                    .environment
                     .modify_bulk_orders(&self.config.asset, all_modifies.clone())
                     .await;
 
@@ -1515,7 +1515,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                         // Cancel the order on exchange
                         let cancel_result = self
-                            .executor
+                            .environment
                             .cancel_order(&self.config.asset, spec.oid)
                             .await;
 
@@ -1588,7 +1588,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         // Pass the pre-registered CLOID to place_order for deterministic matching.
                         // This ensures the pending order is finalized with the correct OID.
                         let place_result = self
-                            .executor
+                            .environment
                             .place_order(
                                 &self.config.asset,
                                 spec.new_price,
@@ -2027,7 +2027,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         // Place orders
         let num_orders = order_specs.len() as u32;
         let results = self
-            .executor
+            .environment
             .place_bulk_orders(&self.config.asset, order_specs.clone())
             .await;
 

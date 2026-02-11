@@ -28,7 +28,8 @@ use hyperliquid_rust_sdk::{
     QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
     RejectionRateLimitConfig, RiskConfig, RiskModelConfig, SpreadConfig, SpreadProfile,
     StochasticConfig,
-    SymmetricStrategy, market_maker::{BinanceFeed, resolve_binance_symbol},
+    SymmetricStrategy, market_maker::{BinanceFeed, resolve_binance_symbol,
+    environment::live::LiveEnvironment},
 };
 
 // ============================================================================
@@ -355,6 +356,14 @@ enum Commands {
     Status,
     /// Run the market maker (default)
     Run,
+    /// Run in paper trading mode using the unified observation loop.
+    /// Uses the same MarketMaker core as live, with a PaperEnvironment
+    /// that synthesizes fills from market data.
+    Paper {
+        /// Paper trading duration in seconds (0 = run indefinitely).
+        #[arg(long, default_value = "0")]
+        duration: u64,
+    },
 }
 
 // ============================================================================
@@ -878,6 +887,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Status) => {
             return show_account_status(&cli).await;
+        }
+        Some(Commands::Paper { duration }) => {
+            return run_paper_mode(&cli, *duration).await;
         }
         Some(Commands::Run) | None => {
             // Continue to run the market maker
@@ -1863,10 +1875,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("config validation failed");
 
     // Create and start market maker
+    let environment = LiveEnvironment::from_executor(executor);
     let mut market_maker = MarketMaker::new(
         mm_config,
         strategy,
-        executor,
+        environment,
         info_client,
         user_address,
         initial_position,
@@ -1935,33 +1948,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
     }
 
-    // === RL Agent: Load paper Q-table as prior and enable action control ===
+    // === Prior Injection: Load paper checkpoint and inject full prior (φ→ψ) ===
     if let Some(ref paper_ckpt_path) = cli.paper_checkpoint {
-        let paper_ckpt_file = std::path::Path::new(paper_ckpt_path).join("latest/checkpoint.json");
-        match std::fs::read_to_string(&paper_ckpt_file) {
-            Ok(json) => {
+        use hyperliquid_rust_sdk::market_maker::checkpoint::{PriorInject, transfer::InjectionConfig};
+
+        // Try multiple candidate paths (paper mode saves to prior.json, old path used latest/checkpoint.json)
+        let candidates = [
+            std::path::Path::new(paper_ckpt_path).join("prior.json"),
+            std::path::Path::new(paper_ckpt_path).join("latest/checkpoint.json"),
+            std::path::PathBuf::from(paper_ckpt_path), // direct file path
+        ];
+
+        let mut loaded = false;
+        for candidate in &candidates {
+            if let Ok(json) = std::fs::read_to_string(candidate) {
                 match serde_json::from_str::<hyperliquid_rust_sdk::market_maker::checkpoint::CheckpointBundle>(&json) {
                     Ok(bundle) => {
-                        let sim_to_real = hyperliquid_rust_sdk::market_maker::learning::SimToRealConfig::default();
-                        let states_loaded = market_maker.load_paper_rl_prior(
-                            &bundle.rl_q_table,
-                            sim_to_real.paper_prior_weight,
-                        );
+                        let config = InjectionConfig::default();
+                        let rl_states = market_maker.inject_prior(&bundle, &config);
                         tracing::info!(
-                            path = %paper_ckpt_file.display(),
-                            states = states_loaded,
-                            weight = sim_to_real.paper_prior_weight,
-                            "Loaded paper Q-table as RL prior"
+                            path = %candidate.display(),
+                            rl_states_injected = rl_states,
+                            rl_blend_weight = config.rl_blend_weight,
+                            "Injected paper prior into live state (full φ→ψ transfer)"
                         );
+                        loaded = true;
+                        break;
                     }
-                    Err(e) => tracing::warn!(error = %e, "Failed to parse paper checkpoint JSON"),
+                    Err(e) => tracing::warn!(
+                        path = %candidate.display(),
+                        error = %e,
+                        "Failed to parse checkpoint JSON, trying next candidate"
+                    ),
                 }
             }
-            Err(e) => tracing::warn!(
-                path = %paper_ckpt_file.display(),
-                error = %e,
-                "Failed to read paper checkpoint file"
-            ),
+        }
+        if !loaded {
+            tracing::warn!(
+                paper_ckpt_path = %paper_ckpt_path,
+                "No valid paper checkpoint found (tried prior.json, latest/checkpoint.json, and direct path)"
+            );
         }
     }
 
@@ -2267,6 +2293,217 @@ async fn list_available_dexs(cli: &Cli) -> Result<(), Box<dyn std::error::Error>
     println!();
     println!("Usage: cargo run --bin market_maker -- --asset BTC --dex <name>");
     println!();
+
+    Ok(())
+}
+
+/// Run paper trading mode using the unified MarketMaker core + PaperEnvironment.
+///
+/// This uses the same MarketMaker<S, PaperEnvironment> as the unified architecture,
+/// consuming market data and synthesizing fills through the FillSimulator.
+async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::error::Error>> {
+    use hyperliquid_rust_sdk::market_maker::{
+        environment::paper::{PaperEnvironment, PaperEnvironmentConfig},
+        simulation::fill_sim::FillSimulatorConfig,
+        checkpoint::PriorExtract,
+    };
+
+    let config = load_config(cli)?;
+
+    // Setup logging (reuse the same setup as live mode)
+    setup_logging(&config, cli)?;
+
+    // Get private key (same priority as live: CLI > config > env)
+    let private_key = cli
+        .private_key
+        .clone()
+        .or(config.network.private_key.clone())
+        .ok_or("Private key required. Set via --private-key, HYPERLIQUID_PRIVATE_KEY env var, or config file.")?;
+    let wallet: PrivateKeySigner = private_key
+        .parse()
+        .map_err(|_| "Invalid private key format")?;
+    let user_address = wallet.address();
+
+    // Parse network (same as live)
+    let base_url = parse_base_url(cli.network.as_ref().unwrap_or(&config.network.base_url))?;
+
+    // Create info clients — one for PaperEnvironment subscriptions, one for MarketMaker state queries
+    let info_client = InfoClient::with_reconnect(None, Some(base_url)).await?;
+    let info_client_for_mm = InfoClient::with_reconnect(None, Some(base_url)).await?;
+
+    // Resolve asset (same as live: CLI > config, with DEX prefix)
+    let dex = cli.dex.clone();
+    let asset = cli.asset.clone().unwrap_or(config.trading.asset.clone());
+    let asset = if let Some(ref dex_name) = dex {
+        if asset.contains(':') {
+            asset
+        } else {
+            format!("{dex_name}:{asset}")
+        }
+    } else {
+        asset
+    };
+
+    // Query metadata for sz_decimals (use the MM client, not the paper env one)
+    let meta = info_client_for_mm
+        .meta_for_dex(dex.as_deref())
+        .await
+        .map_err(|e| format!("Failed to get metadata: {e}"))?;
+
+    let asset_meta = meta
+        .universe
+        .iter()
+        .find(|a| a.name == asset)
+        .ok_or_else(|| format!("Asset '{asset}' not found"))?;
+    let sz_decimals = asset_meta.sz_decimals;
+    let runtime_config = AssetRuntimeConfig::from_asset_meta(asset_meta);
+
+    // Auto-calculate decimals
+    let decimals = cli.decimals.or(config.trading.decimals).unwrap_or_else(|| {
+        let is_spot = meta.universe.iter().position(|a| a.name == asset).map(|i| i >= 10000).unwrap_or(false);
+        let max_decimals: u32 = if is_spot { 8 } else { 6 };
+        max_decimals.saturating_sub(sz_decimals)
+    });
+
+    // Position limit: conservative default for paper
+    let max_position = cli.max_position.unwrap_or(
+        config.trading.max_absolute_position_size.unwrap_or(1.0),
+    );
+
+    // Resolve collateral
+    let collateral = if let Some(token_index) = meta.collateral_token {
+        let spot_meta = info_client_for_mm.spot_meta().await
+            .map_err(|e| format!("Failed to get spot metadata: {e}"))?;
+        CollateralInfo::from_token_index(token_index, &spot_meta)
+    } else {
+        CollateralInfo::usdc()
+    };
+
+    info!(
+        asset = %asset,
+        duration_s = duration,
+        max_position = %max_position,
+        decimals = decimals,
+        "Starting paper trading mode"
+    );
+
+    // Create PaperEnvironment
+    let paper_config = PaperEnvironmentConfig {
+        asset: asset.clone(),
+        user_address,
+        fill_sim_config: FillSimulatorConfig::default(),
+        dex: dex.clone(),
+    };
+    let paper_env = PaperEnvironment::new(paper_config, info_client);
+
+    // Build MmConfig (same struct literal pattern as live, simplified)
+    let risk_aversion = cli.risk_aversion.unwrap_or(config.trading.risk_aversion);
+    let mm_config = MmConfig {
+        asset: Arc::from(asset.as_str()),
+        target_liquidity: cli.target_liquidity.unwrap_or(config.trading.target_liquidity),
+        risk_aversion,
+        max_bps_diff: cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff),
+        max_position,
+        max_position_usd: 0.0,
+        max_position_user_specified: cli.max_position.is_some(),
+        decimals,
+        sz_decimals,
+        multi_asset: false,
+        stochastic: StochasticConfig::default(),
+        smart_reconcile: true,
+        reconcile: ReconcileConfig::default(),
+        runtime: runtime_config,
+        initial_isolated_margin: cli.initial_isolated_margin,
+        dex: dex.clone(),
+        collateral,
+        impulse_control: ImpulseControlConfig::default(),
+        spread_profile: SpreadProfile::from_str(&cli.spread_profile),
+        fee_bps: 1.5,
+    };
+
+    // Create strategy (Ladder with sensible defaults)
+    let strategy: Box<dyn QuotingStrategy> = Box::new(
+        LadderStrategy::new(risk_aversion),
+    );
+
+    // Create metrics
+    let metrics = Arc::new(MarketMakerMetrics::new());
+
+    // Module configs (all defaults for paper)
+    let estimator_config = EstimatorConfig::from_legacy(
+        config.strategy.estimation_window_secs * 1000,
+        config.strategy.min_trades,
+        config.strategy.default_sigma,
+        config.strategy.default_kappa,
+        config.strategy.default_arrival_intensity,
+        config.strategy.warmup_decay_secs,
+        config.strategy.min_warmup_trades,
+    );
+
+    let mut market_maker = MarketMaker::new(
+        mm_config,
+        strategy,
+        paper_env,
+        info_client_for_mm,
+        user_address,
+        0.0, // Initial position = 0 for paper
+        Some(metrics),
+        estimator_config,
+        AdverseSelectionConfig::default(),
+        QueueConfig::default(),
+        LiquidationConfig::default(),
+        KillSwitchConfig::default(),
+        HawkesConfig::default(),
+        FundingConfig::default(),
+        SpreadConfig::default(),
+        PnLConfig::default(),
+        MarginConfig::default(),
+        DataQualityConfig::default(),
+        RecoveryConfig::default(),
+        ReconciliationConfig::default(),
+        RejectionRateLimitConfig::default(),
+    );
+
+    // Wire checkpoint persistence
+    let checkpoint_dir = PathBuf::from(format!("data/checkpoints/paper/{asset}"));
+    market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
+
+    // Disable Binance signals for paper (no cross-venue feed)
+    market_maker.disable_binance_signals();
+
+    // Seed paper balance — without this, margin_available=0 and no orders are placed.
+    // Paper balance should be a realistic account size, NOT the max_position_usd (which
+    // is just the position limit). Default $1000 ensures orders pass the $10 minimum
+    // notional check even for low-priced assets.
+    let paper_balance = 1000.0_f64;
+    market_maker = market_maker.with_paper_balance(paper_balance);
+
+    // Run with optional duration
+    if duration > 0 {
+        info!(duration_s = duration, "Paper trading with time limit");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(duration),
+            market_maker.run(),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(())) => info!("Paper trading completed normally"),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                info!("Paper trading duration elapsed, extracting prior...");
+                let prior = market_maker.extract_prior();
+                let checkpoint_path = format!("data/checkpoints/paper/{asset}/prior.json");
+                if let Ok(json) = serde_json::to_string_pretty(&prior) {
+                    std::fs::create_dir_all(format!("data/checkpoints/paper/{asset}"))?;
+                    std::fs::write(&checkpoint_path, json)?;
+                    info!(path = %checkpoint_path, "Paper prior saved");
+                }
+            }
+        }
+    } else {
+        market_maker.run().await?;
+    }
 
     Ok(())
 }

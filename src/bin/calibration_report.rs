@@ -722,7 +722,7 @@ fn print_ascii(report: &CalibrationReport) {
             }
         }
     } else {
-        println!("  No analytics data available. Run paper_trader to collect data.");
+        println!("  No analytics data available. Run `market_maker paper` to collect data.");
     }
 
     let pnl_path = "logs/paper_trading/signal_pnl.jsonl";
