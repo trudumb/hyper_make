@@ -6,7 +6,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::prelude::Result;
 
 use super::super::{
-    quoting, MarketMaker, OrderExecutor, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
+    quoting, MarketMaker, TradingEnvironment, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
     QuotingStrategy, Side,
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
@@ -22,7 +22,7 @@ use crate::market_maker::strategy::action_to_inventory_ratio;
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Update quotes based on current market state.
     #[tracing::instrument(name = "quote_cycle", skip_all, fields(asset = %self.config.asset))]
     pub(crate) async fn update_quotes(&mut self) -> Result<()> {
@@ -40,7 +40,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 .map(|o| o.oid)
                 .collect();
             if !all_oids.is_empty() {
-                self.executor
+                self.environment
                     .cancel_bulk_orders(&self.config.asset, all_oids)
                     .await;
             }
@@ -126,7 +126,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     .map(|o| o.oid)
                     .collect();
                 if !all_oids.is_empty() {
-                    self.executor
+                    self.environment
                         .cancel_bulk_orders(&self.config.asset, all_oids)
                         .await;
                 }
@@ -1989,7 +1989,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                         count = resting_oids.len(),
                         "Quote gate: cancelling resting orders"
                     );
-                    self.executor
+                    self.environment
                         .cancel_bulk_orders(&self.config.asset, resting_oids)
                         .await;
                 }

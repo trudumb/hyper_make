@@ -24,8 +24,10 @@
 
 pub mod types;
 pub mod prediction_reader;
+pub mod transfer;
 
 pub use types::*;
+pub use transfer::*;
 
 use std::fs;
 use std::io;

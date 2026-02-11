@@ -10,15 +10,17 @@ use crate::Message;
 use super::super::{
     adverse_selection::TradeObservation as MicroTradeObs,
     belief::BeliefUpdate,
+    environment::Observation,
     estimator::HmmObservation,
     fills,
     infra::{BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate},
     messages, tracking::ws_order_state::WsFillEvent,
-    tracking::ws_order_state::WsOrderUpdateEvent, MarketMaker, OrderExecutor, OrderState,
+    tracking::ws_order_state::WsOrderUpdateEvent, MarketMaker, OrderState,
     QuotingStrategy, Side, TrackedOrder,
+    environment::TradingEnvironment,
 };
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Handle a message from subscriptions.
     /// Main message dispatcher - routes to focused handlers.
     pub(crate) async fn handle_message(&mut self, message: Message) -> Result<()> {
@@ -35,6 +37,58 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             Message::WebData2(web_data2) => self.handle_web_data2(web_data2),
             Message::UserNonFundingLedgerUpdates(update) => self.handle_ledger_update(update),
             _ => Ok(()),
+        }
+    }
+
+    /// Handle an observation from the environment's observation stream.
+    ///
+    /// This is the **T: S × O → S** transition function — the same handlers
+    /// are called regardless of whether the observation came from a live or
+    /// paper environment.
+    ///
+    /// Bridge: delegates to the same handler methods as `handle_message()`.
+    /// In Phase 4, the event loop will call this instead of `handle_message()`.
+    #[allow(dead_code)] // Wired in Phase 3/4 when event loop uses observation stream
+    pub(crate) async fn handle_observation(&mut self, obs: Observation) -> Result<()> {
+        match obs {
+            Observation::AllMids(all_mids) => self.handle_all_mids(all_mids).await,
+            Observation::Trades(trades) => self.handle_trades(trades),
+            Observation::UserFills(user_fills) => self.handle_user_fills(user_fills).await,
+            Observation::L2Book(l2_book) => self.handle_l2_book(l2_book),
+            Observation::OrderUpdates(order_updates) => {
+                self.handle_order_updates(order_updates)
+            }
+            Observation::OpenOrders(open_orders) => self.handle_open_orders(open_orders),
+            Observation::ActiveAssetData(active_asset_data) => {
+                self.handle_active_asset_data(active_asset_data)
+            }
+            Observation::WebData2(web_data2) => self.handle_web_data2(*web_data2),
+            Observation::LedgerUpdate(update) => self.handle_ledger_update(update),
+            Observation::CrossVenuePrice { price, timestamp_ms } => {
+                self.handle_binance_price_update(BinancePriceUpdate {
+                    timestamp_ms: timestamp_ms as i64,
+                    mid_price: price,
+                    best_bid: price, // Simplified — full data in Phase 4
+                    best_ask: price,
+                    spread_bps: 0.0,
+                });
+                Ok(())
+            }
+            Observation::CrossVenueTrade {
+                price,
+                size,
+                is_buy,
+                timestamp_ms,
+            } => {
+                self.handle_binance_trade(BinanceTradeUpdate {
+                    timestamp_ms: timestamp_ms as i64,
+                    price,
+                    quantity: size,
+                    is_buyer_maker: !is_buy,
+                    trade_id: 0,
+                });
+                Ok(())
+            }
         }
     }
 
@@ -165,7 +219,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     /// - Sell fill is adverse if mid rose > 1 bps (we undersold)
     ///
     /// Feeds outcomes to pre-fill classifier and model gating for calibration.
-    /// Mirrors paper_trader.rs `check_adverse_selection_outcomes()`.
+    /// Checks adverse selection outcomes from pending fills.
     fn check_pending_fill_outcomes(&mut self, now_ms: u64) {
         const OUTCOME_DELAY_MS: u64 = 5_000; // 5-second markout window
         // Volatility-scaled threshold: 2σ × √τ prevents noise misclassification.
@@ -679,7 +733,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                 // === Kappa Learning: Feed own fills to parameter estimator ===
                 // This teaches the kappa estimator from our own fill intensity,
-                // mirroring paper_trader.rs on_simulated_fill() wiring.
+                // teaching the kappa estimator from our own fills.
                 let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
                 self.estimator.on_own_fill(
                     fill.time,       // timestamp_ms

@@ -150,7 +150,7 @@ pub struct FillSimulator {
     /// Configuration
     config: FillSimulatorConfig,
     /// Reference to the simulation executor
-    executor: Arc<SimulationExecutor>,
+    pub(crate) executor: Arc<SimulationExecutor>,
     /// Recent fills for logging
     recent_fills: VecDeque<SimulatedFill>,
     /// Maximum recent fills to keep

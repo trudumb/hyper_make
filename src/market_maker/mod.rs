@@ -36,6 +36,7 @@ pub mod simulation;
 pub mod stochastic;
 
 pub mod checkpoint;
+pub mod environment;
 
 mod orchestrator;
 
@@ -72,6 +73,7 @@ pub use tracking::*;
 
 use alloy::primitives::Address;
 use belief::{CentralBeliefConfig, CentralBeliefState};
+use environment::TradingEnvironment;
 use tracing::{error, info, warn};
 
 use crate::InfoClient;
@@ -91,14 +93,14 @@ use crate::InfoClient;
 /// - **Safety**: kill switch, risk aggregator, fill processor
 /// - **Infra**: margin, prometheus, connection health, data quality
 /// - **Stochastic**: HJB controller, stochastic config, dynamic risk
-pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
+pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     // === Core Fields ===
     /// Configuration
     config: MarketMakerConfig,
     /// Quoting strategy
     strategy: S,
-    /// Order executor
-    executor: E,
+    /// Trading environment (order execution + observation stream)
+    pub(crate) environment: Env,
     /// Order state manager
     orders: OrderManager,
     /// WebSocket-based order state manager for improved state tracking
@@ -288,11 +290,11 @@ pub struct MarketMaker<S: QuotingStrategy, E: OrderExecutor> {
     /// Unique session identifier for correlating experience records.
     experience_session_id: String,
     /// Live analytics bundle (Sharpe, signal attribution, persistence).
-    /// Enabled by default — mirrors paper_trader's analytics scaffolding.
+    /// Enabled by default for both paper and live environments.
     pub live_analytics: analytics::live::LiveAnalytics,
 }
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Create a new market maker.
     ///
     /// # Parameters
@@ -321,7 +323,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
     pub fn new(
         config: MarketMakerConfig,
         strategy: S,
-        executor: E,
+        environment: Env,
         info_client: InfoClient,
         user_address: Address,
         initial_position: f64,
@@ -386,7 +388,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
         Self {
             config,
             strategy,
-            executor,
+            environment,
             orders: OrderManager::new(),
             ws_state: WsOrderStateManager::new(),
             position: PositionTracker::new(initial_position),
@@ -543,6 +545,38 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                 warn!("Checkpoint init failed: {e}");
             }
         }
+        self
+    }
+
+    /// Seed the margin sizer and exchange limits for paper trading.
+    ///
+    /// Without this, the MarketMaker sees `margin_available=0.00` and
+    /// `limits_initialized=false`, generating empty ladders (no orders, no fills).
+    /// This provides the synthetic account state that would normally come from
+    /// WebData2 and ActiveAssetData in live mode.
+    pub fn with_paper_balance(mut self, paper_balance_usd: f64) -> Self {
+        // Seed margin sizer
+        self.infra.margin_sizer.update_state(
+            paper_balance_usd,
+            0.0,  // no margin used initially
+            0.0,  // no notional initially
+        );
+
+        // Seed exchange limits so place_bulk_ladder_orders doesn't block on
+        // limits_initialized=false. Use a generous position limit derived from
+        // the paper balance, leverage, and a fallback price.
+        let leverage = self.infra.margin_sizer.max_leverage().max(1.0);
+        let price = if self.latest_mid > 0.0 { self.latest_mid } else { 1.0 };
+        let paper_max_position = (paper_balance_usd * leverage / price).max(1.0);
+        self.infra
+            .exchange_limits
+            .initialize_for_paper(paper_max_position);
+
+        info!(
+            paper_balance_usd = paper_balance_usd,
+            paper_max_position = %format!("{:.4}", paper_max_position),
+            "Initialized paper balance for margin sizing and exchange limits"
+        );
         self
     }
 
@@ -716,6 +750,88 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             .restore_from_checkpoint(&bundle.kill_switch);
     }
 
+    // =========================================================================
+    // Prior Transfer Protocol
+    // =========================================================================
+}
+
+/// φ: S → P — extract learned priors.
+impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorExtract
+    for MarketMaker<S, Env>
+{
+    fn extract_prior(&self) -> checkpoint::CheckpointBundle {
+        self.assemble_checkpoint_bundle()
+    }
+}
+
+/// ψ: P × S → S — inject priors with configurable blending.
+impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
+    for MarketMaker<S, Env>
+{
+    fn inject_prior(
+        &mut self,
+        prior: &checkpoint::CheckpointBundle,
+        config: &checkpoint::InjectionConfig,
+    ) -> usize {
+        use tracing::{info, warn};
+
+        // Validate asset match.
+        if config.require_asset_match && *prior.metadata.asset != *self.config.asset {
+            warn!(
+                prior_asset = %prior.metadata.asset,
+                our_asset = %self.config.asset,
+                "Prior asset mismatch — skipping injection"
+            );
+            return 0;
+        }
+
+        // Validate age.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let age_s = (now_ms.saturating_sub(prior.metadata.timestamp_ms)) as f64 / 1000.0;
+        if age_s > config.max_prior_age_s {
+            warn!(
+                age_s = age_s,
+                max_age_s = config.max_prior_age_s,
+                "Prior too old — skipping injection"
+            );
+            return 0;
+        }
+
+        // Inject all non-RL, non-kill-switch components via restore_from_bundle.
+        // Create a modified bundle that zeroes out excluded components.
+        let mut injection_bundle = prior.clone();
+        if config.skip_kill_switch {
+            injection_bundle.kill_switch = checkpoint::KillSwitchCheckpoint::default();
+        }
+
+        // Restore all standard components.
+        self.restore_from_bundle(&injection_bundle);
+
+        // RL Q-table injection with configurable blend weight.
+        let rl_states = if config.skip_rl {
+            0
+        } else {
+            self.load_paper_rl_prior(&prior.rl_q_table, config.rl_blend_weight)
+        };
+
+        info!(
+            asset = %prior.metadata.asset,
+            prior_age_s = %format!("{:.0}", age_s),
+            session_duration_s = %format!("{:.0}", prior.metadata.session_duration_s),
+            rl_states = rl_states,
+            rl_weight = config.rl_blend_weight,
+            skip_kill_switch = config.skip_kill_switch,
+            "Prior injected successfully"
+        );
+
+        rl_states
+    }
+}
+
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     // =========================================================================
     // Accessor Methods
     // =========================================================================

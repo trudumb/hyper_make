@@ -9,11 +9,11 @@ use tracing::{debug, info, warn};
 use crate::prelude::Result;
 
 use super::super::{
-    calculate_dynamic_max_position_value, safety, CancelResult, MarketMaker, OrderExecutor,
+    calculate_dynamic_max_position_value, safety, CancelResult, MarketMaker, TradingEnvironment,
     QuotingStrategy,
 };
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Graceful shutdown - cancel all orders and log final state.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("=== GRACEFUL SHUTDOWN INITIATED ===");
@@ -131,7 +131,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // that aren't tracked locally (orphans, race conditions, previous sessions).
             // At shutdown, we want to cancel ALL orders from the exchange unconditionally.
             let results = self
-                .executor
+                .environment
                 .cancel_bulk_orders(&self.config.asset, exchange_oids.clone())
                 .await;
 
@@ -436,7 +436,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
 
                 // Bulk cancel for efficiency (single API call)
                 let cancel_results = self
-                    .executor
+                    .environment
                     .cancel_bulk_orders(&self.config.asset, confirmed_orphans.clone())
                     .await;
 

@@ -61,10 +61,6 @@ name = "parameter_estimator"
 path = "src/bin/parameter_estimator.rs"
 
 [[bin]]
-name = "paper_trader"
-path = "src/bin/paper_trader.rs"
-
-[[bin]]
 name = "health_dashboard"
 path = "src/bin/health_dashboard.rs"
 

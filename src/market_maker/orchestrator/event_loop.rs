@@ -11,10 +11,10 @@ use crate::prelude::Result;
 use crate::{Message, Subscription};
 
 use super::super::{
-    CancelResult, ConnectionState, MarketMaker, OrderExecutor, QuotingStrategy, Side, TrackedOrder,
+    CancelResult, ConnectionState, MarketMaker, TradingEnvironment, QuotingStrategy, Side, TrackedOrder,
 };
 
-impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
+impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Sync open orders from exchange and initialize state.
     pub async fn sync_open_orders(&mut self) -> Result<()> {
         // === CRITICAL: Sync position from exchange first ===
@@ -197,7 +197,7 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
             // RATE LIMIT OPTIMIZATION: Use bulk cancel instead of individual cancels
             let oids: Vec<u64> = our_orders.iter().map(|o| o.oid).collect();
             let results = self
-                .executor
+                .environment
                 .cancel_bulk_orders(&self.config.asset, oids.clone())
                 .await;
 
@@ -801,6 +801,299 @@ impl<S: QuotingStrategy, E: OrderExecutor> MarketMaker<S, E> {
                     "Graceful shutdown timed out after 5 seconds - orders may remain on exchange"
                 );
             }
+        }
+
+        info!("Market maker stopped.");
+        Ok(())
+    }
+
+    /// Run the market maker using the observation-based event loop.
+    ///
+    /// This is the unified event loop that works with any [`TradingEnvironment`].
+    /// Both paper and live environments produce [`Observation`] values; the core
+    /// processes them identically through [`handle_observation()`].
+    ///
+    /// For paper trading, fills are synthesized by the environment's stream.
+    /// For live trading, fills come from the exchange's UserFills WS channel.
+    pub async fn run(&mut self) -> Result<()> {
+        use futures_util::StreamExt;
+        use tracing::trace;
+
+        // Environment startup sync (live: cancel orders + sync position; paper: no-op).
+        self.environment.sync_state().await?;
+
+        // Create the observation stream from the environment.
+        let mut obs_stream = self.environment.observation_stream().await?;
+
+        info!(
+            asset = %self.config.asset,
+            strategy = %self.strategy.name(),
+            is_live = self.environment.is_live(),
+            "Market maker started (observation loop)"
+        );
+        info!("Warming up parameter estimator...");
+
+        // Start HJB session.
+        self.stochastic.hjb_controller.start_session();
+        debug!("HJB inventory controller session started");
+
+        // Safety sync interval.
+        let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
+        sync_interval.tick().await;
+
+        // Shutdown signal handling.
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag_clone = shutdown_flag.clone();
+
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Shutdown signal received (SIGINT/Ctrl+C)");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("Shutdown signal received (SIGTERM)");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Shutdown signal received (SIGINT/Ctrl+C)");
+            }
+            shutdown_flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        loop {
+            // Shutdown check.
+            if shutdown_flag.load(Ordering::SeqCst) {
+                info!("Shutdown flag detected, initiating graceful shutdown...");
+                break;
+            }
+
+            // Kill switch check.
+            if self.safety.kill_switch.is_triggered() {
+                let reasons = self.safety.kill_switch.trigger_reasons();
+                let reason_strs: Vec<String> = reasons.iter().map(|r| r.to_string()).collect();
+                error!("KILL SWITCH TRIGGERED: {:?}", reason_strs);
+
+                // Write post-mortem dump.
+                let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+                let trigger_str = reason_strs.first().cloned().unwrap_or_default();
+                let mut dump = crate::market_maker::monitoring::PostMortemDump::new(
+                    trigger_str,
+                    pnl_summary.total_pnl,
+                    self.safety.kill_switch.config().max_daily_loss,
+                );
+                dump.position = self.position.position();
+                dump.daily_pnl = pnl_summary.total_pnl;
+                dump.realized_pnl = pnl_summary.realized_pnl;
+                dump.unrealized_pnl = pnl_summary.unrealized_pnl;
+                dump.mid_price = self.latest_mid;
+                dump.cascade_severity = self.tier1.liquidation_detector.cascade_severity();
+                dump.risk_state = crate::market_maker::monitoring::RiskSnapshot {
+                    drawdown_pct: if pnl_summary.peak_pnl > 0.0 {
+                        (pnl_summary.peak_pnl - pnl_summary.total_pnl) / pnl_summary.peak_pnl * 100.0
+                    } else {
+                        0.0
+                    },
+                    margin_utilization_pct: 0.0,
+                    position_utilization_pct: if self.effective_max_position > 0.0 {
+                        self.position.position().abs() / self.effective_max_position * 100.0
+                    } else {
+                        0.0
+                    },
+                    rate_limit_errors: self.safety.kill_switch.state().rate_limit_errors,
+                    kill_switch_reasons: reason_strs,
+                };
+
+                let postmortem_dir = std::path::Path::new("logs/postmortem");
+                match dump.write_to_dir(postmortem_dir) {
+                    Ok(path) => error!("Post-mortem dump written to {path:?}"),
+                    Err(e) => error!("Failed to write post-mortem dump: {e}"),
+                }
+
+                break;
+            }
+
+            tokio::select! {
+                // Observation processing — the unified dispatch.
+                obs = obs_stream.next() => {
+                    match obs {
+                        Some(observation) => {
+                            trace!(obs = observation.label(), "Processing observation");
+                            if let Err(e) = self.handle_observation(observation).await {
+                                error!("Error handling observation: {e}");
+                            }
+
+                            // Check kill switch after each observation.
+                            self.check_kill_switch();
+
+                            // Event-driven reconciliation check (live only).
+                            // In paper mode, safety_sync queries the exchange REST API
+                            // which would overwrite synthetic margin with real $0 balance.
+                            if self.environment.is_live() {
+                                if let Some(trigger) = self.infra.reconciler.should_sync() {
+                                    debug!(trigger = ?trigger, "Event-driven reconciliation triggered");
+                                    if let Err(e) = self.safety_sync().await {
+                                        warn!("Event-driven sync failed: {e}");
+                                    }
+                                }
+                            }
+
+                            // Event-driven quote updates.
+                            if let Err(e) = self.check_event_accumulator().await {
+                                warn!("Event accumulator quote update failed: {e}");
+                            }
+                        }
+                        None => {
+                            warn!("Observation stream closed, stopping market maker");
+                            break;
+                        }
+                    }
+                }
+
+                // Binance feed (optional).
+                Some(update) = async {
+                    match self.binance_receiver.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_binance_update(update);
+                }
+
+                // Periodic safety sync + metrics + checkpoint.
+                _ = sync_interval.tick() => {
+                    // Safety sync for live environments only.
+                    if self.environment.is_live() {
+                        if let Err(e) = self.safety_sync().await {
+                            warn!("Safety sync failed: {e}");
+                        }
+                    }
+
+                    // Prometheus metrics update.
+                    let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+                    self.estimator.update_trend_pnl(pnl_summary.unrealized_pnl);
+                    self.infra.prometheus.update_position(
+                        self.position.position(),
+                        self.effective_max_position,
+                    );
+                    self.infra.prometheus.update_pnl(
+                        pnl_summary.total_pnl,
+                        pnl_summary.total_pnl,
+                        pnl_summary.realized_pnl,
+                        pnl_summary.unrealized_pnl,
+                    );
+                    self.infra.prometheus.update_market(
+                        self.latest_mid,
+                        self.tier2.spread_tracker.current_spread_bps(),
+                        self.estimator.sigma_clean(),
+                        self.estimator.jump_ratio(),
+                        self.estimator.kappa(),
+                    );
+                    self.infra.prometheus.update_risk(
+                        self.safety.kill_switch.is_triggered(),
+                        self.tier1.liquidation_detector.cascade_severity(),
+                        self.tier1.adverse_selection.realized_as_bps(),
+                        self.tier1.liquidation_detector.tail_risk_multiplier(),
+                    );
+                    self.infra.prometheus.update_v2_estimator(
+                        self.estimator.hierarchical_kappa_std(),
+                        self.estimator.hierarchical_kappa_ci_95().0,
+                        self.estimator.hierarchical_kappa_ci_95().1,
+                        self.estimator.soft_toxicity_score(),
+                        self.estimator.kappa_sigma_correlation(),
+                        self.estimator.hierarchical_as_factor(),
+                    );
+                    self.infra.prometheus.update_robust_kappa(
+                        self.estimator.robust_kappa_ess(),
+                        self.estimator.kappa_outlier_count(),
+                        self.estimator.robust_kappa_nu(),
+                        self.estimator.robust_kappa_obs_count(),
+                    );
+                    let (bid_exp, ask_exp) = self.orders.pending_exposure();
+                    self.infra.prometheus.update_pending_exposure(
+                        bid_exp,
+                        ask_exp,
+                        self.position.position(),
+                    );
+                    self.infra.prometheus.update_calibration(
+                        self.stochastic.calibration_controller.gamma_multiplier(),
+                        self.stochastic.calibration_controller.calibration_progress(),
+                        self.stochastic.calibration_controller.fill_count(),
+                        self.stochastic.calibration_controller.is_calibrated(),
+                    );
+                    let learned_status = self.stochastic.learned_params.calibration_status();
+                    self.infra.prometheus.update_learned_params(
+                        self.stochastic.learned_params.alpha_touch.estimate(),
+                        self.stochastic.learned_params.kappa.estimate(),
+                        self.stochastic.learned_params.spread_floor_bps.estimate(),
+                        self.stochastic.learned_params.total_fills_observed,
+                        learned_status.tier1_ready,
+                    );
+
+                    self.periodic_component_update();
+
+                    // Periodic checkpoint save (every 5 minutes).
+                    if self.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {
+                        if let Some(ref manager) = self.checkpoint_manager {
+                            let bundle = self.assemble_checkpoint_bundle();
+                            if let Err(e) = manager.save_all(&bundle) {
+                                warn!("Checkpoint save failed: {e}");
+                            }
+                            self.last_checkpoint_save = std::time::Instant::now();
+                        }
+                    }
+
+                    // P&L inventory snapshot for carry calculation.
+                    if self.latest_mid > 0.0 {
+                        self.tier2.pnl_tracker.record_inventory_snapshot(self.latest_mid);
+                    }
+
+                    // Update learned parameters from AS classifier.
+                    if self.stochastic.stochastic_config.use_learned_parameters {
+                        let (informed, uninformed) = self.tier1.adverse_selection.take_informed_counts();
+                        if informed > 0 || uninformed > 0 {
+                            self.stochastic.learned_params.alpha_touch.observe_beta(informed, uninformed);
+                        }
+
+                        let total_fills = self.tier2.pnl_tracker.fill_count();
+                        let session_duration_s = self.session_start_time.elapsed().as_secs_f64();
+                        let avg_spread_bps = self.tier2.spread_tracker.current_spread_bps();
+                        if total_fills >= 10 && session_duration_s > 60.0 && avg_spread_bps > 0.0 {
+                            self.stochastic.update_kappa_from_fills(
+                                total_fills,
+                                session_duration_s,
+                                avg_spread_bps,
+                            );
+                        }
+                    }
+
+                    // Kill switch status log.
+                    let summary = self.safety.kill_switch.summary();
+                    debug!(
+                        daily_pnl = %format!("${:.2}", summary.daily_pnl),
+                        drawdown = %format!("{:.1}%", summary.drawdown_pct),
+                        position_value = %format!("${:.2}", summary.position_value),
+                        data_age = %format!("{:.1}s", summary.data_age_secs),
+                        cascade_severity = %format!("{:.2}", summary.cascade_severity),
+                        "Kill switch status"
+                    );
+                }
+            }
+        }
+
+        // Graceful shutdown.
+        info!("Initiating graceful shutdown (5 second timeout)...");
+        match tokio::time::timeout(Duration::from_secs(5), self.shutdown()).await {
+            Ok(Ok(())) => info!("Graceful shutdown completed successfully"),
+            Ok(Err(e)) => error!("Graceful shutdown encountered error: {e}"),
+            Err(_) => error!("Graceful shutdown timed out after 5 seconds"),
         }
 
         info!("Market maker stopped.");

@@ -33,8 +33,7 @@ pub struct LiveAnalyticsSummary {
 
 /// Bundled analytics components for the live market maker.
 ///
-/// Mirrors the analytics setup in `paper_trader.rs` but provides a clean
-/// interface for the live event loop. The `EdgeTracker` is NOT included
+/// Provides analytics for both paper and live environments. The `EdgeTracker` is NOT included
 /// here because it already lives in `Tier2Components`.
 pub struct LiveAnalytics {
     /// Return-based Sharpe ratio tracker.
@@ -260,8 +259,7 @@ impl LiveAnalytics {
 
 /// Build a `CycleContributions` from a `SignalContributionRecord`.
 ///
-/// This replicates the logic in `paper_trader.rs` that converts the raw
-/// record into the attribution format.
+/// Converts the raw signal contribution record into the attribution format.
 fn build_cycle_contributions(
     cycle_id: u64,
     timestamp_ns: u64,
