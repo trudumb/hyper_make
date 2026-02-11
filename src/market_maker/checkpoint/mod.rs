@@ -235,6 +235,7 @@ mod tests {
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
+            readiness: PriorReadiness::default(),
         }
     }
 

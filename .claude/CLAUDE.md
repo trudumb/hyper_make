@@ -53,7 +53,7 @@ cargo test <test_name>           # Prefer single tests for speed
 cargo clippy -- -D warnings      # Lint — treat warnings as errors
 
 # Binaries (user runs these manually, never run them yourself UNLESS explicitly asked)
-# market_maker, parameter_estimator, paper_trader, health_dashboard, calibration_report
+# market_maker (paper mode: `market_maker paper`), parameter_estimator, health_dashboard, calibration_report
 ```
 
 IMPORTANT: After any code change, run `cargo clippy -- -D warnings` and fix all warnings before considering the task done.

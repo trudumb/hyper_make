@@ -635,7 +635,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // === Periodic Checkpoint Save (every 5 minutes) ===
                     if self.last_checkpoint_save.elapsed() >= Duration::from_secs(300) {
                         if let Some(ref manager) = self.checkpoint_manager {
-                            let bundle = self.assemble_checkpoint_bundle();
+                            let mut bundle = self.assemble_checkpoint_bundle();
+                            // Stamp readiness assessment on every periodic save
+                            let gate = crate::market_maker::calibration::gate::CalibrationGate::new(
+                                crate::market_maker::calibration::gate::CalibrationGateConfig::default(),
+                            );
+                            bundle.readiness = gate.assess(&bundle);
                             if let Err(e) = manager.save_all(&bundle) {
                                 warn!("Checkpoint save failed: {e}");
                             }

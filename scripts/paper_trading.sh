@@ -116,9 +116,9 @@ echo ""
 mkdir -p "${OUTPUT_DIR}"
 
 # Pre-flight check: verify build
-echo -e "${YELLOW}[1/3] Building paper_trader...${NC}"
-if ! cargo build --bin paper_trader 2>/dev/null; then
-    echo -e "${RED}Build failed! Run 'cargo build --bin paper_trader' to see errors.${NC}"
+echo -e "${YELLOW}[1/3] Building market_maker...${NC}"
+if ! cargo build --bin market_maker 2>/dev/null; then
+    echo -e "${RED}Build failed! Run 'cargo build --bin market_maker' to see errors.${NC}"
     exit 1
 fi
 echo -e "${GREEN}Build OK${NC}"
@@ -137,14 +137,14 @@ echo ""
 
 # Set RUST_LOG based on verbose mode
 if [ "$VERBOSE" = true ]; then
-    export RUST_LOG="hyperliquid_rust_sdk::market_maker::simulation=debug,paper_trader=debug"
+    export RUST_LOG="hyperliquid_rust_sdk::market_maker::simulation=debug,market_maker=debug"
     echo -e "${MAGENTA}VERBOSE MODE ENABLED - detailed logging active${NC}"
 else
-    export RUST_LOG="hyperliquid_rust_sdk::market_maker::simulation=info,paper_trader=info"
+    export RUST_LOG="hyperliquid_rust_sdk::market_maker::simulation=info,market_maker=info"
 fi
 
 # Build command args
-PT_ARGS="--asset ${ASSET} --duration ${DURATION} --output-dir ${OUTPUT_DIR}"
+PT_ARGS="paper --asset ${ASSET} --duration ${DURATION}"
 if [ "$REPORT" = true ]; then
     PT_ARGS="${PT_ARGS} --report"
 fi
@@ -196,7 +196,7 @@ if [ "$CAPTURE" = true ]; then
 fi
 
 # Run paper trader with tee to capture output
-./target/debug/paper_trader ${PT_ARGS} 2>&1 | tee "${LOG_FILE}" || true
+./target/debug/market_maker ${PT_ARGS} 2>&1 | tee "${LOG_FILE}" || true
 
 # Stop capture tool if started
 if [ -n "$CAPTURE_PID" ]; then

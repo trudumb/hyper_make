@@ -27,6 +27,7 @@ mod information_ratio;
 pub mod model_gating;
 pub mod parameter_learner;
 mod prediction_log;
+pub mod gate;
 pub mod meta_calibration;
 pub mod signal_decay;
 
@@ -49,6 +50,7 @@ pub use information_ratio::{BinStats, ExponentialIRTracker, InformationRatioTrac
 pub use model_gating::{InformedFlowAdjustment, ModelGating, ModelGatingConfig, ModelWeights};
 pub use parameter_learner::{BayesianParam, CalibrationStatus, FillOutcome, LearnedParameters, PriorFamily};
 pub use prediction_log::{PredictionLog, PredictionRecord, PredictionType};
+pub use gate::{CalibrationGate, CalibrationGateConfig, PriorStatus};
 pub use signal_decay::{
     LatencyStats, SignalDecayConfig, SignalDecayTracker, SignalEmission, SignalOutcome,
 };

@@ -724,6 +724,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             },
             rl_q_table: self.stochastic.rl_agent.to_checkpoint(),
             kill_switch: self.safety.kill_switch.to_checkpoint(),
+            readiness: checkpoint::PriorReadiness::default(),
         }
     }
 

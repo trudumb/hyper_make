@@ -338,6 +338,24 @@ struct Cli {
     #[arg(long)]
     rl_watch: Option<String>,
 
+    // === Auto-Calibration Pipeline Flags ===
+    /// Skip calibration gate — run live with whatever priors exist.
+    /// WARNING: uncalibrated priors risk real money.
+    #[arg(long)]
+    skip_calibration: bool,
+
+    /// Force cold-start live with no prior. Implies --skip-calibration.
+    #[arg(long)]
+    force: bool,
+
+    /// Auto-paper calibration duration in seconds (default: 1800 = 30 min).
+    #[arg(long, default_value = "1800")]
+    calibration_duration: u64,
+
+    /// Don't auto-paper — just refuse to start if no calibrated prior exists.
+    #[arg(long)]
+    no_auto_paper: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -892,6 +910,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return run_paper_mode(&cli, *duration).await;
         }
         Some(Commands::Run) | None => {
+            // === Auto-Calibration Pipeline ===
+            // Unless --force or --skip-calibration, check for calibrated priors
+            // and auto-paper if needed.
+            if !cli.force && !cli.skip_calibration {
+                use hyperliquid_rust_sdk::market_maker::calibration::gate::{
+                    CalibrationGate, CalibrationGateConfig,
+                };
+                use hyperliquid_rust_sdk::market_maker::checkpoint::types::CheckpointBundle;
+
+                let asset_raw = cli.asset.clone().unwrap_or_else(|| "BTC".to_string());
+                let resolved_asset = if let Some(ref dex_name) = cli.dex {
+                    if asset_raw.contains(':') {
+                        asset_raw.clone()
+                    } else {
+                        format!("{dex_name}:{asset_raw}")
+                    }
+                } else {
+                    asset_raw.clone()
+                };
+
+                // Auto-resolve prior path from --paper-checkpoint or default location
+                let prior_path = cli
+                    .paper_checkpoint
+                    .as_ref()
+                    .map(|p| std::path::PathBuf::from(p).join("prior.json"))
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(format!(
+                            "data/checkpoints/paper/{resolved_asset}/prior.json"
+                        ))
+                    });
+
+                let gate = CalibrationGate::new(CalibrationGateConfig::default());
+
+                // Try to load and assess existing prior
+                let prior_ok = if prior_path.exists() {
+                    match std::fs::read_to_string(&prior_path) {
+                        Ok(json) => match serde_json::from_str::<CheckpointBundle>(&json) {
+                            Ok(bundle) => {
+                                let readiness = &bundle.readiness;
+                                // Check age
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64;
+                                let age_s = (now_ms.saturating_sub(bundle.metadata.timestamp_ms))
+                                    as f64
+                                    / 1000.0;
+                                if age_s > gate.config().max_prior_age_s {
+                                    println!(
+                                        "Prior is stale ({:.0}s old, max {:.0}s)",
+                                        age_s,
+                                        gate.config().max_prior_age_s
+                                    );
+                                    false
+                                } else if gate.passes(readiness) {
+                                    println!(
+                                        "Prior calibration: {:?} ({}/5 estimators ready, {:.0}s session)",
+                                        readiness.verdict,
+                                        readiness.estimators_ready,
+                                        readiness.session_duration_s
+                                    );
+                                    true
+                                } else {
+                                    println!(
+                                        "Prior insufficient: {}",
+                                        gate.explain_failure(readiness)
+                                    );
+                                    false
+                                }
+                            }
+                            Err(e) => {
+                                println!("Failed to parse prior: {e}");
+                                false
+                            }
+                        },
+                        Err(_) => false,
+                    }
+                } else {
+                    println!("No prior found at {}", prior_path.display());
+                    false
+                };
+
+                if !prior_ok {
+                    if cli.no_auto_paper {
+                        return Err(
+                            "No calibrated prior exists and --no-auto-paper was set. \
+                             Run `market_maker paper --duration 1800` first, or use --force to cold-start."
+                                .into(),
+                        );
+                    }
+
+                    println!(
+                        "\n=== Auto-calibration: paper trading for {}s ===\n",
+                        cli.calibration_duration
+                    );
+                    run_paper_mode(&cli, cli.calibration_duration).await?;
+                    println!("\n=== Auto-calibration complete, proceeding to live ===\n");
+
+                    // Re-check the saved prior
+                    if prior_path.exists() {
+                        if let Ok(json) = std::fs::read_to_string(&prior_path) {
+                            if let Ok(bundle) = serde_json::from_str::<CheckpointBundle>(&json) {
+                                if !gate.passes(&bundle.readiness) {
+                                    return Err(format!(
+                                        "Auto-calibration completed but prior still insufficient: {}\n\
+                                         Use --force to override.",
+                                        gate.explain_failure(&bundle.readiness)
+                                    )
+                                    .into());
+                                }
+                                println!(
+                                    "Post-calibration verdict: {:?}",
+                                    bundle.readiness.verdict
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // Continue to run the market maker
         }
     }
@@ -1949,7 +2086,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // === Prior Injection: Load paper checkpoint and inject full prior (φ→ψ) ===
-    if let Some(ref paper_ckpt_path) = cli.paper_checkpoint {
+    // Auto-resolve: use --paper-checkpoint if given, else check default paper prior path
+    let paper_ckpt_path_resolved = cli.paper_checkpoint.clone().or_else(|| {
+        let default_path = format!("data/checkpoints/paper/{asset}");
+        if std::path::Path::new(&default_path).join("prior.json").exists() {
+            Some(default_path)
+        } else {
+            None
+        }
+    });
+    if let Some(ref paper_ckpt_path) = paper_ckpt_path_resolved {
         use hyperliquid_rust_sdk::market_maker::checkpoint::{PriorInject, transfer::InjectionConfig};
 
         // Try multiple candidate paths (paper mode saves to prior.json, old path used latest/checkpoint.json)
@@ -2492,7 +2638,17 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
                 info!("Paper trading duration elapsed, extracting prior...");
-                let prior = market_maker.extract_prior();
+                let mut prior = market_maker.extract_prior();
+                // Stamp readiness assessment before saving
+                let gate = hyperliquid_rust_sdk::market_maker::calibration::gate::CalibrationGate::new(
+                    hyperliquid_rust_sdk::market_maker::calibration::gate::CalibrationGateConfig::default(),
+                );
+                prior.readiness = gate.assess(&prior);
+                info!(
+                    verdict = ?prior.readiness.verdict,
+                    estimators_ready = prior.readiness.estimators_ready,
+                    "Prior readiness assessed"
+                );
                 let checkpoint_path = format!("data/checkpoints/paper/{asset}/prior.json");
                 if let Ok(json) = serde_json::to_string_pretty(&prior) {
                     std::fs::create_dir_all(format!("data/checkpoints/paper/{asset}"))?;

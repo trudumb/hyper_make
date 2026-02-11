@@ -48,7 +48,8 @@
       "Bash(echo:*)",
       "Bash(rustfmt --check:*)",
       "mcp__serena__get_current_config",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(xargs:*)"
     ]
   }
 }

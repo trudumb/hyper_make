@@ -9,6 +9,37 @@ use serde::{Deserialize, Serialize};
 use crate::market_maker::calibration::parameter_learner::LearnedParameters;
 use crate::market_maker::ComponentParams;
 
+/// Readiness verdict for a checkpoint — can it safely drive live trading?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PriorVerdict {
+    /// All estimators converged, safe for live at full confidence.
+    Ready,
+    /// Partial convergence — live with defensive spreads (wider, smaller size).
+    Marginal,
+    /// Insufficient data — live would be reckless.
+    #[default]
+    Insufficient,
+}
+
+/// Calibration readiness snapshot, stamped into each saved checkpoint.
+/// Captures estimator convergence at save time so the `run` command
+/// can make a go/no-go decision without re-deriving from raw state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PriorReadiness {
+    pub verdict: PriorVerdict,
+    /// Observation counts per estimator at assessment time
+    pub vol_observations: usize,
+    pub kappa_observations: usize,
+    pub as_learning_samples: usize,
+    pub regime_observations: usize,
+    pub fill_rate_observations: usize,
+    pub kelly_fills: usize,
+    /// Session duration (seconds) at assessment time
+    pub session_duration_s: f64,
+    /// How many of the 5 core estimators met min_observations
+    pub estimators_ready: u8,
+}
+
 /// Complete checkpoint bundle containing all model state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBundle {
@@ -47,6 +78,9 @@ pub struct CheckpointBundle {
     /// Kill switch state for persistence across restarts
     #[serde(default)]
     pub kill_switch: KillSwitchCheckpoint,
+    /// Calibration readiness assessment, stamped at save time
+    #[serde(default)]
+    pub readiness: PriorReadiness,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -591,6 +625,7 @@ mod tests {
                 peak_pnl: 50.0,
                 triggered_at_ms: 1700000000000,
             },
+            readiness: PriorReadiness::default(),
         };
 
         // Serialize to JSON
@@ -631,6 +666,8 @@ mod tests {
         assert_eq!(restored.kill_switch.daily_pnl, -100.0);
         assert_eq!(restored.kill_switch.peak_pnl, 50.0);
         assert_eq!(restored.kill_switch.triggered_at_ms, 1700000000000);
+        // Readiness round-trip
+        assert_eq!(restored.readiness.verdict, PriorVerdict::Insufficient);
     }
 
     #[test]
@@ -672,6 +709,7 @@ mod tests {
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
+            readiness: PriorReadiness::default(),
         };
 
         // Serialize to JSON
@@ -693,5 +731,40 @@ mod tests {
         assert_eq!(restored.kill_switch.daily_pnl, 0.0);
         assert_eq!(restored.kill_switch.peak_pnl, 0.0);
         assert_eq!(restored.kill_switch.triggered_at_ms, 0);
+    }
+
+    #[test]
+    fn test_checkpoint_bundle_backward_compat_no_readiness() {
+        let bundle = CheckpointBundle {
+            metadata: CheckpointMetadata {
+                version: 1,
+                timestamp_ms: 1700000000000,
+                asset: "ETH".to_string(),
+                session_duration_s: 100.0,
+            },
+            learned_params: LearnedParameters::default(),
+            pre_fill: PreFillCheckpoint::default(),
+            enhanced: EnhancedCheckpoint::default(),
+            vol_filter: VolFilterCheckpoint::default(),
+            regime_hmm: RegimeHMMCheckpoint::default(),
+            informed_flow: InformedFlowCheckpoint::default(),
+            fill_rate: FillRateCheckpoint::default(),
+            kappa_own: KappaCheckpoint::default(),
+            kappa_bid: KappaCheckpoint::default(),
+            kappa_ask: KappaCheckpoint::default(),
+            momentum: MomentumCheckpoint::default(),
+            kelly_tracker: KellyTrackerCheckpoint::default(),
+            ensemble_weights: EnsembleWeightsCheckpoint::default(),
+            rl_q_table: RLCheckpoint::default(),
+            kill_switch: KillSwitchCheckpoint::default(),
+            readiness: PriorReadiness::default(),
+        };
+        let json = serde_json::to_string(&bundle).expect("serialize");
+        let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        map.as_object_mut().unwrap().remove("readiness");
+        let old_json = serde_json::to_string(&map).expect("re-serialize");
+        let restored: CheckpointBundle = serde_json::from_str(&old_json).expect("deserialize old format");
+        assert_eq!(restored.readiness.verdict, PriorVerdict::Insufficient);
+        assert_eq!(restored.readiness.estimators_ready, 0);
     }
 }
