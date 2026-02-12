@@ -60,6 +60,7 @@ mod trend_persistence;
 mod volatility;
 pub mod volatility_filter;
 mod volume;
+pub mod trade_flow_tracker;
 pub mod vpin;
 
 // V2 re-exports (will be used when integrated)
@@ -148,6 +149,9 @@ pub use threshold_kappa::{ThresholdKappa, ThresholdKappaConfig, ThresholdKappaRe
 
 // Binance flow analysis (cross-venue signals)
 pub use binance_flow::{BinanceFlowAnalyzer, BinanceFlowConfig, FlowFeatureVec};
+
+// Trade flow tracker (EWMA-based HL-native flow features)
+pub use trade_flow_tracker::TradeFlowTracker;
 
 // Cross-venue analysis (joint Binance + Hyperliquid signals)
 pub use cross_venue::{CrossVenueAnalyzer, CrossVenueConfig, CrossVenueFeatures, BivariateFlowObservation};

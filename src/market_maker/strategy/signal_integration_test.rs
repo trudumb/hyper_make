@@ -402,8 +402,8 @@ mod signal_improvement_proof {
         // Test InformedFlowAdjustment
         let adj = InformedFlowAdjustment::default();
 
-        // Low informed = tighten
-        assert!(adj.spread_multiplier(0.01) < 1.0, "Should tighten when p_informed very low");
+        // Low informed = no tightening (min_tighten_mult = 1.0 disables spread tightening)
+        assert!(adj.spread_multiplier(0.01) >= 1.0, "Should not tighten (tightening disabled)");
 
         // Medium = neutral
         let mid_mult = adj.spread_multiplier(0.1);
@@ -413,7 +413,7 @@ mod signal_improvement_proof {
         assert!(adj.spread_multiplier(0.4) > 1.1, "Should widen when p_informed high");
 
         println!("\n=== COMPONENT TESTS PASSED ===");
-        println!("✓ InformedFlowAdjustment tightens spreads when p_informed low");
+        println!("✓ InformedFlowAdjustment does not tighten when p_informed low (disabled)");
         println!("✓ InformedFlowAdjustment is neutral for moderate p_informed");
         println!("✓ InformedFlowAdjustment widens spreads when p_informed high");
 

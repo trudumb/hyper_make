@@ -331,6 +331,18 @@ impl RegimeKappaEstimator {
         kappa.clamp(50.0, 10000.0)
     }
 
+    /// Get blended prior kappa using current regime probabilities.
+    ///
+    /// Weights the per-regime prior kappa by the HMM regime probabilities,
+    /// providing the expected prior kappa under the current regime distribution.
+    pub fn blended_prior(&self) -> f64 {
+        let mut prior = 0.0;
+        for i in 0..NUM_KAPPA_REGIMES {
+            prior += self.regime_probs[i] * self.config.prior_for_regime(i);
+        }
+        prior.clamp(50.0, 10000.0)
+    }
+
     /// Get kappa for a specific regime.
     pub fn kappa_for_regime(&self, regime: usize) -> f64 {
         if regime >= NUM_KAPPA_REGIMES {

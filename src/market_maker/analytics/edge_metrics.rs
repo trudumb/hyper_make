@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Phase of edge measurement lifecycle.
+///
+/// Pending: measured at fill time (AS estimated from classifier).
+/// Resolved: updated after 5s markout (AS measured from actual mid movement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EdgePhase {
+    #[default]
+    Pending,
+    Resolved,
+}
+
 /// Per-fill edge measurement comparing predictions to realizations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeSnapshot {
@@ -24,6 +35,15 @@ pub struct EdgeSnapshot {
     /// Measures model accuracy without fee drag.
     #[serde(default)]
     pub gross_edge_bps: f64,
+    /// Phase of edge measurement: Pending (at fill) or Resolved (after markout).
+    #[serde(default)]
+    pub phase: EdgePhase,
+    /// Mid price when the order was originally placed.
+    #[serde(default)]
+    pub mid_at_placement: f64,
+    /// Markout-based adverse selection in bps (populated after 5s markout).
+    #[serde(default)]
+    pub markout_as_bps: Option<f64>,
 }
 
 /// Tracks edge snapshots and computes aggregate statistics.
@@ -281,6 +301,9 @@ mod tests {
             predicted_edge_bps: predicted_bps,
             realized_edge_bps: realized_bps,
             gross_edge_bps: gross_bps,
+            phase: EdgePhase::Pending,
+            mid_at_placement: 0.0,
+            markout_as_bps: None,
         }
     }
 
@@ -558,5 +581,86 @@ mod tests {
         }
         let var = var_tracker.gross_edge_variance();
         assert!((var - 10.0 / 9.0).abs() < 1e-10, "Expected 10/9, got {var}");
+    }
+
+    #[test]
+    fn test_edge_phase_default_is_pending() {
+        let phase = EdgePhase::default();
+        assert_eq!(phase, EdgePhase::Pending);
+    }
+
+    #[test]
+    fn test_edge_snapshot_serde_roundtrip_with_new_fields() {
+        let snap = EdgeSnapshot {
+            timestamp_ns: 42000,
+            predicted_spread_bps: 5.0,
+            realized_spread_bps: 4.0,
+            predicted_as_bps: 1.0,
+            realized_as_bps: 0.5,
+            fee_bps: 1.5,
+            predicted_edge_bps: 2.5,
+            realized_edge_bps: 2.0,
+            gross_edge_bps: 3.5,
+            phase: EdgePhase::Resolved,
+            mid_at_placement: 50_000.0,
+            markout_as_bps: Some(0.8),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let deser: EdgeSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.phase, EdgePhase::Resolved);
+        assert!((deser.mid_at_placement - 50_000.0).abs() < f64::EPSILON);
+        assert_eq!(deser.markout_as_bps, Some(0.8));
+    }
+
+    #[test]
+    fn test_edge_snapshot_serde_backward_compat() {
+        // Old JSON without the new fields — should deserialize with defaults
+        let old_json = r#"{
+            "timestamp_ns": 1000,
+            "predicted_spread_bps": 5.0,
+            "realized_spread_bps": 4.0,
+            "predicted_as_bps": 1.0,
+            "realized_as_bps": 0.5,
+            "fee_bps": 1.5,
+            "predicted_edge_bps": 2.5,
+            "realized_edge_bps": 2.0,
+            "gross_edge_bps": 3.5
+        }"#;
+        let snap: EdgeSnapshot = serde_json::from_str(old_json).unwrap();
+        assert_eq!(snap.phase, EdgePhase::Pending);
+        assert!((snap.mid_at_placement - 0.0).abs() < f64::EPSILON);
+        assert_eq!(snap.markout_as_bps, None);
+    }
+
+    #[test]
+    fn test_edge_snapshot_pending_vs_resolved() {
+        let pending = EdgeSnapshot {
+            timestamp_ns: 1000,
+            predicted_spread_bps: 5.0,
+            realized_spread_bps: 4.0,
+            predicted_as_bps: 1.0,
+            realized_as_bps: 0.5,
+            fee_bps: 1.5,
+            predicted_edge_bps: 2.5,
+            realized_edge_bps: 2.0,
+            gross_edge_bps: 3.5,
+            phase: EdgePhase::Pending,
+            mid_at_placement: 50_000.0,
+            markout_as_bps: None,
+        };
+        assert_eq!(pending.phase, EdgePhase::Pending);
+        assert!(pending.markout_as_bps.is_none());
+
+        // Simulate resolution: update phase and set markout
+        let resolved = EdgeSnapshot {
+            phase: EdgePhase::Resolved,
+            markout_as_bps: Some(1.2),
+            ..pending
+        };
+        assert_eq!(resolved.phase, EdgePhase::Resolved);
+        assert_eq!(resolved.markout_as_bps, Some(1.2));
+        // Original fields preserved
+        assert!((resolved.mid_at_placement - 50_000.0).abs() < f64::EPSILON);
+        assert!((resolved.realized_edge_bps - 2.0).abs() < f64::EPSILON);
     }
 }

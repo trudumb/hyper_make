@@ -298,6 +298,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         Some(fill_pred_id),
                         Some(as_pred_id),
                         Some(depth_bps),
+                        mid_price,
                     );
                     cloids_for_tracker.push(cloid.clone());
 
@@ -313,7 +314,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
                 } else {
                     // Fallback (shouldn't happen with new code)
-                    self.orders.add_pending(side, spec.price, spec.size);
+                    self.orders.add_pending(side, spec.price, spec.size, mid_price);
                 }
             }
 
@@ -413,9 +414,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                 side,
                                 spec.price,
                                 spec.size,
+                                self.latest_mid,
                             )
                         } else {
-                            TrackedOrder::new(result.oid, side, spec.price, spec.size)
+                            TrackedOrder::new(result.oid, side, spec.price, spec.size, self.latest_mid)
                         };
                         tracked.filled = actual_fill;
                         tracked.transition_to(OrderState::FilledImmediately);
@@ -1446,6 +1448,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                     side,
                                     spec.new_price,
                                     spec.new_size,
+                                    self.latest_mid,
                                 );
                                 self.orders.add_order(new_order);
                                 oid_remap_count += 1;
@@ -1578,6 +1581,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             Some(fill_pred_id),
                             Some(as_pred_id),
                             Some(depth_bps),
+                            mid_price,
                         );
 
                         // Phase 7: Register expected CLOID with orphan tracker BEFORE API call
@@ -1634,6 +1638,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                     side,
                                     spec.new_price,
                                     spec.new_size,
+                                    self.latest_mid,
                                 );
                                 tracked.filled = actual_fill;
 
@@ -2016,6 +2021,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     Some(fill_pred_id),
                     Some(as_pred_id),
                     Some(depth_bps),
+                    mid_price,
                 );
                 cloids_for_tracker.push(cloid.clone());
             }
@@ -2097,9 +2103,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                     // Track order as FilledImmediately for WebSocket deduplication
                     let mut tracked = if let Some(c) = cloid {
-                        TrackedOrder::with_cloid(result.oid, c.clone(), side, spec.price, spec.size)
+                        TrackedOrder::with_cloid(result.oid, c.clone(), side, spec.price, spec.size, self.latest_mid)
                     } else {
-                        TrackedOrder::new(result.oid, side, spec.price, spec.size)
+                        TrackedOrder::new(result.oid, side, spec.price, spec.size, self.latest_mid)
                     };
                     tracked.filled = actual_fill;
                     tracked.transition_to(OrderState::FilledImmediately);
@@ -2168,9 +2174,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         side,
                         spec.price,
                         result.resting_size,
+                        self.latest_mid,
                     )
                 } else {
-                    TrackedOrder::new(result.oid, side, spec.price, result.resting_size)
+                    TrackedOrder::new(result.oid, side, spec.price, result.resting_size, self.latest_mid)
                 };
                 self.ws_state.add_order(tracked);
 

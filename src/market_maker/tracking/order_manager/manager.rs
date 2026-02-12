@@ -205,10 +205,10 @@ impl OrderManager {
     /// call `finalize_pending()` to convert to a tracked order.
     ///
     /// NOTE: Prefer `add_pending_with_cloid()` for deterministic fill tracking.
-    pub fn add_pending(&mut self, side: Side, price: f64, size: f64) {
+    pub fn add_pending(&mut self, side: Side, price: f64, size: f64, mid: f64) {
         let key = (side, price_to_key(price));
         self.pending
-            .insert(key, PendingOrder::new(side, price, size));
+            .insert(key, PendingOrder::new(side, price, size, mid));
     }
 
     /// Register a pending order with CLOID before placing it on the exchange.
@@ -222,9 +222,9 @@ impl OrderManager {
     /// - `price`: Limit price
     /// - `size`: Order size
     /// - `cloid`: Client Order ID (UUID string, generated before placement)
-    pub fn add_pending_with_cloid(&mut self, side: Side, price: f64, size: f64, cloid: String) {
+    pub fn add_pending_with_cloid(&mut self, side: Side, price: f64, size: f64, cloid: String, mid: f64) {
         // Store in CLOID map (primary lookup)
-        let pending = PendingOrder::with_cloid(side, price, size, cloid.clone());
+        let pending = PendingOrder::with_cloid(side, price, size, cloid.clone(), mid);
         self.pending_by_cloid.insert(cloid, pending.clone());
 
         // Also store by price (fallback lookup)
@@ -246,6 +246,7 @@ impl OrderManager {
     /// - `fill_prediction_id`: Prediction ID from CalibratedFillModel::predict()
     /// - `as_prediction_id`: Prediction ID from CalibratedASModel::predict()
     /// - `depth_bps`: Depth from mid in basis points (for calibration context)
+    /// - `mid`: Mid price at placement time (for edge measurement)
     #[allow(clippy::too_many_arguments)]
     pub fn add_pending_with_calibration(
         &mut self,
@@ -256,6 +257,7 @@ impl OrderManager {
         fill_prediction_id: Option<u64>,
         as_prediction_id: Option<u64>,
         depth_bps: Option<f64>,
+        mid: f64,
     ) {
         // Use the with_calibration constructor to include all tracking data
         let pending = PendingOrder::with_calibration(
@@ -266,6 +268,7 @@ impl OrderManager {
             fill_prediction_id,
             as_prediction_id,
             depth_bps,
+            mid,
         );
         self.pending_by_cloid.insert(cloid, pending.clone());
 
@@ -777,7 +780,7 @@ mod tests {
         let mut manager = OrderManager::new();
 
         // Add an order with old OID
-        let order = TrackedOrder::new(100, Side::Buy, 50000.0, 0.01);
+        let order = TrackedOrder::new(100, Side::Buy, 50000.0, 0.01, 0.0);
         manager.add_order(order);
 
         assert!(manager.get_order(100).is_some());
@@ -801,7 +804,7 @@ mod tests {
     #[test]
     fn test_replace_oid_same() {
         let mut manager = OrderManager::new();
-        let order = TrackedOrder::new(100, Side::Buy, 50000.0, 0.01);
+        let order = TrackedOrder::new(100, Side::Buy, 50000.0, 0.01, 0.0);
         manager.add_order(order);
 
         // Replacing with same OID should succeed (no-op)

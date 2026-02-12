@@ -605,7 +605,7 @@ impl Default for InformedFlowAdjustment {
             widen_threshold: 0.2,
             tighten_threshold: 0.05,
             max_widen_mult: 1.5,
-            min_tighten_mult: 0.9,
+            min_tighten_mult: 1.0,
         }
     }
 }
@@ -741,9 +741,9 @@ mod tests {
     fn test_informed_flow_adjustment_tighten() {
         let adj = InformedFlowAdjustment::default();
 
-        // Low P(informed) should tighten
+        // Low P(informed) should NOT tighten (min_tighten_mult = 1.0 disables tightening)
         let mult = adj.spread_multiplier(0.01);
-        assert!(mult < 1.0);
+        assert!(mult >= 1.0);
         assert!(mult >= adj.min_tighten_mult);
     }
 

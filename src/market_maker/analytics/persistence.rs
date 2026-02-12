@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use super::attribution::SignalPnLAttributor;
 use super::edge_metrics::EdgeSnapshot;
+#[cfg(test)]
+use super::edge_metrics::EdgePhase;
 use super::sharpe::SharpeSummary;
 use super::CycleContributions;
 
@@ -178,6 +180,9 @@ mod tests {
                 predicted_edge_bps: 2.5,
                 realized_edge_bps: 2.0,
                 gross_edge_bps: 3.5,
+                phase: EdgePhase::Pending,
+                mid_at_placement: 0.0,
+                markout_as_bps: None,
             };
             logger.log_edge(&snap).unwrap();
             logger.flush().unwrap();
@@ -196,6 +201,9 @@ mod tests {
                 predicted_edge_bps: 3.5,
                 realized_edge_bps: 3.0,
                 gross_edge_bps: 4.5,
+                phase: EdgePhase::Pending,
+                mid_at_placement: 0.0,
+                markout_as_bps: None,
             };
             logger.log_edge(&snap).unwrap();
             logger.flush().unwrap();

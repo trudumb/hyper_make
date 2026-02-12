@@ -828,7 +828,7 @@ mod tests {
     use super::*;
 
     fn make_order(oid: u64, side: Side, price: f64) -> TrackedOrder {
-        TrackedOrder::new(oid, side, price, 1.0)
+        TrackedOrder::new(oid, side, price, 1.0, 0.0)
     }
 
     #[test]

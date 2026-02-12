@@ -80,7 +80,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
 
             self.orders
-                .add_order(TrackedOrder::new(order.oid, side, px, sz));
+                .add_order(TrackedOrder::new(order.oid, side, px, sz, self.latest_mid));
         }
 
         Ok(())

@@ -26,6 +26,7 @@ use crate::market_maker::{
         TradeSizeDistribution, TradeSizeDistributionConfig,
         BOCPDKappaConfig, BOCPDKappaPredictor,
         ThresholdKappa, ThresholdKappaConfig,
+        TradeFlowTracker,
     },
     calibration::{LearnedParameters, SignalDecayTracker},
     quoting::{KappaSpreadConfig, KappaSpreadController},
@@ -580,6 +581,11 @@ pub struct StochasticComponents {
     /// Signal integrator: combines lead-lag, informed flow, regime kappa signals.
     /// Receives Binance prices via channel, computes optimal skew for quote engine.
     pub signal_integrator: SignalIntegrator,
+
+    // === HL-Native Trade Flow Tracking ===
+    /// EWMA-based trade flow tracker: directional volume imbalance at multiple horizons.
+    /// Replaces hardcoded zeros in FlowFeatureVec for imbalance_30s, avg_buy_size, etc.
+    pub trade_flow_tracker: TradeFlowTracker,
 }
 
 impl StochasticComponents {
@@ -691,6 +697,8 @@ impl StochasticComponents {
             learned_params: LearnedParameters::default(),
             // Cross-Exchange Signal Integration (Binance → Hyperliquid lead-lag)
             signal_integrator: SignalIntegrator::new(SignalIntegratorConfig::default()),
+            // HL-Native Trade Flow Tracking
+            trade_flow_tracker: TradeFlowTracker::new(),
         }
     }
 

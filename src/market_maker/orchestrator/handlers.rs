@@ -301,6 +301,54 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .signal_integrator
                 .update_as_prediction(predicted_as_prob, was_adverse);
 
+            // === RESOLVED EDGE SNAPSHOT: markout-based edge measurement ===
+            // This is the ground-truth edge measurement using 5-second markout AS.
+            // Fill-time "instant AS" was tautological (AS ≈ depth from same mid).
+            // Now: spread = |fill - placement_mid|, AS = markout mid movement.
+            {
+                use crate::market_maker::analytics::EdgeSnapshot;
+                use crate::market_maker::analytics::edge_metrics::EdgePhase;
+                const MAKER_FEE_BPS: f64 = 1.5;
+
+                let markout_direction = if pending.is_buy { 1.0 } else { -1.0 };
+                let markout_as_bps = if pending.fill_price > 0.0 {
+                    (self.latest_mid - pending.fill_price) * markout_direction
+                        / pending.fill_price * 10_000.0
+                } else {
+                    0.0
+                };
+
+                let predicted_as_bps_val = self.estimator.total_as_bps();
+                let resolved_snap = EdgeSnapshot {
+                    timestamp_ns: pending.timestamp_ms * 1_000_000,
+                    predicted_spread_bps: pending.quoted_spread_bps,
+                    realized_spread_bps: pending.quoted_spread_bps,
+                    predicted_as_bps: predicted_as_bps_val,
+                    realized_as_bps: markout_as_bps,
+                    fee_bps: MAKER_FEE_BPS,
+                    predicted_edge_bps: pending.quoted_spread_bps - predicted_as_bps_val - MAKER_FEE_BPS,
+                    realized_edge_bps: pending.quoted_spread_bps - markout_as_bps - MAKER_FEE_BPS,
+                    gross_edge_bps: pending.quoted_spread_bps - markout_as_bps,
+                    phase: EdgePhase::Resolved,
+                    mid_at_placement: pending.mid_at_placement,
+                    markout_as_bps: Some(markout_as_bps),
+                };
+
+                // Feed resolved snapshot to learning systems
+                self.tier2.edge_tracker.add_snapshot(resolved_snap.clone());
+                let fill_pnl_bps = resolved_snap.realized_edge_bps;
+                self.live_analytics.record_fill(fill_pnl_bps, Some(&resolved_snap));
+
+                tracing::info!(
+                    spread_bps = %format!("{:.2}", pending.quoted_spread_bps),
+                    markout_as_bps = %format!("{:.2}", markout_as_bps),
+                    edge_bps = %format!("{:.2}", resolved_snap.realized_edge_bps),
+                    gross_bps = %format!("{:.2}", resolved_snap.gross_edge_bps),
+                    mid_at_placement = %format!("{:.4}", pending.mid_at_placement),
+                    "[EDGE RESOLVED] markout-based edge measurement"
+                );
+            }
+
             if was_adverse {
                 tracing::info!(
                     side = if pending.is_buy { "Buy" } else { "Sell" },
@@ -388,6 +436,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Wire trade to buy pressure tracker in SignalIntegrator
             self.stochastic.signal_integrator.on_trade_for_pressure(size, is_buy);
+
+            // Wire trade to EWMA flow tracker for FlowFeatureVec
+            self.stochastic.trade_flow_tracker.on_trade(size, is_buy);
 
             // === P0: Wire trade features to SignalIntegrator for informed flow classification ===
             {
@@ -551,12 +602,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 vpin_velocity: self.stochastic.vpin.vpin_velocity(),
                 imbalance_1s: self.tier2.hawkes.flow_imbalance(),
                 imbalance_5s: self.tier2.hawkes.flow_imbalance(), // Best available proxy
-                imbalance_30s: 0.0, // Not tracked at this horizon on HL side
-                imbalance_5m: 0.0,
+                imbalance_30s: self.stochastic.trade_flow_tracker.imbalance_at_30s(),
+                imbalance_5m: self.stochastic.trade_flow_tracker.imbalance_at_5m(),
                 intensity: self.tier2.hawkes.intensity_ratio(),
-                avg_buy_size: 0.0,  // Not tracked independently on HL side
-                avg_sell_size: 0.0,
-                size_ratio: 0.0,
+                avg_buy_size: self.stochastic.trade_flow_tracker.avg_buy_size(),
+                avg_sell_size: self.stochastic.trade_flow_tracker.avg_sell_size(),
+                size_ratio: self.stochastic.trade_flow_tracker.size_ratio(),
                 order_flow_direction: self.stochastic.vpin.order_flow_direction(),
                 timestamp_ms: self.cached_trades.back().map(|t| t.2 as i64).unwrap_or(0),
                 trade_count: self.cached_trades.len() as u64,
@@ -706,16 +757,33 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let fill_price: f64 = fill.px.parse().unwrap_or(0.0);
                 let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
 
-                // Compute realized adverse selection: (mid_after - fill_price) × direction
-                // direction = +1 for buy (we bought, if mid moved up we gained),
-                // direction = -1 for sell (we sold, if mid moved down we gained)
-                // Positive AS means we lost (price moved against us after fill)
+                // Look up the order's placement mid from TrackedOrder.
+                // This is the mid price when the order was originally placed,
+                // NOT the mid at fill time. Using fill-time mid causes the
+                // tautology bug where AS ≈ depth ≈ 0 (same reference point).
+                let mid_at_placement = self.orders.get_order(fill.oid)
+                    .and_then(|tracked| {
+                        if tracked.mid_at_placement > 0.0 { Some(tracked.mid_at_placement) } else { None }
+                    })
+                    .unwrap_or(self.latest_mid); // Fallback for untracked orders
+
+                // Quoted spread: distance from placement mid to fill price (in bps)
+                let quoted_spread_bps = if mid_at_placement > 0.0 {
+                    ((fill_price - mid_at_placement).abs() / mid_at_placement) * 10_000.0
+                } else {
+                    0.0
+                };
+
+                // Compute instant AS using fill-time mid (Phase 1, will be refined at markout)
                 let direction = if is_buy { 1.0 } else { -1.0 };
                 let as_realized = (self.latest_mid - fill_price) * direction / fill_price;
 
-                // Compute depth of this fill (distance from mid when placed)
-                // For now use adverse selection as proxy until we track order placement mid
-                let depth_from_mid = (fill_price - self.latest_mid).abs() / self.latest_mid;
+                // Compute depth from placement mid (not fill-time mid)
+                let depth_from_mid = if mid_at_placement > 0.0 {
+                    (fill_price - mid_at_placement).abs() / mid_at_placement
+                } else {
+                    (fill_price - self.latest_mid).abs() / self.latest_mid
+                };
 
                 // PnL for this fill: simplified as -AS (negative AS = profit)
                 let fill_pnl = -as_realized;
@@ -753,6 +821,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         fill_price,
                         is_buy,
                         mid_at_fill: self.latest_mid,
+                        mid_at_placement,
+                        quoted_spread_bps,
                     },
                 );
 
@@ -775,37 +845,42 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .signal_integrator
                     .update_as_prediction(predicted_as_prob, was_adverse);
 
-                // === EDGE TRACKING: Record predicted vs realized edge per fill ===
+                // === EDGE TRACKING: Create Pending edge snapshot (deferred to markout) ===
+                // Edge learning is deferred to the 5-second markout path where we get
+                // the true markout-based AS. At fill time we only have instant AS which
+                // suffers from the tautology bug (AS ≈ depth when using fill-time mid).
+                // The Resolved snapshot is created in check_pending_fill_outcomes().
                 {
                     use crate::market_maker::analytics::EdgeSnapshot;
+                    use crate::market_maker::analytics::edge_metrics::EdgePhase;
                     const MAKER_FEE_BPS: f64 = 1.5;
-                    let depth_bps = depth_from_mid * 10_000.0;
-                    let as_realized_bps = as_realized * 10_000.0;
-                    // Use the actual AS estimate from the parameter estimator (in bps),
-                    // NOT the Bayesian adverse probability × 10,000 which was a category
-                    // mismatch (probability 0.15 → 1500 bps instead of ~0-5 bps).
                     let predicted_as_bps = self.estimator.total_as_bps();
                     let snap = EdgeSnapshot {
                         timestamp_ns: fill.time * 1_000_000, // ms to ns
-                        predicted_spread_bps: depth_bps,
-                        realized_spread_bps: depth_bps,
+                        predicted_spread_bps: quoted_spread_bps,
+                        realized_spread_bps: quoted_spread_bps,
                         predicted_as_bps,
-                        realized_as_bps: as_realized_bps,
+                        realized_as_bps: 0.0,  // Deferred to markout
                         fee_bps: MAKER_FEE_BPS,
-                        predicted_edge_bps: depth_bps - predicted_as_bps - MAKER_FEE_BPS,
-                        realized_edge_bps: depth_bps - as_realized_bps - MAKER_FEE_BPS,
-                        gross_edge_bps: depth_bps - as_realized_bps,
+                        predicted_edge_bps: quoted_spread_bps - predicted_as_bps - MAKER_FEE_BPS,
+                        realized_edge_bps: 0.0,  // Deferred to markout
+                        gross_edge_bps: 0.0,     // Deferred to markout
+                        phase: EdgePhase::Pending,
+                        mid_at_placement,
+                        markout_as_bps: None,
                     };
-                    self.tier2.edge_tracker.add_snapshot(snap.clone());
 
-                    // === Live Analytics: Record fill for Sharpe/attribution tracking ===
-                    let fill_pnl_bps = snap.realized_edge_bps;
-                    self.live_analytics.record_fill(fill_pnl_bps, Some(&snap));
+                    // Log Pending snapshot for diagnostics only — NOT fed to learning yet
+                    trace!(
+                        quoted_spread_bps = %format!("{:.2}", quoted_spread_bps),
+                        mid_at_placement = %format!("{:.4}", mid_at_placement),
+                        predicted_as_bps = %format!("{:.2}", predicted_as_bps),
+                        "[EDGE] Pending snapshot (deferred to markout)"
+                    );
 
-                    // === Phase 5: Resolve pending quote as filled ===
-                    // Match this fill against pending quotes in the outcome tracker.
-                    // This enables unbiased edge estimation (fills + non-fills).
-                    let _ = self.quote_outcome_tracker.on_fill(is_buy, snap.realized_edge_bps);
+                    // Phase 5: Resolve pending quote as filled (immediate, uses quoted spread)
+                    let _ = self.quote_outcome_tracker.on_fill(is_buy, snap.predicted_edge_bps);
+                    let _ = snap; // Explicit drop — real snapshot created at markout
                 }
 
                 // === V2 INTEGRATION: BOCPD Kappa Relationship Update ===
@@ -1538,6 +1613,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 side,
                 order.limit_px.parse().unwrap_or(0.0),
                 order.sz.parse().unwrap_or(0.0),
+                self.latest_mid,
             );
             self.ws_state.add_order(tracked);
             debug!(

@@ -63,6 +63,10 @@ pub struct PendingFillOutcome {
     pub is_buy: bool,
     /// Mid price at the time of fill
     pub mid_at_fill: f64,
+    /// Mid price when the order was originally placed (from TrackedOrder)
+    pub mid_at_placement: f64,
+    /// Quoted spread in bps: |fill_price - mid_at_placement| / mid_at_placement * 10000
+    pub quoted_spread_bps: f64,
 }
 
 /// A unified fill event containing all data needed by modules.
@@ -323,10 +327,14 @@ mod tests {
             fill_price: 50_000.0,
             is_buy: true,
             mid_at_fill: 50_005.0,
+            mid_at_placement: 49_998.0,
+            quoted_spread_bps: 0.4,
         };
         assert!(outcome.is_buy);
         assert!((outcome.fill_price - 50_000.0).abs() < f64::EPSILON);
         assert!((outcome.mid_at_fill - 50_005.0).abs() < f64::EPSILON);
+        assert!((outcome.mid_at_placement - 49_998.0).abs() < f64::EPSILON);
+        assert!((outcome.quoted_spread_bps - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -343,6 +351,8 @@ mod tests {
                 fill_price: 50_000.0,
                 is_buy: i % 2 == 0,
                 mid_at_fill: 50_000.0,
+                mid_at_placement: 0.0,
+                quoted_spread_bps: 0.0,
             });
         }
         assert_eq!(queue.len(), 3);

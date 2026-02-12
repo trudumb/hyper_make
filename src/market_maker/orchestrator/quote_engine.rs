@@ -385,6 +385,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         };
 
+        // User-specified max_position is an absolute hard cap that must never be exceeded.
+        let pre_effective_max_position = if self.config.max_position_user_specified {
+            pre_effective_max_position.min(self.config.max_position)
+        } else {
+            pre_effective_max_position
+        };
+
         // Update exchange limits with margin-based capacity BEFORE building sources
         self.infra
             .exchange_limits
@@ -867,9 +874,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Record signal contributions for analytics attribution
         self.live_analytics.record_quote_cycle(&signals);
 
+        // Position guard inventory skew (GLFT gamma*sigma^2*q*T) — always additive
+        let position_guard_skew_bps = self.safety.position_guard.inventory_skew_bps();
+
         if signals.lead_lag_actionable {
             // Real cross-exchange signal from Binance feed
-            market_params.lead_lag_signal_bps = signals.combined_skew_bps;
+            market_params.lead_lag_signal_bps = signals.combined_skew_bps + position_guard_skew_bps;
             market_params.lead_lag_confidence = signals.model_confidence;
 
             if signals.combined_skew_bps.abs() > 1.0 {
@@ -909,6 +919,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     }
                 }
             }
+            // Always add position guard skew in fallback path
+            market_params.lead_lag_signal_bps += position_guard_skew_bps;
         }
 
         // Apply informed flow spread multiplier from SignalIntegrator
@@ -981,12 +993,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Risk assessment replaces binary Quote/NoQuote with continuous multipliers.
         // Called early so spread_multiplier and size can be adjusted.
         let risk_overlay = self.stochastic.controller.risk_assessment();
-        if risk_overlay.emergency_pull {
-            info!(
-                reason = %risk_overlay.reason,
-                "Risk overlay: emergency pull — cancelling all quotes"
-            );
-            return Ok(());
+        let risk_level = risk_overlay.risk_level;
+        match risk_level {
+            crate::market_maker::control::RiskLevel::KillSwitch => {
+                info!(reason = %risk_overlay.reason, "Risk overlay: kill switch — cancelling ALL quotes");
+                return Ok(());
+            }
+            crate::market_maker::control::RiskLevel::Emergency => {
+                info!(reason = %risk_overlay.reason, "Risk overlay: emergency — position-reducing only");
+                // Don't return — continue to generate quotes, filter below
+            }
+            crate::market_maker::control::RiskLevel::Elevated => {
+                debug!(reason = %risk_overlay.reason, "Risk overlay: elevated risk");
+            }
+            crate::market_maker::control::RiskLevel::Normal => {}
         }
 
         // Get spread multiplier from circuit breaker if applicable
@@ -1005,6 +1025,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 kappa_ratio = %format!("{:.2}", self.stochastic.threshold_kappa.kappa_ratio()),
                 multiplier = %format!("{:.2}", threshold_kappa_mult),
                 "ThresholdKappa: Momentum regime detected, widening spreads"
+            );
+        }
+
+        // === REGIME KAPPA: Widen when fill intensity is lower than expected ===
+        let regime_kappa_mult = {
+            let kappa_eff = signals.kappa_effective;
+            let kappa_prior = self.stochastic.signal_integrator.kappa_prior();
+            if kappa_eff > 0.0 && kappa_prior > 0.0 {
+                (kappa_prior / kappa_eff).clamp(0.5, 2.0)
+            } else {
+                1.0
+            }
+        };
+        if regime_kappa_mult > 1.01 {
+            spread_multiplier *= regime_kappa_mult;
+            debug!(
+                kappa_eff = %format!("{:.0}", signals.kappa_effective),
+                kappa_prior = %format!("{:.0}", self.stochastic.signal_integrator.kappa_prior()),
+                regime_mult = %format!("{:.2}", regime_kappa_mult),
+                "RegimeKappa: Widening spreads (low fill intensity)"
             );
         }
 
@@ -1104,6 +1144,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 defensive = %format!("{:.2}x", defensive_mult),
                 staleness = %format!("{:.2}x", staleness_mult),
                 model_gating = %format!("{:.2}x", model_gating_mult),
+                regime_kappa = %format!("{:.2}x", regime_kappa_mult),
                 total = %format!("{:.2}x", spread_multiplier),
                 "Spread composition breakdown"
             );
@@ -1174,6 +1215,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
         }
         self.effective_max_position = new_effective;
+        // User-specified max_position is an absolute hard cap
+        if self.config.max_position_user_specified {
+            self.effective_max_position = self.effective_max_position.min(self.config.max_position);
+        }
 
         // =======================================================================
         // PROACTIVE POSITION MANAGEMENT (Phases 1-4)
@@ -1255,6 +1300,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Update effective max position with proactive adjustments
         self.effective_max_position = proactive_max_position;
+        // User-specified max_position is an absolute hard cap
+        if self.config.max_position_user_specified {
+            self.effective_max_position = self.effective_max_position.min(self.config.max_position);
+        }
 
         // Note: exchange limits were already updated BEFORE building sources (line ~1210)
         // using pre_effective_max_position which should equal new_effective
@@ -2114,6 +2163,31 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
+            // === RISK LEVEL EMERGENCY FILTER ===
+            // When risk_level is Emergency, only allow position-reducing quotes.
+            // Long → keep asks (sells to reduce), clear bids.
+            // Short → keep bids (buys to reduce), clear asks.
+            // Flat → keep both (want to catch fills).
+            if risk_level == crate::market_maker::control::RiskLevel::Emergency {
+                let pos = self.position.position();
+                if pos > 0.0 && !bid_quotes.is_empty() {
+                    info!(
+                        position = %format!("{:.4}", pos),
+                        cleared_bids = bid_quotes.len(),
+                        "Emergency: clearing bids (long position, keeping asks to reduce)"
+                    );
+                    bid_quotes.clear();
+                } else if pos < 0.0 && !ask_quotes.is_empty() {
+                    info!(
+                        position = %format!("{:.4}", pos),
+                        cleared_asks = ask_quotes.len(),
+                        "Emergency: clearing asks (short position, keeping bids to reduce)"
+                    );
+                    ask_quotes.clear();
+                }
+                // Flat: keep both sides to catch fills
+            }
+
             // === GRADUATED EMERGENCY PULL ===
             // Instead of binary all-or-nothing, use graduated urgency (0.0-1.0):
             //   Low (>0, <=0.4):    Halve sizes on increasing side
@@ -2440,6 +2514,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // QuoteBoth: normal, no filtering
                     // NoQuote: should have returned early, but defensive
                     // WidenSpreads: quote both sides (spread widening applied earlier)
+                }
+            }
+
+            // === RISK LEVEL EMERGENCY FILTER (single-quote mode) ===
+            if risk_level == crate::market_maker::control::RiskLevel::Emergency {
+                let pos = self.position.position();
+                if pos > 0.0 && bid.is_some() {
+                    debug!("Emergency: clearing BID quote (long position, single-quote mode)");
+                    bid = None;
+                } else if pos < 0.0 && ask.is_some() {
+                    debug!("Emergency: clearing ASK quote (short position, single-quote mode)");
+                    ask = None;
                 }
             }
 

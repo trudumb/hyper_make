@@ -136,11 +136,13 @@ pub struct PendingOrder {
     pub as_prediction_id: Option<u64>,
     /// Depth from mid in basis points (for calibration)
     pub depth_bps: Option<f64>,
+    /// Mid price at order placement time (for accurate edge measurement)
+    pub mid_at_placement: f64,
 }
 
 impl PendingOrder {
     /// Create a new pending order (legacy, without CLOID).
-    pub fn new(side: Side, price: f64, size: f64) -> Self {
+    pub fn new(side: Side, price: f64, size: f64, mid: f64) -> Self {
         Self {
             side,
             price,
@@ -149,12 +151,17 @@ impl PendingOrder {
             cloid: None,
             fill_prediction_id: None,
             as_prediction_id: None,
-            depth_bps: None,
+            depth_bps: if mid > 0.0 {
+                Some(((price - mid).abs() / mid * 10_000.0).max(0.0))
+            } else {
+                None
+            },
+            mid_at_placement: mid,
         }
     }
 
     /// Create a new pending order with CLOID tracking.
-    pub fn with_cloid(side: Side, price: f64, size: f64, cloid: String) -> Self {
+    pub fn with_cloid(side: Side, price: f64, size: f64, cloid: String, mid: f64) -> Self {
         Self {
             side,
             price,
@@ -163,11 +170,17 @@ impl PendingOrder {
             cloid: Some(cloid),
             fill_prediction_id: None,
             as_prediction_id: None,
-            depth_bps: None,
+            depth_bps: if mid > 0.0 {
+                Some(((price - mid).abs() / mid * 10_000.0).max(0.0))
+            } else {
+                None
+            },
+            mid_at_placement: mid,
         }
     }
 
     /// Create a new pending order with full calibration tracking.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_calibration(
         side: Side,
         price: f64,
@@ -176,6 +189,7 @@ impl PendingOrder {
         fill_prediction_id: Option<u64>,
         as_prediction_id: Option<u64>,
         depth_bps: Option<f64>,
+        mid: f64,
     ) -> Self {
         Self {
             side,
@@ -186,6 +200,7 @@ impl PendingOrder {
             fill_prediction_id,
             as_prediction_id,
             depth_bps,
+            mid_at_placement: mid,
         }
     }
 }
@@ -232,11 +247,13 @@ pub struct TrackedOrder {
     pub as_prediction_id: Option<u64>,
     /// Depth from mid in basis points (for calibration outcome recording)
     pub depth_bps: Option<f64>,
+    /// Mid price at order placement time (for accurate edge measurement)
+    pub mid_at_placement: f64,
 }
 
 impl TrackedOrder {
     /// Create a new tracked order in Resting state.
-    pub fn new(oid: u64, side: Side, price: f64, size: f64) -> Self {
+    pub fn new(oid: u64, side: Side, price: f64, size: f64, mid: f64) -> Self {
         let now = Instant::now();
         Self {
             oid,
@@ -253,13 +270,18 @@ impl TrackedOrder {
             fill_tids: SmallVec::new(),
             fill_prediction_id: None,
             as_prediction_id: None,
-            depth_bps: None,
+            depth_bps: if mid > 0.0 {
+                Some(((price - mid).abs() / mid * 10_000.0).max(0.0))
+            } else {
+                None
+            },
+            mid_at_placement: mid,
         }
     }
 
     /// Create a new tracked order with a client order ID.
-    pub fn with_cloid(oid: u64, cloid: String, side: Side, price: f64, size: f64) -> Self {
-        let mut order = Self::new(oid, side, price, size);
+    pub fn with_cloid(oid: u64, cloid: String, side: Side, price: f64, size: f64, mid: f64) -> Self {
+        let mut order = Self::new(oid, side, price, size, mid);
         order.cloid = Some(cloid);
         order
     }
@@ -284,6 +306,7 @@ impl TrackedOrder {
             fill_prediction_id: pending.fill_prediction_id,
             as_prediction_id: pending.as_prediction_id,
             depth_bps: pending.depth_bps,
+            mid_at_placement: pending.mid_at_placement,
         }
     }
 

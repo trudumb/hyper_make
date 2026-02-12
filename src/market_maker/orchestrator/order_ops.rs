@@ -310,6 +310,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 side,
                 quote.price,
                 result.resting_size,
+                self.latest_mid,
             ));
 
             // Also add to WsOrderStateManager for improved state tracking
@@ -318,6 +319,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 side,
                 quote.price,
                 result.resting_size,
+                self.latest_mid,
             ));
 
             // === Tier 1: Register with queue tracker ===

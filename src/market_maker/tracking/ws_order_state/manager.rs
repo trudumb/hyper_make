@@ -297,6 +297,7 @@ impl WsOrderStateManager {
                 side,
                 inflight.price,
                 inflight.size,
+                0.0, // mid not available in WS state manager
             );
 
             if filled {
@@ -368,7 +369,7 @@ impl WsOrderStateManager {
                     let cloid = uuid::Uuid::new_v4().to_string(); // Bulk orders may not have individual CLOIDs
                     let side = if is_buy { Side::Buy } else { Side::Sell };
 
-                    let tracked = TrackedOrder::with_cloid(oid, cloid.clone(), side, 0.0, 0.0);
+                    let tracked = TrackedOrder::with_cloid(oid, cloid.clone(), side, 0.0, 0.0, 0.0);
 
                     self.orders.insert(oid, tracked);
                     self.cloid_to_oid.insert(cloid.clone(), oid);
@@ -442,6 +443,7 @@ impl WsOrderStateManager {
                     side,
                     inflight.price,
                     inflight.size,
+                    old_order.mid_at_placement, // preserve mid from original order
                 );
 
                 self.orders.insert(new_oid, tracked);
@@ -919,7 +921,7 @@ mod tests {
         let mut position = PositionTracker::new(0.0);
 
         // Add a tracked order
-        let order = TrackedOrder::new(123, Side::Buy, 50000.0, 0.02);
+        let order = TrackedOrder::new(123, Side::Buy, 50000.0, 0.02, 0.0);
         mgr.add_order(order);
 
         let fill = WsFillEvent {
@@ -952,7 +954,7 @@ mod tests {
         let mut mgr = WsOrderStateManager::new();
 
         // Add a tracked order
-        let order = TrackedOrder::new(123, Side::Buy, 50000.0, 0.01);
+        let order = TrackedOrder::new(123, Side::Buy, 50000.0, 0.01, 0.0);
         mgr.add_order(order);
 
         // Simulate filled update
@@ -983,7 +985,7 @@ mod tests {
         let mut mgr = WsOrderStateManager::with_config(config);
 
         // Add a filled order
-        let mut order = TrackedOrder::new(123, Side::Buy, 50000.0, 0.01);
+        let mut order = TrackedOrder::new(123, Side::Buy, 50000.0, 0.01, 0.0);
         order.transition_to(OrderState::Filled);
         mgr.add_order(order);
 

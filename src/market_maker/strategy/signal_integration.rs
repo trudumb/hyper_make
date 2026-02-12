@@ -245,6 +245,8 @@ pub struct SignalContributionRecord {
 
     /// Effective kappa from regime detection
     pub regime_kappa_effective: f64,
+    /// Regime kappa spread multiplier (prior / effective, clamped 0.5-2.0)
+    pub regime_kappa_spread_mult: f64,
     /// Whether regime kappa is active
     pub regime_active: bool,
 
@@ -913,6 +915,15 @@ impl SignalIntegrator {
             informed_flow_gating_weight: signals.informed_flow_gating_weight,
 
             regime_kappa_effective: signals.kappa_effective,
+            regime_kappa_spread_mult: {
+                let kappa_eff = signals.kappa_effective;
+                let kappa_prior = self.regime_kappa.blended_prior();
+                if kappa_eff > 0.0 && kappa_prior > 0.0 {
+                    (kappa_prior / kappa_eff).clamp(0.5, 2.0)
+                } else {
+                    1.0
+                }
+            },
             regime_active: self.config.use_regime_kappa,
 
             cross_venue_spread_mult: signals.cross_venue_spread_mult,
@@ -966,6 +977,15 @@ impl SignalIntegrator {
     /// Get regime kappa estimator for direct access.
     pub fn regime_kappa(&self) -> &RegimeKappaEstimator {
         &self.regime_kappa
+    }
+
+    /// Get the blended prior kappa from the regime kappa estimator.
+    ///
+    /// Returns the regime-probability-weighted prior kappa, representing
+    /// the expected fill intensity before observing data. Used to compute
+    /// regime kappa spread multiplier: `prior / effective`.
+    pub fn kappa_prior(&self) -> f64 {
+        self.regime_kappa.blended_prior()
     }
 
     /// Get model gating for direct access.

@@ -43,7 +43,7 @@ fn test_low_volatility_behavior() {
     );
 
     // Current order at 100.00
-    let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0);
+    let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
     let current = vec![&order];
 
     // Target moved to 100.04 (4bps move)
@@ -92,7 +92,7 @@ fn test_high_volatility_behavior() {
     );
 
     // Current order at 100.00
-    let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0);
+    let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
     let current = vec![&order];
 
     // Target moved to 100.20 (20bps move) - SAME AS ABOVE

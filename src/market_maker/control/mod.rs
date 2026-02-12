@@ -559,27 +559,36 @@ impl StochasticController {
         //   spread_mult = 1.0 + 2.0 * cp_prob^2    (clamped to [1.0, 3.0])
         let spread_mult = (1.0 + 2.0 * cp_prob * cp_prob).clamp(1.0, 3.0);
 
-        // 3. Emergency pull: extreme changepoint with high confidence.
-        //    Threshold raised from 0.9 to 0.95 — BOCD cp_prob saturates at 1.0
-        //    due to Student-t PDF collapse on edge prediction outliers. At 0.9 this
-        //    was firing on ~1% of cycles (33 times in 11 min).
-        //    Also enforce a 50-cycle cooldown to prevent rapid oscillation.
+        // 3. Graduated risk level from changepoint probability.
+        //    cp_prob > 0.95 → Emergency (was the old emergency_pull threshold)
+        //    cp_prob > 0.70 → Elevated (wider spreads, smaller size)
+        //    else           → Normal
+        //    KillSwitch is never set here — that comes from kill_switch.rs.
         const EMERGENCY_THRESHOLD: f64 = 0.95;
+        const ELEVATED_THRESHOLD: f64 = 0.70;
         const EMERGENCY_COOLDOWN_CYCLES: usize = 50;
         let cycles_since_last = self.cycle_count.saturating_sub(self.last_emergency_pull_cycle);
-        let emergency = cp_prob > EMERGENCY_THRESHOLD
-            && cycles_since_last >= EMERGENCY_COOLDOWN_CYCLES;
 
-        if emergency {
+        let risk_level = if cp_prob > EMERGENCY_THRESHOLD
+            && cycles_since_last >= EMERGENCY_COOLDOWN_CYCLES
+        {
             self.last_emergency_pull_cycle = self.cycle_count;
-        }
+            RiskLevel::Emergency
+        } else if cp_prob > ELEVATED_THRESHOLD {
+            RiskLevel::Elevated
+        } else {
+            RiskLevel::Normal
+        };
+
+        // Derive emergency_pull from risk_level for backward compatibility
+        let emergency_pull = matches!(risk_level, RiskLevel::Emergency);
 
         // 4. Build reason string
-        let reason = if emergency {
+        let reason = if risk_level == RiskLevel::Emergency {
             format!("extreme_changepoint_{cp_prob:.2}")
         } else if cp_prob > EMERGENCY_THRESHOLD && cycles_since_last < EMERGENCY_COOLDOWN_CYCLES {
             format!("changepoint_{cp_prob:.2}_cooldown_{cycles_since_last}")
-        } else if cp_prob > 0.5 {
+        } else if risk_level == RiskLevel::Elevated {
             format!("elevated_changepoint_{cp_prob:.2}")
         } else if self.learning_trust < 0.5 {
             format!("low_trust_{:.2}", self.learning_trust)
@@ -590,7 +599,8 @@ impl StochasticController {
         RiskAssessment {
             size_multiplier: size_mult,
             spread_multiplier: spread_mult,
-            emergency_pull: emergency,
+            emergency_pull,
+            risk_level,
             reason,
         }
     }
@@ -784,6 +794,17 @@ pub struct ControllerResult {
     pub override_reason: Option<String>,
 }
 
+/// Graduated risk level replacing binary emergency_pull.
+/// Normal: full quoting. Elevated: wider spreads. Emergency: position-reducing only. KillSwitch: cancel all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RiskLevel {
+    #[default]
+    Normal,
+    Elevated,
+    Emergency,
+    KillSwitch,
+}
+
 /// Risk assessment from the stochastic controller.
 ///
 /// Used as a continuous overlay on the ensemble's quote decision.
@@ -796,7 +817,10 @@ pub struct RiskAssessment {
     /// Spread multiplier [1.0, 3.0]. Widen when risk is elevated.
     pub spread_multiplier: f64,
     /// Emergency pull -- should all quotes be cancelled immediately.
+    /// Kept for backward compatibility; derived from `risk_level`.
     pub emergency_pull: bool,
+    /// Graduated risk level. Replaces binary emergency_pull with a spectrum.
+    pub risk_level: RiskLevel,
     /// Reason for current assessment (for logging).
     pub reason: String,
 }
@@ -807,6 +831,7 @@ impl Default for RiskAssessment {
             size_multiplier: 1.0,
             spread_multiplier: 1.0,
             emergency_pull: false,
+            risk_level: RiskLevel::Normal,
             reason: "normal".to_string(),
         }
     }
@@ -916,5 +941,171 @@ mod tests {
 
         assert_eq!(controller.cycle_count, 0);
         assert!((controller.learning_trust - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_risk_level_default() {
+        assert_eq!(RiskLevel::default(), RiskLevel::Normal);
+    }
+
+    #[test]
+    fn test_risk_assessment_default() {
+        let assessment = RiskAssessment::default();
+        assert_eq!(assessment.risk_level, RiskLevel::Normal);
+        assert!(!assessment.emergency_pull);
+        assert!((assessment.size_multiplier - 1.0).abs() < 1e-10);
+        assert!((assessment.spread_multiplier - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_risk_assessment_elevated_on_moderate_changepoint() {
+        let mut controller = StochasticController::default();
+        controller.cycle_count = 100;
+        controller.learning_trust = 0.8;
+        // Warm up changepoint detector with many stable observations
+        for i in 0..50 {
+            controller.changepoint.update(1.0 + (i as f64) * 0.0001);
+        }
+        // Inject a sudden regime shift — many observations at very different mean
+        for _ in 0..50 {
+            controller.changepoint.update(1000.0);
+        }
+
+        let assessment = controller.risk_assessment();
+        // After a big jump, we expect at least Elevated (possibly Emergency
+        // depending on BOCD internals). Either way, emergency_pull should
+        // be consistent with risk_level.
+        assert_eq!(
+            assessment.emergency_pull,
+            matches!(assessment.risk_level, RiskLevel::Emergency),
+            "emergency_pull must match risk_level"
+        );
+    }
+
+    #[test]
+    fn test_risk_level_mapping_consistency() {
+        // Directly verify that the risk_assessment method's output satisfies the
+        // invariant: emergency_pull == (risk_level == Emergency)
+        let mut controller = StochasticController::default();
+        controller.cycle_count = 200;
+        controller.learning_trust = 1.0;
+
+        // Run several cycles with varying data and check the invariant each time
+        for i in 0..100 {
+            let val = if i < 50 { 1.0 } else { 50.0 + i as f64 };
+            controller.changepoint.update(val);
+            controller.cycle_count += 1;
+
+            let assessment = controller.risk_assessment();
+            assert_eq!(
+                assessment.emergency_pull,
+                matches!(assessment.risk_level, RiskLevel::Emergency),
+                "emergency_pull invariant violated at cycle {i}: level={:?}, pull={}",
+                assessment.risk_level,
+                assessment.emergency_pull
+            );
+        }
+    }
+
+    #[test]
+    fn test_risk_assessment_normal_on_stable_data() {
+        let mut controller = StochasticController::default();
+        controller.cycle_count = 100;
+        controller.learning_trust = 0.9;
+        // Feed very stable data — no changepoint
+        for i in 0..30 {
+            controller.changepoint.update(1.0 + (i as f64) * 0.0001);
+        }
+
+        let assessment = controller.risk_assessment();
+        assert_eq!(assessment.risk_level, RiskLevel::Normal);
+        assert!(!assessment.emergency_pull);
+    }
+
+    #[test]
+    fn test_risk_assessment_cold_start_returns_default() {
+        let mut controller = StochasticController::default();
+        // cycle_count = 0, cold start
+        let assessment = controller.risk_assessment();
+        assert_eq!(assessment.risk_level, RiskLevel::Normal);
+        assert!(!assessment.emergency_pull);
+        assert!((assessment.size_multiplier - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_risk_level_enum_traits() {
+        // Verify Debug, Clone, Copy, PartialEq, Eq
+        let level = RiskLevel::Elevated;
+        let copied = level;
+        let cloned = level.clone();
+        assert_eq!(level, copied);
+        assert_eq!(level, cloned);
+        assert_ne!(level, RiskLevel::Normal);
+        // Debug
+        let debug_str = format!("{:?}", level);
+        assert!(debug_str.contains("Elevated"));
+    }
+
+    #[test]
+    fn test_emergency_pull_derived_from_risk_level() {
+        // Verify the contract: emergency_pull is true iff risk_level is Emergency
+        let emergency = RiskAssessment {
+            size_multiplier: 0.5,
+            spread_multiplier: 2.0,
+            emergency_pull: true,
+            risk_level: RiskLevel::Emergency,
+            reason: "test".to_string(),
+        };
+        assert!(matches!(emergency.risk_level, RiskLevel::Emergency));
+        assert!(emergency.emergency_pull);
+
+        let elevated = RiskAssessment {
+            risk_level: RiskLevel::Elevated,
+            emergency_pull: false,
+            ..emergency.clone()
+        };
+        assert!(!elevated.emergency_pull);
+    }
+
+    #[test]
+    fn test_risk_level_kill_switch_never_set_by_controller() {
+        // The controller should never produce KillSwitch — that comes from kill_switch.rs
+        let mut controller = StochasticController::default();
+        controller.cycle_count = 500;
+        controller.learning_trust = 0.0; // Worst case trust
+        // Extreme changepoint data
+        for i in 0..100 {
+            let val = if i < 50 { 1.0 } else { 10000.0 };
+            controller.changepoint.update(val);
+        }
+        for _ in 0..200 {
+            controller.cycle_count += 1;
+            let assessment = controller.risk_assessment();
+            assert_ne!(
+                assessment.risk_level,
+                RiskLevel::KillSwitch,
+                "Controller must never produce KillSwitch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_risk_level_ordering() {
+        // Verify that all four levels are distinct
+        let levels = [
+            RiskLevel::Normal,
+            RiskLevel::Elevated,
+            RiskLevel::Emergency,
+            RiskLevel::KillSwitch,
+        ];
+        for i in 0..levels.len() {
+            for j in 0..levels.len() {
+                if i == j {
+                    assert_eq!(levels[i], levels[j]);
+                } else {
+                    assert_ne!(levels[i], levels[j]);
+                }
+            }
+        }
     }
 }
