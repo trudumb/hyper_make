@@ -1591,7 +1591,9 @@ mod tests {
     }
 
     /// Test the min_meaningful_size calculation used in ladder_strat.rs
-    /// This verifies our change from 1.5x to 1.05x multiplier.
+    /// This verifies our change from 1.5x to 1.15x multiplier.
+    /// The 1.15x margin accounts for price movement between size calculation
+    /// and order placement, plus truncate_float() rounding down.
     #[test]
     fn test_min_meaningful_size_calculation() {
         let min_notional: f64 = 10.0;
@@ -1601,9 +1603,9 @@ mod tests {
         let old_min_meaningful_size: f64 = (min_notional * 1.5) / microprice;
         // = 15.0 / 22.80 = 0.658
 
-        // New calculation (1.05x) - allows more levels
-        let new_min_meaningful_size: f64 = (min_notional * 1.05) / microprice;
-        // = 10.5 / 22.80 = 0.461
+        // Current calculation (1.15x) - balanced safety margin
+        let new_min_meaningful_size: f64 = (min_notional * 1.15) / microprice;
+        // = 11.5 / 22.80 = 0.504
 
         // With 6 HYPE available:
         let available: f64 = 6.0;
@@ -1618,13 +1620,13 @@ mod tests {
             old_min_meaningful_size
         );
         assert!(
-            (new_min_meaningful_size - 0.461).abs() < 0.01,
+            (new_min_meaningful_size - 0.504).abs() < 0.01,
             "new={}",
             new_min_meaningful_size
         );
 
         // Old: 6.0 / 0.658 = 9.1 → 9 levels
-        // New: 6.0 / 0.461 = 13.0 → 13 levels
+        // New: 6.0 / 0.504 = 11.9 → 11 levels
         assert!(
             new_max_levels > old_max_levels,
             "New multiplier should allow more levels: {} vs {}",
@@ -1632,8 +1634,8 @@ mod tests {
             old_max_levels
         );
         assert!(
-            new_max_levels >= 13,
-            "With 1.05x multiplier, should get at least 13 levels, got {}",
+            new_max_levels >= 11,
+            "With 1.15x multiplier, should get at least 11 levels, got {}",
             new_max_levels
         );
         assert!(

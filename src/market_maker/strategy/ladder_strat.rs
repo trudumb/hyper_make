@@ -941,6 +941,18 @@ impl LadderStrategy {
             "[SPREAD TRACE] after floor clamp to effective_floor"
         );
 
+        // Track floor-binding frequency — if this fires >5% of cycles, gamma is miscalibrated
+        let bid_bound = dynamic_depths.bid.iter().any(|d| (*d - effective_floor_bps).abs() < 0.01);
+        let ask_bound = dynamic_depths.ask.iter().any(|d| (*d - effective_floor_bps).abs() < 0.01);
+        if bid_bound || ask_bound {
+            tracing::warn!(
+                effective_floor_bps = %format!("{:.2}", effective_floor_bps),
+                glft_optimal_bps = %format!("{:.2}", glft_optimal_bps),
+                gamma = %format!("{:.4}", gamma),
+                "Floor binding — gamma may be miscalibrated (should be rare after self-consistent gamma)"
+            );
+        }
+
         // === KAPPA-DRIVEN SPREAD CAP (Phase 3) ===
         // When kappa is high (lots of fill intensity), cap spreads to be tighter.
         // This allows us to be more aggressive when the market is active.
@@ -1359,12 +1371,21 @@ impl LadderStrategy {
             // to avoid placing many sub-minimum orders that would be rejected.
             //
             // Formula: max_levels = available_capacity / min_meaningful_size
-            // where min_meaningful_size = 1.01 × (min_notional / price) to ensure each order
-            // is slightly above exchange minimum notional requirements.
+            // where min_meaningful_size = 1.15 × (min_notional / price) to ensure each order
+            // comfortably exceeds exchange minimum notional after truncation/rounding.
             //
-            // CHANGED: Reduced to 1.01× — build_raw_ladder applies its own rounding buffer,
-            // so the capacity check doesn't need additional margin. This gains ~1 more level.
-            let min_meaningful_size = (config.min_notional * 1.01) / market_params.microprice;
+            // 1.15× margin accounts for price movement between size calculation and order
+            // placement, plus truncate_float() rounding down.
+            let min_meaningful_size = (config.min_notional * 1.15) / market_params.microprice;
+
+            // Warn if position limit is too small to place even one minimum-notional order
+            if min_meaningful_size > effective_max_position {
+                tracing::warn!(
+                    min_order = %format!("{:.4} (${:.2})", min_meaningful_size, min_meaningful_size * market_params.microprice),
+                    max_position = %format!("{:.4} (${:.2})", effective_max_position, effective_max_position * market_params.microprice),
+                    "POSITION LIMIT TOO SMALL: cannot place orders meeting exchange minimum"
+                );
+            }
 
             let max_bid_levels = if available_for_bids > EPSILON {
                 ((available_for_bids / min_meaningful_size).floor() as usize).max(1)

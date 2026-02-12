@@ -11,6 +11,7 @@
 //! - `multi_asset`: Multi-asset market making configuration
 //! - `regime_profile`: Thin DEX vs liquid CEX regime profiles
 
+pub mod auto_derive;
 mod core;
 mod impulse;
 mod multi_asset;
@@ -21,6 +22,7 @@ mod spread_profile;
 mod stochastic;
 
 // Re-export everything for backward compatibility
+pub use auto_derive::{auto_derive, DerivedParams, ExchangeContext};
 pub use core::*;
 pub use impulse::*;
 pub use multi_asset::*;

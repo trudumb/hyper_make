@@ -72,8 +72,15 @@ impl EdgeModel for GLFTEdgeModel {
         let half_spread_frac = self.half_spread(gamma, state.kappa);
         let half_spread_bps = half_spread_frac * 10000.0;
 
+        // Use actual quoted spread when available (Phase 2: edge at actual spread)
+        // Theoretical GLFT spread may be much tighter than actual (due to floor/adjustments)
+        let effective_half_spread_bps = state
+            .actual_quoted_spread_bps
+            .map(|s| s / 2.0)
+            .unwrap_or(half_spread_bps);
+
         // Edge = spread - AS - fees
-        let edge_mean = half_spread_bps - state.predicted_as_bps - self.fee_bps;
+        let edge_mean = effective_half_spread_bps - state.predicted_as_bps - self.fee_bps;
 
         // Uncertainty from multiple sources
         // 1. Volatility uncertainty: per-second vol converted to bps, scaled by typical fill duration
@@ -508,5 +515,59 @@ mod tests {
         let weights = ensemble.weights();
         assert!(weights[0] > weights[1]);
         assert!(weights[0] > weights[2]);
+    }
+
+    #[test]
+    fn test_glft_edge_uses_actual_spread() {
+        let model = GLFTEdgeModel::default();
+
+        // Without actual spread: uses theoretical GLFT spread
+        let state_no_actual = MarketState {
+            kappa: 3250.0,
+            sigma_effective: 0.01,
+            predicted_as_bps: 2.0,
+            toxicity_score: 0.0,
+            actual_quoted_spread_bps: None,
+            ..Default::default()
+        };
+        let (edge_theoretical, _) = model.predict_edge(&state_no_actual);
+
+        // With actual spread at 14.84 bps (7.42 per side): edge should be positive
+        let state_actual = MarketState {
+            actual_quoted_spread_bps: Some(14.84),
+            ..state_no_actual
+        };
+        let (edge_actual, _) = model.predict_edge(&state_actual);
+
+        // Edge at actual spread should be higher than at theoretical
+        assert!(
+            edge_actual > edge_theoretical,
+            "edge at actual spread ({:.2}) should exceed theoretical ({:.2})",
+            edge_actual,
+            edge_theoretical
+        );
+
+        // Edge at actual spread should be positive (7.42 - 2.0 - 1.5 = 3.92 bps)
+        assert!(
+            edge_actual > 0.0,
+            "edge at actual spread should be positive: {:.2}",
+            edge_actual
+        );
+    }
+
+    #[test]
+    fn test_glft_edge_fallback_when_no_actual_spread() {
+        let model = GLFTEdgeModel::default();
+        let state = MarketState {
+            kappa: 3250.0,
+            sigma_effective: 0.01,
+            predicted_as_bps: 2.0,
+            toxicity_score: 0.0,
+            actual_quoted_spread_bps: None,
+            ..Default::default()
+        };
+        let (edge, _) = model.predict_edge(&state);
+        // Should still work without actual spread (backward compat)
+        assert!(edge.is_finite(), "edge should be finite");
     }
 }

@@ -169,6 +169,67 @@ pub struct GLFTStrategy {
     pub elasticity_estimator: TakerElasticityEstimator,
 }
 
+/// Solve for minimum gamma that makes GLFT half-spread >= target.
+///
+/// Uses binary search since half_spread is monotonically increasing in gamma
+/// (the vol compensation term 0.5*gamma*sigma^2*T dominates for large gamma).
+///
+/// Returns gamma in the range [0.01, 100.0].
+///
+/// # Arguments
+/// * `target_half_spread` - Target half-spread in price fraction (not bps)
+/// * `kappa` - Order flow intensity
+/// * `sigma` - Volatility (per-second)
+/// * `time_horizon` - Holding time in seconds
+/// * `maker_fee_rate` - Maker fee in price fraction
+pub fn solve_min_gamma(
+    target_half_spread: f64,
+    kappa: f64,
+    sigma: f64,
+    time_horizon: f64,
+    maker_fee_rate: f64,
+) -> f64 {
+    // half_spread(gamma) = (1/gamma)*ln(1 + gamma/kappa) + 0.5*gamma*sigma^2*T + maker_fee
+    // This is monotonically increasing in gamma (the vol compensation term dominates)
+    // Binary search for the gamma where half_spread = target
+
+    let mut lo = 0.01_f64;
+    let mut hi = 100.0_f64;
+
+    // Helper: compute half_spread at given gamma
+    let hs = |gamma: f64| -> f64 {
+        let safe_kappa = kappa.max(1.0);
+        let ratio = gamma / safe_kappa;
+        let glft = if ratio > 1e-9 && gamma > 1e-9 {
+            (1.0 / gamma) * (1.0 + ratio).ln()
+        } else {
+            1.0 / safe_kappa
+        };
+        let vol_comp = 0.5 * gamma * sigma.powi(2) * time_horizon;
+        glft + vol_comp + maker_fee_rate
+    };
+
+    // If even max gamma doesn't reach target, return max
+    if hs(hi) < target_half_spread {
+        return hi;
+    }
+    // If min gamma already exceeds target, return min
+    if hs(lo) >= target_half_spread {
+        return lo;
+    }
+
+    for _ in 0..50 {
+        let mid = (lo + hi) / 2.0;
+        if hs(mid) < target_half_spread {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    (lo + hi) / 2.0
+}
+
 impl GLFTStrategy {
     /// Create a new GLFT strategy with base risk aversion.
     ///
@@ -324,7 +385,19 @@ impl GLFTStrategy {
         let rl_gamma_mult = market_params.rl_gamma_multiplier.clamp(0.1, 10.0);
         let gamma_final = gamma_with_tail * rl_gamma_mult;
 
-        let gamma_clamped = gamma_final.clamp(cfg.gamma_min, cfg.gamma_max);
+        // Self-consistent gamma: ensure GLFT output >= spread floor.
+        // This makes the floor a safety net that rarely binds, not the primary spread.
+        let time_horizon = self.holding_time(market_params.arrival_intensity);
+        let min_gamma = solve_min_gamma(
+            cfg.min_spread_floor,
+            market_params.kappa.max(1.0),
+            market_params.sigma_effective.max(1e-8),
+            time_horizon,
+            cfg.maker_fee_rate,
+        );
+        let gamma_with_floor = gamma_final.max(min_gamma);
+
+        let gamma_clamped = gamma_with_floor.clamp(cfg.gamma_min, cfg.gamma_max);
 
         // Log comparison for shadow mode validation
         if self.risk_model_config.use_calibrated_risk_model || blend > 0.0 {
@@ -2339,5 +2412,64 @@ mod tests {
             "half-spread must be floored at maker fee: ask={ask_half}, fee={}",
             strategy.risk_config.maker_fee_rate
         );
+    }
+
+    #[test]
+    fn test_solve_min_gamma_basic() {
+        // With kappa=3250, sigma=0.0002, T=60, fee=0.00015
+        // Target: 7.42 bps = 0.000742
+        let gamma = solve_min_gamma(0.000742, 3250.0, 0.0002, 60.0, 0.00015);
+        // gamma should be > 0.15 (current default that produces 2.87 bps)
+        assert!(gamma > 0.15, "min_gamma should be > 0.15, got {}", gamma);
+        assert!(gamma < 10.0, "min_gamma should be reasonable, got {}", gamma);
+    }
+
+    #[test]
+    fn test_solve_min_gamma_produces_target_spread() {
+        let target = 0.000742; // 7.42 bps
+        let kappa = 3250.0;
+        let sigma = 0.0002;
+        let t = 60.0;
+        let fee = 0.00015;
+
+        let gamma = solve_min_gamma(target, kappa, sigma, t, fee);
+
+        // Verify the spread at this gamma meets target
+        let ratio = gamma / kappa;
+        let glft = (1.0 / gamma) * (1.0 + ratio).ln();
+        let vol = 0.5 * gamma * sigma.powi(2) * t;
+        let spread = glft + vol + fee;
+
+        assert!(
+            (spread - target).abs() < 0.000001,
+            "spread at min_gamma should equal target: {} vs {}",
+            spread,
+            target
+        );
+    }
+
+    #[test]
+    fn test_solve_min_gamma_low_kappa_high_gamma() {
+        // Low kappa (illiquid) -> GLFT spread = (1/gamma)*ln(1+gamma/kappa) is already wider
+        // So low kappa needs LESS gamma to hit the same target
+        let gamma_low_kappa = solve_min_gamma(0.000742, 500.0, 0.0002, 60.0, 0.00015);
+        let gamma_high_kappa = solve_min_gamma(0.000742, 5000.0, 0.0002, 60.0, 0.00015);
+        assert!(
+            gamma_low_kappa < gamma_high_kappa,
+            "low kappa needs less gamma: {} vs {}",
+            gamma_low_kappa,
+            gamma_high_kappa
+        );
+    }
+
+    #[test]
+    fn test_solve_min_gamma_edge_cases() {
+        // Very small target (below what min gamma produces): should return min gamma
+        let gamma = solve_min_gamma(0.0001, 3250.0, 0.0002, 60.0, 0.00015);
+        assert!(gamma >= 0.01, "gamma should be at least minimum: {}", gamma);
+
+        // Very large target: should return large gamma
+        let gamma = solve_min_gamma(0.01, 3250.0, 0.0002, 60.0, 0.00015);
+        assert!(gamma > 1.0, "large target needs large gamma: {}", gamma);
     }
 }

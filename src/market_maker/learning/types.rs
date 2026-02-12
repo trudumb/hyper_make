@@ -78,6 +78,11 @@ pub struct MarketState {
     // === Cross-asset signals (optional) ===
     /// Cross-asset signal if available
     pub cross_signal: Option<CrossSignal>,
+
+    // === Actual quoted spread (for edge prediction at real spread) ===
+    /// The actual quoted spread in bps (full round-trip, not half-spread).
+    /// When available, edge models should use this instead of their own theoretical spread.
+    pub actual_quoted_spread_bps: Option<f64>,
 }
 
 impl Default for MarketState {
@@ -107,6 +112,7 @@ impl Default for MarketState {
             position: 0.0,
             max_position: 1.0,
             cross_signal: None,
+            actual_quoted_spread_bps: None,
         }
     }
 }

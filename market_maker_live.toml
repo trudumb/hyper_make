@@ -9,11 +9,13 @@ base_url = "mainnet"
 
 [trading]
 asset = "HYPE"
-target_liquidity = 0.5         # ~$15 per side at HYPE ~$30
-risk_aversion = 0.5
-max_bps_diff = 2
-max_position_usd = 50.0       # Max $50 notional exposure
-leverage = 3
+capital_usd = 100.0                # Primary sizing input — everything else auto-derived
+leverage = 10
+# target_liquidity, risk_aversion, max_bps_diff are auto-derived from capital_usd + spread profile
+# Uncomment to override any auto-derived parameter:
+# target_liquidity = 0.5          # contracts per side
+# risk_aversion = 0.5             # gamma (0.1=aggressive, 1.0=conservative)
+# max_bps_diff = 3                # requote threshold in bps
 
 [strategy]
 strategy_type = "ladder"

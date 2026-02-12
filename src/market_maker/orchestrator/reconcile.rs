@@ -1885,8 +1885,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 continue;
             }
 
+            // Smart round-up: if pre-truncation notional exceeds minimum, round UP to avoid
+            // losing orders that are just barely above the $10 threshold
+            let pre_notional = sizing_result.adjusted_size * price;
+            let should_round_up = pre_notional >= MIN_ORDER_NOTIONAL;
             let mut truncated_size =
-                truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, false);
+                truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, should_round_up);
             if truncated_size <= 0.0 {
                 continue;
             }

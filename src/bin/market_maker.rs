@@ -16,20 +16,20 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use hyperliquid_rust_sdk::{
     init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CollateralInfo,
     DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, ExchangeResponseStatus,
-    FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor, ImpulseControlConfig,
-    InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig, LadderStrategy,
-    LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig, MarketMaker,
-    MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig, QueueConfig,
-    QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
+    ExchangeContext, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor,
+    ImpulseControlConfig, InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig,
+    LadderStrategy, LiquidationConfig, LogConfig, LogFormat as MmLogFormat, MarginConfig,
+    MarketMaker, MarketMakerConfig as MmConfig, MarketMakerMetricsRecorder, PnLConfig,
+    QueueConfig, QuotingStrategy, ReconcileConfig, ReconciliationConfig, RecoveryConfig,
     RejectionRateLimitConfig, RiskConfig, RiskModelConfig, SpreadConfig, SpreadProfile,
-    StochasticConfig,
-    SymmetricStrategy, market_maker::{BinanceFeed, resolve_binance_symbol,
-    environment::live::LiveEnvironment},
+    StochasticConfig, SymmetricStrategy,
+    market_maker::{BinanceFeed, resolve_binance_symbol,
+    auto_derive::auto_derive, environment::live::LiveEnvironment},
 };
 
 // ============================================================================
@@ -104,6 +104,11 @@ struct Cli {
     /// Example: 1000.0 → 0.01 BTC at $100K, 40.0 HYPE at $25
     #[arg(long)]
     max_position_usd: Option<f64>,
+
+    /// Capital to deploy in USD (auto-derives position limits, liquidity, gamma, and max_bps_diff)
+    /// This is the primary sizing input. All other trading params are derived from this.
+    #[arg(long)]
+    capital_usd: Option<f64>,
 
     /// Set leverage for the asset (default: max available)
     #[arg(long)]
@@ -522,39 +527,44 @@ pub struct TradingConfig {
     #[serde(default = "default_asset")]
     pub asset: String,
 
-    /// Target liquidity per side in asset units.
-    /// Default: 0.01 BTC (~$1K notional) - conservative, safe for any account.
-    /// Capped at runtime to 40% of max_position based on account equity.
-    #[serde(default = "default_target_liquidity")]
-    pub target_liquidity: f64,
+    /// Capital to deploy in USD. Primary sizing input.
+    /// When set, max_position, target_liquidity, risk_aversion, and max_bps_diff
+    /// are auto-derived from this + exchange metadata + spread profile.
+    /// Any explicitly set parameter overrides the derived value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capital_usd: Option<f64>,
 
-    /// Risk aversion parameter (gamma) - controls spread width and inventory skew.
-    /// Default: 0.3 (matches RiskConfig.gamma_base for consistency)
+    /// Target liquidity per side in asset units (optional, auto-derived from capital_usd).
+    /// When None: auto-derived as fraction of max_position (profile-dependent).
+    /// Capped at runtime to max_position based on account equity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_liquidity: Option<f64>,
+
+    /// Risk aversion parameter (gamma) - controls spread width and inventory skew (optional).
+    /// When None: auto-derived from spread_profile (Default=0.3, Hip3=0.15, Aggressive=0.10).
     /// Range: 0.1 (aggressive, tight spreads) to 1.0+ (conservative, wide spreads)
     /// GLFT formula: δ = (1/γ) × ln(1 + γ/κ)
-    #[serde(default = "default_risk_aversion")]
-    pub risk_aversion: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_aversion: Option<f64>,
 
-    /// Maximum price deviation (in basis points) before requoting.
-    /// Default: 5 bps - balances tight quoting with reduced order churn.
+    /// Maximum price deviation (in basis points) before requoting (optional).
+    /// When None: auto-derived from fee structure (fee_bps × 2, clamped [3, 15]).
     /// Lower values (2 bps) cause excessive cancels in volatile crypto markets.
-    #[serde(default = "default_max_bps_diff")]
-    pub max_bps_diff: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bps_diff: Option<u16>,
 
     /// Maximum position in contracts (optional).
     /// If not specified, defaults to margin-based limit: (account_value × leverage × 0.5) / price
     /// This is capital-efficient: use gamma to control risk, not arbitrary position limits.
     /// Prefer `max_position_usd` for asset-agnostic configuration.
-    #[serde(
-        default = "default_max_position",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_absolute_position_size: Option<f64>,
 
     /// Maximum position in notional USD (asset-agnostic, preferred).
     /// Converted to contracts at startup: max_position = max_position_usd / mark_price.
     /// Example: 1000.0 → 0.01 BTC at $100K, 40.0 HYPE at $25, 0.33 ETH at $3K.
     /// Takes priority over `max_absolute_position_size` when both are set.
+    /// Also serves as backward-compat `capital_usd` when capital_usd is not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_position_usd: Option<f64>,
 
@@ -576,46 +586,18 @@ fn default_asset() -> String {
     "BTC".to_string()
 }
 
-/// Default target liquidity: 0.01 BTC (~$1K at $100K BTC)
-/// Conservative default safe for any account size.
-/// Will be capped at runtime to 40% of max_position based on account equity.
-fn default_target_liquidity() -> f64 {
-    0.01
-}
-
-/// Default risk aversion (gamma): 0.3
-/// Matches RiskConfig.gamma_base for consistency.
-/// Range: 0.1 (aggressive) to 1.0+ (conservative)
-/// In GLFT: δ = (1/γ) × ln(1 + γ/κ) - higher γ means wider spreads
-fn default_risk_aversion() -> f64 {
-    0.3
-}
-
-/// Default max BPS diff before requoting: 5 bps
-/// Crypto markets are volatile - 2 bps causes excessive order churn.
-/// 5 bps balances tight quoting with practical order management.
-fn default_max_bps_diff() -> u16 {
-    5
-}
-
-/// Default max position: 0.05 BTC (~$5K at $100K BTC)
-/// Conservative default below kill switch limit ($10K).
-/// Will be capped at runtime by (account_value × leverage × 0.5) / price.
-fn default_max_position() -> Option<f64> {
-    None // Default to margin-based limit (capital-efficient)
-}
-
 impl Default for TradingConfig {
     fn default() -> Self {
         Self {
             asset: default_asset(),
-            target_liquidity: default_target_liquidity(),
-            risk_aversion: default_risk_aversion(),
-            max_bps_diff: default_max_bps_diff(),
-            max_absolute_position_size: default_max_position(),
-            max_position_usd: None, // Not set by default (backward-compat)
-            leverage: None,         // Uses max available from asset metadata
-            decimals: None,         // Auto-calculated from asset metadata
+            capital_usd: None,                  // Auto-derived from account value
+            target_liquidity: None,             // Auto-derived from capital_usd
+            risk_aversion: None,                // Auto-derived from spread_profile
+            max_bps_diff: None,                 // Auto-derived from fee structure
+            max_absolute_position_size: None,   // Auto-derived from margin
+            max_position_usd: None,
+            leverage: None,
+            decimals: None,
         }
     }
 }
@@ -1060,12 +1042,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build market maker input, CLI args override config
     let asset = cli.asset.clone().unwrap_or(config.trading.asset.clone());
-    let target_liquidity = cli
-        .target_liquidity
-        .unwrap_or(config.trading.target_liquidity);
-    let risk_aversion = cli.risk_aversion.unwrap_or(config.trading.risk_aversion);
-    let max_bps_diff = cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff);
-    // max_position is now optional - will default to margin-based limit later
+
+    // === PARAMETER RESOLUTION ===
+    // All trading params are now Optional. Resolution priority:
+    //   CLI flag → TOML explicit value → auto_derive(capital_usd, exchange_data)
+    // These overrides are resolved later (after mark_px is known) in the auto_derive pipeline.
+    let target_liquidity_override: Option<f64> = cli.target_liquidity.or(config.trading.target_liquidity);
+    let risk_aversion_override: Option<f64> = cli.risk_aversion.or(config.trading.risk_aversion);
+    let max_bps_diff_override: Option<u16> = cli.max_bps_diff.or(config.trading.max_bps_diff);
+
+    // Resolve capital_usd: CLI > TOML capital_usd > TOML max_position_usd (backward compat)
+    let capital_usd_resolved: Option<f64> = cli.capital_usd
+        .or(config.trading.capital_usd)
+        .or(config.trading.max_position_usd); // backward compat: treat max_position_usd as capital
+
+    // max_position is optional - will default to margin-based limit later
     // Priority: CLI --max-position-usd > TOML max_position_usd > CLI --max-position > TOML max_absolute_position_size
     // USD values are converted to contracts later when mark_px is known
     let max_position_usd_override: Option<f64> = cli
@@ -1260,16 +1251,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         asset = %asset,
-        target_liquidity = %target_liquidity,
-        risk_aversion = %risk_aversion,
-        max_bps_diff = %max_bps_diff,
+        target_liquidity = ?target_liquidity_override,
+        risk_aversion = ?risk_aversion_override,
+        max_bps_diff = ?max_bps_diff_override,
+        capital_usd = ?capital_usd_resolved,
         max_position_override = ?max_position_override,
         leverage = %leverage,
         decimals = %decimals,
         strategy = ?config.strategy.strategy_type,
         network = ?base_url,
         dry_run = cli.dry_run,
-        "Starting market maker"
+        "Starting market maker (None values will be auto-derived)"
     );
 
     // Log strategy info
@@ -1392,8 +1384,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Queried initial position"
     );
 
-    // Query account equity for position limits (leverage was already set above)
-    let (target_liquidity, max_position) = {
+    // Query account equity for position limits and auto-derive trading params
+    let (target_liquidity, risk_aversion, max_bps_diff, max_position) = {
         let asset_data_result = info_client
             .active_asset_data(user_address, asset.clone())
             .await;
@@ -1481,35 +1473,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match asset_data_result {
             Ok(asset_data) => {
                 let mark_px: f64 = asset_data.mark_px.parse().unwrap_or(1.0);
+                let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
 
-                // === CAPITAL-EFFICIENT POSITION LIMITS ===
-                // From GLFT theory: max_position should be derived from MARGIN, not arbitrary config.
-                // The user controls risk via gamma (utility), not position caps.
-                //
-                // Formula: max_from_leverage = (account_value × leverage × safety_factor) / price
-                // This is the TRUE hard constraint from solvency.
-                let safety_factor = 0.5; // Leave 50% margin buffer for adverse moves
-                let max_from_leverage = (account_value * leverage as f64 * safety_factor) / mark_px;
+                // === AUTO-DERIVE PIPELINE ===
+                // 1. Resolve capital_usd (the ONE sizing input)
+                let capital_usd = capital_usd_resolved.unwrap_or_else(|| {
+                    let frac = 0.10; // Use 10% of account as default allocation
+                    let derived = account_value * frac;
+                    info!(
+                        account_value = %format!("${:.2}", account_value),
+                        fraction = "10%",
+                        derived_capital = %format!("${:.2}", derived),
+                        "No capital_usd specified, using 10% of account value"
+                    );
+                    derived
+                });
 
-                // Resolve USD→contracts now that mark_px is known
-                // Priority: --max-position-usd > TOML max_position_usd > --max-position > TOML max_absolute_position_size
+                // 2. Auto-derive all parameters from first principles
+                let exchange_ctx = ExchangeContext {
+                    mark_px,
+                    account_value,
+                    available_margin: account_value,
+                    max_leverage: leverage as f64,
+                    fee_bps: 1.5,
+                    sz_decimals,
+                    min_notional: 10.0,
+                };
+                let derived = auto_derive(
+                    capital_usd, spread_profile, &exchange_ctx,
+                );
+
+                // 3. Viability check
+                if !derived.viable {
+                    if let Some(ref diag) = derived.diagnostic {
+                        error!("{}", diag);
+                    }
+                    if !cli.force {
+                        return Err(format!(
+                            "Cannot trade: {}",
+                            derived.diagnostic.as_deref().unwrap_or("insufficient capital")
+                        ).into());
+                    }
+                    warn!("--force: proceeding despite insufficient capital");
+                }
+
+                // 4. Apply overrides (explicit config/CLI values take priority over derived)
+                let risk_aversion = risk_aversion_override.unwrap_or(derived.risk_aversion);
+                let max_bps_diff = max_bps_diff_override.unwrap_or(derived.max_bps_diff);
+
+                // Resolve USD→contracts for explicit position overrides
                 let effective_override: Option<f64> = if let Some(usd_limit) = max_position_usd_override {
                     let contracts = usd_limit / mark_px;
                     info!(
                         max_position_usd = %format!("{:.2}", usd_limit),
                         mark_px = %format!("{:.2}", mark_px),
                         derived_contracts = %format!("{:.6}", contracts),
-                        "USD position limit → contracts (asset-agnostic)"
+                        "USD position limit → contracts (explicit override)"
                     );
                     Some(contracts)
                 } else {
                     max_position_override
                 };
 
-                // Effective max_position:
-                // - If user specified: use min(user_value, margin_based) - user can only REDUCE
-                // - If not specified: use full margin capacity (capital-efficient default)
-                let capped_max_pos = match effective_override {
+                // Max position: explicit override capped by margin, or auto-derived
+                let safety_factor = 0.5;
+                let max_from_leverage = (account_value * leverage as f64 * safety_factor) / mark_px;
+                let max_position = match effective_override {
                     Some(user_limit) => {
                         let capped = user_limit.min(max_from_leverage);
                         info!(
@@ -1520,36 +1549,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         capped
                     }
-                    None => {
-                        info!(
-                            margin_limit = %format!("{:.6}", max_from_leverage),
-                            "Using margin-based max_position (capital-efficient default)"
-                        );
-                        max_from_leverage
-                    }
+                    None => derived.max_position,
                 };
 
-                // Minimum notional for multi-level ladder
-                // min_notional = $10 (Hyperliquid minimum order notional)
+                // Target liquidity: explicit override or auto-derived, then cap by margin
                 let min_notional = 10.0;
-                let min_viable_liquidity = min_notional / mark_px;
-
-                // Calculate minimum liquidity needed for multi-level ladder
-                // With 5 levels and decay, smallest fraction ≈ 5% of total
                 let num_ladder_levels = 5_u8;
                 let smallest_level_fraction = 0.05;
                 let min_for_ladder = min_notional / (mark_px * smallest_level_fraction);
 
-                // Target liquidity: auto-scale for ladder, cap by margin (NOT by max_position)
-                // This allows full margin utilization for quoting even with reduce-only active
-                let capped_liquidity = target_liquidity
+                let raw_target = target_liquidity_override.unwrap_or(derived.target_liquidity);
+                let capped_liquidity = raw_target
                     .max(min_for_ladder) // Ensure multi-level ladder support
-                    .min(max_from_leverage); // Cap by margin, not max_position
+                    .min(max_from_leverage); // Cap by margin
 
-                // Log if we auto-increased target_liquidity for multi-level ladder
-                if target_liquidity < min_for_ladder {
+                if raw_target < min_for_ladder {
                     info!(
-                        configured_target = %format!("{:.6}", target_liquidity),
+                        configured_target = %format!("{:.6}", raw_target),
                         min_for_ladder = %format!("{:.6}", min_for_ladder),
                         using = %format!("{:.6}", capped_liquidity),
                         "Auto-increased target_liquidity to support {} ladder levels",
@@ -1558,26 +1574,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 info!(
-                    account_value = %format!("{:.2}", account_value),
-                    leverage = %leverage,
-                    mark_px = %format!("{:.4}", mark_px),
-                    max_from_leverage = %format!("{:.6}", max_from_leverage),
-                    capped_max_pos = %format!("{:.6}", capped_max_pos),
-                    capped_liquidity = %format!("{:.6}", capped_liquidity),
-                    min_viable = %format!("{:.6}", min_viable_liquidity),
-                    "Capital-efficient position limits (use gamma to control risk)"
+                    capital_usd = %format!("${:.2}", capital_usd),
+                    max_position = %format!("{:.4}", max_position),
+                    target_liquidity = %format!("{:.4}", capped_liquidity),
+                    risk_aversion = %format!("{:.3}", risk_aversion),
+                    max_bps_diff = %max_bps_diff,
+                    auto_derived = derived.diagnostic.is_none(),
+                    "Trading parameters (auto-derived, override with explicit config)"
                 );
 
-                (capped_liquidity, capped_max_pos)
+                (capped_liquidity, risk_aversion, max_bps_diff, max_position)
             }
             Err(e) => {
                 // Fallback: use config values or conservative defaults
                 let fallback_max = max_position_override.unwrap_or(0.05);
+                let fallback_liquidity = target_liquidity_override.unwrap_or(0.01);
+                let fallback_gamma = risk_aversion_override.unwrap_or(0.3);
+                let fallback_bps = max_bps_diff_override.unwrap_or(5);
                 tracing::warn!(
                     fallback_max = %format!("{:.6}", fallback_max),
-                    "Failed to query asset data: {e}, using fallback position limit"
+                    "Failed to query asset data: {e}, using fallback values"
                 );
-                (target_liquidity, fallback_max)
+                (fallback_liquidity, fallback_gamma, fallback_bps, fallback_max)
             }
         }
     };
@@ -2543,12 +2561,13 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     let paper_env = PaperEnvironment::new(paper_config, info_client);
 
     // Build MmConfig (same struct literal pattern as live, simplified)
-    let risk_aversion = cli.risk_aversion.unwrap_or(config.trading.risk_aversion);
+    // Paper trader uses conservative defaults when config values are None
+    let risk_aversion = cli.risk_aversion.or(config.trading.risk_aversion).unwrap_or(0.3);
     let mm_config = MmConfig {
         asset: Arc::from(asset.as_str()),
-        target_liquidity: cli.target_liquidity.unwrap_or(config.trading.target_liquidity),
+        target_liquidity: cli.target_liquidity.or(config.trading.target_liquidity).unwrap_or(0.01),
         risk_aversion,
-        max_bps_diff: cli.max_bps_diff.unwrap_or(config.trading.max_bps_diff),
+        max_bps_diff: cli.max_bps_diff.or(config.trading.max_bps_diff).unwrap_or(5),
         max_position,
         max_position_usd: 0.0,
         max_position_user_specified: cli.max_position.is_some(),

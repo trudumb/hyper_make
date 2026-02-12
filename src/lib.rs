@@ -53,6 +53,8 @@ pub use market_maker::{
     DynamicRiskConfig,
     // Core types
     EstimatorConfig,
+    // Auto-derive config from first principles
+    ExchangeContext,
     ExecutionOrderState,
     ExecutionSide,
     FillMetrics,

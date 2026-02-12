@@ -348,6 +348,11 @@ impl LearningModule {
             position,
             max_position: params.dynamic_max_position,
             cross_signal: None,
+            actual_quoted_spread_bps: if params.market_spread_bps > 0.0 {
+                Some(params.market_spread_bps)
+            } else {
+                None
+            },
         }
     }
 

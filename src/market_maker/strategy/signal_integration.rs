@@ -117,10 +117,9 @@ pub struct SignalIntegratorConfig {
     /// When false, only the aggregate gating_spread_mult is applied (legacy behavior).
     pub use_per_signal_gating: bool,
 
-    /// Minimum model weight for soft scaling (only used when hard gate passes).
-    /// With two-tier gating: hard gate (should_use_model → zero if false),
-    /// then soft scaling by model_weight() if above this floor.
-    /// Set to 0.0 to use raw model_weight with no floor after hard gate.
+    /// Legacy field: minimum model weight floor for soft scaling.
+    /// Superseded by graduated_weight() which enforces a 5% floor internally.
+    /// Kept for backward compatibility with existing configs.
     pub signal_gating_floor: f64,
 
     /// Whether to blend VPIN toxicity with EM-based informed flow.
@@ -695,23 +694,11 @@ impl SignalIntegrator {
 
         // === Lead-Lag Signal ===
         if self.config.use_lead_lag && self.last_lead_lag_signal.is_actionable {
-            // Two-tier per-signal gating:
-            // Tier 1 (hard gate): should_use_model() → zero if false (weight ≤ 0.3)
-            // Tier 2 (soft scale): model_weight() → attenuate proportionally
+            // Graduated gating: continuous weight with 5% floor, no death spiral
             let ll_weight = if self.config.use_per_signal_gating && self.config.use_model_gating {
-                if !self.model_gating.should_use_model("lead_lag") {
-                    signals.lead_lag_gating_weight = 0.0;
-                    0.0 // Hard gate: model fails significance → zero
-                } else {
-                    let w = self.model_gating.model_weight("lead_lag");
-                    signals.lead_lag_gating_weight = w;
-                    // Soft scale: floor prevents near-zero leakage after hard gate passes
-                    if w < self.config.signal_gating_floor {
-                        self.config.signal_gating_floor
-                    } else {
-                        w
-                    }
-                }
+                let w = self.model_gating.graduated_weight("lead_lag");
+                signals.lead_lag_gating_weight = w;
+                w
             } else {
                 signals.lead_lag_gating_weight = 1.0;
                 1.0
@@ -729,20 +716,11 @@ impl SignalIntegrator {
 
         // === Informed Flow ===
         if self.config.use_informed_flow {
-            // Two-tier per-signal gating (same pattern as lead-lag)
+            // Graduated gating: continuous weight with 5% floor, no death spiral
             let if_weight = if self.config.use_per_signal_gating && self.config.use_model_gating {
-                if !self.model_gating.should_use_model("informed_flow") {
-                    signals.informed_flow_gating_weight = 0.0;
-                    0.0 // Hard gate: model fails significance → zero
-                } else {
-                    let w = self.model_gating.model_weight("informed_flow");
-                    signals.informed_flow_gating_weight = w;
-                    if w < self.config.signal_gating_floor {
-                        self.config.signal_gating_floor
-                    } else {
-                        w
-                    }
-                }
+                let w = self.model_gating.graduated_weight("informed_flow");
+                signals.informed_flow_gating_weight = w;
+                w
             } else {
                 signals.informed_flow_gating_weight = 1.0;
                 1.0

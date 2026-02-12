@@ -32,6 +32,10 @@ use super::information_ratio::{ExponentialIRTracker, InformationRatioTracker};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+/// Minimum signal weight to prevent death spiral.
+/// Even unproven models contribute at 5% to allow IR accumulation.
+const MIN_SIGNAL_WEIGHT: f64 = 0.05;
+
 /// Configuration for model gating.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelGatingConfig {
@@ -490,6 +494,16 @@ impl ModelGating {
         }
     }
 
+    /// Get graduated weight for a model — continuous [MIN_SIGNAL_WEIGHT, 1.0].
+    ///
+    /// Unlike `should_use_model()` which is binary (zero or full weight),
+    /// this returns a continuous weight proportional to the model's IR track record,
+    /// with a floor that prevents the death spiral:
+    ///   zero weight -> zero predictions -> zero IR -> zero weight
+    pub fn graduated_weight(&self, model: &str) -> f64 {
+        self.model_weight(model).max(MIN_SIGNAL_WEIGHT)
+    }
+
     /// Get IR for a specific model.
     pub fn model_ir(&self, model: &str) -> f64 {
         match model {
@@ -781,5 +795,38 @@ mod tests {
 
         // Average should be 0.6
         assert!((weights.average_weight() - 0.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_graduated_weight_floor() {
+        let gating = ModelGating::new(ModelGatingConfig::default());
+        // Cold start: all weights should be at floor, not zero
+        assert!(gating.graduated_weight("lead_lag") >= MIN_SIGNAL_WEIGHT);
+        assert!(gating.graduated_weight("informed_flow") >= MIN_SIGNAL_WEIGHT);
+        assert!(gating.graduated_weight("adverse_selection") >= MIN_SIGNAL_WEIGHT);
+        assert!(gating.graduated_weight("regime") >= MIN_SIGNAL_WEIGHT);
+        assert!(gating.graduated_weight("kappa") >= MIN_SIGNAL_WEIGHT);
+        // Unknown model also gets floor (not zero)
+        assert!(gating.graduated_weight("nonexistent") >= MIN_SIGNAL_WEIGHT);
+    }
+
+    #[test]
+    fn test_graduated_weight_proportional_to_ir() {
+        let config = ModelGatingConfig {
+            min_samples: 50, // Lower threshold so 100 updates builds confidence
+            ..ModelGatingConfig::default()
+        };
+        let mut gating = ModelGating::new(config);
+        // Feed positive IR data for lead_lag — need 100 to trigger weight update
+        for _ in 0..100 {
+            gating.update_lead_lag(1.0, true);
+        }
+
+        let weight = gating.graduated_weight("lead_lag");
+        assert!(
+            weight > MIN_SIGNAL_WEIGHT,
+            "weight with positive IR should exceed floor: {}",
+            weight
+        );
     }
 }
