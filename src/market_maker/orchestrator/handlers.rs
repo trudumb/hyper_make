@@ -10,6 +10,7 @@ use crate::Message;
 use super::super::{
     adverse_selection::TradeObservation as MicroTradeObs,
     belief::BeliefUpdate,
+    CascadeEvent,
     environment::Observation,
     estimator::{HmmObservation, MarketEstimator},
     fills,
@@ -693,10 +694,31 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 continue;
             }
 
-            // Record fill side in cascade tracker for same-side run detection
+            // Record fill side in cascade tracker for same-side run detection.
+            // Only accumulating fills count (position-aware).
             let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
             let fill_side = if is_buy { Side::Buy } else { Side::Sell };
-            self.fill_cascade_tracker.record_fill(fill_side);
+            let current_pos = self.position.position();
+            if let Some(cascade_event) = self.fill_cascade_tracker.record_fill(fill_side, current_pos) {
+                // Cascade threshold newly crossed — cancel resting orders on the
+                // accumulating side immediately, before they get filled in the race.
+                let cancel_side = match cascade_event {
+                    CascadeEvent::Widen(s) | CascadeEvent::Suppress(s) => s,
+                };
+                let side_orders = self.orders.get_all_by_side(cancel_side);
+                let oids: Vec<u64> = side_orders.iter().map(|o| o.oid).collect();
+                if !oids.is_empty() {
+                    warn!(
+                        side = ?cancel_side,
+                        count = oids.len(),
+                        event = ?cascade_event,
+                        "Cascade trigger: cancelling resting orders on accumulating side"
+                    );
+                    self.environment
+                        .cancel_bulk_orders(&self.config.asset, oids)
+                        .await;
+                }
+            }
 
             let fill_event = WsFillEvent {
                 oid: fill.oid,

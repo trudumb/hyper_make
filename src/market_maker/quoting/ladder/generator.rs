@@ -978,16 +978,28 @@ pub(crate) fn apply_inventory_skew_with_drift(
 
     let raw_offset = safe_mid * total_skew_fraction;
 
-    // === BOUND OFFSET BY ACTUAL BBO HALF-SPREAD ===
-    // The GLFT formula (γσ²qT) doesn't know about exchange BBO constraints.
-    // For moderate gamma+sigma, the offset easily exceeds the 2-3 bps exchange spread.
-    // Cap at 80% of half-spread so skew never pushes quotes past the opposing BBO.
+    // === BOUND OFFSET BY BBO HALF-SPREAD WITH OWN-LADDER FLOOR ===
+    // Cap skew so it never pushes quotes past the opposing BBO.
+    // BUT: on tight-spread tokens (e.g. HYPE BBO ~0.3 bps) our ladder is 8+ bps from mid,
+    // so the exchange BBO is irrelevant to our crossing risk. Use our own ladder depth
+    // as a floor so inventory skew isn't killed by a tight exchange spread.
     let half_spread = (cached_best_ask - cached_best_bid) / 2.0;
-    let max_offset = if half_spread > 0.0 {
-        half_spread * 0.8
+    let own_min_depth = ladder
+        .bids
+        .iter()
+        .map(|l| (safe_mid - l.price).abs())
+        .chain(ladder.asks.iter().map(|l| (l.price - safe_mid).abs()))
+        .filter(|d| *d > 1e-12)
+        .fold(f64::INFINITY, f64::min);
+    let own_floor = if own_min_depth.is_finite() {
+        own_min_depth * 0.5 // 50% of our innermost level depth
     } else {
-        // Fallback: 1bp of mid if BBO is invalid/zero
-        safe_mid * 0.0001
+        safe_mid * 0.0008 // fallback: 8 bps
+    };
+    let max_offset = if half_spread > 0.0 {
+        (half_spread * 0.8).max(own_floor)
+    } else {
+        own_floor
     };
     let offset = raw_offset.clamp(-max_offset, max_offset);
 
@@ -1952,5 +1964,69 @@ mod tests {
                 i, ladder.asks[i].price
             );
         }
+    }
+
+    #[test]
+    fn test_bbo_cap_allows_large_skew_when_ladder_is_wide() {
+        // Scenario: HYPE with tight exchange BBO (~0.3 bps) but our ladder 8+ bps from mid.
+        // The BBO cap should use our own ladder depth as floor, not the tiny exchange BBO.
+        let mid = 22.80;
+        let mut ladder = Ladder {
+            bids: smallvec![LadderLevel {
+                price: mid * (1.0 - 8.0 / 10000.0), // ~8 bps below mid
+                size: 1.0,
+                depth_bps: 8.0,
+            }],
+            asks: smallvec![LadderLevel {
+                price: mid * (1.0 + 8.0 / 10000.0), // ~8 bps above mid
+                size: 1.0,
+                depth_bps: 8.0,
+            }],
+        };
+
+        let original_bid = ladder.bids[0].price;
+        let original_ask = ladder.asks[0].price;
+
+        // Tight exchange BBO: 0.3 bps half-spread = 0.0003 * mid = $0.00684
+        let tight_bbo_half = mid * 0.3 / 10000.0;
+        let cached_best_bid = mid - tight_bbo_half;
+        let cached_best_ask = mid + tight_bbo_half;
+
+        // Apply large inventory skew (~4 bps raw offset)
+        // base_skew = 0.5 * 3.0 * 0.01^2 * 10.0 = 0.00015 → 1.5 bps (plus size asymmetry)
+        // With gamma=5.0: 0.5 * 5.0 * 0.01^2 * 10.0 = 0.00025 → 2.5 bps raw
+        // With gamma=8.0: 0.5 * 8.0 * 0.01^2 * 10.0 = 0.0004 → 4.0 bps raw
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            0.5,   // inventory_ratio: 50% long
+            8.0,   // gamma: high risk aversion to produce ~4 bps skew
+            0.01,  // sigma: moderate vol
+            10.0,  // time_horizon
+            mid,
+            mid,
+            2,     // decimals
+            4,     // sz_decimals
+            false, // use_drift_adjusted_skew
+            0.0,   // hjb_drift_urgency
+            false, // position_opposes_momentum
+            0.0,   // urgency_score
+            0.0,   // funding_rate
+            false, // use_funding_skew
+            cached_best_bid,
+            cached_best_ask,
+        );
+
+        // With old code: max_offset = tight_bbo_half * 0.8 = 0.24 bps → almost no skew
+        // With new code: max_offset = max(0.24 bps, 4 bps own floor) → meaningful skew
+        let bid_shift_bps = (original_bid - ladder.bids[0].price) / mid * 10000.0;
+        let ask_shift_bps = (original_ask - ladder.asks[0].price) / mid * 10000.0;
+
+        // Skew should be at least 2 bps (not capped to 0.24 bps by tight BBO)
+        // Raw skew is ~4 bps from gamma=8.0, sigma=0.01, inv_ratio=0.5
+        assert!(
+            bid_shift_bps.abs() > 2.0 || ask_shift_bps.abs() > 2.0,
+            "BBO cap killed inventory skew: bid_shift={:.2} bps, ask_shift={:.2} bps",
+            bid_shift_bps, ask_shift_bps
+        );
     }
 }

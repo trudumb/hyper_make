@@ -2189,8 +2189,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         );
                         bid_quotes.clear();
                     }
-                } else if buy_cascade_mult > 1.0 {
-                    // Widen bid prices away from mid (lower bids)
+                } else if buy_cascade_mult > 1.0 && self.position.position() >= 0.0 {
+                    // Only widen buys when accumulating (flat or already long).
+                    // If short, buys REDUCE position — don't penalize reducing fills.
                     let mid = self.latest_mid;
                     for quote in bid_quotes.iter_mut() {
                         let dist = mid - quote.price;
@@ -2211,8 +2212,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         );
                         ask_quotes.clear();
                     }
-                } else if sell_cascade_mult > 1.0 {
-                    // Widen ask prices away from mid (higher asks)
+                } else if sell_cascade_mult > 1.0 && self.position.position() <= 0.0 {
+                    // Only widen sells when accumulating (flat or already short).
+                    // If long, sells REDUCE position — don't penalize reducing fills.
                     let mid = self.latest_mid;
                     for quote in ask_quotes.iter_mut() {
                         let dist = quote.price - mid;
