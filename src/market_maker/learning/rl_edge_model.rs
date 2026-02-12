@@ -1,5 +1,9 @@
 //! RL Edge Model — wraps the Q-learning agent as an `EdgeModel` ensemble member.
 //!
+//! **DEPRECATED**: Superseded by `SpreadBandit`. The RL MDP framing is incorrect
+//! for spread selection (i.i.d. bandit, not state-transitions). Kept for
+//! checkpoint backward compatibility only.
+//!
 //! Converts `MarketState` into `MDPState` and queries the Q-table for edge predictions.
 //! This replaces the separate RL override system with a unified ensemble pipeline.
 
@@ -25,6 +29,10 @@ const MIN_UNCERTAINTY_BPS: f64 = 0.5;
 const HIGH_UNCERTAINTY_BPS: f64 = 5.0;
 
 /// Wraps a shared `QLearningAgent` as an `EdgeModel` for ensemble integration.
+///
+/// **DEPRECATED**: Superseded by `SpreadBandit`. The RL MDP framing is incorrect
+/// for spread selection (i.i.d. bandit, not state-transitions). Kept for
+/// checkpoint backward compatibility only.
 pub struct RLEdgeModel {
     agent: Arc<RwLock<QLearningAgent>>,
 }

@@ -282,6 +282,8 @@ mod tests {
             },
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
+            spread_bandit: crate::market_maker::learning::spread_bandit::SpreadBanditCheckpoint::default(),
+            baseline_tracker: crate::market_maker::checkpoint::types::BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
         }

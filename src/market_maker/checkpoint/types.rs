@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::market_maker::calibration::parameter_learner::LearnedParameters;
+use crate::market_maker::learning::spread_bandit::SpreadBanditCheckpoint;
 use crate::market_maker::ComponentParams;
 
 /// Readiness verdict for a checkpoint — can it safely drive live trading?
@@ -72,9 +73,15 @@ pub struct CheckpointBundle {
     /// Model ensemble weights for prediction persistence
     #[serde(default)]
     pub ensemble_weights: EnsembleWeightsCheckpoint,
-    /// RL agent Q-table for policy persistence
+    /// RL agent Q-table for policy persistence (DEPRECATED — kept for backward compat)
     #[serde(default)]
     pub rl_q_table: RLCheckpoint,
+    /// Contextual bandit spread optimizer state (replaces RL MDP)
+    #[serde(default)]
+    pub spread_bandit: SpreadBanditCheckpoint,
+    /// Baseline tracker EWMA for counterfactual reward centering
+    #[serde(default)]
+    pub baseline_tracker: BaselineTrackerCheckpoint,
     /// Kill switch state for persistence across restarts
     #[serde(default)]
     pub kill_switch: KillSwitchCheckpoint,
@@ -504,6 +511,29 @@ pub struct RLCheckpoint {
     pub use_drift_bucket: bool,
 }
 
+/// Baseline tracker checkpoint for counterfactual reward centering.
+///
+/// Persists the EWMA baseline so the bandit doesn't lose its fee-drag estimate
+/// on restart (avoids ~50-fill warmup period).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineTrackerCheckpoint {
+    /// EWMA of realized edge (typically ~-1.5 bps from fee drag)
+    #[serde(default)]
+    pub ewma_reward: f64,
+    /// Number of observations
+    #[serde(default)]
+    pub n_observations: u64,
+}
+
+impl Default for BaselineTrackerCheckpoint {
+    fn default() -> Self {
+        Self {
+            ewma_reward: 0.0,
+            n_observations: 0,
+        }
+    }
+}
+
 /// Kill switch state for checkpoint persistence.
 ///
 /// Allows restoring triggered state after restart so the system
@@ -618,6 +648,11 @@ mod tests {
                 reward_config_hash: 0,
                 use_drift_bucket: false,
             },
+            spread_bandit: SpreadBanditCheckpoint::default(),
+            baseline_tracker: BaselineTrackerCheckpoint {
+                ewma_reward: -1.5,
+                n_observations: 42,
+            },
             kill_switch: KillSwitchCheckpoint {
                 triggered: true,
                 trigger_reasons: vec!["Max daily loss exceeded".to_string()],
@@ -708,6 +743,8 @@ mod tests {
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
+            spread_bandit: SpreadBanditCheckpoint::default(),
+            baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
         };
@@ -756,6 +793,8 @@ mod tests {
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
+            spread_bandit: SpreadBanditCheckpoint::default(),
+            baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
         };

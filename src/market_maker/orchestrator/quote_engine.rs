@@ -22,6 +22,7 @@ use crate::market_maker::strategy::action_to_inventory_ratio;
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
+
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Update quotes based on current market state.
     #[tracing::instrument(name = "quote_cycle", skip_all, fields(asset = %self.config.asset))]
@@ -1808,48 +1809,31 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         );
         market_params.kappa_spread_bps = Some(kappa_spread_result.spread_bps);
 
-        // === Phase 8: RL Agent Policy Recommendation ===
-        // Build MDP state from current market conditions
-        let mdp_state = crate::market_maker::learning::MDPState::from_continuous(
-            self.position.position(),
-            self.effective_max_position,
-            market_params.book_imbalance,
-            market_params.sigma / market_params.sigma_effective.max(0.0001), // vol ratio
-            self.stochastic.theoretical_edge.bayesian_adverse(),
-            market_params.hawkes_branching_ratio,
-            market_params.drift_rate_per_sec * 1e4, // drift_rate_per_sec (fractional) → momentum_bps
+        // === Phase 8: Contextual Bandit Spread Selection ===
+        // Replaces RL MDP with contextual bandit (i.i.d. rewards, correct statistics).
+        // Build context from current market features
+        let position_frac = self.position.position() / self.effective_max_position.max(1.0);
+        let vol_ratio_bandit = market_params.sigma / market_params.sigma_effective.max(0.0001);
+        let regime_idx = self.stochastic.regime_hmm.most_likely_regime();
+        let bandit_context = crate::market_maker::learning::SpreadContext::from_continuous(
+            regime_idx,
+            position_frac,
+            vol_ratio_bandit,
+            market_params.flow_imbalance,
         );
 
-        // Get RL policy recommendation (exploration during bootstrap, exploitation after)
-        let explore = !self.stochastic.calibrated_edge.is_useful();
-        let rl_recommendation = crate::market_maker::learning::RLPolicyRecommendation::from_agent(
-            &mut self.stochastic.rl_agent,
-            mdp_state.to_index(),
-            explore,
-        );
+        // Select arm via Thompson Sampling (cold start defaults to mult=1.0 = pure GLFT)
+        let bandit_selection = self.stochastic.spread_bandit.select_arm(bandit_context);
+        market_params.bandit_spread_multiplier = bandit_selection.multiplier;
+        market_params.bandit_is_exploration = bandit_selection.is_exploration;
 
-        // Store state-action pair + inventory risk for credit assignment when fill occurs
-        let inventory_risk_at_action = (self.position.position().abs()
-            / self.effective_max_position.max(1.0))
-            .clamp(0.0, 1.0);
-        self.stochastic.rl_agent.push_state_action_with_risk(
-            rl_recommendation.state_idx,
-            rl_recommendation.action_idx,
-            inventory_risk_at_action,
-        );
-
-        // Populate MarketParams with RL recommendations
-        market_params.rl_spread_delta_bps = rl_recommendation.spread_delta_bps;
-        market_params.rl_bid_skew_bps = rl_recommendation.bid_skew_bps;
-        market_params.rl_ask_skew_bps = rl_recommendation.ask_skew_bps;
-        market_params.rl_confidence = rl_recommendation.confidence;
-        market_params.rl_is_exploration = rl_recommendation.is_exploration;
-        market_params.rl_expected_q = rl_recommendation.expected_q;
-
-        // Phase 4: RL override block removed.
-        // RL influence now flows through ensemble (RLEdgeModel) via IR-weighted prediction.
-        // rl_action_applied stays false — direct RL spread/skew overrides are deprecated.
-        // The rl_ fields above are still populated for logging/monitoring purposes.
+        // Legacy RL fields — kept at defaults for backward-compatible logging
+        market_params.rl_spread_delta_bps = 0.0;
+        market_params.rl_bid_skew_bps = 0.0;
+        market_params.rl_ask_skew_bps = 0.0;
+        market_params.rl_confidence = 0.0;
+        market_params.rl_is_exploration = false;
+        market_params.rl_expected_q = 0.0;
 
         // === Phase 8: Competitor Model Inference ===
         // Get competitor summary and populate MarketParams
@@ -2186,6 +2170,59 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     ask_quotes.clear();
                 }
                 // Flat: keep both sides to catch fills
+            }
+
+            // === FILL CASCADE FILTER ===
+            // When we detect 3+ same-side fills in 60s, widen that side (5x).
+            // When 5+ same-side fills, suppress that side entirely (reduce-only).
+            // This prevents runaway accumulation during trending markets.
+            {
+                let buy_cascade_mult = self.fill_cascade_tracker.spread_multiplier(Side::Buy);
+                let sell_cascade_mult = self.fill_cascade_tracker.spread_multiplier(Side::Sell);
+
+                if self.fill_cascade_tracker.is_suppressed(Side::Buy) && !bid_quotes.is_empty() {
+                    // Check if we're short — buys would reduce position, so allow them
+                    if self.position.position() >= 0.0 {
+                        info!(
+                            cleared_bids = bid_quotes.len(),
+                            "Fill cascade: suppressing BID side (5+ same-side buys in 60s)"
+                        );
+                        bid_quotes.clear();
+                    }
+                } else if buy_cascade_mult > 1.0 {
+                    // Widen bid prices away from mid (lower bids)
+                    let mid = self.latest_mid;
+                    for quote in bid_quotes.iter_mut() {
+                        let dist = mid - quote.price;
+                        quote.price = mid - dist * buy_cascade_mult;
+                    }
+                    debug!(
+                        cascade_mult = %format!("{:.1}x", buy_cascade_mult),
+                        "Fill cascade: widening BID side"
+                    );
+                }
+
+                if self.fill_cascade_tracker.is_suppressed(Side::Sell) && !ask_quotes.is_empty() {
+                    // Check if we're long — sells would reduce position, so allow them
+                    if self.position.position() <= 0.0 {
+                        info!(
+                            cleared_asks = ask_quotes.len(),
+                            "Fill cascade: suppressing ASK side (5+ same-side sells in 60s)"
+                        );
+                        ask_quotes.clear();
+                    }
+                } else if sell_cascade_mult > 1.0 {
+                    // Widen ask prices away from mid (higher asks)
+                    let mid = self.latest_mid;
+                    for quote in ask_quotes.iter_mut() {
+                        let dist = quote.price - mid;
+                        quote.price = mid + dist * sell_cascade_mult;
+                    }
+                    debug!(
+                        cascade_mult = %format!("{:.1}x", sell_cascade_mult),
+                        "Fill cascade: widening ASK side"
+                    );
+                }
             }
 
             // === GRADUATED EMERGENCY PULL ===

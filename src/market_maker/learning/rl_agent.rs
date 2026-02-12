@@ -1,5 +1,10 @@
 //! Phase 8: Reinforcement Learning Agent for Competitive Quoting
 //!
+//! **DEPRECATED**: This MDP-based RL agent is superseded by `SpreadBandit`
+//! (contextual bandit with Thompson Sampling). The MDP framing is incorrect
+//! for spread selection — quote cycles are i.i.d., not state-transitions.
+//! Kept for checkpoint backward compatibility only.
+//!
 //! This module implements an MDP-based approach to quoting decisions with:
 //! - Discretized state space (inventory, OBI, regime, posteriors)
 //! - Action space (spread adjustments, skew modifications)

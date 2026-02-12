@@ -97,7 +97,9 @@ impl Default for KillSwitchConfig {
             liquidation_position_jump_fraction: 0.20,
             liquidation_fill_timeout_s: 5,
             min_peak_for_drawdown: 1.0,
-            position_velocity_threshold: 0.50,
+            // Tightened from 0.50: catches one-sided fill cascades earlier.
+            // Widen at 0.20x, pull at 0.40x, kill at 0.80x of max_position/min.
+            position_velocity_threshold: 0.20,
             enabled: true,
         }
     }
@@ -135,7 +137,7 @@ impl KillSwitchConfig {
             // With max_position_usd=$1000: min_peak=$20 (~800 fills to activate).
             // check_daily_loss ($50) still protects against catastrophic loss.
             min_peak_for_drawdown: 1.0_f64.max(max_position_usd * 0.02),
-            position_velocity_threshold: 0.50,
+            position_velocity_threshold: 0.20,
             enabled: true,
         }
     }

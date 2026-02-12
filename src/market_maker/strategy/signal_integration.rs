@@ -153,6 +153,11 @@ pub struct SignalIntegratorConfig {
     /// Staleness multiplier is excluded (remains multiplicative as a safety mechanism).
     /// Default: 20.0 bps.
     pub max_spread_adjustment_bps: f64,
+
+    /// Maximum flow urgency skew in bps when 5s imbalance exceeds 0.6.
+    /// Applied on top of existing skew components to prevent accumulating into trends.
+    /// Default: 10.0 bps.
+    pub flow_urgency_max_bps: f64,
 }
 
 impl Default for SignalIntegratorConfig {
@@ -185,6 +190,7 @@ impl Default for SignalIntegratorConfig {
             buy_pressure_skew_fraction: 0.1,
             buy_pressure_max_fraction: 0.3,
             max_spread_adjustment_bps: 20.0,
+            flow_urgency_max_bps: 10.0,
         }
     }
 }
@@ -902,6 +908,20 @@ impl SignalIntegrator {
                 (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
         }
 
+        // === FLOW URGENCY SKEW: Aggressive skew when directional flow is strong ===
+        // When 5s imbalance exceeds 0.6 (strongly one-sided), add urgency skew
+        // up to flow_urgency_max_bps. This prevents accumulating into trends that
+        // the HL-native fallback's 0.9 bps cap is too gentle to address.
+        {
+            let flow_imbalance = self.latest_hl_flow.imbalance_5s;
+            const FLOW_URGENCY_THRESHOLD: f64 = 0.6;
+            if flow_imbalance.abs() > FLOW_URGENCY_THRESHOLD {
+                let urgency = (flow_imbalance.abs() - FLOW_URGENCY_THRESHOLD) / (1.0 - FLOW_URGENCY_THRESHOLD);
+                let flow_skew_bps = urgency * self.config.flow_urgency_max_bps * flow_imbalance.signum();
+                signals.combined_skew_bps += flow_skew_bps;
+            }
+        }
+
         // === Build per-signal contribution record for attribution ===
         let vpin_active = self.config.use_vpin_toxicity && self.vpin_valid
             && self.latest_hl_vpin > self.config.vpin_widen_threshold;
@@ -1605,14 +1625,66 @@ mod tests {
 
         let signals = integrator.get_signals();
 
-        // Skew should be negative but capped at 30% of max_lead_lag_skew_bps
-        let max_skew = integrator.config.max_lead_lag_skew_bps * 0.3;
+        // Skew should be negative — fallback produces up to 30% of max_lead_lag_skew_bps
+        // plus flow urgency adds up to flow_urgency_max_bps for imbalance > 0.6
+        let fallback_cap = integrator.config.max_lead_lag_skew_bps * 0.3;
+        let urgency_cap = integrator.config.flow_urgency_max_bps;
+        let total_cap = fallback_cap + urgency_cap;
         assert!(
-            signals.combined_skew_bps >= -max_skew - f64::EPSILON,
-            "HL-native fallback skew should be capped, got: {} vs max: {}",
+            signals.combined_skew_bps >= -total_cap - f64::EPSILON,
+            "Skew should be bounded by fallback + urgency cap, got: {} vs max: {}",
             signals.combined_skew_bps,
-            -max_skew
+            -total_cap
         );
         assert!(signals.combined_skew_bps < 0.0);
+    }
+
+    #[test]
+    fn test_flow_urgency_skew_strong_imbalance() {
+        use crate::market_maker::estimator::binance_flow::FlowFeatureVec;
+
+        let mut integrator = SignalIntegrator::default_config();
+
+        // Strong buy pressure above urgency threshold (0.6)
+        integrator.latest_hl_flow = FlowFeatureVec {
+            imbalance_5s: 0.9, // 75% urgency: (0.9 - 0.6) / 0.4 = 0.75
+            imbalance_30s: 0.5,
+            confidence: 0.9,
+            ..Default::default()
+        };
+
+        let signals = integrator.get_signals();
+
+        // Flow urgency = 0.75 * 10.0 = 7.5 bps (plus fallback)
+        assert!(
+            signals.combined_skew_bps > 5.0,
+            "Strong flow should produce >5 bps urgency skew, got: {}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_flow_urgency_skew_below_threshold() {
+        use crate::market_maker::estimator::binance_flow::FlowFeatureVec;
+
+        let mut integrator = SignalIntegrator::default_config();
+
+        // Moderate imbalance below urgency threshold
+        integrator.latest_hl_flow = FlowFeatureVec {
+            imbalance_5s: 0.5, // Below 0.6 threshold → no urgency
+            imbalance_30s: 0.3,
+            confidence: 0.7,
+            ..Default::default()
+        };
+
+        let signals = integrator.get_signals();
+
+        // Should only have fallback skew (up to 30% of max_lead_lag_skew_bps = 1.5 bps)
+        let fallback_cap = integrator.config.max_lead_lag_skew_bps * 0.3;
+        assert!(
+            signals.combined_skew_bps <= fallback_cap + 0.01,
+            "Below urgency threshold, skew should be <= fallback cap {fallback_cap}, got: {}",
+            signals.combined_skew_bps
+        );
     }
 }

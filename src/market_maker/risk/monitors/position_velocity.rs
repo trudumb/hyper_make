@@ -55,8 +55,10 @@ impl PositionVelocityMonitor {
 
 impl Default for PositionVelocityMonitor {
     fn default() -> Self {
-        // 50%/min warn, 100%/min pull, 200%/min kill
-        Self::new(0.50, 1.00, 2.00)
+        // 20%/min warn, 50%/min pull, 100%/min kill
+        // Tightened from 50/100/200: Episode 2 accumulated at ~38%/min without even
+        // triggering WARN. These thresholds catch one-sided fill cascades earlier.
+        Self::new(0.20, 0.50, 1.00)
     }
 }
 
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn test_normal_velocity_passes() {
         let monitor = PositionVelocityMonitor::default();
-        let state = make_state(0.1); // 10% of max/min — normal
+        let state = make_state(0.05); // 5% of max/min — well below 20% warn
 
         let assessment = monitor.evaluate(&state);
         assert_eq!(assessment.severity, RiskSeverity::None);
@@ -157,7 +159,7 @@ mod tests {
     #[test]
     fn test_warn_threshold_triggers_widen() {
         let monitor = PositionVelocityMonitor::default();
-        let state = make_state(0.60); // 60% of max/min — above warn (0.50)
+        let state = make_state(0.30); // 30% of max/min — above warn (0.20)
 
         let assessment = monitor.evaluate(&state);
         assert_eq!(assessment.severity, RiskSeverity::High);
@@ -192,7 +194,7 @@ mod tests {
     #[test]
     fn test_pull_threshold_triggers_pull_quotes() {
         let monitor = PositionVelocityMonitor::default();
-        let state = make_state(1.20); // 120% of max/min — above pull (1.00)
+        let state = make_state(0.60); // 60% of max/min — above pull (0.50)
 
         let assessment = monitor.evaluate(&state);
         assert_eq!(assessment.severity, RiskSeverity::High);
@@ -212,7 +214,7 @@ mod tests {
     #[test]
     fn test_kill_threshold_triggers_kill() {
         let monitor = PositionVelocityMonitor::default();
-        let state = make_state(2.50); // 250% of max/min — above kill (2.00)
+        let state = make_state(1.20); // 120% of max/min — above kill (1.00)
 
         let assessment = monitor.evaluate(&state);
         assert_eq!(assessment.severity, RiskSeverity::Critical);
@@ -280,13 +282,13 @@ mod tests {
     fn test_recovery_after_velocity_drops() {
         let monitor = PositionVelocityMonitor::default();
 
-        // First: rapid accumulation
-        let state = make_state(1.50);
+        // First: rapid accumulation (above pull threshold 0.50)
+        let state = make_state(0.60);
         let assessment = monitor.evaluate(&state);
         assert!(matches!(assessment.action, RiskAction::PullQuotes));
 
-        // Then: velocity drops to normal
-        let state = make_state(0.10);
+        // Then: velocity drops to normal (below warn 0.20)
+        let state = make_state(0.05);
         let assessment = monitor.evaluate(&state);
         assert_eq!(assessment.severity, RiskSeverity::None);
     }
@@ -294,13 +296,13 @@ mod tests {
     #[test]
     fn test_metric_and_threshold_populated() {
         let monitor = PositionVelocityMonitor::default();
-        let state = make_state(0.70);
+        let state = make_state(0.30); // Above warn (0.20), triggers WidenSpreads
 
         let assessment = monitor.evaluate(&state);
         assert!(assessment.metric_value.is_some());
         assert!(assessment.threshold.is_some());
-        assert!((assessment.metric_value.unwrap() - 0.70).abs() < f64::EPSILON);
-        assert!((assessment.threshold.unwrap() - 0.50).abs() < f64::EPSILON);
+        assert!((assessment.metric_value.unwrap() - 0.30).abs() < f64::EPSILON);
+        assert!((assessment.threshold.unwrap() - 0.20).abs() < f64::EPSILON);
     }
 
     #[test]

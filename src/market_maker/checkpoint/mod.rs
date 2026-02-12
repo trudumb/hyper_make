@@ -194,6 +194,7 @@ impl CheckpointManager {
 mod tests {
     use super::*;
     use crate::market_maker::calibration::parameter_learner::LearnedParameters;
+    use crate::market_maker::learning::SpreadBanditCheckpoint;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -234,6 +235,8 @@ mod tests {
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
             rl_q_table: RLCheckpoint::default(),
+            spread_bandit: SpreadBanditCheckpoint::default(),
+            baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
         }

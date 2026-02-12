@@ -243,6 +243,8 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     position_history: std::collections::VecDeque<(std::time::Instant, f64)>,
     /// Current position velocity (abs change / max_position per minute).
     position_velocity_1m: f64,
+    /// Fill cascade tracker: detects and mitigates same-side fill runs.
+    fill_cascade_tracker: FillCascadeTracker,
 
     // === Signal Diagnostics Cache (Phase 1) ===
     /// Cached market params from last quote cycle.
@@ -436,6 +438,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Position velocity tracking for rapid accumulation detection
             position_history: std::collections::VecDeque::with_capacity(120),
             position_velocity_1m: 0.0,
+            // Fill cascade tracker for same-side fill run detection
+            fill_cascade_tracker: FillCascadeTracker::new(),
             // Signal diagnostics cache (updated each quote cycle)
             cached_market_params: None,
             // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
@@ -713,6 +717,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 total_updates: self.learning.ensemble_total_updates(),
             },
             rl_q_table: self.stochastic.rl_agent.to_checkpoint(),
+            spread_bandit: self.stochastic.spread_bandit.to_checkpoint(),
+            baseline_tracker: checkpoint::BaselineTrackerCheckpoint {
+                ewma_reward: self.stochastic.baseline_tracker.baseline(),
+                n_observations: self.stochastic.baseline_tracker.n_observations(),
+            },
             kill_switch: self.safety.kill_switch.to_checkpoint(),
             readiness: checkpoint::PriorReadiness::default(),
         }
@@ -736,6 +745,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.stochastic
             .rl_agent
             .restore_from_checkpoint(&bundle.rl_q_table);
+        self.stochastic
+            .spread_bandit
+            .restore_from_checkpoint(&bundle.spread_bandit);
+        self.stochastic.baseline_tracker.restore(
+            bundle.baseline_tracker.ewma_reward,
+            bundle.baseline_tracker.n_observations,
+        );
         self.safety
             .kill_switch
             .restore_from_checkpoint(&bundle.kill_switch);
@@ -1104,5 +1120,140 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let max_pos = self.effective_max_position.max(0.001); // avoid div by zero
             self.position_velocity_1m = (current_pos - oldest_pos).abs() / max_pos;
         }
+    }
+}
+
+/// Tracks consecutive same-side fills to detect and mitigate fill cascades.
+///
+/// When the MM accumulates fills on one side (e.g., 3+ shorts in 60s),
+/// this tracker widens that side's spread (5x) or suppresses it entirely (after 5+),
+/// preventing runaway position accumulation during trending markets.
+///
+/// The key insight: fill clustering on one side is a strong signal of adverse flow.
+/// Position limits alone are too late — by the time position hits the limit,
+/// the loss is already realized.
+#[derive(Debug)]
+pub struct FillCascadeTracker {
+    /// Recent fills: (timestamp, side)
+    recent_fills: std::collections::VecDeque<(std::time::Instant, Side)>,
+    /// Rolling window for cascade detection
+    window: std::time::Duration,
+    /// Number of same-side fills to trigger widening (5x)
+    widen_threshold: usize,
+    /// Number of same-side fills to trigger suppression (reduce-only)
+    suppress_threshold: usize,
+    /// Cooldown: suppressed side and expiry time
+    cooldown_until: Option<(std::time::Instant, Side)>,
+    /// Cooldown duration for widen mode
+    widen_cooldown: std::time::Duration,
+    /// Cooldown duration for suppress mode
+    suppress_cooldown: std::time::Duration,
+}
+
+impl FillCascadeTracker {
+    /// Create a new fill cascade tracker with default parameters.
+    pub fn new() -> Self {
+        Self {
+            recent_fills: std::collections::VecDeque::with_capacity(32),
+            window: std::time::Duration::from_secs(60),
+            widen_threshold: 3,
+            suppress_threshold: 5,
+            cooldown_until: None,
+            widen_cooldown: std::time::Duration::from_secs(15),
+            suppress_cooldown: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// Record a fill event.
+    pub fn record_fill(&mut self, side: Side) {
+        let now = std::time::Instant::now();
+        self.recent_fills.push_back((now, side));
+        self.prune_old_fills(now);
+
+        // Check for cascade
+        let same_side_count = self.count_same_side(side, now);
+        if same_side_count >= self.suppress_threshold {
+            self.cooldown_until = Some((now + self.suppress_cooldown, side));
+            tracing::warn!(
+                side = ?side,
+                count = same_side_count,
+                suppress_secs = self.suppress_cooldown.as_secs(),
+                "Fill cascade SUPPRESS: {} same-side fills in {}s window",
+                same_side_count,
+                self.window.as_secs()
+            );
+        } else if same_side_count >= self.widen_threshold {
+            // Only set widen cooldown if not already in suppress mode for this side
+            if !self.is_suppressed(side) {
+                self.cooldown_until = Some((now + self.widen_cooldown, side));
+                tracing::warn!(
+                    side = ?side,
+                    count = same_side_count,
+                    widen_secs = self.widen_cooldown.as_secs(),
+                    "Fill cascade WIDEN: {} same-side fills in {}s window",
+                    same_side_count,
+                    self.window.as_secs()
+                );
+            }
+        }
+    }
+
+    /// Get spread multiplier for a side (1.0 = normal, 5.0 = widened due to cascade).
+    pub fn spread_multiplier(&self, side: Side) -> f64 {
+        let now = std::time::Instant::now();
+        if let Some((expiry, cooldown_side)) = self.cooldown_until {
+            if now < expiry && cooldown_side == side {
+                let same_side_count = self.count_same_side(side, now);
+                if same_side_count >= self.suppress_threshold {
+                    return 10.0; // Extreme widening before suppress
+                }
+                return 5.0;
+            }
+        }
+        1.0
+    }
+
+    /// Check if a side is suppressed (reduce-only).
+    pub fn is_suppressed(&self, side: Side) -> bool {
+        let now = std::time::Instant::now();
+        if let Some((expiry, cooldown_side)) = self.cooldown_until {
+            if now < expiry && cooldown_side == side {
+                return self.count_same_side(side, now) >= self.suppress_threshold;
+            }
+        }
+        false
+    }
+
+    /// Count same-side fills within the window.
+    fn count_same_side(&self, side: Side, now: std::time::Instant) -> usize {
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        self.recent_fills
+            .iter()
+            .filter(|(t, s)| *t >= cutoff && *s == side)
+            .count()
+    }
+
+    /// Remove fills older than the window.
+    fn prune_old_fills(&mut self, now: std::time::Instant) {
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        while let Some(&(t, _)) = self.recent_fills.front() {
+            if t < cutoff {
+                self.recent_fills.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Also clear expired cooldown
+        if let Some((expiry, _)) = self.cooldown_until {
+            if now >= expiry {
+                self.cooldown_until = None;
+            }
+        }
+    }
+}
+
+impl Default for FillCascadeTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }

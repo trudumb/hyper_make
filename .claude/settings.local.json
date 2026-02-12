@@ -58,7 +58,9 @@
       "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make diff --stat HEAD~5)",
       "Bash(while read f)",
       "Bash(do head -5 \"$f\")",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(for i in 1 2 3 4 5)",
+      "Bash(do echo \"=== Run $i ===\")"
     ]
   }
 }

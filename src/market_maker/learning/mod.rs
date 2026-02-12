@@ -37,6 +37,7 @@ pub mod offline_trainer;
 pub mod rl_agent;
 pub mod quote_outcome;
 pub mod rl_edge_model;
+pub mod spread_bandit;
 pub mod types;
 
 // Re-export key types
@@ -55,6 +56,7 @@ pub use competitor_model::{
     CompetitorModel, CompetitorModelConfig, CompetitorSummary,
     MarketEvent, Side, BayesianGamma, SnipeTracker,
 };
+pub use spread_bandit::{SpreadBandit, SpreadContext, BanditSelection, SpreadBanditCheckpoint};
 pub use types::*;
 
 use crate::market_maker::calibration::{CalibrationSample, CoefficientEstimator};

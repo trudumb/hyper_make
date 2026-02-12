@@ -54,8 +54,13 @@ pub struct PositionGuardConfig {
     /// Pull threshold (fraction of max_position)
     /// Pull quotes on one side at this level
     pub pull_threshold: f64,
-    /// Maximum skew in basis points
+    /// Maximum skew in basis points (GL formula)
     pub max_skew_bps: f64,
+    /// Direct linear skew at max position (bps).
+    /// Added on top of GL formula to provide meaningful skew even when
+    /// gamma*sigma^2*q*tau is negligible (~0.28 bps).
+    /// At 50% position utilization, adds direct_skew_max_bps/2 to GL skew.
+    pub direct_skew_max_bps: f64,
     /// Volatility estimate for skew calculation (bps per sqrt(second))
     pub sigma_bps: f64,
     /// Time horizon for skew calculation (seconds)
@@ -74,6 +79,7 @@ impl Default for PositionGuardConfig {
             warning_threshold: 0.7,
             pull_threshold: 0.9,
             max_skew_bps: 100.0,
+            direct_skew_max_bps: 15.0, // 15 bps at max position
             sigma_bps: 50.0,     // 50 bps volatility
             tau_seconds: 300.0,  // 5 minute horizon
             hard_entry_threshold: 0.95,
@@ -118,15 +124,11 @@ pub struct PositionGuard {
 impl PositionGuard {
     /// Create a new position guard with default config.
     pub fn new(max_position: f64, gamma: f64) -> Self {
-        Self {
-            config: PositionGuardConfig {
-                max_position,
-                gamma,
-                ..Default::default()
-            },
-            position: 0.0,
-            last_skew_bps: 0.0,
-        }
+        Self::with_config(PositionGuardConfig {
+            max_position,
+            gamma,
+            ..Default::default()
+        })
     }
 
     /// Create with full configuration.
@@ -295,6 +297,13 @@ impl PositionGuard {
     }
 
     /// Compute inventory skew (internal).
+    ///
+    /// Combines two components:
+    /// 1. Guéant-Lehalle formula: γ × σ² × q × τ (typically ~0.28 bps — negligible)
+    /// 2. Direct linear skew: position_fraction × direct_skew_max_bps (up to 15 bps)
+    ///
+    /// The direct term ensures meaningful skew even when GL parameters produce
+    /// negligible values. At 50% position utilization → 7.5 bps skew.
     fn compute_inventory_skew_bps(&self) -> f64 {
         if self.config.max_position <= 0.0 {
             return 0.0;
@@ -303,13 +312,17 @@ impl PositionGuard {
         // Normalized inventory [-1, 1]
         let q = self.position / self.config.max_position;
 
-        // Guéant-Lehalle skew: γ × σ² × q × τ
+        // Component 1: Guéant-Lehalle skew: γ × σ² × q × τ
         let sigma = self.config.sigma_bps / 10000.0; // Convert bps to fraction
         let sigma_squared = sigma * sigma;
-        let raw_skew = self.config.gamma * sigma_squared * q * self.config.tau_seconds;
+        let gl_skew = self.config.gamma * sigma_squared * q * self.config.tau_seconds * 10000.0;
 
-        // Convert to bps and clamp
-        let skew_bps = raw_skew * 10000.0;
+        // Component 2: Direct linear skew — position-proportional
+        let position_fraction = q.clamp(-1.0, 1.0);
+        let direct_skew = position_fraction * self.config.direct_skew_max_bps;
+
+        // Combine and clamp
+        let skew_bps = gl_skew + direct_skew;
         skew_bps.clamp(-self.config.max_skew_bps, self.config.max_skew_bps)
     }
 
@@ -516,6 +529,51 @@ mod tests {
         guard.update_position(-0.5);
         let skew = guard.inventory_skew_bps();
         assert!(skew < 0.0);
+    }
+
+    #[test]
+    fn test_direct_skew_at_half_position() {
+        let mut guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 1.0,
+            gamma: 0.15,
+            direct_skew_max_bps: 15.0,
+            sigma_bps: 50.0,
+            tau_seconds: 300.0,
+            max_skew_bps: 100.0,
+            ..Default::default()
+        });
+
+        // At 50% position:
+        //   direct_skew = 0.5 * 15.0 = 7.5 bps
+        //   GL = 0.15 * (0.005)^2 * 0.5 * 300 * 10000 = 5.625 bps
+        //   total = ~13.1 bps
+        guard.update_position(0.5);
+        let skew = guard.inventory_skew_bps();
+        assert!(skew > 12.0, "Expected >12 bps skew at 50% position, got {skew}");
+        assert!(skew < 14.0, "Expected <14 bps skew at 50% position, got {skew}");
+
+        // Negative position should give negative skew of same magnitude
+        guard.update_position(-0.5);
+        let skew = guard.inventory_skew_bps();
+        assert!(skew < -12.0, "Expected <-12 bps skew at -50% position, got {skew}");
+    }
+
+    #[test]
+    fn test_direct_skew_at_max_position() {
+        let mut guard = PositionGuard::with_config(PositionGuardConfig {
+            max_position: 10.0,
+            gamma: 0.15,
+            direct_skew_max_bps: 15.0,
+            sigma_bps: 50.0,
+            tau_seconds: 300.0,
+            max_skew_bps: 100.0,
+            ..Default::default()
+        });
+
+        // At 100% position utilization: direct_skew = 1.0 * 15.0 = 15.0 bps + GL
+        guard.update_position(10.0);
+        let skew = guard.inventory_skew_bps();
+        assert!(skew > 15.0, "Expected >15 bps skew at max position, got {skew}");
     }
 
     #[test]

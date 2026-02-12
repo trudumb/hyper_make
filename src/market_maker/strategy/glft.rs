@@ -386,10 +386,20 @@ impl GLFTStrategy {
         let gamma_final = gamma_with_tail * rl_gamma_mult;
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
-        // This makes the floor a safety net that rarely binds, not the primary spread.
+        // Uses the ACTUAL effective floor (learned > adaptive > static) so that
+        // gamma is high enough that the post-hoc floor clamp rarely binds.
         let time_horizon = self.holding_time(market_params.arrival_intensity);
+        let effective_floor_for_gamma = if market_params.use_learned_parameters
+            && market_params.learned_params_calibrated
+        {
+            (market_params.learned_spread_floor_bps / 10000.0).max(cfg.min_spread_floor)
+        } else if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+            market_params.adaptive_spread_floor.max(cfg.min_spread_floor)
+        } else {
+            cfg.min_spread_floor
+        };
         let min_gamma = solve_min_gamma(
-            cfg.min_spread_floor,
+            effective_floor_for_gamma,
             market_params.kappa.max(1.0),
             market_params.sigma_effective.max(1e-8),
             time_horizon,
@@ -1121,6 +1131,18 @@ impl QuotingStrategy for GLFTStrategy {
             // Legacy: Static floor from RiskConfig + tick/latency constraints
             market_params.effective_spread_floor(self.risk_config.min_spread_floor)
         };
+        // Floor clamp: safety net only. With unified floor in solve_min_gamma,
+        // this should fire <5% of cycles (only during transient parameter changes).
+        let floor_bound = half_spread_bid < effective_floor
+            || half_spread_ask < effective_floor;
+        if floor_bound {
+            debug!(
+                spread_bid_bps = %format!("{:.1}", half_spread_bid * 10000.0),
+                spread_ask_bps = %format!("{:.1}", half_spread_ask * 10000.0),
+                floor_bps = %format!("{:.1}", effective_floor * 10000.0),
+                "Floor clamp binding (safety net) — gamma may need adjustment"
+            );
+        }
         half_spread_bid = half_spread_bid.max(effective_floor);
         half_spread_ask = half_spread_ask.max(effective_floor);
         half_spread = half_spread.max(effective_floor);
@@ -1524,8 +1546,10 @@ impl QuotingStrategy for GLFTStrategy {
         };
 
         // Apply spread widening multiplier from quote gate (pending changepoint confirmation)
-        let half_spread_bid_widened = half_spread_bid * market_params.spread_widening_mult;
-        let half_spread_ask_widened = half_spread_ask * market_params.spread_widening_mult;
+        // Then apply bandit-selected spread multiplier (contextual bandit optimizer)
+        let bandit_mult = market_params.bandit_spread_multiplier.clamp(0.5, 2.0);
+        let half_spread_bid_widened = half_spread_bid * market_params.spread_widening_mult * bandit_mult;
+        let half_spread_ask_widened = half_spread_ask * market_params.spread_widening_mult * bandit_mult;
 
         // Compute asymmetric deltas with predictive bias
         // Note: predictive_bias is typically negative when changepoint imminent (expect price drop)

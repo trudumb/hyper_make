@@ -693,12 +693,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 continue;
             }
 
+            // Record fill side in cascade tracker for same-side run detection
+            let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
+            let fill_side = if is_buy { Side::Buy } else { Side::Sell };
+            self.fill_cascade_tracker.record_fill(fill_side);
+
             let fill_event = WsFillEvent {
                 oid: fill.oid,
                 tid: fill.tid,
                 size: fill.sz.parse().unwrap_or(0.0),
                 price: fill.px.parse().unwrap_or(0.0),
-                is_buy: fill.side == "B" || fill.side.to_lowercase() == "buy",
+                is_buy,
                 coin: fill.coin.clone(),
                 cloid: fill.cloid.clone(),
                 timestamp: fill.time,
@@ -938,149 +943,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // === Phase 8: RL Agent Learning Update ===
                 // Update Q-values from fill outcome
                 {
-                    use crate::market_maker::learning::{MDPState, MDPAction, Reward, MarketEvent};
-                    use crate::market_maker::learning::experience::{
-                        ExperienceRecord, ExperienceParams, ExperienceSource,
-                    };
+                    use crate::market_maker::learning::MarketEvent;
 
-                    // Build current MDP state from fill conditions
-                    let book_imbalance = self.estimator.book_imbalance();
-                    // Use current sigma vs a baseline (use sigma_clean as proxy for short-term)
-                    let vol_ratio = self.estimator.sigma() / self.estimator.sigma_clean().max(0.0001);
-                    let adverse_prob = self.stochastic.theoretical_edge.bayesian_adverse();
-                    // Use intensity percentile as proxy for excitation level
-                    let hawkes_excitation = self.tier2.hawkes.intensity_percentile();
+                    // === Contextual Bandit Reward Update ===
+                    // Realized edge = spread_captured - AS - fees (i.i.d. bandit reward)
+                    const MAKER_FEE_BPS: f64 = 1.5;
+                    let depth_bps = depth_from_mid * 10_000.0;
+                    let as_bps = as_realized * 10_000.0;
+                    let realized_edge_bps = depth_bps - as_bps - MAKER_FEE_BPS;
+                    let was_adverse = as_bps > 3.0;
 
-                    let current_state = MDPState::from_continuous(
-                        self.position.position(),
-                        self.effective_max_position,
-                        book_imbalance,
-                        vol_ratio,
-                        adverse_prob,
-                        hawkes_excitation,
-                        0.0, // momentum_bps: drift bucket wired by lead when ready
+                    // Update baseline tracker (EWMA of realized edge)
+                    self.stochastic.baseline_tracker.observe(realized_edge_bps);
+
+                    // Baseline-adjusted reward: removes fee drag (~-1.5 bps)
+                    let bandit_reward = self.stochastic.baseline_tracker
+                        .counterfactual_reward(realized_edge_bps);
+
+                    // Update bandit with 1:1 quote→outcome reward attribution
+                    let bandit_updated = self.stochastic.spread_bandit
+                        .update_from_pending(bandit_reward);
+
+                    debug!(
+                        realized_edge_bps = %format!("{:.2}", realized_edge_bps),
+                        baseline_bps = %format!("{:.2}", self.stochastic.baseline_tracker.baseline()),
+                        bandit_reward = %format!("{:.2}", bandit_reward),
+                        bandit_updated = bandit_updated,
+                        was_adverse = was_adverse,
+                        bandit_obs = self.stochastic.spread_bandit.total_observations(),
+                        "Bandit updated from fill"
                     );
-
-                    // FIX P0-1: Use depth_from_mid (spread capture) minus AS minus fee as reward
-                    // Previously: depth_bps - fee only, ignoring adverse selection cost
-                    // Correct: depth_bps - realized_as_bps - fee = true realized edge
-                    const RL_MAKER_FEE_BPS: f64 = 1.5;
-                    let depth_bps_rl = depth_from_mid * 10_000.0;
-                    let as_realized_bps_rl = as_realized * 10_000.0;
-                    let realized_edge_bps = depth_bps_rl - as_realized_bps_rl - RL_MAKER_FEE_BPS;
-                    let was_adverse = as_realized_bps_rl > 3.0; // Consistent with AS threshold used elsewhere
-
-                    // Inventory risk: |position| / max_position
-                    let inventory_risk = (self.position.position().abs()
-                        / self.effective_max_position.max(1.0))
-                        .clamp(0.0, 1.0);
-
-                    // FIX P1-2: Drain ALL pending state-actions (handles clustered fills)
-                    let mut updated = false;
-                    let regime_str = self.stochastic.position_decision.current_regime().to_string();
-                    while let Some((state_idx, action_idx)) = self.stochastic.rl_agent.take_next_state_action()
-                    {
-                        // Use stored prev_inventory_risk from when the action was chosen
-                        let prev_inventory_risk = self.stochastic.rl_agent.take_next_inventory_risk();
-                        let reward = Reward::compute(
-                            self.stochastic.rl_agent.reward_config(),
-                            realized_edge_bps,
-                            inventory_risk,
-                            vol_ratio,
-                            prev_inventory_risk,
-                        );
-
-                        self.stochastic.rl_agent.update_idx(
-                            state_idx,
-                            action_idx,
-                            reward,
-                            current_state.to_index(),
-                            false, // not done
-                        );
-                        updated = true;
-
-                        // === Experience Logging ===
-                        if let Some(ref mut logger) = self.experience_logger {
-                            let mdp_state = MDPState::from_index(state_idx);
-                            let mdp_action = MDPAction::from_index(action_idx);
-                            let record = ExperienceRecord::from_params(ExperienceParams {
-                                state: mdp_state,
-                                action: mdp_action,
-                                reward,
-                                next_state: current_state,
-                                done: false,
-                                timestamp_ms: fill.time,
-                                session_id: self.experience_session_id.clone(),
-                                source: ExperienceSource::Live,
-                                side: if is_buy { "buy".to_string() } else { "sell".to_string() },
-                                fill_price,
-                                mid_price: self.latest_mid,
-                                fill_size,
-                                inventory: self.position.position(),
-                                regime: regime_str.clone(),
-                            });
-                            let _ = logger.log(&record);
-                        }
-
-                        let mdp_action_log = MDPAction::from_index(action_idx);
-                        debug!(
-                            realized_edge_bps = %format!("{:.2}", realized_edge_bps),
-                            inventory_risk = %format!("{:.3}", inventory_risk),
-                            reward_total = %format!("{:.3}", reward.total),
-                            was_adverse = was_adverse,
-                            action_spread = %format!("{:.1}", mdp_action_log.spread.delta_bps()),
-                            action_skew = %format!("{:.1}", mdp_action_log.skew.bid_skew_bps()),
-                            "RL agent updated from fill (actual action)"
-                        );
-                    }
-                    if !updated {
-                        // Fallback: no stored action (shouldn't happen normally)
-                        // Use current inventory_risk as prev since no stored value
-                        let fallback_reward = Reward::compute(
-                            self.stochastic.rl_agent.reward_config(),
-                            realized_edge_bps,
-                            inventory_risk,
-                            vol_ratio,
-                            inventory_risk, // no stored prev, use current as approximation
-                        );
-                        let action = MDPAction::default();
-                        self.stochastic.rl_agent.update(
-                            current_state,
-                            action,
-                            fallback_reward,
-                            current_state,
-                            false,
-                        );
-
-                        // === Experience Logging (fallback) ===
-                        if let Some(ref mut logger) = self.experience_logger {
-                            let record = ExperienceRecord::from_params(ExperienceParams {
-                                state: current_state,
-                                action,
-                                reward: fallback_reward,
-                                next_state: current_state,
-                                done: false,
-                                timestamp_ms: fill.time,
-                                session_id: self.experience_session_id.clone(),
-                                source: ExperienceSource::Live,
-                                side: if is_buy { "buy".to_string() } else { "sell".to_string() },
-                                fill_price,
-                                mid_price: self.latest_mid,
-                                fill_size,
-                                inventory: self.position.position(),
-                                regime: regime_str.clone(),
-                            });
-                            let _ = logger.log(&record);
-                        }
-
-                        debug!(
-                            realized_edge_bps = %format!("{:.2}", realized_edge_bps),
-                            inventory_risk = %format!("{:.3}", inventory_risk),
-                            reward_total = %format!("{:.3}", fallback_reward.total),
-                            was_adverse = was_adverse,
-                            "RL agent updated from fill (default action - no stored state)"
-                        );
-                    }
 
                     // === Competitor Model Observation ===
                     // Estimate queue position from depth

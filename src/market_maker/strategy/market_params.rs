@@ -294,6 +294,14 @@ pub struct MarketParams {
     /// > 1.0 = stronger inventory clearing, < 1.0 = weaker clearing.
     pub rl_omega_multiplier: f64,
 
+    // --- Contextual Bandit SpreadOptimizer ---
+    /// Bandit-selected spread multiplier [0.85, 1.40].
+    /// Applied after GLFT base spread: final_spread = base × bandit_mult × safety_mults.
+    /// Default 1.0 = pure GLFT (cold start / no bandit observation).
+    pub bandit_spread_multiplier: f64,
+    /// Whether the bandit selection was exploration (Thompson) vs exploitation (greedy).
+    pub bandit_is_exploration: bool,
+
     // --- Phase 8: Competitor Model ---
     /// Competitor snipe probability [0, 1].
     pub competitor_snipe_prob: f64,
@@ -947,6 +955,9 @@ impl Default for MarketParams {
             rl_action_applied: false,
             rl_gamma_multiplier: 1.0,
             rl_omega_multiplier: 1.0,
+            // Contextual Bandit SpreadOptimizer
+            bandit_spread_multiplier: 1.0,
+            bandit_is_exploration: false,
             // Phase 8: Competitor Model
             competitor_snipe_prob: 0.1,      // 10% baseline
             competitor_spread_factor: 1.0,   // No adjustment

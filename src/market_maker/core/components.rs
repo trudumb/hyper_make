@@ -493,13 +493,22 @@ pub struct StochasticComponents {
     pub kappa_spread: KappaSpreadController,
 
     // === Phase 8: RL and Competitor Modeling ===
-    /// Q-Learning agent for adaptive quoting policy.
-    /// Uses Thompson sampling on Bayesian Q-values for exploration.
+    /// Q-Learning agent for adaptive quoting policy (DEPRECATED — replaced by spread_bandit).
+    /// Retained for checkpoint backward compatibility.
     pub rl_agent: crate::market_maker::learning::QLearningAgent,
 
     /// Competitor model for rival MM inference.
     /// Tracks snipe probability and queue competition.
     pub competitor_model: crate::market_maker::learning::CompetitorModel,
+
+    // === Contextual Bandit SpreadOptimizer (replaces RL MDP) ===
+    /// Contextual bandit for spread multiplier selection.
+    /// 81 contexts × 8 arms, Thompson Sampling with exponential forgetting.
+    pub spread_bandit: crate::market_maker::learning::SpreadBandit,
+
+    /// EWMA baseline tracker for counterfactual reward centering.
+    /// Subtracts fee drag (~-1.5 bps) so bandit learns meaningful reward differences.
+    pub baseline_tracker: crate::market_maker::learning::BaselineTracker,
 
     // === First-Principles Stochastic Control (DEPRECATED) ===
     /// DEPRECATED (Phase 7): Use `CentralBeliefState` instead.
@@ -677,6 +686,9 @@ impl StochasticComponents {
             // Phase 8: RL and Competitor Modeling
             rl_agent: crate::market_maker::learning::QLearningAgent::default(),
             competitor_model: crate::market_maker::learning::CompetitorModel::default(),
+            // Contextual Bandit SpreadOptimizer (replaces RL MDP)
+            spread_bandit: crate::market_maker::learning::SpreadBandit::default(),
+            baseline_tracker: crate::market_maker::learning::BaselineTracker::default(),
             // First-Principles Stochastic Control
             beliefs_builder: StochasticControlBuilder::new(StochasticControlConfig::default()),
             // Position Continuation Model (HOLD/ADD/REDUCE)

@@ -300,6 +300,10 @@ impl ParameterAggregator {
             rl_gamma_multiplier: 1.0,
             rl_omega_multiplier: 1.0,
 
+            // Contextual Bandit SpreadOptimizer
+            bandit_spread_multiplier: 1.0,
+            bandit_is_exploration: false,
+
             // Phase 8: Competitor Model
             // These will be populated from CompetitorModel in orchestrator
             competitor_snipe_prob: 0.1,          // Default 10% baseline

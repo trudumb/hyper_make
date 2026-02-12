@@ -340,6 +340,70 @@ impl QuoteOutcomeTracker {
     pub fn total_outcomes(&self) -> usize {
         self.outcome_log.len()
     }
+
+    /// Find the optimal spread (bps) that maximizes expected edge for a target fill rate.
+    ///
+    /// Expected edge = P(fill | spread) × E[edge | fill, spread].
+    /// Returns the spread bin midpoint with the highest expected edge,
+    /// or None if insufficient data.
+    pub fn optimal_spread_bps(&self, _fill_rate_target: f64) -> Option<f64> {
+        let rates = self.fill_rate.all_rates();
+        if rates.is_empty() {
+            return None;
+        }
+
+        let mut best_spread = None;
+        let mut best_expected = f64::NEG_INFINITY;
+
+        for (spread_mid, fill_rate, _count) in &rates {
+            let edge_at_spread = self.mean_edge_at_spread(*spread_mid);
+            let expected = fill_rate * edge_at_spread;
+
+            if expected > best_expected {
+                best_expected = expected;
+                best_spread = Some(*spread_mid);
+            }
+        }
+
+        best_spread
+    }
+
+    /// Estimate the expected edge (bps) at a given spread level.
+    ///
+    /// Uses the outcome log to find filled outcomes near this spread
+    /// and returns P(fill) × E[edge | fill]. Returns 0.0 if no data.
+    pub fn expected_edge_at(&self, spread_bps: f64) -> f64 {
+        let fill_rate = self.fill_rate.fill_rate_at(spread_bps).unwrap_or(0.0);
+        let mean_edge = self.mean_edge_at_spread(spread_bps);
+        fill_rate * mean_edge
+    }
+
+    /// Mean realized edge for fills near a given spread level.
+    fn mean_edge_at_spread(&self, spread_bps: f64) -> f64 {
+        let tolerance_bps = 3.0;
+        let mut sum = 0.0;
+        let mut count = 0;
+
+        for outcome in &self.outcome_log {
+            if let QuoteOutcome::Filled {
+                edge_bps,
+                spread_bps: s,
+                ..
+            } = outcome
+            {
+                if (*s - spread_bps).abs() < tolerance_bps {
+                    sum += edge_bps;
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            sum / count as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 impl Default for QuoteOutcomeTracker {
