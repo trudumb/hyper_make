@@ -184,3 +184,69 @@ Paper-to-Live EV Gap: Analysis & Improvement Hypotheses
   │ P3       │ H8: Cancel-race AS tracking                    │ +0.2 bps (hidden AS detection)       │ Medium     │
   └──────────┴────────────────────────────────────────────────┴──────────────────────────────────────┴────────────┘
   The P0 items alone (H4 + H10) should recover ~2.3 bps — enough to flip live EV from -1.5 bps to positive. Want me to implement any of these?
+
+
+
+
+
+
+
+  Here's the full picture of what happened.
+                                                                                                                                                                                   
+  The Session: 89 Minutes, -$5.02, Kill Switch              
+                                                                                                                                                                                   
+  HYPE dropped 188 bps during our session. We accumulated 12.81 HYPE long (4x our configured max of 3.24) in the first 7 minutes — 13 buys, 1 sell. Then the changepoint detector  
+  went haywire, pulled ALL quotes for 78 of 89 minutes (89% of the session). We sat there with a massive long position, unable to reduce, while the market bled us dry. Kill switch
+   fired at -$5.02.
+
+  The 6 Bugs That Killed Us
+
+  1. AS Measurement is Tautological — Both "adverse selection" and "spread depth" are computed from self.latest_mid at the same instant. They're algebraically identical. So
+  realized_edge = 0 - 1.5 = -1.5 bps for 97% of fills. Every learning signal downstream (RL rewards, edge predictions, calibration) is trained on pure noise. We literally cannot
+  measure our own edge.
+
+  2. ZERO Directional Skew — Across 1,964 quote cycles, combined_skew_bps ≈ 0 always. No signal produces skew. The HL-native flow fallback has imbalance_30s: 0.0 hardcoded and
+  avg_buy/sell_size: 0.0 not tracked. We quote perfectly symmetrically during sweeps. 24 buys vs 5 sells = textbook adverse selection from one-sided flow we never leaned away
+  from.
+
+  3. RegimeDetection is Connected But Output is Dead — Has live kappa data ranging 500-4203 (8.4x variation!) but spread_adjustment_bps = 0.0 always. The kappa_effective value is
+  computed, stored, logged... and never consumed by the spread calculator. The signal sees regime changes and screams into the void.
+
+  4. Emergency Pull Paralysis — 903 emergency pulls. The "safety" mechanism caused the loss. We accumulated 10+ HYPE long BEFORE the overlay kicked in, then it locked us out for
+  78 minutes straight. We couldn't reduce position because the overlay cancelled ALL quotes (including the sells we desperately needed). Two brief 3-minute windows opened — and we
+   bought MORE in both.
+
+  5. Position Limit Not Enforced — Config says max_position: 3.24. We hit 12.81. Same effective_max_position bug from Feb 10 — derived from margin (~55 HYPE) instead of user
+  config.
+
+  6. InformedFlow is Actively Harmful — The one signal that actually does something has marginal value of -0.23 bps. It tightens spreads when p_informed < 0.05, which reduces our
+  safety buffer right before we get run over.
+
+  What's Missing in Feature Engineering
+
+  - No directional intelligence whatsoever (no Binance for HYPE, no working flow-based skew)
+  - Regime kappa data exists but is ignored (wiring bug)
+  - No multi-timescale order flow (30s EWMA hardcoded to 0)
+  - No OI delta or book depth velocity (both have TODO comments with = 0.0)
+  - QuoteOutcomeTracker accumulates data but never feeds it back to the spread optimizer
+  - Only 2 of 6 signals (InformedFlow, VPIN) produce any spread adjustment — and one is harmful
+
+  Priority Fix List
+
+  The full analysis is saved to .claude/plans/live-session-audit-findings.md. Top priorities:
+  ┌──────┬────────────────────────────────────────────────┬────────────────────────────────────────────────────┐
+  │  #   │                      Fix                       │                        Why                         │
+  ├──────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ P0-1 │ Store mid_at_placement, fix EdgeSnapshot       │ Unlocks all learning — prerequisite for everything │
+  ├──────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ P0-2 │ Emergency pull: let reduce-only quotes survive │ Prevents the exact loss pattern we just saw        │
+  ├──────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ P0-3 │ Enforce config.max_position as hard cap        │ We hit 4x our limit                                │
+  ├──────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ P0-4 │ Wire regime kappa to spread calculator         │ 8.4x kappa variation is being ignored              │
+  ├──────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ P0-5 │ Fix HL flow feature vec (30s, sizes = 0)       │ Enables directional skew                           │
+  ├──────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ P0-6 │ Disable InformedFlow tightening                │ One-line fix, +0.23 bps                            │
+  └──────┴────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+  Want me to start implementing these fixes?
