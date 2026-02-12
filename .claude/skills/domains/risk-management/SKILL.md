@@ -1,6 +1,6 @@
 ---
-name: Risk Management
-description: Layered risk system with monitors, circuit breakers, kill switch, and position guards. Read when working on risk/, safety/, or monitoring/ modules, or when debugging position limits, emergency shutdowns, or spread widening.
+name: risk-management
+description: Layered risk system with monitors, circuit breakers, kill switch, and position guards. Use when working on risk/, safety/, or monitoring/ modules, debugging position limits, emergency shutdowns, spread widening, or adding new risk monitors. Covers RiskMonitor trait, severity escalation, and defense-first architecture.
 user-invocable: false
 ---
 
@@ -239,3 +239,11 @@ These must ALWAYS hold — violations are bugs:
 4. Default to `RiskSeverity::Normal` when uncertain
 5. Include clear `reason` strings for debugging
 6. Add tests covering all severity transitions
+
+---
+
+## Supporting Files
+
+| File | Description |
+|------|-------------|
+| [references/monitor-template.md](references/monitor-template.md) | Complete template for implementing a new RiskMonitor: trait skeleton, registration in RiskAggregator, testing requirements for all severity transitions, common patterns (threshold escalation, hysteresis, cooldown), and implementation checklist |

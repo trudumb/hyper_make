@@ -1,6 +1,7 @@
 ---
-name: Fill Intensity Hawkes
-description: Model fill intensity using Hawkes processes for state-dependent kappa estimation
+name: fill-intensity-hawkes
+description: Model fill intensity using Hawkes processes for state-dependent kappa estimation. Use when upgrading from simple fill-rate kappa, building fill probability predictions, incorporating queue position dynamics, or adding Hyperliquid-specific features (funding, OI) to fill rate models.
+user-invocable: false
 ---
 
 # Fill Intensity Model (Hawkes Process) Skill

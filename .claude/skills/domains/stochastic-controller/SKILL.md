@@ -1,6 +1,6 @@
 ---
-name: Stochastic Controller
-description: Layer 3 optimal sequential decision-making with Bayesian belief tracking, HJB value functions, and changepoint detection. Read when working on control/, stochastic/, or process_models/ modules.
+name: stochastic-controller
+description: Layer 3 optimal sequential decision-making with Bayesian belief tracking, HJB value functions, and changepoint detection. Use when working on control/, stochastic/, or process_models/ modules, debugging quote/wait/pull decisions, modifying the HJB solver, or adding action types. Covers conjugate updates, BOCD, and value of information.
 user-invocable: false
 ---
 
@@ -254,3 +254,11 @@ enum Action {
 4. Wire through `QuoteGateDecision`
 5. Handle in orchestrator's action dispatch
 6. Add diagnostic logging
+
+---
+
+## Supporting Files
+
+| File | Description |
+|------|-------------|
+| [references/formula-reference.md](references/formula-reference.md) | Consolidated math reference: GLFT optimal spread, inventory skew, NIG conjugate updates, Gamma fill intensity updates, BOCD run-length equations, value function basis features, and OU drift process -- each with equation, variables, implementation location, and parameter ranges |

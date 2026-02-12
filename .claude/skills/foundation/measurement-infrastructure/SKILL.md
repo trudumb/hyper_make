@@ -1,6 +1,6 @@
 ---
-name: Measurement Infrastructure
-description: Build the prediction logging and outcome tracking system that all other model improvements depend on
+name: measurement-infrastructure
+description: Build prediction logging, outcome tracking, and data pipelines for model calibration. Read FIRST before any model, calibration, or signal work. Covers PredictionRecord schema, async outcome matcher, JSONL persistence, and market state snapshots.
 user-invocable: false
 ---
 

@@ -76,6 +76,11 @@ Domain knowledge lives in `.claude/skills/`, not here. Skills are loaded on dema
 | Risk/safety changes | `risk-management` |
 | Controller/decision logic | `stochastic-controller` |
 | Paper trading issues | `/paper-trading` workflow |
+| Go live / deploy | `/go-live` workflow -> `live-incident-response` |
+| Live incident | `live-incident-response` |
+| Add new asset | `/add-asset` workflow |
+| Checkpoint/state work | `checkpoint-management` |
+| RL/learning work | Read `learning/` source directly (learning-pipeline skill future work) |
 
 ---
 

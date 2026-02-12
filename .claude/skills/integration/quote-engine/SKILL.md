@@ -1,6 +1,6 @@
 ---
-name: Quote Engine Integration
-description: Wire together all model components into a coherent quote generation pipeline
+name: quote-engine
+description: Wire all model components into the quote generation pipeline. Use when building the quote engine, adding new model components, debugging quote generation, or understanding the full data flow from market data through GLFT optimal spread to final bid/ask prices.
 user-invocable: false
 ---
 

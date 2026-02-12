@@ -1,6 +1,7 @@
 ---
-name: Regime Detection HMM
-description: Bayesian belief tracking over market states using Hidden Markov Models for regime-dependent parameters
+name: regime-detection-hmm
+description: Bayesian belief tracking over market states (Quiet/Trending/Volatile/Cascade) using Hidden Markov Models. Use when implementing regime-dependent parameters, building aggressive/defensive decisions, debugging regime-specific losses, or replacing hard-coded volatility thresholds with smooth probability blending.
+user-invocable: false
 ---
 
 # Regime Detection (HMM) Skill

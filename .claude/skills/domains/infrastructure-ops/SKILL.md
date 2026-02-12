@@ -1,6 +1,6 @@
 ---
-name: Infrastructure Operations
-description: WebSocket management, event loop, rate limiting, reconnection, recovery, metrics, and execution infrastructure. Read when working on orchestrator/, infra/, messages/, core/, fills/, or execution/ modules.
+name: infrastructure-ops
+description: WebSocket management, event loop, rate limiting, reconnection, recovery, metrics, and order execution infrastructure. Use when working on orchestrator/, infra/, messages/, core/, fills/, or execution/ modules, debugging connectivity or order placement, adding message handlers, or investigating stale data and latency issues.
 user-invocable: false
 ---
 
@@ -291,3 +291,11 @@ Event -> AtomicMetric (lock-free) -> MetricsSummary -> PrometheusOutput
 4. Register event type in `event_accumulator.rs`
 5. Update metrics in `metrics/updates.rs`
 6. Add data quality checks in `data_quality.rs`
+
+---
+
+## Supporting Files
+
+| File | Description |
+|------|-------------|
+| [references/debugging-playbook.md](references/debugging-playbook.md) | Expanded debugging playbooks for "orders not sending", "stale quotes", "position mismatch", and "high latency" -- full diagnostic chains with file references, specific checks, and resolution steps |

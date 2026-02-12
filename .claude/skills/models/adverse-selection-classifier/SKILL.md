@@ -1,6 +1,7 @@
 ---
-name: Adverse Selection Classifier
-description: Predict which incoming trades are informed before they hit you, enabling dynamic spread/kappa adjustment
+name: adverse-selection-classifier
+description: Predict informed vs noise trades for dynamic spread/kappa adjustment. Use when building AS prediction, debugging fill losses, adding liquidation cascade detection, or tuning toxic flow response. Covers trade classification, 26-feature engineering, MLP classifier, and real-time integration.
+user-invocable: false
 ---
 
 # Adverse Selection Classifier Skill

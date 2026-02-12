@@ -50,7 +50,15 @@
       "mcp__serena__get_current_config",
       "Bash(git stash:*)",
       "Bash(xargs:*)",
-      "Bash(./target/release/market_maker:*)"
+      "Bash(./target/release/market_maker:*)",
+      "WebFetch(domain:resources.anthropic.com)",
+      "WebFetch(domain:websearchapi.ai)",
+      "WebFetch(domain:leehanchung.github.io)",
+      "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make log --oneline -30)",
+      "Bash(git -C /mnt/c/Users/17808/Desktop/hyper_make diff --stat HEAD~5)",
+      "Bash(while read f)",
+      "Bash(do head -5 \"$f\")",
+      "Bash(done)"
     ]
   }
 }
