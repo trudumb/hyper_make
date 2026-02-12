@@ -11,7 +11,7 @@ use super::super::{
     adverse_selection::TradeObservation as MicroTradeObs,
     belief::BeliefUpdate,
     environment::Observation,
-    estimator::HmmObservation,
+    estimator::{HmmObservation, MarketEstimator},
     fills,
     infra::{BinancePriceUpdate, BinanceTradeUpdate, BinanceUpdate},
     messages, tracking::ws_order_state::WsFillEvent,
@@ -279,7 +279,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let as_realized_bps = as_realized * 10_000.0;
                 let fill_distance_bps = ((pending.fill_price - pending.mid_at_fill).abs() / pending.mid_at_fill) * 10_000.0;
                 let fill_pnl = -as_realized; // Negative AS = profit
-                let predicted_as_bps_val = self.tier1.pre_fill_classifier.cached_toxicity() * 10_000.0;
+                // Use actual AS estimate (bps) from the estimator, not toxicity probability × 10,000
+                let predicted_as_bps_val = self.estimator.total_as_bps();
 
                 let outcome = FillOutcome {
                     was_informed: was_adverse,
@@ -780,7 +781,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     const MAKER_FEE_BPS: f64 = 1.5;
                     let depth_bps = depth_from_mid * 10_000.0;
                     let as_realized_bps = as_realized * 10_000.0;
-                    let predicted_as_bps = predicted_as_prob * 10_000.0;
+                    // Use the actual AS estimate from the parameter estimator (in bps),
+                    // NOT the Bayesian adverse probability × 10,000 which was a category
+                    // mismatch (probability 0.15 → 1500 bps instead of ~0-5 bps).
+                    let predicted_as_bps = self.estimator.total_as_bps();
                     let snap = EdgeSnapshot {
                         timestamp_ns: fill.time * 1_000_000, // ms to ns
                         predicted_spread_bps: depth_bps,

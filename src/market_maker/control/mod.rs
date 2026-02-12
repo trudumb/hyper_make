@@ -159,6 +159,9 @@ pub struct StochasticController {
 
     /// Previous action taken (for TD learning)
     prev_action_taken: Option<state::ActionTaken>,
+
+    /// Cycle when last emergency pull was triggered (for cooldown)
+    last_emergency_pull_cycle: usize,
 }
 
 impl Default for StochasticController {
@@ -181,6 +184,7 @@ impl StochasticController {
             wait_cycles: 0,
             prev_state: None,
             prev_action_taken: None,
+            last_emergency_pull_cycle: 0,
             config,
         }
     }
@@ -532,7 +536,7 @@ impl StochasticController {
     ///
     /// Conservative defaults: when cold or uncertain, returns neutral
     /// (size 1.0, spread 1.0, no emergency).
-    pub fn risk_assessment(&self) -> RiskAssessment {
+    pub fn risk_assessment(&mut self) -> RiskAssessment {
         // Cold start: not yet had a single act() cycle -- return safe defaults
         if self.cycle_count == 0 {
             return RiskAssessment::default();
@@ -555,12 +559,26 @@ impl StochasticController {
         //   spread_mult = 1.0 + 2.0 * cp_prob^2    (clamped to [1.0, 3.0])
         let spread_mult = (1.0 + 2.0 * cp_prob * cp_prob).clamp(1.0, 3.0);
 
-        // 3. Emergency pull: extreme changepoint with high confidence
-        let emergency = cp_prob > 0.9;
+        // 3. Emergency pull: extreme changepoint with high confidence.
+        //    Threshold raised from 0.9 to 0.95 — BOCD cp_prob saturates at 1.0
+        //    due to Student-t PDF collapse on edge prediction outliers. At 0.9 this
+        //    was firing on ~1% of cycles (33 times in 11 min).
+        //    Also enforce a 50-cycle cooldown to prevent rapid oscillation.
+        const EMERGENCY_THRESHOLD: f64 = 0.95;
+        const EMERGENCY_COOLDOWN_CYCLES: usize = 50;
+        let cycles_since_last = self.cycle_count.saturating_sub(self.last_emergency_pull_cycle);
+        let emergency = cp_prob > EMERGENCY_THRESHOLD
+            && cycles_since_last >= EMERGENCY_COOLDOWN_CYCLES;
+
+        if emergency {
+            self.last_emergency_pull_cycle = self.cycle_count;
+        }
 
         // 4. Build reason string
         let reason = if emergency {
             format!("extreme_changepoint_{cp_prob:.2}")
+        } else if cp_prob > EMERGENCY_THRESHOLD && cycles_since_last < EMERGENCY_COOLDOWN_CYCLES {
+            format!("changepoint_{cp_prob:.2}_cooldown_{cycles_since_last}")
         } else if cp_prob > 0.5 {
             format!("elevated_changepoint_{cp_prob:.2}")
         } else if self.learning_trust < 0.5 {
