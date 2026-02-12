@@ -55,3 +55,26 @@ Compound effect: predicted_edge = 30 - 0 - 1.5 = 28.5 bps vs realized ~0.7 bps =
 - hybrid_ev: 9 tests
 - quote_gate: 42 tests
 - All pass after changes
+
+## Self-Consistent Gamma + Edge at Actual Spread (2026-02-11)
+
+### Phase 1: solve_min_gamma()
+- `glft.rs`: Binary search for min gamma where `half_spread(gamma) >= target_floor`
+- Wired in `effective_gamma()` after RL multiplier, before final clamp
+- **Key limitation**: GLFT half-spread has a MAXIMUM w.r.t. gamma when sigma is tiny.
+  With sigma=0.0001, vol_comp is ~0, and GLFT term `(1/gamma)*ln(1+gamma/kappa)` is bounded.
+  At kappa=5000: max achievable spread ~3.5 bps. Floor of 5 bps is UNREACHABLE via gamma alone.
+  `solve_min_gamma` returns `hi=100.0` in these cases (clamped by gamma_max).
+- **Test fixture lesson**: `test_market_params()` must set `sigma_effective` = `sigma`.
+  Default `sigma_effective=0.0001` causes self-consistent gamma to hit gamma_max.
+  Set `min_spread_floor=0.00001` in test strategies to isolate from the gamma floor.
+
+### Phase 2: actual_quoted_spread_bps
+- `types.rs`: New `Option<f64>` field on `MarketState`
+- `ensemble.rs`: `GLFTEdgeModel::predict_edge()` uses `actual_quoted_spread_bps/2` when available
+- `mod.rs`: Wired from `params.market_spread_bps` in `build_market_state()`
+- Fixes: edge prediction at theoretical 2.87 bps (always negative) vs actual 7.42 bps (positive)
+
+### Serena Tool Reliability Note
+Serena `replace_content` sometimes reports OK but edits don't persist on disk (WSL2 filesystem).
+Always verify with `grep` after Serena edits. Prefer Claude's Edit tool for reliability.

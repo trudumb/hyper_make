@@ -524,6 +524,59 @@ impl StochasticController {
         self.learning_trust
     }
 
+    /// Compute a continuous risk assessment overlay.
+    ///
+    /// Returns multipliers for size and spread instead of making binary
+    /// Quote/NoQuote decisions. The ensemble owns the quoting decision;
+    /// this method provides risk-informed adjustments.
+    ///
+    /// Conservative defaults: when cold or uncertain, returns neutral
+    /// (size 1.0, spread 1.0, no emergency).
+    pub fn risk_assessment(&self) -> RiskAssessment {
+        // Cold start: not yet had a single act() cycle -- return safe defaults
+        if self.cycle_count == 0 {
+            return RiskAssessment::default();
+        }
+
+        // 1. Size from trust score: lower trust -> smaller size
+        //    Trust is already in [0, 1] from assess_learning_trust()
+        let size_mult = self.learning_trust.clamp(0.1, 1.0);
+
+        // 2. Spread from changepoint probability (last 5 observations)
+        let cp_prob = if self.changepoint.is_warmed_up() {
+            self.changepoint.changepoint_probability(5)
+        } else {
+            // Not warmed up yet -- assume no changepoint (safe default)
+            0.0
+        };
+
+        // Linear interpolation: cp_prob 0.0 -> 1.0x, cp_prob 0.5 -> 1.5x, cp_prob 1.0 -> 3.0x
+        // Using quadratic ramp for stronger response at high probabilities:
+        //   spread_mult = 1.0 + 2.0 * cp_prob^2    (clamped to [1.0, 3.0])
+        let spread_mult = (1.0 + 2.0 * cp_prob * cp_prob).clamp(1.0, 3.0);
+
+        // 3. Emergency pull: extreme changepoint with high confidence
+        let emergency = cp_prob > 0.9;
+
+        // 4. Build reason string
+        let reason = if emergency {
+            format!("extreme_changepoint_{cp_prob:.2}")
+        } else if cp_prob > 0.5 {
+            format!("elevated_changepoint_{cp_prob:.2}")
+        } else if self.learning_trust < 0.5 {
+            format!("low_trust_{:.2}", self.learning_trust)
+        } else {
+            "normal".to_string()
+        };
+
+        RiskAssessment {
+            size_multiplier: size_mult,
+            spread_multiplier: spread_mult,
+            emergency_pull: emergency,
+            reason,
+        }
+    }
+
     /// Get changepoint summary.
     pub fn changepoint_summary(&self) -> changepoint::ChangepointSummary {
         self.changepoint.summary()
@@ -711,6 +764,34 @@ pub struct ControllerResult {
     pub overrode_myopic: bool,
     /// Reason for override (if any)
     pub override_reason: Option<String>,
+}
+
+/// Risk assessment from the stochastic controller.
+///
+/// Used as a continuous overlay on the ensemble's quote decision.
+/// The controller provides risk multipliers rather than making
+/// binary Quote/NoQuote decisions -- that is the ensemble's job.
+#[derive(Debug, Clone)]
+pub struct RiskAssessment {
+    /// Size multiplier [0.1, 1.0]. Reduce when trust is low or changepoint detected.
+    pub size_multiplier: f64,
+    /// Spread multiplier [1.0, 3.0]. Widen when risk is elevated.
+    pub spread_multiplier: f64,
+    /// Emergency pull -- should all quotes be cancelled immediately.
+    pub emergency_pull: bool,
+    /// Reason for current assessment (for logging).
+    pub reason: String,
+}
+
+impl Default for RiskAssessment {
+    fn default() -> Self {
+        Self {
+            size_multiplier: 1.0,
+            spread_multiplier: 1.0,
+            emergency_pull: false,
+            reason: "normal".to_string(),
+        }
+    }
 }
 
 impl StochasticController {

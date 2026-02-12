@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use tracing::debug;
 
 use crate::market_maker::checkpoint::types::{QTableEntry, RLCheckpoint};
+use super::baseline_tracker::BaselineTracker;
 
 // ============================================================================
 // MDP State Space
@@ -1394,6 +1395,11 @@ pub struct QLearningAgent {
     /// Used by `Reward::compute()` to correctly compute the inventory change penalty
     /// instead of approximating prev_inventory_risk with the current value.
     pending_inventory_risks: VecDeque<f64>,
+    /// EWMA baseline tracker for counterfactual reward centering.
+    /// Subtracts constant fee drag (~-1.5 bps) so Q-values differentiate actions.
+    /// Will be wired into `update_q_value` to center rewards around the running mean.
+    #[allow(dead_code)]
+    baseline: BaselineTracker,
 }
 
 impl QLearningAgent {
@@ -1408,6 +1414,7 @@ impl QLearningAgent {
             recent_rewards: VecDeque::with_capacity(1000),
             pending_state_actions: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
             pending_inventory_risks: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
+            baseline: BaselineTracker::default(),
         }
     }
 
@@ -1422,6 +1429,7 @@ impl QLearningAgent {
             recent_rewards: VecDeque::with_capacity(1000),
             pending_state_actions: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
             pending_inventory_risks: VecDeque::with_capacity(STATE_ACTION_QUEUE_CAPACITY),
+            baseline: BaselineTracker::default(),
         }
     }
 

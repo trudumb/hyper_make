@@ -176,6 +176,41 @@ impl CalibrationGate {
     }
 }
 
+// === Phase 6: Bootstrap Warmup via Graduated Uncertainty ===
+//
+// With self-consistent gamma (Phase 1) and graduated gating (Phase 3),
+// warmup is handled naturally. The only bootstrap-specific behavior:
+// quote slightly tighter during warmup to attract fills for calibration,
+// with small size to limit learning cost.
+
+/// Spread discount during warmup to attract fills.
+///
+/// Returns a multiplier [0.85, 1.0] applied to gamma (lower gamma -> tighter spreads).
+/// After 200 fills, the discount vanishes and spreads are fully model-driven.
+pub fn warmup_spread_discount(fill_count: usize) -> f64 {
+    if fill_count < 50 {
+        0.85 // 15% tighter to attract fills quickly
+    } else if fill_count < 200 {
+        0.95 // 5% tighter, still learning
+    } else {
+        1.0 // Fully calibrated
+    }
+}
+
+/// Size multiplier during warmup to limit learning cost.
+///
+/// Returns a multiplier [0.3, 1.0] applied to target_liquidity.
+/// Small size while learning prevents large losses from miscalibrated models.
+pub fn warmup_size_multiplier(fill_count: usize) -> f64 {
+    if fill_count < 50 {
+        0.3 // Small size while learning AS/kappa
+    } else if fill_count < 200 {
+        0.7 // Medium size, growing confidence
+    } else {
+        1.0 // Full size
+    }
+}
+
 /// Result of loading and assessing a prior checkpoint.
 #[allow(dead_code)]
 pub enum PriorStatus {
@@ -314,5 +349,37 @@ mod tests {
         let readiness = gate.assess(&bundle);
         // Short duration prevents Ready, but 5/5 estimators + duration -> Marginal not Ready
         assert_ne!(readiness.verdict, PriorVerdict::Ready);
+    }
+
+    #[test]
+    fn test_warmup_spread_discount() {
+        // Early warmup: 15% tighter to attract fills
+        assert!((warmup_spread_discount(0) - 0.85).abs() < 0.001);
+        assert!((warmup_spread_discount(25) - 0.85).abs() < 0.001);
+        assert!((warmup_spread_discount(49) - 0.85).abs() < 0.001);
+
+        // Mid warmup: 5% tighter
+        assert!((warmup_spread_discount(50) - 0.95).abs() < 0.001);
+        assert!((warmup_spread_discount(100) - 0.95).abs() < 0.001);
+        assert!((warmup_spread_discount(199) - 0.95).abs() < 0.001);
+
+        // Fully calibrated
+        assert!((warmup_spread_discount(200) - 1.0).abs() < 0.001);
+        assert!((warmup_spread_discount(1000) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_warmup_size_multiplier() {
+        // Early warmup: small size
+        assert!((warmup_size_multiplier(0) - 0.3).abs() < 0.001);
+        assert!((warmup_size_multiplier(49) - 0.3).abs() < 0.001);
+
+        // Mid warmup: medium size
+        assert!((warmup_size_multiplier(50) - 0.7).abs() < 0.001);
+        assert!((warmup_size_multiplier(199) - 0.7).abs() < 0.001);
+
+        // Fully calibrated: full size
+        assert!((warmup_size_multiplier(200) - 1.0).abs() < 0.001);
+        assert!((warmup_size_multiplier(500) - 1.0).abs() < 0.001);
     }
 }

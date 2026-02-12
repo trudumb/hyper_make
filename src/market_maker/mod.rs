@@ -264,14 +264,9 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     last_checkpoint_save: std::time::Instant,
 
     // === RL Agent Control ===
-    /// Whether RL agent controls quoting actions (vs observe-only)
-    pub(crate) rl_enabled: bool,
-    /// Minimum real fills before RL controls actions
-    rl_min_real_fills: usize,
-    /// Auto-disable RL if mean reward < threshold after this many fills
-    rl_auto_disable_fills: usize,
-    /// Threshold for RL auto-disable (default: -1.5 bps, matching maker fee)
-    rl_auto_disable_threshold_bps: f64,
+    // Phase 4: rl_enabled, rl_min_real_fills, rl_auto_disable_fills, rl_auto_disable_threshold_bps
+    // REMOVED — RL now flows through ensemble as RLEdgeModel, weighted by IR.
+    // No separate enable/disable; worst case = 5% ensemble weight (harmless).
 
     // === RL Hot-Reload ===
     /// Watch channel receiver for Q-table hot-reload from an offline trainer.
@@ -292,6 +287,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Live analytics bundle (Sharpe, signal attribution, persistence).
     /// Enabled by default for both paper and live environments.
     pub live_analytics: analytics::live::LiveAnalytics,
+
+    // === Phase 5: Quote Outcome Tracking ===
+    /// Tracks outcomes of all quotes (filled AND unfilled) for unbiased edge estimation.
+    /// Enables learning from expired quotes and computing optimal spread = argmax(edge × fill_rate).
+    quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -443,11 +443,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
-            // RL agent control (enabled by default, gated by min_real_fills)
-            rl_enabled: true,
-            rl_min_real_fills: 20,
-            rl_auto_disable_fills: 100,
-            rl_auto_disable_threshold_bps: -1.5,
+            // Phase 4: RL agent control fields removed (now ensemble member)
             // RL hot-reload (disabled by default, enabled via with_rl_reload)
             q_table_reload_rx: None,
             q_table_reload_weight: 0.3,
@@ -465,6 +461,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             live_analytics: analytics::live::LiveAnalytics::new(
                 Some(std::path::PathBuf::from("data/analytics")),
             ),
+            // Phase 5: Quote outcome tracking for unbiased edge estimation
+            quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
         }
     }
 
@@ -617,16 +615,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
     }
 
-    /// Enable or disable RL agent control of quoting actions (builder).
-    pub fn with_rl_enabled(mut self, enabled: bool) -> Self {
-        self.rl_enabled = enabled;
-        self
-    }
-
-    /// Enable or disable RL agent control of quoting actions (setter).
-    pub fn set_rl_enabled(&mut self, enabled: bool) {
-        self.rl_enabled = enabled;
-    }
+    // Phase 4: with_rl_enabled / set_rl_enabled REMOVED.
+    // RL now flows through ensemble as RLEdgeModel, weighted by IR.
 
     /// Disable Binance-dependent signals (lead-lag, cross-venue).
     /// Call when no Binance feed is available for the asset to prevent

@@ -797,6 +797,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // === Live Analytics: Record fill for Sharpe/attribution tracking ===
                     let fill_pnl_bps = snap.realized_edge_bps;
                     self.live_analytics.record_fill(fill_pnl_bps, Some(&snap));
+
+                    // === Phase 5: Resolve pending quote as filled ===
+                    // Match this fill against pending quotes in the outcome tracker.
+                    // This enables unbiased edge estimation (fills + non-fills).
+                    let _ = self.quote_outcome_tracker.on_fill(is_buy, snap.realized_edge_bps);
                 }
 
                 // === V2 INTEGRATION: BOCPD Kappa Relationship Update ===

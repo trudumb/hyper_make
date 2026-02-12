@@ -224,6 +224,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .calibration_controller
             .update_calibration_status(as_fills_measured, kappa_confidence);
 
+        // === Phase 5: QUOTE OUTCOME TRACKING ===
+        // Update mid price and expire old pending quotes each cycle.
+        // This enables unbiased edge estimation from both filled and unfilled quotes.
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.quote_outcome_tracker.update_mid(self.latest_mid);
+            self.quote_outcome_tracker.expire_old_quotes(now_ms);
+        }
+
         // === CENTRALIZED BELIEF SNAPSHOT (Phase 4) ===
         // Take a point-in-time snapshot of all beliefs for use throughout this quote cycle.
         // This replaces scattered reads from beliefs_builder, regime_hmm, and changepoint.
@@ -284,6 +296,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
             // Log detailed calibration metrics for diagnostics
             self.learning.log_calibration_report();
+
+            // Phase 5: Log quote outcome stats for unbiased edge estimation
+            let outcome_stats = self.quote_outcome_tracker.outcome_stats();
+            if outcome_stats.n_total > 0 {
+                info!(
+                    target: "layer2::calibration",
+                    n_total = outcome_stats.n_total,
+                    n_filled = outcome_stats.n_filled,
+                    fill_rate = %format!("{:.2}%", outcome_stats.fill_rate * 100.0),
+                    mean_edge_given_fill = %format!("{:.2}", outcome_stats.mean_edge_given_fill),
+                    expected_edge = %format!("{:.2}", outcome_stats.expected_edge),
+                    pending = self.quote_outcome_tracker.pending_count(),
+                    "[Phase5] Quote outcome tracker stats"
+                );
+            }
         }
 
         // Phase 3: Check recovery state and handle IOC recovery if needed
@@ -549,6 +576,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             },
         };
         let mut market_params = ParameterAggregator::build(&sources);
+
+        // === Phase 6: WARMUP GRADUATED UNCERTAINTY ===
+        // During warmup (few fills), quote tighter to attract fills and limit size.
+        // Warmup discount reduces gamma → tighter GLFT spreads (more fills for learning).
+        // Size multiplier limits loss from miscalibrated models during learning.
+        let warmup_size_mult = {
+            let fill_count = self.tier1.adverse_selection.fills_measured();
+            let warmup_gamma_discount = crate::market_maker::calibration::gate::warmup_spread_discount(fill_count);
+            let warmup_sz = crate::market_maker::calibration::gate::warmup_size_multiplier(fill_count);
+            if warmup_gamma_discount < 1.0 || warmup_sz < 1.0 {
+                market_params.hjb_gamma_multiplier *= warmup_gamma_discount;
+                debug!(
+                    fill_count,
+                    gamma_discount = %format!("{:.2}", warmup_gamma_discount),
+                    size_mult = %format!("{:.2}", warmup_sz),
+                    "Warmup graduated uncertainty active"
+                );
+            }
+            warmup_sz
+        };
 
         // === V2 INTEGRATION: BOCPD Kappa Relationship Tracking ===
         // Use BOCPD to detect when feature→κ relationships change.
@@ -930,6 +977,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === CONTROLLER RISK OVERLAY (Phase 4: unified pipeline) ===
+        // Risk assessment replaces binary Quote/NoQuote with continuous multipliers.
+        // Called early so spread_multiplier and size can be adjusted.
+        let risk_overlay = self.stochastic.controller.risk_assessment();
+        if risk_overlay.emergency_pull {
+            info!(
+                reason = %risk_overlay.reason,
+                "Risk overlay: emergency pull — cancelling all quotes"
+            );
+            return Ok(());
+        }
+
         // Get spread multiplier from circuit breaker if applicable
         let mut spread_multiplier = match breaker_action {
             Some(CircuitBreakerAction::WidenSpreads { multiplier }) => multiplier,
@@ -1020,6 +1079,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 mean_gross_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_gross_edge()),
                 fills = self.tier2.edge_tracker.edge_count(),
                 "Defensive edge multiplier: supplementary fill-based defense"
+            );
+        }
+
+        // === CONTROLLER RISK OVERLAY: Widen based on changepoint/trust assessment ===
+        if risk_overlay.spread_multiplier > 1.01 {
+            spread_multiplier *= risk_overlay.spread_multiplier;
+            debug!(
+                risk_spread_mult = %format!("{:.2}", risk_overlay.spread_multiplier),
+                risk_reason = %risk_overlay.reason,
+                "Controller risk overlay: widening spreads"
             );
         }
 
@@ -1203,17 +1272,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             (MIN_ORDER_NOTIONAL / market_params.microprice) + truncation_buffer;
 
         // Use derived liquidity as default, cap with user config
+        // Risk overlay size_multiplier scales down when trust is low or changepoint detected.
+        // Warmup size_multiplier limits position size while models are learning.
+        let risk_size_mult = risk_overlay.size_multiplier;
+        let combined_size_mult = risk_size_mult * warmup_size_mult;
         let new_effective_liquidity = if market_params.derived_target_liquidity > 0.0 {
             // GLFT-derived is available: use it, capped by user config
-            market_params
+            (market_params
                 .derived_target_liquidity
+                * combined_size_mult)  // Scale by controller trust + warmup
                 .min(self.config.target_liquidity) // User cap
                 .max(min_viable_liquidity) // Exchange minimum
                 .min(self.effective_max_position) // Position limit
         } else {
             // Fallback: use config (warmup or zero account_value)
-            self.config
+            (self.config
                 .target_liquidity
+                * combined_size_mult)  // Scale by controller trust + warmup
                 .max(min_viable_liquidity)
                 .min(self.effective_max_position)
         };
@@ -1562,38 +1637,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 "[Trace] L1->L2->L3 pipeline"
             );
 
-            // Handle controller decision
-            use crate::market_maker::control::Action;
-            match action {
-                Action::NoQuote { reason } => {
-                    info!(reason = ?reason, "Layer 3: not quoting");
-                    return Ok(());
-                }
-                Action::WaitToLearn {
-                    expected_info_gain,
-                    suggested_wait_cycles,
-                } => {
-                    debug!(
-                        info_gain = %format!("{:.4}", expected_info_gain),
-                        wait_cycles = suggested_wait_cycles,
-                        "Layer 3: WaitToLearn signal (proceeding with quoting — learning requires fills)"
-                    );
-                    // Continue with normal quoting: you can't learn without fills,
-                    // and blocking quotes creates a cold-start deadlock.
-                }
-                Action::DumpInventory { urgency, .. } => {
-                    debug!(urgency = %format!("{:.2}", urgency), "Layer 3: dump inventory mode");
-                    // Continue with normal quoting but the strategy will handle urgency
-                }
-                Action::BuildInventory { .. } => {
-                    debug!("Layer 3: build inventory mode");
-                    // Continue with normal quoting
-                }
-                Action::Quote { expected_value, .. } => {
-                    info!(expected_value = %format!("{:.4}", expected_value), "Layer 3: normal quote");
-                    // Continue with normal quoting
-                }
-            }
+            // Phase 4: Controller action logged for diagnostics only.
+            // Quoting decision flows from ensemble, not controller.
+            // Emergency pull is handled earlier via risk_assessment().
+            debug!(
+                action = %format!("{action:?}").chars().take(60).collect::<String>(),
+                risk_size = %format!("{:.2}", risk_overlay.size_multiplier),
+                risk_spread = %format!("{:.2}", risk_overlay.spread_multiplier),
+                risk_reason = %risk_overlay.reason,
+                "Controller action (diagnostic) + risk overlay"
+            );
         }
 
         // === CALIBRATED EDGE SIGNAL: Track whether flow_imbalance predicts price direction ===
@@ -1744,50 +1797,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         market_params.rl_is_exploration = rl_recommendation.is_exploration;
         market_params.rl_expected_q = rl_recommendation.expected_q;
 
-        // === RL Action Application (when enabled) ===
-        if self.rl_enabled {
-            let total_rl_updates = self.stochastic.rl_agent.total_updates();
-            let mean_reward = self.stochastic.rl_agent.mean_recent_reward();
-
-            let should_apply = total_rl_updates >= self.rl_min_real_fills as u64
-                && (total_rl_updates < self.rl_auto_disable_fills as u64
-                    || mean_reward >= self.rl_auto_disable_threshold_bps);
-
-            if should_apply {
-                // Apply spread delta with safety floor: cannot go negative
-                market_params.rl_spread_delta_bps = rl_recommendation
-                    .spread_delta_bps
-                    .max(-market_params.market_spread_bps + 2.0);
-
-                // Apply skew directly (already stored above, but re-apply clamped)
-                market_params.rl_bid_skew_bps = rl_recommendation.bid_skew_bps;
-                market_params.rl_ask_skew_bps = rl_recommendation.ask_skew_bps;
-
-                market_params.rl_action_applied = true;
-
-                debug!(
-                    spread_delta = %format!("{:.2}", rl_recommendation.spread_delta_bps),
-                    bid_skew = %format!("{:.2}", rl_recommendation.bid_skew_bps),
-                    ask_skew = %format!("{:.2}", rl_recommendation.ask_skew_bps),
-                    confidence = %format!("{:.3}", rl_recommendation.confidence),
-                    total_updates = total_rl_updates,
-                    "RL action APPLIED to market params"
-                );
-            } else if total_rl_updates < self.rl_min_real_fills as u64 {
-                debug!(
-                    total_updates = total_rl_updates,
-                    min_required = self.rl_min_real_fills,
-                    "RL observation-only (insufficient fills)"
-                );
-            } else {
-                warn!(
-                    mean_reward = %format!("{:.3}", mean_reward),
-                    threshold = %format!("{:.1}", self.rl_auto_disable_threshold_bps),
-                    total_updates = total_rl_updates,
-                    "RL auto-disabled (mean reward below threshold)"
-                );
-            }
-        }
+        // Phase 4: RL override block removed.
+        // RL influence now flows through ensemble (RLEdgeModel) via IR-weighted prediction.
+        // rl_action_applied stays false — direct RL spread/skew overrides are deprecated.
+        // The rl_ fields above are still populated for logging/monitoring purposes.
 
         // === Phase 8: Competitor Model Inference ===
         // Get competitor summary and populate MarketParams
@@ -2268,6 +2281,44 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 best_ask = ?ask_quotes.first().map(|q| (q.price, q.size)),
                 "Calculated ladder quotes"
             );
+
+            // === Phase 5: REGISTER PENDING QUOTES for outcome tracking ===
+            // Register best bid/ask as pending quotes for fill/expiry resolution.
+            // Only track best level (most likely to fill) to keep overhead minimal.
+            {
+                use crate::market_maker::learning::quote_outcome::{CompactMarketState, PendingQuote};
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mid = self.latest_mid;
+                let compact_state = CompactMarketState {
+                    microprice: market_params.microprice,
+                    sigma: market_params.sigma,
+                    book_imbalance: market_params.book_imbalance,
+                    flow_imbalance: market_params.flow_imbalance,
+                    toxicity_score: market_params.toxicity_score,
+                    kappa: market_params.kappa,
+                };
+                if let Some(best_bid) = bid_quotes.first() {
+                    let half_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
+                    self.quote_outcome_tracker.register_quote(PendingQuote {
+                        timestamp_ms: now_ms,
+                        half_spread_bps,
+                        is_bid: true,
+                        state: compact_state.clone(),
+                    });
+                }
+                if let Some(best_ask) = ask_quotes.first() {
+                    let half_spread_bps = ((best_ask.price - mid) / mid) * 10000.0;
+                    self.quote_outcome_tracker.register_quote(PendingQuote {
+                        timestamp_ms: now_ms,
+                        half_spread_bps,
+                        is_bid: false,
+                        state: compact_state,
+                    });
+                }
+            }
 
             // === RECORD QUOTE DECISION FOR DASHBOARD ===
             // Capture why this specific spread was chosen

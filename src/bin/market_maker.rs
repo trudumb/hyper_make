@@ -2155,11 +2155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // RL is enabled by default; --enable-rl flag is now a no-op (kept for backward compat)
+    // Phase 4: RL now flows through ensemble as RLEdgeModel, weighted by IR.
+    // No separate enable/disable — RL influence is proportional to its track record.
     tracing::info!(
-        rl_enabled = true,
-        min_fills_gate = 20,
-        "RL agent enabled (actions gated until sufficient real fills)"
+        "RL agent integrated into ensemble pipeline (no separate override)"
     );
 
     // === RL Hot-Reload: Watch checkpoint file for offline trainer updates ===

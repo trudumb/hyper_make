@@ -302,6 +302,18 @@ impl ModelEnsemble {
         }
     }
 
+    /// Add a model to the ensemble at runtime.
+    ///
+    /// Rebalances weights equally across all models (including the new one)
+    /// and allocates a fresh score ring buffer for weight adaptation.
+    pub fn add_model(&mut self, model: Box<dyn EdgeModel>) {
+        self.models.push(model);
+        self.model_scores.push(RingBuffer::new(100));
+        // Rebalance weights equally
+        let n = self.models.len();
+        self.weights = vec![1.0 / n as f64; n];
+    }
+
     /// Predict edge using ensemble.
     pub fn predict_edge(&self, state: &MarketState) -> EnsemblePrediction {
         let mut contributions = Vec::with_capacity(self.models.len());

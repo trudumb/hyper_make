@@ -26,6 +26,7 @@
 //! This is online learning with labels from trading outcomes.
 
 pub mod adaptive_ensemble;
+pub mod baseline_tracker;
 pub mod competitor_model;
 pub mod confidence;
 pub mod decision;
@@ -34,9 +35,12 @@ pub mod execution;
 pub mod experience;
 pub mod offline_trainer;
 pub mod rl_agent;
+pub mod quote_outcome;
+pub mod rl_edge_model;
 pub mod types;
 
 // Re-export key types
+pub use baseline_tracker::BaselineTracker;
 pub use adaptive_ensemble::{AdaptiveEnsemble, EnsembleSummary, ModelPerformance};
 pub use confidence::{AggregateConfidence, EdgeBiasSummary, EdgeBiasTracker, ModelConfidenceTracker};
 pub use decision::DecisionEngine;
