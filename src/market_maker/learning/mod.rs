@@ -33,10 +33,8 @@ pub mod decision;
 pub mod ensemble;
 pub mod execution;
 pub mod experience;
-pub mod offline_trainer;
 pub mod rl_agent;
 pub mod quote_outcome;
-pub mod rl_edge_model;
 pub mod spread_bandit;
 pub mod types;
 

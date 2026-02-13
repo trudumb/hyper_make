@@ -271,19 +271,8 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     last_checkpoint_save: std::time::Instant,
 
     // === RL Agent Control ===
-    // Phase 4: rl_enabled, rl_min_real_fills, rl_auto_disable_fills, rl_auto_disable_threshold_bps
-    // REMOVED — RL now flows through ensemble as RLEdgeModel, weighted by IR.
-    // No separate enable/disable; worst case = 5% ensemble weight (harmless).
-
-    // === RL Hot-Reload ===
-    /// Watch channel receiver for Q-table hot-reload from an offline trainer.
-    /// When the trainer writes a new checkpoint, the file watcher sends it here.
-    q_table_reload_rx:
-        Option<tokio::sync::watch::Receiver<Option<checkpoint::types::RLCheckpoint>>>,
-    /// Blend weight for hot-reloaded Q-table (0.0 = ignore, 1.0 = replace).
-    q_table_reload_weight: f64,
-    /// Quote cycle counter for gating periodic RL reload checks.
-    rl_reload_cycle_count: usize,
+    // REMOVED — RL superseded by SpreadBandit (contextual bandit).
+    // RL hot-reload infrastructure removed in feedback-loop cleanup.
 
     // === Experience Logging ===
     /// JSONL logger for RL experience records (SARSA tuples + metadata).
@@ -456,11 +445,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
-            // Phase 4: RL agent control fields removed (now ensemble member)
-            // RL hot-reload (disabled by default, enabled via with_rl_reload)
-            q_table_reload_rx: None,
-            q_table_reload_weight: 0.3,
-            rl_reload_cycle_count: 0,
+            // Phase 4: RL agent control fields removed (now SpreadBandit)
             // Experience logging (disabled by default, enabled via with_experience_logging)
             experience_logger: None,
             experience_session_id: format!(
@@ -591,45 +576,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self
     }
 
-    /// Enable Q-table hot-reload from an offline trainer via a watch channel.
-    ///
-    /// The file watcher task sends new `RLCheckpoint` values through the channel
-    /// whenever the checkpoint file changes. The live RL agent blends the new
-    /// Q-table with its current state using `weight` (0.0 = ignore, 1.0 = replace).
-    pub fn with_rl_reload(
-        mut self,
-        rx: tokio::sync::watch::Receiver<Option<checkpoint::types::RLCheckpoint>>,
-        weight: f64,
-    ) -> Self {
-        self.q_table_reload_rx = Some(rx);
-        self.q_table_reload_weight = weight;
-        info!(weight, "RL Q-table hot-reload enabled");
-        self
-    }
-
-    /// Check for a new Q-table from the hot-reload watch channel.
-    ///
-    /// Called periodically from the quote cycle (every 100 cycles).
-    /// If the watch channel has a new value, loads it as a prior into the RL agent.
-    pub fn check_rl_reload(&mut self) {
-        if let Some(ref mut rx) = self.q_table_reload_rx {
-            if rx.has_changed().unwrap_or(false) {
-                let checkpoint_opt = rx.borrow_and_update().clone();
-                if let Some(ref checkpoint) = checkpoint_opt {
-                    let n_states =
-                        self.load_paper_rl_prior(checkpoint, self.q_table_reload_weight);
-                    info!(
-                        n_states,
-                        weight = self.q_table_reload_weight,
-                        "RL Q-table hot-reloaded"
-                    );
-                }
-            }
-        }
-    }
-
-    // Phase 4: with_rl_enabled / set_rl_enabled REMOVED.
-    // RL now flows through ensemble as RLEdgeModel, weighted by IR.
+    // RL hot-reload and Q-table transfer removed — SpreadBandit is the optimizer now.
 
     /// Disable Binance-dependent signals (lead-lag, cross-venue).
     /// Call when no Binance feed is available for the asset to prevent
@@ -667,21 +614,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self
     }
 
-    /// Load a paper trader's Q-table as a discounted prior for the live RL agent.
-    ///
-    /// Returns the number of states loaded.
-    pub fn load_paper_rl_prior(
-        &mut self,
-        rl_checkpoint: &checkpoint::types::RLCheckpoint,
-        weight: f64,
-    ) -> usize {
-        let mut paper_agent = learning::QLearningAgent::default();
-        paper_agent.restore_from_checkpoint(rl_checkpoint);
-        let paper_q = paper_agent.export_q_table();
-        let n_states = paper_q.len();
-        self.stochastic.rl_agent.import_q_table_as_prior(&paper_q, weight);
-        n_states
-    }
 
     /// Assemble a checkpoint bundle from current state.
     fn assemble_checkpoint_bundle(&self) -> checkpoint::CheckpointBundle {
@@ -725,7 +657,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 model_weights: self.learning.ensemble_weights(),
                 total_updates: self.learning.ensemble_total_updates(),
             },
-            rl_q_table: self.stochastic.rl_agent.to_checkpoint(),
+            quote_outcomes: self.quote_outcome_tracker.to_checkpoint(),
             spread_bandit: self.stochastic.spread_bandit.to_checkpoint(),
             baseline_tracker: checkpoint::BaselineTrackerCheckpoint {
                 ewma_reward: self.stochastic.baseline_tracker.baseline(),
@@ -751,9 +683,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.stochastic.learned_params = bundle.learned_params.clone();
         self.learning
             .restore_from_checkpoint(&bundle.kelly_tracker, &bundle.ensemble_weights);
-        self.stochastic
-            .rl_agent
-            .restore_from_checkpoint(&bundle.rl_q_table);
+        self.quote_outcome_tracker
+            .restore_from_checkpoint(&bundle.quote_outcomes);
         self.stochastic
             .spread_bandit
             .restore_from_checkpoint(&bundle.spread_bandit);
@@ -816,34 +747,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
             return 0;
         }
 
-        // Inject all non-RL, non-kill-switch components via restore_from_bundle.
+        // Inject all components via restore_from_bundle.
         // Create a modified bundle that zeroes out excluded components.
         let mut injection_bundle = prior.clone();
         if config.skip_kill_switch {
             injection_bundle.kill_switch = checkpoint::KillSwitchCheckpoint::default();
         }
 
-        // Restore all standard components.
+        // Restore all standard components (including quote outcomes).
         self.restore_from_bundle(&injection_bundle);
-
-        // RL Q-table injection with configurable blend weight.
-        let rl_states = if config.skip_rl {
-            0
-        } else {
-            self.load_paper_rl_prior(&prior.rl_q_table, config.rl_blend_weight)
-        };
 
         info!(
             asset = %prior.metadata.asset,
             prior_age_s = %format!("{:.0}", age_s),
             session_duration_s = %format!("{:.0}", prior.metadata.session_duration_s),
-            rl_states = rl_states,
-            rl_weight = config.rl_blend_weight,
             skip_kill_switch = config.skip_kill_switch,
             "Prior injected successfully"
         );
 
-        rl_states
+        0 // RL states no longer injected
     }
 }
 

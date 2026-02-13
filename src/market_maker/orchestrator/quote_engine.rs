@@ -235,6 +235,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .unwrap_or(0);
             self.quote_outcome_tracker.update_mid(self.latest_mid);
             self.quote_outcome_tracker.expire_old_quotes(now_ms);
+
+            // No-fill feedback for SpreadBandit: if pending selection is >2s old, treat as no-fill
+            let pending_expired = self.stochastic.spread_bandit.pending()
+                .map(|p| now_ms.saturating_sub(p.timestamp_ms) > 2000)
+                .unwrap_or(false);
+            if pending_expired {
+                let no_fill_reward = self.stochastic.baseline_tracker.counterfactual_reward(0.0);
+                self.stochastic.spread_bandit.update_from_pending(no_fill_reward);
+            }
         }
 
         // === CENTRALIZED BELIEF SNAPSHOT (Phase 4) ===
@@ -276,11 +285,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Mark that we're doing a requote
         self.infra.proactive_rate_tracker.mark_requote();
 
-        // === RL HOT-RELOAD: Check for updated Q-table every 100 cycles ===
-        self.rl_reload_cycle_count += 1;
-        if self.rl_reload_cycle_count.is_multiple_of(100) {
-            self.check_rl_reload();
-        }
+        // AdaptiveEnsemble weight logging moved to learning health block below.
 
         // === LEARNING MODULE: Periodic model health logging ===
         if self.learning.is_enabled() && self.learning.should_log_health() {
@@ -310,6 +315,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     expected_edge = %format!("{:.2}", outcome_stats.expected_edge),
                     pending = self.quote_outcome_tracker.pending_count(),
                     "[Phase5] Quote outcome tracker stats"
+                );
+            }
+
+            // Log AdaptiveEnsemble weight distribution
+            let summary = self.stochastic.ensemble.summary();
+            if summary.total_models > 0 {
+                tracing::info!(
+                    target: "layer2::ensemble",
+                    total = summary.total_models,
+                    active = summary.active_models,
+                    degraded = summary.degraded_models,
+                    best = ?summary.best_model_name,
+                    best_ir = %format!("{:.3}", summary.best_model_ir),
+                    entropy = %format!("{:.3}", summary.weight_entropy),
+                    avg_ir = %format!("{:.3}", summary.average_ir),
+                    predictions = summary.total_predictions,
+                    "AdaptiveEnsemble weights"
                 );
             }
         }

@@ -347,6 +347,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let fill_pnl_bps = resolved_snap.realized_edge_bps;
                 self.live_analytics.record_fill(fill_pnl_bps, Some(&resolved_snap));
 
+                // Update AdaptiveEnsemble with GLFT prediction performance
+                {
+                    let prediction_error = resolved_snap.predicted_edge_bps - resolved_snap.realized_edge_bps;
+                    // IR proxy: realized edge (positive = model captured value)
+                    let ir_proxy = resolved_snap.realized_edge_bps;
+                    // Brier proxy: squared prediction error (lower = better calibration)
+                    let brier_proxy = prediction_error * prediction_error;
+                    self.stochastic.ensemble.update_performance(
+                        "GLFT", ir_proxy, brier_proxy, pending.timestamp_ms,
+                    );
+                }
+
                 tracing::info!(
                     spread_bps = %format!("{:.2}", pending.quoted_spread_bps),
                     markout_as_bps = %format!("{:.2}", markout_as_bps),
@@ -608,8 +620,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let hl_flow = FlowFeatureVec {
                 vpin: self.stochastic.vpin.vpin(),
                 vpin_velocity: self.stochastic.vpin.vpin_velocity(),
-                imbalance_1s: self.tier2.hawkes.flow_imbalance(),
-                imbalance_5s: self.tier2.hawkes.flow_imbalance(), // Best available proxy
+                imbalance_1s: self.stochastic.trade_flow_tracker.imbalance_at_1s(),
+                imbalance_5s: self.stochastic.trade_flow_tracker.imbalance_at_5s(),
                 imbalance_30s: self.stochastic.trade_flow_tracker.imbalance_at_30s(),
                 imbalance_5m: self.stochastic.trade_flow_tracker.imbalance_at_5m(),
                 intensity: self.tier2.hawkes.intensity_ratio(),

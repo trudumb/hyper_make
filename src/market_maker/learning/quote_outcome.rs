@@ -10,6 +10,8 @@
 
 use std::collections::VecDeque;
 
+use crate::market_maker::checkpoint::types::QuoteOutcomeCheckpoint;
+
 /// Compact market state for pending quote tracking (~100 bytes).
 #[derive(Debug, Clone)]
 pub struct CompactMarketState {
@@ -80,15 +82,15 @@ impl QuoteOutcome {
 
 /// Bin for tracking fill rates at different spread levels.
 #[derive(Debug, Clone)]
-struct SpreadBin {
+pub struct SpreadBin {
     /// Lower bound of bin (bps)
-    lo_bps: f64,
+    pub lo_bps: f64,
     /// Upper bound of bin (bps)
-    hi_bps: f64,
+    pub hi_bps: f64,
     /// Number of fills in this bin
-    fills: u64,
+    pub fills: u64,
     /// Total quotes in this bin
-    total: u64,
+    pub total: u64,
 }
 
 impl SpreadBin {
@@ -104,7 +106,7 @@ impl SpreadBin {
 /// Tracks P(fill | spread_bin) empirically.
 #[derive(Debug, Clone)]
 pub struct BinnedFillRate {
-    bins: Vec<SpreadBin>,
+    pub bins: Vec<SpreadBin>,
 }
 
 impl BinnedFillRate {
@@ -339,6 +341,28 @@ impl QuoteOutcomeTracker {
     /// Total outcomes recorded.
     pub fn total_outcomes(&self) -> usize {
         self.outcome_log.len()
+    }
+
+    /// Create a checkpoint of the fill rate bins.
+    pub fn to_checkpoint(&self) -> QuoteOutcomeCheckpoint {
+        QuoteOutcomeCheckpoint {
+            bins: self.fill_rate.bins.iter()
+                .map(|b| (b.lo_bps, b.hi_bps, b.fills, b.total))
+                .collect(),
+        }
+    }
+
+    /// Restore fill rate bins from a checkpoint.
+    pub fn restore_from_checkpoint(&mut self, cp: &QuoteOutcomeCheckpoint) {
+        if cp.bins.len() == self.fill_rate.bins.len() {
+            for (bin, &(lo, hi, fills, total)) in self.fill_rate.bins.iter_mut().zip(cp.bins.iter()) {
+                bin.lo_bps = lo;
+                bin.hi_bps = hi;
+                bin.fills = fills;
+                bin.total = total;
+            }
+        }
+        // If bin count doesn't match (format change), start fresh — safe default
     }
 
     /// Find the optimal spread (bps) that maximizes expected edge for a target fill rate.
@@ -589,5 +613,38 @@ mod tests {
         // Should have evicted 5 oldest as expired
         assert_eq!(tracker.pending_count(), MAX_PENDING_QUOTES);
         assert_eq!(tracker.total_outcomes(), 5);
+    }
+
+    #[test]
+    fn test_checkpoint_roundtrip() {
+        let mut tracker = QuoteOutcomeTracker::new();
+        tracker.update_mid(100.0);
+
+        // Record some data
+        for _ in 0..10 {
+            tracker.register_quote(PendingQuote {
+                timestamp_ms: 1000,
+                half_spread_bps: 3.0,
+                is_bid: true,
+                state: make_state(100.0),
+            });
+        }
+        for _ in 0..3 {
+            tracker.on_fill(true, 1.5);
+        }
+        tracker.expire_old_quotes(100_000);
+
+        // Checkpoint
+        let cp = tracker.to_checkpoint();
+        assert_eq!(cp.bins.len(), 8); // 8 default bins
+
+        // Restore into fresh tracker
+        let mut restored = QuoteOutcomeTracker::new();
+        restored.restore_from_checkpoint(&cp);
+
+        // Verify fill rates match
+        let orig_rate = tracker.fill_rate().fill_rate_at(3.0);
+        let restored_rate = restored.fill_rate().fill_rate_at(3.0);
+        assert_eq!(orig_rate, restored_rate);
     }
 }

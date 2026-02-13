@@ -677,7 +677,12 @@ impl StochasticComponents {
             controller: StochasticController::new(controller_config),
             regime_hmm: RegimeHMM::new(),
             model_calibration: ModelCalibrationOrchestrator::default(),
-            ensemble: AdaptiveEnsemble::default(),
+            ensemble: {
+                let mut ens = AdaptiveEnsemble::default();
+                ens.register_model("GLFT");
+                ens.register_model("SpreadBandit");
+                ens
+            },
             position_ramp,
             performance_gating,
             quote_gate,

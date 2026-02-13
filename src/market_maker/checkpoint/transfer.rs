@@ -18,15 +18,14 @@ pub trait PriorExtract {
 /// Configuration for prior injection.
 #[derive(Debug, Clone)]
 pub struct InjectionConfig {
-    /// RL Q-table blend weight (0.0 = ignore prior, 1.0 = full prior).
-    /// Typical: 0.3 for paper→live transfer.
+    /// Deprecated: RL removed. Kept for config compatibility.
     pub rl_blend_weight: f64,
     /// Maximum age of prior before it's considered stale (seconds).
     /// Priors older than this are rejected.
     pub max_prior_age_s: f64,
     /// If true, reject priors from a different asset.
     pub require_asset_match: bool,
-    /// Skip RL Q-table injection entirely.
+    /// Deprecated: RL removed. Kept for config compatibility.
     pub skip_rl: bool,
     /// Skip kill switch state injection (safety: never inherit kill state from paper).
     pub skip_kill_switch: bool,

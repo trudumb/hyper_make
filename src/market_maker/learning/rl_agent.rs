@@ -17,8 +17,37 @@
 use std::collections::{HashMap, VecDeque};
 use tracing::debug;
 
-use crate::market_maker::checkpoint::types::{QTableEntry, RLCheckpoint};
+use serde::{Deserialize, Serialize};
 use super::baseline_tracker::BaselineTracker;
+
+/// RL agent Q-table entry for checkpoint persistence (deprecated — local to rl_agent).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QTableEntry {
+    pub state_index: usize,
+    pub action_index: usize,
+    pub mu_n: f64,
+    pub kappa_n: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub n: u64,
+}
+
+/// RL agent checkpoint (deprecated — local to rl_agent).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RLCheckpoint {
+    pub q_entries: Vec<QTableEntry>,
+    pub episodes: u64,
+    pub total_reward: f64,
+    pub total_observations: u64,
+    #[serde(default)]
+    pub action_space_version: u32,
+    #[serde(default)]
+    pub use_compact_state: bool,
+    #[serde(default)]
+    pub reward_config_hash: u64,
+    #[serde(default)]
+    pub use_drift_bucket: bool,
+}
 
 // ============================================================================
 // MDP State Space

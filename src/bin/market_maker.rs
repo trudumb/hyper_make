@@ -2129,11 +2129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match serde_json::from_str::<hyperliquid_rust_sdk::market_maker::checkpoint::CheckpointBundle>(&json) {
                     Ok(bundle) => {
                         let config = InjectionConfig::default();
-                        let rl_states = market_maker.inject_prior(&bundle, &config);
+                        let _ = market_maker.inject_prior(&bundle, &config);
                         tracing::info!(
                             path = %candidate.display(),
-                            rl_states_injected = rl_states,
-                            rl_blend_weight = config.rl_blend_weight,
                             "Injected paper prior into live state (full φ→ψ transfer)"
                         );
                         loaded = true;
@@ -2155,42 +2153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Phase 4: RL now flows through ensemble as RLEdgeModel, weighted by IR.
-    // No separate enable/disable — RL influence is proportional to its track record.
-    tracing::info!(
-        "RL agent integrated into ensemble pipeline (no separate override)"
-    );
-
-    // === RL Hot-Reload: Watch checkpoint file for offline trainer updates ===
-    if let Some(ref rl_watch_path) = cli.rl_watch {
-        let (rl_watch_tx, rl_watch_rx) = tokio::sync::watch::channel(None);
-        market_maker = market_maker.with_rl_reload(rl_watch_rx, 0.3);
-
-        let watch_path = std::path::PathBuf::from(rl_watch_path);
-        tokio::spawn(async move {
-            let mut last_modified = None;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                if let Ok(metadata) = tokio::fs::metadata(&watch_path).await {
-                    if let Ok(modified) = metadata.modified() {
-                        if last_modified.as_ref() != Some(&modified) {
-                            last_modified = Some(modified);
-                            if let Ok(contents) = tokio::fs::read_to_string(&watch_path).await {
-                                if let Ok(checkpoint) = serde_json::from_str::<
-                                    hyperliquid_rust_sdk::market_maker::checkpoint::types::RLCheckpoint,
-                                >(&contents) {
-                                    let _ = rl_watch_tx.send(Some(checkpoint));
-                                    tracing::info!(
-                                        path = %watch_path.display(),
-                                        "RL checkpoint file changed, sent for hot-reload"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+    // RL agent deprecated — SpreadBandit handles spread optimization now.
+    if cli.rl_watch.is_some() {
+        tracing::warn!("--rl-watch is deprecated (RL replaced by SpreadBandit), ignoring");
     }
 
     // Sync open orders

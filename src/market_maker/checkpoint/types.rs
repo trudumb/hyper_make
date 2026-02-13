@@ -41,6 +41,16 @@ pub struct PriorReadiness {
     pub estimators_ready: u8,
 }
 
+/// Quote outcome tracker checkpoint for fill rate persistence.
+///
+/// Persists the BinnedFillRate empirical P(fill|spread) so the
+/// tracker doesn't restart from zero on restart.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuoteOutcomeCheckpoint {
+    /// Binned fill rate data: Vec of (lo_bps, hi_bps, fills, total) per bin
+    pub bins: Vec<(f64, f64, u64, u64)>,
+}
+
 /// Complete checkpoint bundle containing all model state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBundle {
@@ -73,15 +83,15 @@ pub struct CheckpointBundle {
     /// Model ensemble weights for prediction persistence
     #[serde(default)]
     pub ensemble_weights: EnsembleWeightsCheckpoint,
-    /// RL agent Q-table for policy persistence (DEPRECATED — kept for backward compat)
-    #[serde(default)]
-    pub rl_q_table: RLCheckpoint,
     /// Contextual bandit spread optimizer state (replaces RL MDP)
     #[serde(default)]
     pub spread_bandit: SpreadBanditCheckpoint,
     /// Baseline tracker EWMA for counterfactual reward centering
     #[serde(default)]
     pub baseline_tracker: BaselineTrackerCheckpoint,
+    /// Quote outcome tracker fill rate bins
+    #[serde(default)]
+    pub quote_outcomes: QuoteOutcomeCheckpoint,
     /// Kill switch state for persistence across restarts
     #[serde(default)]
     pub kill_switch: KillSwitchCheckpoint,
@@ -456,61 +466,6 @@ impl Default for EnsembleWeightsCheckpoint {
 }
 
 
-/// RL agent Q-table entry for checkpoint persistence.
-///
-/// Each entry represents a single (state, action) posterior from the
-/// Bayesian Q-learning agent's Normal-Gamma conjugate model.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct QTableEntry {
-    /// State index in the MDP discretization
-    pub state_index: usize,
-    /// Action index within that state
-    pub action_index: usize,
-    /// Posterior mean
-    pub mu_n: f64,
-    /// Posterior precision scale
-    pub kappa_n: f64,
-    /// Gamma shape parameter
-    pub alpha: f64,
-    /// Gamma rate parameter
-    pub beta: f64,
-    /// Number of observations
-    pub n: u64,
-}
-
-/// RL agent checkpoint for Q-table persistence.
-///
-/// Captures the Bayesian Q-table so the RL agent doesn't restart
-/// from priors after a restart. Only non-default entries are stored
-/// to keep the checkpoint compact.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RLCheckpoint {
-    /// Q-table entries: only (state, action) pairs that have been updated
-    pub q_entries: Vec<QTableEntry>,
-    /// Total episodes completed
-    pub episodes: u64,
-    /// Total reward accumulated
-    pub total_reward: f64,
-    /// Total state-action observations
-    pub total_observations: u64,
-    /// Action space version for compatibility checking.
-    /// 0 = legacy (pre-versioning), 1 = BPS-delta (MDPAction), 2 = parameter (ParameterAction).
-    #[serde(default)]
-    pub action_space_version: u32,
-    /// Whether this checkpoint used compact 3D state space.
-    #[serde(default)]
-    pub use_compact_state: bool,
-    /// Hash of the RewardConfig used when this checkpoint was created.
-    /// Used to detect incompatible reward config changes on restore.
-    /// 0 = legacy checkpoint (pre-hash), skip validation.
-    #[serde(default)]
-    pub reward_config_hash: u64,
-    /// Whether this checkpoint used the drift bucket dimension in state space.
-    /// When false, state indices are from the 675-state space; when true, 2025-state.
-    #[serde(default)]
-    pub use_drift_bucket: bool,
-}
-
 /// Baseline tracker checkpoint for counterfactual reward centering.
 ///
 /// Persists the EWMA baseline so the bandit doesn't lose its fee-drag estimate
@@ -624,35 +579,7 @@ mod tests {
                 model_weights: vec![0.6, 0.25, 0.15],
                 total_updates: 100,
             },
-            rl_q_table: RLCheckpoint {
-                q_entries: vec![
-                    QTableEntry {
-                        state_index: 0,
-                        action_index: 2,
-                        mu_n: 1.5,
-                        kappa_n: 5.0,
-                        alpha: 3.0,
-                        beta: 2.0,
-                        n: 10,
-                    },
-                    QTableEntry {
-                        state_index: 1,
-                        action_index: 0,
-                        mu_n: -0.3,
-                        kappa_n: 2.0,
-                        alpha: 1.5,
-                        beta: 1.0,
-                        n: 5,
-                    },
-                ],
-                episodes: 50,
-                total_reward: 12.5,
-                total_observations: 15,
-                action_space_version: 1,
-                use_compact_state: false,
-                reward_config_hash: 0,
-                use_drift_bucket: false,
-            },
+            quote_outcomes: QuoteOutcomeCheckpoint { bins: vec![(0.0, 2.0, 5, 20), (2.0, 4.0, 10, 30)] },
             spread_bandit: SpreadBanditCheckpoint::default(),
             baseline_tracker: BaselineTrackerCheckpoint {
                 ewma_reward: -1.5,
@@ -692,15 +619,9 @@ mod tests {
         // Ensemble weights round-trip
         assert_eq!(restored.ensemble_weights.model_weights, vec![0.6, 0.25, 0.15]);
         assert_eq!(restored.ensemble_weights.total_updates, 100);
-        // RL checkpoint round-trip
-        assert_eq!(restored.rl_q_table.episodes, 50);
-        assert_eq!(restored.rl_q_table.total_reward, 12.5);
-        assert_eq!(restored.rl_q_table.total_observations, 15);
-        assert_eq!(restored.rl_q_table.q_entries.len(), 2);
-        assert_eq!(restored.rl_q_table.q_entries[0].state_index, 0);
-        assert_eq!(restored.rl_q_table.q_entries[0].action_index, 2);
-        assert_eq!(restored.rl_q_table.q_entries[0].mu_n, 1.5);
-        assert_eq!(restored.rl_q_table.q_entries[0].n, 10);
+        // Quote outcomes round-trip
+        assert_eq!(restored.quote_outcomes.bins.len(), 2);
+        assert_eq!(restored.quote_outcomes.bins[0].2, 5);
         // Kill switch round-trip
         assert!(restored.kill_switch.triggered);
         assert_eq!(restored.kill_switch.trigger_reasons.len(), 1);
@@ -748,7 +669,7 @@ mod tests {
             momentum: MomentumCheckpoint::default(),
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
-            rl_q_table: RLCheckpoint::default(),
+            quote_outcomes: QuoteOutcomeCheckpoint::default(),
             spread_bandit: SpreadBanditCheckpoint::default(),
             baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
@@ -798,7 +719,7 @@ mod tests {
             momentum: MomentumCheckpoint::default(),
             kelly_tracker: KellyTrackerCheckpoint::default(),
             ensemble_weights: EnsembleWeightsCheckpoint::default(),
-            rl_q_table: RLCheckpoint::default(),
+            quote_outcomes: QuoteOutcomeCheckpoint::default(),
             spread_bandit: SpreadBanditCheckpoint::default(),
             baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
