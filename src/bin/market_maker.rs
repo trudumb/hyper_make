@@ -1827,16 +1827,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
-            // Use log-additive risk model for Hip3 to prevent gamma explosion
+            // Use log-additive risk model for ALL profiles to prevent gamma explosion.
+            // Legacy multiplicative gamma compounds 7+ scalars (1.2^7 = 3.6x) and is never
+            // the right choice — risk_model_blend=1.0 bypasses the multiplicative path entirely.
             let risk_model_cfg = match spread_profile {
-                SpreadProfile::Hip3 | SpreadProfile::Aggressive => {
-                    info!(
-                        risk_model_blend = 1.0,
-                        "Using log-additive CalibratedRiskModel (no multiplicative gamma explosion)"
-                    );
-                    RiskModelConfig::hip3()
-                }
-                SpreadProfile::Default => RiskModelConfig::default(),
+                SpreadProfile::Hip3 | SpreadProfile::Aggressive => RiskModelConfig::hip3(),
+                SpreadProfile::Default => RiskModelConfig {
+                    use_calibrated_risk_model: true,
+                    risk_model_blend: 1.0,
+                    ..Default::default()
+                },
             };
 
             info!(

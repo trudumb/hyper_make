@@ -893,14 +893,12 @@ impl KillSwitch {
         let reasons = self.trigger_reasons.lock().unwrap();
         let triggered = self.is_triggered();
 
-        let triggered_at_ms = if triggered {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let triggered_at_ms = if triggered { now_ms } else { 0 };
 
         KillSwitchCheckpoint {
             triggered,
@@ -908,20 +906,43 @@ impl KillSwitch {
             daily_pnl: state.daily_pnl,
             peak_pnl: state.peak_pnl,
             triggered_at_ms,
+            saved_at_ms: now_ms,
         }
     }
 
     /// Restore kill switch state from a checkpoint.
     ///
+    /// Daily P&L and peak P&L are only restored if the checkpoint was saved on the
+    /// same UTC trading day. On a new day, counters reset to zero — a fresh day means
+    /// a fresh P&L slate. This prevents stale losses from blocking new sessions.
+    ///
     /// Re-triggers the kill switch if the checkpoint was triggered within
-    /// the last 24 hours. Stale triggers (>24h) are ignored to avoid
-    /// blocking trading after extended maintenance windows.
+    /// the last 24 hours, but daily-scoped reasons (daily loss, drawdown) are
+    /// skipped on a new trading day since the P&L they reference has been reset.
+    /// Stale triggers (>24h) are always ignored.
     pub fn restore_from_checkpoint(&self, checkpoint: &KillSwitchCheckpoint) {
-        // Restore P&L state regardless of trigger status
-        {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let same_day = is_same_utc_day(checkpoint.saved_at_ms, now_ms);
+
+        // Only restore daily P&L if checkpoint is from the same UTC trading day.
+        // On a new day, counters start fresh at zero.
+        if same_day && checkpoint.saved_at_ms > 0 {
             let mut state = self.state.lock().unwrap();
             state.daily_pnl = checkpoint.daily_pnl;
             state.peak_pnl = checkpoint.peak_pnl;
+        } else {
+            let checkpoint_day = checkpoint.saved_at_ms / MS_PER_DAY;
+            let current_day = now_ms / MS_PER_DAY;
+            tracing::info!(
+                checkpoint_day,
+                current_day,
+                stale_daily_pnl = checkpoint.daily_pnl,
+                "Checkpoint from different trading day — daily P&L reset to zero"
+            );
         }
 
         if !checkpoint.triggered {
@@ -929,11 +950,6 @@ impl KillSwitch {
         }
 
         // Check if the trigger is within 24 hours
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
         const TWENTY_FOUR_HOURS_MS: u64 = 24 * 60 * 60 * 1000;
         let age_ms = now_ms.saturating_sub(checkpoint.triggered_at_ms);
 
@@ -942,22 +958,20 @@ impl KillSwitch {
             return;
         }
 
-        // Re-trigger with saved reasons, but skip transient ones.
-        // Position runaway is transient: the live check_position_runaway handles it
-        // correctly with initial_position exemption. Re-triggering on restore blocks
-        // startup when an inherited position exceeds current margin capacity.
-        // Only persistent reasons (daily loss, drawdown) should survive restart.
+        // Re-trigger with saved reasons, filtering out:
+        // - Position runaway: transient, live checks handle it with initial_position exemption
+        // - Daily loss / drawdown on new day: P&L has been reset, these reasons are stale
         let persistent_reasons: Vec<_> = checkpoint
             .trigger_reasons
             .iter()
             .filter(|r| !r.contains("Position runaway"))
+            .filter(|r| same_day || !is_daily_scoped_reason(r))
             .collect();
 
         if persistent_reasons.is_empty() {
-            // All reasons were transient — don't re-trigger
             tracing::info!(
-                "Checkpoint had kill switch trigger but all reasons were transient (position runaway), \
-                 not re-triggering. Live checks will re-evaluate."
+                same_day,
+                "Checkpoint had kill switch trigger but no reasons survive for this session — not re-triggering"
             );
             return;
         }
@@ -973,6 +987,19 @@ impl KillSwitch {
             }
         }
     }
+}
+
+const MS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
+
+/// Check if two timestamps (ms since epoch) fall on the same UTC calendar day.
+fn is_same_utc_day(ts1_ms: u64, ts2_ms: u64) -> bool {
+    (ts1_ms / MS_PER_DAY) == (ts2_ms / MS_PER_DAY)
+}
+
+/// Returns true if the kill reason string is daily-scoped (tied to daily P&L counters).
+/// These reasons should not survive across trading day boundaries.
+fn is_daily_scoped_reason(reason: &str) -> bool {
+    reason.contains("daily loss") || reason.contains("drawdown")
 }
 
 #[cfg(test)]
@@ -1439,15 +1466,16 @@ mod tests {
             daily_pnl: -100.0,
             peak_pnl: 50.0,
             triggered_at_ms: twenty_five_hours_ago,
+            saved_at_ms: twenty_five_hours_ago,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
         // Should NOT re-trigger because trigger is >24h old
         assert!(!ks.is_triggered());
-        // But P&L state should still be restored
+        // P&L should NOT be restored because checkpoint is from a different day
         let state = ks.state();
-        assert_eq!(state.daily_pnl, -100.0);
-        assert_eq!(state.peak_pnl, 50.0);
+        assert_eq!(state.daily_pnl, 0.0);
+        assert_eq!(state.peak_pnl, 0.0);
     }
 
     #[test]
@@ -1466,12 +1494,232 @@ mod tests {
             daily_pnl: -600.0,
             peak_pnl: 0.0,
             triggered_at_ms: now_ms,
+            saved_at_ms: now_ms,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
         assert!(ks.is_triggered());
         // The kill switch being triggered means is_triggered() returns true,
         // which blocks all trading in the event loop
+    }
+
+    // === Trading day boundary tests ===
+
+    #[test]
+    fn test_kill_switch_new_day_resets_daily_pnl() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Checkpoint from yesterday with daily loss trigger
+        let yesterday_ms = now_ms.saturating_sub(MS_PER_DAY);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec!["Max daily loss exceeded: $5.02 > $5.00".to_string()],
+            daily_pnl: -5.02,
+            peak_pnl: 0.0,
+            triggered_at_ms: yesterday_ms,
+            saved_at_ms: yesterday_ms,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Should NOT re-trigger: daily loss is day-scoped and this is a new day
+        assert!(!ks.is_triggered());
+
+        // Daily P&L should be reset to zero, not restored
+        let state = ks.state();
+        assert_eq!(state.daily_pnl, 0.0);
+        assert_eq!(state.peak_pnl, 0.0);
+    }
+
+    #[test]
+    fn test_kill_switch_same_day_preserves_daily_pnl() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Checkpoint from 1 minute ago (same day)
+        let one_min_ago = now_ms.saturating_sub(60_000);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec!["Max daily loss exceeded: $600.00 > $500.00".to_string()],
+            daily_pnl: -600.0,
+            peak_pnl: 10.0,
+            triggered_at_ms: one_min_ago,
+            saved_at_ms: one_min_ago,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Same day: should re-trigger and restore P&L
+        assert!(ks.is_triggered());
+        let state = ks.state();
+        assert_eq!(state.daily_pnl, -600.0);
+        assert_eq!(state.peak_pnl, 10.0);
+    }
+
+    #[test]
+    fn test_kill_switch_new_day_non_daily_reason_persists_within_24h() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // 12 hours ago — different day if we crossed midnight, still within 24h
+        let twelve_hours_ago = now_ms.saturating_sub(12 * 3600 * 1000);
+        let same_day = is_same_utc_day(twelve_hours_ago, now_ms);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec!["Manual shutdown: operator requested".to_string()],
+            daily_pnl: -50.0,
+            peak_pnl: 0.0,
+            triggered_at_ms: twelve_hours_ago,
+            saved_at_ms: twelve_hours_ago,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Manual shutdown is NOT daily-scoped → persists across day boundaries within 24h
+        assert!(ks.is_triggered());
+
+        // But P&L depends on day boundary
+        let state = ks.state();
+        if same_day {
+            assert_eq!(state.daily_pnl, -50.0);
+        } else {
+            assert_eq!(state.daily_pnl, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_kill_switch_new_day_daily_loss_dropped_but_manual_kept() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Guaranteed to be a different day but within 24h
+        let yesterday_ms = now_ms.saturating_sub(MS_PER_DAY - 1000);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec![
+                "Max daily loss exceeded: $600.00 > $500.00".to_string(),
+                "Manual shutdown: operator requested".to_string(),
+            ],
+            daily_pnl: -600.0,
+            peak_pnl: 0.0,
+            triggered_at_ms: yesterday_ms,
+            saved_at_ms: yesterday_ms,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Should still trigger because manual reason persists
+        assert!(ks.is_triggered());
+
+        // But daily P&L is reset (different day)
+        let state = ks.state();
+        assert_eq!(state.daily_pnl, 0.0);
+
+        // Only the manual reason should survive, not the daily loss
+        let reasons = ks.trigger_reasons.lock().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].to_string().contains("operator requested"));
+    }
+
+    #[test]
+    fn test_kill_switch_new_day_drawdown_not_restored() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let yesterday_ms = now_ms.saturating_sub(MS_PER_DAY);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec!["Max drawdown exceeded: 15.00% > 10.00%".to_string()],
+            daily_pnl: -30.0,
+            peak_pnl: 200.0,
+            triggered_at_ms: yesterday_ms,
+            saved_at_ms: yesterday_ms,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Drawdown is daily-scoped → should not re-trigger on new day
+        assert!(!ks.is_triggered());
+        // P&L reset
+        let state = ks.state();
+        assert_eq!(state.daily_pnl, 0.0);
+        assert_eq!(state.peak_pnl, 0.0);
+    }
+
+    #[test]
+    fn test_kill_switch_old_checkpoint_without_saved_at_resets_pnl() {
+        // Old checkpoints (pre-upgrade) have saved_at_ms=0 via #[serde(default)]
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: false,
+            trigger_reasons: vec![],
+            daily_pnl: -5.02,
+            peak_pnl: 1.0,
+            triggered_at_ms: 0,
+            saved_at_ms: 0, // simulates old checkpoint without this field
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // saved_at_ms=0 is never "same day" as now → P&L should reset
+        assert!(!ks.is_triggered());
+        let state = ks.state();
+        assert_eq!(state.daily_pnl, 0.0);
+        assert_eq!(state.peak_pnl, 0.0);
+    }
+
+    #[test]
+    fn test_is_same_utc_day() {
+        // Same day
+        let base = 1_707_782_400_000_u64; // 2024-02-13 00:00:00 UTC
+        assert!(is_same_utc_day(base, base + 1000));
+        assert!(is_same_utc_day(base, base + 23 * 3600 * 1000));
+
+        // Different days
+        assert!(!is_same_utc_day(base, base + 25 * 3600 * 1000));
+        assert!(!is_same_utc_day(0, base));
+    }
+
+    #[test]
+    fn test_is_daily_scoped_reason() {
+        assert!(is_daily_scoped_reason(
+            "Max daily loss exceeded: $5.02 > $5.00"
+        ));
+        assert!(is_daily_scoped_reason(
+            "Max drawdown exceeded: 15.00% > 10.00%"
+        ));
+        assert!(!is_daily_scoped_reason("Manual shutdown: test"));
+        assert!(!is_daily_scoped_reason("Position runaway: 5.0 > 3.0"));
+        assert!(!is_daily_scoped_reason(
+            "Liquidation cascade detected: severity 3.00"
+        ));
     }
 
     // === Liquidation self-detection tests ===

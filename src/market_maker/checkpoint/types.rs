@@ -550,6 +550,10 @@ pub struct KillSwitchCheckpoint {
     pub peak_pnl: f64,
     /// Timestamp when kill switch was triggered (ms since epoch), 0 if not triggered
     pub triggered_at_ms: u64,
+    /// Timestamp when checkpoint was saved (ms since epoch).
+    /// Used to detect trading day boundaries and reset daily P&L on new day.
+    #[serde(default)]
+    pub saved_at_ms: u64,
 }
 
 impl Default for KillSwitchCheckpoint {
@@ -560,6 +564,7 @@ impl Default for KillSwitchCheckpoint {
             daily_pnl: 0.0,
             peak_pnl: 0.0,
             triggered_at_ms: 0,
+            saved_at_ms: 0,
         }
     }
 }
@@ -659,6 +664,7 @@ mod tests {
                 daily_pnl: -100.0,
                 peak_pnl: 50.0,
                 triggered_at_ms: 1700000000000,
+                saved_at_ms: 1700000000000,
             },
             readiness: PriorReadiness::default(),
         };
