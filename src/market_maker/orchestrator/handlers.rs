@@ -342,6 +342,26 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     markout_as_bps: Some(markout_as_bps),
                 };
 
+                // === PHASE 4: Close measurement loop — feed markout AS to regime state ===
+                self.stochastic.regime_state.params.update_as_from_markout(markout_as_bps);
+
+                // === PHASE 8: Adaptive spread learning at markout time ===
+                // Moved from fill-time handler where AS was tautological (AS ≈ depth).
+                // Now uses markout AS = true mid movement over 5 seconds.
+                let markout_as_fraction = markout_as_bps / 10_000.0;
+                let depth_from_mid = if pending.mid_at_fill > 0.0 {
+                    (pending.fill_price - pending.mid_at_fill).abs() / pending.mid_at_fill
+                } else {
+                    0.0
+                };
+                let markout_fill_pnl = -markout_as_fraction;
+                self.stochastic.adaptive_spreads.on_fill_simple(
+                    markout_as_fraction,
+                    depth_from_mid,
+                    markout_fill_pnl,
+                    self.estimator.kappa(),
+                );
+
                 // Feed resolved snapshot to learning systems
                 self.tier2.edge_tracker.add_snapshot(resolved_snap.clone());
                 let fill_pnl_bps = resolved_snap.realized_edge_bps;
@@ -835,23 +855,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let direction = if is_buy { 1.0 } else { -1.0 };
                 let as_realized = (mid_at_placement - fill_price) * direction / fill_price;
 
-                // Compute depth from placement mid (not fill-time mid)
+                // Compute depth from placement mid (used by bandit reward + competitor model)
                 let depth_from_mid = if mid_at_placement > 0.0 {
                     (fill_price - mid_at_placement).abs() / mid_at_placement
                 } else {
                     (fill_price - self.latest_mid).abs() / self.latest_mid
                 };
 
-                // PnL for this fill: simplified as -AS (negative AS = profit)
-                let fill_pnl = -as_realized;
-
-                // Update all adaptive components via simplified fill handler
-                self.stochastic.adaptive_spreads.on_fill_simple(
-                    as_realized,
-                    depth_from_mid,
-                    fill_pnl,
-                    self.estimator.kappa(),
-                );
+                // Phase 8: on_fill_simple moved to markout time in check_pending_fill_outcomes()
+                // where we have true markout-based AS instead of tautological fill-time AS.
 
                 // Record fill for calibration controller
                 // This updates fill rate tracking for fill-hungry mode

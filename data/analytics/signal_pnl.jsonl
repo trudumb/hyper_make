@@ -1323,3 +1323,11 @@
 {"LeadLag":{"active_pnl_bps":0.0,"inactive_pnl_bps":530.388484282076,"marginal_value_bps":-5.1494027600201555},"InformedFlow":{"active_pnl_bps":530.388484282076,"inactive_pnl_bps":0.0,"marginal_value_bps":5.1494027600201555},"RegimeDetection":{"active_pnl_bps":530.388484282076,"inactive_pnl_bps":0.0,"marginal_value_bps":5.1494027600201555},"CrossVenue":{"active_pnl_bps":0.0,"inactive_pnl_bps":530.388484282076,"marginal_value_bps":-5.1494027600201555},"VPIN":{"active_pnl_bps":530.388484282076,"inactive_pnl_bps":0.0,"marginal_value_bps":5.1494027600201555},"BuyPressure":{"active_pnl_bps":0.0,"inactive_pnl_bps":530.388484282076,"marginal_value_bps":-5.1494027600201555}}
 {"VPIN":{"active_pnl_bps":534.9432389008717,"inactive_pnl_bps":0.0,"marginal_value_bps":5.143684989431459},"RegimeDetection":{"active_pnl_bps":534.9432389008717,"inactive_pnl_bps":0.0,"marginal_value_bps":5.143684989431459},"InformedFlow":{"active_pnl_bps":534.9432389008717,"inactive_pnl_bps":0.0,"marginal_value_bps":5.143684989431459},"CrossVenue":{"active_pnl_bps":0.0,"inactive_pnl_bps":534.9432389008717,"marginal_value_bps":-5.143684989431459},"LeadLag":{"active_pnl_bps":0.0,"inactive_pnl_bps":534.9432389008717,"marginal_value_bps":-5.143684989431459},"BuyPressure":{"active_pnl_bps":0.0,"inactive_pnl_bps":534.9432389008717,"marginal_value_bps":-5.143684989431459}}
 {"BuyPressure":{"active_pnl_bps":0.0,"inactive_pnl_bps":534.8028869984786,"marginal_value_bps":-4.906448504573198},"LeadLag":{"active_pnl_bps":0.0,"inactive_pnl_bps":534.8028869984786,"marginal_value_bps":-4.906448504573198},"InformedFlow":{"active_pnl_bps":534.8028869984786,"inactive_pnl_bps":0.0,"marginal_value_bps":4.906448504573198},"CrossVenue":{"active_pnl_bps":0.0,"inactive_pnl_bps":534.8028869984786,"marginal_value_bps":-4.906448504573198},"VPIN":{"active_pnl_bps":534.8028869984786,"inactive_pnl_bps":0.0,"marginal_value_bps":4.906448504573198},"RegimeDetection":{"active_pnl_bps":534.8028869984786,"inactive_pnl_bps":0.0,"marginal_value_bps":4.906448504573198}}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}

@@ -9,6 +9,7 @@
 #   ./scripts/test_mainnet.sh SOL 3600           # 1 hour test
 #   ./scripts/test_mainnet.sh BTC 300 --dashboard # With live dashboard
 #   ./scripts/test_mainnet.sh BTC 300 --capture   # With dashboard + screenshot capture
+#   ./scripts/test_mainnet.sh HYPE 3600 --capture # With dashboard + screenshot capture
 #
 # Options:
 #   --dashboard    Starts HTTP server for live dashboard at http://localhost:3000

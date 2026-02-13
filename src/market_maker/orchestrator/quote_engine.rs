@@ -109,53 +109,105 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
-        // === Circuit Breaker Checks ===
+        // === PHASE 3: INVENTORY GOVERNOR — First structural check ===
+        // The inventory governor enforces config.max_position as a HARD ceiling.
+        // This runs BEFORE any other logic to ensure position safety is structural.
+        let position_assessment = self.inventory_governor.assess(self.position.position());
+        if position_assessment.zone == crate::market_maker::risk::PositionZone::Kill {
+            warn!(
+                position = %format!("{:.4}", self.position.position()),
+                ratio = %format!("{:.2}", position_assessment.position_ratio),
+                max_position = %format!("{:.4}", self.inventory_governor.max_position()),
+                "InventoryGovernor: KILL zone — cancelling ALL quotes"
+            );
+            let bid_orders = self.orders.get_all_by_side(Side::Buy);
+            let ask_orders = self.orders.get_all_by_side(Side::Sell);
+            let all_oids: Vec<u64> = bid_orders
+                .iter()
+                .chain(ask_orders.iter())
+                .map(|o| o.oid)
+                .collect();
+            if !all_oids.is_empty() {
+                self.environment
+                    .cancel_bulk_orders(&self.config.asset, all_oids)
+                    .await;
+            }
+            return Ok(());
+        }
+
+        // === PHASE 7: Graduated risk overlay multipliers ===
+        // Track additive spread and size multipliers from all risk sources.
+        // Only the kill switch can actually cancel all quotes — everything else
+        // applies graduated spread widening and size reduction.
+        let mut risk_overlay_mult = 1.0_f64;
+        let mut risk_size_reduction = 1.0_f64;
+        let mut risk_reduce_only = false;
+
+        // Yellow zone: widen increasing side, cap exposure
+        if position_assessment.zone == crate::market_maker::risk::PositionZone::Yellow {
+            risk_overlay_mult *= position_assessment.increasing_side_spread_mult;
+            debug!(
+                zone = "Yellow",
+                spread_mult = %format!("{:.2}", position_assessment.increasing_side_spread_mult),
+                max_new_exposure = %format!("{:.4}", position_assessment.max_new_exposure),
+                "InventoryGovernor: Yellow zone — widening increasing side"
+            );
+        }
+        // Red zone: reduce-only
+        if position_assessment.zone == crate::market_maker::risk::PositionZone::Red {
+            risk_reduce_only = true;
+            risk_overlay_mult *= position_assessment.increasing_side_spread_mult;
+            info!(
+                zone = "Red",
+                "InventoryGovernor: Red zone — reduce-only mode"
+            );
+        }
+
+        // === Circuit Breaker Checks (Phase 7: graduated) ===
         let breaker_action = self.tier1.circuit_breaker.most_severe_action();
         match breaker_action {
             Some(CircuitBreakerAction::PauseTrading) => {
-                warn!("Circuit breaker: pausing trading");
-                return Ok(()); // Skip quoting entirely
+                // Phase 7: PauseTrading → 5x spread + 10% size, continue (don't cancel)
+                risk_overlay_mult *= 5.0;
+                risk_size_reduction *= 0.1;
+                warn!("Circuit breaker: PauseTrading → graduated 5x spread + 10% size");
             }
             Some(CircuitBreakerAction::CancelAllQuotes) => {
-                warn!("Circuit breaker: cancelling all quotes");
-                // Cancel existing quotes on both sides
-                let bid_orders = self.orders.get_all_by_side(Side::Buy);
-                let ask_orders = self.orders.get_all_by_side(Side::Sell);
-                let all_oids: Vec<u64> = bid_orders
-                    .iter()
-                    .chain(ask_orders.iter())
-                    .map(|o| o.oid)
-                    .collect();
-                if !all_oids.is_empty() {
-                    self.environment
-                        .cancel_bulk_orders(&self.config.asset, all_oids)
-                        .await;
-                }
-                return Ok(());
+                // Phase 7: CancelAllQuotes → 5x spread, continue (don't cancel)
+                risk_overlay_mult *= 5.0;
+                warn!("Circuit breaker: CancelAllQuotes → graduated 5x spread (continuing)");
             }
             Some(CircuitBreakerAction::WidenSpreads { multiplier }) => {
+                risk_overlay_mult *= multiplier;
                 info!(
                     multiplier = %format!("{:.2}x", multiplier),
                     "Circuit breaker: widening spreads"
                 );
-                // Multiplier is applied below via spread_multiplier composition
             }
             None => {}
         }
 
-        // === Risk Limit Checks ===
+        // === Risk Limit Checks (Phase 7: graduated) ===
         let position_notional = self.position.position().abs() * self.latest_mid;
         let position_check = self.safety.risk_checker.check_position(position_notional);
         if matches!(position_check, RiskCheckResult::HardLimitBreached { .. }) {
-            error!("Hard position limit breached - cancelling quotes");
-            return Ok(());
+            // Hard limit → 3x spread + reduce-only, continue
+            risk_overlay_mult *= 3.0;
+            risk_reduce_only = true;
+            error!("Hard position limit breached → graduated 3x spread + reduce-only");
         }
 
-        // === Drawdown Check ===
+        // === Drawdown Check (Phase 7: graduated) ===
         if self.safety.drawdown_tracker.should_pause() {
-            warn!("Emergency drawdown - pausing trading");
-            return Ok(());
+            // Drawdown pause → 3x spread + 10% size, continue
+            risk_overlay_mult *= 3.0;
+            risk_size_reduction *= 0.1;
+            warn!("Emergency drawdown → graduated 3x spread + 10% size");
         }
+
+        // Cap risk_overlay_mult at 3x (single overlay) to prevent infinite widening
+        // The global spread cap downstream handles total composition
+        risk_overlay_mult = risk_overlay_mult.min(3.0);
 
         // === CENTRALIZED BELIEF SYSTEM: Update with price observations ===
         // Phase 7: Removed dual-write - centralized beliefs are now the single source of truth.
@@ -367,14 +419,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             "Open order state"
         );
 
-        // Get dynamic position VALUE limit from kill switch (first-principles derived)
+        // === PHASE 3: config.max_position IS the hard ceiling (InventoryGovernor principle) ===
+        // Margin can only LOWER the effective limit for solvency, never raise above config.
         let dynamic_max_position_value = self.safety.kill_switch.max_position_value();
-        // Margin state is valid if we've refreshed margin at least once
         let margin_state = self.infra.margin_sizer.state();
         let dynamic_limit_valid = margin_state.account_value > 0.0;
 
-        // CRITICAL: Pre-compute effective_max_position and update exchange limits BEFORE building sources
-        // This ensures sources.exchange_effective_bid/ask_limit use the margin-based capacity
         let margin_quoting_capacity = if margin_state.available_margin > 0.0
             && self.infra.margin_sizer.summary().max_leverage > 0.0
             && self.latest_mid > 0.0
@@ -386,36 +436,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             0.0
         };
 
-        // Compute effective_max_position using same priority as MarketParams::effective_max_position
-        let dynamic_max_position = if dynamic_limit_valid && self.latest_mid > 0.0 {
-            dynamic_max_position_value / self.latest_mid
+        // config.max_position is the primary ceiling. Margin is a solvency floor only.
+        let pre_effective_max_position = if margin_quoting_capacity > 1e-9 {
+            margin_quoting_capacity.min(self.config.max_position)
         } else {
-            0.0
+            self.config.max_position
         };
 
-        let pre_effective_max_position = {
-            const EPSILON: f64 = 1e-9;
-            if margin_quoting_capacity > EPSILON {
-                if dynamic_limit_valid && dynamic_max_position > EPSILON {
-                    margin_quoting_capacity.min(dynamic_max_position)
-                } else {
-                    margin_quoting_capacity
-                }
-            } else if dynamic_limit_valid && dynamic_max_position > EPSILON {
-                dynamic_max_position
-            } else {
-                self.config.max_position // Fallback to config during warmup
-            }
-        };
-
-        // User-specified max_position is an absolute hard cap that must never be exceeded.
-        let pre_effective_max_position = if self.config.max_position_user_specified {
-            pre_effective_max_position.min(self.config.max_position)
-        } else {
-            pre_effective_max_position
-        };
-
-        // Update exchange limits with margin-based capacity BEFORE building sources
+        // Update exchange limits with config-derived capacity BEFORE building sources
         self.infra
             .exchange_limits
             .update_local_max(pre_effective_max_position);
@@ -918,6 +946,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             crate::market_maker::strategy::regime_state::MarketRegime::Extreme => 3,
         };
 
+        // === PHASE 4: Wire ALL regime params to market_params ===
+        {
+            let rp = &self.stochastic.regime_state.params;
+            market_params.regime_as_expected_bps = rp.as_expected_bps;
+            market_params.regime_risk_premium_bps = rp.risk_premium_bps;
+            market_params.regime_skew_gain = rp.skew_gain;
+            market_params.regime_size_multiplier = rp.size_multiplier;
+            market_params.controller_objective = rp.controller_objective;
+            market_params.max_position_fraction = rp.max_position_fraction;
+        }
+
         // === Skew Context Update ===
         // Wire inventory + signal skew context before get_signals().
         // set_skew_context() drives inventory-based and signal-based directional skew.
@@ -1062,7 +1101,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === CONTROLLER RISK OVERLAY (Phase 4: unified pipeline) ===
         // Risk assessment replaces binary Quote/NoQuote with continuous multipliers.
-        // Called early so spread_multiplier and size can be adjusted.
+        // Called early so risk_overlay_mult and size can be adjusted.
         let risk_overlay = self.stochastic.controller.risk_assessment();
         let risk_level = risk_overlay.risk_level;
         match risk_level {
@@ -1072,79 +1111,31 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             crate::market_maker::control::RiskLevel::Emergency => {
                 info!(reason = %risk_overlay.reason, "Risk overlay: emergency — position-reducing only");
-                // Don't return — continue to generate quotes, filter below
+                risk_reduce_only = true;
+                risk_overlay_mult *= 2.0;
             }
             crate::market_maker::control::RiskLevel::Elevated => {
                 debug!(reason = %risk_overlay.reason, "Risk overlay: elevated risk");
+                risk_overlay_mult *= risk_overlay.spread_multiplier.max(1.0);
             }
             crate::market_maker::control::RiskLevel::Normal => {}
         }
 
-        // Get spread multiplier from circuit breaker if applicable
-        let mut spread_multiplier = match breaker_action {
-            Some(CircuitBreakerAction::WidenSpreads { multiplier }) => multiplier,
-            _ => 1.0,
+        // === PHASE 5: Additive risk premium replaces multiplicative spread chain ===
+        // Instead of compounding N multipliers (which can blow up to 10x+), we compute
+        // an additive risk premium in bps that flows to solve_min_gamma() for self-consistent spreads.
+        let mut total_risk_premium = market_params.regime_risk_premium_bps;
+
+        // Hawkes synchronicity addon: 0-3 bps when synchronicity > 0.5
+        let sync_coeff = self.stochastic.hawkes_predictor.synchronicity_coefficient();
+        let hawkes_addon_bps = if sync_coeff > 0.5 {
+            3.0 * (sync_coeff - 0.5) * 2.0 // 0-3 bps
+        } else {
+            0.0
         };
+        total_risk_premium += hawkes_addon_bps;
 
-        // === First-Principles Gap 2: Apply ThresholdKappa regime-based spread multiplier ===
-        // During momentum regimes (large price moves), widen spreads to reduce adverse selection.
-        let threshold_kappa_mult = self.stochastic.threshold_kappa.regime().spread_multiplier();
-        if threshold_kappa_mult > 1.0 && self.stochastic.threshold_kappa.is_warmed_up() {
-            spread_multiplier *= threshold_kappa_mult;
-            trace!(
-                regime = ?self.stochastic.threshold_kappa.regime(),
-                kappa_ratio = %format!("{:.2}", self.stochastic.threshold_kappa.kappa_ratio()),
-                multiplier = %format!("{:.2}", threshold_kappa_mult),
-                "ThresholdKappa: Momentum regime detected, widening spreads"
-            );
-        }
-
-        // === HAWKES EXCITATION: Widen spreads during trade clustering ===
-        let hawkes_widening = self.stochastic.hawkes_predictor.spread_widening_factor();
-        if hawkes_widening > 1.05 {
-            spread_multiplier *= hawkes_widening.min(2.0);
-            info!(
-                hawkes_mult = %format!("{:.2}", hawkes_widening),
-                "Hawkes: widening spreads due to trade clustering"
-            );
-        }
-
-        // === REGIME KAPPA ===
-        // Regime kappa now flows through RegimeState -> market_params.regime_kappa
-        // into the ladder strategy's kappa selection (primary path).
-        // Retained as diagnostic only — no longer multiplied into spread.
-        let regime_kappa_mult = 1.0_f64;
-        let _regime_kappa_diagnostic = {
-            let kappa_eff = signals.kappa_effective;
-            let kappa_prior = self.stochastic.signal_integrator.kappa_prior();
-            if kappa_eff > 0.0 && kappa_prior > 0.0 {
-                (kappa_prior / kappa_eff).clamp(0.5, 2.0)
-            } else {
-                1.0
-            }
-        };
-
-        // === MODEL GATING: Widen spreads when models are poorly calibrated ===
-        let model_gating_mult = self.stochastic.signal_integrator.model_gating_spread_multiplier();
-        if model_gating_mult > 1.0 {
-            spread_multiplier *= model_gating_mult;
-            debug!(
-                model_gating_mult = %format!("{:.2}", model_gating_mult),
-                "ModelGating: Widening spreads (low model confidence)"
-            );
-        }
-
-        // === SIGNAL STALENESS DEFENSE: Widen when enabled signals go stale ===
-        let staleness_mult = self.stochastic.signal_integrator.staleness_spread_multiplier();
-        if staleness_mult > 1.0 {
-            spread_multiplier *= staleness_mult;
-            warn!(
-                staleness_mult = %format!("{:.2}", staleness_mult),
-                "Signal staleness: widening spreads (stale signals detected)"
-            );
-        }
-
-        // === PROACTIVE TOXICITY: Widen based on public-data signals ===
+        // Toxicity addon: 0-5 bps when composite score > 0.5
         let toxicity_input = ToxicityInput {
             vpin: {
                 let v = signals.hl_vpin;
@@ -1169,60 +1160,52 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             price_velocity_1s: self.price_velocity_1s,
         };
         let toxicity = self.tier2.toxicity.evaluate(&toxicity_input);
-        let toxicity_mult = toxicity.spread_multiplier;
+        let toxicity_addon_bps = if toxicity.composite_score > 0.5 {
+            5.0 * (toxicity.composite_score - 0.5) * 2.0 // 0-5 bps
+        } else {
+            0.0
+        };
+        total_risk_premium += toxicity_addon_bps;
 
-        if toxicity_mult > 1.01 {
-            spread_multiplier *= toxicity_mult;
-            debug!(
-                toxicity_score = %format!("{:.2}", toxicity.composite_score),
-                toxicity_mult = %format!("{:.2}", toxicity_mult),
-                cold_start = toxicity.cold_start,
-                vpin = %format!("{:.2}", toxicity.components.vpin),
-                informed = %format!("{:.2}", toxicity.components.informed),
-                trend = %format!("{:.2}", toxicity.components.trend),
-                book = %format!("{:.2}", toxicity.components.book_imbalance),
-                velocity = %format!("{:.2}", toxicity.components.velocity),
-                "Proactive toxicity widening"
-            );
-        }
+        // Staleness addon: 0-3 bps from signal staleness
+        let staleness_mult = self.stochastic.signal_integrator.staleness_spread_multiplier();
+        let staleness_addon_bps = if staleness_mult > 1.0 {
+            // Convert multiplicative staleness to additive: (mult - 1) * base_spread_bps
+            // Use 3 bps cap as proxy for staleness penalty
+            ((staleness_mult - 1.0) * 5.0).min(3.0)
+        } else {
+            0.0
+        };
+        total_risk_premium += staleness_addon_bps;
 
-        // === DEFENSIVE EDGE MULTIPLIER: Fill-based supplementary defense ===
-        let defensive_mult = self.tier2.edge_tracker.max_defensive_multiplier();
-        if defensive_mult > 1.01 {
-            spread_multiplier *= defensive_mult;
-            debug!(
-                defensive_mult = %format!("{:.2}", defensive_mult),
-                mean_gross_edge_bps = %format!("{:.2}", self.tier2.edge_tracker.mean_gross_edge()),
-                fills = self.tier2.edge_tracker.edge_count(),
-                "Defensive edge multiplier: supplementary fill-based defense"
-            );
-        }
+        // Hidden liquidity discount: when iceberg detected on both sides, reduce premium by 20%
+        // IcebergDetector is not yet wired on StochasticComponents — use TODO for future integration
+        // TODO: Wire IcebergDetector to StochasticComponents for hidden liquidity discount
+        // if self.stochastic.iceberg_detector.has_bilateral_support() {
+        //     total_risk_premium *= 0.8;
+        // }
 
-        // === CONTROLLER RISK OVERLAY: Widen based on changepoint/trust assessment ===
-        if risk_overlay.spread_multiplier > 1.01 {
-            spread_multiplier *= risk_overlay.spread_multiplier;
-            debug!(
-                risk_spread_mult = %format!("{:.2}", risk_overlay.spread_multiplier),
-                risk_reason = %risk_overlay.reason,
-                "Controller risk overlay: widening spreads"
-            );
-        }
+        // Store total risk premium on market_params for solve_min_gamma()
+        market_params.total_risk_premium_bps = total_risk_premium;
 
-        // === GLOBAL SPREAD CAP: Prevent infinite widening ===
-        let max_composed = self.tier2.toxicity.config().max_composed_spread_mult;
-        spread_multiplier = spread_multiplier.min(max_composed);
-
-        // Apply composed spread multiplier to market params
-        if spread_multiplier > 1.0 {
+        // === Compose final spread_widening_mult ===
+        // Phase 7: Single risk_overlay_mult (from graduated responses above), capped at 3x
+        let spread_multiplier = risk_overlay_mult.min(3.0);
+        if spread_multiplier > 1.01 {
             market_params.spread_widening_mult *= spread_multiplier;
+        }
+
+        if total_risk_premium > 0.1 || spread_multiplier > 1.01 {
             debug!(
-                toxicity = %format!("{:.2}x", toxicity_mult),
-                defensive = %format!("{:.2}x", defensive_mult),
-                staleness = %format!("{:.2}x", staleness_mult),
-                model_gating = %format!("{:.2}x", model_gating_mult),
-                regime_kappa = %format!("{:.2}x", regime_kappa_mult),
-                total = %format!("{:.2}x", spread_multiplier),
-                "Spread composition breakdown"
+                regime_premium = %format!("{:.1}", market_params.regime_risk_premium_bps),
+                hawkes_addon = %format!("{:.1}", hawkes_addon_bps),
+                toxicity_addon = %format!("{:.1}", toxicity_addon_bps),
+                staleness_addon = %format!("{:.1}", staleness_addon_bps),
+                total_risk_premium = %format!("{:.1}", total_risk_premium),
+                risk_overlay = %format!("{:.2}x", spread_multiplier),
+                toxicity_score = %format!("{:.2}", toxicity.composite_score),
+                sync_coeff = %format!("{:.2}", sync_coeff),
+                "Additive risk premium + risk overlay"
             );
         }
 
@@ -1232,7 +1215,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .risk_checker
             .suggested_size_multiplier(self.position.position().abs() * self.latest_mid);
         let drawdown_size_mult = self.safety.drawdown_tracker.position_multiplier();
-        let size_multiplier = risk_size_mult * drawdown_size_mult;
+        let size_multiplier = risk_size_mult * drawdown_size_mult * risk_size_reduction;
 
         if size_multiplier < 1.0 {
             debug!(
@@ -1279,23 +1262,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             MIN_ORDER_NOTIONAL,        // Exchange minimum ($10)
         );
 
-        // CRITICAL: Update cached effective max_position from first principles
-        // This is THE source of truth for all position limit checks
-        let new_effective = market_params.effective_max_position(self.config.max_position);
-        // config.max_position is ALWAYS the hard ceiling (InventoryGovernor principle).
-        // Margin can only LOWER the effective limit, never raise it above config.
-        let capped_effective = new_effective.min(self.config.max_position);
-        if (capped_effective - self.effective_max_position).abs() > 0.001 {
+        // === PHASE 3+4: effective_max_position from InventoryGovernor + regime tightening ===
+        // config.max_position is the hard ceiling. Margin is solvency floor only.
+        // Regime tightens further: Extreme → 30% of max (via max_position_fraction).
+        let margin_effective = market_params.effective_max_position(self.config.max_position);
+        let new_effective = margin_effective
+            .min(self.config.max_position)
+            * market_params.max_position_fraction.clamp(0.1, 1.0);
+        if (new_effective - self.effective_max_position).abs() > 0.001 {
             debug!(
                 old = %format!("{:.6}", self.effective_max_position),
-                new = %format!("{:.6}", capped_effective),
-                margin_derived = %format!("{:.6}", new_effective),
+                new = %format!("{:.6}", new_effective),
+                margin_derived = %format!("{:.6}", margin_effective),
                 config_max = %format!("{:.6}", self.config.max_position),
-                dynamic_valid = market_params.dynamic_limit_valid,
-                "Effective max position updated (capped by config.max_position)"
+                regime_fraction = %format!("{:.2}", market_params.max_position_fraction),
+                "Effective max position updated (config cap × regime fraction)"
             );
         }
-        self.effective_max_position = capped_effective;
+        self.effective_max_position = new_effective;
 
         // =======================================================================
         // PROACTIVE POSITION MANAGEMENT (Phases 1-4)
@@ -2093,32 +2077,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
 
         // Handle quote gate decision
+        // Phase 7: NoQuote → graduated response (3x spread + reduce-only), not cancel all
         match &quote_gate_decision {
             QuoteGateDecision::NoQuote { reason } => {
                 info!(
                     reason = %reason,
                     flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
                     position = %format!("{:.4}", self.position.position()),
-                    "Quote gate: NO QUOTE - waiting for signal"
+                    "Quote gate: NoQuote → graduated 3x spread + reduce-only"
                 );
-                // Cancel any resting orders when not quoting
-                let bid_orders = self.orders.get_all_by_side(Side::Buy);
-                let ask_orders = self.orders.get_all_by_side(Side::Sell);
-                let resting_oids: Vec<u64> = bid_orders
-                    .iter()
-                    .chain(ask_orders.iter())
-                    .map(|o| o.oid)
-                    .collect();
-                if !resting_oids.is_empty() {
-                    info!(
-                        count = resting_oids.len(),
-                        "Quote gate: cancelling resting orders"
-                    );
-                    self.environment
-                        .cancel_bulk_orders(&self.config.asset, resting_oids)
-                        .await;
-                }
-                return Ok(());
+                // Phase 7: Apply 3x widening + reduce-only instead of cancelling
+                market_params.spread_widening_mult *= 3.0;
+                risk_reduce_only = true;
+                // Fall through to quote generation with widened spreads
             }
             QuoteGateDecision::QuoteOnlyBids { urgency } => {
                 debug!(
@@ -2407,7 +2378,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
             // When user explicitly specified max_position (CLI/TOML), enforce as hard ceiling.
             // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
-            let reduce_only_max = if self.config.max_position_user_specified {
+            // Phase 7: risk_reduce_only forces reduce-only by capping max to current position.
+            let reduce_only_max = if risk_reduce_only {
+                // Force reduce-only: cap to current position so any increase is filtered
+                self.position.position().abs()
+            } else if self.config.max_position_user_specified {
                 self.effective_max_position.min(self.config.max_position)
             } else {
                 self.effective_max_position
@@ -2700,7 +2675,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
             // When user explicitly specified max_position (CLI/TOML), enforce as hard ceiling.
             // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
-            let reduce_only_max_single = if self.config.max_position_user_specified {
+            let reduce_only_max_single = if risk_reduce_only {
+                self.position.position().abs() // Force reduce-only from graduated risk
+            } else if self.config.max_position_user_specified {
                 self.effective_max_position.min(self.config.max_position)
             } else {
                 self.effective_max_position

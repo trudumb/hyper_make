@@ -60,8 +60,9 @@ enable_calibration_fill_rate = true
 target_fill_rate_per_hour = 30.0
 min_fill_hungry_gamma = 0.3
 
-# Position management
-enable_position_ramp = true
+# Position management — ramp + perf gating disabled (min order > ramped max at $100 capital)
+enable_position_ramp = false
+enable_performance_gating = false
 
 # Stochastic constraints
 use_latency_spread_floor = true

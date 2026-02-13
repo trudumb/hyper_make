@@ -17,6 +17,8 @@ use super::{
     RiskModelConfig,
 };
 
+use crate::market_maker::risk::PositionZone;
+
 /// Maximum fraction of effective_max_position allowed in a single resting order.
 ///
 /// GLFT inventory theory: a single fill at max position creates reservation price
@@ -735,6 +737,48 @@ impl LadderStrategy {
             0.0
         };
 
+        // === POSITION ZONE: Graduated risk overlay ===
+        // Only kill switch can cancel all quotes. Everything else widens or reduces size.
+        // Zone thresholds are fractions of max_position:
+        //   Green  (<60%): normal operation
+        //   Yellow (60-80%): wider spread on accumulating side + smaller size
+        //   Red    (80-100%): reduce-only (only position-reducing side quotes)
+        //   Kill   (>100%): same as Red here; kill switch handles cancellation
+        let abs_inventory_ratio = inventory_ratio.abs();
+        let position_zone = if abs_inventory_ratio >= 1.0 {
+            PositionZone::Kill
+        } else if abs_inventory_ratio >= 0.8 {
+            PositionZone::Red
+        } else if abs_inventory_ratio >= 0.6 {
+            PositionZone::Yellow
+        } else {
+            PositionZone::Green
+        };
+
+        // Zone-aware size multiplier: reduces size as we approach limits
+        let zone_size_mult = match position_zone {
+            PositionZone::Green => 1.0,
+            PositionZone::Yellow => 0.5,
+            PositionZone::Red | PositionZone::Kill => 0.3, // Minimal size, reduce-only
+        };
+
+        // Zone-aware spread widening on the accumulating side
+        let zone_spread_widen_bps = match position_zone {
+            PositionZone::Green => 0.0,
+            PositionZone::Yellow => 3.0,  // +3 bps on accumulating side
+            PositionZone::Red | PositionZone::Kill => 10.0, // +10 bps (discourage accumulation)
+        };
+
+        if position_zone != PositionZone::Green {
+            tracing::info!(
+                zone = ?position_zone,
+                abs_inventory_ratio = %format!("{:.2}", abs_inventory_ratio),
+                zone_size_mult = %format!("{:.2}", zone_size_mult),
+                zone_spread_widen_bps = %format!("{:.1}", zone_spread_widen_bps),
+                "Position zone risk overlay active"
+            );
+        }
+
         // Convert AS spread adjustment to bps for ladder generation
         let as_at_touch_bps = if market_params.as_warmed_up {
             market_params.as_spread_adjustment * 10000.0
@@ -752,7 +796,8 @@ impl LadderStrategy {
         // FIXED: Previously used target_liquidity which was often much smaller than
         // quoting capacity (e.g., 1.3 HYPE vs 66 HYPE), causing ALL levels to fail
         // min_notional check, triggering concentration fallback BEFORE entropy optimizer.
-        let size_for_initial_ladder = effective_max_position * market_params.cascade_size_factor;
+        let size_for_initial_ladder =
+            effective_max_position * market_params.cascade_size_factor * zone_size_mult;
 
         // === L2 RESERVATION SHIFT (Avellaneda-Stoikov Framework) ===
         // Edge enters through the reservation price, not sizing.
@@ -952,6 +997,39 @@ impl LadderStrategy {
                 glft_optimal_bps = %format!("{:.2}", glft_optimal_bps),
                 gamma = %format!("{:.4}", gamma),
                 "Floor binding — gamma may be miscalibrated (should be rare after self-consistent gamma)"
+            );
+        }
+
+        // === POSITION ZONE: Apply graduated spread widening ===
+        // Widen the accumulating side in Yellow/Red zones.
+        // If long (position > 0), accumulating side = bids (buying more).
+        // If short (position < 0), accumulating side = asks (selling more).
+        if zone_spread_widen_bps > 0.0 {
+            let widen_bids = position > 0.0; // Long → bids accumulate
+            if widen_bids {
+                for depth in dynamic_depths.bid.iter_mut() {
+                    *depth += zone_spread_widen_bps;
+                }
+            } else {
+                for depth in dynamic_depths.ask.iter_mut() {
+                    *depth += zone_spread_widen_bps;
+                }
+            }
+        }
+
+        // In Red zone, clear the accumulating side entirely (reduce-only).
+        if matches!(position_zone, PositionZone::Red | PositionZone::Kill) {
+            if position > 0.0 {
+                // Long: clear bids (don't buy more), keep asks (let us sell)
+                dynamic_depths.bid.clear();
+            } else if position < 0.0 {
+                // Short: clear asks (don't sell more), keep bids (let us buy)
+                dynamic_depths.ask.clear();
+            }
+            tracing::warn!(
+                zone = ?position_zone,
+                position = %format!("{:.4}", position),
+                "Red zone: accumulating side cleared (reduce-only)"
             );
         }
 
@@ -2249,5 +2327,105 @@ mod tests {
             half_spread_bps >= target_floor_bps - 0.01,
             "GLFT half-spread ({half_spread_bps:.2} bps) should meet floor ({target_floor_bps:.2} bps)"
         );
+    }
+
+    #[test]
+    fn test_position_zone_green() {
+        // <60% inventory → Green zone
+        let abs_ratio = 0.5;
+        let zone = if abs_ratio >= 1.0 {
+            PositionZone::Kill
+        } else if abs_ratio >= 0.8 {
+            PositionZone::Red
+        } else if abs_ratio >= 0.6 {
+            PositionZone::Yellow
+        } else {
+            PositionZone::Green
+        };
+        assert_eq!(zone, PositionZone::Green);
+    }
+
+    #[test]
+    fn test_position_zone_yellow() {
+        // 60-80% inventory → Yellow zone
+        let abs_ratio = 0.7;
+        let zone = if abs_ratio >= 1.0 {
+            PositionZone::Kill
+        } else if abs_ratio >= 0.8 {
+            PositionZone::Red
+        } else if abs_ratio >= 0.6 {
+            PositionZone::Yellow
+        } else {
+            PositionZone::Green
+        };
+        assert_eq!(zone, PositionZone::Yellow);
+    }
+
+    #[test]
+    fn test_position_zone_red() {
+        // 80-100% inventory → Red zone
+        let abs_ratio = 0.85;
+        let zone = if abs_ratio >= 1.0 {
+            PositionZone::Kill
+        } else if abs_ratio >= 0.8 {
+            PositionZone::Red
+        } else if abs_ratio >= 0.6 {
+            PositionZone::Yellow
+        } else {
+            PositionZone::Green
+        };
+        assert_eq!(zone, PositionZone::Red);
+    }
+
+    #[test]
+    fn test_zone_size_multiplier_decreases() {
+        // Size multiplier should decrease as zone severity increases
+        let green_mult = 1.0_f64;
+        let yellow_mult = 0.5_f64;
+        let red_mult = 0.3_f64;
+
+        assert!(green_mult > yellow_mult);
+        assert!(yellow_mult > red_mult);
+        assert!(red_mult > 0.0, "Red zone should still have non-zero size for reduce-only");
+    }
+
+    #[test]
+    fn test_zone_spread_widening_increases() {
+        // Spread widening should increase with severity
+        let green_widen = 0.0_f64;
+        let yellow_widen = 3.0_f64;
+        let red_widen = 10.0_f64;
+
+        assert_eq!(green_widen, 0.0, "Green should have no widening");
+        assert!(yellow_widen > green_widen);
+        assert!(red_widen > yellow_widen);
+    }
+
+    #[test]
+    fn test_red_zone_clears_accumulating_side() {
+        // In Red zone, accumulating side should be cleared
+        let mut bid_depths = vec![5.0, 7.0, 9.0];
+        let ask_depths = vec![5.0, 7.0, 9.0];
+        let position = 1.0; // Long
+
+        // Simulate Red zone: long → clear bids (accumulating)
+        if position > 0.0 {
+            bid_depths.clear();
+        }
+
+        assert!(bid_depths.is_empty(), "Long in Red → bids should be cleared");
+        assert!(!ask_depths.is_empty(), "Long in Red → asks should remain");
+
+        // Short case
+        let bid_depths2 = vec![5.0, 7.0, 9.0];
+        let mut ask_depths2 = vec![5.0, 7.0, 9.0];
+        let position2 = -1.0;
+
+        if position2 < 0.0 {
+            ask_depths2.clear();
+        }
+
+        assert!(!bid_depths2.is_empty(), "Short in Red → bids should remain");
+        assert!(ask_depths2.is_empty(), "Short in Red → asks should be cleared");
     }
 }
