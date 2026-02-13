@@ -158,23 +158,42 @@ impl LiveAnalytics {
         }
 
         let sharpe_summary = self.sharpe_tracker.summary();
-        let (sharpe_all, sharpe_lo, sharpe_hi) = self.sharpe_tracker.sharpe_with_confidence(0.90);
-        let data_quality = if self.sharpe_tracker.has_sufficient_data() {
-            ""
+        let fill_count = sharpe_summary.count;
+
+        if fill_count < 10 {
+            // Too few fills for any meaningful statistics
+            info!(
+                fills = fill_count,
+                gross_pnl_bps = %format!("{:.1}", sharpe_summary.mean_return_bps * fill_count as f64),
+                avg_edge_bps = %format!("{:.1}", mean_realized_edge_bps),
+                "[ANALYTICS] TOO FEW FILLS -- Sharpe not reported"
+            );
+        } else if fill_count < 50 {
+            // Preliminary: report Sharpe but flag as unreliable
+            let (sharpe_all, sharpe_lo, sharpe_hi) = self.sharpe_tracker.sharpe_with_confidence(0.90);
+            info!(
+                "[ANALYTICS] PRELIMINARY Sharpe(1h)={:.2} Sharpe(all)={:.2} [{:.2}, {:.2}] Fills={} Edge={:.1}bps",
+                sharpe_summary.sharpe_1h,
+                sharpe_all,
+                sharpe_lo,
+                sharpe_hi,
+                fill_count,
+                mean_realized_edge_bps,
+            );
         } else {
-            " (insufficient data)"
-        };
-        info!(
-            "[ANALYTICS] Sharpe(1h)={:.2} Sharpe(24h)={:.2} Sharpe(all)={:.2} [{:.2}, {:.2}]{} Fills={} Edge={:.1}bps",
-            sharpe_summary.sharpe_1h,
-            sharpe_summary.sharpe_24h,
-            sharpe_all,
-            sharpe_lo,
-            sharpe_hi,
-            data_quality,
-            sharpe_summary.count,
-            mean_realized_edge_bps,
-        );
+            // Sufficient data: full output
+            let (sharpe_all, sharpe_lo, sharpe_hi) = self.sharpe_tracker.sharpe_with_confidence(0.90);
+            info!(
+                "[ANALYTICS] Sharpe(1h)={:.2} Sharpe(24h)={:.2} Sharpe(all)={:.2} [{:.2}, {:.2}] Fills={} Edge={:.1}bps",
+                sharpe_summary.sharpe_1h,
+                sharpe_summary.sharpe_24h,
+                sharpe_all,
+                sharpe_lo,
+                sharpe_hi,
+                fill_count,
+                mean_realized_edge_bps,
+            );
+        }
 
         if !self.signal_attributor.signal_names().is_empty() {
             let signal_parts: Vec<String> = self

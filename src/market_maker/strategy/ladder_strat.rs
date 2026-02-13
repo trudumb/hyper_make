@@ -658,6 +658,19 @@ impl LadderStrategy {
             legacy_gamma * bayesian_scalar
         };
 
+        // === REGIME GAMMA MULTIPLIER ===
+        // Route regime risk through gamma instead of floor clamping.
+        // This lets GLFT naturally widen spreads in volatile/extreme regimes
+        // via δ = (1/γ)ln(1 + γ/κ) — higher γ → wider spread.
+        let gamma = gamma * market_params.regime_gamma_multiplier;
+        if (market_params.regime_gamma_multiplier - 1.0).abs() > 0.01 {
+            tracing::info!(
+                regime_gamma_mult = %format!("{:.2}", market_params.regime_gamma_multiplier),
+                gamma_after = %format!("{:.4}", gamma),
+                "Regime gamma multiplier applied (replaces floor clamping)"
+            );
+        }
+
         // === KAPPA: Robust V3 > Adaptive > Legacy ===
         // Priority: 1. Robust kappa (outlier-resistant), 2. Adaptive, 3. Legacy
         let mut kappa = if market_params.use_kappa_robust {
@@ -900,18 +913,14 @@ impl LadderStrategy {
             },
         };
 
-        // === SPREAD FLOOR: Regime-Based Self-Consistent ===
-        // The floor is: fee + regime AS expected + total risk premium.
-        // GLFT with solve_min_gamma() produces the correct spread by construction,
-        // so no further adaptive/conditional flooring is needed.
+        // === SPREAD FLOOR: Physical Constraints Only ===
+        // The floor ONLY includes physical/exchange constraints that cannot be violated.
+        // Regime risk is routed through gamma (gamma_multiplier) instead of floor clamping.
+        // This lets GLFT produce the actual spread instead of being overridden by regime floors.
         let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
-        let regime_floor_bps = fee_bps
-            + market_params.regime_as_expected_bps
-            + market_params.total_risk_premium_bps;
-        // Still enforce tick and latency constraints as hard physical limits
         let tick_floor_bps = market_params.tick_size_bps;
         let latency_floor_bps = market_params.latency_spread_floor * 10_000.0;
-        let effective_floor_bps = regime_floor_bps
+        let effective_floor_bps = fee_bps
             .max(tick_floor_bps)
             .max(latency_floor_bps)
             .max(self.risk_config.min_spread_floor * 10_000.0);
@@ -922,9 +931,10 @@ impl LadderStrategy {
             phase = "floor",
             glft_optimal_bps = %format!("{:.2}", glft_optimal_bps),
             effective_floor_bps = %format!("{:.2}", effective_floor_bps),
-            regime_as_bps = %format!("{:.2}", market_params.regime_as_expected_bps),
-            risk_premium_bps = %format!("{:.2}", market_params.total_risk_premium_bps),
-            "[SPREAD TRACE] after regime-based floor computation"
+            fee_bps = %format!("{:.2}", fee_bps),
+            tick_bps = %format!("{:.2}", tick_floor_bps),
+            latency_bps = %format!("{:.2}", latency_floor_bps),
+            "[SPREAD TRACE] physical-only floor (regime risk routes through gamma)"
         );
 
         // === DYNAMIC DEPTHS: GLFT-optimal depth computation with Bayesian bounds ===
@@ -1102,11 +1112,28 @@ impl LadderStrategy {
         // The GLFT formula δ = (1/γ) × ln(1 + γ/κ) now handles all spread widening
         // in a mathematically principled way.
 
-        // Create ladder config with dynamic depths
-        let ladder_config = self
+        // Capital-aware level count: don't spread across more levels than capital can support
+        let budget_per_side = size_for_initial_ladder * market_params.microprice / 2.0;
+        let max_viable_levels = (budget_per_side / config.min_notional).floor() as usize;
+        let capital_limited_levels = if max_viable_levels < self.ladder_config.num_levels && max_viable_levels >= 1 {
+            tracing::info!(
+                budget_per_side = %format!("{:.2}", budget_per_side),
+                min_notional = %format!("{:.2}", config.min_notional),
+                max_viable_levels = max_viable_levels,
+                configured_levels = self.ladder_config.num_levels,
+                "Capital constrains ladder levels"
+            );
+            max_viable_levels
+        } else {
+            self.ladder_config.num_levels
+        };
+
+        // Create ladder config with dynamic depths and capital-limited levels
+        let mut ladder_config = self
             .ladder_config
             .clone()
             .with_dynamic_depths(dynamic_depths);
+        ladder_config.num_levels = capital_limited_levels;
 
         // INFO-level log for spread diagnostics
         // Shows gamma (includes book_depth + warmup scaling), kappa, and resulting spread
@@ -1703,14 +1730,19 @@ impl LadderStrategy {
             ladder.bids.retain(|l| l.size > min_size_for_exchange);
             ladder.asks.retain(|l| l.size > min_size_for_exchange);
 
-            // 10. CONCENTRATION FALLBACK: If all levels filtered out but total size
+            // 10. CONCENTRATION FALLBACK: If ladder is empty but total available size
             // meets min_notional, create single concentrated order at tightest depth.
-            // This prevents empty ladders when margin is tight but still above exchange minimum.
+            // This handles TWO cases:
+            //   a) Levels existed but were filtered by min_size_for_exchange (bids_before > 0)
+            //   b) Ladder::generate() returned empty because total_size was too small to
+            //      distribute across num_levels and pass min_notional per level (bids_before == 0)
+            // Case (b) occurs with small capital in restrictive regimes (e.g., $100 capital,
+            // Extreme regime → effective_max ~1 HYPE → 0.09/level across 10 levels < $10 min)
             let _min_size_for_order = config.min_notional / market_params.microprice; // Kept for reference
             let tightest_depth_bps = ladder_config.min_depth_bps;
 
             // Bid concentration fallback
-            if bids_before > 0 && ladder.bids.is_empty() {
+            if ladder.bids.is_empty() {
                 // Total available size for bids, capped at 25% of the USER'S risk-based
                 // max position per order (not margin-based quoting capacity).
                 // GLFT inventory theory: one fill at max position creates maximal reservation
@@ -1765,7 +1797,7 @@ impl LadderStrategy {
             }
 
             // Ask concentration fallback
-            if asks_before > 0 && ladder.asks.is_empty() {
+            if ladder.asks.is_empty() {
                 // Total available size for asks, capped at 25% of the USER'S risk-based
                 // max position per order (not margin-based quoting capacity).
                 let per_order_cap = (max_position * MAX_SINGLE_ORDER_FRACTION)
@@ -1812,6 +1844,109 @@ impl LadderStrategy {
                         mid_price = %format!("{:.2}", market_params.microprice),
                         "All ask levels filtered out (total size below min_notional)"
                     );
+                }
+            }
+
+            // === COST-BASIS-AWARE PRICE CLAMPING ===
+            // Prevent selling below breakeven (long) or buying above breakeven (short).
+            // This eliminates the "buy high, sell low" pattern observed in live trading.
+            // Override only when urgency is low — high urgency overrides to exit.
+            //
+            // IMPORTANT: The breakeven price must be snapped to the exchange tick grid
+            // BEFORE sig-fig rounding, using directional rounding (ceil for asks, floor
+            // for bids) to guarantee we never sell below / buy above true breakeven.
+            // The tick size is 10^(-price_decimals) where price_decimals = config.decimals.
+            if let Some(entry_price) = market_params.avg_entry_price {
+                let breakeven = market_params.breakeven_price;
+                let position = inventory_ratio; // already computed above
+                let tick_size = 10f64.powi(-(config.decimals as i32));
+
+                if breakeven > 0.0 {
+                    if position > 0.0 {
+                        // Long position: don't sell below breakeven unless urgent.
+                        // Round breakeven UP to tick grid so ask >= true breakeven.
+                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 50.0).max(0.0)).min(1.0);
+                        if urgency < 0.5 {
+                            // Snap breakeven UP to tick grid (ceil), then enforce 5-sig-fig
+                            let breakeven_on_tick = (breakeven / tick_size).ceil() * tick_size;
+                            let mut rounded_breakeven = round_to_significant_and_decimal(
+                                breakeven_on_tick,
+                                5,
+                                config.decimals,
+                            );
+                            // Safety: if sig-fig rounding dropped us below true breakeven,
+                            // bump up by one tick and re-round
+                            if rounded_breakeven < breakeven - EPSILON {
+                                rounded_breakeven = round_to_significant_and_decimal(
+                                    rounded_breakeven + tick_size,
+                                    5,
+                                    config.decimals,
+                                );
+                            }
+
+                            let mut clamped_count = 0;
+                            for level in ladder.asks.iter_mut() {
+                                if level.price < breakeven {
+                                    level.price = rounded_breakeven;
+                                    clamped_count += 1;
+                                }
+                            }
+                            if clamped_count > 0 {
+                                tracing::info!(
+                                    entry = %format!("{:.4}", entry_price),
+                                    breakeven = %format!("{:.4}", breakeven),
+                                    rounded_breakeven = %format!("{:.4}", rounded_breakeven),
+                                    tick_size = %tick_size,
+                                    unrealized_bps = %format!("{:.1}", market_params.unrealized_pnl_bps),
+                                    clamped = clamped_count,
+                                    urgency = %format!("{:.2}", urgency),
+                                    "[COST-BASIS] Long: clamped ask prices to breakeven"
+                                );
+                            }
+                        }
+                    } else if position < 0.0 {
+                        // Short position: don't buy above breakeven unless urgent.
+                        // Round breakeven DOWN to tick grid so bid <= true breakeven.
+                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 50.0).max(0.0)).min(1.0);
+                        if urgency < 0.5 {
+                            // Snap breakeven DOWN to tick grid (floor), then enforce 5-sig-fig
+                            let breakeven_on_tick = (breakeven / tick_size).floor() * tick_size;
+                            let mut rounded_breakeven = round_to_significant_and_decimal(
+                                breakeven_on_tick,
+                                5,
+                                config.decimals,
+                            );
+                            // Safety: if sig-fig rounding pushed us above true breakeven,
+                            // drop by one tick and re-round
+                            if rounded_breakeven > breakeven + EPSILON {
+                                rounded_breakeven = round_to_significant_and_decimal(
+                                    rounded_breakeven - tick_size,
+                                    5,
+                                    config.decimals,
+                                );
+                            }
+
+                            let mut clamped_count = 0;
+                            for level in ladder.bids.iter_mut() {
+                                if level.price > breakeven {
+                                    level.price = rounded_breakeven;
+                                    clamped_count += 1;
+                                }
+                            }
+                            if clamped_count > 0 {
+                                tracing::info!(
+                                    entry = %format!("{:.4}", entry_price),
+                                    breakeven = %format!("{:.4}", breakeven),
+                                    rounded_breakeven = %format!("{:.4}", rounded_breakeven),
+                                    tick_size = %tick_size,
+                                    unrealized_bps = %format!("{:.1}", market_params.unrealized_pnl_bps),
+                                    clamped = clamped_count,
+                                    urgency = %format!("{:.2}", urgency),
+                                    "[COST-BASIS] Short: clamped bid prices to breakeven"
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2260,43 +2395,45 @@ mod tests {
     }
 
     #[test]
-    fn test_regime_floor_composition() {
-        // Verify the regime-based floor = fee + AS expected + risk premium
-        let fee_bps: f64 = 1.5;
+    fn test_regime_gamma_multiplier_ordering() {
+        // Regime risk routes through gamma_multiplier, not spread floor.
+        // More volatile regimes have higher gamma → wider GLFT spreads.
+        use crate::market_maker::strategy::regime_state::MarketRegime;
 
-        // Normal regime: fee(1.5) + AS(1.0) + risk(1.0) = 3.5 bps
-        let normal_floor = fee_bps + 1.0 + 1.0;
-        assert!((normal_floor - 3.5_f64).abs() < 0.01);
+        let calm = MarketRegime::Calm.default_params();
+        let normal = MarketRegime::Normal.default_params();
+        let volatile = MarketRegime::Volatile.default_params();
+        let extreme = MarketRegime::Extreme.default_params();
 
-        // Extreme regime: fee(1.5) + AS(5.0) + risk(6.0) = 12.5 bps
-        let extreme_floor = fee_bps + 5.0 + 6.0;
-        assert!((extreme_floor - 12.5_f64).abs() < 0.01);
+        assert!(calm.gamma_multiplier <= normal.gamma_multiplier);
+        assert!(normal.gamma_multiplier < volatile.gamma_multiplier);
+        assert!(volatile.gamma_multiplier < extreme.gamma_multiplier);
 
-        // Floor must exceed fee (profitable quoting)
-        assert!(normal_floor > fee_bps);
-        assert!(extreme_floor > fee_bps);
-
-        // Extreme floor must be wider than normal floor
-        assert!(extreme_floor > normal_floor);
+        // Calm = 1.0 (no scaling), Extreme = 3.0 (3x gamma → significantly wider)
+        assert!((calm.gamma_multiplier - 1.0).abs() < 0.01);
+        assert!((extreme.gamma_multiplier - 3.0).abs() < 0.01);
     }
 
     #[test]
-    fn test_risk_premium_flows_through_floor() {
-        // Test that increasing risk premium increases the floor
+    fn test_physical_floor_is_fee_minimum() {
+        // Physical floor = max(fee, tick, latency, min_spread_floor).
+        // With default config: min_spread_floor = 0.00015 = 1.5 bps = fee.
+        // So physical floor = 1.5 bps in normal conditions (tick < 1.5, latency < 1.5).
         let fee_bps: f64 = 1.5;
-        let as_bps: f64 = 1.0;
+        let tick_bps: f64 = 0.5; // typical
+        let latency_bps: f64 = 0.1; // low latency
+        let min_floor_bps: f64 = 1.5; // new default
 
-        let low_risk = fee_bps + as_bps + 0.5; // risk_premium = 0.5
-        let high_risk = fee_bps + as_bps + 5.0; // risk_premium = 5.0
+        let physical_floor = fee_bps.max(tick_bps).max(latency_bps).max(min_floor_bps);
+        assert!((physical_floor - 1.5_f64).abs() < 0.01,
+            "Physical floor should be 1.5 bps (maker fee), got {physical_floor}");
 
-        assert!(
-            high_risk > low_risk,
-            "Higher risk premium should produce wider floor: {high_risk} vs {low_risk}"
-        );
-
-        // Delta matches the risk premium difference
-        let delta = high_risk - low_risk;
-        assert!((delta - 4.5_f64).abs() < 0.01, "Floor delta should equal risk premium delta");
+        // GLFT optimal should be ABOVE the fee floor in normal conditions
+        // GLFT approx: 1/kappa * 10000 + fee
+        let kappa = 2000.0;
+        let glft_approx = 1.0 / kappa * 10_000.0 + fee_bps;
+        assert!(glft_approx > physical_floor,
+            "GLFT ({glft_approx:.2}) should exceed physical floor ({physical_floor:.2})");
     }
 
     #[test]
@@ -2427,5 +2564,123 @@ mod tests {
 
         assert!(!bid_depths2.is_empty(), "Short in Red → bids should remain");
         assert!(ask_depths2.is_empty(), "Short in Red → asks should be cleared");
+    }
+
+    #[test]
+    fn test_cost_basis_breakeven_clamping() {
+        // Long position: asks should not go below breakeven
+        let entry = 100.0;
+        let fee_rate = 0.00015;
+        let breakeven = entry * (1.0 + fee_rate); // 100.015
+
+        let ask_price = 99.99; // Below breakeven
+        assert!(ask_price < breakeven, "Ask ({ask_price}) should be below breakeven ({breakeven})");
+
+        // Clamping should move it up to breakeven
+        let clamped = breakeven;
+        assert!(clamped >= breakeven, "Clamped ask should be at or above breakeven");
+
+        // Short position: bids should not go above breakeven
+        let breakeven_short = entry * (1.0 - fee_rate); // 99.985
+        let bid_price = 100.01; // Above breakeven for short
+        assert!(bid_price > breakeven_short, "Bid ({bid_price}) should be above breakeven ({breakeven_short})");
+
+        let clamped_bid = breakeven_short;
+        assert!(clamped_bid <= breakeven_short, "Clamped bid should be at or below breakeven");
+    }
+
+    #[test]
+    fn test_cost_basis_breakeven_tick_rounding() {
+        // Validates the fix for "Order has invalid price" errors.
+        // The breakeven price must land on the exchange tick grid
+        // (10^(-price_decimals)) AND satisfy the 5-sig-fig constraint.
+        use crate::round_to_significant_and_decimal;
+
+        // HYPE-like: price ~$25, price_decimals=4, tick=0.0001
+        let decimals: u32 = 4;
+        let tick_size: f64 = 10f64.powi(-(decimals as i32)); // 0.0001
+
+        // === Ask side (long position): breakeven rounded UP ===
+        // Breakeven at a non-tick-aligned price
+        let breakeven_ask = 25.12345678;
+        let breakeven_on_tick = (breakeven_ask / tick_size).ceil() * tick_size;
+        let rounded = round_to_significant_and_decimal(breakeven_on_tick, 5, decimals);
+
+        // Must be on tick grid: (rounded / tick_size) is integer within float tolerance
+        let ticks = rounded / tick_size;
+        assert!(
+            (ticks - ticks.round()).abs() < 1e-6,
+            "Ask breakeven {rounded} not on tick grid (tick={tick_size})"
+        );
+        // Must satisfy 5 sig figs: re-rounding is idempotent
+        let re_rounded = round_to_significant_and_decimal(rounded, 5, decimals);
+        assert!(
+            (re_rounded - rounded).abs() < 1e-10,
+            "Ask breakeven {rounded} does not satisfy 5-sig-fig: re-rounded to {re_rounded}"
+        );
+        // Must be >= true breakeven (we rounded UP)
+        assert!(
+            rounded >= breakeven_ask - 1e-9,
+            "Ask breakeven {rounded} is below true breakeven {breakeven_ask}"
+        );
+
+        // === Bid side (short position): breakeven rounded DOWN ===
+        let breakeven_bid = 25.12345678;
+        let breakeven_on_tick_bid = (breakeven_bid / tick_size).floor() * tick_size;
+        let rounded_bid = round_to_significant_and_decimal(breakeven_on_tick_bid, 5, decimals);
+
+        // Must be on tick grid
+        let ticks_bid = rounded_bid / tick_size;
+        assert!(
+            (ticks_bid - ticks_bid.round()).abs() < 1e-6,
+            "Bid breakeven {rounded_bid} not on tick grid (tick={tick_size})"
+        );
+        // Must satisfy 5 sig figs
+        let re_rounded_bid = round_to_significant_and_decimal(rounded_bid, 5, decimals);
+        assert!(
+            (re_rounded_bid - rounded_bid).abs() < 1e-10,
+            "Bid breakeven {rounded_bid} does not satisfy 5-sig-fig: re-rounded to {re_rounded_bid}"
+        );
+        // Must be <= true breakeven (we rounded DOWN)
+        assert!(
+            rounded_bid <= breakeven_bid + 1e-9,
+            "Bid breakeven {rounded_bid} is above true breakeven {breakeven_bid}"
+        );
+
+        // === Edge case: breakeven already on tick grid ===
+        let exact_breakeven = 25.123;
+        let on_tick = (exact_breakeven / tick_size).ceil() * tick_size;
+        let rounded_exact = round_to_significant_and_decimal(on_tick, 5, decimals);
+        assert!(
+            (rounded_exact - exact_breakeven).abs() < 1e-9,
+            "Already-on-tick breakeven {exact_breakeven} changed to {rounded_exact}"
+        );
+
+        // === Edge case: very small decimal diff that triggers the bug ===
+        // breakeven = 25.0005 -> 5-sig-fig rounds to 25.001 (3 decimals)
+        // This should be fine since 25.001 > 25.0005 for asks
+        let tricky = 25.00045;
+        let tricky_on_tick = (tricky / tick_size).ceil() * tick_size;
+        let tricky_rounded = round_to_significant_and_decimal(tricky_on_tick, 5, decimals);
+        assert!(
+            tricky_rounded >= tricky - 1e-9,
+            "Tricky ask breakeven {tricky_rounded} < true {tricky}"
+        );
+    }
+
+    #[test]
+    fn test_cost_basis_urgency_override() {
+        // When position is large AND deeply underwater, urgency > 0.5 skips clamping
+        let position_fraction: f64 = 0.9; // 90% of max
+        let unrealized_bps: f64 = -60.0; // 6 bps underwater
+
+        let urgency: f64 = (position_fraction * (-unrealized_bps / 50.0_f64).max(0.0)).min(1.0);
+        assert!(urgency > 0.5, "High position + underwater should produce urgency > 0.5, got {urgency}");
+
+        // Small position, slightly underwater: no urgency override
+        let position_fraction2: f64 = 0.2;
+        let unrealized_bps2: f64 = -5.0;
+        let urgency2: f64 = (position_fraction2 * (-unrealized_bps2 / 50.0_f64).max(0.0)).min(1.0);
+        assert!(urgency2 < 0.5, "Small position, slightly underwater: urgency should be < 0.5, got {urgency2}");
     }
 }

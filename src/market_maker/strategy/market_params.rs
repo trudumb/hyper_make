@@ -762,6 +762,20 @@ pub struct MarketParams {
     /// Total risk premium (bps): regime risk premium + hawkes addon + toxicity addon + staleness addon.
     /// Used as input to solve_min_gamma() for self-consistent spread floor.
     pub total_risk_premium_bps: f64,
+    /// Regime gamma multiplier — routes regime risk through gamma instead of floor.
+    /// Calm=1.0, Normal=1.2, Volatile=2.0, Extreme=3.0.
+    pub regime_gamma_multiplier: f64,
+
+    // ==================== Cost-Basis-Aware Quoting ====================
+    /// Average entry price for current position. None if flat.
+    /// From PnLTracker::avg_entry_price.
+    pub avg_entry_price: Option<f64>,
+    /// Breakeven price including fees. Entry + fees for longs, entry - fees for shorts.
+    /// Selling below this (long) or buying above this (short) guarantees a loss.
+    pub breakeven_price: f64,
+    /// Unrealized PnL in basis points relative to entry.
+    /// Positive = in profit, negative = underwater.
+    pub unrealized_pnl_bps: f64,
 
     // ==================== Bayesian Gamma Components (Alpha Plan) ====================
     /// Trend confidence [0, 1] from directional signals.
@@ -1128,6 +1142,10 @@ impl Default for MarketParams {
             controller_objective: ControllerObjective::MeanRevert,
             max_position_fraction: 0.8,
             total_risk_premium_bps: 1.0, // Default: 1 bps risk premium
+            regime_gamma_multiplier: 1.0, // Default: Normal regime
+            avg_entry_price: None,
+            breakeven_price: 0.0,
+            unrealized_pnl_bps: 0.0,
             // Bayesian Gamma Components (Alpha Plan)
             trend_confidence: 0.5,        // 50% confidence initially (uncertain)
             bootstrap_confidence: 0.0,    // Not calibrated initially

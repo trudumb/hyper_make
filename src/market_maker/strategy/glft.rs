@@ -387,22 +387,19 @@ impl GLFTStrategy {
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
         //
-        // The floor is: fee + regime AS expected + total risk premium.
-        // This replaces the learned/adaptive/static waterfall with a single
-        // regime-aware formula. GLFT produces the correct spread by construction.
+        // The floor is physical constraints only: fee + tick + latency.
+        // Regime risk routes through gamma_multiplier, not floor clamping.
         let time_horizon = self.holding_time(market_params.arrival_intensity);
-        let regime_floor_bps = cfg.maker_fee_rate * 10_000.0
-            + market_params.regime_as_expected_bps
-            + market_params.total_risk_premium_bps;
-        let regime_floor_frac = (regime_floor_bps / 10_000.0).max(cfg.min_spread_floor);
+        let physical_floor_frac = cfg.maker_fee_rate.max(cfg.min_spread_floor);
         let min_gamma = solve_min_gamma(
-            regime_floor_frac,
+            physical_floor_frac,
             market_params.kappa.max(1.0),
             market_params.sigma_effective.max(1e-8),
             time_horizon,
             cfg.maker_fee_rate,
         );
-        let gamma_with_floor = gamma_final.max(min_gamma);
+        // Apply regime gamma multiplier: routes regime risk through gamma
+        let gamma_with_floor = gamma_final.max(min_gamma) * market_params.regime_gamma_multiplier;
 
         let gamma_clamped = gamma_with_floor.clamp(cfg.gamma_min, cfg.gamma_max);
 
@@ -2255,7 +2252,14 @@ mod tests {
         risk_config.use_monopolist_pricing = true;
         risk_config.monopolist_markup_cap_bps = 5.0;
         let strategy = GLFTStrategy::with_config(risk_config);
-        let config = test_quote_config();
+        // Use 4 decimal places so monopolist markup (0.8 bps = $0.008 at $100)
+        // survives price rounding (at 2 decimals it rounds to $0.00)
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 4,
+            min_notional: 10.0,
+        };
 
         // Sole LP: competitor_count = 0, market_share = 0.8
         let mut mp = test_market_params();

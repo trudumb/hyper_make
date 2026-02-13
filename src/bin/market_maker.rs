@@ -407,6 +407,8 @@ pub struct AppConfig {
     pub monitoring: MonitoringAppConfig,
     #[serde(default)]
     pub kill_switch: KillSwitchAppConfig,
+    #[serde(default)]
+    pub stochastic: StochasticConfig,
 }
 
 /// Kill switch configuration from TOML.
@@ -1633,6 +1635,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(v) = cli.quote_gate_min_edge_confidence {
             cfg.quote_gate_min_edge_confidence = v;
         }
+        // Position ramp starts below exchange minimum at $100 capital on HYPE.
+        // Disable until TOML→StochasticConfig wiring is implemented.
+        cfg.enable_position_ramp = false;
+        cfg.enable_performance_gating = false;
         cfg
     };
 

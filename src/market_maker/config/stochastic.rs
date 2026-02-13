@@ -1,5 +1,7 @@
 //! Stochastic module integration configuration.
 
+use serde::{Deserialize, Serialize};
+
 /// Method for calculating Kelly time horizon for first-passage fill probability.
 ///
 /// The Kelly-Stochastic optimizer needs a time horizon τ to compute fill probabilities.
@@ -8,7 +10,7 @@
 /// For first-passage probability P(fill) = 2Φ(-δ/(σ√τ)) to be meaningful:
 /// - τ must be long enough for price to diffuse to quote depth
 /// - τ = (δ/σ)² gives P(fill at δ) ≈ 15.9%
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub enum KellyTimeHorizonMethod {
     /// Fixed time horizon in seconds.
     /// Use when you want predictable behavior regardless of volatility.
@@ -31,7 +33,8 @@ pub enum KellyTimeHorizonMethod {
 /// - Constrained variational ladder optimization
 /// - Depth-dependent adverse selection calibration
 /// - Kelly-Stochastic optimal allocation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StochasticConfig {
     /// Use HJB optimal_skew instead of heuristic inventory_skew_with_flow.
     /// When true: skew = γσ²qT + terminal_penalty × q × urgency + funding_bias

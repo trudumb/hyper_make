@@ -435,7 +435,7 @@ impl RegimeHMM {
             emission_learning_rate: 0.01,
             vol_buffer: VecDeque::with_capacity(2000),
             spread_buffer: VecDeque::with_capacity(2000),
-            calibration_buffer_size: 200,
+            calibration_buffer_size: 600,
             initial_calibration_done: false,
             recalibration_window: 2000,
             recalibration_interval: 500,
@@ -756,6 +756,20 @@ impl RegimeHMM {
     /// Get the number of observations processed.
     pub fn observation_count(&self) -> u64 {
         self.observation_count
+    }
+
+    /// Authority ramp: regime has no power early in session.
+    /// At 200 obs (old threshold), authority = 0.067 -- regime only reduces by ~5%.
+    /// Full authority at 3000 obs.
+    pub fn authority(&self) -> f64 {
+        (self.observation_count as f64 / 3000.0).min(1.0)
+    }
+
+    /// Damped max position fraction -- prevents regime from destroying quoting capacity early.
+    /// Returns 1.0 when authority is 0 (full position), gradually applies regime restriction.
+    pub fn damped_max_position_fraction(&self, raw_fraction: f64) -> f64 {
+        let auth = self.authority();
+        1.0 - auth * (1.0 - raw_fraction)
     }
 
     /// Get entropy of current belief (measure of uncertainty).

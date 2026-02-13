@@ -58,6 +58,7 @@ impl MarketRegime {
                 as_expected_bps: 1.0,
                 risk_premium_bps: 0.5,
                 controller_objective: ControllerObjective::MeanRevert,
+                gamma_multiplier: 1.0,
             },
             Self::Normal => RegimeParams {
                 kappa: 2000.0,
@@ -70,30 +71,33 @@ impl MarketRegime {
                 as_expected_bps: 1.0,
                 risk_premium_bps: 1.0,
                 controller_objective: ControllerObjective::MeanRevert,
+                gamma_multiplier: 1.2,
             },
             Self::Volatile => RegimeParams {
                 kappa: 1000.0,
                 spread_floor_bps: 10.0,
                 skew_gain: 0.5,
-                max_position_fraction: 0.5,
+                max_position_fraction: 0.7,
                 emergency_cp_threshold: 0.6,
                 reduce_only_fraction: 0.3,
                 size_multiplier: 0.5,
                 as_expected_bps: 3.0,
                 risk_premium_bps: 3.0,
                 controller_objective: ControllerObjective::TrendingToxic,
+                gamma_multiplier: 2.0,
             },
             Self::Extreme => RegimeParams {
                 kappa: 500.0,
                 spread_floor_bps: 20.0,
                 skew_gain: 0.3,
-                max_position_fraction: 0.3,
+                max_position_fraction: 0.5,
                 emergency_cp_threshold: 0.4,
                 reduce_only_fraction: 0.2,
                 size_multiplier: 0.3,
                 as_expected_bps: 5.0,
                 risk_premium_bps: 6.0,
                 controller_objective: ControllerObjective::TrendingToxic,
+                gamma_multiplier: 3.0,
             },
         }
     }
@@ -127,6 +131,11 @@ pub struct RegimeParams {
     /// Controller objective for this regime.
     #[serde(default)]
     pub controller_objective: ControllerObjective,
+    /// Gamma multiplier for this regime.
+    /// Routes regime risk through gamma instead of spread floor clamping.
+    /// Higher gamma → wider spreads via GLFT formula δ = (1/γ)ln(1 + γ/κ).
+    #[serde(default = "default_gamma_multiplier")]
+    pub gamma_multiplier: f64,
 }
 
 impl RegimeParams {
@@ -171,6 +180,10 @@ pub struct RegimeState {
     /// The proposed regime (may differ from active during hysteresis).
     #[serde(default)]
     proposed_regime: MarketRegime,
+}
+
+fn default_gamma_multiplier() -> f64 {
+    1.0
 }
 
 fn default_confidence() -> f64 {

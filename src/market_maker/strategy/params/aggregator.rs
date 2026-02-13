@@ -611,6 +611,10 @@ impl ParameterAggregator {
             controller_objective: ControllerObjective::MeanRevert,
             max_position_fraction: 0.8,
             total_risk_premium_bps: 1.0, // Wired from regime + addons in quote_engine
+            regime_gamma_multiplier: 1.0, // Wired from regime_state in quote_engine
+            avg_entry_price: None,
+            breakeven_price: 0.0,
+            unrealized_pnl_bps: 0.0,
 
             // === Bayesian Gamma Components (Alpha Plan) ===
             // These are populated from QuoteGate and TheoreticalEdgeEstimator

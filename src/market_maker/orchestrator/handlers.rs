@@ -1824,7 +1824,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === Live Analytics: Periodic summary (Sharpe, signal attribution) ===
         let mean_edge = self.tier2.edge_tracker.mean_realized_edge();
-        let _ = self.live_analytics.maybe_log_summary(mean_edge);
+        let logged_summary = self.live_analytics.maybe_log_summary(mean_edge);
+
+        // === PnL Summary (only when analytics summary fires, to avoid log spam) ===
+        if logged_summary {
+            let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+            tracing::info!(
+                realized = %format!("${:.2}", pnl_summary.realized_pnl),
+                unrealized = %format!("${:.2}", pnl_summary.unrealized_pnl),
+                total = %format!("${:.2}", pnl_summary.total_pnl),
+                fills = pnl_summary.fill_count,
+                "[PnL] session summary"
+            );
+        }
 
         // Log current state for debugging
         trace!(

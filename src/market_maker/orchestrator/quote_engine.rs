@@ -955,6 +955,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             market_params.regime_size_multiplier = rp.size_multiplier;
             market_params.controller_objective = rp.controller_objective;
             market_params.max_position_fraction = rp.max_position_fraction;
+            market_params.regime_gamma_multiplier = rp.gamma_multiplier;
+        }
+
+        // === COST-BASIS-AWARE QUOTING ===
+        // Thread entry price and unrealized PnL to ladder for breakeven-aware quoting.
+        {
+            let position = self.position.position();
+            let entry = self.tier2.pnl_tracker.avg_entry_price();
+            let fee_rate = 0.00015; // 1.5 bps maker fee
+
+            if position.abs() > 1e-9 && entry > 0.0 {
+                market_params.avg_entry_price = Some(entry);
+                // Breakeven = entry + fees for longs, entry - fees for shorts
+                market_params.breakeven_price = if position > 0.0 {
+                    entry * (1.0 + fee_rate) // Must sell above this to profit
+                } else {
+                    entry * (1.0 - fee_rate) // Must buy below this to profit
+                };
+                let unrealized = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
+                let notional = position.abs() * entry;
+                market_params.unrealized_pnl_bps = if notional > 0.0 {
+                    unrealized / notional * 10_000.0
+                } else {
+                    0.0
+                };
+            } else {
+                market_params.avg_entry_price = None;
+                market_params.breakeven_price = 0.0;
+                market_params.unrealized_pnl_bps = 0.0;
+            }
         }
 
         // === Skew Context Update ===

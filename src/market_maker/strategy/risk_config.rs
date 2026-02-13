@@ -44,8 +44,9 @@ pub struct RiskConfig {
     /// Maximum γ ceiling
     pub gamma_max: f64,
 
-    /// Minimum spread floor (as fraction, e.g., 0.00015 = 1.5 bps)
-    /// Should be >= maker_fee_rate to ensure profitability at minimum spread
+    /// Minimum spread floor (as fraction, e.g., 0.00015 = 1.5 bps).
+    /// Physical minimum: must be >= maker_fee_rate to avoid guaranteed loss.
+    /// Regime risk routes through gamma_multiplier, not this floor.
     pub min_spread_floor: f64,
 
     /// Maximum holding time cap (seconds)
@@ -398,14 +399,10 @@ impl Default for RiskConfig {
             inventory_sensitivity: 3.0, // Increased from 2.0 - stronger inventory effect on gamma
             gamma_min: 0.05,
             gamma_max: 5.0,
-            // MAINNET OPTIMIZED: Tighter spread floor for liquid markets
-            // FIRST PRINCIPLES: min_spread_floor = fees + slippage + buffer
-            // Liquid market (mainnet BTC):
-            //   - Fees: 1.5 bps
-            //   - Expected slippage: 2.0 bps (tight books)
-            //   - Buffer: 1.5 bps
-            //   Total: 5 bps (reduced from 8 bps)
-            min_spread_floor: 0.0005, // 5 bps (reduced from 8 bps)
+            // FIRST PRINCIPLES: min_spread_floor = maker fee (physical minimum).
+            // Regime risk is now routed through gamma_multiplier, not floor.
+            // Floor only prevents quoting below fee (guaranteed loss).
+            min_spread_floor: 0.00015, // 1.5 bps = Hyperliquid maker fee
             max_holding_time: 120.0,  // 2 minutes
             flow_sensitivity: 0.5,    // exp(-0.5) ≈ 0.61 at perfect alignment
             maker_fee_rate: 0.00015,  // 1.5 bps Hyperliquid maker fee
