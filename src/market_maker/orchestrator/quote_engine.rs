@@ -918,6 +918,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             crate::market_maker::strategy::regime_state::MarketRegime::Extreme => 3,
         };
 
+        // === Skew Context Update ===
+        // Wire inventory + signal skew context before get_signals().
+        // set_skew_context() drives inventory-based and signal-based directional skew.
+        let alpha_estimate = {
+            let flow_dir = self.stochastic.trade_flow_tracker.imbalance_at_5s();
+            (0.5 + flow_dir * 0.3).clamp(0.1, 0.9)
+        };
+        let half_spread_est_bps = (market_params.adaptive_spread_floor * 10000.0).max(5.0);
+        self.stochastic.signal_integrator.set_skew_context(
+            self.position.position(),
+            self.config.max_position,
+            alpha_estimate,
+            half_spread_est_bps,
+        );
+
         // === Lead-Lag Signal Integration ===
         // Wire cross-exchange lead-lag signal for predictive skew.
         // Uses SignalIntegrator which combines:
@@ -1081,6 +1096,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 kappa_ratio = %format!("{:.2}", self.stochastic.threshold_kappa.kappa_ratio()),
                 multiplier = %format!("{:.2}", threshold_kappa_mult),
                 "ThresholdKappa: Momentum regime detected, widening spreads"
+            );
+        }
+
+        // === HAWKES EXCITATION: Widen spreads during trade clustering ===
+        let hawkes_widening = self.stochastic.hawkes_predictor.spread_widening_factor();
+        if hawkes_widening > 1.05 {
+            spread_multiplier *= hawkes_widening.min(2.0);
+            info!(
+                hawkes_mult = %format!("{:.2}", hawkes_widening),
+                "Hawkes: widening spreads due to trade clustering"
             );
         }
 

@@ -602,6 +602,11 @@ pub struct StochasticComponents {
     /// Updated early in each quote cycle from HMM probs, BOCPD, and kappa estimator.
     /// All downstream consumers read `regime_state.params` for regime-conditioned values.
     pub regime_state: RegimeState,
+
+    // === Hawkes Excitation Prediction (Phase 1: Feature Engineering) ===
+    /// Hawkes excitation predictor: detects trade clustering for reactive spread widening.
+    /// Uses calibrated branching ratio and intensity percentiles from HawkesOrderFlowEstimator.
+    pub hawkes_predictor: crate::market_maker::process_models::hawkes::HawkesExcitationPredictor,
 }
 
 impl StochasticComponents {
@@ -725,6 +730,8 @@ impl StochasticComponents {
             trade_flow_tracker: TradeFlowTracker::new(),
             // Regime state machine (Phase 2 Redesign)
             regime_state: RegimeState::new(),
+            // Hawkes excitation predictor for spread widening
+            hawkes_predictor: crate::market_maker::process_models::hawkes::HawkesExcitationPredictor::default(),
         }
     }
 
@@ -905,6 +912,6 @@ mod tests {
         assert!(belief[1] > 0.5); // Normal regime index is 1
                                   // Ensemble should start empty
         let summary = stochastic.ensemble.summary();
-        assert_eq!(summary.total_models, 0);
+        assert_eq!(summary.total_models, 2);
     }
 }

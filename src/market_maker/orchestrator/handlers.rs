@@ -636,6 +636,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.stochastic.signal_integrator.set_hl_flow_features(hl_flow);
         }
 
+        // === Feed Hawkes excitation predictor for reactive spread widening ===
+        // Forward latest summary from the order flow estimator to the excitation predictor.
+        // This drives spread_widening_factor() consumed in the quote engine.
+        {
+            let hawkes_summary = self.tier2.hawkes.summary();
+            self.stochastic.hawkes_predictor.update_summary(hawkes_summary);
+        }
+
         Ok(())
     }
 

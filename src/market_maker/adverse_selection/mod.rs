@@ -18,6 +18,7 @@
 //! - `estimator`: Main adverse selection estimator (post-fill measurement)
 //! - `pre_fill_classifier`: Pre-fill toxicity prediction
 
+pub mod book_dynamics;
 mod cancel_race;
 mod depth_decay;
 mod enhanced_classifier;
