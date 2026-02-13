@@ -9,6 +9,7 @@ mod ladder_strat;
 mod market_params;
 mod params;
 mod position_manager;
+pub mod regime_state;
 mod risk_config;
 mod risk_model;
 mod signal_integration;
@@ -22,6 +23,9 @@ pub use ladder_strat::*;
 pub use market_params::*;
 pub use params::*;
 pub use position_manager::*;
+// regime_state types are used via qualified paths (strategy::regime_state::*)
+// to avoid name conflicts with control::changepoint::MarketRegime and
+// infra::metrics::dashboard::RegimeState.
 pub use risk_config::*;
 pub use risk_model::*;
 pub use signal_integration::*;

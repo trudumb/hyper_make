@@ -16,7 +16,8 @@ use crate::market_maker::{
         TheoreticalEdgeEstimator,
     },
     stochastic::{StochasticControlBuilder, StochasticControlConfig},
-    strategy::{PositionDecisionConfig, PositionDecisionEngine, SignalIntegrator, SignalIntegratorConfig},
+    strategy::{PositionDecisionConfig, PositionDecisionEngine, SignalIntegrator, SignalIntegratorConfig,
+               regime_state::RegimeState},
     estimator::{
         CalibrationController, CalibrationControllerConfig, RegimeHMM,
         EnhancedFlowConfig, EnhancedFlowEstimator,
@@ -595,6 +596,12 @@ pub struct StochasticComponents {
     /// EWMA-based trade flow tracker: directional volume imbalance at multiple horizons.
     /// Replaces hardcoded zeros in FlowFeatureVec for imbalance_30s, avg_buy_size, etc.
     pub trade_flow_tracker: TradeFlowTracker,
+
+    // === Regime State Machine (Phase 2 Redesign) ===
+    /// Single source of truth for all regime-dependent parameters.
+    /// Updated early in each quote cycle from HMM probs, BOCPD, and kappa estimator.
+    /// All downstream consumers read `regime_state.params` for regime-conditioned values.
+    pub regime_state: RegimeState,
 }
 
 impl StochasticComponents {
@@ -711,6 +718,8 @@ impl StochasticComponents {
             signal_integrator: SignalIntegrator::new(SignalIntegratorConfig::default()),
             // HL-Native Trade Flow Tracking
             trade_flow_tracker: TradeFlowTracker::new(),
+            // Regime state machine (Phase 2 Redesign)
+            regime_state: RegimeState::new(),
         }
     }
 

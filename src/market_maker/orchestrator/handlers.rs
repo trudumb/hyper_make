@@ -276,7 +276,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 use crate::market_maker::calibration::parameter_learner::FillOutcome;
 
                 let direction = if pending.is_buy { 1.0 } else { -1.0 };
-                let as_realized = (self.latest_mid - pending.fill_price) * direction / pending.fill_price;
+                // Markout AS: how much did mid move against us from fill time to markout time.
+                // Uses mid_at_fill as reference (not fill_price) to isolate pure mid movement
+                // from the depth/spread component which is already captured in fill_distance_bps.
+                let mid_at_markout = self.latest_mid;
+                let as_realized = (mid_at_markout - pending.mid_at_fill) * direction / pending.mid_at_fill;
                 let as_realized_bps = as_realized * 10_000.0;
                 let fill_distance_bps = ((pending.fill_price - pending.mid_at_fill).abs() / pending.mid_at_fill) * 10_000.0;
                 let fill_pnl = -as_realized; // Negative AS = profit
@@ -312,9 +316,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 const MAKER_FEE_BPS: f64 = 1.5;
 
                 let markout_direction = if pending.is_buy { 1.0 } else { -1.0 };
-                let markout_as_bps = if pending.fill_price > 0.0 {
-                    (self.latest_mid - pending.fill_price) * markout_direction
-                        / pending.fill_price * 10_000.0
+                // Markout AS: mid movement from fill time to 5s later.
+                // Uses mid_at_fill (not fill_price) to isolate pure adverse mid drift
+                // from the depth/spread component already captured in quoted_spread_bps.
+                let markout_as_bps = if pending.mid_at_fill > 0.0 {
+                    (self.latest_mid - pending.mid_at_fill) * markout_direction
+                        / pending.mid_at_fill * 10_000.0
                 } else {
                     0.0
                 };
@@ -801,9 +808,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     0.0
                 };
 
-                // Compute instant AS using fill-time mid (Phase 1, will be refined at markout)
+                // Compute instant AS using mid at order placement time.
+                // Previously used self.latest_mid (fill-time mid), which made AS ≈ depth
+                // (tautological since both reference the same mid). Using mid_at_placement
+                // measures how much the fill price differs from where we THOUGHT mid was.
                 let direction = if is_buy { 1.0 } else { -1.0 };
-                let as_realized = (self.latest_mid - fill_price) * direction / fill_price;
+                let as_realized = (mid_at_placement - fill_price) * direction / fill_price;
 
                 // Compute depth from placement mid (not fill-time mid)
                 let depth_from_mid = if mid_at_placement > 0.0 {

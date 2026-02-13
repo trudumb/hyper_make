@@ -289,7 +289,7 @@ fn build_cycle_contributions(
             },
             SignalContribution {
                 signal_name: "RegimeDetection".to_string(),
-                spread_adjustment_bps: 0.0,
+                spread_adjustment_bps: (record.regime_kappa_spread_mult - 1.0) * 100.0,
                 skew_adjustment_bps: 0.0,
                 was_active: record.regime_active,
                 gating_weight: if record.regime_active { 1.0 } else { 0.0 },

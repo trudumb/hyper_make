@@ -681,19 +681,20 @@ impl LadderStrategy {
         };
 
         // === REGIME KAPPA BLENDING ===
-        // Blend selected kappa with regime-conditioned kappa (70% current + 30% regime).
-        // Regime kappa captures structural differences: Low vol → 3000, Normal → 2000,
-        // High → 1000, Extreme → 500. This makes spreads naturally widen in volatile regimes.
+        // Regime kappa is the PRIMARY driver of spread width (60% weight).
+        // Captures structural differences: Calm → 3000, Normal → 2000,
+        // Volatile → 1000, Extreme → 500. This makes spreads naturally widen
+        // in volatile regimes without relying on multiplicative spread chain.
         if let Some(regime_kappa) = market_params.regime_kappa {
             let kappa_before_regime = kappa;
-            const REGIME_BLEND_WEIGHT: f64 = 0.3;
+            const REGIME_BLEND_WEIGHT: f64 = 0.6;
             kappa = (1.0 - REGIME_BLEND_WEIGHT) * kappa + REGIME_BLEND_WEIGHT * regime_kappa;
             debug!(
                 kappa_before = %format!("{:.0}", kappa_before_regime),
                 regime_kappa = %format!("{:.0}", regime_kappa),
                 kappa_after = %format!("{:.0}", kappa),
                 regime = market_params.regime_kappa_current_regime,
-                "Regime kappa blending applied"
+                "Regime kappa blending applied (60% regime weight)"
             );
         }
         // NOTE: Agent 3's alpha-based kappa adjustment follows below.

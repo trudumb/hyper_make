@@ -863,6 +863,39 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
         }
 
+        // === Regime State Machine Update ===
+        // Update the centralized regime state from HMM probs, BOCPD, and kappa estimator.
+        // This runs BEFORE signal integration so all downstream consumers see current regime.
+        let signals_for_regime = self.stochastic.signal_integrator.get_signals();
+        let bocpd_cp = if belief_snapshot.changepoint.is_warmed_up {
+            belief_snapshot.changepoint.prob_5
+        } else {
+            0.0
+        };
+        let regime_changed = self.stochastic.regime_state.update(
+            &regime_probs,
+            bocpd_cp,
+            signals_for_regime.kappa_effective,
+        );
+        if regime_changed {
+            info!(
+                regime = self.stochastic.regime_state.regime_label(),
+                kappa = %format!("{:.0}", self.stochastic.regime_state.params.kappa),
+                floor_bps = %format!("{:.1}", self.stochastic.regime_state.params.spread_floor_bps),
+                confidence = %format!("{:.2}", self.stochastic.regime_state.confidence),
+                "Regime transition"
+            );
+        }
+
+        // Wire regime kappa into MarketParams so ladder strategy uses regime-adjusted kappa
+        market_params.regime_kappa = Some(self.stochastic.regime_state.params.kappa);
+        market_params.regime_kappa_current_regime = match self.stochastic.regime_state.regime {
+            crate::market_maker::strategy::regime_state::MarketRegime::Calm => 0,
+            crate::market_maker::strategy::regime_state::MarketRegime::Normal => 1,
+            crate::market_maker::strategy::regime_state::MarketRegime::Volatile => 2,
+            crate::market_maker::strategy::regime_state::MarketRegime::Extreme => 3,
+        };
+
         // === Lead-Lag Signal Integration ===
         // Wire cross-exchange lead-lag signal for predictive skew.
         // Uses SignalIntegrator which combines:
@@ -1029,8 +1062,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
         }
 
-        // === REGIME KAPPA: Widen when fill intensity is lower than expected ===
-        let regime_kappa_mult = {
+        // === REGIME KAPPA ===
+        // Regime kappa now flows through RegimeState -> market_params.regime_kappa
+        // into the ladder strategy's kappa selection (primary path).
+        // Retained as diagnostic only — no longer multiplied into spread.
+        let regime_kappa_mult = 1.0_f64;
+        let _regime_kappa_diagnostic = {
             let kappa_eff = signals.kappa_effective;
             let kappa_prior = self.stochastic.signal_integrator.kappa_prior();
             if kappa_eff > 0.0 && kappa_prior > 0.0 {
@@ -1039,15 +1076,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 1.0
             }
         };
-        if regime_kappa_mult > 1.01 {
-            spread_multiplier *= regime_kappa_mult;
-            debug!(
-                kappa_eff = %format!("{:.0}", signals.kappa_effective),
-                kappa_prior = %format!("{:.0}", self.stochastic.signal_integrator.kappa_prior()),
-                regime_mult = %format!("{:.2}", regime_kappa_mult),
-                "RegimeKappa: Widening spreads (low fill intensity)"
-            );
-        }
 
         // === MODEL GATING: Widen spreads when models are poorly calibrated ===
         let model_gating_mult = self.stochastic.signal_integrator.model_gating_spread_multiplier();
