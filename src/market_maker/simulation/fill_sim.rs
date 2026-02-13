@@ -143,6 +143,56 @@ impl QueuePositionEstimator {
     pub fn initial_size_at_level(&self) -> f64 {
         self.initial_size_at_level
     }
+
+    /// Conditional fill probability at a given depth from BBO.
+    ///
+    /// Returns P(fill | depth_ahead) in [0, 1].
+    /// Uses inverse-linear decay from the touch fill probability: the further
+    /// back in the queue (more depth ahead), the lower the fill probability.
+    ///
+    /// `depth_ahead_lots`: total size in the book ahead of our order.
+    /// `touch_fill_prob`: probability of fill when at the front (depth = 0).
+    /// `queue_alpha`: decay rate calibrated from `FillSimulatorConfig::queue_alpha`.
+    pub fn conditional_fill_prob(
+        &self,
+        depth_ahead_lots: f64,
+        touch_fill_prob: f64,
+        queue_alpha: f64,
+    ) -> f64 {
+        if depth_ahead_lots <= 0.0 {
+            return touch_fill_prob.clamp(0.0, 1.0);
+        }
+        // Survival-based model: P(fill) = touch_prob / (1 + alpha * depth)
+        // Parameterized by absolute depth rather than fractional queue position.
+        let decay = 1.0 / (1.0 + queue_alpha * depth_ahead_lots);
+        (touch_fill_prob * decay).clamp(0.0, 1.0)
+    }
+
+    /// Size scaling factor for a given level based on fill probability.
+    ///
+    /// Front of queue (depth=0) returns 1.0, back of queue approaches `min_fraction`.
+    /// Uses sqrt scaling so size decreases more gently than raw probability.
+    ///
+    /// `depth_ahead_lots`: total size in the book ahead of our order.
+    /// `touch_fill_prob`: probability of fill when at the front.
+    /// `queue_alpha`: decay rate.
+    /// `min_fraction`: minimum size fraction (floor).
+    pub fn size_scale_for_level(
+        &self,
+        depth_ahead_lots: f64,
+        touch_fill_prob: f64,
+        queue_alpha: f64,
+        min_fraction: f64,
+    ) -> f64 {
+        let p = self.conditional_fill_prob(depth_ahead_lots, touch_fill_prob, queue_alpha);
+        // Normalize by touch_fill_prob so front-of-queue gives 1.0
+        let normalized = if touch_fill_prob > 0.0 {
+            p / touch_fill_prob
+        } else {
+            1.0
+        };
+        normalized.sqrt().max(min_fraction)
+    }
 }
 
 /// Simulates fills for paper trading
@@ -846,5 +896,89 @@ mod tests {
         assert!((config.touch_fill_probability - 0.3).abs() < 1e-10);
         assert!((config.queue_position_factor - 0.4).abs() < 1e-10);
         assert!((config.queue_alpha - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_conditional_fill_prob_at_front() {
+        let est = QueuePositionEstimator::new(1, 1.0, 1.0);
+        let touch_prob = 0.3;
+        let alpha = 1.5;
+        // At front of queue (depth=0), should return touch_fill_prob
+        let p = est.conditional_fill_prob(0.0, touch_prob, alpha);
+        assert!((p - touch_prob).abs() < 1e-10,
+            "Front of queue should return touch_fill_prob, got {}", p);
+    }
+
+    #[test]
+    fn test_conditional_fill_prob_negative_depth() {
+        let est = QueuePositionEstimator::new(1, 1.0, 1.0);
+        // Negative depth is treated as front of queue
+        let p = est.conditional_fill_prob(-5.0, 0.3, 1.5);
+        assert!((p - 0.3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_conditional_fill_prob_decays_with_depth() {
+        let est = QueuePositionEstimator::new(1, 1.0, 10.0);
+        let touch_prob = 0.5;
+        let alpha = 0.1;
+
+        let p0 = est.conditional_fill_prob(0.0, touch_prob, alpha);
+        let p1 = est.conditional_fill_prob(1.0, touch_prob, alpha);
+        let p5 = est.conditional_fill_prob(5.0, touch_prob, alpha);
+        let p20 = est.conditional_fill_prob(20.0, touch_prob, alpha);
+
+        // Probability must strictly decrease with depth
+        assert!(p0 > p1, "p0={} should be > p1={}", p0, p1);
+        assert!(p1 > p5, "p1={} should be > p5={}", p1, p5);
+        assert!(p5 > p20, "p5={} should be > p20={}", p5, p20);
+
+        // All probabilities in [0, 1]
+        assert!(p20 > 0.0, "Should never reach zero");
+        assert!(p0 <= 1.0);
+    }
+
+    #[test]
+    fn test_conditional_fill_prob_clamped() {
+        let est = QueuePositionEstimator::new(1, 1.0, 1.0);
+        // Even with touch_prob > 1.0, should clamp
+        let p = est.conditional_fill_prob(0.0, 1.5, 1.0);
+        assert!((p - 1.0).abs() < 1e-10, "Should clamp to 1.0, got {}", p);
+    }
+
+    #[test]
+    fn test_size_scale_front_of_queue() {
+        let est = QueuePositionEstimator::new(1, 1.0, 1.0);
+        // Front of queue: depth = 0 -> scale = 1.0
+        let scale = est.size_scale_for_level(0.0, 0.3, 1.5, 0.1);
+        assert!((scale - 1.0).abs() < 1e-10,
+            "Front of queue should have scale 1.0, got {}", scale);
+    }
+
+    #[test]
+    fn test_size_scale_decreases_with_depth() {
+        let est = QueuePositionEstimator::new(1, 1.0, 10.0);
+        let touch_prob = 0.3;
+        let alpha = 0.5;
+        let min_frac = 0.05;
+
+        let s0 = est.size_scale_for_level(0.0, touch_prob, alpha, min_frac);
+        let s5 = est.size_scale_for_level(5.0, touch_prob, alpha, min_frac);
+        let s20 = est.size_scale_for_level(20.0, touch_prob, alpha, min_frac);
+
+        assert!(s0 > s5, "s0={} should be > s5={}", s0, s5);
+        assert!(s5 > s20, "s5={} should be > s20={}", s5, s20);
+        // All above minimum fraction
+        assert!(s20 >= min_frac, "Scale should be >= min_fraction, got {}", s20);
+    }
+
+    #[test]
+    fn test_size_scale_respects_min_fraction() {
+        let est = QueuePositionEstimator::new(1, 1.0, 1.0);
+        let min_frac = 0.5;
+        // Very deep queue: should be clamped to min_fraction
+        let scale = est.size_scale_for_level(1000.0, 0.3, 1.0, min_frac);
+        assert!(scale >= min_frac,
+            "Scale should be >= min_fraction {}, got {}", min_frac, scale);
     }
 }

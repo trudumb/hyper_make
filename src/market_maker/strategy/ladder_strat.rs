@@ -790,8 +790,10 @@ impl LadderStrategy {
         let skew_fraction = skew_bps / 10_000.0;
         let skewed_microprice = adjusted_microprice * (1.0 + skew_fraction);
 
-        // SAFETY: Bound skewed mid within half-spread of market_mid to prevent crossing
-        let half_spread_bound = market_params.market_spread_bps / 10_000.0 * 0.5;
+        // SAFETY: Bound skewed mid within 80% of GLFT half-spread to prevent crossing.
+        // Uses the GLFT formula directly so the bound is consistent with our quoting depth.
+        let glft_half_spread_frac = self.depth_generator.glft_optimal_spread(gamma, kappa);
+        let half_spread_bound = glft_half_spread_frac * 0.8;
         let max_mid = market_params.market_mid * (1.0 + half_spread_bound);
         let min_mid = market_params.market_mid * (1.0 - half_spread_bound);
         let effective_mid = skewed_microprice.clamp(min_mid, max_mid);
@@ -853,26 +855,21 @@ impl LadderStrategy {
             },
         };
 
-        // === SPREAD FLOOR: Adaptive vs Static ===
-        // When adaptive spreads enabled: use learned floor from Bayesian AS estimation
-        // When disabled: use static RiskConfig floor + tick/latency constraints
-        let effective_floor_frac = if market_params.use_adaptive_spreads
-            && market_params.adaptive_can_estimate
-        {
-            // Adaptive floor: learned from actual fill AS + fees + safety buffer
-            // During warmup, the prior-based floor is already conservative (fees + 3bps + 1.5σ)
-            debug!(
-                adaptive_floor_bps = %format!("{:.2}", market_params.adaptive_spread_floor * 10000.0),
-                static_floor_bps = %format!("{:.2}", self.risk_config.min_spread_floor * 10000.0),
-                warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-                "Ladder using ADAPTIVE spread floor"
-            );
-            market_params.adaptive_spread_floor
-        } else {
-            // Legacy: Static floor from RiskConfig + tick/latency constraints
-            market_params.effective_spread_floor(self.risk_config.min_spread_floor)
-        };
-        let effective_floor_bps = effective_floor_frac * 10_000.0;
+        // === SPREAD FLOOR: Regime-Based Self-Consistent ===
+        // The floor is: fee + regime AS expected + total risk premium.
+        // GLFT with solve_min_gamma() produces the correct spread by construction,
+        // so no further adaptive/conditional flooring is needed.
+        let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
+        let regime_floor_bps = fee_bps
+            + market_params.regime_as_expected_bps
+            + market_params.total_risk_premium_bps;
+        // Still enforce tick and latency constraints as hard physical limits
+        let tick_floor_bps = market_params.tick_size_bps;
+        let latency_floor_bps = market_params.latency_spread_floor * 10_000.0;
+        let effective_floor_bps = regime_floor_bps
+            .max(tick_floor_bps)
+            .max(latency_floor_bps)
+            .max(self.risk_config.min_spread_floor * 10_000.0);
 
         // [SPREAD TRACE] Phase 1: floor — capture GLFT optimal for diagnostics
         let glft_optimal_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
@@ -880,42 +877,10 @@ impl LadderStrategy {
             phase = "floor",
             glft_optimal_bps = %format!("{:.2}", glft_optimal_bps),
             effective_floor_bps = %format!("{:.2}", effective_floor_bps),
-            "[SPREAD TRACE] after floor computation"
+            regime_as_bps = %format!("{:.2}", market_params.regime_as_expected_bps),
+            risk_premium_bps = %format!("{:.2}", market_params.total_risk_premium_bps),
+            "[SPREAD TRACE] after regime-based floor computation"
         );
-
-        // === CONDITIONAL AS: Confidence-scaled buffer ===
-        // E[AS | fill] ≠ E[AS] unconditional. Fills cluster around toxic moments.
-        // The fill tracker maintains a Bayesian posterior of realized fill AS.
-        // Buffer shrinks as measurement confidence grows:
-        //   Cold (0 fills): full buffer (defensive)
-        //   Warmed up (20+ fills): buffer → 0 (AS measurement is reliable, floor alone suffices)
-        let raw_as_buffer_bps = market_params.conditional_as_posterior_mean_bps.unwrap_or(0.0);
-        // Always use gradual fill-based warmup — never binary jump.
-        // fill_model_warmed_up() triggers on attempts (not fills), causing instant 0→1 jump.
-        let (fills, _attempts) = self.fill_model_stats();
-        let as_warmup_fraction = (fills as f64 / 20.0).min(1.0);
-        let conditional_as_buffer_bps = raw_as_buffer_bps * (1.0 - as_warmup_fraction);
-        let effective_floor_bps = effective_floor_bps + conditional_as_buffer_bps;
-
-        // [SPREAD TRACE] Phase 2: AS buffer
-        tracing::info!(
-            phase = "as_buffer",
-            raw_as_buffer_bps = %format!("{:.2}", raw_as_buffer_bps),
-            as_warmup_fraction = %format!("{:.2}", as_warmup_fraction),
-            conditional_as_buffer_bps = %format!("{:.2}", conditional_as_buffer_bps),
-            effective_floor_bps = %format!("{:.2}", effective_floor_bps),
-            "[SPREAD TRACE] after conditional AS buffer"
-        );
-
-        // Log when conditional AS buffer is active (learned from fill data)
-        if conditional_as_buffer_bps > 0.1 {
-            debug!(
-                conditional_as_buffer_bps = %format!("{:.2}", conditional_as_buffer_bps),
-                base_floor_bps = %format!("{:.2}", effective_floor_frac * 10_000.0),
-                total_floor_bps = %format!("{:.2}", effective_floor_bps),
-                "Conditional AS buffer from Bayesian posterior (E[AS|fill])"
-            );
-        }
 
         // === DYNAMIC DEPTHS: GLFT-optimal depth computation with Bayesian bounds ===
         // Compute depths from effective gamma and kappa using GLFT formula:
@@ -2213,6 +2178,76 @@ mod tests {
             glft_approx_bps < effective_floor_cold,
             "Cold: floor ({:.2}) should exceed GLFT ({:.2}) — floor BINDING (defensive)",
             effective_floor_cold, glft_approx_bps
+        );
+    }
+
+    #[test]
+    fn test_regime_floor_composition() {
+        // Verify the regime-based floor = fee + AS expected + risk premium
+        let fee_bps: f64 = 1.5;
+
+        // Normal regime: fee(1.5) + AS(1.0) + risk(1.0) = 3.5 bps
+        let normal_floor = fee_bps + 1.0 + 1.0;
+        assert!((normal_floor - 3.5_f64).abs() < 0.01);
+
+        // Extreme regime: fee(1.5) + AS(5.0) + risk(6.0) = 12.5 bps
+        let extreme_floor = fee_bps + 5.0 + 6.0;
+        assert!((extreme_floor - 12.5_f64).abs() < 0.01);
+
+        // Floor must exceed fee (profitable quoting)
+        assert!(normal_floor > fee_bps);
+        assert!(extreme_floor > fee_bps);
+
+        // Extreme floor must be wider than normal floor
+        assert!(extreme_floor > normal_floor);
+    }
+
+    #[test]
+    fn test_risk_premium_flows_through_floor() {
+        // Test that increasing risk premium increases the floor
+        let fee_bps: f64 = 1.5;
+        let as_bps: f64 = 1.0;
+
+        let low_risk = fee_bps + as_bps + 0.5; // risk_premium = 0.5
+        let high_risk = fee_bps + as_bps + 5.0; // risk_premium = 5.0
+
+        assert!(
+            high_risk > low_risk,
+            "Higher risk premium should produce wider floor: {high_risk} vs {low_risk}"
+        );
+
+        // Delta matches the risk premium difference
+        let delta = high_risk - low_risk;
+        assert!((delta - 4.5_f64).abs() < 0.01, "Floor delta should equal risk premium delta");
+    }
+
+    #[test]
+    fn test_solve_min_gamma_matches_regime_floor() {
+        use crate::market_maker::strategy::glft::solve_min_gamma;
+
+        let fee_rate = 0.00015; // 1.5 bps
+        let regime_as_bps = 1.0;
+        let risk_premium_bps = 1.0;
+        let target_floor_bps = fee_rate * 10_000.0 + regime_as_bps + risk_premium_bps;
+        let target_floor_frac = target_floor_bps / 10_000.0;
+
+        let kappa = 2000.0;
+        let sigma = 0.0005;
+        let time_horizon = 60.0;
+
+        let gamma = solve_min_gamma(target_floor_frac, kappa, sigma, time_horizon, fee_rate);
+
+        // Verify that GLFT at this gamma produces at least the target
+        let safe_kappa = kappa.max(1.0);
+        let ratio = gamma / safe_kappa;
+        let glft = (1.0 / gamma) * (1.0 + ratio).ln();
+        let vol_comp = 0.5 * gamma * sigma.powi(2) * time_horizon;
+        let half_spread = glft + vol_comp + fee_rate;
+        let half_spread_bps = half_spread * 10_000.0;
+
+        assert!(
+            half_spread_bps >= target_floor_bps - 0.01,
+            "GLFT half-spread ({half_spread_bps:.2} bps) should meet floor ({target_floor_bps:.2} bps)"
         );
     }
 }

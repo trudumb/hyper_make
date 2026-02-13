@@ -72,21 +72,33 @@ pub struct FeatureVector {
     pub kappa_normalized: f64,
     /// When this vector was computed
     pub computed_at: Instant,
+    /// Hawkes synchronicity: cross-venue intensity correlation [-1, 1]
+    pub synchronicity: NormalizedFeature,
+    /// Cross-venue flow acceleration: rate of change of flow imbalance [-1, 1]
+    pub flow_acceleration: NormalizedFeature,
+    /// Funding basis velocity: rate of premium change scaled by settlement proximity [-1, 1]
+    pub basis_velocity: NormalizedFeature,
 }
 
 impl FeatureVector {
     /// Directional signal: weighted combination for skew computation.
     /// Positive = bullish pressure, negative = bearish.
     pub fn directional_signal(&self) -> f64 {
-        const FLOW_DIR_WEIGHT: f64 = 0.40;
-        const FLOW_TOX_WEIGHT: f64 = 0.25;
-        const BOOK_THIN_WEIGHT: f64 = 0.20;
-        const FUNDING_WEIGHT: f64 = 0.15;
+        const FLOW_DIR_WEIGHT: f64 = 0.35;
+        const FLOW_TOX_WEIGHT: f64 = 0.20;
+        const BOOK_THIN_WEIGHT: f64 = 0.15;
+        const FUNDING_WEIGHT: f64 = 0.10;
+        const SYNC_WEIGHT: f64 = 0.10;
+        const ACCEL_WEIGHT: f64 = 0.05;
+        const BASIS_VEL_WEIGHT: f64 = 0.05;
 
         self.flow_direction.effective(2000.0) * FLOW_DIR_WEIGHT
             + self.flow_toxicity.effective(1000.0) * FLOW_TOX_WEIGHT
             + self.book_thinning.effective(3000.0) * BOOK_THIN_WEIGHT
             + self.funding_pressure.effective(10000.0) * FUNDING_WEIGHT
+            + self.synchronicity.effective(2000.0) * SYNC_WEIGHT
+            + self.flow_acceleration.effective(1500.0) * ACCEL_WEIGHT
+            + self.basis_velocity.effective(5000.0) * BASIS_VEL_WEIGHT
     }
 
     /// Risk signal: urgency for spread widening. Always >= 0.
@@ -106,6 +118,9 @@ impl FeatureVector {
             sigma_normalized: 1.0,
             kappa_normalized: 1.0,
             computed_at: Instant::now(),
+            synchronicity: NormalizedFeature::stale(),
+            flow_acceleration: NormalizedFeature::stale(),
+            basis_velocity: NormalizedFeature::stale(),
         }
     }
 }
@@ -219,5 +234,59 @@ mod tests {
         let young = NormalizedFeature::new(1.0, 1.0, 100.0);
         let old = NormalizedFeature::new(1.0, 1.0, 5000.0);
         assert!(young.effective(1000.0) > old.effective(1000.0));
+    }
+
+    #[test]
+    fn test_new_features_default_stale() {
+        let fv = FeatureVector::empty();
+        assert!(!fv.synchronicity.is_valid());
+        assert!(!fv.flow_acceleration.is_valid());
+        assert!(!fv.basis_velocity.is_valid());
+    }
+
+    #[test]
+    fn test_directional_signal_with_synchronicity() {
+        let mut fv = FeatureVector::empty();
+        fv.synchronicity = NormalizedFeature::new(0.9, 1.0, 0.0);
+        let signal = fv.directional_signal();
+        assert!(
+            signal > 0.0,
+            "Positive synchronicity should produce positive directional signal, got {signal}"
+        );
+    }
+
+    #[test]
+    fn test_directional_signal_with_basis_velocity() {
+        let mut fv = FeatureVector::empty();
+        fv.basis_velocity = NormalizedFeature::new(-0.7, 1.0, 0.0);
+        let signal = fv.directional_signal();
+        assert!(
+            signal < 0.0,
+            "Negative basis velocity should produce negative directional signal, got {signal}"
+        );
+    }
+
+    #[test]
+    fn test_directional_signal_weights_sum_to_one() {
+        // Verify weights are properly normalized
+        const FLOW_DIR_WEIGHT: f64 = 0.35;
+        const FLOW_TOX_WEIGHT: f64 = 0.20;
+        const BOOK_THIN_WEIGHT: f64 = 0.15;
+        const FUNDING_WEIGHT: f64 = 0.10;
+        const SYNC_WEIGHT: f64 = 0.10;
+        const ACCEL_WEIGHT: f64 = 0.05;
+        const BASIS_VEL_WEIGHT: f64 = 0.05;
+
+        let total = FLOW_DIR_WEIGHT
+            + FLOW_TOX_WEIGHT
+            + BOOK_THIN_WEIGHT
+            + FUNDING_WEIGHT
+            + SYNC_WEIGHT
+            + ACCEL_WEIGHT
+            + BASIS_VEL_WEIGHT;
+        assert!(
+            (total - 1.0).abs() < 1e-10,
+            "Directional signal weights should sum to 1.0, got {total}"
+        );
     }
 }

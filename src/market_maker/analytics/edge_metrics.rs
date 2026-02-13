@@ -63,7 +63,19 @@ impl EdgeTracker {
     }
 
     /// Record an edge measurement.
+    ///
+    /// INVARIANT: Only `EdgePhase::Resolved` snapshots should be added.
+    /// Pending snapshots have placeholder zeroes for realized_edge_bps,
+    /// gross_edge_bps, and realized_as_bps, which would corrupt all
+    /// aggregate statistics. The caller (check_pending_fill_outcomes in
+    /// handlers.rs) enforces this by only creating Resolved snapshots
+    /// after the 5-second markout window.
     pub fn add_snapshot(&mut self, snap: EdgeSnapshot) {
+        // Defensive guard: silently skip Pending snapshots to prevent
+        // tautological edge measurements from corrupting statistics.
+        if snap.phase == EdgePhase::Pending {
+            return;
+        }
         self.snapshots.push(snap);
     }
 
@@ -301,7 +313,7 @@ mod tests {
             predicted_edge_bps: predicted_bps,
             realized_edge_bps: realized_bps,
             gross_edge_bps: gross_bps,
-            phase: EdgePhase::Pending,
+            phase: EdgePhase::Resolved,
             mid_at_placement: 0.0,
             markout_as_bps: None,
         }
@@ -662,5 +674,46 @@ mod tests {
         // Original fields preserved
         assert!((resolved.mid_at_placement - 50_000.0).abs() < f64::EPSILON);
         assert!((resolved.realized_edge_bps - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_add_snapshot_rejects_pending() {
+        let mut tracker = EdgeTracker::new();
+
+        // Pending snapshot should be silently rejected
+        let pending = EdgeSnapshot {
+            timestamp_ns: 1000,
+            predicted_spread_bps: 5.0,
+            realized_spread_bps: 4.0,
+            predicted_as_bps: 1.0,
+            realized_as_bps: 0.0,
+            fee_bps: 1.5,
+            predicted_edge_bps: 2.5,
+            realized_edge_bps: 0.0,
+            gross_edge_bps: 0.0,
+            phase: EdgePhase::Pending,
+            mid_at_placement: 50_000.0,
+            markout_as_bps: None,
+        };
+        tracker.add_snapshot(pending);
+        assert_eq!(tracker.edge_count(), 0, "Pending snapshots should not be added");
+
+        // Resolved snapshot should be accepted
+        let resolved = EdgeSnapshot {
+            timestamp_ns: 6000,
+            predicted_spread_bps: 5.0,
+            realized_spread_bps: 4.0,
+            predicted_as_bps: 1.0,
+            realized_as_bps: 0.8,
+            fee_bps: 1.5,
+            predicted_edge_bps: 2.5,
+            realized_edge_bps: 1.7,
+            gross_edge_bps: 3.2,
+            phase: EdgePhase::Resolved,
+            mid_at_placement: 50_000.0,
+            markout_as_bps: Some(0.8),
+        };
+        tracker.add_snapshot(resolved);
+        assert_eq!(tracker.edge_count(), 1, "Resolved snapshots should be added");
     }
 }

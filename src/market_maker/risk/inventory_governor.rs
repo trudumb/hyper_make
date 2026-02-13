@@ -6,20 +6,21 @@
 //! # Position Zones
 //!
 //! ```text
-//! |--- Green (< 50%) ---|--- Yellow (50-80%) ---|--- Red (80-100%) ---|--- Kill (> 100%) ---|
+//! |--- Green (< 60%) ---|--- Yellow (60-80%) ---|--- Red (80-100%) ---|--- Kill (> 100%) ---|
 //! | full two-sided       | bias toward reducing  | reduce-only         | cancel all          |
 //! ```
 
 use serde::{Deserialize, Serialize};
 
 /// Position zone classification for the inventory governor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PositionZone {
-    /// < 50% of max — full two-sided quoting
+    /// < 60% of max — full two-sided quoting
+    #[default]
     Green,
-    /// 50-80% — bias toward reducing, wider on increasing side
+    /// 60-80% — bias toward reducing, wider on increasing side
     Yellow,
-    /// > 80% — reduce-only both sides
+    /// 80-100% — reduce-only both sides
     Red,
     /// > 100% — cancel all, kill switch territory
     Kill,
@@ -83,11 +84,11 @@ impl InventoryGovernor {
         } else if ratio >= 0.8 {
             // Red zone: reduce-only
             (PositionZone::Red, 0.0, 2.0)
-        } else if ratio >= 0.5 {
+        } else if ratio >= 0.6 {
             // Yellow zone: bias toward reducing, cap new exposure
             let capped_exposure = remaining * 0.5;
-            // Linear ramp: 1.0 at ratio=0.5, 2.0 at ratio=0.8
-            let mult = 1.0 + (ratio - 0.5) * (1.0 / 0.3);
+            // Linear ramp: 1.0 at ratio=0.6, 2.0 at ratio=0.8
+            let mult = 1.0 + (ratio - 0.6) * (1.0 / 0.2);
             (PositionZone::Yellow, capped_exposure, mult)
         } else {
             // Green zone: full two-sided
@@ -134,6 +135,34 @@ impl InventoryGovernor {
             false
         }
     }
+
+    /// Get current position zone based on position vs max.
+    ///
+    /// Uses 60/80/100% boundaries for Green/Yellow/Red/Kill classification.
+    /// This is a lightweight zone check without the full assessment.
+    pub fn current_zone(&self, position_abs: f64) -> PositionZone {
+        let ratio = position_abs / self.max_position;
+        if ratio >= 1.0 {
+            PositionZone::Kill
+        } else if ratio >= 0.8 {
+            PositionZone::Red
+        } else if ratio >= 0.6 {
+            PositionZone::Yellow
+        } else {
+            PositionZone::Green
+        }
+    }
+
+    /// Adjust max position based on regime volatility fraction.
+    ///
+    /// In calm markets (fraction=0.0), max stays at config value.
+    /// In extreme regime (fraction=1.0), max reduces to 30% of config max.
+    /// Linear interpolation between: tightening = 1.0 - 0.7 * fraction.
+    pub fn zone_adjusted_max(&self, regime_volatility_fraction: f64) -> f64 {
+        let fraction = regime_volatility_fraction.clamp(0.0, 1.0);
+        let tightening = 1.0 - 0.7 * fraction; // [0.3, 1.0]
+        self.max_position * tightening
+    }
 }
 
 #[cfg(test)]
@@ -163,11 +192,21 @@ mod tests {
     #[test]
     fn test_yellow_zone_lower_bound() {
         let gov = InventoryGovernor::new(10.0);
-        let a = gov.assess(5.0);
+        let a = gov.assess(6.0);
         assert_eq!(a.zone, PositionZone::Yellow);
-        // remaining = 5.0, capped = 2.5
-        assert!((a.max_new_exposure - 2.5).abs() < 1e-9);
-        // spread_mult at ratio=0.5 should be 1.0
+        // remaining = 4.0, capped = 2.0
+        assert!((a.max_new_exposure - 2.0).abs() < 1e-9);
+        // spread_mult at ratio=0.6 should be 1.0
+        assert!((a.increasing_side_spread_mult - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_green_zone_at_fifty_pct() {
+        let gov = InventoryGovernor::new(10.0);
+        // ratio = 0.5 is now Green (boundary moved to 0.6)
+        let a = gov.assess(5.0);
+        assert_eq!(a.zone, PositionZone::Green);
+        assert!((a.max_new_exposure - 5.0).abs() < 1e-9);
         assert!((a.increasing_side_spread_mult - 1.0).abs() < 0.01);
     }
 
@@ -179,8 +218,8 @@ mod tests {
         assert_eq!(a.zone, PositionZone::Yellow);
         // remaining = 2.1, capped = 1.05
         assert!((a.max_new_exposure - 1.05).abs() < 1e-9);
-        // spread_mult should be close to 2.0
-        let expected_mult = 1.0 + (0.79 - 0.5) * (1.0 / 0.3);
+        // spread_mult: 1.0 + (0.79 - 0.6) * (1.0 / 0.2) = 1.0 + 0.95 = 1.95
+        let expected_mult = 1.0 + (0.79 - 0.6) * (1.0 / 0.2);
         assert!((a.increasing_side_spread_mult - expected_mult).abs() < 0.01);
     }
 
@@ -324,16 +363,101 @@ mod tests {
     #[test]
     fn test_spread_mult_linear_ramp() {
         let gov = InventoryGovernor::new(100.0);
-        // At ratio=0.5: mult should be 1.0
-        let a = gov.assess(50.0);
+        // At ratio=0.6: mult should be 1.0 (Yellow lower bound)
+        let a = gov.assess(60.0);
         assert!((a.increasing_side_spread_mult - 1.0).abs() < 0.01);
 
-        // At ratio=0.65: mult should be 1.5
-        let a = gov.assess(65.0);
+        // At ratio=0.7: mult should be 1.5 (midpoint Yellow)
+        let a = gov.assess(70.0);
         assert!((a.increasing_side_spread_mult - 1.5).abs() < 0.01);
 
         // Just below 0.8: mult should approach 2.0
         let a = gov.assess(79.9);
         assert!((a.increasing_side_spread_mult - 2.0).abs() < 0.05);
+    }
+
+    // --- current_zone tests ---
+
+    #[test]
+    fn test_current_zone_green() {
+        let gov = InventoryGovernor::new(10.0);
+        // 0% — Green
+        assert_eq!(gov.current_zone(0.0), PositionZone::Green);
+        // 59% — still Green
+        assert_eq!(gov.current_zone(5.9), PositionZone::Green);
+    }
+
+    #[test]
+    fn test_current_zone_yellow() {
+        let gov = InventoryGovernor::new(10.0);
+        // 60% exactly — Yellow (>= 0.6)
+        assert_eq!(gov.current_zone(6.0), PositionZone::Yellow);
+        // 61% — Yellow
+        assert_eq!(gov.current_zone(6.1), PositionZone::Yellow);
+        // 79% — Yellow
+        assert_eq!(gov.current_zone(7.9), PositionZone::Yellow);
+    }
+
+    #[test]
+    fn test_current_zone_red() {
+        let gov = InventoryGovernor::new(10.0);
+        // 80% exactly — Red (>= 0.8)
+        assert_eq!(gov.current_zone(8.0), PositionZone::Red);
+        // 81% — Red
+        assert_eq!(gov.current_zone(8.1), PositionZone::Red);
+        // 99% — Red
+        assert_eq!(gov.current_zone(9.9), PositionZone::Red);
+    }
+
+    #[test]
+    fn test_current_zone_kill() {
+        let gov = InventoryGovernor::new(10.0);
+        // 100% — Kill (>= 1.0)
+        assert_eq!(gov.current_zone(10.0), PositionZone::Kill);
+        // 101% — Kill
+        assert_eq!(gov.current_zone(10.1), PositionZone::Kill);
+    }
+
+    // --- zone_adjusted_max tests ---
+
+    #[test]
+    fn test_zone_adjusted_max_calm() {
+        let gov = InventoryGovernor::new(10.0);
+        // fraction=0.0: tightening=1.0, max=10.0
+        let adjusted = gov.zone_adjusted_max(0.0);
+        assert!((adjusted - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_zone_adjusted_max_moderate() {
+        let gov = InventoryGovernor::new(10.0);
+        // fraction=0.5: tightening = 1.0 - 0.35 = 0.65, max = 6.5
+        let adjusted = gov.zone_adjusted_max(0.5);
+        assert!((adjusted - 6.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_zone_adjusted_max_extreme() {
+        let gov = InventoryGovernor::new(10.0);
+        // fraction=1.0: tightening = 1.0 - 0.7 = 0.3, max = 3.0
+        let adjusted = gov.zone_adjusted_max(1.0);
+        assert!((adjusted - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_zone_adjusted_max_clamps_input() {
+        let gov = InventoryGovernor::new(10.0);
+        // fraction > 1.0 clamped to 1.0
+        let adjusted = gov.zone_adjusted_max(2.0);
+        assert!((adjusted - 3.0).abs() < 1e-9);
+        // fraction < 0.0 clamped to 0.0
+        let adjusted = gov.zone_adjusted_max(-1.0);
+        assert!((adjusted - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_zone_default() {
+        let zone = PositionZone::default();
+        assert_eq!(zone, PositionZone::Green);
     }
 }

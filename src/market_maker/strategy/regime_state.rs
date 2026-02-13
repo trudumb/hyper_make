@@ -7,6 +7,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Controller objective — determines whether the controller optimizes for
+/// spread capture (mean-reverting) or inventory minimization (trending/toxic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ControllerObjective {
+    /// Tight spread, high skew gain, maximize spread capture.
+    #[default]
+    MeanRevert,
+    /// Wide spread, minimize inventory, defensive posture.
+    TrendingToxic,
+}
+
 /// Discrete market regime — drives all regime-dependent parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarketRegime {
@@ -44,6 +55,9 @@ impl MarketRegime {
                 emergency_cp_threshold: 0.9,
                 reduce_only_fraction: 0.7,
                 size_multiplier: 1.0,
+                as_expected_bps: 1.0,
+                risk_premium_bps: 0.5,
+                controller_objective: ControllerObjective::MeanRevert,
             },
             Self::Normal => RegimeParams {
                 kappa: 2000.0,
@@ -53,24 +67,33 @@ impl MarketRegime {
                 emergency_cp_threshold: 0.8,
                 reduce_only_fraction: 0.5,
                 size_multiplier: 0.8,
+                as_expected_bps: 1.0,
+                risk_premium_bps: 1.0,
+                controller_objective: ControllerObjective::MeanRevert,
             },
             Self::Volatile => RegimeParams {
                 kappa: 1000.0,
                 spread_floor_bps: 10.0,
-                skew_gain: 0.7,
+                skew_gain: 0.5,
                 max_position_fraction: 0.5,
                 emergency_cp_threshold: 0.6,
                 reduce_only_fraction: 0.3,
                 size_multiplier: 0.5,
+                as_expected_bps: 3.0,
+                risk_premium_bps: 3.0,
+                controller_objective: ControllerObjective::TrendingToxic,
             },
             Self::Extreme => RegimeParams {
                 kappa: 500.0,
                 spread_floor_bps: 20.0,
-                skew_gain: 0.5,
+                skew_gain: 0.3,
                 max_position_fraction: 0.3,
                 emergency_cp_threshold: 0.4,
                 reduce_only_fraction: 0.2,
                 size_multiplier: 0.3,
+                as_expected_bps: 5.0,
+                risk_premium_bps: 6.0,
+                controller_objective: ControllerObjective::TrendingToxic,
             },
         }
     }
@@ -94,6 +117,28 @@ pub struct RegimeParams {
     pub reduce_only_fraction: f64,
     /// Quote size scaling factor (0.3 = 30% of normal).
     pub size_multiplier: f64,
+    /// Expected adverse selection cost for this regime (bps).
+    /// Updated via EWMA from markout measurements.
+    #[serde(default)]
+    pub as_expected_bps: f64,
+    /// Additive risk premium for this regime (bps).
+    #[serde(default)]
+    pub risk_premium_bps: f64,
+    /// Controller objective for this regime.
+    #[serde(default)]
+    pub controller_objective: ControllerObjective,
+}
+
+impl RegimeParams {
+    /// EWMA update of expected adverse selection from markout measurements.
+    ///
+    /// Blends new markout AS observation into the regime's running estimate.
+    /// Uses a conservative EWMA weight (0.05) to avoid overreacting to noise.
+    pub fn update_as_from_markout(&mut self, markout_as_bps: f64) {
+        const EWMA_WEIGHT: f64 = 0.05;
+        let clamped = markout_as_bps.clamp(0.0, 50.0); // Sanity: AS can't be negative or > 50 bps
+        self.as_expected_bps = (1.0 - EWMA_WEIGHT) * self.as_expected_bps + EWMA_WEIGHT * clamped;
+    }
 }
 
 impl Default for RegimeParams {
@@ -452,6 +497,113 @@ mod tests {
         let changed = state.update(&calm_probs, 0.0, 2000.0);
         assert!(changed);
         assert_eq!(state.regime, MarketRegime::Calm);
+    }
+
+    #[test]
+    fn test_controller_objective_per_regime() {
+        assert_eq!(
+            MarketRegime::Calm.default_params().controller_objective,
+            ControllerObjective::MeanRevert
+        );
+        assert_eq!(
+            MarketRegime::Normal.default_params().controller_objective,
+            ControllerObjective::MeanRevert
+        );
+        assert_eq!(
+            MarketRegime::Volatile.default_params().controller_objective,
+            ControllerObjective::TrendingToxic
+        );
+        assert_eq!(
+            MarketRegime::Extreme.default_params().controller_objective,
+            ControllerObjective::TrendingToxic
+        );
+    }
+
+    #[test]
+    fn test_as_expected_bps_ordering() {
+        let calm = MarketRegime::Calm.default_params();
+        let normal = MarketRegime::Normal.default_params();
+        let volatile = MarketRegime::Volatile.default_params();
+        let extreme = MarketRegime::Extreme.default_params();
+
+        assert!(calm.as_expected_bps <= normal.as_expected_bps);
+        assert!(normal.as_expected_bps < volatile.as_expected_bps);
+        assert!(volatile.as_expected_bps < extreme.as_expected_bps);
+    }
+
+    #[test]
+    fn test_risk_premium_ordering() {
+        let calm = MarketRegime::Calm.default_params();
+        let normal = MarketRegime::Normal.default_params();
+        let volatile = MarketRegime::Volatile.default_params();
+        let extreme = MarketRegime::Extreme.default_params();
+
+        assert!(calm.risk_premium_bps <= normal.risk_premium_bps);
+        assert!(normal.risk_premium_bps < volatile.risk_premium_bps);
+        assert!(volatile.risk_premium_bps < extreme.risk_premium_bps);
+    }
+
+    #[test]
+    fn test_update_as_from_markout() {
+        let mut params = MarketRegime::Normal.default_params();
+        let initial_as = params.as_expected_bps;
+
+        // Feed high AS observation
+        params.update_as_from_markout(10.0);
+        assert!(
+            params.as_expected_bps > initial_as,
+            "AS should increase toward observation"
+        );
+        assert!(
+            params.as_expected_bps < 10.0,
+            "AS should not jump to observation (EWMA smoothing)"
+        );
+
+        // Feed many observations at 10.0 — should converge
+        for _ in 0..200 {
+            params.update_as_from_markout(10.0);
+        }
+        assert!(
+            (params.as_expected_bps - 10.0).abs() < 0.1,
+            "AS should converge to observation after many updates, got {}",
+            params.as_expected_bps
+        );
+    }
+
+    #[test]
+    fn test_update_as_from_markout_clamps() {
+        let mut params = MarketRegime::Normal.default_params();
+
+        // Negative AS clamped to 0
+        params.update_as_from_markout(-5.0);
+        assert!(params.as_expected_bps >= 0.0);
+
+        // Extreme AS clamped to 50
+        for _ in 0..200 {
+            params.update_as_from_markout(100.0);
+        }
+        assert!(
+            params.as_expected_bps <= 50.0,
+            "AS should be clamped to 50 bps, got {}",
+            params.as_expected_bps
+        );
+    }
+
+    #[test]
+    fn test_regime_transition_preserves_objective() {
+        let mut state = RegimeState::new();
+        assert_eq!(
+            state.params.controller_objective,
+            ControllerObjective::MeanRevert
+        );
+
+        // Transition to Extreme
+        let extreme_probs = [0.0, 0.05, 0.1, 0.85];
+        state.update(&extreme_probs, 0.0, 500.0);
+        assert_eq!(
+            state.params.controller_objective,
+            ControllerObjective::TrendingToxic
+        );
     }
 
     #[test]

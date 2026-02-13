@@ -386,20 +386,17 @@ impl GLFTStrategy {
         let gamma_final = gamma_with_tail * rl_gamma_mult;
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
-        // Uses the ACTUAL effective floor (learned > adaptive > static) so that
-        // gamma is high enough that the post-hoc floor clamp rarely binds.
+        //
+        // The floor is: fee + regime AS expected + total risk premium.
+        // This replaces the learned/adaptive/static waterfall with a single
+        // regime-aware formula. GLFT produces the correct spread by construction.
         let time_horizon = self.holding_time(market_params.arrival_intensity);
-        let effective_floor_for_gamma = if market_params.use_learned_parameters
-            && market_params.learned_params_calibrated
-        {
-            (market_params.learned_spread_floor_bps / 10000.0).max(cfg.min_spread_floor)
-        } else if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
-            market_params.adaptive_spread_floor.max(cfg.min_spread_floor)
-        } else {
-            cfg.min_spread_floor
-        };
+        let regime_floor_bps = cfg.maker_fee_rate * 10_000.0
+            + market_params.regime_as_expected_bps
+            + market_params.total_risk_premium_bps;
+        let regime_floor_frac = (regime_floor_bps / 10_000.0).max(cfg.min_spread_floor);
         let min_gamma = solve_min_gamma(
-            effective_floor_for_gamma,
+            regime_floor_frac,
             market_params.kappa.max(1.0),
             market_params.sigma_effective.max(1e-8),
             time_horizon,

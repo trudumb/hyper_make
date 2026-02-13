@@ -5,6 +5,7 @@ use crate::market_maker::estimator::{MarketEstimator, VolatilityRegime};
 use crate::market_maker::process_models::SpreadRegime;
 
 use super::params;
+use super::regime_state::ControllerObjective;
 
 /// Parameters estimated from live market data.
 ///
@@ -746,6 +747,22 @@ pub struct MarketParams {
     /// 0=Low, 1=Normal, 2=High, 3=Extreme.
     pub regime_kappa_current_regime: usize,
 
+    /// Regime-conditioned expected adverse selection cost (bps).
+    pub regime_as_expected_bps: f64,
+    /// Regime-conditioned additive risk premium (bps).
+    pub regime_risk_premium_bps: f64,
+    /// Regime-conditioned skew gain multiplier.
+    pub regime_skew_gain: f64,
+    /// Regime-conditioned size multiplier.
+    pub regime_size_multiplier: f64,
+    /// Controller objective for current regime.
+    pub controller_objective: ControllerObjective,
+    /// Max position fraction for current regime (regime tightening).
+    pub max_position_fraction: f64,
+    /// Total risk premium (bps): regime risk premium + hawkes addon + toxicity addon + staleness addon.
+    /// Used as input to solve_min_gamma() for self-consistent spread floor.
+    pub total_risk_premium_bps: f64,
+
     // ==================== Bayesian Gamma Components (Alpha Plan) ====================
     /// Trend confidence [0, 1] from directional signals.
     /// High confidence → can quote tighter spreads (lower gamma).
@@ -1103,6 +1120,14 @@ impl Default for MarketParams {
             // Regime-Conditioned Kappa
             regime_kappa: None,                // Not available until regime estimator warmed up
             regime_kappa_current_regime: 1,    // Normal regime default
+            // Regime-conditioned objective and parameters
+            regime_as_expected_bps: 1.0,
+            regime_risk_premium_bps: 1.0,
+            regime_skew_gain: 1.0,
+            regime_size_multiplier: 0.8,
+            controller_objective: ControllerObjective::MeanRevert,
+            max_position_fraction: 0.8,
+            total_risk_premium_bps: 1.0, // Default: 1 bps risk premium
             // Bayesian Gamma Components (Alpha Plan)
             trend_confidence: 0.5,        // 50% confidence initially (uncertain)
             bootstrap_confidence: 0.0,    // Not calibrated initially

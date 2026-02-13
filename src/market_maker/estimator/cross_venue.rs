@@ -274,6 +274,16 @@ pub struct CrossVenueAnalyzer {
 
     /// Last computed features.
     last_features: CrossVenueFeatures,
+
+    /// Fast EWMA of lead venue imbalance (alpha = 0.2, ~5-sample half-life).
+    /// Tracks rapid changes in Binance order flow direction.
+    /// Defaults to 0.0 on construction (checkpoint-compatible).
+    lead_imbalance_fast: f64,
+
+    /// Slow EWMA of lead venue imbalance (alpha = 0.05, ~14-sample half-life).
+    /// Tracks the baseline trend of Binance order flow direction.
+    /// Defaults to 0.0 on construction (checkpoint-compatible).
+    lead_imbalance_slow: f64,
 }
 
 impl CrossVenueAnalyzer {
@@ -287,6 +297,8 @@ impl CrossVenueAnalyzer {
             sample_count: 0,
             last_features: CrossVenueFeatures::default(),
             config,
+            lead_imbalance_fast: 0.0,
+            lead_imbalance_slow: 0.0,
         }
     }
 
@@ -299,6 +311,14 @@ impl CrossVenueAnalyzer {
     pub fn update(&mut self, binance: &FlowFeatureVec, hl: &FlowFeatureVec) {
         // Update rolling correlation of imbalances (use 5s window)
         self.imbalance_correlation.add(binance.imbalance_5s, hl.imbalance_5s);
+
+        // Update lead venue (Binance) imbalance EWMAs for flow acceleration
+        const LEAD_FAST_ALPHA: f64 = 0.2;
+        const LEAD_SLOW_ALPHA: f64 = 0.05;
+        self.lead_imbalance_fast = LEAD_FAST_ALPHA * binance.imbalance_5s
+            + (1.0 - LEAD_FAST_ALPHA) * self.lead_imbalance_fast;
+        self.lead_imbalance_slow = LEAD_SLOW_ALPHA * binance.imbalance_5s
+            + (1.0 - LEAD_SLOW_ALPHA) * self.lead_imbalance_slow;
 
         // Update intensity EMAs
         let alpha = self.config.intensity_ema_alpha;
@@ -474,6 +494,17 @@ impl CrossVenueAnalyzer {
         self.last_features.max_toxicity
     }
 
+    /// Flow acceleration: fast EWMA minus slow EWMA of lead venue imbalance.
+    ///
+    /// Positive values mean the lead venue (Binance) buy pressure is
+    /// *accelerating* — the fast average is pulling ahead of the slow average.
+    /// Negative values mean sell pressure is accelerating.
+    ///
+    /// Returns `[-1.0, 1.0]`.
+    pub fn flow_acceleration(&self) -> f64 {
+        (self.lead_imbalance_fast - self.lead_imbalance_slow).clamp(-1.0, 1.0)
+    }
+
     /// Create bivariate observation from venue features.
     pub fn create_observation(&self, binance: FlowFeatureVec, hl: FlowFeatureVec, timestamp_ms: i64) -> BivariateFlowObservation {
         BivariateFlowObservation {
@@ -502,6 +533,8 @@ impl CrossVenueAnalyzer {
         self.agreement_streak = 0;
         self.sample_count = 0;
         self.last_features = CrossVenueFeatures::default();
+        self.lead_imbalance_fast = 0.0;
+        self.lead_imbalance_slow = 0.0;
     }
 
     /// Get configuration.
@@ -698,5 +731,96 @@ mod tests {
         analyzer.reset();
 
         assert_eq!(analyzer.sample_count(), 0);
+        // Flow acceleration EWMAs should also reset
+        assert!((analyzer.flow_acceleration() - 0.0).abs() < 1e-9);
+    }
+
+    // ============================================================================
+    // Flow Acceleration Tests
+    // ============================================================================
+
+    #[test]
+    fn test_flow_acceleration_initial() {
+        let analyzer = CrossVenueAnalyzer::default();
+        // Both EWMAs start at 0 → acceleration = 0
+        assert!((analyzer.flow_acceleration() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_flow_acceleration_buy_burst() {
+        let mut analyzer = CrossVenueAnalyzer::default();
+        // Feed sustained buy pressure on Binance
+        for _ in 0..20 {
+            let binance = make_binance_features(0.8, 0.3, 10.0);
+            let hl = make_binance_features(0.0, 0.2, 8.0);
+            analyzer.update(&binance, &hl);
+        }
+        // Fast EWMA converges faster to 0.8 than slow EWMA
+        // After 20 steps: fast ≈ 0.8*(1-0.8^20) ≈ 0.799, slow ≈ 0.8*(1-0.95^20) ≈ 0.528
+        // acceleration = fast - slow > 0
+        let accel = analyzer.flow_acceleration();
+        assert!(
+            accel > 0.0,
+            "Buy pressure should give positive acceleration, got {}",
+            accel
+        );
+    }
+
+    #[test]
+    fn test_flow_acceleration_converges_to_zero() {
+        let mut analyzer = CrossVenueAnalyzer::default();
+        // Feed constant imbalance for a long time — both EWMAs converge to same value
+        for _ in 0..500 {
+            let binance = make_binance_features(0.5, 0.3, 10.0);
+            let hl = make_binance_features(0.3, 0.2, 8.0);
+            analyzer.update(&binance, &hl);
+        }
+        let accel = analyzer.flow_acceleration();
+        assert!(
+            accel.abs() < 0.05,
+            "After convergence, acceleration should be near zero, got {}",
+            accel
+        );
+    }
+
+    #[test]
+    fn test_flow_acceleration_direction_change() {
+        let mut analyzer = CrossVenueAnalyzer::default();
+        // First converge to sell pressure
+        for _ in 0..200 {
+            let binance = make_binance_features(-0.6, 0.3, 10.0);
+            let hl = make_binance_features(-0.3, 0.2, 8.0);
+            analyzer.update(&binance, &hl);
+        }
+        // Now switch to buy pressure
+        for _ in 0..5 {
+            let binance = make_binance_features(0.7, 0.3, 10.0);
+            let hl = make_binance_features(0.0, 0.2, 8.0);
+            analyzer.update(&binance, &hl);
+        }
+        let accel = analyzer.flow_acceleration();
+        // Fast should react to buy, slow still near sell → positive acceleration
+        assert!(
+            accel > 0.0,
+            "Direction change should give positive acceleration, got {}",
+            accel
+        );
+    }
+
+    #[test]
+    fn test_flow_acceleration_bounded() {
+        let mut analyzer = CrossVenueAnalyzer::default();
+        // Even with extreme inputs, should be clamped to [-1, 1]
+        for _ in 0..10 {
+            let binance = make_binance_features(1.0, 0.9, 100.0);
+            let hl = make_binance_features(-1.0, 0.1, 1.0);
+            analyzer.update(&binance, &hl);
+        }
+        let accel = analyzer.flow_acceleration();
+        assert!(
+            accel >= -1.0 && accel <= 1.0,
+            "Acceleration must be in [-1, 1], got {}",
+            accel
+        );
     }
 }

@@ -50,6 +50,118 @@ pub struct BookDynamicsTracker {
     update_count: u64,
 }
 
+/// EWMA decay factor for iceberg hidden ratio (0.05 new observation weight).
+const ICEBERG_ALPHA: f64 = 0.05;
+
+/// Threshold for considering a side to have meaningful hidden liquidity support.
+const HIDDEN_SUPPORT_THRESHOLD: f64 = 0.3;
+
+/// Detects iceberg (hidden) liquidity by comparing fill sizes against book depth decreases.
+///
+/// When a fill occurs for X units but the book only decreases by Y < X, the difference
+/// `(X - Y) / X` indicates hidden depth that refilled the level. High hidden ratios
+/// imply passive support at that price level, allowing tighter quoting.
+///
+/// Each side maintains an EWMA hidden ratio in [0, 1]:
+/// - 0.0 → no hidden liquidity detected
+/// - 1.0 → all fills are hidden (extreme iceberg)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IcebergDetector {
+    /// EWMA of hidden fraction on the bid side.
+    #[serde(default)]
+    hidden_ratio_bid: f64,
+    /// EWMA of hidden fraction on the ask side.
+    #[serde(default)]
+    hidden_ratio_ask: f64,
+    /// Snapshot of bid depth before a fill (for before/after comparison).
+    #[serde(default)]
+    last_bid_depth: f64,
+    /// Snapshot of ask depth before a fill (for before/after comparison).
+    #[serde(default)]
+    last_ask_depth: f64,
+}
+
+impl IcebergDetector {
+    /// Create a new detector with zeroed fields.
+    pub fn new() -> Self {
+        Self {
+            hidden_ratio_bid: 0.0,
+            hidden_ratio_ask: 0.0,
+            last_bid_depth: 0.0,
+            last_ask_depth: 0.0,
+        }
+    }
+
+    /// Snapshot current book depths before a potential fill.
+    ///
+    /// Must be called before `on_fill_with_book_update` so the detector can
+    /// compare pre-fill vs post-fill depth.
+    pub fn snapshot_book(&mut self, bid_depth: f64, ask_depth: f64) {
+        self.last_bid_depth = bid_depth;
+        self.last_ask_depth = ask_depth;
+    }
+
+    /// Record a fill and compare with the new book depth to detect hidden liquidity.
+    ///
+    /// `is_buy` — true if a buy order filled (consuming ask-side depth).
+    /// `fill_size` — size of the fill in base units.
+    /// `new_depth_at_level` — the book depth on the consumed side *after* the fill.
+    ///
+    /// If `fill_size > depth_decrease`, the excess suggests hidden (iceberg) depth
+    /// that refilled the level.
+    pub fn on_fill_with_book_update(
+        &mut self,
+        is_buy: bool,
+        fill_size: f64,
+        new_depth_at_level: f64,
+    ) {
+        if fill_size <= 0.0 {
+            return;
+        }
+
+        if is_buy {
+            // Buy fills consume ask-side depth
+            let depth_decrease = (self.last_ask_depth - new_depth_at_level).max(0.0);
+            let hidden_frac = ((fill_size - depth_decrease) / fill_size).clamp(0.0, 1.0);
+            self.hidden_ratio_ask =
+                self.hidden_ratio_ask * (1.0 - ICEBERG_ALPHA) + hidden_frac * ICEBERG_ALPHA;
+            self.last_ask_depth = new_depth_at_level;
+        } else {
+            // Sell fills consume bid-side depth
+            let depth_decrease = (self.last_bid_depth - new_depth_at_level).max(0.0);
+            let hidden_frac = ((fill_size - depth_decrease) / fill_size).clamp(0.0, 1.0);
+            self.hidden_ratio_bid =
+                self.hidden_ratio_bid * (1.0 - ICEBERG_ALPHA) + hidden_frac * ICEBERG_ALPHA;
+            self.last_bid_depth = new_depth_at_level;
+        }
+    }
+
+    /// Returns the EWMA hidden liquidity ratio for the given side.
+    ///
+    /// Value in [0, 1]: 0 = no hidden, 1 = fully hidden.
+    pub fn hidden_liquidity_ratio(&self, is_buy: bool) -> f64 {
+        if is_buy {
+            self.hidden_ratio_ask
+        } else {
+            self.hidden_ratio_bid
+        }
+    }
+
+    /// Whether both sides show significant hidden liquidity (> threshold).
+    ///
+    /// Bilateral support suggests a well-supported book where tighter quoting is safer.
+    pub fn has_bilateral_support(&self) -> bool {
+        self.hidden_ratio_bid > HIDDEN_SUPPORT_THRESHOLD
+            && self.hidden_ratio_ask > HIDDEN_SUPPORT_THRESHOLD
+    }
+}
+
+impl Default for IcebergDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BookDynamicsTracker {
     pub fn new() -> Self {
         Self {
@@ -333,5 +445,139 @@ mod tests {
             p < stable_p,
             "volatile book ({p}) should have lower persistence than stable ({stable_p})"
         );
+    }
+
+    // ─── IcebergDetector tests ───
+
+    #[test]
+    fn test_iceberg_new_zeroed() {
+        let d = IcebergDetector::new();
+        assert_eq!(d.hidden_liquidity_ratio(true), 0.0);
+        assert_eq!(d.hidden_liquidity_ratio(false), 0.0);
+        assert!(!d.has_bilateral_support());
+    }
+
+    #[test]
+    fn test_iceberg_hidden_detected_when_fill_exceeds_decrease() {
+        let mut d = IcebergDetector::new();
+
+        // Snapshot: ask depth = 100
+        d.snapshot_book(100.0, 100.0);
+
+        // Buy fill of 10 units, but ask depth only dropped to 95 (decrease = 5)
+        // hidden_frac = (10 - 5) / 10 = 0.5
+        d.on_fill_with_book_update(true, 10.0, 95.0);
+
+        let ratio = d.hidden_liquidity_ratio(true);
+        // First observation: EWMA = 0.0 * 0.95 + 0.5 * 0.05 = 0.025
+        assert!(
+            (ratio - 0.025).abs() < 1e-9,
+            "expected 0.025, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_iceberg_no_hidden_when_fill_equals_decrease() {
+        let mut d = IcebergDetector::new();
+
+        // Snapshot: bid depth = 100
+        d.snapshot_book(100.0, 100.0);
+
+        // Sell fill of 10 units, bid depth drops to 90 (decrease = 10, matches fill)
+        // hidden_frac = (10 - 10) / 10 = 0.0
+        d.on_fill_with_book_update(false, 10.0, 90.0);
+
+        let ratio = d.hidden_liquidity_ratio(false);
+        assert!(
+            ratio.abs() < 1e-9,
+            "expected 0.0, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_iceberg_ewma_decay_over_time() {
+        let mut d = IcebergDetector::new();
+
+        // First: a fill with heavy hidden liquidity
+        d.snapshot_book(100.0, 100.0);
+        // Buy fill of 10, ask only drops to 100 (no decrease at all)
+        // hidden_frac = (10 - 0) / 10 = 1.0
+        d.on_fill_with_book_update(true, 10.0, 100.0);
+
+        let ratio_after_hidden = d.hidden_liquidity_ratio(true);
+        // EWMA = 0.0 * 0.95 + 1.0 * 0.05 = 0.05
+        assert!(
+            (ratio_after_hidden - 0.05).abs() < 1e-9,
+            "expected 0.05, got {ratio_after_hidden}"
+        );
+
+        // Now feed many fills with zero hidden fraction to decay the EWMA
+        for _ in 0..20 {
+            d.snapshot_book(100.0, 100.0);
+            // Buy fill of 10, ask drops to 90 (decrease = 10 = fill, hidden_frac = 0)
+            d.on_fill_with_book_update(true, 10.0, 90.0);
+        }
+
+        let ratio_decayed = d.hidden_liquidity_ratio(true);
+        assert!(
+            ratio_decayed < ratio_after_hidden,
+            "EWMA should decay: {ratio_decayed} should be < {ratio_after_hidden}"
+        );
+        assert!(
+            ratio_decayed < 0.02,
+            "after 20 zero-hidden fills, ratio should be small, got {ratio_decayed}"
+        );
+    }
+
+    #[test]
+    fn test_iceberg_bilateral_support() {
+        let mut d = IcebergDetector::new();
+
+        // Repeatedly feed fills with full hidden liquidity on both sides
+        // to build up EWMA above the 0.3 threshold
+        for _ in 0..100 {
+            d.snapshot_book(100.0, 100.0);
+            // Buy: ask stays at 100 → hidden_frac = 1.0
+            d.on_fill_with_book_update(true, 10.0, 100.0);
+            // Sell: bid stays at 100 → hidden_frac = 1.0
+            d.snapshot_book(100.0, 100.0);
+            d.on_fill_with_book_update(false, 10.0, 100.0);
+        }
+
+        assert!(
+            d.hidden_liquidity_ratio(true) > HIDDEN_SUPPORT_THRESHOLD,
+            "ask hidden ratio should exceed threshold"
+        );
+        assert!(
+            d.hidden_liquidity_ratio(false) > HIDDEN_SUPPORT_THRESHOLD,
+            "bid hidden ratio should exceed threshold"
+        );
+        assert!(
+            d.has_bilateral_support(),
+            "both sides above threshold should report bilateral support"
+        );
+    }
+
+    #[test]
+    fn test_iceberg_zero_fill_ignored() {
+        let mut d = IcebergDetector::new();
+        d.snapshot_book(100.0, 100.0);
+
+        // Zero-size fill should be a no-op
+        d.on_fill_with_book_update(true, 0.0, 95.0);
+        assert_eq!(d.hidden_liquidity_ratio(true), 0.0);
+
+        // Negative-size fill should also be a no-op
+        d.on_fill_with_book_update(false, -5.0, 95.0);
+        assert_eq!(d.hidden_liquidity_ratio(false), 0.0);
+    }
+
+    #[test]
+    fn test_iceberg_default_impl() {
+        let d = IcebergDetector::default();
+        assert_eq!(d.hidden_ratio_bid, 0.0);
+        assert_eq!(d.hidden_ratio_ask, 0.0);
+        assert_eq!(d.last_bid_depth, 0.0);
+        assert_eq!(d.last_ask_depth, 0.0);
     }
 }

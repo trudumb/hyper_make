@@ -606,7 +606,7 @@ pub struct StochasticComponents {
     // === Hawkes Excitation Prediction (Phase 1: Feature Engineering) ===
     /// Hawkes excitation predictor: detects trade clustering for reactive spread widening.
     /// Uses calibrated branching ratio and intensity percentiles from HawkesOrderFlowEstimator.
-    pub hawkes_predictor: crate::market_maker::process_models::hawkes::HawkesExcitationPredictor,
+    pub hawkes_predictor: crate::market_maker::HawkesExcitationPredictor,
 }
 
 impl StochasticComponents {
@@ -731,7 +731,7 @@ impl StochasticComponents {
             // Regime state machine (Phase 2 Redesign)
             regime_state: RegimeState::new(),
             // Hawkes excitation predictor for spread widening
-            hawkes_predictor: crate::market_maker::process_models::hawkes::HawkesExcitationPredictor::default(),
+            hawkes_predictor: crate::market_maker::HawkesExcitationPredictor::default(),
         }
     }
 

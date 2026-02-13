@@ -13,6 +13,7 @@ use crate::market_maker::belief::BeliefSnapshot;
 use crate::market_maker::stochastic::StochasticControlBuilder;
 
 use super::super::MarketParams;
+use super::super::regime_state::ControllerObjective;
 
 /// Sources for parameter aggregation.
 ///
@@ -602,6 +603,14 @@ impl ParameterAggregator {
             // Regime-Conditioned Kappa - wired from SignalIntegration in quote_engine
             regime_kappa: None,
             regime_kappa_current_regime: 1, // Normal default
+            // Regime-conditioned objective and parameters (wired from RegimeState)
+            regime_as_expected_bps: 1.0,
+            regime_risk_premium_bps: 1.0,
+            regime_skew_gain: 1.0,
+            regime_size_multiplier: 0.8,
+            controller_objective: ControllerObjective::MeanRevert,
+            max_position_fraction: 0.8,
+            total_risk_premium_bps: 1.0, // Wired from regime + addons in quote_engine
 
             // === Bayesian Gamma Components (Alpha Plan) ===
             // These are populated from QuoteGate and TheoreticalEdgeEstimator

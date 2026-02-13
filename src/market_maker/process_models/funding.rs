@@ -104,6 +104,14 @@ pub struct FundingRateEstimator {
     ewma_premium: f64,
     /// Premium history for analysis
     premium_history: VecDeque<(Instant, f64)>,
+
+    // === Basis Velocity Tracking ===
+    /// Previous basis (mark-index premium) for velocity computation
+    prev_basis: f64,
+    /// Instant of previous basis snapshot
+    prev_basis_time: Option<Instant>,
+    /// Instant of current basis snapshot (when current_premium was last set via update_from_prices)
+    current_basis_time: Option<Instant>,
 }
 
 impl FundingRateEstimator {
@@ -125,6 +133,10 @@ impl FundingRateEstimator {
             current_premium: 0.0,
             ewma_premium: 0.0,
             premium_history: VecDeque::with_capacity(500),
+            // Basis velocity tracking
+            prev_basis: 0.0,
+            prev_basis_time: None,
+            current_basis_time: None,
         }
     }
 
@@ -351,6 +363,11 @@ impl FundingRateEstimator {
         let now = Instant::now();
         let premium = (mark - index) / index;
 
+        // Update basis velocity tracking: shift current → prev, then set new current
+        self.prev_basis = self.current_premium;
+        self.prev_basis_time = self.current_basis_time;
+        self.current_basis_time = Some(now);
+
         self.current_premium = premium;
 
         // Update EWMA
@@ -429,6 +446,45 @@ impl FundingRateEstimator {
     pub fn premium_direction(&self) -> f64 {
         // Normalize to -1 to 1 range
         (self.current_premium / 0.01).clamp(-1.0, 1.0)
+    }
+
+    /// Basis velocity: rate of change of mark-index premium, scaled by settlement proximity.
+    ///
+    /// Captures whether the basis is converging or diverging as funding settlement
+    /// approaches. Fast-moving basis near settlement is a stronger signal.
+    ///
+    /// Returns a value clamped to [-1, 1].
+    pub fn basis_velocity(&self) -> f64 {
+        let (prev_time, cur_time) = match (self.prev_basis_time, self.current_basis_time) {
+            (Some(pt), Some(ct)) => (pt, ct),
+            _ => return 0.0, // Need at least 2 price updates
+        };
+
+        let elapsed_s = cur_time.duration_since(prev_time).as_secs_f64();
+        if elapsed_s < 0.01 {
+            return 0.0; // Avoid division by near-zero
+        }
+
+        // Raw velocity: change in basis per second
+        let raw_velocity = (self.current_premium - self.prev_basis) / elapsed_s;
+
+        // Scale by settlement proximity: velocity matters more near settlement
+        // settlement_fraction = time remaining / 8h period, in [0, 1]
+        let funding_interval_s = self.config.funding_interval.as_secs_f64();
+        let settlement_fraction = self
+            .time_to_next_funding()
+            .map(|d| d.as_secs_f64() / funding_interval_s)
+            .unwrap_or(0.5); // default to mid-period if unknown
+
+        // 1 / (fraction + 0.1) amplifies near settlement: ranges from ~1 (far) to ~10 (near)
+        let proximity_scale = 1.0 / (settlement_fraction + 0.1);
+
+        // Scale raw velocity to a reasonable range:
+        // Typical basis changes are ~0.001 per second at most.
+        // Multiply by 100 to get into [-1, 1] range before clamping.
+        let scaled = raw_velocity * 100.0 * proximity_scale;
+
+        scaled.clamp(-1.0, 1.0)
     }
 }
 
@@ -621,5 +677,66 @@ mod tests {
         assert!(summary.is_warmed_up);
         assert!((summary.current_rate - 0.0001).abs() < 1e-10);
         assert_eq!(summary.observation_count, 3);
+    }
+
+    #[test]
+    fn test_basis_velocity_no_data() {
+        let estimator = FundingRateEstimator::new(FundingConfig::default());
+        assert_eq!(estimator.basis_velocity(), 0.0);
+    }
+
+    #[test]
+    fn test_basis_velocity_single_update() {
+        let mut estimator = FundingRateEstimator::new(FundingConfig::default());
+        estimator.update_from_prices(100.01, 100.0); // 0.01% premium
+        // Only one update, prev_basis_time is None
+        assert_eq!(estimator.basis_velocity(), 0.0);
+    }
+
+    #[test]
+    fn test_basis_velocity_increasing_premium() {
+        let mut estimator = FundingRateEstimator::new(FundingConfig::default());
+        // Record a funding so next_funding_time is set
+        estimator.record_funding(0.0001, 1);
+
+        // First update: premium = 0.01%
+        estimator.update_from_prices(100.01, 100.0);
+        // Need time to elapse for non-zero velocity
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Second update: premium = 0.05% (increasing)
+        estimator.update_from_prices(100.05, 100.0);
+
+        let vel = estimator.basis_velocity();
+        assert!(vel > 0.0, "Increasing premium should give positive velocity, got {vel}");
+    }
+
+    #[test]
+    fn test_basis_velocity_decreasing_premium() {
+        let mut estimator = FundingRateEstimator::new(FundingConfig::default());
+        estimator.record_funding(0.0001, 1);
+
+        // First update: premium = 0.05%
+        estimator.update_from_prices(100.05, 100.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Second update: premium = 0.01% (decreasing)
+        estimator.update_from_prices(100.01, 100.0);
+
+        let vel = estimator.basis_velocity();
+        assert!(vel < 0.0, "Decreasing premium should give negative velocity, got {vel}");
+    }
+
+    #[test]
+    fn test_basis_velocity_clamped() {
+        let mut estimator = FundingRateEstimator::new(FundingConfig::default());
+        estimator.record_funding(0.0001, 1);
+
+        // First update: very low premium
+        estimator.update_from_prices(100.0, 100.0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Second update: huge premium jump (should clamp to 1.0)
+        estimator.update_from_prices(110.0, 100.0); // 10% premium jump
+
+        let vel = estimator.basis_velocity();
+        assert!(vel <= 1.0 && vel >= -1.0, "Velocity should be clamped, got {vel}");
     }
 }

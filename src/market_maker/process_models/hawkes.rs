@@ -968,6 +968,12 @@ impl Default for HawkesExcitationPrediction {
 /// ```
 ///
 /// When P(cluster) is high, excitation_penalty is low, reducing quoting aggressiveness.
+///
+/// # Synchronicity Coefficient
+///
+/// Measures event density entropy — toxic flow arrives in bursts of many trades
+/// with low inter-arrival time entropy. Returns [0, 1]: 0 = random noise,
+/// 1 = synchronized toxic flow.
 #[derive(Debug, Clone)]
 pub struct HawkesExcitationPredictor {
     config: HawkesExcitationConfig,
@@ -986,6 +992,20 @@ pub struct HawkesExcitationPredictor {
 
     /// EWMA decay factor
     ewma_alpha: f64,
+
+    // --- Synchronicity fields ---
+
+    /// Recent inter-arrival times (seconds) for entropy computation.
+    /// Defaults to empty on construction (checkpoint-compatible).
+    inter_arrival_buffer: VecDeque<f64>,
+
+    /// Timestamp (seconds, monotonic) of the last recorded event.
+    /// Defaults to None on construction (checkpoint-compatible).
+    last_event_time_secs: Option<f64>,
+
+    /// EWMA baseline density (events/sec) for normalizing burst detection.
+    /// Defaults to 1.0 on construction (checkpoint-compatible).
+    baseline_density: f64,
 }
 
 impl HawkesExcitationPredictor {
@@ -1003,6 +1023,9 @@ impl HawkesExcitationPredictor {
             baseline_intensity: 0.5, // Default baseline
             ewma_intensity_percentile: 0.5,
             ewma_alpha: 0.1, // Smooth over ~10 updates
+            inter_arrival_buffer: VecDeque::with_capacity(20),
+            last_event_time_secs: None,
+            baseline_density: 1.0, // 1 event/sec default
         }
     }
 
@@ -1019,6 +1042,105 @@ impl HawkesExcitationPredictor {
             + (1.0 - self.ewma_alpha) * self.ewma_intensity_percentile;
 
         self.latest_summary = Some(summary);
+    }
+
+    /// Record an event timestamp for synchronicity tracking.
+    ///
+    /// Call this on every trade event. The timestamp must be monotonically
+    /// increasing (seconds, e.g. `Instant::now().elapsed().as_secs_f64()`
+    /// or any monotonic clock).
+    pub fn record_event_time(&mut self, timestamp_secs: f64) {
+        const MAX_BUFFER: usize = 20;
+        const DENSITY_EWMA_ALPHA: f64 = 0.05;
+
+        if let Some(last_t) = self.last_event_time_secs {
+            let dt = (timestamp_secs - last_t).max(1e-9);
+            self.inter_arrival_buffer.push_back(dt);
+            if self.inter_arrival_buffer.len() > MAX_BUFFER {
+                self.inter_arrival_buffer.pop_front();
+            }
+
+            // Update baseline density EWMA (events/sec)
+            let instant_density = 1.0 / dt;
+            self.baseline_density = DENSITY_EWMA_ALPHA * instant_density
+                + (1.0 - DENSITY_EWMA_ALPHA) * self.baseline_density;
+        }
+        self.last_event_time_secs = Some(timestamp_secs);
+    }
+
+    /// Synchronicity coefficient: measures event density entropy.
+    ///
+    /// Toxic flow arrives in bursts with uniform (low-entropy) inter-arrival
+    /// times — many trades spaced equally within a short window. Random noise
+    /// has high-entropy (varied) inter-arrival times.
+    ///
+    /// Returns `[0, 1]`:
+    /// - `0.0` = random noise (high entropy, no density burst)
+    /// - `1.0` = synchronized toxic flow (low entropy, high density burst)
+    ///
+    /// Formula:
+    /// ```text
+    /// sync = (1 - H_norm) * min(density / baseline_density, 1.0)
+    /// ```
+    /// where `H_norm` is the normalized Shannon entropy of inter-arrival times
+    /// (binned into equal-width buckets), and density is the current arrival rate.
+    pub fn synchronicity_coefficient(&self) -> f64 {
+        const MIN_EVENTS: usize = 5;
+        const NUM_BINS: usize = 5;
+
+        if self.inter_arrival_buffer.len() < MIN_EVENTS {
+            return 0.0;
+        }
+
+        // Find range of inter-arrival times
+        let mut min_dt = f64::MAX;
+        let mut max_dt = f64::MIN;
+        for &dt in &self.inter_arrival_buffer {
+            if dt < min_dt { min_dt = dt; }
+            if dt > max_dt { max_dt = dt; }
+        }
+
+        let range = max_dt - min_dt;
+        if range < 1e-12 {
+            // All inter-arrival times are identical — perfectly synchronized
+            let density = 1.0 / min_dt.max(1e-9);
+            let density_ratio = (density / self.baseline_density.max(1e-9)).min(1.0);
+            return density_ratio;
+        }
+
+        // Bin inter-arrival times
+        let bin_width = range / NUM_BINS as f64;
+        let mut bins = [0u32; NUM_BINS];
+        let n = self.inter_arrival_buffer.len() as f64;
+
+        for &dt in &self.inter_arrival_buffer {
+            let idx = ((dt - min_dt) / bin_width).floor() as usize;
+            let idx = idx.min(NUM_BINS - 1);
+            bins[idx] += 1;
+        }
+
+        // Normalized Shannon entropy
+        let max_entropy = (NUM_BINS as f64).ln();
+        let mut entropy = 0.0_f64;
+        for &count in &bins {
+            if count > 0 {
+                let p = count as f64 / n;
+                entropy -= p * p.ln();
+            }
+        }
+        let normalized_entropy = if max_entropy > 1e-12 {
+            (entropy / max_entropy).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        // Current density from most recent inter-arrival time
+        let last_dt = *self.inter_arrival_buffer.back().unwrap();
+        let current_density = 1.0 / last_dt.max(1e-9);
+        let density_ratio = (current_density / self.baseline_density.max(1e-9)).min(1.0);
+
+        // Synchronicity = low entropy × high density
+        (1.0 - normalized_entropy) * density_ratio
     }
 
     /// Get current branching ratio (α/β).
@@ -1226,6 +1348,9 @@ impl HawkesExcitationPredictor {
         self.latest_summary = None;
         self.baseline_intensity = 0.5;
         self.ewma_intensity_percentile = 0.5;
+        self.inter_arrival_buffer.clear();
+        self.last_event_time_secs = None;
+        self.baseline_density = 1.0;
     }
 }
 
@@ -1921,5 +2046,92 @@ mod tests {
 
         // Should be back to defaults
         assert!((predictor.branching_ratio() - 0.3).abs() < 1e-6); // Default is 0.3
+    }
+
+    // ============================================================================
+    // Synchronicity Coefficient Tests
+    // ============================================================================
+
+    #[test]
+    fn test_synchronicity_cold_start() {
+        let predictor = HawkesExcitationPredictor::new();
+        // No events recorded — should return 0
+        assert!((predictor.synchronicity_coefficient() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_synchronicity_too_few_events() {
+        let mut predictor = HawkesExcitationPredictor::new();
+        // Record only 3 events (below MIN_EVENTS = 5)
+        for i in 0..3 {
+            predictor.record_event_time(i as f64 * 0.1);
+        }
+        assert!((predictor.synchronicity_coefficient() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_synchronicity_uniform_arrivals() {
+        let mut predictor = HawkesExcitationPredictor::new();
+        // Perfectly uniform inter-arrival times (all 0.01s apart)
+        // → zero entropy → high synchronicity (modulated by density ratio)
+        for i in 0..15 {
+            predictor.record_event_time(i as f64 * 0.01);
+        }
+        let sync = predictor.synchronicity_coefficient();
+        // All inter-arrivals identical → range ≈ 0 → fast path → density_ratio
+        // density = 1/0.01 = 100, baseline starts at 1.0 and converges
+        // density_ratio capped at 1.0
+        assert!(
+            sync > 0.5,
+            "Uniform arrivals should have high synchronicity, got {}",
+            sync
+        );
+    }
+
+    #[test]
+    fn test_synchronicity_random_arrivals() {
+        let mut predictor = HawkesExcitationPredictor::new();
+        // Highly varied inter-arrival times → high entropy → low synchronicity
+        // Use a manually constructed "random-like" sequence
+        let timestamps = [
+            0.0, 0.5, 0.52, 1.8, 1.81, 3.5, 3.9, 4.0, 7.0, 7.1,
+            7.3, 9.0, 12.0, 12.5, 15.0,
+        ];
+        for &t in &timestamps {
+            predictor.record_event_time(t);
+        }
+        let sync = predictor.synchronicity_coefficient();
+        // With varied spacing, entropy should be relatively high → lower sync
+        assert!(
+            sync < 0.8,
+            "Random-like arrivals should have lower synchronicity, got {}",
+            sync
+        );
+    }
+
+    #[test]
+    fn test_synchronicity_bounded_zero_one() {
+        let mut predictor = HawkesExcitationPredictor::new();
+        // Record a mix of events
+        for i in 0..20 {
+            let t = i as f64 * 0.05 + if i % 3 == 0 { 0.2 } else { 0.0 };
+            predictor.record_event_time(t);
+        }
+        let sync = predictor.synchronicity_coefficient();
+        assert!(sync >= 0.0 && sync <= 1.0, "Sync must be in [0,1], got {}", sync);
+    }
+
+    #[test]
+    fn test_synchronicity_reset_clears() {
+        let mut predictor = HawkesExcitationPredictor::new();
+        for i in 0..10 {
+            predictor.record_event_time(i as f64 * 0.01);
+        }
+        assert!(predictor.synchronicity_coefficient() > 0.0);
+
+        predictor.reset();
+        assert!((predictor.synchronicity_coefficient() - 0.0).abs() < 1e-9);
+        assert!(predictor.inter_arrival_buffer.is_empty());
+        assert!(predictor.last_event_time_secs.is_none());
     }
 }
