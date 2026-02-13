@@ -23,7 +23,7 @@ mod stochastic;
 
 // Re-export pub(crate) types for internal use within the crate
 pub(crate) use multi_scale::MultiScaleBipowerEstimator;
-pub(crate) use regime::{RegimeBeliefState, VolatilityRegimeTracker};
+pub(crate) use regime::VolatilityRegimeTracker;
 
 // Test-only re-export (used by parameter_estimator tests)
 #[cfg(test)]
@@ -31,4 +31,5 @@ pub(crate) use bipower::SingleScaleBipower;
 
 // Re-export public types for external access
 pub use regime::VolatilityRegime;
+pub use regime::{BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig};
 pub use stochastic::StochasticVolParams;

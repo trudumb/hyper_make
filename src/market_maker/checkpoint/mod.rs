@@ -239,6 +239,7 @@ mod tests {
             baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
+            calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
         }
     }
 

@@ -7,8 +7,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::market_maker::calibration::parameter_learner::LearnedParameters;
+use crate::market_maker::estimator::calibration_coordinator::CalibrationCoordinator;
 use crate::market_maker::learning::spread_bandit::SpreadBanditCheckpoint;
 use crate::market_maker::ComponentParams;
+
+/// Type alias: CalibrationCoordinator is directly serializable and acts as its own checkpoint.
+pub type CalibrationCoordinatorCheckpoint = CalibrationCoordinator;
 
 /// Readiness verdict for a checkpoint — can it safely drive live trading?
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -98,6 +102,9 @@ pub struct CheckpointBundle {
     /// Calibration readiness assessment, stamped at save time
     #[serde(default)]
     pub readiness: PriorReadiness,
+    /// Calibration coordinator state for L2-derived kappa blending
+    #[serde(default)]
+    pub calibration_coordinator: CalibrationCoordinatorCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -594,6 +601,7 @@ mod tests {
                 saved_at_ms: 1700000000000,
             },
             readiness: PriorReadiness::default(),
+            calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
         };
 
         // Serialize to JSON
@@ -630,6 +638,12 @@ mod tests {
         assert_eq!(restored.kill_switch.triggered_at_ms, 1700000000000);
         // Readiness round-trip
         assert_eq!(restored.readiness.verdict, PriorVerdict::Insufficient);
+        // Calibration coordinator round-trip
+        assert_eq!(restored.calibration_coordinator.fill_count(), 0);
+        assert_eq!(
+            restored.calibration_coordinator.phase(),
+            crate::market_maker::estimator::calibration_coordinator::CalibrationPhase::Cold,
+        );
     }
 
     #[test]
@@ -674,6 +688,7 @@ mod tests {
             baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
+            calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
         };
 
         // Serialize to JSON
@@ -724,6 +739,7 @@ mod tests {
             baseline_tracker: BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
+            calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -732,5 +748,49 @@ mod tests {
         let restored: CheckpointBundle = serde_json::from_str(&old_json).expect("deserialize old format");
         assert_eq!(restored.readiness.verdict, PriorVerdict::Insufficient);
         assert_eq!(restored.readiness.estimators_ready, 0);
+    }
+
+    #[test]
+    fn test_checkpoint_bundle_backward_compat_no_calibration_coordinator() {
+        let bundle = CheckpointBundle {
+            metadata: CheckpointMetadata {
+                version: 1,
+                timestamp_ms: 1700000000000,
+                asset: "ETH".to_string(),
+                session_duration_s: 100.0,
+            },
+            learned_params: LearnedParameters::default(),
+            pre_fill: PreFillCheckpoint::default(),
+            enhanced: EnhancedCheckpoint::default(),
+            vol_filter: VolFilterCheckpoint::default(),
+            regime_hmm: RegimeHMMCheckpoint::default(),
+            informed_flow: InformedFlowCheckpoint::default(),
+            fill_rate: FillRateCheckpoint::default(),
+            kappa_own: KappaCheckpoint::default(),
+            kappa_bid: KappaCheckpoint::default(),
+            kappa_ask: KappaCheckpoint::default(),
+            momentum: MomentumCheckpoint::default(),
+            kelly_tracker: KellyTrackerCheckpoint::default(),
+            ensemble_weights: EnsembleWeightsCheckpoint::default(),
+            quote_outcomes: QuoteOutcomeCheckpoint::default(),
+            spread_bandit: SpreadBanditCheckpoint::default(),
+            baseline_tracker: BaselineTrackerCheckpoint::default(),
+            kill_switch: KillSwitchCheckpoint::default(),
+            readiness: PriorReadiness::default(),
+            calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+        };
+        let json = serde_json::to_string(&bundle).expect("serialize");
+        let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        map.as_object_mut().unwrap().remove("calibration_coordinator");
+        let old_json = serde_json::to_string(&map).expect("re-serialize");
+        let restored: CheckpointBundle =
+            serde_json::from_str(&old_json).expect("deserialize old format without calibration_coordinator");
+        // Should default to Cold phase with 0 fills
+        assert_eq!(
+            restored.calibration_coordinator.phase(),
+            crate::market_maker::estimator::calibration_coordinator::CalibrationPhase::Cold,
+        );
+        assert_eq!(restored.calibration_coordinator.fill_count(), 0);
+        assert!(!restored.calibration_coordinator.is_seeded());
     }
 }

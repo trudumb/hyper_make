@@ -286,6 +286,7 @@ mod tests {
             baseline_tracker: crate::market_maker::checkpoint::types::BaselineTrackerCheckpoint::default(),
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
+            calibration_coordinator: crate::market_maker::checkpoint::types::CalibrationCoordinatorCheckpoint::default(),
         }
     }
 

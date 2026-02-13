@@ -118,7 +118,7 @@ impl VolatilityRegime {
 /// let blended = blender.blend_all(&belief);
 /// ```
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RegimeBeliefState {
+pub struct RegimeBeliefState {
     /// Probability of Low (calm) regime
     pub p_low: f64,
     /// Probability of Normal regime
@@ -254,7 +254,7 @@ impl RegimeBeliefState {
 /// - κ varies 10x between calm and cascade
 /// - γ varies 5x between calm and cascade
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RegimeParameterConfig {
+pub struct RegimeParameterConfig {
     /// Base gamma (risk aversion) for Normal regime
     pub gamma_base: f64,
     /// Base kappa (fill intensity) for Normal regime
@@ -280,7 +280,7 @@ impl Default for RegimeParameterConfig {
 ///
 /// This provides smooth transitions and handles regime uncertainty appropriately.
 #[derive(Debug, Clone)]
-pub(crate) struct RegimeParameterBlender {
+pub struct RegimeParameterBlender {
     /// Base parameter configuration
     config: RegimeParameterConfig,
 
@@ -418,7 +418,7 @@ impl RegimeParameterBlender {
 
 /// Result of blending all parameters for a given belief state.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BlendedParameters {
+pub struct BlendedParameters {
     /// Blended gamma (risk aversion)
     pub gamma: f64,
     /// Blended kappa (fill intensity)

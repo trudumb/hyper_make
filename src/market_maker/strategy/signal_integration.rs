@@ -1104,6 +1104,21 @@ impl SignalIntegrator {
         self.regime_kappa.blended_prior()
     }
 
+    /// Reinitialize regime kappa priors from a MarketProfile.
+    ///
+    /// Called once when the first L2 snapshot provides implied kappa.
+    /// Replaces BTC-calibrated priors with asset-specific values.
+    pub fn reinit_regime_kappa_from_profile(
+        &mut self,
+        implied_kappa: f64,
+        _liquidity_class: crate::market_maker::estimator::market_profile::LiquidityClass,
+    ) {
+        let config = crate::market_maker::estimator::regime_kappa::RegimeKappaConfig::from_base_kappa(
+            implied_kappa.clamp(50.0, 50000.0),
+        );
+        self.regime_kappa = RegimeKappaEstimator::new(config);
+    }
+
     /// Get model gating for direct access.
     pub fn model_gating(&self) -> &ModelGating {
         &self.model_gating

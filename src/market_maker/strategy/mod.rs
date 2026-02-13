@@ -11,6 +11,7 @@ mod market_params;
 mod params;
 mod position_manager;
 pub mod regime_state;
+pub mod spread_oracle;
 mod risk_config;
 mod risk_model;
 mod signal_integration;

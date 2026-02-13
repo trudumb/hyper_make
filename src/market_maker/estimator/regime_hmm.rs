@@ -515,6 +515,58 @@ impl RegimeHMM {
         self
     }
 
+    /// Seed emission distributions from a MarketProfile's observable parameters.
+    ///
+    /// Convenience wrapper around `with_baseline_volatility` logic that takes
+    /// raw f64 parameters (extracted from MarketProfile by the caller).
+    /// This avoids a direct dependency on the MarketProfile struct.
+    ///
+    /// Enforces minimum regime separation: HIGH vol >= 2x NORMAL vol.
+    ///
+    /// # Arguments
+    /// * `normal_vol` - Normal-condition per-second volatility (from `MarketProfile::implied_sigma()`)
+    /// * `normal_spread_bps` - Normal-condition BBO spread in bps (from `MarketProfile::bbo_half_spread_bps()`)
+    pub fn seed_emissions_from_profile(&mut self, normal_vol: f64, normal_spread_bps: f64) {
+        let vol = normal_vol.max(1e-6);
+        let spread = normal_spread_bps.max(1.0);
+
+        // Set emissions using the same multiplier pattern as with_baseline_volatility:
+        // Low: 0.3x, Normal: 1.0x, High: 3.0x, Extreme: 10.0x
+        self.emission_params[regime_idx::LOW] = EmissionParams::new(
+            vol * 0.3,
+            vol * 0.15,
+            spread * 0.6,
+            spread * 0.3,
+        );
+        self.emission_params[regime_idx::NORMAL] = EmissionParams::new(
+            vol,
+            vol * 0.4,
+            spread,
+            spread * 0.4,
+        );
+        self.emission_params[regime_idx::HIGH] = EmissionParams::new(
+            vol * 3.0,
+            vol * 1.5,
+            spread * 2.0,
+            spread * 1.0,
+        );
+        self.emission_params[regime_idx::EXTREME] = EmissionParams::new(
+            vol * 10.0,
+            vol * 5.0,
+            spread * 5.0,
+            spread * 3.0,
+        );
+
+        // Enforce regime separation: HIGH vol >= 2x NORMAL vol
+        let normal_vol_mean = self.emission_params[regime_idx::NORMAL].mean_volatility;
+        let high_vol_mean = self.emission_params[regime_idx::HIGH].mean_volatility;
+        if high_vol_mean < normal_vol_mean * 2.0 {
+            self.emission_params[regime_idx::HIGH].mean_volatility = normal_vol_mean * 2.0;
+        }
+
+        self.initial_calibration_done = true;
+    }
+
     /// Set the calibration buffer size (number of observations before auto-calibration).
     pub fn with_calibration_buffer_size(mut self, size: usize) -> Self {
         self.calibration_buffer_size = size.max(50);
@@ -733,8 +785,7 @@ impl RegimeHMM {
     /// 1. Holds `RegimeHMM` and `RegimeParameterBlender`
     /// 2. On each update, calls `hmm.to_belief_state()` → `blender.blend_all()`
     /// 3. Uses blended gamma/kappa in GLFT calculation
-    #[allow(dead_code)] // Reserved for future HMM → parameter blending integration
-    pub(crate) fn to_belief_state(&self) -> RegimeBeliefState {
+    pub fn to_belief_state(&self) -> RegimeBeliefState {
         RegimeBeliefState {
             p_low: self.belief[regime_idx::LOW],
             p_normal: self.belief[regime_idx::NORMAL],
@@ -1428,5 +1479,78 @@ mod tests {
         }
 
         assert!((hmm.emission_learning_rate - 0.05).abs() < 1e-9);
+    }
+
+    // === seed_emissions_from_profile tests ===
+
+    #[test]
+    fn test_seed_from_profile_hype_conditions() {
+        // HYPE: ~0.001 vol, ~15 bps half-spread
+        let mut hmm = RegimeHMM::default();
+        hmm.seed_emissions_from_profile(0.001, 15.0);
+
+        let normal = &hmm.emission_params()[regime_idx::NORMAL];
+        assert!(
+            (normal.mean_volatility - 0.001).abs() < 1e-8,
+            "Normal vol should be 0.001, got {}",
+            normal.mean_volatility
+        );
+        assert!(
+            (normal.mean_spread - 15.0).abs() < 0.01,
+            "Normal spread should be 15 bps, got {}",
+            normal.mean_spread
+        );
+    }
+
+    #[test]
+    fn test_seed_from_profile_btc_conditions() {
+        // BTC: ~0.00025 vol, ~1.5 bps half-spread
+        let mut hmm = RegimeHMM::default();
+        hmm.seed_emissions_from_profile(0.00025, 1.5);
+
+        let normal = &hmm.emission_params()[regime_idx::NORMAL];
+        assert!(
+            (normal.mean_volatility - 0.00025).abs() < 1e-9,
+            "Normal vol should be 0.00025, got {}",
+            normal.mean_volatility
+        );
+        assert!(
+            (normal.mean_spread - 1.5).abs() < 0.01,
+            "Normal spread should be 1.5 bps, got {}",
+            normal.mean_spread
+        );
+    }
+
+    #[test]
+    fn test_seed_from_profile_regime_separation() {
+        let mut hmm = RegimeHMM::default();
+        hmm.seed_emissions_from_profile(0.0005, 10.0);
+
+        let normal_vol = hmm.emission_params()[regime_idx::NORMAL].mean_volatility;
+        let high_vol = hmm.emission_params()[regime_idx::HIGH].mean_volatility;
+        let extreme_vol = hmm.emission_params()[regime_idx::EXTREME].mean_volatility;
+
+        // HIGH >= 2x NORMAL (enforced by safety check)
+        assert!(
+            high_vol >= normal_vol * 2.0 - 1e-12,
+            "HIGH vol ({}) should be >= 2x NORMAL vol ({})",
+            high_vol,
+            normal_vol
+        );
+        // EXTREME > HIGH
+        assert!(
+            extreme_vol > high_vol,
+            "EXTREME vol ({}) should be > HIGH vol ({})",
+            extreme_vol,
+            high_vol
+        );
+        // LOW < NORMAL
+        let low_vol = hmm.emission_params()[regime_idx::LOW].mean_volatility;
+        assert!(
+            low_vol < normal_vol,
+            "LOW vol ({}) should be < NORMAL vol ({})",
+            low_vol,
+            normal_vol
+        );
     }
 }

@@ -665,6 +665,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             },
             kill_switch: self.safety.kill_switch.to_checkpoint(),
             readiness: checkpoint::PriorReadiness::default(),
+            calibration_coordinator: checkpoint::CalibrationCoordinatorCheckpoint::default(),
         }
     }
 

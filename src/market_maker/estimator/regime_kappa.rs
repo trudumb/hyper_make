@@ -132,6 +132,45 @@ impl RegimeKappaConfig {
         }
     }
 
+    /// Create config from a base kappa derived from market observables.
+    ///
+    /// Multipliers: Low=1.5x, Normal=1.0x, High=0.5x, Extreme=0.25x.
+    /// This replaces hardcoded BTC priors with asset-adaptive values.
+    pub fn from_base_kappa(base: f64) -> Self {
+        let base = base.clamp(50.0, 50000.0);
+        Self {
+            prior_kappa_low: base * 1.5,
+            prior_kappa_normal: base,
+            prior_kappa_high: base * 0.5,
+            prior_kappa_extreme: base * 0.25,
+            ..Self::default()
+        }
+    }
+
+    /// Create regime kappa config from a MarketProfile's implied kappa.
+    ///
+    /// Replaces hardcoded BTC-calibrated priors {3000, 2000, 1000, 500}
+    /// with multipliers of the asset's observed fill intensity.
+    /// Uses weaker prior strength (5.0) for profile-derived values to allow
+    /// faster adaptation to real fills.
+    ///
+    /// # Arguments
+    /// * `implied_kappa` - Kappa implied by the asset's BBO spread
+    /// * `_liquidity_class` - Liquidity class as u8 (0=Illiquid, 1=Moderate, 2=Liquid).
+    ///   Reserved for future per-class tuning; currently all classes use the same multipliers.
+    pub fn from_profile(implied_kappa: f64, _liquidity_class: u8) -> Self {
+        let base = implied_kappa.clamp(50.0, 50000.0);
+        Self {
+            prior_kappa_low: base * 1.5,
+            prior_kappa_normal: base,
+            prior_kappa_high: base * 0.5,
+            prior_kappa_extreme: base * 0.25,
+            // Weaker prior for profile-derived values (faster adaptation)
+            prior_strength: 5.0,
+            ..Self::default()
+        }
+    }
+
     /// Get prior kappa for a regime index.
     fn prior_for_regime(&self, regime: usize) -> f64 {
         match regime {
@@ -629,5 +668,97 @@ mod tests {
         assert!(!estimator.is_warmed_up());
         // But was_ever_warmed_up() stays true
         assert!(estimator.was_ever_warmed_up());
+    }
+
+    // === from_profile tests ===
+
+    #[test]
+    fn test_from_profile_hype_kappa() {
+        // HYPE-like: implied kappa ~466
+        let config = RegimeKappaConfig::from_profile(466.0, 0);
+        assert!(
+            (config.prior_kappa_low - 699.0).abs() < 0.1,
+            "Low should be 1.5x: got {:.1}",
+            config.prior_kappa_low
+        );
+        assert!(
+            (config.prior_kappa_normal - 466.0).abs() < 0.1,
+            "Normal should be 1.0x: got {:.1}",
+            config.prior_kappa_normal
+        );
+        assert!(
+            (config.prior_kappa_high - 233.0).abs() < 0.1,
+            "High should be 0.5x: got {:.1}",
+            config.prior_kappa_high
+        );
+        assert!(
+            (config.prior_kappa_extreme - 116.5).abs() < 0.1,
+            "Extreme should be 0.25x: got {:.1}",
+            config.prior_kappa_extreme
+        );
+    }
+
+    #[test]
+    fn test_from_profile_btc_kappa() {
+        // BTC-like: implied kappa ~6000
+        let config = RegimeKappaConfig::from_profile(6000.0, 2);
+        assert!(
+            (config.prior_kappa_low - 9000.0).abs() < 0.1,
+            "Low should be 9000, got {:.1}",
+            config.prior_kappa_low
+        );
+        assert!(
+            (config.prior_kappa_normal - 6000.0).abs() < 0.1,
+            "Normal should be 6000, got {:.1}",
+            config.prior_kappa_normal
+        );
+        assert!(
+            (config.prior_kappa_high - 3000.0).abs() < 0.1,
+            "High should be 3000, got {:.1}",
+            config.prior_kappa_high
+        );
+        assert!(
+            (config.prior_kappa_extreme - 1500.0).abs() < 0.1,
+            "Extreme should be 1500, got {:.1}",
+            config.prior_kappa_extreme
+        );
+    }
+
+    #[test]
+    fn test_from_profile_prior_ordering() {
+        for &kappa in &[100.0, 466.0, 2000.0, 6000.0, 20000.0] {
+            let config = RegimeKappaConfig::from_profile(kappa, 1);
+            assert!(
+                config.prior_kappa_low > config.prior_kappa_normal,
+                "Low > Normal for kappa={kappa}"
+            );
+            assert!(
+                config.prior_kappa_normal > config.prior_kappa_high,
+                "Normal > High for kappa={kappa}"
+            );
+            assert!(
+                config.prior_kappa_high > config.prior_kappa_extreme,
+                "High > Extreme for kappa={kappa}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_profile_clamp_extremes() {
+        // Very small kappa -> clamped to 50
+        let config = RegimeKappaConfig::from_profile(10.0, 0);
+        assert!(
+            (config.prior_kappa_normal - 50.0).abs() < 0.1,
+            "Should clamp to 50, got {:.1}",
+            config.prior_kappa_normal
+        );
+
+        // Very large kappa -> clamped to 50000
+        let config = RegimeKappaConfig::from_profile(100000.0, 2);
+        assert!(
+            (config.prior_kappa_normal - 50000.0).abs() < 0.1,
+            "Should clamp to 50000, got {:.1}",
+            config.prior_kappa_normal
+        );
     }
 }

@@ -62,6 +62,8 @@ pub mod volatility_filter;
 mod volume;
 pub mod trade_flow_tracker;
 pub mod vpin;
+pub mod market_profile;
+pub mod calibration_coordinator;
 
 // V2 re-exports (will be used when integrated)
 #[allow(unused_imports)]
@@ -106,7 +108,10 @@ pub use mock::MockEstimator;
 pub use momentum::MomentumModel;
 pub use parameter_estimator::{KappaStagnationAlert, ParameterEstimator};
 pub use trend_persistence::{TrendConfig, TrendPersistenceTracker, TrendSignal};
-pub use volatility::{StochasticVolParams, VolatilityRegime};
+pub use volatility::{
+    BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig,
+    StochasticVolParams, VolatilityRegime,
+};
 pub use volatility_filter::{VolFilterConfig, VolParticle, VolRegimeParams, VolatilityFilter};
 
 // Mutual information for feature quality assessment
