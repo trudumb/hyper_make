@@ -158,6 +158,29 @@ pub struct SignalIntegratorConfig {
     /// Applied on top of existing skew components to prevent accumulating into trends.
     /// Default: 10.0 bps.
     pub flow_urgency_max_bps: f64,
+
+    // === Inventory + Signal Skew ===
+
+    /// Enable inventory-based skew (always active when position != 0).
+    /// Lean quotes away from inventory to encourage mean reversion.
+    pub use_inventory_skew: bool,
+
+    /// Sensitivity of inventory skew to position_ratio.
+    /// inventory_skew_bps = -position_ratio * skew_sensitivity * half_spread_estimate_bps.
+    /// Default: 0.5 (50% of half-spread at full position).
+    pub inventory_skew_sensitivity: f64,
+
+    /// Enable signal-based directional skew from alpha/trend signals.
+    pub use_signal_skew: bool,
+
+    /// Maximum signal skew in bps.
+    /// Alpha and trend signals are converted to skew capped at this value.
+    /// Default: 3.0 bps.
+    pub signal_skew_max_bps: f64,
+
+    /// Maximum combined skew as fraction of estimated half_spread.
+    /// Prevents quote crossing. Default: 0.8 (80% of half-spread).
+    pub max_skew_half_spread_fraction: f64,
 }
 
 impl Default for SignalIntegratorConfig {
@@ -191,6 +214,12 @@ impl Default for SignalIntegratorConfig {
             buy_pressure_max_fraction: 0.3,
             max_spread_adjustment_bps: 20.0,
             flow_urgency_max_bps: 10.0,
+            // Inventory + signal skew: enabled by default
+            use_inventory_skew: true,
+            inventory_skew_sensitivity: 0.5,
+            use_signal_skew: true,
+            signal_skew_max_bps: 3.0,
+            max_skew_half_spread_fraction: 0.8,
         }
     }
 }
@@ -226,6 +255,8 @@ impl SignalIntegratorConfig {
             use_per_signal_gating: false,
             use_vpin_toxicity: false,
             use_buy_pressure: false,
+            use_inventory_skew: false,
+            use_signal_skew: false,
             ..Default::default()
         }
     }
@@ -458,6 +489,16 @@ pub struct SignalIntegrator {
 
     /// Update counter for logging.
     update_count: u64,
+
+    // === Inventory/Signal Skew Context (set each cycle by orchestrator) ===
+    /// Current signed position (positive = long, negative = short).
+    position: f64,
+    /// Maximum position from config (hard limit).
+    max_position: f64,
+    /// Predicted alpha [0, 1] from AS estimator (0.5 = neutral).
+    predicted_alpha: f64,
+    /// Estimated half-spread in bps (from kappa-derived GLFT spread).
+    half_spread_estimate_bps: f64,
 }
 
 impl SignalIntegrator {
@@ -483,6 +524,10 @@ impl SignalIntegrator {
             vpin_valid: false,
             buy_pressure: BuyPressureTracker::new(),
             update_count: 0,
+            position: 0.0,
+            max_position: 0.0,
+            predicted_alpha: 0.5,
+            half_spread_estimate_bps: 5.0,
         }
     }
 
@@ -649,6 +694,24 @@ impl SignalIntegrator {
         self.latest_hl_vpin = vpin;
         self.latest_hl_vpin_velocity = velocity;
         self.vpin_valid = valid;
+    }
+
+    /// Update inventory and signal context for skew computation.
+    ///
+    /// Must be called each quote cycle before `get_signals()` to provide
+    /// position, max_position, predicted_alpha, and half-spread estimate.
+    /// These drive inventory-based and signal-based directional skew.
+    pub fn set_skew_context(
+        &mut self,
+        position: f64,
+        max_position: f64,
+        predicted_alpha: f64,
+        half_spread_estimate_bps: f64,
+    ) {
+        self.position = position;
+        self.max_position = max_position;
+        self.predicted_alpha = predicted_alpha;
+        self.half_spread_estimate_bps = half_spread_estimate_bps;
     }
 
     /// Update buy pressure tracker with a trade observation.
@@ -887,7 +950,37 @@ impl SignalIntegrator {
             0.0
         };
 
-        signals.combined_skew_bps = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps;
+        // === INVENTORY SKEW: Always active when position != 0 ===
+        // Lean quotes away from inventory to encourage mean reversion.
+        // Negative when long (tighten asks), positive when short (tighten bids).
+        let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
+            let position_ratio = (self.position / self.max_position).clamp(-1.0, 1.0);
+            -position_ratio * self.config.inventory_skew_sensitivity * self.half_spread_estimate_bps
+        } else {
+            0.0
+        };
+
+        // === SIGNAL SKEW: Directional skew from alpha/trend signals ===
+        // Alpha > 0.5 = bullish (lean bids), alpha < 0.5 = bearish (lean asks).
+        // Convert alpha [0, 1] to normalized signal [-1, 1].
+        let signal_skew_bps = if self.config.use_signal_skew {
+            let signal_normalized = (self.predicted_alpha - 0.5) * 2.0;
+            // Only apply when alpha deviates meaningfully from 0.5 (neutral)
+            if signal_normalized.abs() > 0.1 {
+                signal_normalized * self.config.signal_skew_max_bps
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let raw_skew = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps
+            + inventory_skew_bps + signal_skew_bps;
+
+        // Clamp combined skew to prevent quote crossing: max 80% of half-spread
+        let max_skew_bps = self.config.max_skew_half_spread_fraction * self.half_spread_estimate_bps;
+        signals.combined_skew_bps = raw_skew.clamp(-max_skew_bps, max_skew_bps);
 
         // === HL-Native Directional Skew Fallback ===
         // When cross-venue signals are unavailable (no Binance feed for this asset),
@@ -921,6 +1014,9 @@ impl SignalIntegrator {
                 signals.combined_skew_bps += flow_skew_bps;
             }
         }
+
+        // Final clamp: ensure all additive skew components combined don't exceed safe bounds
+        signals.combined_skew_bps = signals.combined_skew_bps.clamp(-max_skew_bps, max_skew_bps);
 
         // === Build per-signal contribution record for attribution ===
         let vpin_active = self.config.use_vpin_toxicity && self.vpin_valid
@@ -1148,6 +1244,10 @@ impl SignalIntegrator {
         self.vpin_valid = false;
         self.buy_pressure = BuyPressureTracker::new();
         self.update_count = 0;
+        self.position = 0.0;
+        self.max_position = 0.0;
+        self.predicted_alpha = 0.5;
+        self.half_spread_estimate_bps = 5.0;
     }
 }
 
@@ -1645,6 +1745,9 @@ mod tests {
 
         let mut integrator = SignalIntegrator::default_config();
 
+        // Set wide half-spread so skew clamp doesn't bite (max = 0.8 * 15 = 12 bps)
+        integrator.set_skew_context(0.0, 1.0, 0.5, 15.0);
+
         // Strong buy pressure above urgency threshold (0.6)
         integrator.latest_hl_flow = FlowFeatureVec {
             imbalance_5s: 0.9, // 75% urgency: (0.9 - 0.6) / 0.4 = 0.75
@@ -1684,6 +1787,147 @@ mod tests {
         assert!(
             signals.combined_skew_bps <= fallback_cap + 0.01,
             "Below urgency threshold, skew should be <= fallback cap {fallback_cap}, got: {}",
+            signals.combined_skew_bps
+        );
+    }
+
+    // === Inventory + Signal Skew Tests ===
+
+    #[test]
+    fn test_inventory_skew_zero_position_neutral() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Position = 0, alpha = 0.5 (neutral) → skew should be ~0
+        integrator.set_skew_context(0.0, 1.0, 0.5, 5.0);
+        let signals = integrator.get_signals();
+        // With zero position and neutral alpha, only fallback skew from flow (also 0)
+        assert!(
+            signals.combined_skew_bps.abs() < 0.5,
+            "Zero position + neutral alpha should give near-zero skew, got: {:.3}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_inventory_skew_long_position_negative() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Long position → skew should be NEGATIVE (lean asks, encourage selling)
+        integrator.set_skew_context(0.5, 1.0, 0.5, 5.0);
+        let signals = integrator.get_signals();
+        assert!(
+            signals.combined_skew_bps < -0.1,
+            "Long position should produce negative skew, got: {:.3}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_inventory_skew_short_position_positive() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Short position → skew should be POSITIVE (lean bids, encourage buying)
+        integrator.set_skew_context(-0.5, 1.0, 0.5, 5.0);
+        let signals = integrator.get_signals();
+        assert!(
+            signals.combined_skew_bps > 0.1,
+            "Short position should produce positive skew, got: {:.3}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_inventory_skew_scales_with_position_ratio() {
+        let mut integrator = SignalIntegrator::default_config();
+
+        // Small position
+        integrator.set_skew_context(0.2, 1.0, 0.5, 5.0);
+        let signals_small = integrator.get_signals();
+
+        // Large position
+        integrator.set_skew_context(0.8, 1.0, 0.5, 5.0);
+        let signals_large = integrator.get_signals();
+
+        // Larger position should produce more skew (larger magnitude)
+        assert!(
+            signals_large.combined_skew_bps.abs() > signals_small.combined_skew_bps.abs(),
+            "Larger position should produce more skew: small={:.3}, large={:.3}",
+            signals_small.combined_skew_bps,
+            signals_large.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_skew_clamped_prevents_crossing() {
+        let mut integrator = SignalIntegrator::default_config();
+
+        // Max position + extreme alpha → should clamp to 80% of half-spread
+        integrator.set_skew_context(1.0, 1.0, 0.0, 5.0);
+        let signals = integrator.get_signals();
+
+        let max_allowed = 0.8 * 5.0; // max_skew_half_spread_fraction * half_spread
+        assert!(
+            signals.combined_skew_bps.abs() <= max_allowed + 0.01,
+            "Skew should be clamped to {:.2} bps, got: {:.3}",
+            max_allowed,
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_signal_skew_bullish_alpha() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Bullish alpha (0.8) with no position → positive signal skew
+        integrator.set_skew_context(0.0, 1.0, 0.8, 5.0);
+        let signals = integrator.get_signals();
+        assert!(
+            signals.combined_skew_bps > 0.1,
+            "Bullish alpha should produce positive skew, got: {:.3}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_signal_skew_bearish_alpha() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Bearish alpha (0.2) with no position → negative signal skew
+        integrator.set_skew_context(0.0, 1.0, 0.2, 5.0);
+        let signals = integrator.get_signals();
+        assert!(
+            signals.combined_skew_bps < -0.1,
+            "Bearish alpha should produce negative skew, got: {:.3}",
+            signals.combined_skew_bps
+        );
+    }
+
+    #[test]
+    fn test_signal_skew_neutral_alpha_no_effect() {
+        let mut integrator = SignalIntegrator::default_config();
+        // Neutral alpha (0.5) → signal skew should be zero (below 0.1 threshold)
+        integrator.set_skew_context(0.0, 1.0, 0.5, 5.0);
+        let signals_neutral = integrator.get_signals();
+
+        // Slightly off-neutral (0.54 → normalized = 0.08, below 0.1 threshold)
+        integrator.set_skew_context(0.0, 1.0, 0.54, 5.0);
+        let signals_slight = integrator.get_signals();
+
+        assert!(
+            (signals_neutral.combined_skew_bps - signals_slight.combined_skew_bps).abs() < 0.01,
+            "Near-neutral alpha should not produce signal skew"
+        );
+    }
+
+    #[test]
+    fn test_inventory_skew_disabled_config() {
+        let mut config = SignalIntegratorConfig::default();
+        config.use_inventory_skew = false;
+        config.use_signal_skew = false;
+        let mut integrator = SignalIntegrator::new(config);
+
+        integrator.set_skew_context(1.0, 1.0, 0.9, 10.0);
+        let signals = integrator.get_signals();
+
+        // With inventory/signal skew disabled and no other signals, skew should be ~0
+        assert!(
+            signals.combined_skew_bps.abs() < 0.5,
+            "Disabled skew should give near-zero, got: {:.3}",
             signals.combined_skew_bps
         );
     }

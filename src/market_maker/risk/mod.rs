@@ -40,6 +40,7 @@
 mod aggregator;
 mod circuit_breaker;
 mod drawdown;
+mod inventory_governor;
 mod kill_switch;
 mod limits;
 mod monitor;
@@ -49,6 +50,7 @@ mod reentry;
 mod state;
 
 pub use aggregator::{AggregatedRisk, RiskAggregator};
+pub use inventory_governor::{InventoryGovernor, PositionAssessment, PositionZone};
 pub use circuit_breaker::{
     CircuitBreakerAction, CircuitBreakerConfig, CircuitBreakerMonitor, CircuitBreakerType,
 };

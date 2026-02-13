@@ -78,3 +78,30 @@ Compound effect: predicted_edge = 30 - 0 - 1.5 = 28.5 bps vs realized ~0.7 bps =
 ### Serena Tool Reliability Note
 Serena `replace_content` sometimes reports OK but edits don't persist on disk (WSL2 filesystem).
 Always verify with `grep` after Serena edits. Prefer Claude's Edit tool for reliability.
+
+## Asymmetric Pricing / Directional Skew (2026-02-12)
+
+### Problem
+`combined_skew_bps = 0` for 99.8% of cycles — symmetric quoting even during one-sided sweeps.
+Result: 24 buys / 5 sells during 188 bps market drop.
+
+### Solution: Inventory + Signal Skew in `signal_integration.rs`
+- **Inventory skew**: `−(position/max_position) × 0.5 × half_spread_bps` — always active
+- **Signal skew**: `(alpha − 0.5) × 2 × 3.0 bps` — when alpha deviates >0.1 from neutral
+- **Clamp**: `±0.8 × half_spread_bps` prevents quote crossing
+- **Setter**: `set_skew_context(position, max_position, predicted_alpha, half_spread_estimate_bps)`
+  Must be called by orchestrator each cycle before `get_signals()`.
+
+### Mid-Price Offset in `ladder_strat.rs`
+- Applied after L2 reservation shift: `skewed_mid = adjusted_microprice × (1 + skew_bps / 10000)`
+- Bounded within half-spread of `market_mid` to prevent crossing
+- `lead_lag_signal_bps` carries combined skew from signal integrator + position guard
+
+### Key Design Decisions
+1. Context via setter (not method params) — follows existing `set_vpin`, `set_hl_flow_features` pattern
+2. Skew clamp at 80% half-spread — strict enough to prevent crossing, loose enough to be effective
+3. Alpha dead zone at ±0.1 — prevents noise from triggering signal skew
+4. Existing HL-native fallback and flow urgency still work — they trigger when other skew is zero
+
+### Tests: 9 new, all passing
+Config field defaults propagate via `..Default::default()` in `hip3()`, `liquid()`, `disabled()`.

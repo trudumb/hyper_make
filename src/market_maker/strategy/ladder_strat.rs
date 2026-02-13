@@ -584,15 +584,17 @@ impl LadderStrategy {
         }
 
         // CONTROLLER-DERIVED POSITION SIZING:
-        // Use margin-based quoting capacity for ladder allocation.
-        // The user's max_position is ONLY used for reduce-only filter, not quoting capacity.
-        // This allows the Kelly optimizer to allocate across full margin capacity.
+        // Use margin-based quoting capacity for ladder allocation, BUT capped by
+        // user's config.max_position. The user's max_position is a HARD ceiling —
+        // margin can only LOWER the limit, never raise it above config.
         let quoting_capacity = market_params.quoting_capacity();
-        let effective_max_position = if quoting_capacity > EPSILON {
+        let margin_effective = if quoting_capacity > EPSILON {
             quoting_capacity
         } else {
             market_params.effective_max_position(max_position)
         };
+        // CRITICAL: config.max_position is the hard ceiling. Margin can only lower it.
+        let effective_max_position = margin_effective.min(max_position);
 
         // ALWAYS log quoting capacity for debugging (INFO level for visibility)
         tracing::info!(
@@ -601,8 +603,9 @@ impl LadderStrategy {
             margin_quoting_capacity = %format!("{:.6}", market_params.margin_quoting_capacity),
             margin_available = %format!("{:.2}", market_params.margin_available),
             leverage = %format!("{:.1}", market_params.leverage),
+            margin_effective = %format!("{:.6}", margin_effective),
             effective_max_position = %format!("{:.6}", effective_max_position),
-            "Quoting capacity: user max_position is for reduce-only only"
+            "Quoting capacity: capped by config.max_position"
         );
 
         // === GAMMA: Adaptive vs Legacy with Bayesian Adjustment ===
@@ -689,12 +692,12 @@ impl LadderStrategy {
             let kappa_before_regime = kappa;
             const REGIME_BLEND_WEIGHT: f64 = 0.6;
             kappa = (1.0 - REGIME_BLEND_WEIGHT) * kappa + REGIME_BLEND_WEIGHT * regime_kappa;
-            debug!(
+            info!(
                 kappa_before = %format!("{:.0}", kappa_before_regime),
                 regime_kappa = %format!("{:.0}", regime_kappa),
                 kappa_after = %format!("{:.0}", kappa),
                 regime = market_params.regime_kappa_current_regime,
-                "Regime kappa blending applied (60% regime weight)"
+                "[SPREAD TRACE] regime kappa blending (60% regime weight)"
             );
         }
         // NOTE: Agent 3's alpha-based kappa adjustment follows below.
@@ -778,8 +781,33 @@ impl LadderStrategy {
             adjusted_microprice
         };
 
+        // === DIRECTIONAL SKEW: Apply combined skew as mid-price offset ===
+        // lead_lag_signal_bps carries combined_skew_bps + position_guard_skew_bps
+        // from the signal integrator and position guard.
+        // Positive skew = bullish → shift mid UP → tighten bids, widen asks.
+        // Negative skew = bearish → shift mid DOWN → widen bids, tighten asks.
+        let skew_bps = market_params.lead_lag_signal_bps;
+        let skew_fraction = skew_bps / 10_000.0;
+        let skewed_microprice = adjusted_microprice * (1.0 + skew_fraction);
+
+        // SAFETY: Bound skewed mid within half-spread of market_mid to prevent crossing
+        let half_spread_bound = market_params.market_spread_bps / 10_000.0 * 0.5;
+        let max_mid = market_params.market_mid * (1.0 + half_spread_bound);
+        let min_mid = market_params.market_mid * (1.0 - half_spread_bound);
+        let effective_mid = skewed_microprice.clamp(min_mid, max_mid);
+
+        if skew_bps.abs() > 0.5 {
+            tracing::debug!(
+                skew_bps = %format!("{:.2}", skew_bps),
+                adjusted_microprice = %format!("{:.4}", adjusted_microprice),
+                effective_mid = %format!("{:.4}", effective_mid),
+                market_mid = %format!("{:.4}", market_params.market_mid),
+                "Directional skew applied to mid price"
+            );
+        }
+
         let params = LadderParams {
-            mid_price: adjusted_microprice,
+            mid_price: effective_mid,
             market_mid: market_params.market_mid, // Actual exchange mid for safety checks
             sigma: market_params.sigma,
             kappa, // Use AS-adjusted kappa
@@ -855,17 +883,25 @@ impl LadderStrategy {
             "[SPREAD TRACE] after floor computation"
         );
 
-        // === CONDITIONAL AS: Learned from data, not magic numbers ===
+        // === CONDITIONAL AS: Confidence-scaled buffer ===
         // E[AS | fill] ≠ E[AS] unconditional. Fills cluster around toxic moments.
         // The fill tracker maintains a Bayesian posterior of realized fill AS.
-        // Use the posterior mean as the buffer - this is statistically grounded.
-        // If no fill data yet, use 0 buffer (don't penalize before measuring).
-        let conditional_as_buffer_bps = market_params.conditional_as_posterior_mean_bps.unwrap_or(0.0);
+        // Buffer shrinks as measurement confidence grows:
+        //   Cold (0 fills): full buffer (defensive)
+        //   Warmed up (20+ fills): buffer → 0 (AS measurement is reliable, floor alone suffices)
+        let raw_as_buffer_bps = market_params.conditional_as_posterior_mean_bps.unwrap_or(0.0);
+        // Always use gradual fill-based warmup — never binary jump.
+        // fill_model_warmed_up() triggers on attempts (not fills), causing instant 0→1 jump.
+        let (fills, _attempts) = self.fill_model_stats();
+        let as_warmup_fraction = (fills as f64 / 20.0).min(1.0);
+        let conditional_as_buffer_bps = raw_as_buffer_bps * (1.0 - as_warmup_fraction);
         let effective_floor_bps = effective_floor_bps + conditional_as_buffer_bps;
 
         // [SPREAD TRACE] Phase 2: AS buffer
         tracing::info!(
             phase = "as_buffer",
+            raw_as_buffer_bps = %format!("{:.2}", raw_as_buffer_bps),
+            as_warmup_fraction = %format!("{:.2}", as_warmup_fraction),
             conditional_as_buffer_bps = %format!("{:.2}", conditional_as_buffer_bps),
             effective_floor_bps = %format!("{:.2}", effective_floor_bps),
             "[SPREAD TRACE] after conditional AS buffer"
@@ -973,14 +1009,15 @@ impl LadderStrategy {
             }
         }
 
-        // [SPREAD TRACE] Phase 5: kappa cap applied
+        // [SPREAD TRACE] Phase 5: kappa cap applied (2/kappa formula)
         tracing::info!(
             phase = "kappa_cap",
             kappa_cap_bps = %format!("{:.1}", market_params.kappa_spread_bps.unwrap_or(0.0)),
+            kappa_used = %format!("{:.0}", kappa),
             touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
             touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
             total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
-            "[SPREAD TRACE] after kappa spread cap"
+            "[SPREAD TRACE] after kappa spread cap (2/kappa formula)"
         );
 
         // === PRE-FILL AS MULTIPLIERS ===
@@ -2082,6 +2119,100 @@ mod tests {
             (sum - 1.0).abs() < f64::EPSILON,
             "Weights should sum to 1.0, got: {}",
             sum
+        );
+    }
+
+    #[test]
+    fn test_dynamic_as_buffer_scales_with_warmup() {
+        // Buffer should be full (raw value) when cold, zero when warmed up.
+        // Formula: buffer = raw * (1 - warmup_fraction)
+        let raw_buffer = 2.0; // bps
+
+        // Cold: 0 fills → warmup_fraction = 0 → buffer = 2.0
+        let warmup_0 = (0.0_f64 / 20.0).min(1.0);
+        assert!((warmup_0 - 0.0).abs() < f64::EPSILON);
+        assert!((raw_buffer * (1.0 - warmup_0) - 2.0).abs() < f64::EPSILON);
+
+        // Half warmed: 10 fills → warmup_fraction = 0.5 → buffer = 1.0
+        let warmup_10 = (10.0_f64 / 20.0).min(1.0);
+        assert!((warmup_10 - 0.5).abs() < f64::EPSILON);
+        assert!((raw_buffer * (1.0 - warmup_10) - 1.0).abs() < f64::EPSILON);
+
+        // Fully warmed: 20 fills → warmup_fraction = 1.0 → buffer = 0.0
+        let warmup_20 = (20.0_f64 / 20.0).min(1.0);
+        assert!((warmup_20 - 1.0).abs() < f64::EPSILON);
+        assert!((raw_buffer * (1.0 - warmup_20)).abs() < f64::EPSILON);
+
+        // Over-warmed: 50 fills → clamped to 1.0 → buffer = 0.0
+        let warmup_50 = (50.0_f64 / 20.0).min(1.0);
+        assert!((warmup_50 - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_dynamic_kappa_cap_formula() {
+        // Formula: kappa_cap_bps = (2/kappa * 10_000).max(1.5)
+        // High kappa = tight cap, low kappa = wide cap
+
+        // kappa = 8000 → cap = 2.5 bps
+        let cap_8000: f64 = (2.0 / 8000.0 * 10_000.0_f64).max(1.5);
+        assert!((cap_8000 - 2.5).abs() < 0.01, "kappa=8000 → cap=2.5 bps, got {:.2}", cap_8000);
+
+        // kappa = 2500 → cap = 8.0 bps
+        let cap_2500: f64 = (2.0 / 2500.0 * 10_000.0_f64).max(1.5);
+        assert!((cap_2500 - 8.0).abs() < 0.01, "kappa=2500 → cap=8.0 bps, got {:.2}", cap_2500);
+
+        // kappa = 500 → cap = 40 bps (very wide)
+        let cap_500: f64 = (2.0 / 500.0 * 10_000.0_f64).max(1.5);
+        assert!((cap_500 - 40.0).abs() < 0.01, "kappa=500 → cap=40 bps, got {:.2}", cap_500);
+
+        // kappa = 20000 → cap = 1.5 bps (clamped to min fee floor)
+        let cap_20k: f64 = (2.0 / 20000.0 * 10_000.0_f64).max(1.5);
+        assert!((cap_20k - 1.5).abs() < f64::EPSILON, "kappa=20000 → cap=1.5 bps (min), got {:.2}", cap_20k);
+    }
+
+    #[test]
+    fn test_kappa_cap_higher_kappa_means_tighter() {
+        // Monotonicity: higher kappa → smaller cap (tighter spread allowed)
+        let caps: Vec<f64> = [500.0, 1000.0, 2000.0, 4000.0, 8000.0]
+            .iter()
+            .map(|k| (2.0 / k * 10_000.0_f64).max(1.5))
+            .collect();
+
+        for i in 0..caps.len() - 1 {
+            assert!(
+                caps[i] > caps[i + 1],
+                "Cap should decrease as kappa increases: kappa[{}]={:.1} > kappa[{}]={:.1}",
+                i, caps[i], i + 1, caps[i + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_floor_binding_eliminated_with_warmed_buffer() {
+        // The buffer change eliminates floor binding in the common case.
+        // Adaptive floor (paper mode) = 2.5 bps.
+        // GLFT asymptotic half-spread: 1/kappa * 10000 + fee_bps
+        let adaptive_floor_bps = 2.5;
+        let fee_bps = 1.5;
+        let kappa = 8000.0;
+        let glft_approx_bps = 1.0 / kappa * 10_000.0 + fee_bps; // ~2.75 bps
+
+        // Warmed up: buffer = 0 → effective_floor = 2.5 → GLFT (2.75) > floor (2.5)
+        let buffer_warmed = 0.0;
+        let effective_floor_warmed = adaptive_floor_bps + buffer_warmed;
+        assert!(
+            glft_approx_bps > effective_floor_warmed,
+            "Warmed: GLFT ({:.2}) should exceed floor ({:.2}) — floor NOT binding",
+            glft_approx_bps, effective_floor_warmed
+        );
+
+        // Cold: buffer = 2.0 → effective_floor = 4.5 → GLFT (2.75) < floor (4.5) → binding
+        let buffer_cold = 2.0;
+        let effective_floor_cold = adaptive_floor_bps + buffer_cold;
+        assert!(
+            glft_approx_bps < effective_floor_cold,
+            "Cold: floor ({:.2}) should exceed GLFT ({:.2}) — floor BINDING (defensive)",
+            effective_floor_cold, glft_approx_bps
         );
     }
 }

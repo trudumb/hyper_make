@@ -60,6 +60,20 @@ before first fill). New tests must set `last_fill_time` to expired instant for t
 11. **unsafe impl Send/Sync FIXED**: Replaced with safe `const _: fn() = || { ... }` pattern
     on DrawdownTracker, CircuitBreakerMonitor, and RiskChecker.
 
+### InventoryGovernor (2026-02-12)
+
+12. **InventoryGovernor**: New module in `risk/inventory_governor.rs`. Enforces `config.max_position`
+    as HARD ceiling — margin-derived limits can only LOWER it, never raise above config.
+    Zone classification: Green (<50%), Yellow (50-80%), Red (80-100%), Kill (>100%).
+    Methods: `new()`, `assess()`, `max_position()`, `would_exceed()`, `is_reducing()`.
+    19 unit tests. Wired into: reconcile.rs (place_bulk_ladder_orders), order_ops.rs (place_new_order),
+    ladder_strat.rs (effective_max_position cap), glft.rs (same), quote_engine.rs (unconditional cap),
+    build_risk_state (unconditional cap). MarketMaker struct field initialized from config.max_position.
+
+    **Key fix**: `max_position_user_specified` conditional was REMOVED from caps — config.max_position
+    is ALWAYS the ceiling. Previously, when `max_position_user_specified=false`, margin-derived limits
+    (e.g., 55 HYPE) could override user's config (3.24 HYPE), causing 3.95x overshoot.
+
 ### Full Audit (2026-02-09)
 
 **Overall: 8.5/10 production-ready.** 3 HIGH, 3 MEDIUM, 5 LOW, 3 INFORMATIONAL findings.

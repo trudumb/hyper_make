@@ -1235,19 +1235,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // CRITICAL: Update cached effective max_position from first principles
         // This is THE source of truth for all position limit checks
         let new_effective = market_params.effective_max_position(self.config.max_position);
-        if (new_effective - self.effective_max_position).abs() > 0.001 {
+        // config.max_position is ALWAYS the hard ceiling (InventoryGovernor principle).
+        // Margin can only LOWER the effective limit, never raise it above config.
+        let capped_effective = new_effective.min(self.config.max_position);
+        if (capped_effective - self.effective_max_position).abs() > 0.001 {
             debug!(
                 old = %format!("{:.6}", self.effective_max_position),
-                new = %format!("{:.6}", new_effective),
+                new = %format!("{:.6}", capped_effective),
+                margin_derived = %format!("{:.6}", new_effective),
+                config_max = %format!("{:.6}", self.config.max_position),
                 dynamic_valid = market_params.dynamic_limit_valid,
-                "Effective max position updated from first principles"
+                "Effective max position updated (capped by config.max_position)"
             );
         }
-        self.effective_max_position = new_effective;
-        // User-specified max_position is an absolute hard cap
-        if self.config.max_position_user_specified {
-            self.effective_max_position = self.effective_max_position.min(self.config.max_position);
-        }
+        self.effective_max_position = capped_effective;
 
         // =======================================================================
         // PROACTIVE POSITION MANAGEMENT (Phases 1-4)
@@ -1829,13 +1830,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             None
         };
 
-        // === Phase 3: Compute kappa-driven spread ===
-        // Uses fill intensity to dynamically adjust spread (higher kappa → tighter spread)
-        let kappa_spread_result = self.stochastic.kappa_spread.compute_spread(
-            market_params.market_spread_bps.max(5.0), // Use market spread as base, floor at 5 bps
-            market_params.kappa,
-        );
-        market_params.kappa_spread_bps = Some(kappa_spread_result.spread_bps);
+        // === Phase 3: Compute kappa-driven spread cap ===
+        // Dynamic kappa cap: 2/kappa in bps (matches GLFT asymptotic spread when γ << κ).
+        // High kappa (8000) → 2.5 bps cap (allows tight quoting).
+        // Low kappa (2500) → 8 bps cap (stays wide).
+        // Min 1.5 bps to never go below fee.
+        let kappa_for_cap = market_params.kappa.max(1.0);
+        let kappa_cap_bps = (2.0 / kappa_for_cap * 10_000.0).max(1.5);
+        market_params.kappa_spread_bps = Some(kappa_cap_bps);
+        // Still update the kappa EMA for diagnostics
+        self.stochastic.kappa_spread.update_avg_kappa(market_params.kappa);
 
         // === Phase 8: Contextual Bandit Spread Selection ===
         // Replaces RL MDP with contextual bandit (i.i.d. rewards, correct statistics).
@@ -2176,28 +2180,50 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // === RISK LEVEL EMERGENCY FILTER ===
-            // When risk_level is Emergency, only allow position-reducing quotes.
-            // Long → keep asks (sells to reduce), clear bids.
-            // Short → keep bids (buys to reduce), clear asks.
-            // Flat → keep both (want to catch fills).
+            // When risk_level is Emergency, preserve position-reducing quotes so
+            // the system can unwind inventory.  The increasing side is cancelled;
+            // the reducing side is kept but at 50% size.  Near-zero positions
+            // keep both sides at 30% size.
             if risk_level == crate::market_maker::control::RiskLevel::Emergency {
                 let pos = self.position.position();
-                if pos > 0.0 && !bid_quotes.is_empty() {
-                    info!(
-                        position = %format!("{:.4}", pos),
-                        cleared_bids = bid_quotes.len(),
-                        "Emergency: clearing bids (long position, keeping asks to reduce)"
-                    );
-                    bid_quotes.clear();
-                } else if pos < 0.0 && !ask_quotes.is_empty() {
-                    info!(
-                        position = %format!("{:.4}", pos),
-                        cleared_asks = ask_quotes.len(),
-                        "Emergency: clearing asks (short position, keeping bids to reduce)"
-                    );
-                    ask_quotes.clear();
+                let max_pos = self.effective_max_position.max(0.01);
+                let position_ratio = pos / max_pos;
+
+                if position_ratio > 0.01 {
+                    // Long: cancel bids (would increase), keep asks at 50% (reduce)
+                    if !bid_quotes.is_empty() {
+                        info!(
+                            position = %format!("{:.4}", pos),
+                            cleared_bids = bid_quotes.len(),
+                            "Emergency: clearing bids (long position, keeping asks to reduce)"
+                        );
+                        bid_quotes.clear();
+                    }
+                    for q in ask_quotes.iter_mut() {
+                        q.size *= 0.5;
+                    }
+                } else if position_ratio < -0.01 {
+                    // Short: cancel asks (would increase), keep bids at 50% (reduce)
+                    if !ask_quotes.is_empty() {
+                        info!(
+                            position = %format!("{:.4}", pos),
+                            cleared_asks = ask_quotes.len(),
+                            "Emergency: clearing asks (short position, keeping bids to reduce)"
+                        );
+                        ask_quotes.clear();
+                    }
+                    for q in bid_quotes.iter_mut() {
+                        q.size *= 0.5;
+                    }
+                } else {
+                    // Near zero: keep both sides at 30% size
+                    for q in bid_quotes.iter_mut() {
+                        q.size *= 0.3;
+                    }
+                    for q in ask_quotes.iter_mut() {
+                        q.size *= 0.3;
+                    }
                 }
-                // Flat: keep both sides to catch fills
             }
 
             // === FILL CASCADE FILTER ===
@@ -2585,14 +2611,38 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // === RISK LEVEL EMERGENCY FILTER (single-quote mode) ===
+            // Same logic as ladder mode: cancel increasing side, halve reducing side.
             if risk_level == crate::market_maker::control::RiskLevel::Emergency {
                 let pos = self.position.position();
-                if pos > 0.0 && bid.is_some() {
-                    debug!("Emergency: clearing BID quote (long position, single-quote mode)");
-                    bid = None;
-                } else if pos < 0.0 && ask.is_some() {
-                    debug!("Emergency: clearing ASK quote (short position, single-quote mode)");
-                    ask = None;
+                let max_pos = self.effective_max_position.max(0.01);
+                let position_ratio = pos / max_pos;
+
+                if position_ratio > 0.01 {
+                    // Long: cancel bid, halve ask size
+                    if bid.is_some() {
+                        debug!("Emergency: clearing BID quote (long position, single-quote mode)");
+                        bid = None;
+                    }
+                    if let Some(ref mut a) = ask {
+                        a.size *= 0.5;
+                    }
+                } else if position_ratio < -0.01 {
+                    // Short: cancel ask, halve bid size
+                    if ask.is_some() {
+                        debug!("Emergency: clearing ASK quote (short position, single-quote mode)");
+                        ask = None;
+                    }
+                    if let Some(ref mut b) = bid {
+                        b.size *= 0.5;
+                    }
+                } else {
+                    // Near zero: keep both at 30% size
+                    if let Some(ref mut b) = bid {
+                        b.size *= 0.3;
+                    }
+                    if let Some(ref mut a) = ask {
+                        a.size *= 0.3;
+                    }
                 }
             }
 
@@ -2752,6 +2802,46 @@ fn apply_emergency_pull(pull_urgency: f64, increasing_quotes: &mut Vec<Quote>) {
     }
 }
 
+/// Apply risk-level emergency filter to bid and ask quote vectors.
+///
+/// Position-aware: cancels the side that would increase exposure and reduces
+/// the closing side to 50% size.  Near-zero positions keep both sides at 30%.
+///
+/// This is the testable standalone equivalent of the inline emergency filter
+/// in `generate_and_emit_quotes()`.
+#[cfg(test)]
+fn apply_risk_emergency_filter(
+    bid_quotes: &mut Vec<Quote>,
+    ask_quotes: &mut Vec<Quote>,
+    position: f64,
+    max_position: f64,
+) {
+    let max_pos = max_position.max(0.01);
+    let position_ratio = position / max_pos;
+
+    if position_ratio > 0.01 {
+        // Long: cancel bids, keep asks at 50%
+        bid_quotes.clear();
+        for q in ask_quotes.iter_mut() {
+            q.size *= 0.5;
+        }
+    } else if position_ratio < -0.01 {
+        // Short: cancel asks, keep bids at 50%
+        ask_quotes.clear();
+        for q in bid_quotes.iter_mut() {
+            q.size *= 0.5;
+        }
+    } else {
+        // Near zero: both sides at 30%
+        for q in bid_quotes.iter_mut() {
+            q.size *= 0.3;
+        }
+        for q in ask_quotes.iter_mut() {
+            q.size *= 0.3;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2889,5 +2979,63 @@ mod tests {
         let urgency = compute_pull_urgency(false, 0.9, 50.0, &mut active);
         assert!((urgency - 0.0).abs() < 1e-10, "No pull when not opposed");
         assert!(!active, "Should not activate");
+    }
+
+    // ---------------------------------------------------------------
+    // Risk-level emergency filter tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_emergency_long_position_clears_bids_keeps_asks() {
+        let mut bids = vec![Quote::new(99.0, 1.0), Quote::new(98.0, 2.0)];
+        let mut asks = vec![Quote::new(101.0, 1.0), Quote::new(102.0, 2.0)];
+        // Long position: position=5.0, max=10.0
+        apply_risk_emergency_filter(&mut bids, &mut asks, 5.0, 10.0);
+
+        assert!(bids.is_empty(), "Bids (increasing) should be cleared when long");
+        assert_eq!(asks.len(), 2, "Asks (reducing) should be preserved");
+        assert!((asks[0].size - 0.5).abs() < 1e-10, "Ask size should be halved");
+        assert!((asks[1].size - 1.0).abs() < 1e-10, "Ask size should be halved");
+    }
+
+    #[test]
+    fn test_emergency_short_position_clears_asks_keeps_bids() {
+        let mut bids = vec![Quote::new(99.0, 1.0), Quote::new(98.0, 2.0)];
+        let mut asks = vec![Quote::new(101.0, 1.0), Quote::new(102.0, 2.0)];
+        // Short position: position=-5.0, max=10.0
+        apply_risk_emergency_filter(&mut bids, &mut asks, -5.0, 10.0);
+
+        assert!(asks.is_empty(), "Asks (increasing) should be cleared when short");
+        assert_eq!(bids.len(), 2, "Bids (reducing) should be preserved");
+        assert!((bids[0].size - 0.5).abs() < 1e-10, "Bid size should be halved");
+        assert!((bids[1].size - 1.0).abs() < 1e-10, "Bid size should be halved");
+    }
+
+    #[test]
+    fn test_emergency_zero_position_keeps_both_reduced() {
+        let mut bids = vec![Quote::new(99.0, 1.0)];
+        let mut asks = vec![Quote::new(101.0, 1.0)];
+        // Near-zero position: position=0.001, max=10.0 -> ratio=0.0001 < 0.01
+        apply_risk_emergency_filter(&mut bids, &mut asks, 0.001, 10.0);
+
+        assert_eq!(bids.len(), 1, "Bids should be preserved at near-zero");
+        assert_eq!(asks.len(), 1, "Asks should be preserved at near-zero");
+        assert!((bids[0].size - 0.3).abs() < 1e-10, "Bid size should be 30%");
+        assert!((asks[0].size - 0.3).abs() < 1e-10, "Ask size should be 30%");
+    }
+
+    #[test]
+    fn test_emergency_reducing_quotes_survive() {
+        // The core invariant: after emergency pull, reducing quotes must exist
+        // so the system can unwind stuck positions.
+        let mut bids = vec![Quote::new(99.0, 2.0)];
+        let mut asks = vec![Quote::new(101.0, 2.0)];
+        // Large long position
+        apply_risk_emergency_filter(&mut bids, &mut asks, 12.0, 3.0);
+
+        // position_ratio = 12/3 = 4.0 > 0.01 -> long path
+        assert!(bids.is_empty(), "Bids cleared");
+        assert!(!asks.is_empty(), "Asks (reducing) MUST survive emergency pull");
+        assert!(asks[0].size > 0.0, "Reducing side must have positive size");
     }
 }

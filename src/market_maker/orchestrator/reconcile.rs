@@ -1848,9 +1848,27 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let mut order_specs: Vec<OrderSpec> = Vec::new();
         let mut cumulative_size = 0.0; // Track cumulative exposure for exchange limits
         let mut orders_blocked_by_capacity = 0usize;
+        let mut orders_blocked_by_governor = 0usize;
 
         for (price, size) in orders {
             if size <= 0.0 {
+                continue;
+            }
+
+            // === InventoryGovernor: Hard ceiling check (defense-in-depth) ===
+            if self.inventory_governor.would_exceed(self.position.position(), size, is_buy)
+                && !self.inventory_governor.is_reducing(self.position.position(), is_buy)
+            {
+                orders_blocked_by_governor += 1;
+                if orders_blocked_by_governor == 1 {
+                    warn!(
+                        side = %side_str,
+                        position = %format!("{:.4}", self.position.position()),
+                        order_size = %format!("{:.4}", size),
+                        max_position = %format!("{:.4}", self.inventory_governor.max_position()),
+                        "[PlaceBulk] InventoryGovernor: blocking position-increasing order"
+                    );
+                }
                 continue;
             }
 
@@ -1975,6 +1993,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             orders_passed_filter = order_specs.len(),
             orders_filtered_out = input_count - order_specs.len(),
             orders_blocked_by_capacity = orders_blocked_by_capacity,
+            orders_blocked_by_governor = orders_blocked_by_governor,
             cumulative_size = %format!("{:.6}", cumulative_size),
             total_available = %format!("{:.6}", total_available),
             "[PlaceBulk] Order filtering complete"

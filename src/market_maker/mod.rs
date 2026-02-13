@@ -132,6 +132,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Stochastic: HJB control, dynamic risk
     stochastic: core::StochasticComponents,
 
+    // === Inventory Governor ===
+    /// Hard ceiling on position size from config.max_position.
+    /// FIRST check in every quote cycle — never overridden by margin-derived limits.
+    pub(crate) inventory_governor: risk::InventoryGovernor,
+
     // === First-Principles Position Limit ===
     /// Effective max position SIZE (contracts), updated each quote cycle.
     ///
@@ -380,6 +385,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             DynamicRiskConfig::default(),
         );
 
+        // Initialize inventory governor from user's max_position (hard ceiling)
+        let inventory_governor = risk::InventoryGovernor::new(config.max_position);
+
         // Initialize effective_max_position to static fallback (used during warmup)
         let effective_max_position = config.max_position;
 
@@ -405,6 +413,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             safety,
             infra,
             stochastic,
+            inventory_governor,
             effective_max_position,
             effective_target_liquidity,
             last_ws_open_orders_snapshot: None,
@@ -912,18 +921,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         let position = self.position.position();
 
-        // When user explicitly specified max_position (CLI/TOML), enforce as hard ceiling.
-        // Otherwise, let dynamic margin-based effective_max_position be the sole limit.
-        let risk_max_position = if self.config.max_position_user_specified {
-            self.effective_max_position.min(self.config.max_position)
-        } else {
-            self.effective_max_position
-        };
+        // config.max_position is ALWAYS the hard ceiling (InventoryGovernor principle).
+        // Margin can only LOWER the limit, never raise it above config.
+        let risk_max_position = self.effective_max_position.min(self.config.max_position);
         risk::RiskState::new(
             pnl_summary.total_pnl,
             pnl_summary.peak_pnl,
             position,
-            risk_max_position, // min(effective, config) — user config is hard constraint
+            risk_max_position, // min(effective, config) — config is always hard ceiling
             self.latest_mid,
             self.safety.kill_switch.max_position_value(),
             self.infra.margin_sizer.state().account_value,

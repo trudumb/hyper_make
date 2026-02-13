@@ -167,6 +167,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === InventoryGovernor: Hard ceiling check (defense-in-depth) ===
+        if self.inventory_governor.would_exceed(self.position.position(), quote.size, is_buy)
+            && !self.inventory_governor.is_reducing(self.position.position(), is_buy)
+        {
+            warn!(
+                side = %side_str(side),
+                position = %format!("{:.4}", self.position.position()),
+                order_size = %format!("{:.4}", quote.size),
+                max_position = %format!("{:.4}", self.inventory_governor.max_position()),
+                "InventoryGovernor: blocking order that would exceed config.max_position"
+            );
+            return Ok(());
+        }
+
         // === P1: HARD Position Limit Enforcement ===
         // Absolute hard limit — reject any order that would increase position beyond max.
         // When user explicitly specified max_position, enforce as hard ceiling.

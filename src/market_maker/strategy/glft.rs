@@ -794,8 +794,9 @@ impl QuotingStrategy for GLFTStrategy {
         }
 
         // FIRST PRINCIPLES: Use dynamic max_position derived from equity/volatility
-        // Falls back to static max_position if margin state hasn't been refreshed yet
-        let effective_max_position = market_params.effective_max_position(max_position);
+        // Falls back to static max_position if margin state hasn't been refreshed yet.
+        // config.max_position (passed as max_position) is ALWAYS the hard ceiling.
+        let effective_max_position = market_params.effective_max_position(max_position).min(max_position);
 
         // === 1. DYNAMIC GAMMA with Tail Risk ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma

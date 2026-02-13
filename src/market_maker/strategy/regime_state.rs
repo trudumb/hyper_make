@@ -329,13 +329,18 @@ mod tests {
         assert_eq!(state.regime, MarketRegime::Calm);
 
         // Immediately try to go back to Normal — cooldown should prevent
+        // Cooldown was set to HYSTERESIS_CYCLES (5) on transition to Calm.
+        // Each cycle ticks it down. Transition requires cooldown == 0 AND
+        // consecutive count >= HYSTERESIS_CYCLES, so first 4 cycles should not transition.
         let normal_probs = [0.1, 0.8, 0.05, 0.05];
-        for _ in 0..5 {
+        for i in 0..4 {
+            let cooldown_before = state.transition_cooldown_cycles;
             let changed = state.update(&normal_probs, 0.0, 2000.0);
-            // First 5 cycles: cooldown active, should not transition
-            if state.transition_cooldown_cycles > 0 {
-                assert!(!changed, "Cooldown should prevent transition");
-            }
+            assert!(
+                !changed,
+                "Cycle {i}: cooldown was {cooldown_before}, should prevent transition"
+            );
+            assert_eq!(state.regime, MarketRegime::Calm, "Should still be Calm after cycle {i}");
         }
     }
 
