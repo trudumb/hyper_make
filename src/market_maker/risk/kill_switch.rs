@@ -77,6 +77,16 @@ pub struct KillSwitchConfig {
     /// Widen at 1x, pull quotes at 2x, kill at 4x.
     pub position_velocity_threshold: f64,
 
+    /// Maximum absolute drawdown in USD before kill switch triggers.
+    ///
+    /// This catches cases where percentage drawdown is disabled due to low peak
+    /// (peak < min_peak_for_drawdown). For example, a session with $100 capital
+    /// might only reach $0.20 peak PnL, bypassing the percentage check entirely.
+    /// Without this absolute check, the session could hit 63% drawdown undetected.
+    ///
+    /// Default: $5.00 (conservative). Production: 2% of max position notional, min $1.
+    pub max_absolute_drawdown: f64,
+
     /// Enable/disable the kill switch (for testing)
     pub enabled: bool,
 }
@@ -100,6 +110,7 @@ impl Default for KillSwitchConfig {
             // Tightened from 0.50: catches one-sided fill cascades earlier.
             // Widen at 0.20x, pull at 0.40x, kill at 0.80x of max_position/min.
             position_velocity_threshold: 0.20,
+            max_absolute_drawdown: 5.0, // Conservative $5 default
             enabled: true,
         }
     }
@@ -138,6 +149,9 @@ impl KillSwitchConfig {
             // check_daily_loss ($50) still protects against catastrophic loss.
             min_peak_for_drawdown: 1.0_f64.max(max_position_usd * 0.02),
             position_velocity_threshold: 0.20,
+            // Absolute drawdown = 2% of max position notional, min $1.
+            // Catches small-capital scenarios where percentage check is bypassed.
+            max_absolute_drawdown: (max_position_usd * 0.02).max(1.0),
             enabled: true,
         }
     }
@@ -186,6 +200,7 @@ impl KillSwitchConfig {
             max_drawdown,
             max_position_value,
             min_peak_for_drawdown: 1.0_f64.max(max_position_value * 0.02),
+            max_absolute_drawdown: (max_position_value * 0.02).max(1.0),
             ..Default::default()
         }
     }
@@ -284,8 +299,15 @@ pub fn calculate_dynamic_max_position_value(
 pub enum KillReason {
     /// Daily loss exceeded configured maximum
     MaxLoss { loss: f64, limit: f64 },
-    /// Drawdown exceeded configured maximum
+    /// Drawdown exceeded configured maximum (percentage-based)
     MaxDrawdown { drawdown: f64, limit: f64 },
+    /// Absolute drawdown exceeded configured maximum (USD-based)
+    /// Safety net for small-capital scenarios where percentage check is bypassed.
+    Drawdown {
+        drawdown: f64,
+        threshold: f64,
+        reason: String,
+    },
     /// Position value exceeded configured maximum
     MaxPosition { value: f64, limit: f64 },
     /// Position contracts exceeded 2x configured maximum (runaway position)
@@ -318,6 +340,16 @@ impl std::fmt::Display for KillReason {
                 let dd_pct = drawdown * 100.0;
                 let lim_pct = limit * 100.0;
                 write!(f, "Max drawdown exceeded: {dd_pct:.2}% > {lim_pct:.2}%")
+            }
+            KillReason::Drawdown {
+                drawdown,
+                threshold,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Absolute drawdown ${drawdown:.2} > ${threshold:.2}: {reason}"
+                )
             }
             KillReason::MaxPosition { value, limit } => {
                 write!(f, "Max position value exceeded: ${value:.2} > ${limit:.2}")
@@ -712,10 +744,25 @@ impl KillSwitch {
             return None; // No peak to draw down from
         }
 
-        // Skip drawdown check when peak is below the noise floor.
+        // Absolute drawdown safety net: catches small-capital scenarios where
+        // percentage check is disabled (peak < min_peak_for_drawdown).
+        // For example: $100 capital, $0.20 peak, $2.50 loss = $2.70 absolute drawdown.
+        let absolute_drawdown = state.peak_pnl - state.daily_pnl;
+        if absolute_drawdown > config.max_absolute_drawdown && absolute_drawdown > 0.0 {
+            return Some(KillReason::Drawdown {
+                drawdown: absolute_drawdown,
+                threshold: config.max_absolute_drawdown,
+                reason: format!(
+                    "Absolute drawdown ${:.2} exceeds max ${:.2}",
+                    absolute_drawdown, config.max_absolute_drawdown
+                ),
+            });
+        }
+
+        // Skip percentage drawdown check when peak is below the noise floor.
         // Percentage drawdown from a tiny peak (e.g., $0.02 from one fill) is
         // statistically meaningless — any tick against you looks like 100%+ drawdown.
-        // The absolute daily loss check still protects against catastrophic losses.
+        // The absolute check above and daily loss check still protect.
         if state.peak_pnl < config.min_peak_for_drawdown {
             return None;
         }

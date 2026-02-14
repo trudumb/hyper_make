@@ -15,6 +15,8 @@
 //! - κ_eff = blended kappa from BlendedKappaEstimator (Component 3)
 //! - δ_ceiling = fill rate ceiling from FillRateController (Component 4)
 
+use std::time::Instant;
+
 use tracing::{debug, info};
 
 use super::blended_kappa::BlendedKappaEstimator;
@@ -142,6 +144,12 @@ pub struct AdaptiveSpreadCalculator {
 
     /// Time since last fill (seconds)
     time_since_last_fill: f64,
+
+    /// Session start time for time-based warmup acceleration.
+    /// At low fill rates, fill-based warmup can take 6+ hours. Time-based
+    /// warmup ensures the system reaches 80% operating capacity within 30 minutes,
+    /// with the last 20% still requiring actual fill data for convergence.
+    session_start: Instant,
 }
 
 impl AdaptiveSpreadCalculator {
@@ -163,6 +171,7 @@ impl AdaptiveSpreadCalculator {
             last_signals: Vec::new(),
             quote_count: 0,
             time_since_last_fill: 0.0,
+            session_start: Instant::now(),
         }
     }
 
@@ -417,8 +426,25 @@ impl AdaptiveSpreadCalculator {
         // Gamma uses standardizers which need ~20 observations
         let gamma_progress = if self.gamma.is_warmed_up() { 1.0 } else { 0.5 };
 
-        // Weighted average (floor and kappa most important)
-        floor_progress * 0.4 + kappa_progress * 0.4 + gamma_progress * 0.2
+        // Fill-based warmup (original formula)
+        let fill_warmup = floor_progress * 0.4 + kappa_progress * 0.4 + gamma_progress * 0.2;
+
+        // Time-based warmup floor: ensures system reaches 80% within 30 minutes
+        // even with low fill rates. Fills still needed for last 20%.
+        //
+        // At 4.5% fill rate, fill-based warmup requires 20 fills which takes 6+ hours.
+        // A 4-hour session was stuck at 90% warmup. Time-based floor ensures the priors
+        // (which are well-calibrated) get used at near-full capacity after 30 minutes,
+        // while still incentivizing fill data for the final convergence.
+        let session_age_s = self.session_start.elapsed().as_secs_f64();
+        let time_progress = if session_age_s > 0.0 {
+            (session_age_s / 1800.0).min(1.0) // 30 min to full time progress
+        } else {
+            0.0
+        };
+        let time_warmup = time_progress * 0.8; // Time can get to 80%
+
+        fill_warmup.max(time_warmup)
     }
 
     /// Get an uncertainty scaling factor for warmup period.
@@ -811,5 +837,71 @@ mod tests {
         // Initially should be approximately symmetric
         let diff = ((bid - ask) / bid).abs();
         assert!(diff < 0.2, "Initial spreads should be roughly symmetric");
+    }
+
+    #[test]
+    fn test_warmup_time_based_floor() {
+        use std::time::Duration;
+
+        let mut calc = AdaptiveSpreadCalculator::default_config();
+
+        // At t=0 with 0 fills, warmup is purely fill-based (gamma starts at 0.5 * 0.2 = 0.1)
+        let initial = calc.warmup_progress();
+        // Gamma contributes 0.5 * 0.2 = 0.1 minimum from the fill-based formula
+        assert!(
+            initial < 0.2,
+            "Initial warmup with no fills should be low: {:.3}",
+            initial
+        );
+
+        // Simulate 15 minutes elapsed with 0 fills
+        calc.session_start = Instant::now() - Duration::from_secs(900);
+        let at_15min = calc.warmup_progress();
+        // time_warmup = (900 / 1800) * 0.8 = 0.4
+        assert!(
+            at_15min >= 0.39,
+            "At 15 minutes, warmup should be at least ~40%: {:.3}",
+            at_15min
+        );
+
+        // Simulate 30 minutes elapsed with 0 fills
+        calc.session_start = Instant::now() - Duration::from_secs(1800);
+        let at_30min = calc.warmup_progress();
+        // time_warmup = (1800 / 1800) * 0.8 = 0.8
+        assert!(
+            at_30min >= 0.79,
+            "At 30 minutes, warmup should be at least ~80%: {:.3}",
+            at_30min
+        );
+
+        // Simulate 60 minutes elapsed with 0 fills — time floor caps at 80%
+        calc.session_start = Instant::now() - Duration::from_secs(3600);
+        let at_60min = calc.warmup_progress();
+        assert!(
+            at_60min >= 0.79 && at_60min <= 0.81,
+            "At 60 minutes with no fills, warmup should cap at ~80%: {:.3}",
+            at_60min
+        );
+
+        // Time-based floor should not prevent reaching 100% with fills
+        // Simulate enough fills to get fill-based warmup to 100%
+        for i in 0..25 {
+            let outcome = FillOutcome {
+                fill_price: 100.0,
+                mid_at_fill: 100.0,
+                mid_after_horizon: 100.001,
+                size: 1.0,
+                direction: 1.0,
+                timestamp_ms: i * 1000,
+                pnl: Some(0.01),
+            };
+            calc.on_fill(&outcome);
+        }
+        let with_fills = calc.warmup_progress();
+        assert!(
+            with_fills > 0.85,
+            "With fills + time, warmup should exceed 85%: {:.3}",
+            with_fills
+        );
     }
 }

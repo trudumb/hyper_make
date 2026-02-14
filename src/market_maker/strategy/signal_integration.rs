@@ -993,7 +993,7 @@ impl SignalIntegrator {
             // Blend short-term (5s) and medium-term (30s) imbalance for stability
             const HL_IMBALANCE_SHORT_WEIGHT: f64 = 0.6;
             const HL_IMBALANCE_MED_WEIGHT: f64 = 0.4;
-            const HL_NATIVE_SKEW_FRACTION: f64 = 0.3;
+            const HL_NATIVE_SKEW_FRACTION: f64 = 0.6;
             let flow_dir = self.latest_hl_flow.imbalance_5s * HL_IMBALANCE_SHORT_WEIGHT
                 + self.latest_hl_flow.imbalance_30s * HL_IMBALANCE_MED_WEIGHT;
             let fallback_cap = self.config.max_lead_lag_skew_bps * HL_NATIVE_SKEW_FRACTION;
@@ -1740,9 +1740,9 @@ mod tests {
 
         let signals = integrator.get_signals();
 
-        // Skew should be negative — fallback produces up to 30% of max_lead_lag_skew_bps
+        // Skew should be negative — fallback produces up to 60% of max_lead_lag_skew_bps
         // plus flow urgency adds up to flow_urgency_max_bps for imbalance > 0.6
-        let fallback_cap = integrator.config.max_lead_lag_skew_bps * 0.3;
+        let fallback_cap = integrator.config.max_lead_lag_skew_bps * 0.6;
         let urgency_cap = integrator.config.flow_urgency_max_bps;
         let total_cap = fallback_cap + urgency_cap;
         assert!(
@@ -1797,8 +1797,8 @@ mod tests {
 
         let signals = integrator.get_signals();
 
-        // Should only have fallback skew (up to 30% of max_lead_lag_skew_bps = 1.5 bps)
-        let fallback_cap = integrator.config.max_lead_lag_skew_bps * 0.3;
+        // Should only have fallback skew (up to 60% of max_lead_lag_skew_bps = 3.0 bps)
+        let fallback_cap = integrator.config.max_lead_lag_skew_bps * 0.6;
         assert!(
             signals.combined_skew_bps <= fallback_cap + 0.01,
             "Below urgency threshold, skew should be <= fallback cap {fallback_cap}, got: {}",

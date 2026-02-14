@@ -2000,6 +2000,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             1.0_f64.max(pos_val * 0.02)
         },
+        // Absolute drawdown = 2% of max position notional, min $1.
+        // Safety net for small-capital sessions where percentage drawdown is bypassed.
+        max_absolute_drawdown: {
+            let pos_val = if let Some(usd_limit) = max_position_usd_override {
+                usd_limit
+            } else {
+                ks_toml.max_position_value
+            };
+            (pos_val * 0.02).max(1.0)
+        },
         enabled: ks_toml.enabled,
     };
     info!(

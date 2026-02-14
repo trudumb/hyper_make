@@ -93,7 +93,7 @@ pub fn process_user_fills<'a>(
         }
 
         // Create fill event with CLOID for deterministic tracking
-        let fill_event = FillEvent::with_cloid(
+        let mut fill_event = FillEvent::with_cloid(
             fill.tid,
             fill.oid,
             fill.cloid.clone(),
@@ -104,6 +104,47 @@ pub fn process_user_fills<'a>(
             None,
             ctx.asset.to_string(),
         );
+
+        // Bridge mid_at_placement from order tracking to the fill event.
+        // This is critical for correct adverse selection measurement: without it,
+        // AS is computed against fill-time mid (tautological, always ~0).
+        // Lookup priority: TrackedOrder by OID, then PendingOrder by CLOID, then by price.
+        let order_mid = fill_state
+            .orders
+            .get_order(fill.oid)
+            .filter(|o| o.mid_at_placement > 0.0)
+            .map(|o| o.mid_at_placement)
+            .or_else(|| {
+                fill.cloid.as_ref().and_then(|cloid| {
+                    fill_state
+                        .orders
+                        .get_pending_by_cloid(cloid)
+                        .filter(|p| p.mid_at_placement > 0.0)
+                        .map(|p| p.mid_at_placement)
+                })
+            })
+            .or_else(|| {
+                let side = if is_buy {
+                    crate::market_maker::tracking::Side::Buy
+                } else {
+                    crate::market_maker::tracking::Side::Sell
+                };
+                fill_state
+                    .orders
+                    .get_pending(side, fill_price)
+                    .filter(|p| p.mid_at_placement > 0.0)
+                    .map(|p| p.mid_at_placement)
+            });
+
+        if let Some(mid) = order_mid {
+            fill_event.mid_at_placement = mid;
+            // Quoted half-spread: distance from placement mid to fill price (in bps)
+            fill_event.quoted_half_spread_bps = if mid > 0.0 {
+                ((fill_price - mid).abs() / mid) * 10_000.0
+            } else {
+                0.0
+            };
+        }
 
         // Process through unified processor
         let process_result = fill_processor.process(&fill_event, fill_state);

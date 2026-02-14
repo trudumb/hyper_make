@@ -283,25 +283,46 @@ impl LearningModule {
     }
 
     /// Measure the outcome of a prediction.
+    ///
+    /// Adverse selection is measured as the price move from the *placement-time mid*
+    /// to the *horizon-time mid*. Previously this used `self.last_mid` at both
+    /// fill time and horizon time, which made AS tautologically equal to depth
+    /// (same reference point). Now we use `fill.mid_at_placement` when available,
+    /// falling back to `self.last_mid` for backward compatibility with old fills.
     fn measure_outcome(&self, pred: &PendingPrediction) -> TradingOutcome {
-        // Calculate realized adverse selection
-        // AS = price_move_against_fill / fill_price
-        let fill_price = pred.fill.price;
         let current_mid = self.last_mid;
 
-        let price_move = if pred.fill.is_buy {
-            // For buys, AS is positive if price went down (we bought high)
-            (fill_price - current_mid) / fill_price * 10000.0
+        // Use placement-time mid for AS reference when available.
+        // When mid_at_placement is 0.0 (unset / old fill events), fall back to
+        // current mid (legacy behavior, still tautological but safe).
+        let reference_mid = if pred.fill.mid_at_placement > 0.0 {
+            pred.fill.mid_at_placement
         } else {
-            // For sells, AS is positive if price went up (we sold low)
-            (current_mid - fill_price) / fill_price * 10000.0
+            current_mid
+        };
+
+        // AS = how much mid moved against us from placement to horizon.
+        // For buys: mid dropping after we bought = adverse (positive AS)
+        // For sells: mid rising after we sold = adverse (positive AS)
+        let price_move = if pred.fill.is_buy {
+            // Buy: AS positive when mid dropped (we bought, price fell)
+            // reference_mid - current_mid > 0 means mid fell
+            (reference_mid - current_mid) / reference_mid * 10_000.0
+        } else {
+            // Sell: AS positive when mid rose (we sold, price rose)
+            // current_mid - reference_mid > 0 means mid rose
+            (current_mid - reference_mid) / reference_mid * 10_000.0
         };
 
         let realized_as_bps = price_move.max(0.0);
 
-        // Calculate realized edge
-        // Note: depth_bps() returns basis points, spread_capture() returns dollars
-        let spread_captured_bps = pred.fill.depth_bps();
+        // Spread captured: use quoted half-spread when available (from placement mid),
+        // otherwise fall back to depth_bps() which uses fill-time mid.
+        let spread_captured_bps = if pred.fill.quoted_half_spread_bps > 0.0 {
+            pred.fill.quoted_half_spread_bps
+        } else {
+            pred.fill.depth_bps()
+        };
         let realized_edge_bps = spread_captured_bps - realized_as_bps - self.config.fee_bps;
 
         TradingOutcome {

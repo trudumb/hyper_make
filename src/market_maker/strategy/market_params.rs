@@ -763,7 +763,11 @@ pub struct MarketParams {
     /// Used as input to solve_min_gamma() for self-consistent spread floor.
     pub total_risk_premium_bps: f64,
     /// Regime gamma multiplier — routes regime risk through gamma instead of floor.
-    /// Calm=1.0, Normal=1.2, Volatile=2.0, Extreme=3.0.
+    /// Continuously blended from regime probabilities via
+    /// `RegimeState::blended_gamma_multiplier_from_probs()` or
+    /// `RegimeState::effective_gamma_multiplier()`.
+    /// Discrete values per regime: Calm=1.0, Normal=1.2, Volatile=2.0, Extreme=3.0.
+    /// Blended example: probs [0.2, 0.3, 0.3, 0.2] -> 1.76.
     pub regime_gamma_multiplier: f64,
 
     // ==================== Cost-Basis-Aware Quoting ====================
@@ -1064,7 +1068,7 @@ impl Default for MarketParams {
             dynamic_limit_valid: false,   // Not valid until margin state refreshed
             margin_quoting_capacity: 0.0, // Will be computed from margin_available
             // Stochastic Constraints
-            tick_size_bps: 10.0,          // Default 10 bps tick
+            tick_size_bps: 0.5,           // Conservative default; overridden by compute_tick_size_bps()
             latency_spread_floor: 0.0003, // 3 bps default floor
             near_touch_depth_usd: 0.0,    // No depth data initially
             tight_quoting_allowed: false, // Conservative default

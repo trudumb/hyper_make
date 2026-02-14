@@ -738,6 +738,41 @@ impl RegimeState {
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         self.conviction = (sorted[0] - sorted[1]).max(0.0);
     }
+
+    /// Compute blended gamma multiplier from regime probabilities.
+    ///
+    /// Interpolates gamma multipliers across all 4 regimes weighted by belief
+    /// probabilities, producing a continuous value instead of the discrete
+    /// {1.0, 1.2, 2.0, 3.0} jumps from the active regime label.
+    ///
+    /// # Arguments
+    /// * `regime_probs` - `[p_calm, p_normal, p_volatile, p_extreme]`
+    ///
+    /// # Returns
+    /// Belief-weighted gamma multiplier, always >= 1.0.
+    ///
+    /// # Example
+    /// With probs `[0.2, 0.3, 0.3, 0.2]`:
+    /// `0.2*1.0 + 0.3*1.2 + 0.3*2.0 + 0.2*3.0 = 0.2 + 0.36 + 0.6 + 0.6 = 1.76`
+    pub fn blended_gamma_multiplier_from_probs(regime_probs: &[f64; 4]) -> f64 {
+        const GAMMA_MULTIPLIERS: [f64; 4] = [1.0, 1.2, 2.0, 3.0];
+        let blended: f64 = regime_probs
+            .iter()
+            .zip(GAMMA_MULTIPLIERS.iter())
+            .map(|(p, m)| p * m)
+            .sum();
+        // Enforce gamma_multiplier >= 1.0 invariant
+        blended.max(1.0)
+    }
+
+    /// Get the continuously blended gamma multiplier.
+    ///
+    /// Returns the blended value from `self.blended.gamma_multiplier` which
+    /// is EWMA-smoothed across regime probability updates. Falls back to the
+    /// discrete regime gamma multiplier if blending has not been initialized.
+    pub fn effective_gamma_multiplier(&self) -> f64 {
+        self.blended.gamma_multiplier.max(1.0)
+    }
 }
 
 #[cfg(test)]

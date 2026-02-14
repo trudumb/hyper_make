@@ -604,7 +604,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             dynamic_max_position_value,
             dynamic_limit_valid,
             // Stochastic constraints (first principles)
-            tick_size_bps: 10.0, // TODO: Get from asset metadata
+            // Derive tick_size_bps from Hyperliquid's 5-significant-figure pricing.
+            // E.g. HYPE@$31: tick=$0.001, tick_bps=0.32; BTC@$97k: tick=$1, tick_bps=0.10
+            tick_size_bps: compute_tick_size_bps(self.latest_mid),
             near_touch_depth_usd: self.estimator.near_touch_depth_usd(),
             // Calibration fill rate controller
             calibration_gamma_mult: self.stochastic.calibration_controller.gamma_multiplier(),
@@ -2334,7 +2336,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             //   Low (>0, <=0.4):    Halve sizes on increasing side
             //   Medium (>0.4, <=0.7): Keep only innermost level
             //   High (>0.7):        Full clear of increasing side
-            // Hysteresis: once active, stays active until momentum drops below 7 bps.
+            // Hysteresis: once active, stays active until momentum drops below exit threshold.
+            // Thresholds are spread-proportional: momentum must exceed 1.5x half-spread to trigger.
             {
                 let pos = self.position.position();
                 let inventory_frac = if self.effective_max_position > 1e-10 {
@@ -2343,12 +2346,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     0.0
                 };
                 let momentum_abs = trend_signal.long_momentum_bps.abs();
+                // Estimate current quoted half-spread for proportional thresholds
+                let quoted_half_spread_bps =
+                    (market_params.adaptive_spread_floor * 10_000.0).max(3.0);
 
                 // Compute pull urgency (0.0-1.0) with hysteresis
                 let pull_urgency = compute_pull_urgency(
                     drift_adjusted_skew.is_opposed,
                     inventory_frac,
                     momentum_abs,
+                    quoted_half_spread_bps,
                     &mut self.infra.emergency_pull_active,
                 );
 
@@ -2811,16 +2818,20 @@ fn compute_pull_urgency(
     is_opposed: bool,
     inventory_frac: f64,
     momentum_abs_bps: f64,
+    quoted_half_spread_bps: f64,
     pull_active: &mut bool,
 ) -> f64 {
-    const INVENTORY_ENTRY_THRESHOLD: f64 = 0.3;
-    const MOMENTUM_ENTRY_BPS: f64 = 10.0;
-    const MOMENTUM_EXIT_BPS: f64 = 7.0;
+    // Spread-proportional thresholds: momentum must significantly exceed our quoted spread
+    // to justify emergency action. With tight spreads (3 bps), entry = 5 bps.
+    // With wide spreads (20 bps), entry = 30 bps.
+    let momentum_entry_bps = (quoted_half_spread_bps * 1.5).max(5.0);
+    let momentum_exit_bps = momentum_entry_bps * 0.7; // 70% of entry for hysteresis
+    const INVENTORY_ENTRY_THRESHOLD: f64 = 0.4; // Raised from 0.3 to reduce over-triggering
     const HYSTERESIS_URGENCY: f64 = 0.3;
 
-    if !is_opposed || inventory_frac < INVENTORY_ENTRY_THRESHOLD || momentum_abs_bps < MOMENTUM_ENTRY_BPS {
+    if !is_opposed || inventory_frac < INVENTORY_ENTRY_THRESHOLD || momentum_abs_bps < momentum_entry_bps {
         // Below trigger thresholds — check hysteresis off-ramp
-        if *pull_active && momentum_abs_bps < MOMENTUM_EXIT_BPS {
+        if *pull_active && momentum_abs_bps < momentum_exit_bps {
             *pull_active = false;
         }
         if *pull_active {
@@ -2830,10 +2841,33 @@ fn compute_pull_urgency(
         }
     } else {
         *pull_active = true;
-        let inv_component = ((inventory_frac - 0.3) / 0.4).clamp(0.0, 1.0);
-        let mom_component = ((momentum_abs_bps - 10.0) / 15.0).clamp(0.0, 1.0);
+        let inv_component = ((inventory_frac - 0.4) / 0.3).clamp(0.0, 1.0);
+        let mom_component = ((momentum_abs_bps - momentum_entry_bps) / (momentum_entry_bps * 1.5)).clamp(0.0, 1.0);
         (inv_component * 0.5 + mom_component * 0.5).clamp(0.0, 1.0)
     }
+}
+
+/// Compute tick size in basis points from Hyperliquid's 5-significant-figure pricing.
+///
+/// Hyperliquid perps use 5 significant figures for all prices.
+/// The minimum price increment (tick) depends on the price magnitude:
+///   - BTC @ $97,000 → tick = $1.00   → 0.10 bps
+///   - ETH @  $3,000 → tick = $0.10   → 0.33 bps
+///   - HYPE @    $31 → tick = $0.001  → 0.32 bps
+///   - SOL @   $200 → tick = $0.01   → 0.50 bps
+///
+/// This replaces the hardcoded `tick_size_bps: 10.0` which caused spreads
+/// to be 32x wider than market (20 bps vs 0.6 bps BBO).
+fn compute_tick_size_bps(mid_price: f64) -> f64 {
+    if mid_price <= 0.0 {
+        return 1.0; // Safe default before first mid price
+    }
+    const SIGNIFICANT_FIGURES: i32 = 5;
+    let integer_digits = (mid_price.log10().floor() as i32 + 1).max(1);
+    let decimal_places = (SIGNIFICANT_FIGURES - integer_digits).max(0);
+    let tick_size = 10_f64.powi(-decimal_places);
+    // Convert to bps, floor at 0.01 bps to avoid zero
+    (tick_size / mid_price * 10_000.0).max(0.01)
 }
 
 /// Apply graduated emergency pull to the increasing-side quotes.
@@ -2907,11 +2941,12 @@ mod tests {
     #[test]
     fn test_graduated_urgency_low_halves_sizes() {
         let mut active = false;
-        // inventory_frac = 0.35 (just above 0.3), momentum = 12 bps (just above 10)
-        let urgency = compute_pull_urgency(true, 0.35, 12.0, &mut active);
-        // inv_component = (0.35-0.3)/0.4 = 0.125
-        // mom_component = (12-10)/15 = 0.133
-        // urgency = 0.125*0.5 + 0.133*0.5 = ~0.129
+        // With spread=5.0: entry=7.5 bps, inv threshold=0.4
+        // inventory_frac=0.45 (just above 0.4), momentum=12 (above 7.5)
+        let urgency = compute_pull_urgency(true, 0.45, 12.0, 5.0, &mut active);
+        // inv_component = (0.45-0.4)/0.3 = 0.167
+        // mom_component = (12-7.5)/11.25 = 0.4
+        // urgency = 0.167*0.5 + 0.4*0.5 = 0.283
         assert!(urgency > 0.0 && urgency <= 0.4, "Expected low urgency, got {urgency}");
         assert!(active, "Should activate pull");
 
@@ -2936,20 +2971,20 @@ mod tests {
     fn test_hysteresis_off_ramp() {
         let mut active = false;
 
-        // Step 1: Trigger the pull
-        let u1 = compute_pull_urgency(true, 0.5, 20.0, &mut active);
+        // With spread=5.0: entry=7.5 bps, exit=5.25 bps, inv threshold=0.4
+        // Step 1: Trigger the pull (inv=0.6 > 0.4, momentum=20 > 7.5)
+        let u1 = compute_pull_urgency(true, 0.6, 20.0, 5.0, &mut active);
         assert!(u1 > 0.0, "Should trigger");
         assert!(active, "Should be active");
 
-        // Step 2: Conditions drop below entry threshold but above exit (8 bps)
-        // is_opposed = true, inventory still high, but momentum dropped to 8 bps
-        let u2 = compute_pull_urgency(true, 0.5, 8.0, &mut active);
-        assert!(active, "Should stay active (8 > 7 exit threshold)");
+        // Step 2: Momentum drops below entry (7.5) but above exit (5.25) → hysteresis
+        let u2 = compute_pull_urgency(true, 0.6, 6.0, 5.0, &mut active);
+        assert!(active, "Should stay active (6.0 > 5.25 exit threshold)");
         assert!((u2 - 0.3).abs() < 1e-10, "Should return hysteresis urgency 0.3");
 
-        // Step 3: Momentum drops below exit threshold (6 bps)
-        let u3 = compute_pull_urgency(true, 0.5, 6.0, &mut active);
-        assert!(!active, "Should deactivate (6 < 7)");
+        // Step 3: Momentum drops below exit threshold (5.25)
+        let u3 = compute_pull_urgency(true, 0.6, 4.0, 5.0, &mut active);
+        assert!(!active, "Should deactivate (4.0 < 5.25)");
         assert!((u3 - 0.0).abs() < 1e-10, "Should return 0.0");
     }
 
@@ -2961,8 +2996,8 @@ mod tests {
     #[test]
     fn test_preserves_closing_side() {
         let mut active = false;
-        // High urgency to trigger full clear
-        let urgency = compute_pull_urgency(true, 0.8, 30.0, &mut active);
+        // High urgency to trigger full clear (spread=5.0: entry=7.5)
+        let urgency = compute_pull_urgency(true, 0.8, 30.0, 5.0, &mut active);
         assert!(urgency > 0.7, "Should be high urgency");
 
         let mut bids = vec![Quote::new(100.0, 1.0), Quote::new(99.0, 2.0)];
@@ -2986,10 +3021,11 @@ mod tests {
     #[test]
     fn test_full_clear_at_high_urgency() {
         let mut active = false;
-        // inv_frac = 0.7 → inv_component = (0.7-0.3)/0.4 = 1.0
-        // momentum = 25 bps → mom_component = (25-10)/15 = 1.0
+        // With spread=5.0: entry=7.5
+        // inv_frac = 0.7 → inv_component = (0.7-0.4)/0.3 = 1.0
+        // momentum = 25 bps → mom_component = (25-7.5)/11.25 = 1.0 (clamped)
         // urgency = 1.0*0.5 + 1.0*0.5 = 1.0
-        let urgency = compute_pull_urgency(true, 0.7, 25.0, &mut active);
+        let urgency = compute_pull_urgency(true, 0.7, 25.0, 5.0, &mut active);
         assert!(urgency > 0.7, "Expected high urgency, got {urgency}");
         assert!(active);
 
@@ -3008,10 +3044,11 @@ mod tests {
     #[test]
     fn test_medium_urgency_keeps_inner_level() {
         let mut active = false;
-        // inv_frac = 0.5 → inv_component = (0.5-0.3)/0.4 = 0.5
-        // momentum = 18 bps → mom_component = (18-10)/15 = 0.533
-        // urgency = 0.5*0.5 + 0.533*0.5 = 0.517
-        let urgency = compute_pull_urgency(true, 0.5, 18.0, &mut active);
+        // With spread=5.0: entry=7.5
+        // inv_frac = 0.5 → inv_component = (0.5-0.4)/0.3 = 0.333
+        // momentum = 14 bps → mom_component = (14-7.5)/11.25 = 0.578
+        // urgency = 0.333*0.5 + 0.578*0.5 = 0.455
+        let urgency = compute_pull_urgency(true, 0.5, 14.0, 5.0, &mut active);
         assert!(urgency > 0.4 && urgency <= 0.7, "Expected medium urgency, got {urgency}");
 
         let mut quotes = vec![
@@ -3030,7 +3067,7 @@ mod tests {
     #[test]
     fn test_no_pull_when_not_opposed() {
         let mut active = false;
-        let urgency = compute_pull_urgency(false, 0.9, 50.0, &mut active);
+        let urgency = compute_pull_urgency(false, 0.9, 50.0, 5.0, &mut active);
         assert!((urgency - 0.0).abs() < 1e-10, "No pull when not opposed");
         assert!(!active, "Should not activate");
     }
@@ -3091,5 +3128,61 @@ mod tests {
         assert!(bids.is_empty(), "Bids cleared");
         assert!(!asks.is_empty(), "Asks (reducing) MUST survive emergency pull");
         assert!(asks[0].size > 0.0, "Reducing side must have positive size");
+    }
+
+    // =========================================================================
+    // compute_tick_size_bps tests
+    // =========================================================================
+
+    #[test]
+    fn test_tick_size_bps_hype() {
+        // HYPE @ $31: 5 sig figs → 3 decimal places → tick = $0.001
+        // tick_bps = 0.001 / 31 * 10000 ≈ 0.323 bps
+        let tick = compute_tick_size_bps(31.0);
+        assert!(tick > 0.3 && tick < 0.35, "HYPE tick_bps={tick}, expected ~0.32");
+    }
+
+    #[test]
+    fn test_tick_size_bps_eth() {
+        // ETH @ $3000: 5 sig figs → 1 decimal place → tick = $0.1
+        // tick_bps = 0.1 / 3000 * 10000 ≈ 0.333 bps
+        let tick = compute_tick_size_bps(3000.0);
+        assert!(tick > 0.3 && tick < 0.4, "ETH tick_bps={tick}, expected ~0.33");
+    }
+
+    #[test]
+    fn test_tick_size_bps_btc() {
+        // BTC @ $97000: 5 sig figs → 0 decimal places → tick = $1.0
+        // tick_bps = 1.0 / 97000 * 10000 ≈ 0.103 bps
+        let tick = compute_tick_size_bps(97000.0);
+        assert!(tick > 0.09 && tick < 0.15, "BTC tick_bps={tick}, expected ~0.10");
+    }
+
+    #[test]
+    fn test_tick_size_bps_sol() {
+        // SOL @ $200: 5 sig figs → 2 decimal places → tick = $0.01
+        // tick_bps = 0.01 / 200 * 10000 = 0.5 bps
+        let tick = compute_tick_size_bps(200.0);
+        assert!((tick - 0.5).abs() < 0.05, "SOL tick_bps={tick}, expected 0.5");
+    }
+
+    #[test]
+    fn test_tick_size_bps_zero_price() {
+        // Zero/negative price should return safe default
+        assert_eq!(compute_tick_size_bps(0.0), 1.0);
+        assert_eq!(compute_tick_size_bps(-5.0), 1.0);
+    }
+
+    #[test]
+    fn test_tick_size_bps_always_below_old_default() {
+        // The old hardcoded value was 10.0 bps.
+        // For any reasonable perp price ($0.01 to $1M), tick should be well below 10 bps.
+        for price in [0.5, 1.0, 5.0, 31.0, 200.0, 3000.0, 50000.0, 97000.0] {
+            let tick = compute_tick_size_bps(price);
+            assert!(
+                tick < 10.0,
+                "tick_bps={tick} at price={price} should be < 10.0 (old hardcoded default)"
+            );
+        }
     }
 }

@@ -96,6 +96,14 @@ pub struct FillEvent {
     pub timestamp: Instant,
     /// Asset being traded
     pub asset: String,
+    /// Mid price when the order was originally placed (from TrackedOrder/PendingOrder).
+    /// Used for correct adverse selection measurement. When 0.0, callers should
+    /// fall back to mid_at_fill for backward compatibility.
+    pub mid_at_placement: f64,
+    /// Quoted half-spread in bps: |fill_price - mid_at_placement| / mid_at_placement * 10000.
+    /// Measures how far from mid we were quoting when the order was placed.
+    /// 0.0 when mid_at_placement is unavailable.
+    pub quoted_half_spread_bps: f64,
 }
 
 impl FillEvent {
@@ -122,6 +130,8 @@ impl FillEvent {
             placement_price,
             timestamp: Instant::now(),
             asset,
+            mid_at_placement: 0.0,
+            quoted_half_spread_bps: 0.0,
         }
     }
 
@@ -149,6 +159,8 @@ impl FillEvent {
             placement_price,
             timestamp: Instant::now(),
             asset,
+            mid_at_placement: 0.0,
+            quoted_half_spread_bps: 0.0,
         }
     }
 

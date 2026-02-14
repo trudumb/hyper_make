@@ -12,6 +12,9 @@ pub struct DrawdownMonitor {
     /// Drawdown from peak is only meaningful when the peak represents
     /// a significant sample of fills, not spread noise.
     min_peak_for_drawdown: f64,
+    /// Maximum absolute drawdown in USD before triggering critical.
+    /// Safety net for small-capital scenarios where percentage check is bypassed.
+    max_absolute_drawdown: f64,
 }
 
 impl DrawdownMonitor {
@@ -25,6 +28,7 @@ impl DrawdownMonitor {
             max_drawdown: max_drawdown.clamp(0.0, 1.0),
             warning_threshold: 0.7,
             min_peak_for_drawdown: 1.0,
+            max_absolute_drawdown: 5.0, // Conservative $5 default
         }
     }
 
@@ -39,6 +43,15 @@ impl DrawdownMonitor {
         self.min_peak_for_drawdown = min_peak;
         self
     }
+
+    /// Set maximum absolute drawdown in USD.
+    ///
+    /// Safety net for small-capital scenarios where percentage drawdown is
+    /// bypassed because peak PnL is below `min_peak_for_drawdown`.
+    pub fn with_max_absolute_drawdown(mut self, max_absolute: f64) -> Self {
+        self.max_absolute_drawdown = max_absolute;
+        self
+    }
 }
 
 impl RiskMonitor for DrawdownMonitor {
@@ -46,6 +59,21 @@ impl RiskMonitor for DrawdownMonitor {
         // No drawdown if no peak or at peak
         if state.peak_pnl <= 0.0 || state.daily_pnl >= state.peak_pnl {
             return RiskAssessment::ok(self.name());
+        }
+
+        // Absolute drawdown safety net: catches small-capital scenarios where
+        // percentage check is disabled (peak < min_peak_for_drawdown).
+        let absolute_drawdown = state.peak_pnl - state.daily_pnl;
+        if absolute_drawdown > self.max_absolute_drawdown && absolute_drawdown > 0.0 {
+            return RiskAssessment::critical(
+                self.name(),
+                format!(
+                    "Absolute drawdown ${:.2} exceeds max ${:.2}",
+                    absolute_drawdown, self.max_absolute_drawdown
+                ),
+            )
+            .with_metric(absolute_drawdown)
+            .with_threshold(self.max_absolute_drawdown);
         }
 
         // Drawdown is meaningless when peak is spread noise (e.g., $0.02 from one fill).

@@ -4,9 +4,37 @@
 //! a component. Ephemeral state (cached values, timestamps, rolling windows) is NOT
 //! persisted — it rebuilds from live data within seconds.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::market_maker::calibration::parameter_learner::LearnedParameters;
+
+/// Deserialize an f64 field that may be `null` in JSON.
+///
+/// When a checkpoint is hand-edited or corrupted, f64 fields can become `null`.
+/// Without this, serde fails with "invalid type: null, expected f64".
+/// This deserializer treats `null` as `0.0` (the f64 default).
+fn deserialize_f64_or_null<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
+/// Deserialize a u64 field that may be `null` in JSON.
+fn deserialize_u64_or_null<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
+/// Deserialize a usize field that may be `null` in JSON.
+fn deserialize_usize_or_null<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
 use crate::market_maker::estimator::calibration_coordinator::CalibrationCoordinator;
 use crate::market_maker::learning::spread_bandit::SpreadBanditCheckpoint;
 use crate::market_maker::ComponentParams;
@@ -111,12 +139,16 @@ pub struct CheckpointBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMetadata {
     /// Schema version for forward compatibility
+    #[serde(default)]
     pub version: u32,
     /// Timestamp when checkpoint was saved (ms since epoch)
+    #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub timestamp_ms: u64,
     /// Asset this checkpoint is for (e.g., "ETH")
+    #[serde(default)]
     pub asset: String,
     /// How long the session ran before this checkpoint (seconds)
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub session_duration_s: f64,
 }
 
@@ -221,18 +253,25 @@ impl Default for PreFillCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnhancedCheckpoint {
     /// Learned feature weights (10 features)
+    #[serde(default)]
     pub learned_weights: [f64; 10],
     /// Weight gradient momentum
+    #[serde(default)]
     pub weight_gradients: [f64; 10],
     /// Number of learning samples
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub learning_samples: usize,
     /// Sum of predictions (for calibration tracking)
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub prediction_sum: f64,
     /// Sum of outcomes (for calibration tracking)
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub outcome_sum: f64,
     /// Correct predictions count
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub correct_predictions: usize,
     /// Total predictions count
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub total_predictions: usize,
 }
 
@@ -257,12 +296,16 @@ impl Default for EnhancedCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolFilterCheckpoint {
     /// Posterior mean of sigma
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub sigma_mean: f64,
     /// Posterior standard deviation of sigma
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub sigma_std: f64,
     /// Regime probabilities [low, normal, high, extreme]
+    #[serde(default)]
     pub regime_probs: [f64; 4],
     /// Total observations processed
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub observation_count: usize,
 }
 
@@ -284,12 +327,16 @@ impl Default for VolFilterCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegimeHMMCheckpoint {
     /// Current belief state probabilities [4 regimes]
+    #[serde(default)]
     pub belief: [f64; 4],
     /// Learned transition counts [from][to] (Bayesian sufficient statistics)
+    #[serde(default)]
     pub transition_counts: [[f64; 4]; 4],
     /// Total observations processed
+    #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub observation_count: u64,
     /// Number of recalibrations performed
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub recalibration_count: usize,
 }
 
@@ -308,10 +355,13 @@ impl Default for RegimeHMMCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InformedFlowCheckpoint {
     /// Component parameters for 3-component mixture [informed, noise, forced]
+    #[serde(default)]
     pub component_params: [ComponentParams; 3],
     /// Mixing weights for the 3 components
+    #[serde(default)]
     pub mixing_weights: [f64; 3],
     /// Total observations processed
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub observation_count: usize,
 }
 

@@ -658,10 +658,13 @@ impl LadderStrategy {
             legacy_gamma * bayesian_scalar
         };
 
-        // === REGIME GAMMA MULTIPLIER ===
+        // === REGIME GAMMA MULTIPLIER (Continuously Blended) ===
         // Route regime risk through gamma instead of floor clamping.
         // This lets GLFT naturally widen spreads in volatile/extreme regimes
         // via δ = (1/γ)ln(1 + γ/κ) — higher γ → wider spread.
+        // The multiplier is continuously blended from regime probabilities
+        // (e.g. probs [0.2, 0.3, 0.3, 0.2] -> 1.76) instead of discrete
+        // jumps {1.0, 1.2, 2.0, 3.0}.
         let gamma = gamma * market_params.regime_gamma_multiplier;
         if (market_params.regime_gamma_multiplier - 1.0).abs() > 0.01 {
             tracing::info!(
@@ -1852,6 +1855,10 @@ impl LadderStrategy {
             // This eliminates the "buy high, sell low" pattern observed in live trading.
             // Override only when urgency is low — high urgency overrides to exit.
             //
+            // SKIP when position > 50% of max: reducing inventory is more important
+            // than protecting breakeven. In a 4h session this triggered 976 times
+            // (every cycle), preventing the strategy from ever reducing position.
+            //
             // IMPORTANT: The breakeven price must be snapped to the exchange tick grid
             // BEFORE sig-fig rounding, using directional rounding (ceil for asks, floor
             // for bids) to guarantee we never sell below / buy above true breakeven.
@@ -1861,11 +1868,18 @@ impl LadderStrategy {
                 let position = inventory_ratio; // already computed above
                 let tick_size = 10f64.powi(-(config.decimals as i32));
 
-                if breakeven > 0.0 {
+                // Skip breakeven clamping when position is large — reducing is more important.
+                // At > 50% of max position, the inventory risk from holding outweighs the
+                // small loss from selling below / buying above breakeven.
+                let skip_clamping = position.abs() > 0.5;
+
+                if breakeven > 0.0 && !skip_clamping {
                     if position > 0.0 {
                         // Long position: don't sell below breakeven unless urgent.
                         // Round breakeven UP to tick grid so ask >= true breakeven.
-                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 50.0).max(0.0)).min(1.0);
+                        // Divisor 20.0: triggers urgency override earlier than the
+                        // previous /50.0 (at ~10 bps underwater vs ~25 bps before).
+                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 20.0).max(0.0)).min(1.0);
                         if urgency < 0.5 {
                             // Snap breakeven UP to tick grid (ceil), then enforce 5-sig-fig
                             let breakeven_on_tick = (breakeven / tick_size).ceil() * tick_size;
@@ -1907,7 +1921,8 @@ impl LadderStrategy {
                     } else if position < 0.0 {
                         // Short position: don't buy above breakeven unless urgent.
                         // Round breakeven DOWN to tick grid so bid <= true breakeven.
-                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 50.0).max(0.0)).min(1.0);
+                        // Divisor 20.0: triggers urgency override earlier (see long side comment).
+                        let urgency = (position.abs() * (-market_params.unrealized_pnl_bps / 20.0).max(0.0)).min(1.0);
                         if urgency < 0.5 {
                             // Snap breakeven DOWN to tick grid (floor), then enforce 5-sig-fig
                             let breakeven_on_tick = (breakeven / tick_size).floor() * tick_size;

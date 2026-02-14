@@ -995,7 +995,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .with_monitor(Box::new(LossMonitor::new(config.max_daily_loss)))
             .with_monitor(Box::new(
                 DrawdownMonitor::new(config.max_drawdown)
-                    .with_min_peak(config.min_peak_for_drawdown),
+                    .with_min_peak(config.min_peak_for_drawdown)
+                    .with_max_absolute_drawdown(config.max_absolute_drawdown),
             ))
             .with_monitor(Box::new(PositionMonitor::new()))
             .with_monitor(Box::new(DataStalenessMonitor::new(

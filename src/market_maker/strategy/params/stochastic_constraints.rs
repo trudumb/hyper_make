@@ -32,7 +32,7 @@ pub struct StochasticConstraintParams {
 impl Default for StochasticConstraintParams {
     fn default() -> Self {
         Self {
-            tick_size_bps: 10.0,
+            tick_size_bps: 0.5, // Conservative default; overridden by compute_tick_size_bps()
             latency_spread_floor: 0.0003,
             near_touch_depth_usd: 0.0,
             tight_quoting_allowed: false,

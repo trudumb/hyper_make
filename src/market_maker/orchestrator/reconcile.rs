@@ -20,10 +20,15 @@ use super::{partition_ladder_actions, side_str};
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
-/// Quote latch threshold in bps - orders within this threshold are preserved
-/// to reduce cancellation churn and maintain queue position.
-/// Set to 2.5 bps to significantly reduce the 86% cancellation rate.
-const QUOTE_LATCH_THRESHOLD_BPS: f64 = 2.5;
+/// Compute adaptive quote latch threshold based on quoted spread.
+///
+/// Orders within this threshold are preserved to reduce cancellation churn
+/// and maintain queue position. Proportional to spread: at 3 bps half-spread
+/// the latch is 1.0 bps; at 20 bps it's 6.0 bps. This replaces the fixed
+/// 2.5 bps constant that caused 87% cancel rate.
+fn latch_threshold_bps(quoted_half_spread_bps: f64) -> f64 {
+    (quoted_half_spread_bps * 0.3).clamp(1.0, 10.0)
+}
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Reconcile a single order per side (legacy single-order mode).
@@ -593,14 +598,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             });
         }
 
+        // Compute adaptive latch threshold from quoted half-spread
+        let quoted_half_spread_bps = if !new_quotes.is_empty() && self.latest_mid > 0.0 {
+            let innermost_price = new_quotes[0].price;
+            ((innermost_price - self.latest_mid).abs() / self.latest_mid * 10_000.0).max(1.0)
+        } else {
+            3.0 // Conservative fallback
+        };
+        let latch_bps = latch_threshold_bps(quoted_half_spread_bps);
+
         // Check each level for meaningful price/size changes
         for (order, quote) in sorted_current.iter().zip(new_quotes.iter()) {
             // Price change check
             let price_diff_bps = ((order.price - quote.price) / order.price).abs() * 10000.0;
 
             // QUOTE LATCHING: Skip tiny changes to preserve queue position
-            // This reduces the 86% cancellation rate by avoiding cancel-replace for small drifts
-            if price_diff_bps <= QUOTE_LATCH_THRESHOLD_BPS {
+            // Adaptive threshold proportional to quoted spread
+            if price_diff_bps <= latch_bps {
                 // Size change within latch window - also check size tolerance
                 if order.size > 0.0 {
                     let size_diff_pct = ((order.size - quote.size) / order.size).abs();
