@@ -58,6 +58,11 @@ cargo clippy -- -D warnings      # Lint — treat warnings as errors
 
 IMPORTANT: After any code change, run `cargo clippy -- -D warnings` and fix all warnings before considering the task done.
 
+**Resource constraint**: Running the full test suite + clippy simultaneously crashes the machine. Always run commands sequentially, never in parallel:
+1. `cargo clippy -- -D warnings` first, fix any issues
+2. `cargo test` after clippy passes (or target specific tests with `cargo test <test_name>`)
+3. Never run `cargo test`, `cargo clippy`, and `cargo build` at the same time
+
 ---
 
 ## Skill System
