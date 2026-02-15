@@ -55,6 +55,7 @@ use crate::market_maker::estimator::{
     RegimeKappaConfig, RegimeKappaEstimator, TimestampRange, TradeFeatures, VolatilityRegime,
 };
 use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
+use std::cell::Cell;
 use tracing::{debug, info};
 
 /// Lag analyzer diagnostic status.
@@ -499,6 +500,10 @@ pub struct SignalIntegrator {
     predicted_alpha: f64,
     /// Estimated half-spread in bps (from kappa-derived GLFT spread).
     half_spread_estimate_bps: f64,
+    /// Whether cross-venue signal has ever been valid this session.
+    has_had_cross_venue: Cell<bool>,
+    /// Whether we've logged the no-signal warning.
+    logged_no_signal_warning: Cell<bool>,
 }
 
 impl SignalIntegrator {
@@ -528,6 +533,8 @@ impl SignalIntegrator {
             max_position: 0.0,
             predicted_alpha: 0.5,
             half_spread_estimate_bps: 5.0,
+            has_had_cross_venue: Cell::new(false),
+            logged_no_signal_warning: Cell::new(false),
         }
     }
 
@@ -830,9 +837,12 @@ impl SignalIntegrator {
                 } else {
                     signals.p_informed
                 };
+                // Clamp to >= 1.0: InformedFlow should only widen spreads, never tighten.
+                // Tightening has marginal value -0.23 bps (harmful).
                 self.config
                     .informed_flow_adjustment
                     .spread_multiplier(effective_p)
+                    .max(1.0)
             } else {
                 1.0 // No spread adjustment when gated out
             };
@@ -999,6 +1009,19 @@ impl SignalIntegrator {
             let fallback_cap = self.config.max_lead_lag_skew_bps * HL_NATIVE_SKEW_FRACTION;
             signals.combined_skew_bps =
                 (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
+        }
+
+        // Track if we've ever had cross-venue signal
+        if signals.cross_venue_valid || signals.lead_lag_actionable {
+            self.has_had_cross_venue.set(true);
+        }
+
+        // No-signal safety mode: log warning once when no cross-venue feed is available
+        if !self.has_had_cross_venue.get() && !self.logged_no_signal_warning.get() {
+            tracing::warn!(
+                "No cross-venue signal available — running in symmetric mode with reduced position limits (30%)"
+            );
+            self.logged_no_signal_warning.set(true);
         }
 
         // === FLOW URGENCY SKEW: Aggressive skew when directional flow is strong ===
@@ -1193,6 +1216,16 @@ impl SignalIntegrator {
         self.config.use_cross_venue = false;
     }
 
+    /// Returns position limit multiplier based on signal availability.
+    /// 0.30 when no cross-venue signal has ever been available, 1.0 otherwise.
+    pub fn signal_position_limit_mult(&self) -> f64 {
+        if self.has_had_cross_venue.get() {
+            1.0
+        } else {
+            0.30
+        }
+    }
+
     /// Get lag analyzer status for diagnostics.
     pub fn lag_analyzer_status(&self) -> LagAnalyzerStatus<'_> {
         let (optimal_lag_ms, mi_bits) = self
@@ -1263,6 +1296,8 @@ impl SignalIntegrator {
         self.max_position = 0.0;
         self.predicted_alpha = 0.5;
         self.half_spread_estimate_bps = 5.0;
+        self.has_had_cross_venue.set(false);
+        self.logged_no_signal_warning.set(false);
     }
 }
 
@@ -1278,10 +1313,8 @@ mod tests {
         // Should have default values
         assert_eq!(signals.skew_direction, 0);
         assert!(!signals.lead_lag_actionable);
-        // When p_informed = 0.0 (no data), we're below tighten_threshold (0.05),
-        // so spread_multiplier returns min_tighten_mult (0.9)
-        assert!(signals.informed_flow_spread_mult >= 0.9);
-        assert!(signals.informed_flow_spread_mult <= 1.0);
+        // Informed flow spread mult is clamped to >= 1.0 (no tightening allowed)
+        assert!(signals.informed_flow_spread_mult >= 1.0);
     }
 
     #[test]
@@ -1369,9 +1402,8 @@ mod tests {
         assert!(!contrib.lead_lag_active);
         assert_eq!(contrib.lead_lag_skew_bps, 0.0);
 
-        // Informed flow spread mult should be reasonable (0.9-1.0 range for no-data case)
-        assert!(contrib.informed_flow_spread_mult >= 0.9);
-        assert!(contrib.informed_flow_spread_mult <= 1.0);
+        // Informed flow spread mult clamped to >= 1.0 (no tightening)
+        assert!(contrib.informed_flow_spread_mult >= 1.0);
 
         // Regime kappa should be active (default config enables it)
         assert!(contrib.regime_active);
@@ -1593,9 +1625,9 @@ mod tests {
         let signals = integrator.get_signals();
 
         // Diagnostics should be populated
-        // With no data, informed_flow_spread_mult is ~0.9 (tighten below threshold)
-        // So informed_flow_adj_bps should be slightly negative
-        assert!(signals.informed_flow_adj_bps <= 0.0);
+        // With no data, informed_flow_spread_mult is clamped to 1.0 (no tightening)
+        // So informed_flow_adj_bps should be 0.0
+        assert!(signals.informed_flow_adj_bps >= 0.0);
 
         // Cross-venue: with default (empty) features, confidence=0 triggers
         // low-confidence widening → spread_mult ~1.15, so adj_bps ~1.5
@@ -1945,5 +1977,25 @@ mod tests {
             "Disabled skew should give near-zero, got: {:.3}",
             signals.combined_skew_bps
         );
+    }
+
+    #[test]
+    fn test_no_signal_safety_mode() {
+        let config = SignalIntegratorConfig::default();
+        let integrator = SignalIntegrator::new(config);
+
+        // Initially no cross-venue signal
+        assert!(!integrator.has_had_cross_venue.get());
+        assert_eq!(integrator.signal_position_limit_mult(), 0.30);
+    }
+
+    #[test]
+    fn test_signal_recovery_restores_limits() {
+        let config = SignalIntegratorConfig::default();
+        let integrator = SignalIntegrator::new(config);
+
+        // Simulate cross-venue signal becoming valid
+        integrator.has_had_cross_venue.set(true);
+        assert_eq!(integrator.signal_position_limit_mult(), 1.0);
     }
 }

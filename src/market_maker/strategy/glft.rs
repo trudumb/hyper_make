@@ -1540,11 +1540,28 @@ impl QuotingStrategy for GLFTStrategy {
             0.0
         };
 
-        // Apply spread widening multiplier from quote gate (pending changepoint confirmation)
-        // Then apply bandit-selected spread multiplier (contextual bandit optimizer)
-        let bandit_mult = market_params.bandit_spread_multiplier.clamp(0.5, 2.0);
-        let half_spread_bid_widened = half_spread_bid * market_params.spread_widening_mult * bandit_mult;
-        let half_spread_ask_widened = half_spread_ask * market_params.spread_widening_mult * bandit_mult;
+        // === ADDITIVE spread composition (replaces multiplicative stacking) ===
+        // Multiplicative chains caused death spirals (3.34x quota × 2x bandit = 6.7x).
+        // Now: base GLFT spread + additive components, each individually capped.
+
+        // 1. Bandit multiplier: narrow range, still multiplicative (optimizer feedback)
+        let bandit_mult = market_params.bandit_spread_multiplier.clamp(0.8, 1.5);
+
+        // 2. Changepoint/AS widening: convert excess multiplier to additive bps
+        // spread_widening_mult of 1.5 on 5 bps half-spread = 2.5 bps addon
+        // Capped at 100% of base spread (i.e., at most doubles the base)
+        let widening_excess = (market_params.spread_widening_mult - 1.0).clamp(0.0, 1.0);
+        let widening_addon_bid = half_spread_bid * widening_excess;
+        let widening_addon_ask = half_spread_ask * widening_excess;
+
+        // 3. Quota shadow spread: already in bps, convert to price fraction
+        // Capped at 50 bps to prevent quota pressure from dominating
+        let quota_addon = (market_params.quota_shadow_spread_bps / 10_000.0).min(0.0050);
+
+        // Compose: base × bandit (multiplicative) + addons (additive)
+        // The base spread passes through at natural GLFT level; only addons are bounded.
+        let half_spread_bid_widened = half_spread_bid * bandit_mult + widening_addon_bid + quota_addon;
+        let half_spread_ask_widened = half_spread_ask * bandit_mult + widening_addon_ask + quota_addon;
 
         // Compute asymmetric deltas with predictive bias
         // Note: predictive_bias is typically negative when changepoint imminent (expect price drop)
@@ -1718,6 +1735,10 @@ impl QuotingStrategy for GLFTStrategy {
 
     fn name(&self) -> &'static str {
         "GLFT"
+    }
+
+    fn record_elasticity_observation(&mut self, spread_bps: f64, fill_rate: f64) {
+        self.elasticity_estimator.record(spread_bps, fill_rate);
     }
 }
 
@@ -2520,5 +2541,45 @@ mod tests {
             "unreachable target should return max gamma: {}",
             gamma
         );
+    }
+
+    #[test]
+    fn test_additive_spread_composition_capped() {
+        let strategy = test_strategy();
+        let config = test_quote_config();
+        let mut mp = test_market_params();
+        // Set directional kappas to match symmetric kappa for clean test
+        mp.kappa_bid = mp.kappa;
+        mp.kappa_ask = mp.kappa;
+
+        // Baseline spread with no widening
+        let (bid_base, _ask_base) = strategy.calculate_quotes(&config, 0.0, 100.0, 1.0, &mp);
+
+        // Extreme widening: should be additive, not multiplicative
+        mp.spread_widening_mult = 5.0; // Clamped: excess = min(5-1, 1.0) = 1.0 → at most doubles
+        mp.bandit_spread_multiplier = 2.0; // Clamped to 1.5
+        mp.quota_shadow_spread_bps = 10.0; // 10 bps quota pressure
+
+        let (bid_wide, ask_wide) = strategy.calculate_quotes(&config, 0.0, 100.0, 1.0, &mp);
+
+        // Both quotes should exist
+        assert!(bid_wide.is_some(), "Bid should exist even with extreme widening");
+        assert!(ask_wide.is_some(), "Ask should exist even with extreme widening");
+
+        // Verify additive not multiplicative:
+        // Old multiplicative: base × 5.0 × 2.0 = 10x
+        // New additive: base × 1.5 (bandit) + base × 1.0 (widening) + 10bps (quota)
+        //             = 2.5 × base + 10bps ≈ 3.5x base (much less than 10x)
+        if let (Some(b_base), Some(b_wide)) = (bid_base, bid_wide) {
+            let mid = mp.microprice;
+            let base_spread_bps = (mid - b_base.price) / mid * 10000.0;
+            let wide_spread_bps = (mid - b_wide.price) / mid * 10000.0;
+            let ratio = wide_spread_bps / base_spread_bps.max(0.01);
+            assert!(
+                ratio < 5.0,
+                "Widened spread should be < 5x base (additive), got {:.1}x ({:.1} vs {:.1} bps)",
+                ratio, wide_spread_bps, base_spread_bps
+            );
+        }
     }
 }

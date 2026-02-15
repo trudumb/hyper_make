@@ -306,6 +306,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .signal_integrator
                 .update_as_prediction(predicted_as_prob, was_adverse);
 
+            // Close prediction→correction loop: if classifier overpredicts AS,
+            // bias correction reduces effective toxicity in spread_multiplier().
+            // predicted_as_bps_val and markout_as_bps computed below in EdgeSnapshot block.
+            let markout_direction_for_bias = if pending.is_buy { 1.0 } else { -1.0 };
+            let markout_as_bps_for_bias = if pending.mid_at_fill > 0.0 {
+                (self.latest_mid - pending.mid_at_fill) * markout_direction_for_bias
+                    / pending.mid_at_fill * 10_000.0
+            } else {
+                0.0
+            };
+            let predicted_as_bps_for_bias = self.estimator.total_as_bps();
+            self.tier1.pre_fill_classifier.observe_as_outcome(
+                predicted_as_bps_for_bias, markout_as_bps_for_bias,
+            );
+
             // === RESOLVED EDGE SNAPSHOT: markout-based edge measurement ===
             // This is the ground-truth edge measurement using 5-second markout AS.
             // Fill-time "instant AS" was tautological (AS ≈ depth from same mid).
@@ -326,7 +341,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     0.0
                 };
 
-                let predicted_as_bps_val = self.estimator.total_as_bps();
+                let predicted_as_bps_val = pending.predicted_as_bps;
                 let resolved_snap = EdgeSnapshot {
                     timestamp_ns: pending.timestamp_ms * 1_000_000,
                     predicted_spread_bps: pending.quoted_spread_bps,
@@ -892,6 +907,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         mid_at_fill: self.latest_mid,
                         mid_at_placement,
                         quoted_spread_bps,
+                        predicted_as_bps: self.estimator.total_as_bps(),
                     },
                 );
 
@@ -1027,6 +1043,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Update bandit with 1:1 quote→outcome reward attribution
                     let bandit_updated = self.stochastic.spread_bandit
                         .update_from_pending(bandit_reward);
+
+                    // Update ensemble performance for SpreadBandit (enables GLFT vs Bandit comparison)
+                    if bandit_updated {
+                        let bandit_brier = bandit_reward * bandit_reward;
+                        self.stochastic.ensemble.update_performance(
+                            "SpreadBandit", realized_edge_bps, bandit_brier, fill.time,
+                        );
+                    }
 
                     debug!(
                         realized_edge_bps = %format!("{:.2}", realized_edge_bps),

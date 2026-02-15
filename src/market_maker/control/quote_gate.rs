@@ -1015,58 +1015,17 @@ impl QuoteGate {
         probe
     }
 
-    /// Check if we should enter wide two-sided quoting mode at low quota.
+    /// Quota-driven spread widening — DISABLED.
     ///
-    /// When quota headroom is critically low AND we have a position, instead of
-    /// forcing one-sided quoting (which causes position whipsaw death spirals),
-    /// quote BOTH sides with widened spreads and position-reducing skew.
+    /// Previously computed a `1/sqrt(headroom)` spread multiplier when quota < 10%,
+    /// but this caused a death spiral: at 9% headroom the 3.34x multiplier made quotes
+    /// uncompetitive, killed fills, and prevented quota recovery.
     ///
-    /// The spread multiplier scales inversely with sqrt(headroom):
-    ///   multiplier = (1.0 / headroom_pct.sqrt()).min(max_quota_spread_multiplier)
-    ///
-    /// This eliminates the whipsaw pattern because:
-    /// 1. Both sides remain quoted (can capture spread in either direction)
-    /// 2. Wide spreads naturally reduce fill rate (conserving quota)
-    /// 3. Position skew is handled by the existing quote engine skew mechanism
-    /// 4. Any fill restores quota, helping escape the low-headroom state
-    ///
-    /// # Arguments
-    /// * `input` - Contains rate_limit_headroom_pct and position
-    ///
-    /// # Returns
-    /// Some(QuoteDecision::WidenSpreads) with quota-derived multiplier if activated,
-    /// None if wide two-sided mode is not triggered
-    pub fn wide_two_sided_decision(&self, input: &QuoteGateInput) -> Option<QuoteDecision> {
-        // Only activate when quota is critically low
-        if input.rate_limit_headroom_pct >= 0.10 {
-            return None;
-        }
-
-        // Only activate if we have a meaningful position
-        let position_threshold = input.max_position * 0.01; // 1% of max
-        if input.position.abs() < position_threshold {
-            return None;
-        }
-
-        // Spread multiplier: inversely proportional to sqrt(headroom)
-        // At 7% headroom: 1/sqrt(0.07) ≈ 3.78x
-        // At 3% headroom: 1/sqrt(0.03) ≈ 5.77x → capped at 5.0x
-        // At 1% headroom: 1/sqrt(0.01) = 10x → capped at 5.0x
-        const MAX_QUOTA_SPREAD_MULTIPLIER: f64 = 5.0;
-        let headroom = input.rate_limit_headroom_pct.max(0.01); // floor to avoid division by zero
-        let multiplier = (1.0 / headroom.sqrt()).min(MAX_QUOTA_SPREAD_MULTIPLIER);
-
-        warn!(
-            position = %format!("{:.4}", input.position),
-            headroom_pct = %format!("{:.1}%", input.rate_limit_headroom_pct * 100.0),
-            spread_multiplier = %format!("{:.2}x", multiplier),
-            "Low quota with position - wide two-sided quoting (not one-sided forcing)"
-        );
-
-        Some(QuoteDecision::WidenSpreads {
-            multiplier,
-            changepoint_prob: 0.0, // Not from changepoint - quota-driven widening
-        })
+    /// Quota pressure is now handled by:
+    /// 1. `quota_shadow_spread_bps` (additive, not multiplicative)
+    /// 2. Cycle frequency throttling (fewer updates, not wider spreads)
+    pub fn wide_two_sided_decision(&self, _input: &QuoteGateInput) -> Option<QuoteDecision> {
+        None
     }
 
     /// Compute hierarchical P(correct) by fusing L1/L2/L3 beliefs.
@@ -3193,38 +3152,26 @@ mod tests {
     }
 
     #[test]
-    fn test_wide_two_sided_at_low_quota_with_long_position() {
-        // Regression test: at low quota with position, we should get WidenSpreads
-        // (both sides) instead of one-sided forcing that causes whipsaw.
+    fn test_wide_two_sided_disabled_at_low_quota_with_long_position() {
+        // wide_two_sided_decision is disabled: quota-driven spread widening caused
+        // death spiral (3.34x at 9% headroom -> uncompetitive -> no fills -> no recovery).
         let gate = QuoteGate::default();
 
-        // Scenario: 3% headroom with meaningful long position
         let input = QuoteGateInput {
-            rate_limit_headroom_pct: 0.03, // 3% - shadow price is prohibitive
-            position: 5.0,                  // Long position (5% of max)
+            rate_limit_headroom_pct: 0.03,
+            position: 5.0,
             max_position: 100.0,
             vol_regime: 1,
             ..default_input()
         };
 
         let decision = gate.wide_two_sided_decision(&input);
-        assert!(
-            decision.is_some(),
-            "Wide two-sided should activate at 3% headroom with position"
-        );
-        match decision.unwrap() {
-            QuoteDecision::WidenSpreads { multiplier, changepoint_prob } => {
-                // At 3% headroom: 1/sqrt(0.03) ≈ 5.77 → capped at 5.0
-                assert!((multiplier - 5.0).abs() < 0.01, "Multiplier should be capped at 5.0, got {}", multiplier);
-                assert_eq!(changepoint_prob, 0.0, "changepoint_prob should be 0.0 for quota-driven widening");
-            }
-            other => panic!("Expected WidenSpreads, got {:?}", other),
-        }
+        assert!(decision.is_none(), "wide_two_sided_decision should be disabled");
     }
 
     #[test]
-    fn test_wide_two_sided_at_7pct_headroom() {
-        // At 7% headroom (our live scenario), multiplier should be ~3.78x
+    fn test_wide_two_sided_disabled_at_7pct_headroom() {
+        // wide_two_sided_decision is disabled even at 7% headroom (our live death-spiral scenario).
         let gate = QuoteGate::default();
 
         let input = QuoteGateInput {
@@ -3236,15 +3183,7 @@ mod tests {
         };
 
         let decision = gate.wide_two_sided_decision(&input);
-        assert!(decision.is_some(), "Should activate at 7% headroom with position");
-        match decision.unwrap() {
-            QuoteDecision::WidenSpreads { multiplier, .. } => {
-                // 1/sqrt(0.07) ≈ 3.78
-                assert!(multiplier > 3.5 && multiplier < 4.0,
-                    "At 7% headroom multiplier should be ~3.78, got {}", multiplier);
-            }
-            other => panic!("Expected WidenSpreads, got {:?}", other),
-        }
+        assert!(decision.is_none(), "wide_two_sided_decision should be disabled");
     }
 
     #[test]
@@ -3283,37 +3222,29 @@ mod tests {
     }
 
     #[test]
-    fn test_wide_two_sided_short_position() {
-        // Short position should also get WidenSpreads (not one-sided)
+    fn test_wide_two_sided_disabled_short_position() {
+        // wide_two_sided_decision is disabled even with short position at low headroom.
         let gate = QuoteGate::default();
 
         let input = QuoteGateInput {
             rate_limit_headroom_pct: 0.05,
-            position: -10.0, // Short position
+            position: -10.0,
             max_position: 100.0,
             vol_regime: 1,
             ..default_input()
         };
 
         let decision = gate.wide_two_sided_decision(&input);
-        assert!(decision.is_some(), "Should activate at 5% headroom with short position");
-        match decision.unwrap() {
-            QuoteDecision::WidenSpreads { multiplier, .. } => {
-                // 1/sqrt(0.05) ≈ 4.47
-                assert!(multiplier > 4.0 && multiplier < 5.0,
-                    "At 5% headroom multiplier should be ~4.47, got {}", multiplier);
-            }
-            other => panic!("Expected WidenSpreads, got {:?}", other),
-        }
+        assert!(decision.is_none(), "wide_two_sided_decision should be disabled");
     }
 
     #[test]
-    fn test_wide_two_sided_multiplier_capped_at_5x() {
-        // At very low headroom, multiplier should be capped at 5.0
+    fn test_wide_two_sided_disabled_at_extreme_low_headroom() {
+        // wide_two_sided_decision is disabled even at 1% headroom.
         let gate = QuoteGate::default();
 
         let input = QuoteGateInput {
-            rate_limit_headroom_pct: 0.01, // 1% - extremely low
+            rate_limit_headroom_pct: 0.01,
             position: 5.0,
             max_position: 100.0,
             vol_regime: 1,
@@ -3321,12 +3252,7 @@ mod tests {
         };
 
         let decision = gate.wide_two_sided_decision(&input);
-        match decision.unwrap() {
-            QuoteDecision::WidenSpreads { multiplier, .. } => {
-                assert!((multiplier - 5.0).abs() < 0.01, "Multiplier should be capped at 5.0, got {}", multiplier);
-            }
-            other => panic!("Expected WidenSpreads, got {:?}", other),
-        }
+        assert!(decision.is_none(), "wide_two_sided_decision should be disabled");
     }
 
     #[test]

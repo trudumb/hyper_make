@@ -109,6 +109,38 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === QUOTA-AWARE CYCLE THROTTLING ===
+        // Reduce update frequency when API quota is low instead of widening spreads.
+        // This conserves quota while keeping quotes competitive.
+        let headroom_for_throttle = self
+            .infra
+            .cached_rate_limit
+            .as_ref()
+            .map(|c| c.headroom_pct())
+            .unwrap_or(1.0);
+        let min_cycle_interval_ms: u64 = if headroom_for_throttle >= 0.30 {
+            1000 // Normal: every 1s
+        } else if headroom_for_throttle >= 0.10 {
+            3000 // Low: every 3s
+        } else if headroom_for_throttle >= 0.05 {
+            5000 // Critical: every 5s
+        } else {
+            10000 // Emergency: every 10s
+        };
+        if let Some(last) = self.last_quote_cycle_time {
+            let elapsed_ms = last.elapsed().as_millis() as u64;
+            if elapsed_ms < min_cycle_interval_ms {
+                tracing::debug!(
+                    headroom_pct = %format!("{:.1}%", headroom_for_throttle * 100.0),
+                    min_interval_ms = min_cycle_interval_ms,
+                    elapsed_ms,
+                    "Quota throttle: skipping cycle to conserve API quota"
+                );
+                return Ok(());
+            }
+        }
+        self.last_quote_cycle_time = Some(std::time::Instant::now());
+
         // === PHASE 3: INVENTORY GOVERNOR — First structural check ===
         // The inventory governor enforces config.max_position as a HARD ceiling.
         // This runs BEFORE any other logic to ensure position safety is structural.
@@ -386,6 +418,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     "AdaptiveEnsemble weights"
                 );
             }
+
+            // Feed empirical fill rates to GLFT elasticity estimator
+            let rates = self.quote_outcome_tracker.fill_rate().all_rates();
+            for (spread_mid, fill_rate, count) in &rates {
+                if *count >= 5 {
+                    self.strategy.record_elasticity_observation(*spread_mid, *fill_rate);
+                }
+            }
+
+            // Log empirical optimal spread for theory vs data comparison
+            if let Some(empirical_optimal) = self.quote_outcome_tracker.optimal_spread_bps(0.5) {
+                info!(
+                    empirical_optimal_bps = %format!("{:.2}", empirical_optimal),
+                    "QuoteOutcomeTracker empirical optimal spread"
+                );
+            }
         }
 
         // Phase 3: Check recovery state and handle IOC recovery if needed
@@ -565,6 +613,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Funding rate update
             let funding_rate_8h = self.tier2.funding.current_rate();
             self.tier1.pre_fill_classifier.update_funding(funding_rate_8h);
+
+            // Trend signal update: feed 5-min EWMA momentum to classifier
+            // Kyle (1985) drift conditioning — fills against strong trends are more toxic
+            if trend_signal.is_warmed_up {
+                self.tier1.pre_fill_classifier.update_trend(trend_signal.long_momentum_bps);
+            }
+
+            // Enhanced microstructure classifier blend: inject 10-feature toxicity
+            // into pre_fill_classifier as external signal (uses z-score normalized
+            // trade intensity, price impact, run length, volume imbalance, etc.)
+            // Average bid/ask toxicity to get symmetric microstructure signal.
+            let enhanced_bid = self.tier1.enhanced_classifier.predict_toxicity(true);
+            let enhanced_ask = self.tier1.enhanced_classifier.predict_toxicity(false);
+            let enhanced_avg = (enhanced_bid + enhanced_ask) / 2.0;
+            self.tier1.pre_fill_classifier.set_blended_toxicity(enhanced_avg);
+            // 30% weight to enhanced classifier, 70% to internal 6-signal classifier
+            self.tier1.pre_fill_classifier.set_blend_weight(0.3);
         }
 
         let sources = ParameterSources {
@@ -1398,6 +1463,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.effective_max_position = self.effective_max_position.min(self.config.max_position);
         }
 
+        // No-signal safety mode: reduce position limits when no cross-venue feed available
+        let signal_limit_mult = self.stochastic.signal_integrator.signal_position_limit_mult();
+        if signal_limit_mult < 1.0 {
+            self.effective_max_position *= signal_limit_mult;
+            tracing::debug!(
+                signal_limit_mult = %format!("{:.2}", signal_limit_mult),
+                effective_max = %format!("{:.4}", self.effective_max_position),
+                "No-signal safety mode: reduced effective max position"
+            );
+        }
+
         // Note: exchange limits were already updated BEFORE building sources (line ~1210)
         // using pre_effective_max_position which should equal new_effective
 
@@ -2118,8 +2194,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     position = %format!("{:.4}", self.position.position()),
                     "Quote gate: NoQuote → graduated 3x spread + reduce-only"
                 );
-                // Phase 7: Apply 3x widening + reduce-only instead of cancelling
-                market_params.spread_widening_mult *= 3.0;
+                // Phase 7: Apply 2x widening + reduce-only instead of cancelling
+                // Capped at 2.0 — multiplicative stacking beyond 2x is counterproductive
+                market_params.spread_widening_mult = (market_params.spread_widening_mult * 2.0).min(2.0);
                 risk_reduce_only = true;
                 // Fall through to quote generation with widened spreads
             }
@@ -2142,13 +2219,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             QuoteGateDecision::WidenSpreads { multiplier, changepoint_prob } => {
                 // Changepoint pending confirmation - apply spread widening
+                // Cap at 2.0x — beyond that is counterproductive (makes quotes uncompetitive)
+                let capped_mult = multiplier.min(2.0);
                 info!(
-                    multiplier = %format!("{:.2}", multiplier),
+                    raw_multiplier = %format!("{:.2}", multiplier),
+                    capped_multiplier = %format!("{:.2}", capped_mult),
                     changepoint_prob = %format!("{:.3}", changepoint_prob),
-                    "Quote gate: widening spreads (changepoint pending)"
+                    "Quote gate: widening spreads (changepoint pending, capped at 2.0x)"
                 );
-                // Update market_params with the widening multiplier and changepoint_prob
-                market_params.spread_widening_mult = *multiplier;
+                market_params.spread_widening_mult = capped_mult;
                 market_params.changepoint_prob = *changepoint_prob;
             }
         }
@@ -2226,6 +2305,62 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // QuoteBoth: normal, no filtering
                     // NoQuote: should have returned early, but defensive
                     // WidenSpreads: quote both sides (spread widening applied earlier)
+                }
+            }
+
+            // === TOXICITY-BASED DEFENSE: Cancel or reduce sizes based on toxicity ===
+            // Extreme toxicity (>0.75): clear that side entirely to avoid BBO pickoff.
+            // Moderate toxicity (0.5-0.75): reduce sizes proportionally.
+            // Rate-limited to prevent cancel storms.
+            {
+                const TOXICITY_CANCEL_THRESHOLD: f64 = 0.75;
+                const TOXICITY_SIZE_THRESHOLD: f64 = 0.5;
+                const MIN_SIZE_MULT: f64 = 0.3;
+                const TOXICITY_CANCEL_COOLDOWN_MS: u64 = 5_000;
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let bid_tox = market_params.pre_fill_toxicity_bid;
+                let ask_tox = market_params.pre_fill_toxicity_ask;
+
+                let cooldown_ok = now_ms.saturating_sub(self.last_toxicity_cancel_ms) >= TOXICITY_CANCEL_COOLDOWN_MS;
+
+                // Extreme toxicity: cancel side entirely
+                if cooldown_ok && bid_tox > TOXICITY_CANCEL_THRESHOLD && !bid_quotes.is_empty() {
+                    info!(
+                        bid_toxicity = %format!("{:.3}", bid_tox),
+                        cleared_bids = bid_quotes.len(),
+                        "Toxicity cancel: clearing BID side (extreme toxicity)"
+                    );
+                    bid_quotes.clear();
+                    self.last_toxicity_cancel_ms = now_ms;
+                } else if bid_tox > TOXICITY_SIZE_THRESHOLD && !bid_quotes.is_empty() {
+                    // Moderate toxicity: reduce sizes proportionally
+                    // tox=0.5 → mult=1.0, tox=0.75 → mult=0.5, clamped to [0.3, 1.0]
+                    let bid_size_mult = (1.0 - (bid_tox - TOXICITY_SIZE_THRESHOLD) * 2.0)
+                        .clamp(MIN_SIZE_MULT, 1.0);
+                    for q in bid_quotes.iter_mut() {
+                        q.size *= bid_size_mult;
+                    }
+                }
+
+                if cooldown_ok && ask_tox > TOXICITY_CANCEL_THRESHOLD && !ask_quotes.is_empty() {
+                    info!(
+                        ask_toxicity = %format!("{:.3}", ask_tox),
+                        cleared_asks = ask_quotes.len(),
+                        "Toxicity cancel: clearing ASK side (extreme toxicity)"
+                    );
+                    ask_quotes.clear();
+                    self.last_toxicity_cancel_ms = now_ms;
+                } else if ask_tox > TOXICITY_SIZE_THRESHOLD && !ask_quotes.is_empty() {
+                    let ask_size_mult = (1.0 - (ask_tox - TOXICITY_SIZE_THRESHOLD) * 2.0)
+                        .clamp(MIN_SIZE_MULT, 1.0);
+                    for q in ask_quotes.iter_mut() {
+                        q.size *= ask_size_mult;
+                    }
                 }
             }
 

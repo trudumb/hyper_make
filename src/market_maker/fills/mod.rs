@@ -67,6 +67,8 @@ pub struct PendingFillOutcome {
     pub mid_at_placement: f64,
     /// Quoted spread in bps: |fill_price - mid_at_placement| / mid_at_placement * 10000
     pub quoted_spread_bps: f64,
+    /// Predicted AS at fill time (stored for temporal calibration correctness)
+    pub predicted_as_bps: f64,
 }
 
 /// A unified fill event containing all data needed by modules.
@@ -341,6 +343,7 @@ mod tests {
             mid_at_fill: 50_005.0,
             mid_at_placement: 49_998.0,
             quoted_spread_bps: 0.4,
+            predicted_as_bps: 2.5,
         };
         assert!(outcome.is_buy);
         assert!((outcome.fill_price - 50_000.0).abs() < f64::EPSILON);
@@ -365,6 +368,7 @@ mod tests {
                 mid_at_fill: 50_000.0,
                 mid_at_placement: 0.0,
                 quoted_spread_bps: 0.0,
+                predicted_as_bps: 0.0,
             });
         }
         assert_eq!(queue.len(), 3);

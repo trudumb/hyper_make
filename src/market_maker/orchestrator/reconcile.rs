@@ -20,14 +20,24 @@ use super::{partition_ladder_actions, side_str};
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
-/// Compute adaptive quote latch threshold based on quoted spread.
+/// Compute adaptive quote latch threshold based on quoted spread and API quota headroom.
 ///
 /// Orders within this threshold are preserved to reduce cancellation churn
 /// and maintain queue position. Proportional to spread: at 3 bps half-spread
 /// the latch is 1.0 bps; at 20 bps it's 6.0 bps. This replaces the fixed
 /// 2.5 bps constant that caused 87% cancel rate.
-fn latch_threshold_bps(quoted_half_spread_bps: f64) -> f64 {
-    (quoted_half_spread_bps * 0.3).clamp(1.0, 10.0)
+///
+/// When API quota headroom is low (< 30%), the latch widens to let orders ride
+/// rather than burning quota to move them. A resting order 3 bps off-center is
+/// better than burning quota to move it 2 bps.
+fn latch_threshold_bps(quoted_half_spread_bps: f64, headroom_pct: f64) -> f64 {
+    let base = quoted_half_spread_bps * 0.3;
+    if headroom_pct < 0.30 {
+        // Low quota: widen latch to reduce churn
+        (base * 2.0).clamp(3.0, 15.0)
+    } else {
+        base.clamp(1.0, 10.0)
+    }
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -605,7 +615,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         } else {
             3.0 // Conservative fallback
         };
-        let latch_bps = latch_threshold_bps(quoted_half_spread_bps);
+        let headroom_pct = self
+            .infra
+            .cached_rate_limit
+            .as_ref()
+            .map(|c| c.headroom_pct())
+            .unwrap_or(1.0);
+        let latch_bps = latch_threshold_bps(quoted_half_spread_bps, headroom_pct);
 
         // Check each level for meaningful price/size changes
         for (order, quote) in sorted_current.iter().zip(new_quotes.iter()) {
@@ -904,6 +920,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let has_targets = !bid_levels.is_empty() || !ask_levels.is_empty();
 
         if ladder_empty && has_targets {
+            // Empty ladder cooldown: prevent churn from repeated recovery attempts
+            const EMPTY_LADDER_COOLDOWN_SECS: u64 = 2;
+            if let Some(last_recovery) = self.last_empty_ladder_recovery {
+                if last_recovery.elapsed().as_secs() < EMPTY_LADDER_COOLDOWN_SECS {
+                    debug!(
+                        cooldown_remaining_ms = (EMPTY_LADDER_COOLDOWN_SECS * 1000).saturating_sub(last_recovery.elapsed().as_millis() as u64),
+                        "EMPTY LADDER recovery in cooldown - skipping to reduce churn"
+                    );
+                    return Ok(());
+                }
+            }
+
             // QUOTA-AWARE CHECK: Get current headroom before deciding recovery strategy
             let headroom = self
                 .infra
@@ -988,6 +1016,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 placed = placed_count,
                 "[Reconcile] Empty ladder recovery complete"
             );
+            self.last_empty_ladder_recovery = Some(std::time::Instant::now());
 
             // Skip normal reconciliation since we just replenished
             return Ok(());

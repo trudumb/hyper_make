@@ -2073,6 +2073,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_dynamic_risk_config(dynamic_risk_config)
     .with_microprice_ema(microprice_ema_alpha, microprice_ema_min_change_bps);
 
+    // Enable experience logging for offline RL training
+    market_maker = market_maker.with_experience_logging("logs/experience");
+
     // Wire checkpoint persistence for warm-starting across sessions
     let checkpoint_dir = PathBuf::from(format!("data/checkpoints/{asset}"));
     market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
@@ -2608,6 +2611,9 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         ReconciliationConfig::default(),
         RejectionRateLimitConfig::default(),
     );
+
+    // Enable experience logging for offline RL training
+    market_maker = market_maker.with_experience_logging("logs/experience");
 
     // Wire checkpoint persistence
     let checkpoint_dir = PathBuf::from(format!("data/checkpoints/paper/{asset}"));

@@ -128,6 +128,18 @@ pub trait QuotingStrategy: Send + Sync {
     fn record_quote_cycle_no_fills(&mut self, _depths_bps: &[f64]) {
         // Default: no-op for strategies without Bayesian fill models
     }
+
+    /// Record a (spread, fill_rate) observation for taker elasticity estimation.
+    ///
+    /// Strategies with elasticity estimators (e.g., GLFTStrategy) implement this
+    /// to learn the relationship between quoted spread and fill probability.
+    ///
+    /// # Arguments
+    /// * `spread_bps` - Spread bin midpoint in basis points
+    /// * `fill_rate` - Observed fill rate for this spread bin
+    fn record_elasticity_observation(&mut self, _spread_bps: f64, _fill_rate: f64) {
+        // Default: no-op for strategies without elasticity models
+    }
 }
 
 /// Blanket implementation for Box<dyn QuotingStrategy>.
@@ -184,6 +196,10 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
 
     fn record_quote_cycle_no_fills(&mut self, depths_bps: &[f64]) {
         (**self).record_quote_cycle_no_fills(depths_bps)
+    }
+
+    fn record_elasticity_observation(&mut self, spread_bps: f64, fill_rate: f64) {
+        (**self).record_elasticity_observation(spread_bps, fill_rate)
     }
 }
 

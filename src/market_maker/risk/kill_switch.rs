@@ -229,6 +229,22 @@ impl KillSwitchConfig {
             }
         }
     }
+
+    /// Create config scaled to account capital.
+    /// Uses conservative defaults: 5% daily loss, 3% drawdown.
+    pub fn for_capital(account_value: f64) -> Self {
+        let max_daily_loss = (account_value * 0.05).max(1.0);
+        let max_absolute_drawdown = (account_value * 0.03).max(0.50);
+        let min_peak = (account_value * 0.005).max(0.50);
+        let max_position_value = account_value * 3.0; // 3x leverage default
+        Self {
+            max_daily_loss,
+            max_absolute_drawdown,
+            min_peak_for_drawdown: min_peak,
+            max_position_value,
+            ..Default::default()
+        }
+    }
 }
 
 use crate::market_maker::config::DynamicRiskConfig;
@@ -467,6 +483,36 @@ impl KillSwitch {
             state: Mutex::new(KillSwitchState::default()),
             atomic_max_position_value: AtomicF64::new(initial_max_position_value),
             last_fill_time: Mutex::new(None),
+        }
+    }
+
+    /// Validate kill switch config against account capital.
+    /// Logs warnings if thresholds seem misconfigured.
+    pub fn validate_for_capital(&self, account_value: f64) {
+        let config = self.config.lock().unwrap();
+        if account_value > 0.0 {
+            if config.max_daily_loss > account_value * 0.20 {
+                tracing::warn!(
+                    max_daily_loss = config.max_daily_loss,
+                    account_value = account_value,
+                    pct = %format!("{:.0}%", config.max_daily_loss / account_value * 100.0),
+                    "Kill switch max_daily_loss > 20% of account — may be misconfigured"
+                );
+            }
+            if config.max_daily_loss > account_value {
+                tracing::error!(
+                    max_daily_loss = config.max_daily_loss,
+                    account_value = account_value,
+                    "Kill switch max_daily_loss EXCEEDS account value — effectively disabled!"
+                );
+            }
+            if config.min_peak_for_drawdown > account_value * 0.10 {
+                tracing::warn!(
+                    min_peak = config.min_peak_for_drawdown,
+                    account_value = account_value,
+                    "Kill switch min_peak_for_drawdown > 10% of account — drawdown check may never activate"
+                );
+            }
         }
     }
 
@@ -1961,5 +2007,37 @@ mod tests {
         let reason = ks.check(&state_over);
         assert!(reason.is_some(), "Over margin-based limit should trigger with default ladder depth");
         assert!(matches!(reason.unwrap(), KillReason::PositionRunaway { .. }));
+    }
+
+    #[test]
+    fn test_for_capital_100_usd() {
+        let config = KillSwitchConfig::for_capital(100.0);
+        assert!((config.max_daily_loss - 5.0).abs() < 0.01, "5% of $100 = $5");
+        assert!((config.max_absolute_drawdown - 3.0).abs() < 0.01, "3% of $100 = $3");
+        assert!((config.min_peak_for_drawdown - 0.50).abs() < 0.01, "0.5% of $100 = $0.50");
+        assert!((config.max_position_value - 300.0).abs() < 0.01, "3x leverage on $100");
+    }
+
+    #[test]
+    fn test_for_capital_10000_usd() {
+        let config = KillSwitchConfig::for_capital(10000.0);
+        assert!((config.max_daily_loss - 500.0).abs() < 0.01, "5% of $10K = $500");
+        assert!((config.max_absolute_drawdown - 300.0).abs() < 0.01, "3% of $10K = $300");
+        assert!((config.min_peak_for_drawdown - 50.0).abs() < 0.01, "0.5% of $10K = $50");
+    }
+
+    #[test]
+    fn test_for_capital_very_small() {
+        let config = KillSwitchConfig::for_capital(5.0);
+        assert!(config.max_daily_loss >= 1.0, "Min $1 daily loss");
+        assert!(config.max_absolute_drawdown >= 0.50, "Min $0.50 absolute drawdown");
+        assert!(config.min_peak_for_drawdown >= 0.50, "Min $0.50 peak");
+    }
+
+    #[test]
+    fn test_validate_for_capital_warns() {
+        // This test just verifies validate_for_capital doesn't panic
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.validate_for_capital(100.0); // $500 max_daily_loss > $100 account -> should warn
     }
 }

@@ -92,6 +92,11 @@ pub struct PreFillClassifierConfig {
 
     /// Minimum update_count before data fully overrides the prior (default: 10).
     pub warmup_prior_min_updates: u64,
+
+    /// Toxicity floor below which no spread widening occurs (default: 0.3).
+    /// Lowered from 0.5 to allow proportional response across the full toxicity range.
+    /// At 0.5, warmup prior (0.35) produces zero widening — too permissive.
+    pub toxicity_floor: f64,
 }
 
 impl Default for PreFillClassifierConfig {
@@ -121,9 +126,11 @@ impl Default for PreFillClassifierConfig {
 
             warmup_prior_toxicity: 0.35,
             warmup_prior_min_updates: 10,
+            toxicity_floor: 0.3,
         }
     }
 }
+
 
 impl PreFillClassifierConfig {
     /// Return the config-default weights as an array of NUM_SIGNALS elements.
@@ -1020,9 +1027,11 @@ impl PreFillASClassifier {
         let bias_adj = self.bias_correction() / 20.0;
         let corrected_toxicity = (toxicity - bias_adj).clamp(0.0, 1.0);
 
-        // Sigmoid-centered signals: toxicity 0.5 = neutral, only widen above neutral.
-        // Maps [0.5, 1.0] → [1.0, max_multiplier], below 0.5 → 1.0 (no widening).
-        let excess = (corrected_toxicity - 0.5).max(0.0) * 2.0; // [0.5,1.0] → [0.0,1.0]
+        // Proportional response: toxicity below floor = no widening,
+        // above floor = linear ramp to max_multiplier.
+        // With floor=0.3: warmup prior 0.35 → ~1.14x, toxicity 0.5 → ~1.57x
+        let floor = self.config.toxicity_floor;
+        let excess = (corrected_toxicity - floor).max(0.0) / (1.0 - floor);
         let multiplier = 1.0 + excess * (self.config.max_spread_multiplier - 1.0);
         multiplier.clamp(1.0, self.config.max_spread_multiplier)
     }
@@ -1481,20 +1490,17 @@ mod tests {
         let bid_mult = classifier.spread_multiplier(true);
         let ask_mult = classifier.spread_multiplier(false);
 
-        // Warmup prior toxicity = 0.35. The spread_multiplier maps [0.5, 1.0] -> [1.0, max].
-        // Since 0.35 < 0.5, excess = 0 and multiplier = 1.0.
-        // But bias_correction is 0, so corrected_toxicity = 0.35.
-        // Actually: spread_multiplier computes excess = (0.35 - 0.5).max(0.0) = 0.0 → mult = 1.0.
-        //
-        // To get spread widening from the prior, we need toxicity > 0.5.
-        // The default prior of 0.35 is intentionally mild — it provides nonzero AS estimation
-        // without necessarily widening spreads (defense at the AS level, not spread level).
-        //
-        // Verify the prior at least makes toxicity nonzero (the core fix).
+        // Warmup prior toxicity = 0.35. With toxicity_floor = 0.3:
+        // excess = (0.35 - 0.3) / (1.0 - 0.3) ≈ 0.071
+        // multiplier = 1.0 + 0.071 * (3.0 - 1.0) ≈ 1.14
+        // Mild spread widening during cold start — proportional response.
+        assert!(bid_mult > 1.0, "Warmup prior should produce spread widening, got {}", bid_mult);
+        assert!(bid_mult < 1.3, "Warmup widening should be mild, got {}", bid_mult);
+
         let tox = classifier.predict_toxicity(true);
         assert!(tox > 0.0, "Fresh classifier must have nonzero toxicity, got {}", tox);
 
-        // With a higher prior, spread multiplier would exceed 1.0.
+        // With a higher prior, spread multiplier should be larger.
         let mut config = PreFillClassifierConfig::default();
         config.warmup_prior_toxicity = 0.7; // High prior for testing
         let high_prior_classifier = PreFillASClassifier::with_config(config);

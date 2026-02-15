@@ -250,6 +250,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     position_velocity_1m: f64,
     /// Fill cascade tracker: detects and mitigates same-side fill runs.
     fill_cascade_tracker: FillCascadeTracker,
+    /// Last time a quote cycle completed (for quota-aware frequency throttling).
+    last_quote_cycle_time: Option<std::time::Instant>,
+    /// Last time an empty ladder recovery was attempted (2s cooldown prevents churn).
+    last_empty_ladder_recovery: Option<std::time::Instant>,
 
     // === Signal Diagnostics Cache (Phase 1) ===
     /// Cached market params from last quote cycle.
@@ -288,6 +292,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Tracks outcomes of all quotes (filled AND unfilled) for unbiased edge estimation.
     /// Enables learning from expired quotes and computing optimal spread = argmax(edge × fill_rate).
     quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker,
+
+    // === Toxicity Cancel Cooldown ===
+    /// Last time toxicity-triggered order cancellation occurred (epoch ms).
+    /// Minimum 5s between toxicity cancels to avoid cancel storms.
+    last_toxicity_cancel_ms: u64,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -438,6 +447,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             position_velocity_1m: 0.0,
             // Fill cascade tracker for same-side fill run detection
             fill_cascade_tracker: FillCascadeTracker::new(),
+            last_quote_cycle_time: None,
+            last_empty_ladder_recovery: None,
             // Signal diagnostics cache (updated each quote cycle)
             cached_market_params: None,
             // Cross-exchange lead-lag (disabled by default, enabled via with_binance_receiver)
@@ -461,6 +472,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             ),
             // Phase 5: Quote outcome tracking for unbiased edge estimation
             quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
+            last_toxicity_cancel_ms: 0,
         }
     }
 
@@ -1052,24 +1064,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     }
 }
 
+/// Number of same-side fills in window to trigger spread widening.
+const CASCADE_WIDEN_THRESHOLD: usize = 2;
+/// Number of same-side fills in window to trigger position suppression.
+const CASCADE_SUPPRESS_THRESHOLD: usize = 4;
+
 /// Event emitted when a fill cascade threshold is newly crossed.
 /// Used by handlers to trigger immediate cancel of resting accumulating orders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadeEvent {
-    /// 3+ same-side fills: widen that side's spread
+    /// 2+ same-side fills: widen that side's spread
     Widen(Side),
-    /// 5+ same-side fills: suppress (reduce-only) that side
+    /// 4+ same-side fills: suppress (reduce-only) that side
     Suppress(Side),
 }
 
 /// Tracks consecutive same-side fills to detect and mitigate fill cascades.
 ///
-/// When the MM accumulates fills on one side (e.g., 3+ shorts in 60s),
-/// this tracker widens that side's spread (5x) or suppresses it entirely (after 5+),
+/// When the MM receives fills on one side (e.g., 2+ shorts in 60s),
+/// this tracker widens that side's spread (5x) or suppresses it entirely (after 4+),
 /// preventing runaway position accumulation during trending markets.
 ///
-/// Only ACCUMULATING fills count (buying when long/flat, selling when short/flat).
-/// Reducing fills (selling out of a long, buying to cover a short) are not counted.
+/// ALL same-side fills are counted, including reducing fills. Even "reducing" fills
+/// indicate one-directional flow that may flip position and continue accumulating.
 ///
 /// The key insight: fill clustering on one side is a strong signal of adverse flow.
 /// Position limits alone are too late — by the time position hits the limit,
@@ -1080,9 +1097,9 @@ pub struct FillCascadeTracker {
     recent_fills: std::collections::VecDeque<(std::time::Instant, Side)>,
     /// Rolling window for cascade detection
     window: std::time::Duration,
-    /// Number of same-side fills to trigger widening (5x)
+    /// Number of same-side fills to trigger widening (5x spread)
     widen_threshold: usize,
-    /// Number of same-side fills to trigger suppression (reduce-only)
+    /// Number of same-side fills to trigger suppression (reduce-only mode)
     suppress_threshold: usize,
     /// Cooldown: suppressed side and expiry time
     cooldown_until: Option<(std::time::Instant, Side)>,
@@ -1098,27 +1115,20 @@ impl FillCascadeTracker {
         Self {
             recent_fills: std::collections::VecDeque::with_capacity(32),
             window: std::time::Duration::from_secs(60),
-            widen_threshold: 3,
-            suppress_threshold: 5,
+            widen_threshold: CASCADE_WIDEN_THRESHOLD,
+            suppress_threshold: CASCADE_SUPPRESS_THRESHOLD,
             cooldown_until: None,
             widen_cooldown: std::time::Duration::from_secs(30),
             suppress_cooldown: std::time::Duration::from_secs(60),
         }
     }
 
-    /// Record a fill event. Only accumulating fills are counted (buying when long/flat,
-    /// selling when short/flat). Returns `Some(CascadeEvent)` when a threshold is newly crossed,
+    /// Record a fill event. ALL same-side fills are counted regardless of current position.
+    /// Returns `Some(CascadeEvent)` when a threshold is newly crossed,
     /// signaling the handler to cancel resting accumulating-side orders immediately.
-    pub fn record_fill(&mut self, side: Side, position: f64) -> Option<CascadeEvent> {
-        // Only count accumulating fills — reducing fills are healthy
-        let is_accumulating = match side {
-            Side::Buy => position >= 0.0,  // buying when already long or flat
-            Side::Sell => position <= 0.0, // selling when already short or flat
-        };
-        if !is_accumulating {
-            return None;
-        }
-
+    pub fn record_fill(&mut self, side: Side, _position: f64) -> Option<CascadeEvent> {
+        // Count ALL same-side fills — even "reducing" fills indicate one-directional flow
+        // that may flip position and continue accumulating.
         let now = std::time::Instant::now();
         let prev_count = self.count_same_side(side, now);
         self.recent_fills.push_back((now, side));
@@ -1228,45 +1238,44 @@ mod fill_cascade_tests {
     use super::*;
 
     #[test]
-    fn test_reducing_fills_not_counted() {
+    fn test_all_same_side_fills_counted() {
         let mut tracker = FillCascadeTracker::new();
-        // Long position (+5.0), selling to reduce — should NOT count
-        for _ in 0..10 {
-            assert!(tracker.record_fill(Side::Sell, 5.0).is_none());
-        }
-        assert_eq!(tracker.spread_multiplier(Side::Sell), 1.0);
-        assert!(!tracker.is_suppressed(Side::Sell));
+        // Long position (+5.0), selling to reduce — ALL same-side fills counted now
+        assert!(tracker.record_fill(Side::Sell, 5.0).is_none()); // 1st sell
+        let event = tracker.record_fill(Side::Sell, 5.0); // 2nd sell → WIDEN
+        assert_eq!(event, Some(CascadeEvent::Widen(Side::Sell)));
+        assert!(tracker.spread_multiplier(Side::Sell) > 1.0);
 
-        // Short position (-5.0), buying to reduce — should NOT count
+        // Short position (-5.0), buying to reduce — ALL same-side fills counted now
         let mut tracker2 = FillCascadeTracker::new();
-        for _ in 0..10 {
-            assert!(tracker2.record_fill(Side::Buy, -5.0).is_none());
-        }
-        assert_eq!(tracker2.spread_multiplier(Side::Buy), 1.0);
-        assert!(!tracker2.is_suppressed(Side::Buy));
+        assert!(tracker2.record_fill(Side::Buy, -5.0).is_none()); // 1st buy
+        let event2 = tracker2.record_fill(Side::Buy, -5.0); // 2nd buy → WIDEN
+        assert_eq!(event2, Some(CascadeEvent::Widen(Side::Buy)));
+        assert!(tracker2.spread_multiplier(Side::Buy) > 1.0);
     }
 
     #[test]
     fn test_accumulating_fills_trigger_cascade() {
         let mut tracker = FillCascadeTracker::new();
-        // Flat (0.0) then buying → accumulating
+        // First buy: no cascade yet
         assert!(tracker.record_fill(Side::Buy, 0.0).is_none()); // 1
-        assert!(tracker.record_fill(Side::Buy, 1.0).is_none()); // 2
-        // 3rd buy triggers WIDEN
-        let event = tracker.record_fill(Side::Buy, 2.0);
+        // 2nd buy triggers WIDEN (threshold = 2)
+        let event = tracker.record_fill(Side::Buy, 1.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
         assert!(tracker.spread_multiplier(Side::Buy) > 1.0);
     }
 
     #[test]
-    fn test_suppress_at_five_accumulating_fills() {
+    fn test_suppress_at_four_same_side_fills() {
         let mut tracker = FillCascadeTracker::new();
-        // 5 accumulating sells while short/flat
-        for i in 0..4 {
-            tracker.record_fill(Side::Sell, -(i as f64));
-        }
-        let event = tracker.record_fill(Side::Sell, -4.0);
-        assert_eq!(event, Some(CascadeEvent::Suppress(Side::Sell)));
+        // 3 sells → last should be Widen
+        assert!(tracker.record_fill(Side::Sell, 0.0).is_none()); // 1
+        let event2 = tracker.record_fill(Side::Sell, -1.0); // 2 → Widen
+        assert_eq!(event2, Some(CascadeEvent::Widen(Side::Sell)));
+        tracker.record_fill(Side::Sell, -2.0); // 3 → already widened, no new event
+        // 4th sell → Suppress (threshold = 4)
+        let event4 = tracker.record_fill(Side::Sell, -3.0);
+        assert_eq!(event4, Some(CascadeEvent::Suppress(Side::Sell)));
         assert!(tracker.is_suppressed(Side::Sell));
     }
 
@@ -1276,12 +1285,12 @@ mod fill_cascade_tests {
         // If position is +5.0 (long) and sell cascade fires,
         // WIDEN should NOT apply because sells reduce the long.
         let mut tracker = FillCascadeTracker::new();
-        // Simulate: short position, sells accumulate
-        for _ in 0..3 {
+        // Simulate: sells accumulate (position doesn't matter for tracker now)
+        for _ in 0..2 {
             tracker.record_fill(Side::Sell, -1.0);
         }
         let mult = tracker.spread_multiplier(Side::Sell);
-        assert!(mult > 1.0, "Sell cascade should widen when short");
+        assert!(mult > 1.0, "Sell cascade should widen");
 
         // But quote_engine checks position: if position > 0, skip widen for sells
         let position = 5.0; // long
@@ -1297,16 +1306,14 @@ mod fill_cascade_tests {
     }
 
     #[test]
-    fn test_mixed_accumulating_and_reducing() {
+    fn test_mixed_sides_all_counted() {
         let mut tracker = FillCascadeTracker::new();
-        // Buy at flat (accumulating) → counted
+        // Buy at flat → counted (1 buy)
         tracker.record_fill(Side::Buy, 0.0);
-        // Sell at +1.0 (reducing long) → NOT counted
+        // Sell at +1.0 → counted for sells (1 sell) — was "reducing" before, now counted
         tracker.record_fill(Side::Sell, 1.0);
-        // Buy at 0.0 again (accumulating) → counted
-        tracker.record_fill(Side::Buy, 0.0);
-        // Buy at +1.0 (accumulating) → counted → this is the 3rd, should trigger WIDEN
-        let event = tracker.record_fill(Side::Buy, 1.0);
+        // Buy at 0.0 → 2nd buy → triggers WIDEN
+        let event = tracker.record_fill(Side::Buy, 0.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
     }
 }
