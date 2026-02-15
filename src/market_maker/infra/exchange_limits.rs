@@ -80,12 +80,12 @@ impl ExchangePositionLimits {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ExchangeLimitsInner {
-                max_long: AtomicF64::new(f64::MAX),
-                max_short: AtomicF64::new(f64::MAX),
-                available_buy: AtomicF64::new(f64::MAX),
-                available_sell: AtomicF64::new(f64::MAX),
-                effective_bid_limit: AtomicF64::new(f64::MAX),
-                effective_ask_limit: AtomicF64::new(f64::MAX),
+                max_long: AtomicF64::new(0.0),
+                max_short: AtomicF64::new(0.0),
+                available_buy: AtomicF64::new(0.0),
+                available_sell: AtomicF64::new(0.0),
+                effective_bid_limit: AtomicF64::new(0.0),
+                effective_ask_limit: AtomicF64::new(0.0),
                 last_refresh_epoch_ms: AtomicU64::new(0),
                 local_max_position: AtomicF64::new(0.0),
             }),
@@ -393,8 +393,12 @@ impl ExchangePositionLimits {
         current_position: f64,
     ) -> (f64, bool, Option<String>) {
         if !self.is_initialized() {
-            // Not initialized - allow optimistically but warn
-            return (requested_size, false, None);
+            // Not initialized — block all orders until limits are fetched
+            return (
+                0.0,
+                true,
+                Some("Exchange limits not yet initialized".to_string()),
+            );
         }
 
         let available = if is_buy {
@@ -441,7 +445,10 @@ impl ExchangePositionLimits {
         current_position: f64,
     ) -> (bool, Option<String>) {
         if !self.is_initialized() {
-            return (false, None); // Can't check, allow optimistically
+            return (
+                true,
+                Some("Exchange limits not yet initialized".to_string()),
+            );
         }
 
         if is_buy {
@@ -526,8 +533,8 @@ impl ExchangePositionLimits {
         current_position: f64,
     ) -> Vec<bool> {
         if !self.is_initialized() {
-            // Not initialized - allow all optimistically
-            return vec![true; orders.len()];
+            // Not initialized — block all orders until limits are fetched
+            return vec![false; orders.len()];
         }
 
         let available_buy = self.inner.available_buy.load();
@@ -732,7 +739,13 @@ mod tests {
         let limits = ExchangePositionLimits::new();
         assert!(!limits.is_initialized());
         assert!(limits.is_stale());
-        assert_eq!(limits.effective_bid_limit(), f64::MAX);
+        // Conservative default: 0.0 blocks all orders until real limits are fetched
+        assert_eq!(limits.effective_bid_limit(), 0.0);
+        assert_eq!(limits.effective_ask_limit(), 0.0);
+        assert_eq!(limits.max_long(), 0.0);
+        assert_eq!(limits.max_short(), 0.0);
+        assert_eq!(limits.available_buy(), 0.0);
+        assert_eq!(limits.available_sell(), 0.0);
     }
 
     #[test]

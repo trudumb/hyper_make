@@ -80,34 +80,47 @@ pub struct PriorReadiness {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuoteOutcomeCheckpoint {
     /// Binned fill rate data: Vec of (lo_bps, hi_bps, fills, total) per bin
+    #[serde(default)]
     pub bins: Vec<(f64, f64, u64, u64)>,
 }
 
 /// Complete checkpoint bundle containing all model state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBundle {
+    #[serde(default)]
     pub metadata: CheckpointMetadata,
     /// LearnedParameters — already Serialize/Deserialize, ~20 Bayesian posteriors
+    #[serde(default)]
     pub learned_params: LearnedParameters,
     /// Pre-fill adverse selection classifier learning state
+    #[serde(default)]
     pub pre_fill: PreFillCheckpoint,
     /// Enhanced AS classifier learning state
+    #[serde(default)]
     pub enhanced: EnhancedCheckpoint,
     /// Volatility filter sufficient statistics
+    #[serde(default)]
     pub vol_filter: VolFilterCheckpoint,
     /// Regime HMM belief state + transition counts
+    #[serde(default)]
     pub regime_hmm: RegimeHMMCheckpoint,
     /// Informed flow mixture model parameters
+    #[serde(default)]
     pub informed_flow: InformedFlowCheckpoint,
     /// Fill rate model Bayesian regression posteriors
+    #[serde(default)]
     pub fill_rate: FillRateCheckpoint,
     /// BayesianKappaEstimator — own fills
+    #[serde(default)]
     pub kappa_own: KappaCheckpoint,
     /// BayesianKappaEstimator — bid fills
+    #[serde(default)]
     pub kappa_bid: KappaCheckpoint,
     /// BayesianKappaEstimator — ask fills
+    #[serde(default)]
     pub kappa_ask: KappaCheckpoint,
     /// Momentum model — continuation probabilities by magnitude
+    #[serde(default)]
     pub momentum: MomentumCheckpoint,
     /// Kelly win/loss tracker state for position sizing persistence
     #[serde(default)]
@@ -152,6 +165,17 @@ pub struct CheckpointMetadata {
     pub session_duration_s: f64,
 }
 
+impl Default for CheckpointMetadata {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            timestamp_ms: 0,
+            asset: String::new(),
+            session_duration_s: 0.0,
+        }
+    }
+}
+
 /// PreFillASClassifier learning state.
 ///
 /// Captures online learning weights and sufficient statistics.
@@ -159,14 +183,19 @@ pub struct CheckpointMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreFillCheckpoint {
     /// Learned signal weights [imbalance, flow, regime, funding, changepoint]
+    #[serde(default)]
     pub learned_weights: [f64; 5],
     /// Running sum of (signal_i * outcome) for each signal
+    #[serde(default)]
     pub signal_outcome_sum: [f64; 5],
     /// Running sum of signal_i^2 for each signal
+    #[serde(default)]
     pub signal_sq_sum: [f64; 5],
     /// Number of learning samples processed
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub learning_samples: usize,
     /// Regime probabilities for soft blending
+    #[serde(default)]
     pub regime_probs: [f64; 4],
 
     // === EWMA normalizer state (added for z-score normalization fix) ===
@@ -217,6 +246,10 @@ fn default_ewma_var() -> f64 {
 
 fn default_regime_trust() -> f64 {
     1.0
+}
+
+fn default_momentum_prior() -> f64 {
+    0.5
 }
 
 impl Default for PreFillCheckpoint {
@@ -385,18 +418,25 @@ impl Default for InformedFlowCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillRateCheckpoint {
     /// Posterior mean for base fill rate λ₀
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub lambda_0_mean: f64,
     /// Posterior variance for base fill rate λ₀
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub lambda_0_variance: f64,
     /// Effective observations for λ₀
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub lambda_0_n_obs: f64,
     /// Posterior mean for characteristic distance δ*
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub delta_char_mean: f64,
     /// Posterior variance for characteristic distance δ*
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub delta_char_variance: f64,
     /// Effective observations for δ*
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub delta_char_n_obs: f64,
     /// Total observations processed
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub observation_count: usize,
 }
 
@@ -421,16 +461,22 @@ impl Default for FillRateCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KappaCheckpoint {
     /// Prior/posterior shape parameter α
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub prior_alpha: f64,
     /// Prior/posterior rate parameter β
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub prior_beta: f64,
     /// Total observations
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub observation_count: usize,
     /// Sum of distances (Σδᵢ)
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub sum_distances: f64,
     /// Sum of squared distances (Σδᵢ²) for variance
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub sum_sq_distances: f64,
     /// Cached posterior mean κ̂ = α/β
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub kappa_posterior_mean: f64,
 }
 
@@ -454,10 +500,13 @@ impl Default for KappaCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MomentumCheckpoint {
     /// Continuation probability by magnitude bucket [0-10, 10-20, ..., 90+ bps]
+    #[serde(default)]
     pub continuation_by_magnitude: [f64; 10],
     /// Observation counts per magnitude bucket
+    #[serde(default)]
     pub counts_by_magnitude: [usize; 10],
     /// Prior probability of momentum continuation
+    #[serde(default = "default_momentum_prior", deserialize_with = "deserialize_f64_or_null")]
     pub prior_continuation: f64,
 }
 
@@ -478,14 +527,19 @@ impl Default for MomentumCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KellyTrackerCheckpoint {
     /// EWMA of win sizes (bps)
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub ewma_wins: f64,
     /// Count of wins
+    #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub n_wins: u64,
     /// EWMA of loss sizes (bps)
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub ewma_losses: f64,
     /// Count of losses
+    #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub n_losses: u64,
     /// EWMA decay factor
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub decay: f64,
 }
 
@@ -508,8 +562,10 @@ impl Default for KellyTrackerCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsembleWeightsCheckpoint {
     /// Softmax weights per model [GLFT, Empirical, Funding]
+    #[serde(default)]
     pub model_weights: Vec<f64>,
     /// Total weight updates performed
+    #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub total_updates: usize,
 }
 
@@ -553,18 +609,23 @@ impl Default for BaselineTrackerCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillSwitchCheckpoint {
     /// Whether the kill switch was triggered
+    #[serde(default)]
     pub triggered: bool,
     /// Reasons for triggering (may have multiple)
+    #[serde(default)]
     pub trigger_reasons: Vec<String>,
     /// Daily P&L at checkpoint time
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub daily_pnl: f64,
     /// Peak P&L for drawdown calculation
+    #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub peak_pnl: f64,
     /// Timestamp when kill switch was triggered (ms since epoch), 0 if not triggered
+    #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub triggered_at_ms: u64,
     /// Timestamp when checkpoint was saved (ms since epoch).
     /// Used to detect trading day boundaries and reset daily P&L on new day.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub saved_at_ms: u64,
 }
 
@@ -842,5 +903,61 @@ mod tests {
         );
         assert_eq!(restored.calibration_coordinator.fill_count(), 0);
         assert!(!restored.calibration_coordinator.is_seeded());
+    }
+
+    #[test]
+    fn test_checkpoint_bundle_from_empty_json() {
+        // An empty JSON object should deserialize successfully with all defaults
+        let restored: CheckpointBundle =
+            serde_json::from_str("{}").expect("deserialize from empty JSON");
+        assert_eq!(restored.metadata.version, 0);
+        assert_eq!(restored.metadata.asset, "");
+        assert_eq!(restored.pre_fill.learning_samples, 0);
+        assert_eq!(restored.vol_filter.observation_count, 0);
+        assert_eq!(restored.kappa_own.observation_count, 0);
+        assert_eq!(restored.fill_rate.observation_count, 0);
+        assert!(!restored.kill_switch.triggered);
+    }
+
+    #[test]
+    fn test_checkpoint_bundle_null_f64_fields() {
+        // Simulate JSON with null values for f64 fields — should not panic
+        let json = r#"{
+            "metadata": {"version": 1, "timestamp_ms": null, "asset": "ETH", "session_duration_s": null},
+            "fill_rate": {
+                "lambda_0_mean": null,
+                "lambda_0_variance": null,
+                "lambda_0_n_obs": null,
+                "delta_char_mean": null,
+                "delta_char_variance": null,
+                "delta_char_n_obs": null,
+                "observation_count": null
+            },
+            "kappa_own": {
+                "prior_alpha": null,
+                "prior_beta": null,
+                "observation_count": null,
+                "sum_distances": null,
+                "sum_sq_distances": null,
+                "kappa_posterior_mean": null
+            },
+            "kill_switch": {
+                "triggered": false,
+                "trigger_reasons": [],
+                "daily_pnl": null,
+                "peak_pnl": null,
+                "triggered_at_ms": null,
+                "saved_at_ms": null
+            }
+        }"#;
+        let restored: CheckpointBundle =
+            serde_json::from_str(json).expect("deserialize with null f64 fields");
+        assert_eq!(restored.metadata.timestamp_ms, 0);
+        assert_eq!(restored.metadata.session_duration_s, 0.0);
+        assert_eq!(restored.fill_rate.lambda_0_mean, 0.0);
+        assert_eq!(restored.fill_rate.observation_count, 0);
+        assert_eq!(restored.kappa_own.prior_alpha, 0.0);
+        assert_eq!(restored.kill_switch.daily_pnl, 0.0);
+        assert_eq!(restored.kill_switch.triggered_at_ms, 0);
     }
 }

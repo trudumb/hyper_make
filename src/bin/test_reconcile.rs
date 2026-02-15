@@ -59,7 +59,7 @@ fn test_low_volatility_behavior() {
     let targets = vec![target_level];
 
     let actions: Vec<LadderAction> =
-        priority_based_matching(&current, &targets, Side::Buy, &config, None);
+        priority_based_matching(&current, &targets, Side::Buy, &config, None, 4);
 
     info!("Actions for 20bps price move (Low Vol):");
     for action in &actions {
@@ -109,7 +109,7 @@ fn test_high_volatility_behavior() {
     let targets = vec![target_level];
 
     let actions: Vec<LadderAction> =
-        priority_based_matching(&current, &targets, Side::Buy, &config, None);
+        priority_based_matching(&current, &targets, Side::Buy, &config, None, 4);
 
     info!("Actions for 20bps price move (High Vol):");
     for action in &actions {

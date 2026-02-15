@@ -252,6 +252,10 @@ pub struct LadderParams {
     pub cached_best_bid: f64,
     /// Cached best ask from exchange BBO (derived from market_mid ± spread/2)
     pub cached_best_ask: f64,
+    /// Effective spread floor in bps (used as fallback when ladder is empty).
+    /// When own ladder depth is unknown (first cycle), the skew cap uses this
+    /// instead of the hardcoded 8 bps fallback.
+    pub effective_floor_bps: f64,
 }
 
 #[cfg(test)]
@@ -315,6 +319,7 @@ mod tests {
             warmup_pct: 1.0,
             cached_best_bid: 99.99,
             cached_best_ask: 100.01,
+            effective_floor_bps: 8.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -373,6 +378,7 @@ mod tests {
             warmup_pct: 1.0,
             cached_best_bid: 999.9,
             cached_best_ask: 1000.1,
+            effective_floor_bps: 8.0,
         };
 
         let params_long = LadderParams {
@@ -445,6 +451,7 @@ mod tests {
             warmup_pct: 1.0,
             cached_best_bid: 99.99,
             cached_best_ask: 100.01,
+            effective_floor_bps: 8.0,
         };
 
         let ladder = Ladder::generate(&config, &params);
@@ -508,6 +515,7 @@ mod tests {
             // Wide BBO so drift skew offset (15.79 bps) isn't capped by half-spread bound
             cached_best_bid: 99.80,
             cached_best_ask: 100.20,
+            effective_floor_bps: 8.0,
         };
 
         // Same params but WITHOUT drift adjustment

@@ -10,11 +10,13 @@ use super::spread_profile::SpreadProfile;
 
 /// Capital tier classification based on viable ladder levels per side.
 ///
-/// Determines how the system adapts quoting behavior to available capital.
-/// Tier boundaries are based on viable levels (each meeting exchange min_notional).
+/// Used for logging, metrics, and warmup bootstrapping. Does NOT drive code
+/// path selection — all tiers flow through the same GLFT pipeline in
+/// `generate_ladder()`, which naturally constrains level count via
+/// `capital_limited_levels`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapitalTier {
-    /// 1-2 viable levels/side — concentrated quoting, no multi-level ladder
+    /// 1-2 viable levels/side — standard pipeline produces 1-2 levels naturally
     Micro,
     /// 3-5 viable levels/side — reduced ladder, wider spreads compensate
     Small,

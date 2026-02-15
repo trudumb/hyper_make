@@ -16,6 +16,7 @@ use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
 use crate::market_maker::analytics::ToxicityInput;
+use crate::market_maker::config::{CapacityBudget, Viability};
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 use crate::market_maker::strategy::action_to_inventory_ratio;
 
@@ -64,7 +65,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Check warmup timeout: with informative Bayesian priors, we can safely
             // quote before all data thresholds are met. Spread floors and kill switches
             // provide protection. The estimator continues refining as data arrives.
-            let max_warmup = self.estimator.max_warmup_secs();
+            //
+            // Capital-tier-aware timeout: small accounts need shorter warmup to avoid
+            // the death spiral (no fills → no progress → wider spreads → no fills).
+            let base_warmup = self.estimator.max_warmup_secs();
+            let max_warmup = if self.effective_max_position > 0.0 && self.latest_mid > 0.0 {
+                // Quick tier estimate from position limits
+                let min_order_size = (MIN_ORDER_NOTIONAL / self.latest_mid).max(0.01);
+                let approx_levels = (self.effective_max_position / min_order_size)
+                    .floor() as usize / 2;
+                match approx_levels {
+                    0..=2 => base_warmup.min(10), // Micro: 10s max
+                    3..=5 => base_warmup.min(15), // Small: 15s max
+                    _ => base_warmup,
+                }
+            } else {
+                base_warmup
+            };
             let warmup_base = self.first_data_time.unwrap_or(self.session_start_time);
             let elapsed = warmup_base.elapsed();
             if max_warmup > 0 && elapsed >= std::time::Duration::from_secs(max_warmup) {
@@ -2268,6 +2285,59 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === CAPACITY BUDGET: Top-down viability check ===
+        // Computed once per cycle, flows through the entire pipeline.
+        // Uses exact ceiling math to determine if we can place minimum-notional orders.
+        let capacity_budget = CapacityBudget::compute(
+            market_params.account_value,
+            market_params.microprice,
+            MIN_ORDER_NOTIONAL,
+            self.config.sz_decimals,
+            self.effective_max_position,
+            self.position.position(),
+            kelly_adjusted_liquidity,
+        );
+
+        // THE CRITICAL FIX: Wire capital_tier + capacity_budget into market_params.
+        // Without this, market_params.capital_tier defaults to Large, causing
+        // select_mode step 6 to return Flat instead of Maker for small accounts.
+        market_params.capital_tier = capacity_budget.capital_tier;
+        market_params.capacity_budget = Some(capacity_budget.clone());
+
+        // Capital-tier-aware warmup bootstrap: small accounts get a warmup floor
+        // to prevent the death spiral (no fills → 10% warmup → inflated gamma → no fills).
+        // Bayesian priors give sufficient starting estimates for Micro/Small tiers.
+        {
+            use crate::market_maker::config::auto_derive::CapitalTier;
+            let warmup_floor = match capacity_budget.capital_tier {
+                CapitalTier::Micro => 0.40,  // Bayesian priors suffice
+                CapitalTier::Small => 0.25,
+                _ => 0.0,
+            };
+            if warmup_floor > 0.0 {
+                market_params.adaptive_warmup_progress =
+                    market_params.adaptive_warmup_progress.max(warmup_floor);
+            }
+        }
+
+        if !capacity_budget.should_quote() {
+            if let Viability::NotViable { ref reason, min_capital_needed_usd } = capacity_budget.viability {
+                // Throttle log to avoid spam: log on first occurrence then every ~30s
+                // (using seconds-based check since there's no cycle counter on MarketMaker)
+                let now_sec = chrono::Utc::now().timestamp();
+                if now_sec % 30 == 0 {
+                    tracing::warn!(
+                        reason = %reason,
+                        min_capital_usd = %format!("{:.2}", min_capital_needed_usd),
+                        account_value = %format!("{:.2}", market_params.account_value),
+                        mark_px = %format!("{:.2}", market_params.microprice),
+                        "CAPACITY NOT VIABLE: cannot place minimum orders, idling"
+                    );
+                }
+                return Ok(());
+            }
+        }
+
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
         let ladder = self.strategy.calculate_ladder(
@@ -2278,6 +2348,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             &market_params,
         );
 
+        // Post-condition: if capacity said viable but ladder is empty, something is wrong
+        if capacity_budget.should_quote() && ladder.is_empty() {
+            tracing::error!(
+                viability = ?capacity_budget.viability,
+                quantum_min = %format!("{:.6}", capacity_budget.quantum.min_viable_size),
+                bid_capacity = %format!("{:.6}", capacity_budget.bid_capacity),
+                ask_capacity = %format!("{:.6}", capacity_budget.ask_capacity),
+                effective_max = %format!("{:.6}", capacity_budget.effective_max_position),
+                target_liquidity = %format!("{:.6}", kelly_adjusted_liquidity),
+                "CAPACITY INVARIANT VIOLATED: viable budget but empty ladder"
+            );
+        }
+
         // Update kill switch with ladder depth for position runaway detection.
         // Uses the larger side so the threshold reflects maximum one-sided exposure.
         let max_one_side = ladder.total_ask_size().max(ladder.total_bid_size());
@@ -2287,22 +2370,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Replaces QuoteGate side-masking (Phase 4) and hardcoded toxicity filter (Phase 3).
         let execution_mode = {
             use crate::market_maker::execution::{select_mode, ModeSelectionInput};
+            // FIX: Evaluate QueueValue at GLFT-optimal depth (where we'll actually quote),
+            // not BBO half-spread. With $100 HYPE, BBO spread ≈ 4 bps → half = 2 bps,
+            // but QueueValue(2.0, Normal, 0.0) = 2 - 3 - 0 - 1.5 = -2.5 → false.
+            // At GLFT depth (5 bps): QueueValue(5.0, Normal, 0.0) = 5 - 3 - 0 - 1.5 = 0.5 → true.
+            let evaluation_depth_bps = capacity_budget.min_viable_depth_bps
+                .max(feature_snapshot.spread_bps / 2.0);
             let input = ModeSelectionInput {
                 position_zone: position_assessment.zone,
                 toxicity_regime: current_toxicity_regime,
                 bid_has_value: self.queue_value_heuristic.should_quote(
-                    feature_snapshot.spread_bps / 2.0,
+                    evaluation_depth_bps,
                     current_toxicity_regime,
                     feature_snapshot.queue_rank_bid,
                 ),
                 ask_has_value: self.queue_value_heuristic.should_quote(
-                    feature_snapshot.spread_bps / 2.0,
+                    evaluation_depth_bps,
                     current_toxicity_regime,
                     feature_snapshot.queue_rank_ask,
                 ),
                 has_alpha: signals.lead_lag_actionable
                     || self.stochastic.signal_integrator.has_cusum_divergence(),
                 position: self.position.position(),
+                capital_tier: market_params.capital_tier,
             };
             select_mode(&input)
         };
@@ -2532,13 +2622,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
-            // === GRADUATED EMERGENCY PULL ===
-            // Instead of binary all-or-nothing, use graduated urgency (0.0-1.0):
-            //   Low (>0, <=0.4):    Halve sizes on increasing side
-            //   Medium (>0.4, <=0.7): Keep only innermost level
-            //   High (>0.7):        Full clear of increasing side
-            // Hysteresis: once active, stays active until momentum drops below exit threshold.
-            // Thresholds are spread-proportional: momentum must exceed 1.5x half-spread to trigger.
+            // === CONTINUOUS INVENTORY PRESSURE ===
+            // Smooth function of inventory fraction and momentum, no hysteresis state.
+            // Both conditions must be present (product + sqrt). Pressure [0,1] scales
+            // increasing-side sizes by (1 - pressure), preventing death spirals.
             {
                 let pos = self.position.position();
                 let inventory_frac = if self.effective_max_position > 1e-10 {
@@ -2551,16 +2638,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let quoted_half_spread_bps =
                     (market_params.adaptive_spread_floor * 10_000.0).max(3.0);
 
-                // Compute pull urgency (0.0-1.0) with hysteresis
-                let pull_urgency = compute_pull_urgency(
+                // Compute continuous inventory pressure (0.0-1.0), no hysteresis state
+                let pressure = compute_continuous_inventory_pressure(
                     drift_adjusted_skew.is_opposed,
                     inventory_frac,
                     momentum_abs,
                     quoted_half_spread_bps,
-                    &mut self.infra.emergency_pull_active,
                 );
 
-                if pull_urgency > 0.0 {
+                if pressure > 0.01 {
                     let (increasing_quotes, label) = if pos > 0.0 {
                         (&mut bid_quotes, "BID")
                     } else {
@@ -2568,42 +2654,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     };
 
                     if !increasing_quotes.is_empty() {
-                        if pull_urgency > 0.7 {
-                            // High: full clear
-                            info!(
-                                urgency = "high",
-                                side = label,
-                                cleared = increasing_quotes.len(),
-                                inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
-                                momentum_bps = %format!("{:.1}", momentum_abs),
-                                "Emergency FULL pull"
-                            );
-                            increasing_quotes.clear();
-                        } else if pull_urgency > 0.4 {
-                            // Medium: keep only innermost level
-                            let inner = increasing_quotes[0];
-                            increasing_quotes.clear();
-                            increasing_quotes.push(inner);
-                            info!(
-                                urgency = "medium",
-                                side = label,
-                                inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
-                                momentum_bps = %format!("{:.1}", momentum_abs),
-                                "Emergency pull: kept 1 inner level"
-                            );
-                        } else {
-                            // Low: reduce sizes by 50%
-                            for q in increasing_quotes.iter_mut() {
-                                q.size *= 0.5;
-                            }
-                            info!(
-                                urgency = "low",
-                                side = label,
-                                inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
-                                momentum_bps = %format!("{:.1}", momentum_abs),
-                                "Emergency pull: halved sizes"
-                            );
+                        let size_mult = 1.0 - pressure;
+                        for q in increasing_quotes.iter_mut() {
+                            q.size *= size_mult;
                         }
+                        increasing_quotes.retain(|q| q.size > 0.0);
+                        info!(
+                            side = label,
+                            size_mult = %format!("{:.2}", size_mult),
+                            pressure = %format!("{:.2}", pressure),
+                            inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
+                            momentum_bps = %format!("{:.1}", momentum_abs),
+                            "Inventory pressure: size_mult={:.2}", size_mult
+                        );
                     }
                 }
             }
@@ -3009,47 +3072,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     }
 }
 
-/// Compute graduated emergency pull urgency (0.0-1.0) with hysteresis.
+/// Compute continuous inventory pressure as a smooth function of inventory and momentum.
 ///
-/// Returns 0.0 when no pull is needed. The `pull_active` flag provides hysteresis:
-/// once triggered, it stays active until momentum drops below 7 bps, preventing
-/// rapid on/off oscillation near the boundary.
+/// Returns 0.0 (no pressure) to 1.0 (full clear). Both inventory risk AND adverse
+/// momentum must be present — the product ensures neither alone triggers action.
+/// The sqrt smooths the pressure surface so small increases in either input produce
+/// proportional (not explosive) responses.
 ///
-/// Urgency tiers:
-///   - Low   (0.0 < u <= 0.4): halve increasing-side sizes
-///   - Medium (0.4 < u <= 0.7): keep only innermost level
-///   - High  (0.7 < u <= 1.0): full clear of increasing side
-fn compute_pull_urgency(
+/// Replaces the discrete trigger + hysteresis system that caused death spirals:
+/// at medium urgency (0.3), only 1 bid survived → only asks filled → position
+/// increased → urgency increased → bids fully cleared.
+fn compute_continuous_inventory_pressure(
     is_opposed: bool,
     inventory_frac: f64,
     momentum_abs_bps: f64,
     quoted_half_spread_bps: f64,
-    pull_active: &mut bool,
 ) -> f64 {
-    // Spread-proportional thresholds: momentum must significantly exceed our quoted spread
-    // to justify emergency action. With tight spreads (3 bps), entry = 5 bps.
-    // With wide spreads (20 bps), entry = 30 bps.
-    let momentum_entry_bps = (quoted_half_spread_bps * 1.5).max(5.0);
-    let momentum_exit_bps = momentum_entry_bps * 0.7; // 70% of entry for hysteresis
-    const INVENTORY_ENTRY_THRESHOLD: f64 = 0.4; // Raised from 0.3 to reduce over-triggering
-    const HYSTERESIS_URGENCY: f64 = 0.3;
-
-    if !is_opposed || inventory_frac < INVENTORY_ENTRY_THRESHOLD || momentum_abs_bps < momentum_entry_bps {
-        // Below trigger thresholds — check hysteresis off-ramp
-        if *pull_active && momentum_abs_bps < momentum_exit_bps {
-            *pull_active = false;
-        }
-        if *pull_active {
-            HYSTERESIS_URGENCY
-        } else {
-            0.0
-        }
-    } else {
-        *pull_active = true;
-        let inv_component = ((inventory_frac - 0.4) / 0.3).clamp(0.0, 1.0);
-        let mom_component = ((momentum_abs_bps - momentum_entry_bps) / (momentum_entry_bps * 1.5)).clamp(0.0, 1.0);
-        (inv_component * 0.5 + mom_component * 0.5).clamp(0.0, 1.0)
+    if !is_opposed {
+        return 0.0;
     }
+
+    // Inventory component: smooth ramp starting at 30%, full at 100%
+    let inv = ((inventory_frac - 0.3) / 0.7).clamp(0.0, 1.0);
+
+    // Momentum component: normalized by our spread (momentum relative to our exposure)
+    let mom = (momentum_abs_bps / quoted_half_spread_bps.max(1.0))
+        .clamp(0.0, 3.0)
+        / 3.0;
+
+    // Product: both conditions must be present. sqrt smooths the surface.
+    (inv * mom).sqrt().clamp(0.0, 1.0)
 }
 
 /// Compute tick size in basis points from Hyperliquid's 5-significant-figure pricing.
@@ -3075,24 +3127,21 @@ fn compute_tick_size_bps(mid_price: f64) -> f64 {
     (tick_size / mid_price * 10_000.0).max(0.01)
 }
 
-/// Apply graduated emergency pull to the increasing-side quotes.
+/// Apply continuous inventory pressure to the increasing-side quotes.
 ///
-/// This is a standalone helper for testability. It modifies `increasing_quotes`
-/// in place based on `pull_urgency`.
+/// Smoothly reduces sizes by `(1 - pressure)`. At pressure=0 quotes are untouched,
+/// at pressure=1 all sizes go to zero and are removed. This replaces the discrete
+/// tier system (halve / keep-one / clear) that caused death spirals.
 #[cfg(test)]
-fn apply_emergency_pull(pull_urgency: f64, increasing_quotes: &mut Vec<Quote>) {
-    if pull_urgency > 0.7 {
-        increasing_quotes.clear();
-    } else if pull_urgency > 0.4 {
-        if let Some(inner) = increasing_quotes.first().cloned() {
-            increasing_quotes.clear();
-            increasing_quotes.push(inner);
-        }
-    } else if pull_urgency > 0.0 {
-        for q in increasing_quotes.iter_mut() {
-            q.size *= 0.5;
-        }
+fn apply_inventory_pressure(pressure: f64, increasing_quotes: &mut Vec<Quote>) {
+    if pressure < 0.01 {
+        return;
     }
+    let size_mult = 1.0 - pressure;
+    for q in increasing_quotes.iter_mut() {
+        q.size *= size_mult;
+    }
+    increasing_quotes.retain(|q| q.size > 0.0);
 }
 
 /// Apply risk-level emergency filter to bid and ask quote vectors.
@@ -3140,141 +3189,178 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------
-    // Test 1: Graduated urgency — low inventory + moderate momentum
-    //         → partial size reduction (low urgency), not full clear
+    // Test 1: Continuous pressure — monotonic in inventory_frac
     // ---------------------------------------------------------------
     #[test]
-    fn test_graduated_urgency_low_halves_sizes() {
-        let mut active = false;
-        // With spread=5.0: entry=7.5 bps, inv threshold=0.4
-        // inventory_frac=0.45 (just above 0.4), momentum=12 (above 7.5)
-        let urgency = compute_pull_urgency(true, 0.45, 12.0, 5.0, &mut active);
-        // inv_component = (0.45-0.4)/0.3 = 0.167
-        // mom_component = (12-7.5)/11.25 = 0.4
-        // urgency = 0.167*0.5 + 0.4*0.5 = 0.283
-        assert!(urgency > 0.0 && urgency <= 0.4, "Expected low urgency, got {urgency}");
-        assert!(active, "Should activate pull");
+    fn test_pressure_monotonic_in_inventory() {
+        let spread = 5.0;
+        let momentum = 10.0;
+        let mut prev = 0.0_f64;
+        // Pressure should be non-decreasing as inventory increases
+        for i in 0..=100 {
+            let inv = i as f64 / 100.0;
+            let p = compute_continuous_inventory_pressure(true, inv, momentum, spread);
+            assert!(
+                p >= prev - 1e-10,
+                "Pressure should be monotonic: at inv={inv}, p={p} < prev={prev}"
+            );
+            prev = p;
+        }
+        // Should be near-zero at low inventory, significant at high
+        let p_low = compute_continuous_inventory_pressure(true, 0.1, momentum, spread);
+        let p_high = compute_continuous_inventory_pressure(true, 0.9, momentum, spread);
+        assert!(p_low < 0.1, "Low inventory should yield low pressure, got {p_low}");
+        assert!(p_high > 0.3, "High inventory should yield high pressure, got {p_high}");
+    }
 
-        // Apply to quotes: should halve sizes, not clear
+    // ---------------------------------------------------------------
+    // Test 2: Continuous pressure — monotonic in momentum
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_pressure_monotonic_in_momentum() {
+        let spread = 5.0;
+        let inv = 0.6;
+        let mut prev = 0.0_f64;
+        for m in 0..=50 {
+            let momentum = m as f64;
+            let p = compute_continuous_inventory_pressure(true, inv, momentum, spread);
+            assert!(
+                p >= prev - 1e-10,
+                "Pressure should be monotonic: at mom={momentum}, p={p} < prev={prev}"
+            );
+            prev = p;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Test 3: No pressure when not opposed
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_no_pressure_when_not_opposed() {
+        // Even extreme inventory + momentum should produce zero pressure
+        let p = compute_continuous_inventory_pressure(false, 0.99, 100.0, 5.0);
+        assert!(
+            (p - 0.0).abs() < 1e-10,
+            "Pressure should be 0.0 when not opposed, got {p}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 4: Low risk produces near-zero pressure
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_low_risk_near_zero_pressure() {
+        // inventory below 30% threshold: inv component = 0, so product = 0
+        let p = compute_continuous_inventory_pressure(true, 0.2, 5.0, 5.0);
+        assert!(
+            p < 0.01,
+            "Below 30% inventory should yield near-zero pressure, got {p}"
+        );
+
+        // Zero momentum: mom component = 0, so product = 0
+        let p2 = compute_continuous_inventory_pressure(true, 0.8, 0.0, 5.0);
+        assert!(
+            p2 < 0.01,
+            "Zero momentum should yield near-zero pressure, got {p2}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 5: High risk produces near-one pressure
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_high_risk_near_one_pressure() {
+        // Full inventory (1.0) + momentum = 3x spread → both components maxed
+        // inv = (1.0 - 0.3) / 0.7 = 1.0
+        // mom = (15.0 / 5.0).clamp(0, 3) / 3.0 = 1.0
+        // pressure = sqrt(1.0 * 1.0) = 1.0
+        let p = compute_continuous_inventory_pressure(true, 1.0, 15.0, 5.0);
+        assert!(
+            (p - 1.0).abs() < 1e-10,
+            "Full inventory + 3x spread momentum should yield 1.0, got {p}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 6: Smooth size reduction via apply_inventory_pressure
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_apply_inventory_pressure_smooth() {
+        // Moderate pressure should reduce sizes proportionally
         let mut quotes = vec![
             Quote::new(100.0, 1.0),
             Quote::new(99.0, 2.0),
             Quote::new(98.0, 3.0),
         ];
-        apply_emergency_pull(urgency, &mut quotes);
-        assert_eq!(quotes.len(), 3, "All levels should remain");
-        assert!((quotes[0].size - 0.5).abs() < 1e-10, "Size should be halved");
-        assert!((quotes[1].size - 1.0).abs() < 1e-10, "Size should be halved");
-        assert!((quotes[2].size - 1.5).abs() < 1e-10, "Size should be halved");
+        apply_inventory_pressure(0.4, &mut quotes);
+        assert_eq!(quotes.len(), 3, "All levels should remain at moderate pressure");
+        assert!((quotes[0].size - 0.6).abs() < 1e-10, "Size should be * 0.6");
+        assert!((quotes[1].size - 1.2).abs() < 1e-10, "Size should be * 0.6");
+        assert!((quotes[2].size - 1.8).abs() < 1e-10, "Size should be * 0.6");
     }
 
     // ---------------------------------------------------------------
-    // Test 2: Hysteresis off-ramp — once triggered, stays active
-    //         until momentum drops below 7 bps
+    // Test 7: Full pressure clears all quotes
     // ---------------------------------------------------------------
     #[test]
-    fn test_hysteresis_off_ramp() {
-        let mut active = false;
-
-        // With spread=5.0: entry=7.5 bps, exit=5.25 bps, inv threshold=0.4
-        // Step 1: Trigger the pull (inv=0.6 > 0.4, momentum=20 > 7.5)
-        let u1 = compute_pull_urgency(true, 0.6, 20.0, 5.0, &mut active);
-        assert!(u1 > 0.0, "Should trigger");
-        assert!(active, "Should be active");
-
-        // Step 2: Momentum drops below entry (7.5) but above exit (5.25) → hysteresis
-        let u2 = compute_pull_urgency(true, 0.6, 6.0, 5.0, &mut active);
-        assert!(active, "Should stay active (6.0 > 5.25 exit threshold)");
-        assert!((u2 - 0.3).abs() < 1e-10, "Should return hysteresis urgency 0.3");
-
-        // Step 3: Momentum drops below exit threshold (5.25)
-        let u3 = compute_pull_urgency(true, 0.6, 4.0, 5.0, &mut active);
-        assert!(!active, "Should deactivate (4.0 < 5.25)");
-        assert!((u3 - 0.0).abs() < 1e-10, "Should return 0.0");
+    fn test_apply_inventory_pressure_full_clears() {
+        let mut quotes = vec![
+            Quote::new(100.0, 1.0),
+            Quote::new(99.0, 2.0),
+        ];
+        apply_inventory_pressure(1.0, &mut quotes);
+        assert!(quotes.is_empty(), "Pressure=1.0 should clear all quotes");
     }
 
     // ---------------------------------------------------------------
-    // Test 3: Preserves closing side — only increases side affected.
-    //         When position > 0 (long), increasing side is bids.
-    //         Ask quotes (closing side) should be untouched.
+    // Test 8: Negligible pressure leaves quotes untouched
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_apply_inventory_pressure_negligible() {
+        let mut quotes = vec![Quote::new(100.0, 1.0), Quote::new(99.0, 2.0)];
+        apply_inventory_pressure(0.005, &mut quotes);
+        assert_eq!(quotes.len(), 2, "Below 0.01 threshold should not modify");
+        assert!((quotes[0].size - 1.0).abs() < 1e-10, "Size unchanged");
+        assert!((quotes[1].size - 2.0).abs() < 1e-10, "Size unchanged");
+    }
+
+    // ---------------------------------------------------------------
+    // Test 9: Preserves closing side — only increasing side affected
     // ---------------------------------------------------------------
     #[test]
     fn test_preserves_closing_side() {
-        let mut active = false;
-        // High urgency to trigger full clear (spread=5.0: entry=7.5)
-        let urgency = compute_pull_urgency(true, 0.8, 30.0, 5.0, &mut active);
-        assert!(urgency > 0.7, "Should be high urgency");
+        let pressure = compute_continuous_inventory_pressure(true, 0.9, 15.0, 5.0);
+        assert!(pressure > 0.5, "Should have significant pressure");
 
         let mut bids = vec![Quote::new(100.0, 1.0), Quote::new(99.0, 2.0)];
         let asks = vec![Quote::new(101.0, 1.0), Quote::new(102.0, 2.0)];
 
         // For long position: increasing side = bids
-        apply_emergency_pull(urgency, &mut bids);
-        // Closing side (asks) is never passed to apply_emergency_pull
-        // so asks remain untouched
+        apply_inventory_pressure(pressure, &mut bids);
+        // Closing side (asks) is never passed to apply_inventory_pressure
 
-        assert!(bids.is_empty(), "Bids (increasing) should be cleared");
+        // Bids should be reduced (may be empty at very high pressure)
+        assert!(
+            bids.iter().all(|q| q.size < 1.0),
+            "Bid sizes should be reduced"
+        );
         assert_eq!(asks.len(), 2, "Asks (closing) should be untouched");
         assert!((asks[0].size - 1.0).abs() < 1e-10);
         assert!((asks[1].size - 2.0).abs() < 1e-10);
     }
 
     // ---------------------------------------------------------------
-    // Test 4: Full clear at high urgency — extreme inventory or
-    //         momentum triggers complete pull
+    // Test 10: No state — same inputs always produce same output
     // ---------------------------------------------------------------
     #[test]
-    fn test_full_clear_at_high_urgency() {
-        let mut active = false;
-        // With spread=5.0: entry=7.5
-        // inv_frac = 0.7 → inv_component = (0.7-0.4)/0.3 = 1.0
-        // momentum = 25 bps → mom_component = (25-7.5)/11.25 = 1.0 (clamped)
-        // urgency = 1.0*0.5 + 1.0*0.5 = 1.0
-        let urgency = compute_pull_urgency(true, 0.7, 25.0, 5.0, &mut active);
-        assert!(urgency > 0.7, "Expected high urgency, got {urgency}");
-        assert!(active);
-
-        let mut quotes = vec![
-            Quote::new(100.0, 1.0),
-            Quote::new(99.0, 2.0),
-            Quote::new(98.0, 3.0),
-        ];
-        apply_emergency_pull(urgency, &mut quotes);
-        assert!(quotes.is_empty(), "All quotes should be cleared at high urgency");
-    }
-
-    // ---------------------------------------------------------------
-    // Test: Medium urgency — keeps only innermost level
-    // ---------------------------------------------------------------
-    #[test]
-    fn test_medium_urgency_keeps_inner_level() {
-        let mut active = false;
-        // With spread=5.0: entry=7.5
-        // inv_frac = 0.5 → inv_component = (0.5-0.4)/0.3 = 0.333
-        // momentum = 14 bps → mom_component = (14-7.5)/11.25 = 0.578
-        // urgency = 0.333*0.5 + 0.578*0.5 = 0.455
-        let urgency = compute_pull_urgency(true, 0.5, 14.0, 5.0, &mut active);
-        assert!(urgency > 0.4 && urgency <= 0.7, "Expected medium urgency, got {urgency}");
-
-        let mut quotes = vec![
-            Quote::new(100.0, 1.0),
-            Quote::new(99.0, 2.0),
-            Quote::new(98.0, 3.0),
-        ];
-        apply_emergency_pull(urgency, &mut quotes);
-        assert_eq!(quotes.len(), 1, "Should keep only innermost level");
-        assert!((quotes[0].price - 100.0).abs() < 1e-10, "Should keep first (innermost) quote");
-    }
-
-    // ---------------------------------------------------------------
-    // Test: No pull when not opposed
-    // ---------------------------------------------------------------
-    #[test]
-    fn test_no_pull_when_not_opposed() {
-        let mut active = false;
-        let urgency = compute_pull_urgency(false, 0.9, 50.0, 5.0, &mut active);
-        assert!((urgency - 0.0).abs() < 1e-10, "No pull when not opposed");
-        assert!(!active, "Should not activate");
+    fn test_pressure_is_stateless() {
+        // Unlike the old hysteresis system, identical inputs always yield identical output
+        let p1 = compute_continuous_inventory_pressure(true, 0.6, 10.0, 5.0);
+        let p2 = compute_continuous_inventory_pressure(true, 0.6, 10.0, 5.0);
+        assert!(
+            (p1 - p2).abs() < 1e-15,
+            "Stateless function must return identical values: {p1} vs {p2}"
+        );
     }
 
     // ---------------------------------------------------------------

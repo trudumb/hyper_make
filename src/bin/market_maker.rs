@@ -1519,6 +1519,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     warn!("--force: proceeding despite insufficient capital");
                 }
 
+                // 3b. Capacity diagnostic at startup
+                info!(
+                    capital_tier = ?derived.capital_profile.tier,
+                    viable_levels = derived.capital_profile.viable_levels_per_side,
+                    min_viable_position = %format!("{:.4}", derived.capital_profile.min_viable_position),
+                    notional_per_side_usd = %format!("${:.2}", derived.capital_profile.notional_per_side_usd),
+                    min_notional_usd = %format!("${:.2}", derived.capital_profile.min_notional_usd),
+                    "Capacity diagnostic"
+                );
+
                 // 4. Apply overrides (explicit config/CLI values take priority over derived)
                 let risk_aversion = risk_aversion_override.unwrap_or(derived.risk_aversion);
                 let max_bps_diff = max_bps_diff_override.unwrap_or(derived.max_bps_diff);

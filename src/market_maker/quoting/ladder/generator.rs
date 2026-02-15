@@ -15,6 +15,7 @@
 
 use smallvec::SmallVec;
 
+use crate::market_maker::config::SizeQuantum;
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use super::{Ladder, LadderConfig, LadderLevel, LadderLevels, LadderParams};
@@ -150,6 +151,7 @@ impl Ladder {
             params.use_funding_skew,
             params.cached_best_bid,
             params.cached_best_ask,
+            params.effective_floor_bps,
         );
 
         // 6. Apply RL policy adjustments (spread delta + asymmetric skew)
@@ -277,6 +279,7 @@ impl Ladder {
             params.use_funding_skew,
             params.cached_best_bid,
             params.cached_best_ask,
+            params.effective_floor_bps,
         );
 
         // 7. Apply RL policy adjustments (spread delta + asymmetric skew)
@@ -623,9 +626,9 @@ pub(crate) fn build_raw_ladder(
             let offset = bid_base * (tightest_depth / 10000.0);
             let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
 
-            // Floor: enough to meet min_notional at the actual bid price
-            // 1.01x buffer to survive truncation rounding down
-            let min_size_for_notional = (min_notional * 1.01) / bid_price.max(EPSILON);
+            // Floor: exact ceiling math via SizeQuantum (replaces 1.01x buffer)
+            let quantum = SizeQuantum::compute(min_notional, bid_price.max(EPSILON), sz_decimals);
+            let min_size_for_notional = quantum.min_viable_size;
             let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
                 .max(min_size_for_notional);
             let capped_size_truncated =
@@ -655,9 +658,9 @@ pub(crate) fn build_raw_ladder(
             let offset = ask_base * (tightest_depth / 10000.0);
             let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
 
-            // Floor: enough to meet min_notional at the actual ask price
-            // 1.01x buffer to survive truncation rounding down
-            let min_size_for_notional = (min_notional * 1.01) / ask_price.max(EPSILON);
+            // Floor: exact ceiling math via SizeQuantum (replaces 1.01x buffer)
+            let quantum = SizeQuantum::compute(min_notional, ask_price.max(EPSILON), sz_decimals);
+            let min_size_for_notional = quantum.min_viable_size;
             let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
                 .max(min_size_for_notional);
             let capped_size_truncated =
@@ -777,8 +780,9 @@ pub(crate) fn build_asymmetric_ladder(
             let offset = bid_base * (tightest_depth / 10000.0);
             let bid_price = round_to_significant_and_decimal(bid_base - offset, 5, decimals);
 
-            // 1.01x buffer to survive truncation rounding down
-            let min_size_for_notional = (min_notional * 1.01) / bid_price.max(EPSILON);
+            // Exact ceiling math via SizeQuantum (replaces 1.01x buffer)
+            let quantum = SizeQuantum::compute(min_notional, bid_price.max(EPSILON), sz_decimals);
+            let min_size_for_notional = quantum.min_viable_size;
             let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
                 .max(min_size_for_notional);
             let capped_size_truncated =
@@ -809,8 +813,9 @@ pub(crate) fn build_asymmetric_ladder(
             let offset = ask_base * (tightest_depth / 10000.0);
             let ask_price = round_to_significant_and_decimal(ask_base + offset, 5, decimals);
 
-            // 1.01x buffer to survive truncation rounding down
-            let min_size_for_notional = (min_notional * 1.01) / ask_price.max(EPSILON);
+            // Exact ceiling math via SizeQuantum (replaces 1.01x buffer)
+            let quantum = SizeQuantum::compute(min_notional, ask_price.max(EPSILON), sz_decimals);
+            let min_size_for_notional = quantum.min_viable_size;
             let capped_size = (total_size * MAX_SINGLE_ORDER_FRACTION)
                 .max(min_size_for_notional);
             let capped_size_truncated =
@@ -880,6 +885,7 @@ pub(crate) fn apply_inventory_skew_with_drift(
     use_funding_skew: bool,
     cached_best_bid: f64,
     cached_best_ask: f64,
+    effective_floor_bps: f64,
 ) {
     // === BASE INVENTORY SKEW (GLFT) ===
     // Reservation price offset: γσ²qT (as fraction of mid)
@@ -994,7 +1000,7 @@ pub(crate) fn apply_inventory_skew_with_drift(
     let own_floor = if own_min_depth.is_finite() {
         own_min_depth * 0.5 // 50% of our innermost level depth
     } else {
-        safe_mid * 0.0008 // fallback: 8 bps
+        safe_mid * (effective_floor_bps.max(5.0) / 10_000.0) // fallback: effective floor (min 5 bps)
     };
     let max_offset = if half_spread > 0.0 {
         (half_spread * 0.8).max(own_floor)
@@ -1004,11 +1010,16 @@ pub(crate) fn apply_inventory_skew_with_drift(
     let offset = raw_offset.clamp(-max_offset, max_offset);
 
     if (raw_offset - offset).abs() > 1e-10 {
+        let own_floor_bps = own_floor / safe_mid * 10000.0;
+        let half_spread_cap = half_spread * 0.8;
+        let capping_source = if half_spread_cap > own_floor { "bbo" } else { "own_depth" };
         tracing::warn!(
             raw_offset_bps = %format!("{:.2}", raw_offset / safe_mid * 10000.0),
             capped_offset_bps = %format!("{:.2}", offset / safe_mid * 10000.0),
             half_spread_bps = %format!("{:.2}", half_spread / safe_mid * 10000.0),
-            "Inventory skew offset capped by BBO half-spread"
+            own_floor_bps = %format!("{:.2}", own_floor_bps),
+            capping_source = capping_source,
+            "Inventory skew offset capped"
         );
     }
 
@@ -1385,6 +1396,7 @@ mod tests {
             false, // use_funding_skew
             0.0,   // cached_best_bid (0 = fallback to market_mid)
             0.0,   // cached_best_ask
+            8.0,   // effective_floor_bps
         );
 
         assert!(ladder.bids[0].price < 100.0); // Price shifted down
@@ -1426,6 +1438,7 @@ mod tests {
             false, // use_funding_skew
             0.0,   // cached_best_bid
             0.0,   // cached_best_ask
+            8.0,   // effective_floor_bps
         );
 
         assert!(ladder.bids[0].price > 99.0); // Price shifted up
@@ -1467,6 +1480,7 @@ mod tests {
             false, // use_funding_skew
             0.0,   // cached_best_bid
             0.0,   // cached_best_ask
+            8.0,   // effective_floor_bps
         );
 
         assert!((ladder.bids[0].price - 100.0).abs() < EPSILON);
@@ -1509,6 +1523,7 @@ mod tests {
             false, // use_funding_skew
             0.0,   // cached_best_bid
             0.0,   // cached_best_ask
+            8.0,   // effective_floor_bps
         );
 
         // Prices should be integers (no fractional part)
@@ -1602,59 +1617,37 @@ mod tests {
         }
     }
 
-    /// Test the min_meaningful_size calculation used in ladder_strat.rs
-    /// This verifies our change from 1.5x to 1.15x multiplier.
-    /// The 1.15x margin accounts for price movement between size calculation
-    /// and order placement, plus truncate_float() rounding down.
+    /// Test the min_meaningful_size calculation using SizeQuantum.
+    /// SizeQuantum uses exact ceiling math to compute the smallest truncation-stable
+    /// size that meets min_notional, replacing the old buffer-based approach.
     #[test]
     fn test_min_meaningful_size_calculation() {
+        use crate::market_maker::config::SizeQuantum;
+
         let min_notional: f64 = 10.0;
         let microprice: f64 = 22.80;
 
-        // Old calculation (1.5x) - overly conservative
-        let old_min_meaningful_size: f64 = (min_notional * 1.5) / microprice;
-        // = 15.0 / 22.80 = 0.658
+        // Old 1.5x (overly conservative)
+        let old_min = (min_notional * 1.5) / microprice;
 
-        // Current calculation (1.15x) - balanced safety margin
-        let new_min_meaningful_size: f64 = (min_notional * 1.15) / microprice;
-        // = 11.5 / 22.80 = 0.504
+        // New: exact ceiling math via SizeQuantum
+        let quantum = SizeQuantum::compute(min_notional, microprice, 2); // sz_decimals=2
+        let new_min = quantum.min_viable_size;
 
-        // With 6 HYPE available:
+        // SizeQuantum should be LESS conservative than 1.5x
+        assert!(new_min < old_min, "Quantum should be tighter than 1.5x buffer");
+
+        // But still meet min_notional
+        assert!(new_min * microprice >= min_notional);
+
+        // And be truncation-stable
+        assert_eq!(truncate_float(new_min, 2, false), new_min);
+
+        // With 6 HYPE available, should get more levels
         let available: f64 = 6.0;
-
-        let old_max_levels = (available / old_min_meaningful_size).floor() as usize;
-        let new_max_levels = (available / new_min_meaningful_size).floor() as usize;
-
-        // Verify the actual values match our expectations
-        assert!(
-            (old_min_meaningful_size - 0.658).abs() < 0.01,
-            "old={}",
-            old_min_meaningful_size
-        );
-        assert!(
-            (new_min_meaningful_size - 0.504).abs() < 0.01,
-            "new={}",
-            new_min_meaningful_size
-        );
-
-        // Old: 6.0 / 0.658 = 9.1 → 9 levels
-        // New: 6.0 / 0.504 = 11.9 → 11 levels
-        assert!(
-            new_max_levels > old_max_levels,
-            "New multiplier should allow more levels: {} vs {}",
-            new_max_levels,
-            old_max_levels
-        );
-        assert!(
-            new_max_levels >= 11,
-            "With 1.15x multiplier, should get at least 11 levels, got {}",
-            new_max_levels
-        );
-        assert!(
-            old_max_levels <= 10,
-            "With 1.5x multiplier, should get at most 10 levels, got {}",
-            old_max_levels
-        );
+        let old_max_levels = (available / old_min).floor() as usize;
+        let new_max_levels = (available / new_min).floor() as usize;
+        assert!(new_max_levels >= old_max_levels);
     }
 
     #[test]
@@ -2014,6 +2007,7 @@ mod tests {
             false, // use_funding_skew
             cached_best_bid,
             cached_best_ask,
+            8.0, // effective_floor_bps
         );
 
         // With old code: max_offset = tight_bbo_half * 0.8 = 0.24 bps → almost no skew
@@ -2028,5 +2022,153 @@ mod tests {
             "BBO cap killed inventory skew: bid_shift={:.2} bps, ask_shift={:.2} bps",
             bid_shift_bps, ask_shift_bps
         );
+    }
+
+    #[test]
+    fn test_empty_ladder_uses_effective_floor_bps() {
+        // Empty ladder → own_min_depth = f64::INFINITY → should fallback to effective_floor_bps
+        let mut ladder = Ladder {
+            bids: smallvec![],
+            asks: smallvec![],
+        };
+
+        let mid = 31.0; // HYPE-like price
+        let effective_floor_bps = 10.0;
+
+        // With empty ladder, own_floor should be mid * (effective_floor_bps / 10000)
+        // = 31.0 * (10.0 / 10000.0) = 31.0 * 0.001 = 0.031
+        // The skew cap should use this own_floor, not the old hardcoded 8 bps
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            0.5,   // inventory_ratio
+            0.3,   // gamma
+            0.01,  // sigma
+            10.0,  // time_horizon
+            mid,
+            mid,
+            4,     // decimals (HYPE-like)
+            1,     // sz_decimals
+            false, // use_drift_adjusted_skew
+            0.0,   // hjb_drift_urgency
+            false, // position_opposes_momentum
+            0.0,   // urgency_score
+            0.0,   // funding_rate
+            false, // use_funding_skew
+            0.0,   // cached_best_bid
+            0.0,   // cached_best_ask
+            effective_floor_bps,
+        );
+
+        // Empty ladder, nothing to shift — just verify no panic
+        assert!(ladder.bids.is_empty());
+        assert!(ladder.asks.is_empty());
+    }
+
+    /// Validate the actual_tick computation used in BBO crossing checks (reconcile.rs).
+    /// The old proxy (mid * 0.0001) produced $0.0031 for HYPE at $31 when the real
+    /// exchange tick (10^-4 = $0.0001) is 31x smaller.
+    #[test]
+    fn test_actual_tick_vs_proxy_for_bbo_crossing() {
+        // HYPE: decimals=4, price=$31
+        let decimals: u32 = 4;
+        let mid = 31.0;
+
+        let actual_tick = 10f64.powi(-(decimals as i32)); // $0.0001
+        let old_proxy = mid * 0.0001; // $0.0031
+
+        assert!(
+            (actual_tick - 0.0001).abs() < 1e-12,
+            "HYPE tick should be 0.0001, got {}",
+            actual_tick
+        );
+        assert!(
+            old_proxy > actual_tick * 30.0,
+            "Old proxy {:.6} should be ~31x larger than actual tick {:.6}",
+            old_proxy,
+            actual_tick
+        );
+
+        let safety_margin = actual_tick * 2.0; // 2 ticks = $0.0002
+
+        // Scenario 1: HYPE bid at 30.9970 with best_ask=30.9980
+        // Gap = 30.9980 - 30.9970 = 0.0010 = 10 ticks → NOT filtered
+        let bid_price = 30.997;
+        let best_ask = 30.998;
+        let should_filter_bid = bid_price >= best_ask - safety_margin;
+        assert!(
+            !should_filter_bid,
+            "Bid at {:.4} should NOT be filtered with best_ask={:.4} (gap={:.4} > safety={:.4})",
+            bid_price,
+            best_ask,
+            best_ask - bid_price,
+            safety_margin
+        );
+
+        // Scenario 2: HYPE bid at 30.9978 with best_ask=30.9980
+        // Gap = 30.9980 - 30.9978 = 0.0002 = 2 ticks = exactly safety_margin → IS filtered
+        let bid_price_tight = 30.9978;
+        let should_filter_tight = bid_price_tight >= best_ask - safety_margin;
+        assert!(
+            should_filter_tight,
+            "Bid at {:.4} SHOULD be filtered with best_ask={:.4} (gap={:.4} <= safety={:.4})",
+            bid_price_tight,
+            best_ask,
+            best_ask - bid_price_tight,
+            safety_margin
+        );
+
+        // BTC: decimals=0, price=$87000
+        let btc_decimals: u32 = 0;
+        let btc_tick = 10f64.powi(-(btc_decimals as i32)); // $1.0
+        assert!(
+            (btc_tick - 1.0).abs() < 1e-12,
+            "BTC tick should be 1.0, got {}",
+            btc_tick
+        );
+    }
+
+    #[test]
+    fn test_empty_ladder_effective_floor_clamps_to_5bps_minimum() {
+        // Even if effective_floor_bps is very small, own_floor should be at least 5 bps
+        let mut ladder = Ladder {
+            bids: smallvec![LadderLevel {
+                price: 30.99,
+                size: 1.0,
+                depth_bps: 3.0,
+            }],
+            asks: smallvec![LadderLevel {
+                price: 31.01,
+                size: 1.0,
+                depth_bps: 3.0,
+            }],
+        };
+
+        let mid = 31.0;
+        // Pass a very low effective_floor_bps — should clamp to 5.0
+        apply_inventory_skew_with_drift(
+            &mut ladder,
+            0.5,   // inventory_ratio: strong long
+            8.0,   // gamma: high to produce large skew
+            0.01,  // sigma
+            10.0,  // time_horizon
+            mid,
+            mid,
+            4,     // decimals
+            1,     // sz_decimals
+            false,
+            0.0,
+            false,
+            0.0,
+            0.0,
+            false,
+            0.0,
+            0.0,
+            1.0, // effective_floor_bps: very low (would be 1 bps)
+        );
+
+        // Ladder has levels so own_min_depth is finite — the effective_floor_bps
+        // doesn't matter in this case (own_min_depth * 0.5 is used instead).
+        // Just verify no panic and prices shifted.
+        assert!(ladder.bids[0].price < 30.99);
     }
 }

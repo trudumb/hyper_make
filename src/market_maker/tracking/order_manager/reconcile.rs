@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use crate::helpers::truncate_float;
 use crate::{bps_diff, EPSILON};
 
 use super::impulse_filter::{ImpulseDecision, ImpulseFilter};
@@ -270,11 +271,17 @@ pub fn reconcile_side_smart(
     target: &[LadderLevel],
     side: Side,
     config: &ReconcileConfig,
+    sz_decimals: u32,
 ) -> Vec<LadderAction> {
     let (actions, _stats) = reconcile_side_smart_with_impulse(
-        current, target, side, config, None, // No queue tracker
+        current,
+        target,
+        side,
+        config,
+        None, // No queue tracker
         None, // No impulse filter
         None, // No mid price
+        sz_decimals,
     );
     actions
 }
@@ -298,6 +305,7 @@ pub fn reconcile_side_smart(
 /// * `queue_tracker` - Optional queue position tracker for P(fill) calculation
 /// * `impulse_filter` - Optional impulse filter for Δλ gating (legacy)
 /// * `mid_price` - Optional mid price for new order P(fill) estimation
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile_side_smart_with_impulse(
     current: &[&TrackedOrder],
     target: &[LadderLevel],
@@ -306,6 +314,7 @@ pub fn reconcile_side_smart_with_impulse(
     queue_tracker: Option<&QueuePositionTracker>,
     mut impulse_filter: Option<&mut ImpulseFilter>,
     mid_price: Option<f64>,
+    sz_decimals: u32,
 ) -> (Vec<LadderAction>, ReconcileStats) {
     use tracing::debug;
 
@@ -450,13 +459,20 @@ pub fn reconcile_side_smart_with_impulse(
             && m.size_diff_pct <= config.max_modify_size_pct
         {
             // MODIFY - small change, preserve queue position
-            actions.push(LadderAction::Modify {
-                oid: m.order.oid,
-                new_price: target_level.price,
-                new_size: target_level.size,
-                side,
-            });
-            stats.modified_count += 1;
+            let truncated_size = truncate_float(target_level.size, sz_decimals, false);
+            if truncated_size <= 0.0 {
+                // Size truncated to zero — cancel instead of sending a zero-size modify
+                actions.push(LadderAction::Cancel { oid: m.order.oid });
+                stats.cancelled_count += 1;
+            } else {
+                actions.push(LadderAction::Modify {
+                    oid: m.order.oid,
+                    new_price: target_level.price,
+                    new_size: truncated_size,
+                    side,
+                });
+                stats.modified_count += 1;
+            }
         } else {
             // CANCEL + PLACE - too large a change, fresh queue
             actions.push(LadderAction::Cancel { oid: m.order.oid });
@@ -572,6 +588,7 @@ pub fn priority_based_matching(
     side: Side,
     config: &DynamicReconcileConfig,
     queue_tracker: Option<&QueuePositionTracker>,
+    sz_decimals: u32,
 ) -> Vec<LadderAction> {
     use tracing::debug;
 
@@ -699,17 +716,23 @@ pub fn priority_based_matching(
                     && size_change < 0.0
                     && size_diff_pct > 0.05
                 {
+                    let truncated_target = truncate_float(target_size, sz_decimals, false);
+                    if truncated_target <= 0.0 {
+                        // Size truncated to zero — cancel instead
+                        actions.push(LadderAction::Cancel { oid: order.oid });
+                        continue;
+                    }
                     debug!(
                         oid = order.oid,
                         current_size = current_size,
-                        target_size = target_size,
+                        target_size = truncated_target,
                         max_modify_bps = config.max_modify_price_bps,
                         "Priority matching: MODIFY (size down) to preserve queue"
                     );
                     actions.push(LadderAction::Modify {
                         oid: order.oid,
-                        new_price: order.price, // Keep same price
-                        new_size: target_size,  // Reduce size
+                        new_price: order.price,    // Keep same price
+                        new_size: truncated_target, // Reduce size (truncated)
                         side,
                     });
                     continue;
@@ -901,5 +924,174 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, LadderAction::Place { .. })));
+    }
+
+    #[test]
+    fn test_smart_reconcile_modify_truncates_size() {
+        // Order at 100.00 with size 1.0, target at 100.001 (0.1 bps) with size 0.35654
+        // With sz_decimals=1, truncate_float(0.35654, 1, false) = 0.3
+        let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let current = vec![&order];
+
+        let target = vec![LadderLevel {
+            price: 100.001, // 0.1 bps away — within modify tolerance
+            size: 0.35654,  // Fractional size that needs truncation
+            depth_bps: 5.0,
+        }];
+
+        let config = ReconcileConfig {
+            max_modify_price_bps: 10,
+            max_modify_size_pct: 0.99,
+            skip_price_tolerance_bps: 0,
+            skip_size_tolerance_pct: 0.0,
+            use_queue_aware: false,
+            queue_horizon_seconds: 10.0,
+            use_impulse_filter: false,
+            use_queue_value_comparison: false,
+            queue_value_config: QueueValueConfig::default(),
+        };
+
+        let (actions, _stats) = reconcile_side_smart_with_impulse(
+            &current, &target, Side::Buy, &config, None, None, None, 1, // sz_decimals=1
+        );
+
+        // Should get a Modify with truncated size
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            LadderAction::Modify { new_size, .. } => {
+                assert!(
+                    (*new_size - 0.3).abs() < 1e-10,
+                    "Expected truncated size 0.3, got {}",
+                    new_size
+                );
+            }
+            other => panic!("Expected Modify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_smart_reconcile_modify_zero_truncation_cancels() {
+        // Order at 100.00 size 0.05, target at same price size 0.004
+        // Size diff pct = |0.004 - 0.05|/0.05 = 0.92 → within max_modify_size_pct (0.99)
+        // With sz_decimals=2, truncate_float(0.004, 2, false) = 0.0
+        // Should produce Cancel instead of Modify with zero size
+        let order = TrackedOrder::new(1, Side::Buy, 100.00, 0.05, 0.0);
+        let current = vec![&order];
+
+        let target = vec![LadderLevel {
+            price: 100.001,
+            size: 0.004, // Truncates to 0.0 with 2 decimals
+            depth_bps: 5.0,
+        }];
+
+        let config = ReconcileConfig {
+            max_modify_price_bps: 10,
+            max_modify_size_pct: 0.99,
+            skip_price_tolerance_bps: 0,
+            skip_size_tolerance_pct: 0.0,
+            use_queue_aware: false,
+            queue_horizon_seconds: 10.0,
+            use_impulse_filter: false,
+            use_queue_value_comparison: false,
+            queue_value_config: QueueValueConfig::default(),
+        };
+
+        let (actions, stats) = reconcile_side_smart_with_impulse(
+            &current, &target, Side::Buy, &config, None, None, None, 2, // sz_decimals=2
+        );
+
+        // Should get a Cancel (not a Modify with 0 size)
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], LadderAction::Cancel { oid: 1 }),
+            "Expected Cancel for zero-truncated size, got {:?}",
+            actions[0]
+        );
+        assert_eq!(stats.cancelled_count, 1);
+        assert_eq!(stats.modified_count, 0);
+    }
+
+    #[test]
+    fn test_priority_matching_modify_truncates_size() {
+        // Current order at 100.00 size 1.0, target at same price size 0.567
+        // Size is reducing → triggers MODIFY path in priority_based_matching
+        // With sz_decimals=1, should truncate to 0.5
+        let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let current = vec![&order];
+
+        let target = vec![LadderLevel {
+            price: 100.00, // Same price
+            size: 0.567,   // Size reduction that needs truncation
+            depth_bps: 5.0,
+        }];
+
+        let config = DynamicReconcileConfig {
+            best_level_tolerance_bps: 5.0,
+            outer_level_tolerance_bps: 10.0,
+            max_match_distance_bps: 50.0,
+            queue_value_threshold: 0.5,
+            queue_horizon_seconds: 10.0,
+            optimal_spread_bps: 4.0,
+            max_modify_price_bps: 10.0,
+            use_priority_matching: true,
+            use_hjb_queue_value: false,
+            hjb_queue_alpha: 0.0,
+            hjb_queue_beta: 0.0,
+            hjb_queue_modify_cost_bps: 0.0,
+        };
+
+        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 1);
+
+        // Should get a Modify with truncated size 0.5
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            LadderAction::Modify { new_size, .. } => {
+                assert!(
+                    (*new_size - 0.5).abs() < 1e-10,
+                    "Expected truncated size 0.5, got {}",
+                    new_size
+                );
+            }
+            other => panic!("Expected Modify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_priority_matching_zero_truncation_cancels() {
+        // Size 0.003 with sz_decimals=2 → truncates to 0.0
+        // Should produce Cancel instead of Modify
+        let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let current = vec![&order];
+
+        let target = vec![LadderLevel {
+            price: 100.00,
+            size: 0.003, // Truncates to 0.0 with 2 decimals
+            depth_bps: 5.0,
+        }];
+
+        let config = DynamicReconcileConfig {
+            best_level_tolerance_bps: 5.0,
+            outer_level_tolerance_bps: 10.0,
+            max_match_distance_bps: 50.0,
+            queue_value_threshold: 0.5,
+            queue_horizon_seconds: 10.0,
+            optimal_spread_bps: 4.0,
+            max_modify_price_bps: 10.0,
+            use_priority_matching: true,
+            use_hjb_queue_value: false,
+            hjb_queue_alpha: 0.0,
+            hjb_queue_beta: 0.0,
+            hjb_queue_modify_cost_bps: 0.0,
+        };
+
+        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 2);
+
+        // Should get Cancel (truncated to zero → don't send zero-size modify)
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], LadderAction::Cancel { oid: 1 }),
+            "Expected Cancel for zero-truncated size, got {:?}",
+            actions[0]
+        );
     }
 }

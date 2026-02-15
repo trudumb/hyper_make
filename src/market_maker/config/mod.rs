@@ -12,6 +12,7 @@
 //! - `regime_profile`: Thin DEX vs liquid CEX regime profiles
 
 pub mod auto_derive;
+mod capacity;
 mod core;
 mod impulse;
 mod multi_asset;
@@ -23,6 +24,7 @@ mod stochastic;
 
 // Re-export everything for backward compatibility
 pub use auto_derive::{auto_derive, CapitalProfile, CapitalTier, DerivedParams, ExchangeContext};
+pub use capacity::{CapacityBudget, SizeQuantum, Viability};
 pub use core::*;
 pub use impulse::*;
 pub use multi_asset::*;

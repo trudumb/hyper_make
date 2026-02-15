@@ -2,6 +2,7 @@
 
 use crate::market_maker::adverse_selection::DepthDecayAS;
 use crate::market_maker::config::auto_derive::CapitalTier;
+use crate::market_maker::config::CapacityBudget;
 use crate::market_maker::estimator::{MarketEstimator, VolatilityRegime};
 use crate::market_maker::process_models::SpreadRegime;
 
@@ -914,9 +915,14 @@ pub struct MarketParams {
     pub drift_rate_per_sec: f64,
 
     // === Capital Tier ===
-    /// Capital tier from CapitalProfile for adaptive ladder behavior.
-    /// Micro tier skips multi-level generation and uses concentrated quoting.
+    /// Capital tier from CapitalProfile — used for logging, metrics, and warmup
+    /// bootstrapping only. Does NOT drive code path selection in ladder generation.
     pub capital_tier: CapitalTier,
+
+    /// Capacity budget computed at the top of each quote cycle.
+    /// Contains min_viable_depth_bps, viable_levels_per_side, and tier info.
+    /// Used by ladder and QueueValue for depth-aware decisions.
+    pub capacity_budget: Option<CapacityBudget>,
 }
 
 impl Default for MarketParams {
@@ -1192,6 +1198,8 @@ impl Default for MarketParams {
             drift_rate_per_sec: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,
+            // Capacity budget — computed per cycle in quote_engine
+            capacity_budget: None,
         }
     }
 }

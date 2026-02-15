@@ -730,6 +730,8 @@ impl ParameterAggregator {
             drift_rate_per_sec: 0.0,
             // Capital tier — set by quote_engine after build, default Large
             capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
+            // Capacity budget — set by quote_engine after CapacityBudget::compute()
+            capacity_budget: None,
         }
     }
 }

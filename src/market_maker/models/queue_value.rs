@@ -112,6 +112,18 @@ impl QueueValueHeuristic {
         self.prediction_bias_bps
     }
 
+    /// Returns the minimum depth (bps) that produces positive queue value.
+    ///
+    /// QueueValue breakeven: depth > expected_AS + maker_fee + prediction_bias + safety_margin
+    pub fn minimum_viable_depth(&self, toxicity: ToxicityRegime) -> f64 {
+        let expected_as = match toxicity {
+            ToxicityRegime::Benign => AS_COST_BENIGN_BPS,
+            ToxicityRegime::Normal => AS_COST_NORMAL_BPS,
+            ToxicityRegime::Toxic => AS_COST_TOXIC_BPS,
+        };
+        expected_as + MAKER_FEE_BPS + self.prediction_bias_bps + 0.5
+    }
+
     /// Create a QueueValueHeuristic calibrated for the given capital tier.
     ///
     /// Small capital tiers quote at wider depths (GLFT-optimal, not BBO),
@@ -195,6 +207,29 @@ mod tests {
         // 20 bps depth should be positive even in toxic, back of queue
         // 20 - 8 - (20 * 0.3 * 1.0) - 1.5 = 20 - 8 - 6 - 1.5 = 4.5
         assert!(heuristic.should_quote(20.0, ToxicityRegime::Toxic, 1.0));
+    }
+
+    #[test]
+    fn test_minimum_viable_depth_normal() {
+        let heuristic = QueueValueHeuristic::new();
+        let depth = heuristic.minimum_viable_depth(ToxicityRegime::Normal);
+        // 3.0 (AS) + 1.5 (fee) + 0.0 (bias) + 0.5 (safety) = 5.0
+        assert!((depth - 5.0).abs() < 1e-10, "depth={}", depth);
+    }
+
+    #[test]
+    fn test_minimum_viable_depth_toxic() {
+        let heuristic = QueueValueHeuristic::new();
+        let depth = heuristic.minimum_viable_depth(ToxicityRegime::Toxic);
+        // 8.0 (AS) + 1.5 (fee) + 0.0 (bias) + 0.5 (safety) = 10.0
+        assert!((depth - 10.0).abs() < 1e-10, "depth={}", depth);
+    }
+
+    #[test]
+    fn test_queue_value_positive_at_5_bps_normal() {
+        let heuristic = QueueValueHeuristic::new();
+        // 5 - 3 - 0 - 1.5 = 0.5 > 0
+        assert!(heuristic.should_quote(5.0, ToxicityRegime::Normal, 0.0));
     }
 
     #[test]

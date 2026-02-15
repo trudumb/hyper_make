@@ -270,9 +270,6 @@ pub struct InfraComponents {
     /// Fills are pushed here; on each mid update, expired entries are drained
     /// and fed to the pre-fill classifier and model gating.
     pub pending_fill_outcomes: std::collections::VecDeque<crate::market_maker::fills::PendingFillOutcome>,
-    /// Whether the emergency pull is currently active (for hysteresis).
-    /// Once triggered, stays active until momentum drops below the off-ramp threshold.
-    pub emergency_pull_active: bool,
 }
 
 /// Cached exchange rate limit with timestamp.
@@ -429,7 +426,6 @@ impl InfraComponents {
             fill_tracker: FillTracker::new(1000),
             order_lifecycle: OrderLifecycleTracker::new(1000),
             pending_fill_outcomes: std::collections::VecDeque::with_capacity(64),
-            emergency_pull_active: false,
         }
     }
 }

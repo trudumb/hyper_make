@@ -774,21 +774,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     return Ok(());
                 }
 
-                // Calculate staleness buffer: 1 tick per second of book age beyond threshold
-                // For a $33 asset with 5 sig figs, tick = $0.001. For $100k BTC, tick = $1.
-                // We use 1 bps of mid price as a tick proxy (conservative for most assets).
-                let tick_proxy = self.latest_mid * 0.0001; // 1 bps
+                // Calculate staleness buffer: 1 tick per second of book age beyond threshold.
+                // Use actual exchange tick size from config.decimals (10^-decimals).
+                // Old proxy (mid * 0.0001) was 31x too large for HYPE at $31 with tick=0.0001.
+                let actual_tick = 10f64.powi(-(self.config.decimals as i32));
+                let safety_margin = actual_tick * 2.0; // 2 ticks
                 let staleness_ticks = if book_age.as_secs() >= STALENESS_BUFFER_SECS {
                     (book_age.as_secs() - STALENESS_BUFFER_SECS + 1) as f64
                 } else {
                     0.0
                 };
-                let staleness_buffer = staleness_ticks * tick_proxy;
+                let staleness_buffer = staleness_ticks * actual_tick;
 
                 // Validate: bid must be strictly below exchange best ask (with buffer)
-                let effective_ask_limit = self.cached_best_ask - tick_proxy - staleness_buffer;
+                let effective_ask_limit = self.cached_best_ask - safety_margin - staleness_buffer;
                 // Validate: ask must be strictly above exchange best bid (with buffer)
-                let effective_bid_limit = self.cached_best_bid + tick_proxy + staleness_buffer;
+                let effective_bid_limit = self.cached_best_bid + safety_margin + staleness_buffer;
 
                 // Filter crossing levels instead of skipping the entire cycle.
                 // Previously, ANY crossing level caused the whole cycle to be skipped,
@@ -1253,6 +1254,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             Side::Buy,
             &dynamic_config,
             Some(&self.tier1.queue_tracker),
+            self.config.sz_decimals,
         );
 
         let ask_acts = priority_based_matching(
@@ -1261,6 +1263,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             Side::Sell,
             &dynamic_config,
             Some(&self.tier1.queue_tracker),
+            self.config.sz_decimals,
         );
 
         let (mut bid_actions, bid_stats, mut ask_actions, ask_stats): (
@@ -1397,7 +1400,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Execute modifies (preserves queue position)
         // RATE LIMIT FIX: Check modify debounce before executing
         // Filter modify specs that would cross the BBO (defense-in-depth)
-        let tick_proxy = if self.latest_mid > 0.0 { self.latest_mid * 0.0001 } else { 0.0 };
+        let actual_tick = 10f64.powi(-(self.config.decimals as i32));
+        let safety_margin = actual_tick * 2.0; // 2 ticks
         let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
         let all_modifies: Vec<ModifySpec> = bid_modifies
             .into_iter()
@@ -1406,7 +1410,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 if !bbo_valid {
                     return true; // Can't validate without BBO
                 }
-                if spec.is_buy && spec.new_price >= self.cached_best_ask - tick_proxy {
+                if spec.is_buy && spec.new_price >= self.cached_best_ask - safety_margin {
                     warn!(
                         oid = spec.oid,
                         new_price = %format!("{:.6}", spec.new_price),
@@ -1415,7 +1419,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
                     return false;
                 }
-                if !spec.is_buy && spec.new_price <= self.cached_best_bid + tick_proxy {
+                if !spec.is_buy && spec.new_price <= self.cached_best_bid + safety_margin {
                     warn!(
                         oid = spec.oid,
                         new_price = %format!("{:.6}", spec.new_price),
@@ -1632,6 +1636,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             .orphan_tracker
                             .register_expected_cloids(std::slice::from_ref(&cloid));
 
+                        // Truncate size to exchange precision before placement
+                        let safe_size = truncate_float(spec.new_size, self.config.sz_decimals, false);
+                        if safe_size <= 0.0 {
+                            warn!(
+                                original_size = %format!("{:.6}", spec.new_size),
+                                sz_decimals = self.config.sz_decimals,
+                                "Modify fallback: size truncated to zero, skipping placement"
+                            );
+                            self.orders.remove_pending_by_cloid(&cloid);
+                            self.infra.orphan_tracker.mark_failed(&cloid);
+                            continue;
+                        }
+
                         // Pass the pre-registered CLOID to place_order for deterministic matching.
                         // This ensures the pending order is finalized with the correct OID.
                         let place_result = self
@@ -1639,7 +1656,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             .place_order(
                                 &self.config.asset,
                                 spec.new_price,
-                                spec.new_size,
+                                safe_size,
                                 spec.is_buy,
                                 Some(cloid.clone()),
                                 true, // post_only
@@ -1892,9 +1909,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let mut cumulative_size = 0.0; // Track cumulative exposure for exchange limits
         let mut orders_blocked_by_capacity = 0usize;
         let mut orders_blocked_by_governor = 0usize;
+        let mut orders_zero_size = 0usize;
+        let mut orders_post_truncation_zero = 0usize;
+        let mut orders_margin_zero = 0usize;
+        let mut orders_below_notional = 0usize;
+        let mut orders_bbo_crossing = 0usize;
 
         for (price, size) in orders {
             if size <= 0.0 {
+                orders_zero_size += 1;
                 continue;
             }
 
@@ -1921,21 +1944,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             {
                 let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
                 if bbo_valid {
-                    let tick_proxy = self.latest_mid * 0.0001; // 1 bps
-                    if is_buy && price >= self.cached_best_ask - tick_proxy {
+                    let actual_tick = 10f64.powi(-(self.config.decimals as i32));
+                    let safety_margin = actual_tick * 2.0; // 2 ticks
+                    if is_buy && price >= self.cached_best_ask - safety_margin {
                         warn!(
                             bid_price = %format!("{:.6}", price),
                             exchange_ask = %format!("{:.6}", self.cached_best_ask),
                             "Filtering bid order: would cross exchange best ask"
                         );
+                        orders_bbo_crossing += 1;
                         continue;
                     }
-                    if !is_buy && price <= self.cached_best_bid + tick_proxy {
+                    if !is_buy && price <= self.cached_best_bid + safety_margin {
                         warn!(
                             ask_price = %format!("{:.6}", price),
                             exchange_bid = %format!("{:.6}", self.cached_best_bid),
                             "Filtering ask order: would cross exchange best bid"
                         );
+                        orders_bbo_crossing += 1;
                         continue;
                     }
                 }
@@ -1948,6 +1974,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .adjust_size(size, price, self.position.position(), is_buy);
 
             if sizing_result.adjusted_size <= 0.0 {
+                orders_margin_zero += 1;
                 continue;
             }
 
@@ -1958,6 +1985,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let mut truncated_size =
                 truncate_float(sizing_result.adjusted_size, self.config.sz_decimals, should_round_up);
             if truncated_size <= 0.0 {
+                orders_post_truncation_zero += 1;
                 continue;
             }
 
@@ -1971,6 +1999,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     min = MIN_ORDER_NOTIONAL,
                     "Skipping order: post-truncation notional below minimum"
                 );
+                orders_below_notional += 1;
                 continue;
             }
 
@@ -2029,14 +2058,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             ));
         }
 
-        // DIAGNOSTIC: Log how many orders passed filtering
+        // DIAGNOSTIC: Structured summary log with per-reason filter counts
         info!(
             side = %side_str,
             input_orders = input_count,
             orders_passed_filter = order_specs.len(),
             orders_filtered_out = input_count - order_specs.len(),
-            orders_blocked_by_capacity = orders_blocked_by_capacity,
-            orders_blocked_by_governor = orders_blocked_by_governor,
+            zero_size = orders_zero_size,
+            margin_zero = orders_margin_zero,
+            post_truncation_zero = orders_post_truncation_zero,
+            below_notional = orders_below_notional,
+            bbo_crossing = orders_bbo_crossing,
+            blocked_by_capacity = orders_blocked_by_capacity,
+            blocked_by_governor = orders_blocked_by_governor,
             cumulative_size = %format!("{:.6}", cumulative_size),
             total_available = %format!("{:.6}", total_available),
             "[PlaceBulk] Order filtering complete"
