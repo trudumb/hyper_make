@@ -22,7 +22,7 @@ mod spread_profile;
 mod stochastic;
 
 // Re-export everything for backward compatibility
-pub use auto_derive::{auto_derive, DerivedParams, ExchangeContext};
+pub use auto_derive::{auto_derive, CapitalProfile, CapitalTier, DerivedParams, ExchangeContext};
 pub use core::*;
 pub use impulse::*;
 pub use multi_asset::*;

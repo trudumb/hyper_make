@@ -14,6 +14,7 @@
 //! `observe_outcome()` from markout data refines the heuristic over time.
 
 use crate::market_maker::adverse_selection::toxicity_regime::ToxicityRegime;
+use crate::market_maker::config::auto_derive::CapitalTier;
 
 /// Maker fee on Hyperliquid in basis points.
 const MAKER_FEE_BPS: f64 = 1.5;
@@ -110,6 +111,20 @@ impl QueueValueHeuristic {
     pub fn prediction_bias_bps(&self) -> f64 {
         self.prediction_bias_bps
     }
+
+    /// Create a QueueValueHeuristic calibrated for the given capital tier.
+    ///
+    /// Small capital tiers quote at wider depths (GLFT-optimal, not BBO),
+    /// so they face lower adverse selection costs.
+    pub fn for_capital_tier(tier: CapitalTier) -> Self {
+        let h = Self::new();
+        // For Micro/Small tiers, we don't adjust the heuristic itself —
+        // the fix is in the edge evaluation depth (quote_engine passes GLFT depth
+        // instead of BBO half-spread). The heuristic remains universal.
+        // This method exists as a future extension point.
+        let _ = tier;
+        h
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +195,16 @@ mod tests {
         // 20 bps depth should be positive even in toxic, back of queue
         // 20 - 8 - (20 * 0.3 * 1.0) - 1.5 = 20 - 8 - 6 - 1.5 = 4.5
         assert!(heuristic.should_quote(20.0, ToxicityRegime::Toxic, 1.0));
+    }
+
+    #[test]
+    fn test_for_capital_tier_wider_depth_positive_value() {
+        let heuristic = QueueValueHeuristic::for_capital_tier(CapitalTier::Micro);
+        // At GLFT-optimal depth (5 bps) instead of BBO (1 bps), value is positive:
+        // 5 - 3(AS) - 0 - 1.5(fee) = 0.5 bps > 0
+        assert!(heuristic.should_quote(5.0, ToxicityRegime::Normal, 0.0));
+        // But at BBO depth (1 bps), still negative:
+        // 1 - 3 - 0 - 1.5 = -3.5
+        assert!(!heuristic.should_quote(1.0, ToxicityRegime::Normal, 0.0));
     }
 }

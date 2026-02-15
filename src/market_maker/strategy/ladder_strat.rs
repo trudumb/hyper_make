@@ -17,6 +17,7 @@ use super::{
     RiskModelConfig,
 };
 
+use crate::market_maker::config::auto_derive::CapitalTier;
 use crate::market_maker::risk::PositionZone;
 
 /// Maximum fraction of effective_max_position allowed in a single resting order.
@@ -569,6 +570,112 @@ impl LadderStrategy {
         }
     }
 
+    /// Generate a concentrated ladder for Micro capital tier.
+    ///
+    /// Instead of spreading thin across many levels (each below min_notional),
+    /// creates 1 order per side at GLFT-optimal depth with the full available size.
+    /// This is a first-class code path, not a fallback — it avoids wasting API quota
+    /// on orders that would be rejected for being below exchange min_notional.
+    fn generate_concentrated_ladder(
+        &self,
+        config: &QuoteConfig,
+        position: f64,
+        effective_max_position: f64,
+        max_position: f64,
+        _target_liquidity: f64,
+        market_params: &MarketParams,
+    ) -> Ladder {
+        let mut ladder = Ladder::default();
+        let mark = market_params.microprice;
+        if mark <= 0.0 {
+            return ladder;
+        }
+
+        let min_size = config.min_notional / mark;
+        let min_meaningful_size = (config.min_notional * 1.15) / mark;
+
+        // Size: use full available capacity per side, capped at 25% of the USER's
+        // risk-based max_position (not margin-based quoting capacity).
+        let half_max = effective_max_position / 2.0;
+        let per_side_cap = (max_position * MAX_SINGLE_ORDER_FRACTION).max(min_meaningful_size);
+
+        // Calculate available capacity per side, accounting for current position
+        let (available_for_bids, available_for_asks) = if position >= 0.0 {
+            let bid_limit = (effective_max_position - position).max(0.0);
+            let ask_limit = (position + effective_max_position).max(0.0);
+            (bid_limit, ask_limit)
+        } else {
+            let bid_limit = (position.abs() + effective_max_position).max(0.0);
+            let ask_limit = (effective_max_position - position.abs()).max(0.0);
+            (bid_limit, ask_limit)
+        };
+
+        let bid_size = truncate_float(
+            available_for_bids.min(half_max).min(per_side_cap).max(min_size),
+            config.sz_decimals,
+            false,
+        );
+        let ask_size = truncate_float(
+            available_for_asks.min(half_max).min(per_side_cap).max(min_size),
+            config.sz_decimals,
+            false,
+        );
+
+        // Depth: use min_depth_bps from ladder config (GLFT-optimal, not BBO)
+        let depth_bps = self.ladder_config.min_depth_bps.max(2.0);
+        let depth_frac = depth_bps / 10_000.0;
+
+        // Generate bid (if meets min_notional)
+        if bid_size * mark >= config.min_notional && available_for_bids > 0.0 {
+            let bid_price = round_to_significant_and_decimal(
+                mark * (1.0 - depth_frac),
+                5,
+                config.decimals,
+            );
+            ladder.bids.push(LadderLevel {
+                price: bid_price,
+                size: bid_size,
+                depth_bps,
+            });
+        }
+
+        // Generate ask (if meets min_notional)
+        if ask_size * mark >= config.min_notional && available_for_asks > 0.0 {
+            let ask_price = round_to_significant_and_decimal(
+                mark * (1.0 + depth_frac),
+                5,
+                config.decimals,
+            );
+            ladder.asks.push(LadderLevel {
+                price: ask_price,
+                size: ask_size,
+                depth_bps,
+            });
+        }
+
+        if !ladder.bids.is_empty() || !ladder.asks.is_empty() {
+            tracing::info!(
+                tier = ?market_params.capital_tier,
+                bid_size = %format!("{:.4}", bid_size),
+                ask_size = %format!("{:.4}", ask_size),
+                depth_bps = %format!("{:.1}", depth_bps),
+                bid_notional = %format!("${:.2}", bid_size * mark),
+                ask_notional = %format!("${:.2}", ask_size * mark),
+                "Concentrated ladder: 1 order per side at GLFT-optimal depth"
+            );
+        } else {
+            warn!(
+                capital_tier = ?market_params.capital_tier,
+                effective_max_position = %format!("{:.6}", effective_max_position),
+                min_notional = %format!("{:.2}", config.min_notional),
+                microprice = %format!("{:.2}", mark),
+                "Concentrated ladder empty: insufficient capital for min_notional"
+            );
+        }
+
+        ladder
+    }
+
     /// Generate full ladder from market params.
     ///
     /// This is the main method that creates a multi-level quote ladder.
@@ -609,6 +716,22 @@ impl LadderStrategy {
             effective_max_position = %format!("{:.6}", effective_max_position),
             "Quoting capacity: capped by config.max_position"
         );
+
+        // === MICRO TIER EARLY EXIT ===
+        // For Micro capital tier (1-2 viable levels/side), skip multi-level generation
+        // entirely. Go directly to concentrated quoting — this is a first-class path,
+        // not a fallback. Multi-level ladders with $100 capital and 10 levels produce
+        // orders below exchange min_notional ($10), wasting quota on rejected orders.
+        if market_params.capital_tier == CapitalTier::Micro {
+            return self.generate_concentrated_ladder(
+                config,
+                position,
+                effective_max_position,
+                max_position,
+                target_liquidity,
+                market_params,
+            );
+        }
 
         // === GAMMA: Adaptive vs Legacy with Bayesian Adjustment ===
         // When adaptive spreads enabled: use log-additive shrinkage gamma
@@ -2697,5 +2820,169 @@ mod tests {
         let unrealized_bps2: f64 = -5.0;
         let urgency2: f64 = (position_fraction2 * (-unrealized_bps2 / 50.0_f64).max(0.0)).min(1.0);
         assert!(urgency2 < 0.5, "Small position, slightly underwater: urgency should be < 0.5, got {urgency2}");
+    }
+
+    #[test]
+    fn test_micro_tier_concentrated_ladder() {
+        use crate::market_maker::config::auto_derive::CapitalTier;
+        use crate::market_maker::strategy::QuotingStrategy;
+
+        // Setup: $100 capital, HYPE@$30, Micro tier
+        // max_position = $100 / $30 = 3.33 contracts
+        // With 10 levels, each gets 0.333 = $10 — borderline min_notional
+        // Micro tier should produce exactly 1 bid + 1 ask via concentrated path
+        let strategy = LadderStrategy::new(0.07);
+        let config = QuoteConfig {
+            mid_price: 30.0,
+            decimals: 1,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+
+        let mut market_params = MarketParams::default();
+        market_params.microprice = 30.0;
+        market_params.market_mid = 30.0;
+        market_params.capital_tier = CapitalTier::Micro;
+        market_params.margin_available = 100.0;
+        market_params.leverage = 3.0;
+        market_params.margin_quoting_capacity = 3.24;
+
+        let position = 0.0;
+        let max_position = 3.24; // $100 / $30 ≈ 3.33, with margin
+        let target_liquidity = 1.0;
+
+        let ladder = strategy.calculate_ladder(
+            &config,
+            position,
+            max_position,
+            target_liquidity,
+            &market_params,
+        );
+
+        // Should produce exactly 1 bid + 1 ask
+        assert_eq!(
+            ladder.bids.len(), 1,
+            "Micro tier should produce exactly 1 bid, got {}",
+            ladder.bids.len()
+        );
+        assert_eq!(
+            ladder.asks.len(), 1,
+            "Micro tier should produce exactly 1 ask, got {}",
+            ladder.asks.len()
+        );
+
+        // Each order should meet min_notional
+        let bid_notional = ladder.bids[0].size * ladder.bids[0].price;
+        let ask_notional = ladder.asks[0].size * ladder.asks[0].price;
+        assert!(
+            bid_notional >= config.min_notional,
+            "Bid notional ${:.2} should meet min_notional ${:.2}",
+            bid_notional, config.min_notional
+        );
+        assert!(
+            ask_notional >= config.min_notional,
+            "Ask notional ${:.2} should meet min_notional ${:.2}",
+            ask_notional, config.min_notional
+        );
+
+        // Bid price should be below mid, ask above
+        assert!(ladder.bids[0].price < market_params.microprice);
+        assert!(ladder.asks[0].price > market_params.microprice);
+    }
+
+    #[test]
+    fn test_micro_tier_respects_position_limits() {
+        use crate::market_maker::config::auto_derive::CapitalTier;
+        use crate::market_maker::strategy::QuotingStrategy;
+
+        // Scenario: Micro tier with existing long position near max
+        // Should still produce ask (reduce-only) but bid should be very small or empty
+        let strategy = LadderStrategy::new(0.07);
+        let config = QuoteConfig {
+            mid_price: 30.0,
+            decimals: 1,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+
+        let mut market_params = MarketParams::default();
+        market_params.microprice = 30.0;
+        market_params.market_mid = 30.0;
+        market_params.capital_tier = CapitalTier::Micro;
+        market_params.margin_available = 100.0;
+        market_params.leverage = 3.0;
+        market_params.margin_quoting_capacity = 3.24;
+
+        let position = 3.0; // Near max
+        let max_position = 3.24;
+        let target_liquidity = 1.0;
+
+        let ladder = strategy.calculate_ladder(
+            &config,
+            position,
+            max_position,
+            target_liquidity,
+            &market_params,
+        );
+
+        // Ask side should have an order (can sell position)
+        assert!(
+            !ladder.asks.is_empty(),
+            "Micro tier with long position should still produce asks for reducing"
+        );
+
+        // Bid side should be limited — only 0.24 contracts remaining capacity
+        // 0.24 * $30 = $7.20 < $10 min_notional → bid should be empty
+        assert!(
+            ladder.bids.is_empty(),
+            "Micro tier near max long should not produce bids (remaining capacity below min_notional)"
+        );
+    }
+
+    #[test]
+    fn test_large_tier_bypasses_concentrated_path() {
+        use crate::market_maker::config::auto_derive::CapitalTier;
+        use crate::market_maker::strategy::QuotingStrategy;
+
+        // Large tier should NOT use concentrated path — should go through
+        // full multi-level generation. Just verify it doesn't crash and
+        // produces more than 1 level per side.
+        let strategy = LadderStrategy::new(0.07);
+        let config = QuoteConfig {
+            mid_price: 30.0,
+            decimals: 1,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+
+        let mut market_params = MarketParams::default();
+        market_params.microprice = 30.0;
+        market_params.market_mid = 30.0;
+        market_params.capital_tier = CapitalTier::Large;
+        market_params.margin_available = 10_000.0;
+        market_params.leverage = 3.0;
+        market_params.margin_quoting_capacity = 1000.0;
+        market_params.sigma_effective = 0.001; // Reasonable sigma for GLFT
+        market_params.sigma = 0.001;
+
+        let position = 0.0;
+        let max_position = 1000.0;
+        let target_liquidity = 100.0;
+
+        let ladder = strategy.calculate_ladder(
+            &config,
+            position,
+            max_position,
+            target_liquidity,
+            &market_params,
+        );
+
+        // Large tier with ample capital should produce multiple levels
+        // (the full multi-level generation path, not concentrated)
+        assert!(
+            ladder.bids.len() + ladder.asks.len() > 2,
+            "Large tier with $10k capital should produce multi-level ladder, got {} bids + {} asks",
+            ladder.bids.len(), ladder.asks.len()
+        );
     }
 }

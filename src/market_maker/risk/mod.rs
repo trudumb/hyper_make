@@ -50,7 +50,7 @@ mod reentry;
 mod state;
 
 pub use aggregator::{AggregatedRisk, RiskAggregator};
-pub use inventory_governor::{InventoryGovernor, PositionAssessment, PositionZone};
+pub use inventory_governor::{InventoryGovernor, PositionAssessment, PositionBudget, PositionZone};
 pub use circuit_breaker::{
     CircuitBreakerAction, CircuitBreakerConfig, CircuitBreakerMonitor, CircuitBreakerType,
 };

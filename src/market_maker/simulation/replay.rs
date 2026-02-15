@@ -266,6 +266,7 @@ impl ReplayEngine {
             ask_has_value: self.spread_bps > self.config.maker_fee_bps * 2.0,
             has_alpha: false, // No cross-venue signal in replay
             position: self.position,
+            capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
         };
         let new_mode = select_mode(&input);
         if new_mode != self.mode {

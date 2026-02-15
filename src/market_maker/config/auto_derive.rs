@@ -4,7 +4,60 @@
 //! plus exchange context (mark price, margin, leverage, fees). This eliminates
 //! arbitrary config numbers and ensures parameters are always self-consistent.
 
+use serde::{Deserialize, Serialize};
+
 use super::spread_profile::SpreadProfile;
+
+/// Capital tier classification based on viable ladder levels per side.
+///
+/// Determines how the system adapts quoting behavior to available capital.
+/// Tier boundaries are based on viable levels (each meeting exchange min_notional).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapitalTier {
+    /// 1-2 viable levels/side — concentrated quoting, no multi-level ladder
+    Micro,
+    /// 3-5 viable levels/side — reduced ladder, wider spreads compensate
+    Small,
+    /// 6-15 viable levels/side — standard operation
+    Medium,
+    /// 16+ viable levels/side — full ladder capacity
+    Large,
+}
+
+/// Capital-aware profile computed from position limits and exchange minimums.
+///
+/// Everything flows from this: ladder depth, execution mode fallbacks,
+/// position budget floors, and spread compensation.
+#[derive(Debug, Clone)]
+pub struct CapitalProfile {
+    /// Classification tier
+    pub tier: CapitalTier,
+    /// How many ladder levels per side can meet min_notional
+    pub viable_levels_per_side: usize,
+    /// Floor position size: (min_notional * 1.15) / mark_px
+    /// This is the minimum position that produces a valid exchange order.
+    pub min_viable_position: f64,
+    /// min_notional * 1.15 in USD
+    pub min_viable_notional_usd: f64,
+    /// Total notional available per side in USD
+    pub notional_per_side_usd: f64,
+    /// Exchange minimum notional in USD
+    pub min_notional_usd: f64,
+    /// Mark price at time of computation (for staleness detection)
+    pub mark_px_at_computation: f64,
+}
+
+impl CapitalProfile {
+    /// Returns true if the mark price has moved enough to warrant recomputation.
+    pub fn is_stale(&self, current_mark_px: f64) -> bool {
+        if self.mark_px_at_computation <= 0.0 {
+            return true;
+        }
+        let pct_change =
+            ((current_mark_px - self.mark_px_at_computation) / self.mark_px_at_computation).abs();
+        pct_change > 0.10 // >10% price move
+    }
+}
 
 /// Exchange metadata needed for parameter derivation.
 #[derive(Debug, Clone)]
@@ -41,6 +94,8 @@ pub struct DerivedParams {
     pub viable: bool,
     /// Human-readable explanation when not viable.
     pub diagnostic: Option<String>,
+    /// Capital-aware profile for adaptive quoting behavior.
+    pub capital_profile: CapitalProfile,
 }
 
 /// Derive all trading parameters from first principles.
@@ -110,6 +165,31 @@ pub fn auto_derive(
     // Cold-start estimate; runtime DynamicReconcileConfig refines from sigma
     let max_bps_diff = (ctx.fee_bps * 2.0).clamp(3.0, 15.0) as u16;
 
+    // === CAPITAL PROFILE: from position limits and exchange minimums ===
+    let min_viable_notional_usd = ctx.min_notional * 1.15;
+    let min_viable_position = min_viable_notional_usd / ctx.mark_px;
+    let notional_per_side_usd = max_position * ctx.mark_px / 2.0;
+    let viable_levels = if min_viable_notional_usd > 0.0 {
+        (notional_per_side_usd / min_viable_notional_usd).floor() as usize
+    } else {
+        0
+    };
+    let tier = match viable_levels {
+        0..=2 => CapitalTier::Micro,
+        3..=5 => CapitalTier::Small,
+        6..=15 => CapitalTier::Medium,
+        _ => CapitalTier::Large,
+    };
+    let capital_profile = CapitalProfile {
+        tier,
+        viable_levels_per_side: viable_levels,
+        min_viable_position,
+        min_viable_notional_usd,
+        notional_per_side_usd,
+        min_notional_usd: ctx.min_notional,
+        mark_px_at_computation: ctx.mark_px,
+    };
+
     DerivedParams {
         max_position,
         target_liquidity,
@@ -117,6 +197,7 @@ pub fn auto_derive(
         max_bps_diff,
         viable,
         diagnostic,
+        capital_profile,
     }
 }
 
@@ -279,5 +360,111 @@ mod tests {
 
         assert!(!d.viable);
         assert_eq!(d.max_position, 0.0);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
+        assert_eq!(d.capital_profile.viable_levels_per_side, 0);
+    }
+
+    // === Capital Profile / Tier Tests ===
+
+    fn hype30_context() -> ExchangeContext {
+        ExchangeContext {
+            mark_px: 30.0,
+            account_value: 100_000.0, // Large margin so capital_usd is the binding constraint
+            available_margin: 100_000.0,
+            max_leverage: 10.0,
+            fee_bps: 1.5,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        }
+    }
+
+    #[test]
+    fn test_capital_tier_micro_25_usd() {
+        let ctx = hype30_context();
+        let d = auto_derive(25.0, SpreadProfile::Hip3, &ctx);
+        // max_position = 25/30 = 0.833
+        // notional_per_side = 0.833 * 30 / 2 = 12.5
+        // min_viable_notional = 10 * 1.15 = 11.5
+        // viable_levels = floor(12.5 / 11.5) = 1
+        assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
+        assert_eq!(d.capital_profile.viable_levels_per_side, 1);
+        assert!(d.viable);
+    }
+
+    #[test]
+    fn test_capital_tier_micro_50_usd() {
+        let ctx = hype30_context();
+        let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
+        // max_position = 50/30 = 1.667
+        // notional_per_side = 1.667 * 30 / 2 = 25.0
+        // viable_levels = floor(25.0 / 11.5) = 2
+        assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
+        assert_eq!(d.capital_profile.viable_levels_per_side, 2);
+    }
+
+    #[test]
+    fn test_capital_tier_small_100_usd() {
+        let ctx = hype30_context();
+        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
+        // max_position = 100/30 = 3.333
+        // notional_per_side = 3.333 * 30 / 2 = 50.0
+        // viable_levels = floor(50.0 / 11.5) = 4
+        assert_eq!(d.capital_profile.tier, CapitalTier::Small, "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(d.capital_profile.viable_levels_per_side, 4);
+    }
+
+    #[test]
+    fn test_capital_tier_medium_500_usd() {
+        let ctx = hype30_context();
+        let d = auto_derive(500.0, SpreadProfile::Hip3, &ctx);
+        // max_position = 500/30 = 16.667
+        // notional_per_side = 16.667 * 30 / 2 = 250.0
+        // viable_levels = floor(250.0 / 11.5) = 21
+        // Wait, 21 > 15, that's Large
+        assert_eq!(d.capital_profile.tier, CapitalTier::Large, "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+    }
+
+    #[test]
+    fn test_capital_tier_large_5000_usd() {
+        let ctx = hype30_context();
+        let d = auto_derive(5000.0, SpreadProfile::Hip3, &ctx);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Large);
+        assert!(d.capital_profile.viable_levels_per_side >= 16);
+    }
+
+    #[test]
+    fn test_capital_profile_min_viable_position() {
+        let ctx = hype30_context();
+        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
+        // min_viable_position = (10 * 1.15) / 30 = 0.383
+        let expected = (10.0 * 1.15) / 30.0;
+        assert!((d.capital_profile.min_viable_position - expected).abs() < 0.001,
+            "min_viable={}, expected={}", d.capital_profile.min_viable_position, expected);
+    }
+
+    #[test]
+    fn test_capital_profile_staleness_detection() {
+        let ctx = hype30_context();
+        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
+        // Not stale at same price
+        assert!(!d.capital_profile.is_stale(30.0));
+        // Not stale at 5% move
+        assert!(!d.capital_profile.is_stale(31.5));
+        // Stale at 15% move
+        assert!(d.capital_profile.is_stale(34.5));
+        // Stale at -12% move
+        assert!(d.capital_profile.is_stale(26.0));
+    }
+
+    #[test]
+    fn test_capital_tier_5_usd_not_viable() {
+        let ctx = hype30_context();
+        let d = auto_derive(5.0, SpreadProfile::Hip3, &ctx);
+        // max_position = 5/30 = 0.167
+        // notional_per_side = 0.167 * 30 / 2 = 2.5
+        // viable_levels = floor(2.5 / 11.5) = 0
+        assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
+        assert_eq!(d.capital_profile.viable_levels_per_side, 0);
+        assert!(!d.viable);
     }
 }

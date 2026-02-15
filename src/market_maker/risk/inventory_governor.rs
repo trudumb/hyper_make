@@ -43,6 +43,81 @@ pub struct PositionAssessment {
     pub increasing_side_spread_mult: f64,
 }
 
+/// Position budget with a min-viable floor that prevents compound reductions
+/// from crushing position below exchange minimums.
+///
+/// Multiple safety systems apply multiplicative reductions (regime, signal, proactive).
+/// Without a floor, three independent 0.3x reductions compound to 0.027x — pushing
+/// a $100 account's position below exchange min_notional ($10).
+///
+/// The floor is the mathematical minimum for placing one valid exchange order.
+#[derive(Debug, Clone)]
+pub struct PositionBudget {
+    /// Starting max position (config.max_position or margin-derived)
+    base_max: f64,
+    /// Floor: minimum position that produces a valid exchange order
+    min_viable: f64,
+    /// Applied reductions: (source_name, multiplier)
+    reductions: Vec<(&'static str, f64)>,
+}
+
+impl PositionBudget {
+    /// Create a new position budget.
+    ///
+    /// `base_max` is the starting position limit (pre-reductions).
+    /// `min_viable` is the floor — typically (min_notional * 1.15) / mark_px.
+    pub fn new(base_max: f64, min_viable: f64) -> Self {
+        Self {
+            base_max,
+            min_viable,
+            reductions: Vec::new(),
+        }
+    }
+
+    /// Apply a multiplicative reduction from a named source.
+    ///
+    /// Multiplier is clamped to [0.0, 1.0]. Multiple reductions compound
+    /// but `effective()` never drops below `min_viable`.
+    pub fn apply_reduction(&mut self, source: &'static str, multiplier: f64) {
+        self.reductions.push((source, multiplier.clamp(0.0, 1.0)));
+    }
+
+    /// Effective position limit after all reductions, floored at min_viable.
+    ///
+    /// `max(base * product_of_reductions, min_viable)` — unless base_max
+    /// itself is below min_viable (startup should reject this).
+    pub fn effective(&self) -> f64 {
+        let product: f64 = self.reductions.iter().map(|(_, m)| m).product();
+        let reduced = self.base_max * product;
+        reduced.max(self.min_viable).min(self.base_max)
+    }
+
+    /// Returns true if the floor is binding (reductions wanted to go lower).
+    pub fn floor_is_binding(&self) -> bool {
+        let product: f64 = self.reductions.iter().map(|(_, m)| m).product();
+        let reduced = self.base_max * product;
+        reduced < self.min_viable
+    }
+
+    /// Human-readable diagnostic of all reductions and the effective result.
+    pub fn diagnostic(&self) -> String {
+        let mut parts = vec![format!("base={:.4}", self.base_max)];
+        for (source, mult) in &self.reductions {
+            parts.push(format!("{}={:.2}x", source, mult));
+        }
+        let product: f64 = self.reductions.iter().map(|(_, m)| m).product();
+        let raw = self.base_max * product;
+        let eff = self.effective();
+        parts.push(format!("raw={:.4}", raw));
+        if self.floor_is_binding() {
+            parts.push(format!("FLOORED→{:.4} (min_viable={:.4})", eff, self.min_viable));
+        } else {
+            parts.push(format!("effective={:.4}", eff));
+        }
+        parts.join(" | ")
+    }
+}
+
 /// Inventory governor — enforces config.max_position as HARD ceiling.
 ///
 /// This is the FIRST check in every quote cycle. Position safety is structural.
@@ -459,5 +534,73 @@ mod tests {
     fn test_position_zone_default() {
         let zone = PositionZone::default();
         assert_eq!(zone, PositionZone::Green);
+    }
+
+    // === PositionBudget tests ===
+
+    #[test]
+    fn test_budget_no_reductions() {
+        let budget = PositionBudget::new(10.0, 0.5);
+        assert!((budget.effective() - 10.0).abs() < 1e-9);
+        assert!(!budget.floor_is_binding());
+    }
+
+    #[test]
+    fn test_budget_single_reduction() {
+        let mut budget = PositionBudget::new(10.0, 0.5);
+        budget.apply_reduction("regime", 0.3);
+        // 10.0 * 0.3 = 3.0, > min_viable 0.5
+        assert!((budget.effective() - 3.0).abs() < 1e-9);
+        assert!(!budget.floor_is_binding());
+    }
+
+    #[test]
+    fn test_budget_compound_reductions_floored() {
+        let mut budget = PositionBudget::new(10.0, 0.5);
+        budget.apply_reduction("regime", 0.3);
+        budget.apply_reduction("signal", 0.3);
+        budget.apply_reduction("proactive", 0.3);
+        // Without floor: 10.0 * 0.3 * 0.3 * 0.3 = 0.27 < 0.5
+        // With floor: max(0.27, 0.5) = 0.5
+        assert!((budget.effective() - 0.5).abs() < 1e-9);
+        assert!(budget.floor_is_binding());
+    }
+
+    #[test]
+    fn test_budget_effective_never_exceeds_base() {
+        let mut budget = PositionBudget::new(1.0, 5.0);
+        // min_viable > base_max: effective capped at base_max
+        assert!((budget.effective() - 1.0).abs() < 1e-9);
+        budget.apply_reduction("regime", 0.5);
+        // 1.0 * 0.5 = 0.5, max(0.5, 5.0) = 5.0, min(5.0, 1.0) = 1.0
+        assert!((budget.effective() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_budget_diagnostic_readable() {
+        let mut budget = PositionBudget::new(3.24, 0.383);
+        budget.apply_reduction("regime", 0.3);
+        budget.apply_reduction("signal", 0.3);
+        let diag = budget.diagnostic();
+        assert!(diag.contains("base=3.2400"));
+        assert!(diag.contains("regime=0.30x"));
+        assert!(diag.contains("signal=0.30x"));
+        assert!(diag.contains("FLOORED"));
+    }
+
+    #[test]
+    fn test_budget_multiplier_clamped() {
+        let mut budget = PositionBudget::new(10.0, 0.5);
+        budget.apply_reduction("bad", 1.5); // Clamped to 1.0
+        assert!((budget.effective() - 10.0).abs() < 1e-9);
+        budget.apply_reduction("bad2", -0.5); // Clamped to 0.0
+        assert!((budget.effective() - 0.5).abs() < 1e-9); // Floored at min_viable
+    }
+
+    #[test]
+    fn test_budget_zero_base() {
+        let budget = PositionBudget::new(0.0, 0.5);
+        // max(0.0, 0.5) = 0.5, min(0.5, 0.0) = 0.0
+        assert!((budget.effective()).abs() < 1e-9);
     }
 }

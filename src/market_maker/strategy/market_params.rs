@@ -1,6 +1,7 @@
 //! Market parameters for quoting strategies.
 
 use crate::market_maker::adverse_selection::DepthDecayAS;
+use crate::market_maker::config::auto_derive::CapitalTier;
 use crate::market_maker::estimator::{MarketEstimator, VolatilityRegime};
 use crate::market_maker::process_models::SpreadRegime;
 
@@ -911,6 +912,11 @@ pub struct MarketParams {
     /// Positive = price rising. Used by GLFT half_spread_with_drift
     /// for asymmetric bid/ask spread (classical μ·T term).
     pub drift_rate_per_sec: f64,
+
+    // === Capital Tier ===
+    /// Capital tier from CapitalProfile for adaptive ladder behavior.
+    /// Micro tier skips multi-level generation and uses concentrated quoting.
+    pub capital_tier: CapitalTier,
 }
 
 impl Default for MarketParams {
@@ -1184,6 +1190,8 @@ impl Default for MarketParams {
             cached_best_ask: 0.0,
             // Drift rate
             drift_rate_per_sec: 0.0,
+            // Capital tier
+            capital_tier: CapitalTier::Large,
         }
     }
 }

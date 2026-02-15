@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::market_maker::adverse_selection::toxicity_regime::ToxicityRegime;
+use crate::market_maker::config::auto_derive::CapitalTier;
 use crate::market_maker::PositionZone;
 
 /// Execution mode determined by the state machine.
@@ -79,6 +80,8 @@ pub struct ModeSelectionInput {
     pub has_alpha: bool,
     /// Current position (positive = long)
     pub position: f64,
+    /// Capital tier from CapitalProfile — affects fallback behavior
+    pub capital_tier: CapitalTier,
 }
 
 /// Pure function: select execution mode from inputs.
@@ -118,9 +121,16 @@ pub fn select_mode(input: &ModeSelectionInput) -> ExecutionMode {
         return ExecutionMode::Maker { bid, ask };
     }
 
-    // 6. No value and no alpha → Flat
+    // 6. No value and no alpha
     if !input.bid_has_value && !input.ask_has_value && !input.has_alpha {
-        return ExecutionMode::Flat;
+        match input.capital_tier {
+            CapitalTier::Micro | CapitalTier::Small => {
+                // Small capital: quote both sides with widened spreads instead of going Flat.
+                // Spread widening provides protection; Flat prevents all learning.
+                return ExecutionMode::Maker { bid: true, ask: true };
+            }
+            _ => return ExecutionMode::Flat,
+        }
     }
 
     // 7. Default: Maker with sides that have value or alpha
@@ -156,6 +166,7 @@ mod tests {
             ask_has_value: true,
             has_alpha: true,
             position: 0.0,
+            capital_tier: CapitalTier::Large, // Default to Large so existing tests pass unchanged
         }
     }
 
@@ -352,5 +363,65 @@ mod tests {
             }
             other => panic!("Expected InventoryReduce, got {other}"),
         }
+    }
+
+    #[test]
+    fn test_micro_tier_no_value_no_alpha_still_quotes() {
+        let input = ModeSelectionInput {
+            bid_has_value: false,
+            ask_has_value: false,
+            has_alpha: false,
+            capital_tier: CapitalTier::Micro,
+            ..default_input()
+        };
+        // Micro tier should override Flat → Maker(both)
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_small_tier_no_value_no_alpha_still_quotes() {
+        let input = ModeSelectionInput {
+            bid_has_value: false,
+            ask_has_value: false,
+            has_alpha: false,
+            capital_tier: CapitalTier::Small,
+            ..default_input()
+        };
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_medium_tier_no_value_no_alpha_flat() {
+        let input = ModeSelectionInput {
+            bid_has_value: false,
+            ask_has_value: false,
+            has_alpha: false,
+            capital_tier: CapitalTier::Medium,
+            ..default_input()
+        };
+        assert_eq!(select_mode(&input), ExecutionMode::Flat);
+    }
+
+    #[test]
+    fn test_micro_tier_toxic_still_flat() {
+        // Even Micro tier can't override Kill/Toxic safety
+        let input = ModeSelectionInput {
+            position_zone: PositionZone::Kill,
+            capital_tier: CapitalTier::Micro,
+            ..default_input()
+        };
+        assert_eq!(select_mode(&input), ExecutionMode::Flat);
     }
 }

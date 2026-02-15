@@ -56,7 +56,29 @@ use crate::market_maker::estimator::{
 };
 use crate::market_maker::infra::{BinanceTradeUpdate, LeadLagSignal};
 use std::cell::Cell;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Signal availability state for cross-venue feeds.
+///
+/// Tracks whether this asset has a Binance/cross-venue pair configured,
+/// whether signal is currently active, or has degraded. The key behavioral
+/// difference: `NeverConfigured` compensates with wider spreads instead of
+/// crushing position limits (which kills small accounts).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignalAvailability {
+    /// No cross-venue feed configured for this asset (e.g. HIP-3 DEX tokens).
+    /// Compensates through spread widening (1.5x), NOT position reduction.
+    NeverConfigured,
+    /// Cross-venue signal is active and healthy.
+    Available,
+    /// Signal was available but degraded. Graduated reduction over time.
+    Degraded {
+        /// When the signal was last healthy (seconds ago).
+        last_healthy_secs_ago: f64,
+        /// How many seconds until full reduction applies.
+        max_reduction_after_secs: f64,
+    },
+}
 
 /// Lag analyzer diagnostic status.
 pub struct LagAnalyzerStatus<'a> {
@@ -500,10 +522,10 @@ pub struct SignalIntegrator {
     predicted_alpha: f64,
     /// Estimated half-spread in bps (from kappa-derived GLFT spread).
     half_spread_estimate_bps: f64,
-    /// Whether cross-venue signal has ever been valid this session.
-    has_had_cross_venue: Cell<bool>,
-    /// Whether we've logged the no-signal warning.
-    logged_no_signal_warning: Cell<bool>,
+    /// Cross-venue signal availability state machine.
+    signal_availability: Cell<SignalAvailability>,
+    /// Whether we've logged the initial signal availability state.
+    logged_signal_state: Cell<bool>,
 
     // === CUSUM Predictive Lead-Lag (Phase 5) ===
     /// CUSUM changepoint detector for rapid divergence detection.
@@ -515,6 +537,14 @@ pub struct SignalIntegrator {
 impl SignalIntegrator {
     /// Create a new signal integrator.
     pub fn new(config: SignalIntegratorConfig) -> Self {
+        let initial_availability = if config.use_lead_lag || config.use_cross_venue {
+            SignalAvailability::Degraded {
+                last_healthy_secs_ago: 0.0,
+                max_reduction_after_secs: 300.0,
+            }
+        } else {
+            SignalAvailability::NeverConfigured
+        };
         Self {
             lag_analyzer: LagAnalyzer::new(config.lag_config.clone()),
             lead_lag_stability: LeadLagStabilityGate::default(),
@@ -539,8 +569,8 @@ impl SignalIntegrator {
             max_position: 0.0,
             predicted_alpha: 0.5,
             half_spread_estimate_bps: 5.0,
-            has_had_cross_venue: Cell::new(false),
-            logged_no_signal_warning: Cell::new(false),
+            signal_availability: Cell::new(initial_availability),
+            logged_signal_state: Cell::new(false),
             cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector::default(),
             cusum_divergence_bps: 0.0,
         }
@@ -1051,17 +1081,43 @@ impl SignalIntegrator {
                 (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
         }
 
-        // Track if we've ever had cross-venue signal
+        // Update signal availability state machine
+        let current = self.signal_availability.get();
         if signals.cross_venue_valid || signals.lead_lag_actionable {
-            self.has_had_cross_venue.set(true);
-        }
-
-        // No-signal safety mode: log warning once when no cross-venue feed is available
-        if !self.has_had_cross_venue.get() && !self.logged_no_signal_warning.get() {
-            tracing::warn!(
-                "No cross-venue signal available — running in symmetric mode with reduced position limits (30%)"
-            );
-            self.logged_no_signal_warning.set(true);
+            // Signal is healthy — transition to Available
+            if current != SignalAvailability::Available {
+                self.signal_availability.set(SignalAvailability::Available);
+            }
+        } else {
+            match current {
+                SignalAvailability::Available => {
+                    // Signal was healthy but just lost — start degradation
+                    self.signal_availability.set(SignalAvailability::Degraded {
+                        last_healthy_secs_ago: 0.0,
+                        max_reduction_after_secs: 300.0,
+                    });
+                }
+                SignalAvailability::Degraded {
+                    last_healthy_secs_ago,
+                    max_reduction_after_secs,
+                } => {
+                    // Increment degradation timer (~1s per cycle)
+                    self.signal_availability.set(SignalAvailability::Degraded {
+                        last_healthy_secs_ago: last_healthy_secs_ago + 1.0,
+                        max_reduction_after_secs,
+                    });
+                }
+                SignalAvailability::NeverConfigured => {
+                    // No cross-venue configured — log once
+                    if !self.logged_signal_state.get() {
+                        warn!(
+                            "No cross-venue signal configured — compensating with wider spreads (1.5x), \
+                             no position reduction"
+                        );
+                        self.logged_signal_state.set(true);
+                    }
+                }
+            }
         }
 
         // === FLOW URGENCY SKEW: Aggressive skew when directional flow is strong ===
@@ -1259,16 +1315,52 @@ impl SignalIntegrator {
     pub fn disable_binance_signals(&mut self) {
         self.config.use_lead_lag = false;
         self.config.use_cross_venue = false;
+        self.signal_availability.set(SignalAvailability::NeverConfigured);
     }
 
     /// Returns position limit multiplier based on signal availability.
-    /// 0.30 when no cross-venue signal has ever been available, 1.0 otherwise.
+    ///
+    /// Key change from old behavior: `NeverConfigured` returns 1.0 (was 0.30),
+    /// preventing small accounts from being crushed below exchange minimums.
+    /// `Degraded` graduates from 1.0 to 0.5 over `max_reduction_after_secs`.
     pub fn signal_position_limit_mult(&self) -> f64 {
-        if self.has_had_cross_venue.get() {
-            1.0
-        } else {
-            0.30
+        match self.signal_availability.get() {
+            SignalAvailability::NeverConfigured => 1.0,
+            SignalAvailability::Available => 1.0,
+            SignalAvailability::Degraded {
+                last_healthy_secs_ago,
+                max_reduction_after_secs,
+            } => {
+                let progress =
+                    (last_healthy_secs_ago / max_reduction_after_secs).clamp(0.0, 1.0);
+                1.0 - 0.5 * progress
+            }
         }
+    }
+
+    /// Returns spread widening multiplier based on signal availability.
+    ///
+    /// `NeverConfigured` widens spreads 1.5x to compensate for missing signal
+    /// (instead of reducing position limits which kills small accounts).
+    /// `Degraded` graduates from 1.0 to 1.5 over `max_reduction_after_secs`.
+    pub fn signal_spread_widening_mult(&self) -> f64 {
+        match self.signal_availability.get() {
+            SignalAvailability::NeverConfigured => 1.5,
+            SignalAvailability::Available => 1.0,
+            SignalAvailability::Degraded {
+                last_healthy_secs_ago,
+                max_reduction_after_secs,
+            } => {
+                let progress =
+                    (last_healthy_secs_ago / max_reduction_after_secs).clamp(0.0, 1.0);
+                1.0 + 0.5 * progress
+            }
+        }
+    }
+
+    /// Get current signal availability state.
+    pub fn signal_availability(&self) -> SignalAvailability {
+        self.signal_availability.get()
     }
 
     /// Get lag analyzer status for diagnostics.
@@ -1341,8 +1433,17 @@ impl SignalIntegrator {
         self.max_position = 0.0;
         self.predicted_alpha = 0.5;
         self.half_spread_estimate_bps = 5.0;
-        self.has_had_cross_venue.set(false);
-        self.logged_no_signal_warning.set(false);
+        self.signal_availability.set(
+            if self.config.use_lead_lag || self.config.use_cross_venue {
+                SignalAvailability::Degraded {
+                    last_healthy_secs_ago: 0.0,
+                    max_reduction_after_secs: 300.0,
+                }
+            } else {
+                SignalAvailability::NeverConfigured
+            },
+        );
+        self.logged_signal_state.set(false);
     }
 }
 
@@ -1604,6 +1705,10 @@ mod tests {
 
         integrator.disable_binance_signals();
         let first = integrator.staleness_spread_multiplier();
+        assert_eq!(
+            integrator.signal_availability(),
+            SignalAvailability::NeverConfigured
+        );
 
         integrator.disable_binance_signals();
         let second = integrator.staleness_spread_multiplier();
@@ -1614,6 +1719,10 @@ mod tests {
         );
         assert!(!integrator.config.use_lead_lag);
         assert!(!integrator.config.use_cross_venue);
+        assert_eq!(
+            integrator.signal_availability(),
+            SignalAvailability::NeverConfigured
+        );
     }
 
     #[test]
@@ -2026,12 +2135,16 @@ mod tests {
 
     #[test]
     fn test_no_signal_safety_mode() {
+        // Default config has use_lead_lag=true, so starts in Degraded (not NeverConfigured)
         let config = SignalIntegratorConfig::default();
         let integrator = SignalIntegrator::new(config);
 
-        // Initially no cross-venue signal
-        assert!(!integrator.has_had_cross_venue.get());
-        assert_eq!(integrator.signal_position_limit_mult(), 0.30);
+        // Initially Degraded with last_healthy_secs_ago=0.0 → mult=1.0
+        assert!(matches!(
+            integrator.signal_availability(),
+            SignalAvailability::Degraded { .. }
+        ));
+        assert_eq!(integrator.signal_position_limit_mult(), 1.0);
     }
 
     #[test]
@@ -2040,7 +2153,101 @@ mod tests {
         let integrator = SignalIntegrator::new(config);
 
         // Simulate cross-venue signal becoming valid
-        integrator.has_had_cross_venue.set(true);
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Available);
         assert_eq!(integrator.signal_position_limit_mult(), 1.0);
+    }
+
+    #[test]
+    fn test_never_configured_no_position_reduction() {
+        // NeverConfigured returns position_limit_mult=1.0 (was 0.30 — the key fix)
+        let config = SignalIntegratorConfig::disabled();
+        let integrator = SignalIntegrator::new(config);
+
+        assert_eq!(
+            integrator.signal_availability(),
+            SignalAvailability::NeverConfigured
+        );
+        assert_eq!(integrator.signal_position_limit_mult(), 1.0);
+    }
+
+    #[test]
+    fn test_never_configured_widens_spreads() {
+        // NeverConfigured returns spread_widening_mult=1.5
+        let config = SignalIntegratorConfig::disabled();
+        let integrator = SignalIntegrator::new(config);
+
+        assert_eq!(
+            integrator.signal_availability(),
+            SignalAvailability::NeverConfigured
+        );
+        assert!((integrator.signal_spread_widening_mult() - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_degraded_graduates_position_reduction() {
+        let config = SignalIntegratorConfig::default();
+        let integrator = SignalIntegrator::new(config);
+
+        // At 0 seconds → mult = 1.0
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Degraded {
+                last_healthy_secs_ago: 0.0,
+                max_reduction_after_secs: 300.0,
+            });
+        assert!((integrator.signal_position_limit_mult() - 1.0).abs() < f64::EPSILON);
+
+        // At 150 seconds (halfway) → mult = 0.75
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Degraded {
+                last_healthy_secs_ago: 150.0,
+                max_reduction_after_secs: 300.0,
+            });
+        assert!((integrator.signal_position_limit_mult() - 0.75).abs() < f64::EPSILON);
+
+        // At 300+ seconds (fully degraded) → mult = 0.5
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Degraded {
+                last_healthy_secs_ago: 500.0,
+                max_reduction_after_secs: 300.0,
+            });
+        assert!((integrator.signal_position_limit_mult() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_degraded_graduates_spread_widening() {
+        let config = SignalIntegratorConfig::default();
+        let integrator = SignalIntegrator::new(config);
+
+        // At 0 seconds → mult = 1.0
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Degraded {
+                last_healthy_secs_ago: 0.0,
+                max_reduction_after_secs: 300.0,
+            });
+        assert!((integrator.signal_spread_widening_mult() - 1.0).abs() < f64::EPSILON);
+
+        // At 150 seconds (halfway) → mult = 1.25
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Degraded {
+                last_healthy_secs_ago: 150.0,
+                max_reduction_after_secs: 300.0,
+            });
+        assert!((integrator.signal_spread_widening_mult() - 1.25).abs() < f64::EPSILON);
+
+        // At 300+ seconds (fully degraded) → mult = 1.5
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Degraded {
+                last_healthy_secs_ago: 500.0,
+                max_reduction_after_secs: 300.0,
+            });
+        assert!((integrator.signal_spread_widening_mult() - 1.5).abs() < f64::EPSILON);
     }
 }

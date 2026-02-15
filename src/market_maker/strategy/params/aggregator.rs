@@ -728,6 +728,8 @@ impl ParameterAggregator {
             learned_params_calibrated: sources.learned_params.is_some_and(|l| l.calibrated),
             // Drift rate defaults to 0.0 (no drift); set by HJB controller
             drift_rate_per_sec: 0.0,
+            // Capital tier — set by quote_engine after build, default Large
+            capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
         }
     }
 }
