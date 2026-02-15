@@ -72,10 +72,14 @@
 //! - **avg_time_to_cancel_ms**: Average time from placement to cancel
 
 mod fill_tracker;
+pub mod mode_handlers;
 mod order_lifecycle;
+pub mod state_machine;
 
 // Re-export key types
 pub use fill_tracker::{FillMetrics, FillRecord, FillTracker, Side};
+pub use mode_handlers::apply_mode_to_ladder;
+pub use state_machine::{ExecutionMode, ModeSelectionInput, select_mode};
 pub use order_lifecycle::{
     CancelAnalysis, CreateOrderParams, FillStatistics, OrderEvent, OrderLifecycle,
     OrderLifecycleTracker, OrderState,

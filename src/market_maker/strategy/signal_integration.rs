@@ -504,6 +504,12 @@ pub struct SignalIntegrator {
     has_had_cross_venue: Cell<bool>,
     /// Whether we've logged the no-signal warning.
     logged_no_signal_warning: Cell<bool>,
+
+    // === CUSUM Predictive Lead-Lag (Phase 5) ===
+    /// CUSUM changepoint detector for rapid divergence detection.
+    cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector,
+    /// Last CUSUM-detected divergence (bps), cleared when MI confirms.
+    cusum_divergence_bps: f64,
 }
 
 impl SignalIntegrator {
@@ -535,6 +541,8 @@ impl SignalIntegrator {
             half_spread_estimate_bps: 5.0,
             has_had_cross_venue: Cell::new(false),
             logged_no_signal_warning: Cell::new(false),
+            cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector::default(),
+            cusum_divergence_bps: 0.0,
         }
     }
 
@@ -548,6 +556,10 @@ impl SignalIntegrator {
     // =========================================================================
 
     /// Update with Binance price.
+    ///
+    /// Phase 5: Also feeds CUSUM detector for preemptive (graduated) skew.
+    /// On CUSUM detection without MI confirmation: 30% skew.
+    /// On MI confirmation: full skew (existing behavior).
     pub fn on_binance_price(&mut self, mid_price: f64, timestamp_ms: i64) {
         if !self.config.use_lead_lag || mid_price <= 0.0 {
             return;
@@ -555,6 +567,16 @@ impl SignalIntegrator {
 
         self.latest_binance_mid = mid_price;
         self.lag_analyzer.add_signal(timestamp_ms, mid_price);
+
+        // Phase 5: CUSUM detection for preemptive skew
+        if self.latest_hl_mid > 0.0 {
+            let divergence_bps =
+                (mid_price - self.latest_hl_mid) / self.latest_hl_mid * 10_000.0;
+            if let Some(detected_bps) = self.cusum_detector.observe(divergence_bps) {
+                // CUSUM detected a significant divergence — apply preemptive skew
+                self.cusum_divergence_bps = detected_bps;
+            }
+        }
 
         // Update lead-lag signal with stability gate
         if let Some((lag_ms, mi)) = self.lag_analyzer.optimal_lag() {
@@ -572,6 +594,11 @@ impl SignalIntegrator {
                 self.config.min_mi_threshold,
                 stability_conf,
             );
+
+            // MI confirmed — clear CUSUM preemptive state (full skew takes over)
+            if self.last_lead_lag_signal.is_actionable {
+                self.cusum_divergence_bps = 0.0;
+            }
         } else {
             // MI insignificant or lag unavailable — mark signal stale
             self.last_lead_lag_signal.is_actionable = false;
@@ -790,6 +817,19 @@ impl SignalIntegrator {
                 * ll_weight;
             signals.lead_lag_actionable = ll_weight > 0.0;
             signals.binance_hl_diff_bps = self.last_lead_lag_signal.diff_bps;
+        } else if self.config.use_lead_lag
+            && self.cusum_divergence_bps.abs() > 1.0
+            && self.cusum_detector.is_warmed_up()
+        {
+            // Phase 5: Preemptive skew from CUSUM detection (30% confidence)
+            // CUSUM detected divergence but MI hasn't confirmed yet.
+            let preemptive_skew = self.cusum_divergence_bps * 0.3;
+            signals.lead_lag_skew_bps = preemptive_skew
+                .abs()
+                .min(self.config.max_lead_lag_skew_bps);
+            signals.skew_direction = if preemptive_skew > 0.0 { 1 } else { -1 };
+            signals.lead_lag_actionable = true;
+            signals.binance_hl_diff_bps = self.cusum_divergence_bps;
         }
 
         // === Informed Flow ===
@@ -1106,6 +1146,11 @@ impl SignalIntegrator {
     /// Get current lead-lag signal.
     pub fn lead_lag_signal(&self) -> LeadLagSignal {
         self.last_lead_lag_signal
+    }
+
+    /// Whether the CUSUM detector has a preemptive divergence pending.
+    pub fn has_cusum_divergence(&self) -> bool {
+        self.cusum_divergence_bps.abs() > 1.0 && self.cusum_detector.is_warmed_up()
     }
 
     /// Get current flow decomposition.

@@ -16,6 +16,7 @@ pub mod core;
 mod estimator;
 pub mod events;
 pub mod execution;
+pub mod features;
 pub mod fills;
 pub mod infra;
 pub mod messages;
@@ -29,6 +30,7 @@ pub mod tracking;
 
 pub mod control;
 pub mod edge;
+pub mod models;
 pub mod latent;
 pub mod learning;
 pub mod monitoring;
@@ -293,10 +295,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Enables learning from expired quotes and computing optimal spread = argmax(edge × fill_rate).
     quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker,
 
-    // === Toxicity Cancel Cooldown ===
-    /// Last time toxicity-triggered order cancellation occurred (epoch ms).
-    /// Minimum 5s between toxicity cancels to avoid cancel storms.
-    last_toxicity_cancel_ms: u64,
+    // === Queue Value ===
+    /// Heuristic for level-by-level quote filtering based on expected edge.
+    /// Used by ExecutionMode selection and per-level filtering in quote_engine.rs.
+    queue_value_heuristic: models::QueueValueHeuristic,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -472,7 +474,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             ),
             // Phase 5: Quote outcome tracking for unbiased edge estimation
             quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
-            last_toxicity_cancel_ms: 0,
+            queue_value_heuristic: models::QueueValueHeuristic::new(),
         }
     }
 

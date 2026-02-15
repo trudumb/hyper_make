@@ -632,6 +632,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.tier1.pre_fill_classifier.set_blend_weight(0.3);
         }
 
+        // === Compute OFI-based toxicity regime ===
+        // ToxicityRegime classifies {Benign, Normal, Toxic} using base toxicity + OFI acceleration.
+        // Must be computed before FeatureSnapshot and ExecutionMode.
+        let ofi_1s = self.stochastic.trade_flow_tracker.imbalance_at_1s();
+        let ofi_5s = self.stochastic.trade_flow_tracker.imbalance_at_5s();
+        self.tier1.pre_fill_classifier.update_ofi(ofi_1s);
+        let current_toxicity_regime = self.tier1.pre_fill_classifier.toxicity_regime(ofi_1s, ofi_5s);
+
         let sources = ParameterSources {
             estimator: &self.estimator,
             adverse_selection: &self.tier1.adverse_selection,
@@ -701,6 +709,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             },
         };
         let mut market_params = ParameterAggregator::build(&sources);
+
+        // === Construct FeatureSnapshot for downstream models ===
+        // Compact projection of market state for toxicity classification,
+        // queue-value estimation, and execution mode selection.
+        let feature_snapshot = crate::market_maker::features::FeatureSnapshot::from_market_state(
+            &market_params,
+            &belief_snapshot,
+            &self.stochastic.trade_flow_tracker,
+            self.position.position(),
+            self.config.max_position,
+        );
 
         // === Phase 6: WARMUP GRADUATED UNCERTAINTY ===
         // During warmup (few fills), quote tighter to attract fills and limit size.
@@ -2264,6 +2283,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let max_one_side = ladder.total_ask_size().max(ladder.total_bid_size());
         self.safety.kill_switch.set_ladder_depth(max_one_side);
 
+        // === EXECUTION MODE: Compute from position zone + toxicity regime ===
+        // Replaces QuoteGate side-masking (Phase 4) and hardcoded toxicity filter (Phase 3).
+        let execution_mode = {
+            use crate::market_maker::execution::{select_mode, ModeSelectionInput};
+            let input = ModeSelectionInput {
+                position_zone: position_assessment.zone,
+                toxicity_regime: current_toxicity_regime,
+                bid_has_value: self.queue_value_heuristic.should_quote(
+                    feature_snapshot.spread_bps / 2.0,
+                    current_toxicity_regime,
+                    feature_snapshot.queue_rank_bid,
+                ),
+                ask_has_value: self.queue_value_heuristic.should_quote(
+                    feature_snapshot.spread_bps / 2.0,
+                    current_toxicity_regime,
+                    feature_snapshot.queue_rank_ask,
+                ),
+                has_alpha: signals.lead_lag_actionable
+                    || self.stochastic.signal_integrator.has_cusum_divergence(),
+                position: self.position.position(),
+            };
+            select_mode(&input)
+        };
+        debug!(
+            mode = %execution_mode,
+            toxicity = ?current_toxicity_regime,
+            zone = ?position_assessment.zone,
+            "Execution mode computed"
+        );
+
         if !ladder.bids.is_empty() || !ladder.asks.is_empty() {
             // Multi-level ladder mode
             let mut bid_quotes: Vec<Quote> = ladder
@@ -2277,91 +2326,108 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .map(|l| Quote::new(l.price, l.size))
                 .collect();
 
-            // === QUOTE GATE: Apply one-sided filtering if needed ===
-            match &quote_gate_decision {
-                QuoteGateDecision::QuoteOnlyBids { urgency: _ } => {
-                    // Only quote bids (buying) - clear asks
-                    if !ask_quotes.is_empty() {
-                        info!(
-                            cleared_asks = ask_quotes.len(),
-                            "Quote gate: clearing ASK side (only quoting bids)"
-                        );
+            // === EXECUTION MODE: structural side selection ===
+            // Subsumes QuoteGate's QuoteOnlyBids/QuoteOnlyAsks decisions:
+            // - PositionZone::Yellow + long → Maker { bid: false, ask: true }
+            // - ToxicityRegime::Toxic + positioned → InventoryReduce
+            // QuoteGate's spread-width decisions (WidenSpreads, NoQuote) are untouched
+            // (applied earlier via market_params.spread_widening_mult).
+            {
+                use crate::market_maker::execution::ExecutionMode;
+                match execution_mode {
+                    ExecutionMode::Flat => {
+                        bid_quotes.clear();
                         ask_quotes.clear();
                     }
-                }
-                QuoteGateDecision::QuoteOnlyAsks { urgency: _ } => {
-                    // Only quote asks (selling) - clear bids
-                    if !bid_quotes.is_empty() {
-                        info!(
-                            cleared_bids = bid_quotes.len(),
-                            "Quote gate: clearing BID side (only quoting asks)"
-                        );
-                        bid_quotes.clear();
+                    ExecutionMode::Maker { bid, ask } => {
+                        if !bid {
+                            bid_quotes.clear();
+                        }
+                        if !ask {
+                            ask_quotes.clear();
+                        }
                     }
-                }
-                QuoteGateDecision::QuoteBoth
-                | QuoteGateDecision::NoQuote { .. }
-                | QuoteGateDecision::WidenSpreads { .. } => {
-                    // QuoteBoth: normal, no filtering
-                    // NoQuote: should have returned early, but defensive
-                    // WidenSpreads: quote both sides (spread widening applied earlier)
+                    ExecutionMode::InventoryReduce { urgency } => {
+                        let pos = self.position.position();
+                        if pos > 1e-9 {
+                            bid_quotes.clear();
+                            ask_quotes.truncate(1);
+                            for q in ask_quotes.iter_mut() {
+                                q.size *= 0.5 + 0.5 * urgency;
+                            }
+                        } else if pos < -1e-9 {
+                            ask_quotes.clear();
+                            bid_quotes.truncate(1);
+                            for q in bid_quotes.iter_mut() {
+                                q.size *= 0.5 + 0.5 * urgency;
+                            }
+                        }
+                    }
                 }
             }
 
-            // === TOXICITY-BASED DEFENSE: Cancel or reduce sizes based on toxicity ===
-            // Extreme toxicity (>0.75): clear that side entirely to avoid BBO pickoff.
-            // Moderate toxicity (0.5-0.75): reduce sizes proportionally.
-            // Rate-limited to prevent cancel storms.
+            // === TOXICITY-BASED DEFENSE (regime-aware) ===
+            // Replaces hardcoded 0.75/0.50 thresholds with ToxicityRegime classification.
+            // ToxicityRegime has built-in hysteresis, so no cooldown timer needed.
             {
-                const TOXICITY_CANCEL_THRESHOLD: f64 = 0.75;
-                const TOXICITY_SIZE_THRESHOLD: f64 = 0.5;
-                const MIN_SIZE_MULT: f64 = 0.3;
-                const TOXICITY_CANCEL_COOLDOWN_MS: u64 = 5_000;
-
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-
-                let bid_tox = market_params.pre_fill_toxicity_bid;
-                let ask_tox = market_params.pre_fill_toxicity_ask;
-
-                let cooldown_ok = now_ms.saturating_sub(self.last_toxicity_cancel_ms) >= TOXICITY_CANCEL_COOLDOWN_MS;
-
-                // Extreme toxicity: cancel side entirely
-                if cooldown_ok && bid_tox > TOXICITY_CANCEL_THRESHOLD && !bid_quotes.is_empty() {
-                    info!(
-                        bid_toxicity = %format!("{:.3}", bid_tox),
-                        cleared_bids = bid_quotes.len(),
-                        "Toxicity cancel: clearing BID side (extreme toxicity)"
-                    );
-                    bid_quotes.clear();
-                    self.last_toxicity_cancel_ms = now_ms;
-                } else if bid_tox > TOXICITY_SIZE_THRESHOLD && !bid_quotes.is_empty() {
-                    // Moderate toxicity: reduce sizes proportionally
-                    // tox=0.5 → mult=1.0, tox=0.75 → mult=0.5, clamped to [0.3, 1.0]
-                    let bid_size_mult = (1.0 - (bid_tox - TOXICITY_SIZE_THRESHOLD) * 2.0)
-                        .clamp(MIN_SIZE_MULT, 1.0);
-                    for q in bid_quotes.iter_mut() {
-                        q.size *= bid_size_mult;
+                use crate::market_maker::adverse_selection::ToxicityRegime;
+                match current_toxicity_regime {
+                    ToxicityRegime::Toxic => {
+                        // Extreme: clear both sides, or only reducing side if positioned
+                        let pos = self.position.position();
+                        if pos.abs() < 1e-9 {
+                            bid_quotes.clear();
+                            ask_quotes.clear();
+                        } else if pos > 0.0 {
+                            bid_quotes.clear(); // Cancel increasing side
+                            for q in ask_quotes.iter_mut() {
+                                q.size *= 0.5;
+                            } // Reduce reducing side
+                        } else {
+                            ask_quotes.clear();
+                            for q in bid_quotes.iter_mut() {
+                                q.size *= 0.5;
+                            }
+                        }
                     }
-                }
-
-                if cooldown_ok && ask_tox > TOXICITY_CANCEL_THRESHOLD && !ask_quotes.is_empty() {
-                    info!(
-                        ask_toxicity = %format!("{:.3}", ask_tox),
-                        cleared_asks = ask_quotes.len(),
-                        "Toxicity cancel: clearing ASK side (extreme toxicity)"
-                    );
-                    ask_quotes.clear();
-                    self.last_toxicity_cancel_ms = now_ms;
-                } else if ask_tox > TOXICITY_SIZE_THRESHOLD && !ask_quotes.is_empty() {
-                    let ask_size_mult = (1.0 - (ask_tox - TOXICITY_SIZE_THRESHOLD) * 2.0)
-                        .clamp(MIN_SIZE_MULT, 1.0);
-                    for q in ask_quotes.iter_mut() {
-                        q.size *= ask_size_mult;
+                    ToxicityRegime::Normal => {
+                        // Moderate: graduated size reduction on both sides
+                        let bid_tox = market_params.pre_fill_toxicity_bid;
+                        let ask_tox = market_params.pre_fill_toxicity_ask;
+                        let bid_mult = (1.5 - bid_tox * 2.0).clamp(0.3, 1.0);
+                        let ask_mult = (1.5 - ask_tox * 2.0).clamp(0.3, 1.0);
+                        for q in bid_quotes.iter_mut() {
+                            q.size *= bid_mult;
+                        }
+                        for q in ask_quotes.iter_mut() {
+                            q.size *= ask_mult;
+                        }
                     }
+                    ToxicityRegime::Benign => {} // No filtering
                 }
+            }
+
+            // === QUEUE VALUE: filter individual levels with negative expected edge ===
+            // After mode selection and toxicity filtering, remove levels where quoting
+            // has negative expected value (tight levels during Toxic periods).
+            {
+                let mid = quote_config.mid_price;
+                bid_quotes.retain(|q| {
+                    let depth_bps = ((mid - q.price) / mid * 10_000.0).max(0.0);
+                    self.queue_value_heuristic.should_quote(
+                        depth_bps,
+                        current_toxicity_regime,
+                        feature_snapshot.queue_rank_bid,
+                    )
+                });
+                ask_quotes.retain(|q| {
+                    let depth_bps = ((q.price - mid) / mid * 10_000.0).max(0.0);
+                    self.queue_value_heuristic.should_quote(
+                        depth_bps,
+                        current_toxicity_regime,
+                        feature_snapshot.queue_rank_ask,
+                    )
+                });
             }
 
             // === RISK LEVEL EMERGENCY FILTER ===
@@ -2779,28 +2845,32 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &market_params,
             );
 
-            // === QUOTE GATE: Apply one-sided filtering if needed (single-quote mode) ===
-            match &quote_gate_decision {
-                QuoteGateDecision::QuoteOnlyBids { .. } => {
-                    // Only quote bids (buying) - clear ask
-                    if ask.is_some() {
-                        debug!("Quote gate: clearing ASK quote (single-quote mode)");
+            // === EXECUTION MODE: structural side selection (single-quote mode) ===
+            {
+                use crate::market_maker::execution::ExecutionMode;
+                match execution_mode {
+                    ExecutionMode::Flat => {
+                        bid = None;
                         ask = None;
                     }
-                }
-                QuoteGateDecision::QuoteOnlyAsks { .. } => {
-                    // Only quote asks (selling) - clear bid
-                    if bid.is_some() {
-                        debug!("Quote gate: clearing BID quote (single-quote mode)");
-                        bid = None;
+                    ExecutionMode::Maker { bid: bid_ok, ask: ask_ok } => {
+                        if !bid_ok { bid = None; }
+                        if !ask_ok { ask = None; }
                     }
-                }
-                QuoteGateDecision::QuoteBoth
-                | QuoteGateDecision::NoQuote { .. }
-                | QuoteGateDecision::WidenSpreads { .. } => {
-                    // QuoteBoth: normal, no filtering
-                    // NoQuote: should have returned early, but defensive
-                    // WidenSpreads: quote both sides (spread widening applied earlier)
+                    ExecutionMode::InventoryReduce { urgency } => {
+                        let pos = self.position.position();
+                        if pos > 1e-9 {
+                            bid = None;
+                            if let Some(q) = ask.as_mut() {
+                                q.size *= 0.5 + 0.5 * urgency;
+                            }
+                        } else if pos < -1e-9 {
+                            ask = None;
+                            if let Some(q) = bid.as_mut() {
+                                q.size *= 0.5 + 0.5 * urgency;
+                            }
+                        }
+                    }
                 }
             }
 

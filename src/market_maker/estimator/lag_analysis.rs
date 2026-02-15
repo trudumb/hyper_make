@@ -888,6 +888,108 @@ impl LeadLagStabilityDiagnostics {
     }
 }
 
+/// CUSUM changepoint detector for rapid divergence detection.
+///
+/// Detects when the Binance-HL price difference shifts significantly
+/// within 1-2 observations, before the MI-based lag analyzer can confirm.
+/// Used for preemptive (graduated) skew in `signal_integration.rs`.
+#[derive(Debug, Clone)]
+pub struct CusumDetector {
+    /// Cumulative sum (positive direction)
+    s_pos: f64,
+    /// Cumulative sum (negative direction)
+    s_neg: f64,
+    /// Running mean of divergence
+    mean: f64,
+    /// Running variance of divergence
+    variance: f64,
+    /// Number of observations
+    count: u64,
+    /// Detection threshold in standard deviations
+    threshold_sigma: f64,
+    /// EWMA smoothing for mean/variance
+    alpha: f64,
+}
+
+impl Default for CusumDetector {
+    fn default() -> Self {
+        Self::new(3.0, 0.05)
+    }
+}
+
+impl CusumDetector {
+    /// Create a CUSUM detector.
+    ///
+    /// - `threshold_sigma`: Number of standard deviations for detection (default 3.0)
+    /// - `alpha`: EWMA smoothing for running statistics (default 0.05)
+    pub fn new(threshold_sigma: f64, alpha: f64) -> Self {
+        Self {
+            s_pos: 0.0,
+            s_neg: 0.0,
+            mean: 0.0,
+            variance: 1.0, // Start with unit variance to avoid divide-by-zero
+            count: 0,
+            threshold_sigma,
+            alpha,
+        }
+    }
+
+    /// Feed a new divergence observation (e.g., Binance_mid - HL_mid in bps).
+    ///
+    /// Returns `Some(divergence_bps)` if a changepoint is detected, `None` otherwise.
+    pub fn observe(&mut self, divergence_bps: f64) -> Option<f64> {
+        self.count += 1;
+
+        // Update running statistics — track variance around zero (fair pricing baseline)
+        self.variance =
+            (1.0 - self.alpha) * self.variance + self.alpha * divergence_bps * divergence_bps;
+
+        // Track mean for informational purposes (used externally)
+        if self.count == 1 {
+            self.mean = divergence_bps;
+        } else {
+            self.mean += self.alpha * (divergence_bps - self.mean);
+        }
+
+        // Don't fire during warmup — statistics unreliable
+        if self.count < 10 {
+            return None;
+        }
+
+        // Normalize by RMS of divergence (std dev around zero, not around mean)
+        let std_dev = self.variance.sqrt().max(0.1); // Floor to avoid noise amplification
+        let normalized = divergence_bps / std_dev;
+
+        // Update CUSUM statistics
+        self.s_pos = (self.s_pos + normalized).max(0.0);
+        self.s_neg = (self.s_neg - normalized).max(0.0);
+
+        let threshold = self.threshold_sigma;
+
+        if self.s_pos > threshold {
+            self.s_pos = 0.0; // Reset after detection
+            Some(divergence_bps)
+        } else if self.s_neg > threshold {
+            self.s_neg = 0.0;
+            Some(divergence_bps)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the detector has enough data to be reliable.
+    pub fn is_warmed_up(&self) -> bool {
+        self.count >= 10
+    }
+
+    /// Reset the detector state.
+    pub fn reset(&mut self) {
+        self.s_pos = 0.0;
+        self.s_neg = 0.0;
+        self.count = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,5 +1073,62 @@ mod tests {
 
         let half_life = tracker.mi_half_life_hours();
         assert!(half_life.is_some(), "Should compute half-life");
+    }
+
+    #[test]
+    fn test_cusum_detects_shift() {
+        let mut detector = CusumDetector::new(3.0, 0.05);
+
+        // Feed neutral observations to warm up
+        for _ in 0..20 {
+            assert!(detector.observe(0.0).is_none());
+        }
+
+        // Sudden shift should be detected
+        let mut detected = false;
+        for _ in 0..5 {
+            if detector.observe(10.0).is_some() {
+                detected = true;
+                break;
+            }
+        }
+        assert!(detected, "CUSUM should detect a large shift within 5 observations");
+    }
+
+    #[test]
+    fn test_cusum_ignores_noise() {
+        let mut detector = CusumDetector::new(3.0, 0.05);
+
+        // Feed small fluctuations — should not trigger
+        for i in 0..100 {
+            let noise = if i % 2 == 0 { 0.1 } else { -0.1 };
+            assert!(
+                detector.observe(noise).is_none(),
+                "CUSUM should not trigger on small noise"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cusum_warmup() {
+        let detector = CusumDetector::new(3.0, 0.05);
+        assert!(!detector.is_warmed_up());
+
+        let mut d2 = detector;
+        for _ in 0..10 {
+            d2.observe(0.0);
+        }
+        assert!(d2.is_warmed_up());
+    }
+
+    #[test]
+    fn test_cusum_reset() {
+        let mut detector = CusumDetector::new(3.0, 0.05);
+        for _ in 0..20 {
+            detector.observe(5.0);
+        }
+        detector.reset();
+        assert!(!detector.is_warmed_up());
+        assert_eq!(detector.count, 0);
     }
 }

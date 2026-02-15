@@ -251,5 +251,4 @@ Paper-to-Live EV Gap: Analysis & Improvement Hypotheses
   └──────┴────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
   Want me to start implementing these fixes?
 
-  if you were designing systems to address your concerns, examine the current system and design a principled solution that would have emerged if the change was a foundational    
-  assumption from the start
+  if you were designing systems to address your concerns, examine the current system and design a principled solution that would have emerged if the change was a foundational assumption from the start using a team of 5-6 engineers

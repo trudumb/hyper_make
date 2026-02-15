@@ -128,8 +128,8 @@ pub use temporal::{
 
 // Lag analysis for cross-exchange signals
 pub use lag_analysis::{
-    LagAnalyzer, LagAnalyzerConfig, LagDecayTracker, LeadLagStabilityDiagnostics,
-    LeadLagStabilityGate, TimestampRange,
+    CusumDetector, LagAnalyzer, LagAnalyzerConfig, LagDecayTracker,
+    LeadLagStabilityDiagnostics, LeadLagStabilityGate, TimestampRange,
 };
 
 // HMM-based regime detection

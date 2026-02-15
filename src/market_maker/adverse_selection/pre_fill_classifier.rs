@@ -280,6 +280,10 @@ pub struct PreFillASClassifier {
     bias_correction_bps: f64,
     /// Number of AS bias observations.
     bias_observation_count: usize,
+
+    // === OFI Acceleration (Phase 2) ===
+    /// Previous cycle's 1-second OFI for acceleration computation
+    prev_ofi_1s: f64,
 }
 
 impl PreFillASClassifier {
@@ -343,6 +347,8 @@ impl PreFillASClassifier {
             // AS bias correction
             bias_correction_bps: 0.0,
             bias_observation_count: 0,
+            // OFI acceleration
+            prev_ofi_1s: 0.0,
         }
     }
 
@@ -1043,6 +1049,31 @@ impl PreFillASClassifier {
         let bid_mult = self.spread_multiplier(true);
         let ask_mult = self.spread_multiplier(false);
         bid_mult.max(ask_mult)
+    }
+
+    /// Classify current toxicity into a discrete regime.
+    ///
+    /// Combines the averaged bid/ask toxicity with OFI acceleration signals
+    /// for fast detection (1-3 trades). Call `update_ofi()` before this to
+    /// ensure acceleration signals are fresh.
+    pub fn toxicity_regime(
+        &self,
+        ofi_1s: f64,
+        ofi_5s: f64,
+    ) -> super::toxicity_regime::ToxicityRegime {
+        let base = self.cached_toxicity;
+        let ofi_signals = super::toxicity_regime::OfiAccelerationSignals::compute(
+            ofi_1s,
+            ofi_5s,
+            self.prev_ofi_1s,
+        );
+        super::toxicity_regime::classify_toxicity(base, &ofi_signals, &self.regime_probs)
+    }
+
+    /// Update OFI tracking for acceleration computation.
+    /// Call once per quote cycle with the current 1-second OFI.
+    pub fn update_ofi(&mut self, ofi_1s: f64) {
+        self.prev_ofi_1s = ofi_1s;
     }
 
     /// Get cached toxicity estimate (average of bid/ask).

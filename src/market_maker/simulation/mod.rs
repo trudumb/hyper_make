@@ -26,9 +26,11 @@
 pub mod calibration;
 pub mod executor;
 pub mod fill_sim;
+pub mod latency_model;
 pub mod outcome;
 pub mod prediction;
 pub mod quick_mc;
+pub mod replay;
 
 pub use calibration::{
     BrierDecomposition, CalibrationAnalyzer, CalibrationCurve, ConditionalSlice,
@@ -41,3 +43,5 @@ pub use prediction::{
     PredictionLogger, PredictionRecord,
 };
 pub use quick_mc::{MCSimulationResult, QuickMCConfig, QuickMCSimulator};
+pub use latency_model::{LatencyDistribution, LatencyModel};
+pub use replay::{ReplayConfig, ReplayEngine, ReplayEvent, ReplayFill, ReplayReport};

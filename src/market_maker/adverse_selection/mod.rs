@@ -25,6 +25,7 @@ mod enhanced_classifier;
 mod estimator;
 pub mod microstructure_features;
 mod pre_fill_classifier;
+pub mod toxicity_regime;
 
 pub use cancel_race::{CancelRaceConfig, CancelRaceSummary, CancelRaceTracker};
 pub use depth_decay::{DepthDecayAS, DepthDecayASSummary, FillWithDepth};
@@ -37,6 +38,7 @@ pub use microstructure_features::{
     MicrostructureFeatures, TradeObservation,
 };
 pub use pre_fill_classifier::{PreFillASClassifier, PreFillClassifierConfig, PreFillSummary};
+pub use toxicity_regime::{ToxicityRegime, ToxicityThresholds, OfiAccelerationSignals};
 
 /// Configuration for adverse selection estimation.
 #[derive(Debug, Clone)]

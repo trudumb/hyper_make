@@ -377,6 +377,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     self.estimator.kappa(),
                 );
 
+                // Feed fill outcome to queue value heuristic for online bias correction.
+                // depth_from_mid is already in fractional form, convert to bps.
+                let depth_bps_for_qv = depth_from_mid * 10_000.0;
+                let predicted_qv = self.queue_value_heuristic.queue_value(
+                    depth_bps_for_qv,
+                    crate::market_maker::adverse_selection::ToxicityRegime::Normal, // conservative default
+                    0.0, // queue rank not tracked at fill time
+                );
+                self.queue_value_heuristic.observe_outcome(predicted_qv, markout_fill_pnl * 10_000.0);
+
                 // Feed resolved snapshot to learning systems
                 self.tier2.edge_tracker.add_snapshot(resolved_snap.clone());
                 let fill_pnl_bps = resolved_snap.realized_edge_bps;
