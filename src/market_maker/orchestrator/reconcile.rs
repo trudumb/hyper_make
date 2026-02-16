@@ -1240,23 +1240,61 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Get sigma from queue tracker (updated from book data)
         let sigma = self.tier1.queue_tracker.sigma();
 
-        // Use conservative gamma/kappa until we have market params cached
-        // TODO: Cache actual gamma/kappa from ladder strategy in per-cycle state
-        let gamma = 0.1; // Conservative default
-        let kappa = 1500.0; // Typical for liquid perps
+        // Use actual gamma/kappa from cached market params when available.
+        // Falls back to conservative defaults during early warmup before first quote cycle.
+        let (gamma, kappa) = self
+            .cached_market_params
+            .as_ref()
+            .map(|mp| {
+                // Prefer adaptive (learned) values, fall back to base estimator values
+                let g = if mp.adaptive_gamma > 0.0 {
+                    mp.adaptive_gamma
+                } else {
+                    mp.calibration_gamma_mult.max(0.01)
+                };
+                let k = if mp.adaptive_kappa > 0.0 {
+                    mp.adaptive_kappa
+                } else if mp.regime_kappa.unwrap_or(0.0) > 0.0 {
+                    mp.regime_kappa.unwrap_or(0.0)
+                } else {
+                    mp.kappa.max(1.0)
+                };
+                (g, k)
+            })
+            .unwrap_or((0.1, 1500.0));
 
-        let dynamic_config = DynamicReconcileConfig::from_market_params(
+        // Tick size in bps for minimum threshold floor
+        let tick_bps = self
+            .cached_market_params
+            .as_ref()
+            .map(|mp| mp.tick_size_bps)
+            .unwrap_or(0.5);
+
+        // API headroom for adaptive latch widening
+        let headroom_pct = self
+            .infra
+            .cached_rate_limit
+            .as_ref()
+            .map(|c| c.headroom_pct())
+            .unwrap_or(1.0);
+
+        let dynamic_config = DynamicReconcileConfig::from_market_params_with_context(
             gamma,
             kappa,
             sigma,
             reconcile_config.queue_horizon_seconds,
+            tick_bps,
+            headroom_pct,
         );
 
         info!(
+            gamma = %format!("{:.4}", gamma),
+            kappa = %format!("{:.0}", kappa),
             sigma = %format!("{:.6}", sigma),
             optimal_spread_bps = %format!("{:.2}", dynamic_config.optimal_spread_bps),
             best_tolerance_bps = %format!("{:.2}", dynamic_config.best_level_tolerance_bps),
             outer_tolerance_bps = %format!("{:.2}", dynamic_config.outer_level_tolerance_bps),
+            latch_bps = %format!("{:.2}", dynamic_config.latch_threshold_bps),
             "[Reconcile] Priority-based matching with dynamic thresholds"
         );
 
@@ -1841,6 +1879,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let is_buy = side == Side::Buy;
         let side_str = if is_buy { "bid" } else { "ask" };
         let input_count = orders.len();
+
+        // G4: Debug paranoia gate — catch invalid prices before they reach the exchange.
+        // Zero-cost in release builds. Catches validation bugs during development.
+        #[cfg(debug_assertions)]
+        for (price, _size) in &orders {
+            debug_assert!(
+                self.exchange_rules.is_valid_price(*price),
+                "[PlaceBulk] Invalid price {price} on {side_str} side — \
+                 round_to={}, rules={:?}",
+                self.exchange_rules.round_price(*price),
+                self.exchange_rules,
+            );
+        }
 
         // FIX: Get total available capacity from exchange limits UPFRONT
         // This is the key fix - we track remaining capacity directly instead of

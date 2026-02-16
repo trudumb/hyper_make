@@ -13,6 +13,7 @@
 //! its defense intent to an alternative mechanism (wider spread).
 
 use crate::market_maker::config::{Quote, SizeQuantum};
+use crate::market_maker::quoting::exchange_rules::{ExchangeRules, ValidatedQuote, ValidationReport};
 use crate::market_maker::quoting::ladder::Ladder;
 
 /// Maximum spread widening multiplier from defense-via-spread conversions.
@@ -178,17 +179,31 @@ impl ViableQuoteSide {
     ///
     /// Moves quotes farther from mid proportionally to `defense_spread_mult`.
     /// `is_bid`: true for bid side (prices move down), false for ask (prices move up).
-    fn apply_defense_spread_widening(&mut self, mid: f64, is_bid: bool) {
+    /// Re-rounds prices to exchange precision after widening — this fixes the
+    /// "Order has invalid price" rejection that occurred when widened offsets
+    /// produced prices with too many decimal places.
+    fn apply_defense_spread_widening(
+        &mut self,
+        mid: f64,
+        is_bid: bool,
+        rules: Option<&ExchangeRules>,
+    ) {
         if self.defense_spread_mult <= 1.0 {
             return;
         }
         for q in &mut self.quotes {
             let offset = (q.price - mid).abs();
             let widened_offset = offset * self.defense_spread_mult;
-            q.price = if is_bid {
+            let raw_price = if is_bid {
                 mid - widened_offset
             } else {
                 mid + widened_offset
+            };
+            // Re-round to exchange precision after widening.
+            // Without this, widened prices can have arbitrary decimal places.
+            q.price = match rules {
+                Some(r) => r.round_price(raw_price),
+                None => raw_price,
             };
         }
     }
@@ -201,7 +216,7 @@ impl ViableQuoteSide {
 /// meet the exchange minimum notional, or convert defense intent to
 /// spread widening.
 ///
-/// Call `finalize()` to extract raw `Vec<Quote>` for submission.
+/// Call `finalize()` to extract validated quotes for submission.
 #[derive(Debug, Clone)]
 pub struct ViableQuoteLadder {
     /// Bid side (highest price first).
@@ -212,6 +227,9 @@ pub struct ViableQuoteLadder {
     quantum: SizeQuantum,
     /// Mid price for spread widening calculations.
     mid_px: f64,
+    /// Exchange price/size validation rules (if available).
+    /// When set, `finalize()` validates all quotes and returns `ValidatedQuote`.
+    rules: Option<ExchangeRules>,
 }
 
 impl ViableQuoteLadder {
@@ -219,7 +237,15 @@ impl ViableQuoteLadder {
     ///
     /// Sizes are clamped up to `quantum.min_viable_size` if slightly below.
     /// Levels with zero or negative size are dropped.
-    pub fn from_ladder(ladder: &Ladder, quantum: SizeQuantum, mid_px: f64) -> Self {
+    ///
+    /// When `rules` is provided, `finalize()` will validate all quotes against
+    /// exchange precision rules and re-round prices after defense spread widening.
+    pub fn from_ladder(
+        ladder: &Ladder,
+        quantum: SizeQuantum,
+        mid_px: f64,
+        rules: Option<ExchangeRules>,
+    ) -> Self {
         let bid_quotes: Vec<Quote> = ladder
             .bids
             .iter()
@@ -244,6 +270,7 @@ impl ViableQuoteLadder {
             asks: ViableQuoteSide::new(ask_quotes),
             quantum,
             mid_px,
+            rules,
         }
     }
 
@@ -257,15 +284,64 @@ impl ViableQuoteLadder {
         self.bids.is_empty() && self.asks.is_empty()
     }
 
-    /// Finalize the ladder: apply defense spread widening and return raw quotes.
+    /// Finalize the ladder: apply defense spread widening, validate, and return quotes.
     ///
-    /// Consumes self. All returned quotes are guaranteed to have
-    /// `size * price >= quantum.min_notional` (within float tolerance).
-    pub fn finalize(mut self) -> (Vec<Quote>, Vec<Quote>) {
+    /// When `ExchangeRules` was provided at construction, returns validated quotes
+    /// with a validation report. Auto-fixes prices that need re-rounding.
+    ///
+    /// Returns `(bid_quotes, ask_quotes, validation_report)`.
+    /// All returned quotes meet notional minimum and exchange precision rules.
+    pub fn finalize(mut self) -> (Vec<ValidatedQuote>, Vec<ValidatedQuote>, ValidationReport) {
+        let rules_ref = self.rules.as_ref();
         self.bids
-            .apply_defense_spread_widening(self.mid_px, true);
+            .apply_defense_spread_widening(self.mid_px, true, rules_ref);
         self.asks
-            .apply_defense_spread_widening(self.mid_px, false);
+            .apply_defense_spread_widening(self.mid_px, false, rules_ref);
+
+        let mut report = ValidationReport::default();
+
+        let validate_side = |quotes: Vec<Quote>,
+                             is_buy: bool,
+                             rules: Option<&ExchangeRules>,
+                             report: &mut ValidationReport|
+         -> Vec<ValidatedQuote> {
+            report.proposed += quotes.len();
+
+            match rules {
+                Some(r) => {
+                    let mut validated = Vec::with_capacity(quotes.len());
+                    for q in &quotes {
+                        match r.validate_quote(q.price, q.size, is_buy) {
+                            Ok(vq) => {
+                                if vq.was_fixed() {
+                                    report.fixed += 1;
+                                } else {
+                                    report.valid += 1;
+                                }
+                                validated.push(vq);
+                            }
+                            Err(rejection) => {
+                                report.rejected += 1;
+                                report.rejection_reasons.push(rejection.to_string());
+                            }
+                        }
+                    }
+                    validated
+                }
+                None => {
+                    // No rules: wrap quotes as-is (backward compat)
+                    report.valid += quotes.len();
+                    quotes
+                        .iter()
+                        .map(|q| {
+                            // Use validate_quote-like construction but without ExchangeRules.
+                            // Create a minimal ExchangeRules just for wrapping.
+                            ValidatedQuote::from_raw(q.price, q.size, is_buy)
+                        })
+                        .collect()
+                }
+            }
+        };
 
         // Debug assertion: all surviving quotes meet notional minimum
         #[cfg(debug_assertions)]
@@ -291,6 +367,22 @@ impl ViableQuoteLadder {
                 );
             }
         }
+
+        let bid_validated = validate_side(self.bids.quotes, true, rules_ref, &mut report);
+        let ask_validated = validate_side(self.asks.quotes, false, rules_ref, &mut report);
+
+        (bid_validated, ask_validated, report)
+    }
+
+    /// Legacy finalize: return raw `Vec<Quote>` for backward compatibility.
+    ///
+    /// Applies defense spread widening and extracts raw quotes without validation.
+    /// Prefer `finalize()` with `ExchangeRules` in production paths.
+    pub fn finalize_raw(mut self) -> (Vec<Quote>, Vec<Quote>) {
+        self.bids
+            .apply_defense_spread_widening(self.mid_px, true, self.rules.as_ref());
+        self.asks
+            .apply_defense_spread_widening(self.mid_px, false, self.rules.as_ref());
 
         (self.bids.quotes, self.asks.quotes)
     }
@@ -499,6 +591,7 @@ mod tests {
             )]),
             quantum,
             mid_px: mid,
+            rules: None,
         };
 
         // Simulate ToxicityRegime::Normal — bid_mult=0.82, ask_mult=0.82
@@ -524,13 +617,13 @@ mod tests {
         );
 
         // Finalize: spread widening applied
-        let (bids, asks) = ladder.finalize();
+        let (bids, asks, _report) = ladder.finalize();
         assert_eq!(bids.len(), 1);
         assert_eq!(asks.len(), 1);
 
         // Bid should have moved farther from mid (lower price)
         let original_bid_offset = mid * 5.0 / 10_000.0; // 5 bps
-        let actual_bid_offset = mid - bids[0].price;
+        let actual_bid_offset = mid - bids[0].price();
         assert!(
             actual_bid_offset > original_bid_offset,
             "Bid should be wider: original_offset={:.6}, actual_offset={:.6}",
@@ -540,14 +633,14 @@ mod tests {
 
         // Notional must meet exchange minimum
         assert!(
-            bids[0].notional() >= 10.0 - 0.01,
+            bids[0].size() * bids[0].price() >= 10.0 - 0.01,
             "Bid notional {:.2} must be >= $10",
-            bids[0].notional(),
+            bids[0].size() * bids[0].price(),
         );
         assert!(
-            asks[0].notional() >= 10.0 - 0.01,
+            asks[0].size() * asks[0].price() >= 10.0 - 0.01,
             "Ask notional {:.2} must be >= $10",
-            asks[0].notional(),
+            asks[0].size() * asks[0].price(),
         );
     }
 
@@ -570,6 +663,7 @@ mod tests {
             ]),
             quantum,
             mid_px: mid,
+            rules: None,
         };
 
         // ToxicityRegime::Normal — 0.82x
@@ -587,9 +681,9 @@ mod tests {
         );
 
         // Finalize: prices unchanged (no widening)
-        let (bids, asks) = ladder.finalize();
-        assert!((bids[0].price - 49_990.0).abs() < 1e-10);
-        assert!((asks[0].price - 50_010.0).abs() < 1e-10);
+        let (bids, asks, _report) = ladder.finalize();
+        assert!((bids[0].price() - 49_990.0).abs() < 1e-10);
+        assert!((asks[0].price() - 50_010.0).abs() < 1e-10);
     }
 
     #[test]
@@ -604,8 +698,8 @@ mod tests {
         bids.defense_spread_mult = 2.0;
         asks.defense_spread_mult = 1.5;
 
-        bids.apply_defense_spread_widening(mid, true);
-        asks.apply_defense_spread_widening(mid, false);
+        bids.apply_defense_spread_widening(mid, true, None);
+        asks.apply_defense_spread_widening(mid, false, None);
 
         // Bid: offset was 0.10, widened by 2.0x → 0.20 → new price = 99.80
         assert!(
@@ -686,7 +780,7 @@ mod tests {
                 depth_bps: 5.0,
             });
 
-        let viable = ViableQuoteLadder::from_ladder(&ladder, quantum, 30.30);
+        let viable = ViableQuoteLadder::from_ladder(&ladder, quantum, 30.30, None);
 
         // Bid should be clamped up to 0.34 (min_viable)
         assert_eq!(viable.bids.len(), 1);
@@ -714,7 +808,83 @@ mod tests {
                 depth_bps: 5.0,
             });
 
-        let viable = ViableQuoteLadder::from_ladder(&ladder, quantum, 30.30);
+        let viable = ViableQuoteLadder::from_ladder(&ladder, quantum, 30.30, None);
         assert!(viable.bids.is_empty());
+    }
+
+    // =========================================================
+    // Defense widening + validation (regression tests)
+    // =========================================================
+
+    #[test]
+    fn test_defense_widening_prices_valid_with_rules() {
+        // After defense spread widening with ExchangeRules, all prices must be exchange-valid.
+        // This is the bug that caused "Order has invalid price" on line 67 of the log.
+        let quantum = hype_quantum(); // min_viable = 0.34
+        let mid = 30.30;
+        let rules = ExchangeRules::new_perps(2, 10.0); // HYPE: price_decimals=4
+
+        let mut ladder = ViableQuoteLadder {
+            bids: ViableQuoteSide::new(vec![Quote::new(
+                mid * (1.0 - 5.0 / 10_000.0),
+                quantum.min_viable_size,
+            )]),
+            asks: ViableQuoteSide::new(vec![Quote::new(
+                mid * (1.0 + 5.0 / 10_000.0),
+                quantum.min_viable_size,
+            )]),
+            quantum,
+            mid_px: mid,
+            rules: Some(rules),
+        };
+
+        // Force max defense widening (3x) to stress-test rounding
+        ladder.bids.reduce_sizes(0.5, &quantum);
+        ladder.bids.reduce_sizes(0.5, &quantum); // 4x → capped at 3x
+
+        let (bids, _asks, report) = ladder.finalize();
+        assert_eq!(bids.len(), 1);
+
+        // The widened price MUST be exchange-valid
+        assert!(
+            rules.is_valid_price(bids[0].price()),
+            "Widened bid price {} must be exchange-valid",
+            bids[0].price(),
+        );
+
+        // Report should show the price was fixed (or was already valid after re-rounding)
+        assert_eq!(
+            report.proposed,
+            report.valid + report.fixed + report.rejected,
+            "Accounting must balance: {report}",
+        );
+    }
+
+    #[test]
+    fn test_finalize_with_rules_validates_quotes() {
+        // With ExchangeRules, finalize() produces ValidatedQuotes with valid prices.
+        let quantum = SizeQuantum::compute(10.0, 100.0, 2); // min_viable = 0.10
+        let mid = 100.0;
+        let rules = ExchangeRules::new_perps(2, 10.0); // price_decimals=4
+
+        let ladder = ViableQuoteLadder {
+            bids: ViableQuoteSide::new(vec![Quote::new(99.90, 0.50)]),
+            asks: ViableQuoteSide::new(vec![Quote::new(100.10, 0.50)]),
+            quantum,
+            mid_px: mid,
+            rules: Some(rules),
+        };
+
+        let (bids, asks, report) = ladder.finalize();
+        assert_eq!(report.proposed, 2);
+        assert_eq!(report.rejected, 0);
+
+        // All quotes must have valid prices
+        for vq in &bids {
+            assert!(rules.is_valid_price(vq.price()), "Bid price {} invalid", vq.price());
+        }
+        for vq in &asks {
+            assert!(rules.is_valid_price(vq.price()), "Ask price {} invalid", vq.price());
+        }
     }
 }

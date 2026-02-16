@@ -113,7 +113,7 @@ impl BinnedFillRate {
     /// Create binned tracker with default bin edges.
     /// Bins: [0,2), [2,4), [4,6), [6,8), [8,10), [10,15), [15,20), [20,∞)
     pub fn new() -> Self {
-        let edges = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, f64::INFINITY];
+        let edges = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 1e9];
         let bins = edges
             .windows(2)
             .map(|w| SpreadBin {

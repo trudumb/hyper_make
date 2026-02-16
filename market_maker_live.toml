@@ -10,7 +10,7 @@ base_url = "mainnet"
 [trading]
 asset = "HYPE"
 capital_usd = 100.0                # Primary sizing input — everything else auto-derived
-leverage = 10
+# leverage auto-derived from exchange metadata (e.g. 25x for hyna:ETH)
 # target_liquidity, risk_aversion, max_bps_diff are auto-derived from capital_usd + spread profile
 # Uncomment to override any auto-derived parameter:
 # target_liquidity = 0.5          # contracts per side

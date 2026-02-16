@@ -94,6 +94,11 @@ pub struct DynamicReconcileConfig {
     pub max_modify_price_bps: f64,
     /// Enable priority-based matching (ensures best levels are covered first)
     pub use_priority_matching: bool,
+    /// Adaptive quote latch: orders within this threshold are preserved to reduce churn.
+    /// Scales with optimal spread and API headroom. Replaces fixed 2.5 bps constant.
+    pub latch_threshold_bps: f64,
+    /// Size latch: orders with size change below this fraction are preserved.
+    pub latch_size_fraction: f64,
     // === HJB Queue Value Integration (Phase 2: Churn Reduction) ===
     /// Enable HJB queue value preservation.
     /// When true, uses the HJB queue value formula to preserve valuable queue positions.
@@ -117,6 +122,8 @@ impl Default for DynamicReconcileConfig {
             optimal_spread_bps: 20.0,   // Default ~20 bps
             max_modify_price_bps: 50.0, // Default 50 bps
             use_priority_matching: true,
+            latch_threshold_bps: 2.5,   // Adaptive default
+            latch_size_fraction: 0.10,  // 10% size change threshold
             // HJB queue value integration
             use_hjb_queue_value: true,
             hjb_queue_alpha: 0.1,
@@ -136,6 +143,40 @@ impl DynamicReconcileConfig {
     /// - Low gamma (calm market) → tight thresholds
     /// - High gamma (volatile/risky) → looser thresholds
     pub fn from_market_params(gamma: f64, kappa: f64, sigma: f64, queue_horizon: f64) -> Self {
+        Self::from_market_params_with_context(gamma, kappa, sigma, queue_horizon, 0.5, 1.0)
+    }
+
+    /// Compute the stale threshold: expected price drift over one queue lifetime.
+    ///
+    /// Queue priority is an asset — an order at a slightly suboptimal price with
+    /// queue priority beats optimal price with no queue. This threshold defines
+    /// "close enough to preserve."
+    ///
+    /// Formula: max(2 * tick_size_bps, drift_floor, sigma * sqrt(cycle_time) * 10000)
+    /// Clamped to [5, 10] bps.
+    pub fn compute_stale_threshold(sigma: f64, cycle_time_s: f64, tick_bps: f64) -> f64 {
+        let expected_move_bps = sigma * cycle_time_s.sqrt() * 10_000.0;
+        expected_move_bps
+            .max(2.0 * tick_bps)
+            .clamp(5.0, 10.0) // Floor 5 bps (normal drift), cap 10 bps (genuinely stale)
+    }
+
+    /// Create from market parameters with exchange context (tick size, API headroom).
+    ///
+    /// This is the preferred constructor — it produces adaptive thresholds that
+    /// account for exchange tick granularity and API quota pressure. When headroom
+    /// is low, thresholds widen to reduce churn and conserve quota.
+    ///
+    /// Design principle: queue priority > price optimality. Most cycles should
+    /// produce 0 cancels; orders survive 3-5 cycles building queue position.
+    pub fn from_market_params_with_context(
+        gamma: f64,
+        kappa: f64,
+        sigma: f64,
+        queue_horizon: f64,
+        tick_bps: f64,
+        headroom_pct: f64,
+    ) -> Self {
         // Clamp inputs to avoid division by zero
         let gamma_safe = gamma.max(0.001);
         let kappa_safe = kappa.max(1.0);
@@ -150,13 +191,37 @@ impl DynamicReconcileConfig {
         let vol_bps = sigma * queue_horizon.sqrt() * 10_000.0;
         let max_modify_price_bps = (2.0 * vol_bps).max(optimal_spread_bps).clamp(10.0, 100.0);
 
-        // Derive matching tolerances from volatility/modify capability
-        // We must be able to match orders up to max_modify to utilize it
-        let best_level_tolerance_bps = (max_modify_price_bps / 2.0).clamp(2.0, 50.0);
-        let outer_level_tolerance_bps = (max_modify_price_bps).clamp(5.0, 100.0);
+        // Stale threshold: expected drift per cycle. Queue priority > price optimality.
+        let stale_threshold_bps = Self::compute_stale_threshold(sigma, queue_horizon, tick_bps);
 
-        // Maximum match distance: 1.5x optimal spread
-        let max_match_distance_bps = (optimal_spread_bps * 1.5).clamp(15.0, 50.0);
+        // Derive matching tolerances using stale threshold as floor
+        let best_level_tolerance_bps = (max_modify_price_bps / 2.0)
+            .max(stale_threshold_bps)
+            .clamp(5.0, 50.0);
+        let outer_level_tolerance_bps = max_modify_price_bps
+            .max(stale_threshold_bps * 2.0)
+            .clamp(10.0, 100.0);
+
+        // Maximum match distance: 1.5x optimal spread (but at least 2× outer tolerance)
+        let max_match_distance_bps = (optimal_spread_bps * 1.5)
+            .max(outer_level_tolerance_bps * 2.0)
+            .clamp(20.0, 100.0);
+
+        // Adaptive latch: proportional to half-spread, widens under quota pressure.
+        // At 5 bps half-spread → 1.5 bps latch (normal), 3.0 bps (low quota)
+        // At 20 bps half-spread → 6.0 bps latch (normal), 12.0 bps (low quota)
+        let half_spread_bps = optimal_spread_bps / 2.0;
+        let base_latch = half_spread_bps * 0.3;
+        let latch_threshold_bps = if headroom_pct < 0.30 {
+            // Low quota: widen latch aggressively to reduce churn
+            (base_latch * 2.0).clamp(5.0, 15.0)
+        } else {
+            base_latch.clamp(2.0, 10.0)
+        };
+
+        // Size hysteresis at 20%: only modify if size changes by >20%.
+        // Queue priority is valuable — small size adjustments don't justify losing it.
+        let latch_size_fraction = if headroom_pct < 0.30 { 0.30 } else { 0.20 };
 
         Self {
             best_level_tolerance_bps,
@@ -167,6 +232,8 @@ impl DynamicReconcileConfig {
             optimal_spread_bps,
             max_modify_price_bps,
             use_priority_matching: true,
+            latch_threshold_bps,
+            latch_size_fraction,
             // HJB queue value integration (defaults)
             use_hjb_queue_value: true,
             hjb_queue_alpha: 0.1,
@@ -698,13 +765,17 @@ pub fn priority_based_matching(
                     1.0
                 };
 
-                // Case 1: Quote latching - preserve queue for tiny changes (2.5 bps / 10%)
-                // This reduces the 86% cancellation rate by avoiding churn on small drifts
-                if price_diff_bps <= 2.5 && size_diff_pct <= 0.10 {
+                // Case 1: Adaptive quote latching — preserve queue for small changes.
+                // Threshold scales with optimal spread and API headroom instead of
+                // the fixed 2.5 bps / 10% that caused 86% cancellation rate.
+                if price_diff_bps <= config.latch_threshold_bps
+                    && size_diff_pct <= config.latch_size_fraction
+                {
                     debug!(
                         oid = order.oid,
                         price_diff_bps = %format!("{:.2}", price_diff_bps),
                         size_diff_pct = %format!("{:.1}%", size_diff_pct * 100.0),
+                        latch_bps = %format!("{:.2}", config.latch_threshold_bps),
                         "Quote latched: preserving queue position"
                     );
                     continue;
@@ -738,16 +809,19 @@ pub fn priority_based_matching(
                     continue;
                 }
 
-                // Case 3: Price change required OR size increase needed
-                // → Must CANCEL+PLACE (loses queue, but necessary)
-                if price_diff_bps > config.best_level_tolerance_bps
-                    || size_change > current_size * 0.10
+                // Case 3: Catch-all — drift beyond latch not handled by modify-down
+                // Price moved or size increased → must CANCEL+PLACE (loses queue, but necessary)
                 {
+                    let reason = if price_diff_bps > config.latch_threshold_bps {
+                        "price_drift"
+                    } else {
+                        "size_increase"
+                    };
                     debug!(
                         oid = order.oid,
                         price_diff_bps = price_diff_bps,
                         size_change_pct = %format!("{:.1}%", size_change / current_size * 100.0),
-                        reason = if price_diff_bps > config.best_level_tolerance_bps { "price_change" } else { "size_increase" },
+                        reason = reason,
                         "Priority matching: CANCEL+PLACE (queue lost)"
                     );
                     actions.push(LadderAction::Cancel { oid: order.oid });
@@ -1034,6 +1108,8 @@ mod tests {
             optimal_spread_bps: 4.0,
             max_modify_price_bps: 10.0,
             use_priority_matching: true,
+            latch_threshold_bps: 2.5,
+            latch_size_fraction: 0.10,
             use_hjb_queue_value: false,
             hjb_queue_alpha: 0.0,
             hjb_queue_beta: 0.0,
@@ -1078,6 +1154,8 @@ mod tests {
             optimal_spread_bps: 4.0,
             max_modify_price_bps: 10.0,
             use_priority_matching: true,
+            latch_threshold_bps: 2.5,
+            latch_size_fraction: 0.10,
             use_hjb_queue_value: false,
             hjb_queue_alpha: 0.0,
             hjb_queue_beta: 0.0,
@@ -1092,6 +1170,194 @@ mod tests {
             matches!(&actions[0], LadderAction::Cancel { oid: 1 }),
             "Expected Cancel for zero-truncated size, got {:?}",
             actions[0]
+        );
+    }
+
+    #[test]
+    fn test_from_market_params_with_context_adapts_to_actual_params() {
+        // With actual market params (gamma=0.5, kappa=3000) vs defaults (0.1, 1500)
+        // the thresholds should be meaningfully different
+        let default_config = DynamicReconcileConfig::from_market_params(0.1, 1500.0, 0.001, 1.0);
+        let actual_config = DynamicReconcileConfig::from_market_params_with_context(
+            0.5,
+            3000.0,
+            0.001,
+            1.0,
+            0.5, // tick_bps
+            1.0, // full headroom
+        );
+
+        // Actual params should produce different optimal spread
+        assert!(
+            (default_config.optimal_spread_bps - actual_config.optimal_spread_bps).abs() > 0.01,
+            "Expected different optimal spreads: default={:.2}, actual={:.2}",
+            default_config.optimal_spread_bps,
+            actual_config.optimal_spread_bps
+        );
+    }
+
+    #[test]
+    fn test_adaptive_latch_widens_under_low_headroom() {
+        let normal = DynamicReconcileConfig::from_market_params_with_context(
+            0.1, 1500.0, 0.001, 1.0, 0.5, 1.0, // 100% headroom
+        );
+        let low_quota = DynamicReconcileConfig::from_market_params_with_context(
+            0.1, 1500.0, 0.001, 1.0, 0.5, 0.15, // 15% headroom (low)
+        );
+
+        // Low headroom should widen latch to reduce churn
+        assert!(
+            low_quota.latch_threshold_bps >= normal.latch_threshold_bps,
+            "Low quota latch ({:.2}) should be >= normal ({:.2})",
+            low_quota.latch_threshold_bps,
+            normal.latch_threshold_bps
+        );
+        // Size latch also widens
+        assert!(
+            low_quota.latch_size_fraction >= normal.latch_size_fraction,
+            "Low quota size latch ({:.2}) should be >= normal ({:.2})",
+            low_quota.latch_size_fraction,
+            normal.latch_size_fraction
+        );
+    }
+
+    #[test]
+    fn test_tick_floor_respected_in_tolerance() {
+        // With large tick size (5 bps), best tolerance should be at least 2*tick = 10 bps
+        let config = DynamicReconcileConfig::from_market_params_with_context(
+            0.1, 1500.0, 0.0001, // low vol
+            1.0, 5.0,            // 5 bps ticks
+            1.0,
+        );
+
+        assert!(
+            config.best_level_tolerance_bps >= 10.0,
+            "Best tolerance ({:.2}) should be >= 2*tick (10 bps)",
+            config.best_level_tolerance_bps
+        );
+    }
+
+    #[test]
+    fn test_adaptive_latch_preserves_order_in_priority_matching() {
+        // Order within latch threshold should be preserved (no action)
+        let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let current = vec![&order];
+
+        // Target is 1.5 bps away and 5% size diff — within adaptive latch
+        let target = vec![LadderLevel {
+            price: 100.015, // 1.5 bps from 100.00
+            size: 1.05,     // 5% larger
+            depth_bps: 5.0,
+        }];
+
+        let config = DynamicReconcileConfig {
+            best_level_tolerance_bps: 10.0,
+            outer_level_tolerance_bps: 20.0,
+            max_match_distance_bps: 50.0,
+            queue_value_threshold: 0.5,
+            queue_horizon_seconds: 10.0,
+            optimal_spread_bps: 10.0,
+            max_modify_price_bps: 20.0,
+            use_priority_matching: true,
+            latch_threshold_bps: 3.0,  // Order is 1.5 bps away → within latch
+            latch_size_fraction: 0.10, // 5% → within latch
+            use_hjb_queue_value: false,
+            hjb_queue_alpha: 0.0,
+            hjb_queue_beta: 0.0,
+            hjb_queue_modify_cost_bps: 0.0,
+        };
+
+        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 4);
+
+        // Should produce NO actions — order is latched
+        assert!(
+            actions.is_empty(),
+            "Expected no actions (latched), got {:?}",
+            actions
+        );
+    }
+
+    #[test]
+    fn test_adaptive_latch_does_not_preserve_large_drift() {
+        // Order beyond latch threshold should produce an action
+        let order = TrackedOrder::new(1, Side::Buy, 100.00, 1.0, 0.0);
+        let current = vec![&order];
+
+        // Target is 8 bps away — beyond 3 bps latch
+        let target = vec![LadderLevel {
+            price: 100.08, // 8 bps from 100.00
+            size: 1.0,
+            depth_bps: 5.0,
+        }];
+
+        let config = DynamicReconcileConfig {
+            best_level_tolerance_bps: 10.0,
+            outer_level_tolerance_bps: 20.0,
+            max_match_distance_bps: 50.0,
+            queue_value_threshold: 0.5,
+            queue_horizon_seconds: 10.0,
+            optimal_spread_bps: 10.0,
+            max_modify_price_bps: 20.0,
+            use_priority_matching: true,
+            latch_threshold_bps: 3.0,  // Order is 8 bps away → NOT latched
+            latch_size_fraction: 0.10,
+            use_hjb_queue_value: false,
+            hjb_queue_alpha: 0.0,
+            hjb_queue_beta: 0.0,
+            hjb_queue_modify_cost_bps: 0.0,
+        };
+
+        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 4);
+
+        // Should produce an action (cancel+place) since drift exceeds latch
+        assert!(
+            !actions.is_empty(),
+            "Expected cancel+place for large drift, got no actions"
+        );
+    }
+
+    #[test]
+    fn test_compute_stale_threshold_floors_at_5bps() {
+        // Very quiet market: sigma=0.00001, cycle=0.5s, tick=0.1 bps
+        let threshold = DynamicReconcileConfig::compute_stale_threshold(0.00001, 0.5, 0.1);
+        assert!(
+            (threshold - 5.0).abs() < f64::EPSILON,
+            "Stale threshold should floor at 5 bps, got {:.2}",
+            threshold
+        );
+    }
+
+    #[test]
+    fn test_compute_stale_threshold_respects_tick() {
+        // Large tick: 5 bps → 2*tick = 10 bps dominates
+        let threshold = DynamicReconcileConfig::compute_stale_threshold(0.0001, 1.0, 5.0);
+        assert!(
+            (threshold - 10.0).abs() < f64::EPSILON,
+            "Stale threshold should be 2*tick = 10 bps, got {:.2}",
+            threshold
+        );
+    }
+
+    #[test]
+    fn test_compute_stale_threshold_caps_at_10bps() {
+        // High vol: sigma=0.01 → drift = 100 bps → capped at 10
+        let threshold = DynamicReconcileConfig::compute_stale_threshold(0.01, 1.0, 0.5);
+        assert!(
+            (threshold - 10.0).abs() < f64::EPSILON,
+            "Stale threshold should cap at 10 bps, got {:.2}",
+            threshold
+        );
+    }
+
+    #[test]
+    fn test_size_hysteresis_defaults_to_20pct() {
+        let config = DynamicReconcileConfig::from_market_params_with_context(
+            0.1, 1500.0, 0.001, 1.0, 0.5, 1.0,
+        );
+        assert!(
+            (config.latch_size_fraction - 0.20).abs() < f64::EPSILON,
+            "Default size hysteresis should be 20%, got {:.0}%",
+            config.latch_size_fraction * 100.0
         );
     }
 }

@@ -82,6 +82,10 @@ pub struct ModeSelectionInput {
     pub position: f64,
     /// Capital tier from CapitalProfile — affects fallback behavior
     pub capital_tier: CapitalTier,
+    /// Whether the system is still in warmup (fill_samples < min_warmup_trades).
+    /// During warmup, never go Flat just because signals aren't calibrated —
+    /// the system NEEDS fills to calibrate, which requires quoting.
+    pub is_warmup: bool,
 }
 
 /// Pure function: select execution mode from inputs.
@@ -108,6 +112,12 @@ pub fn select_mode(input: &ModeSelectionInput) -> ExecutionMode {
     // 3-4. Toxic regime
     if input.toxicity_regime == ToxicityRegime::Toxic {
         if input.position.abs() < 1e-9 {
+            if input.is_warmup {
+                // During warmup: don't go Flat even in Toxic regime.
+                // Toxicity classifier is uncalibrated — "toxic" may be noise.
+                // Quote both sides with wide spreads (toxicity filter widens further).
+                return ExecutionMode::Maker { bid: true, ask: true };
+            }
             // Flat position → go flat
             return ExecutionMode::Flat;
         }
@@ -123,6 +133,12 @@ pub fn select_mode(input: &ModeSelectionInput) -> ExecutionMode {
 
     // 6. No value and no alpha
     if !input.bid_has_value && !input.ask_has_value && !input.has_alpha {
+        if input.is_warmup {
+            // During warmup: NEVER go Flat. The system needs fills to calibrate
+            // its models, but going Flat prevents all fills — a death spiral.
+            // Quote with wide spreads (downstream spread_widening_mult handles this).
+            return ExecutionMode::Maker { bid: true, ask: true };
+        }
         match input.capital_tier {
             CapitalTier::Micro | CapitalTier::Small => {
                 // Small capital: quote both sides with widened spreads instead of going Flat.
@@ -167,6 +183,7 @@ mod tests {
             has_alpha: true,
             position: 0.0,
             capital_tier: CapitalTier::Large, // Default to Large so existing tests pass unchanged
+            is_warmup: false, // Default: calibrated (not warming up)
         }
     }
 
@@ -423,5 +440,111 @@ mod tests {
             ..default_input()
         };
         assert_eq!(select_mode(&input), ExecutionMode::Flat);
+    }
+
+    // === Warmup tests: system MUST quote during warmup to break death spiral ===
+
+    #[test]
+    fn test_warmup_no_value_no_alpha_still_quotes() {
+        // THE cold-start death spiral fix: during warmup, never go Flat
+        // even for medium+ capital with no detected edge.
+        let input = ModeSelectionInput {
+            bid_has_value: false,
+            ask_has_value: false,
+            has_alpha: false,
+            capital_tier: CapitalTier::Medium,
+            is_warmup: true,
+            ..default_input()
+        };
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_warmup_large_tier_still_quotes() {
+        let input = ModeSelectionInput {
+            bid_has_value: false,
+            ask_has_value: false,
+            has_alpha: false,
+            capital_tier: CapitalTier::Large,
+            is_warmup: true,
+            ..default_input()
+        };
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_warmup_toxic_flat_still_quotes() {
+        // During warmup, "Toxic" regime may be noise from uncalibrated classifier.
+        // Don't go Flat — quote with wide spreads instead.
+        let input = ModeSelectionInput {
+            toxicity_regime: ToxicityRegime::Toxic,
+            position: 0.0,
+            is_warmup: true,
+            ..default_input()
+        };
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_warmup_kill_zone_still_flat() {
+        // Kill zone overrides warmup — safety is absolute
+        let input = ModeSelectionInput {
+            position_zone: PositionZone::Kill,
+            is_warmup: true,
+            ..default_input()
+        };
+        assert_eq!(select_mode(&input), ExecutionMode::Flat);
+    }
+
+    #[test]
+    fn test_warmup_red_zone_still_reduces() {
+        // Red zone overrides warmup — position safety is absolute
+        let input = ModeSelectionInput {
+            position_zone: PositionZone::Red,
+            position: 1.0,
+            is_warmup: true,
+            ..default_input()
+        };
+        match select_mode(&input) {
+            ExecutionMode::InventoryReduce { urgency } => {
+                assert!((urgency - 1.0).abs() < 1e-10);
+            }
+            other => panic!("Expected InventoryReduce, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_warmup_toxic_positioned_still_reduces() {
+        // Even during warmup, toxic+positioned → reduce (not flat, which is fine)
+        let input = ModeSelectionInput {
+            toxicity_regime: ToxicityRegime::Toxic,
+            position: 1.5,
+            is_warmup: true,
+            ..default_input()
+        };
+        match select_mode(&input) {
+            ExecutionMode::InventoryReduce { urgency } => {
+                assert!((urgency - 0.7).abs() < 1e-10);
+            }
+            other => panic!("Expected InventoryReduce, got {other}"),
+        }
     }
 }

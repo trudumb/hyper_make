@@ -5,11 +5,13 @@
 //! - **Filter**: Quote filtering based on position limits, reduce-only mode
 //! - **KappaSpread**: Kappa-driven dynamic spread adjustment
 
+pub mod exchange_rules;
 mod filter;
 pub mod kappa_spread;
 mod ladder;
 pub mod viable;
 
+pub use exchange_rules::{ExchangeRules, QuoteRejection, ValidatedQuote, ValidationReport};
 pub use filter::{
     apply_close_bias, QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
     DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,

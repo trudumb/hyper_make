@@ -2359,6 +2359,35 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // === STALE DATA CIRCUIT BREAKER ===
+        // When data sources go stale, widen spreads proportionally instead of just logging.
+        // This converts staleness from a warning into an automatic defensive response.
+        {
+            let book_age_ms = self.infra.connection_health.time_since_last_data().as_millis() as u64;
+            let exchange_limits_age_ms = self.infra.exchange_limits.age_ms();
+            let stale_mult = compute_staleness_spread_penalty(book_age_ms, exchange_limits_age_ms);
+
+            if stale_mult > 1.0 {
+                market_params.spread_widening_mult *= stale_mult;
+                debug!(
+                    book_age_ms = book_age_ms,
+                    exchange_limits_age_ms = exchange_limits_age_ms,
+                    stale_mult = %format!("{stale_mult:.2}"),
+                    "Stale data: widening spreads"
+                );
+            }
+
+            // Critical staleness: pull quotes entirely (book >30s or limits >5min)
+            if book_age_ms > 30_000 || exchange_limits_age_ms > 300_000 {
+                warn!(
+                    book_age_ms = book_age_ms,
+                    exchange_limits_age_ms = exchange_limits_age_ms,
+                    "STALE DATA CRITICAL: pulling all quotes"
+                );
+                return Ok(());
+            }
+        }
+
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
         let ladder = self.strategy.calculate_ladder(
@@ -2387,6 +2416,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let max_one_side = ladder.total_ask_size().max(ladder.total_bid_size());
         self.safety.kill_switch.set_ladder_depth(max_one_side);
 
+        // Capture target level counts for cycle diagnosis
+        let diag_target_bids = ladder.bids.len();
+        let diag_target_asks = ladder.asks.len();
+        #[allow(unused_assignments)]
+        let mut diag_reduce_only = false;
+
         // === EXECUTION MODE: Compute from position zone + toxicity regime ===
         // Replaces QuoteGate side-masking (Phase 4) and hardcoded toxicity filter (Phase 3).
         let execution_mode = {
@@ -2414,6 +2449,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     || self.stochastic.signal_integrator.has_cusum_divergence(),
                 position: self.position.position(),
                 capital_tier: market_params.capital_tier,
+                is_warmup: !self.estimator.is_warmed_up(),
             };
             select_mode(&input)
         };
@@ -2433,10 +2469,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 quote_config.mid_price,
                 self.config.sz_decimals,
             );
+            let exchange_rules = quoting::ExchangeRules::new(
+                self.config.decimals,
+                self.config.sz_decimals,
+                MIN_ORDER_NOTIONAL,
+            );
             let mut viable = quoting::ViableQuoteLadder::from_ladder(
                 &ladder,
                 quantum,
                 quote_config.mid_price,
+                Some(exchange_rules),
             );
 
             // === EXECUTION MODE: structural side selection ===
@@ -2479,7 +2521,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // === TOXICITY-BASED DEFENSE (regime-aware) ===
             // Replaces hardcoded 0.75/0.50 thresholds with ToxicityRegime classification.
             // ToxicityRegime has built-in hysteresis, so no cooldown timer needed.
-            // Size reductions use viable.reduce_sizes() for exchange-minimum protection.
+            //
+            // DESIGN: Normal regime uses SPREAD WIDENING instead of SIZE REDUCTION.
+            // Size reduction on small accounts pushes sizes below exchange minimum,
+            // triggering the Sisyphean loop where viable.rs rounds up → toxicity reduces
+            // → ExchangeRules rejects. Spread widening achieves the same protective
+            // effect without hitting size floors.
             {
                 use crate::market_maker::adverse_selection::ToxicityRegime;
                 let vq = *viable.quantum();
@@ -2499,13 +2546,27 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         }
                     }
                     ToxicityRegime::Normal => {
-                        // Moderate: graduated size reduction on both sides
+                        // Moderate: WIDEN SPREADS instead of reducing sizes.
+                        // Converts toxicity defense to price protection, preserving
+                        // order sizes that are already at/near exchange minimum.
                         let bid_tox = market_params.pre_fill_toxicity_bid;
                         let ask_tox = market_params.pre_fill_toxicity_ask;
-                        let bid_mult = (1.5 - bid_tox * 2.0).clamp(0.3, 1.0);
-                        let ask_mult = (1.5 - ask_tox * 2.0).clamp(0.3, 1.0);
-                        viable.bids.reduce_sizes(bid_mult, &vq);
-                        viable.asks.reduce_sizes(ask_mult, &vq);
+                        // toxicity 0.25→widen 1.0x (none), 0.50→1.15x, 0.75→1.50x
+                        let bid_widen = (1.0 + bid_tox).clamp(1.0, 1.5);
+                        let ask_widen = (1.0 + ask_tox).clamp(1.0, 1.5);
+                        let mid = quote_config.mid_price;
+                        if bid_widen > 1.001 {
+                            for quote in viable.bids.iter_mut() {
+                                let offset = (mid - quote.price).max(0.0);
+                                quote.price = mid - offset * bid_widen;
+                            }
+                        }
+                        if ask_widen > 1.001 {
+                            for quote in viable.asks.iter_mut() {
+                                let offset = (quote.price - mid).max(0.0);
+                                quote.price = mid + offset * ask_widen;
+                            }
+                        }
                     }
                     ToxicityRegime::Benign => {} // No filtering
                 }
@@ -2725,6 +2786,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &reduce_only_config,
                 &self.infra.exchange_limits,
             );
+            diag_reduce_only = reduce_only_result.was_filtered;
 
             // If escalation is needed, cancel all position-increasing quotes
             // This prevents the position from growing further when reduce-only can't place reducing orders
@@ -2884,9 +2946,36 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .record_quote_decision(decision);
             }
 
-            // === FINALIZE: apply defense spread widening and extract raw quotes ===
-            // All quotes guaranteed to meet min_notional after finalize.
-            let (bid_quotes, ask_quotes) = viable.finalize();
+            // === FINALIZE: apply defense spread widening, validate, and extract quotes ===
+            // All quotes guaranteed to meet min_notional AND exchange precision after finalize.
+            let (bid_validated, ask_validated, validation_report) = viable.finalize();
+
+            // [VALIDATE] logging — tracks price re-rounding and rejection stats per cycle
+            if validation_report.fixed > 0 || validation_report.rejected > 0 {
+                info!(
+                    proposed = validation_report.proposed,
+                    valid = validation_report.valid,
+                    fixed = validation_report.fixed,
+                    rejected = validation_report.rejected,
+                    "[VALIDATE] {validation_report}"
+                );
+            } else {
+                trace!(
+                    proposed = validation_report.proposed,
+                    valid = validation_report.valid,
+                    "[VALIDATE] {validation_report}"
+                );
+            }
+
+            // Convert validated quotes back to Quote for reconciler compatibility
+            let bid_quotes: Vec<Quote> = bid_validated
+                .iter()
+                .map(|vq| Quote::new(vq.price(), vq.size()))
+                .collect();
+            let ask_quotes: Vec<Quote> = ask_validated
+                .iter()
+                .map(|vq| Quote::new(vq.price(), vq.size()))
+                .collect();
 
             // DIAGNOSTIC: Warn when ladder is completely empty after processing
             // This helps diagnose min_notional and capacity issues at INFO level
@@ -3049,6 +3138,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             };
             let reduce_only_result =
                 quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
+            diag_reduce_only = reduce_only_result.was_filtered;
 
             // === CLOSE BIAS: tighten closing side spread in reduce-only mode ===
             if reduce_only_result.was_filtered {
@@ -3097,6 +3187,54 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Handle ask side
             self.reconcile_side(Side::Sell, ask).await?;
+        }
+
+        // === Cycle Diagnosis: one-line summary ===
+        {
+            use super::diagnosis::{BlockingReason, CycleDiagnosis};
+
+            let is_warmup = !self.estimator.is_warmed_up();
+            let warmup_pct = {
+                let (current, target) = self.estimator.warmup_progress_simple();
+                if target > 0 {
+                    (current as f64 / target as f64 * 100.0).min(100.0)
+                } else {
+                    100.0
+                }
+            };
+            let (surviving_bids, surviving_asks) = self.orders.order_counts();
+
+            // Use feature snapshot spread (computed from L2 book)
+            let spread_bps = feature_snapshot.spread_bps;
+
+            let blocking_reason = if self.safety.kill_switch.is_triggered() {
+                Some(BlockingReason::KillSwitchActive {
+                    reason: "kill_switch_active".to_string(),
+                })
+            } else if diag_target_bids == 0 && diag_target_asks == 0 {
+                Some(BlockingReason::EmptyLadder)
+            } else if surviving_bids == 0 && surviving_asks == 0 {
+                Some(BlockingReason::FilteredToEmpty {
+                    filter: "pipeline",
+                    levels_before: diag_target_bids + diag_target_asks,
+                })
+            } else {
+                None
+            };
+
+            let diagnosis = CycleDiagnosis {
+                is_warmup,
+                warmup_pct,
+                spread_bps,
+                target_bid_levels: diag_target_bids,
+                target_ask_levels: diag_target_asks,
+                surviving_bid_levels: surviving_bids,
+                surviving_ask_levels: surviving_asks,
+                execution_mode: format!("{execution_mode}"),
+                reduce_only: diag_reduce_only,
+                blocking_reason,
+            };
+            diagnosis.emit();
         }
 
         // === Post-Quote Tracking ===
@@ -3205,6 +3343,33 @@ fn compute_continuous_inventory_pressure(
 ///   - HYPE @    $31 → tick = $0.001  → 0.32 bps
 ///   - SOL @   $200 → tick = $0.01   → 0.50 bps
 ///
+/// Compute spread widening multiplier for stale data.
+///
+/// When book or exchange limit data goes stale, spreads widen automatically
+/// to compensate for increased uncertainty. This converts staleness warnings
+/// into an automatic defensive response.
+///
+/// Returns 1.0 (no penalty) when data is fresh, up to 3.0 when very stale.
+fn compute_staleness_spread_penalty(book_age_ms: u64, exchange_limits_age_ms: u64) -> f64 {
+    let mut mult: f64 = 1.0;
+
+    // Book data stale: widens at 5s, more at 15s
+    if book_age_ms > 15_000 {
+        mult *= 2.0;
+    } else if book_age_ms > 5_000 {
+        mult *= 1.5;
+    }
+
+    // Exchange limits stale: widens at 30s, more at 2min
+    if exchange_limits_age_ms > 120_000 {
+        mult *= 2.0;
+    } else if exchange_limits_age_ms > 30_000 {
+        mult *= 1.5;
+    }
+
+    mult.min(3.0) // Cap at 3x to avoid extreme widening
+}
+
 /// This replaces the hardcoded `tick_size_bps: 10.0` which caused spreads
 /// to be 32x wider than market (20 bps vs 0.6 bps BBO).
 fn compute_tick_size_bps(mid_price: f64) -> f64 {
@@ -3568,5 +3733,43 @@ mod tests {
                 "tick_bps={tick} at price={price} should be < 10.0 (old hardcoded default)"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Stale data circuit breaker tests
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_staleness_penalty_fresh_data() {
+        // Fresh data: no penalty
+        assert!((compute_staleness_spread_penalty(100, 1000) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_staleness_penalty_stale_book() {
+        // Book stale at 5s: 1.5x
+        let p = compute_staleness_spread_penalty(6_000, 1_000);
+        assert!((p - 1.5).abs() < f64::EPSILON, "Expected 1.5, got {p}");
+
+        // Book very stale at 15s: 2.0x
+        let p = compute_staleness_spread_penalty(16_000, 1_000);
+        assert!((p - 2.0).abs() < f64::EPSILON, "Expected 2.0, got {p}");
+    }
+
+    #[test]
+    fn test_staleness_penalty_stale_limits() {
+        // Exchange limits stale at 30s: 1.5x
+        let p = compute_staleness_spread_penalty(100, 35_000);
+        assert!((p - 1.5).abs() < f64::EPSILON, "Expected 1.5, got {p}");
+
+        // Exchange limits very stale at 2min: 2.0x
+        let p = compute_staleness_spread_penalty(100, 130_000);
+        assert!((p - 2.0).abs() < f64::EPSILON, "Expected 2.0, got {p}");
+    }
+
+    #[test]
+    fn test_staleness_penalty_capped_at_3x() {
+        // Both very stale: 2.0 * 2.0 = 4.0, capped at 3.0
+        let p = compute_staleness_spread_penalty(20_000, 200_000);
+        assert!((p - 3.0).abs() < f64::EPSILON, "Expected 3.0 cap, got {p}");
     }
 }

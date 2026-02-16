@@ -1932,11 +1932,12 @@ impl LadderStrategy {
 
             // 9. Filter out levels below minimum notional (exchange will reject them anyway)
             // SizeQuantum is the exact truncation-safe minimum — no fudge factor needed.
+            // Use >= (not >): levels at exactly min_viable_size are valid and truncation-stable.
             let min_size_for_exchange = quantum.min_viable_size;
             let bids_before = ladder.bids.len();
             let asks_before = ladder.asks.len();
-            ladder.bids.retain(|l| l.size > min_size_for_exchange);
-            ladder.asks.retain(|l| l.size > min_size_for_exchange);
+            ladder.bids.retain(|l| l.size >= min_size_for_exchange);
+            ladder.asks.retain(|l| l.size >= min_size_for_exchange);
 
             // 10. CONCENTRATION FALLBACK: If ladder is empty but total available size
             // meets min_notional, create single concentrated order at tightest depth.

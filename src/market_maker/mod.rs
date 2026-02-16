@@ -222,6 +222,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Bounded to MAX_CACHED_TRADES entries.
     cached_trades: std::collections::VecDeque<(f64, bool, u64)>,
 
+    // === Exchange Price Validation ===
+    /// Exchange pricing rules for quote validation.
+    /// Used by `place_bulk_ladder_orders` to debug_assert price validity.
+    exchange_rules: quoting::ExchangeRules,
+
     // === Event-Driven Churn Reduction (Phase 3) ===
     /// Event accumulator for event-driven quote updates.
     /// Reduces order churn by only reconciling when meaningful events occur.
@@ -399,6 +404,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Will be updated with first-principles min_viable floor once we have price data
         let effective_target_liquidity = config.target_liquidity;
 
+        // Construct exchange rules before moving config into Self
+        let exchange_rules = quoting::ExchangeRules::new(
+            config.decimals,
+            config.sz_decimals,
+            10.0, // MIN_ORDER_NOTIONAL
+        );
+
         Self {
             config,
             strategy,
@@ -438,6 +450,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             cached_best_ask: 0.0,
             last_l2_update_time: std::time::Instant::now(),
             cached_trades: std::collections::VecDeque::with_capacity(500),
+            // Exchange price validation rules
+            exchange_rules,
             // Event-driven churn reduction
             event_accumulator: orchestrator::EventAccumulator::default_config(),
             // First-principles belief system

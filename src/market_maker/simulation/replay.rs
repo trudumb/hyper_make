@@ -267,6 +267,7 @@ impl ReplayEngine {
             has_alpha: false, // No cross-venue signal in replay
             position: self.position,
             capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
+            is_warmup: false, // Replay assumes calibrated state
         };
         let new_mode = select_mode(&input);
         if new_mode != self.mode {
