@@ -14,7 +14,7 @@ use crate::market_maker::quoting::{
 
 use super::{
     CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
-    RiskModelConfig,
+    RiskModelConfig, SpreadComposition,
 };
 
 use crate::market_maker::risk::PositionZone;
@@ -690,6 +690,60 @@ impl LadderStrategy {
         ladder
     }
 
+    /// Compute the additive spread composition for the ladder's touch level.
+    ///
+    /// Returns the same `SpreadComposition` struct as GLFT, decomposing the
+    /// ladder's innermost spread into additive components. This provides
+    /// a unified view of spread formation across both strategies.
+    pub fn compute_spread_composition(
+        &self,
+        market_params: &MarketParams,
+        max_position: f64,
+    ) -> SpreadComposition {
+        let effective_max_position = market_params.effective_max_position(max_position).min(max_position);
+        let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
+            market_params.adaptive_gamma * market_params.tail_risk_multiplier
+        } else {
+            let base = self.effective_gamma(market_params, 0.0, effective_max_position);
+            base * market_params.liquidity_gamma_mult * market_params.tail_risk_multiplier
+        };
+        let gamma = gamma * market_params.regime_gamma_multiplier;
+
+        let kappa = if market_params.use_kappa_robust {
+            market_params.kappa_robust
+        } else {
+            market_params.kappa
+        };
+
+        // Core GLFT half-spread at touch level
+        let glft_half_frac = self.depth_generator.glft_optimal_spread(gamma, kappa);
+        let glft_half_bps = glft_half_frac * 10_000.0;
+
+        // Risk premium from regime and position zone
+        let risk_premium_bps = market_params.regime_risk_premium_bps
+            + market_params.total_risk_premium_bps;
+
+        let quota_addon_bps = market_params.quota_shadow_spread_bps.min(50.0);
+
+        let warmup_addon_bps = if market_params.adaptive_warmup_progress < 1.0 {
+            // Policy-driven warmup addon: Micro=3.0, Large=8.0 bps max, decays with warmup
+            market_params.capital_policy.warmup_floor_bps
+                * (1.0 - market_params.adaptive_warmup_progress)
+        } else {
+            0.0
+        };
+
+        let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
+
+        SpreadComposition {
+            glft_half_spread_bps: glft_half_bps,
+            risk_premium_bps,
+            quota_addon_bps,
+            warmup_addon_bps,
+            fee_bps,
+        }
+    }
+
     /// Generate full ladder from market params.
     ///
     /// This is the main method that creates a multi-level quote ladder.
@@ -1237,20 +1291,26 @@ impl LadderStrategy {
         // The GLFT formula δ = (1/γ) × ln(1 + γ/κ) now handles all spread widening
         // in a mathematically principled way.
 
-        // Capital-aware level count: don't spread across more levels than capital can support
+        // Capital-aware level count: don't spread across more levels than capital can support.
+        // Uses the policy's max_levels_per_side as a hard cap, then further constrained by
+        // actual capital capacity. This replaces ad-hoc capital_limited_levels logic with
+        // a principled policy-driven cap.
         let budget_per_side = size_for_initial_ladder * market_params.microprice / 2.0;
         let max_viable_levels = (budget_per_side / config.min_notional).floor() as usize;
-        let capital_limited_levels = if max_viable_levels < self.ladder_config.num_levels && max_viable_levels >= 1 {
+        let policy_max = market_params.capital_policy.max_levels_per_side;
+        let config_max = self.ladder_config.num_levels.min(policy_max);
+        let capital_limited_levels = if max_viable_levels < config_max && max_viable_levels >= 1 {
             tracing::info!(
                 budget_per_side = %format!("{:.2}", budget_per_side),
                 min_notional = %format!("{:.2}", config.min_notional),
                 max_viable_levels = max_viable_levels,
+                policy_max = policy_max,
                 configured_levels = self.ladder_config.num_levels,
                 "Capital constrains ladder levels"
             );
             max_viable_levels
         } else {
-            self.ladder_config.num_levels
+            config_max
         };
 
         // Create ladder config with dynamic depths and capital-limited levels
@@ -1693,48 +1753,62 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 6. Optimize bid sizes using entropy-based allocation
+            // 6. Optimize bid sizes
             if !bid_level_params.is_empty() {
-                // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
-                // Uses information-theoretic entropy constraints to maintain diversity
-                // and prevent collapse to 1-2 orders even under adverse conditions.
-                let entropy_config = EntropyOptimizerConfig {
-                    distribution: EntropyDistributionConfig {
-                        min_entropy: market_params.entropy_min_entropy,
-                        base_temperature: market_params.entropy_base_temperature,
-                        min_allocation_floor: market_params.entropy_min_allocation_floor,
-                        thompson_samples: market_params.entropy_thompson_samples,
+                if market_params.capital_policy.skip_entropy_optimization {
+                    // CAPITAL-AWARE: Equal-weight allocation for Micro/Small tiers.
+                    // Saves compute and produces predictable, min-size orders.
+                    let equal_size = available_for_bids / ladder.bids.len().max(1) as f64;
+                    for bid in &mut ladder.bids {
+                        bid.size = truncate_float(equal_size, config.sz_decimals, false);
+                    }
+                    debug!(
+                        equal_size = %format!("{:.4}", equal_size),
+                        levels = ladder.bids.len(),
+                        "Skip entropy: equal-weight bid allocation"
+                    );
+                } else {
+                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                    // Uses information-theoretic entropy constraints to maintain diversity
+                    // and prevent collapse to 1-2 orders even under adverse conditions.
+                    let entropy_config = EntropyOptimizerConfig {
+                        distribution: EntropyDistributionConfig {
+                            min_entropy: market_params.entropy_min_entropy,
+                            base_temperature: market_params.entropy_base_temperature,
+                            min_allocation_floor: market_params.entropy_min_allocation_floor,
+                            thompson_samples: market_params.entropy_thompson_samples,
+                            ..Default::default()
+                        },
+                        min_notional: config.min_notional,
                         ..Default::default()
-                    },
-                    min_notional: config.min_notional,
-                    ..Default::default()
-                };
+                    };
 
-                let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
-                    entropy_config,
-                    market_params.microprice,
-                    margin_for_bids, // Use inventory-weighted margin split (not full margin)
-                    available_for_bids,
-                    leverage,
-                );
+                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                        entropy_config,
+                        market_params.microprice,
+                        margin_for_bids, // Use inventory-weighted margin split (not full margin)
+                        available_for_bids,
+                        leverage,
+                    );
 
-                let regime = Self::build_market_regime(market_params);
-                let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
+                    let regime = Self::build_market_regime(market_params);
+                    let entropy_alloc = entropy_optimizer.optimize(&bid_level_params, &regime);
 
-                info!(
-                    entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
-                    effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
-                    entropy_floor_active = entropy_alloc.entropy_floor_active,
-                    active_levels = entropy_alloc.active_levels,
-                    "Entropy optimizer applied to bids"
-                );
+                    info!(
+                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                        entropy_floor_active = entropy_alloc.entropy_floor_active,
+                        active_levels = entropy_alloc.active_levels,
+                        "Entropy optimizer applied to bids"
+                    );
 
-                let allocation = entropy_alloc.to_legacy();
+                    let allocation = entropy_alloc.to_legacy();
 
-                for (i, &size) in allocation.sizes.iter().enumerate() {
-                    if i < ladder.bids.len() {
-                        // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
-                        ladder.bids[i].size = truncate_float(size, config.sz_decimals, false);
+                    for (i, &size) in allocation.sizes.iter().enumerate() {
+                        if i < ladder.bids.len() {
+                            // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
+                            ladder.bids[i].size = truncate_float(size, config.sz_decimals, false);
+                        }
                     }
                 }
             }
@@ -1765,48 +1839,61 @@ impl LadderStrategy {
                 })
                 .collect();
 
-            // 8. Optimize ask sizes using entropy-based allocation
+            // 8. Optimize ask sizes
             if !ask_level_params.is_empty() {
-                // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
-                // Uses information-theoretic entropy constraints to maintain diversity
-                // and prevent collapse to 1-2 orders even under adverse conditions.
-                let entropy_config = EntropyOptimizerConfig {
-                    distribution: EntropyDistributionConfig {
-                        min_entropy: market_params.entropy_min_entropy,
-                        base_temperature: market_params.entropy_base_temperature,
-                        min_allocation_floor: market_params.entropy_min_allocation_floor,
-                        thompson_samples: market_params.entropy_thompson_samples,
+                if market_params.capital_policy.skip_entropy_optimization {
+                    // CAPITAL-AWARE: Equal-weight allocation for Micro/Small tiers.
+                    let equal_size = available_for_asks / ladder.asks.len().max(1) as f64;
+                    for ask in &mut ladder.asks {
+                        ask.size = truncate_float(equal_size, config.sz_decimals, false);
+                    }
+                    debug!(
+                        equal_size = %format!("{:.4}", equal_size),
+                        levels = ladder.asks.len(),
+                        "Skip entropy: equal-weight ask allocation"
+                    );
+                } else {
+                    // === ENTROPY-BASED ALLOCATION (FIRST PRINCIPLES) ===
+                    // Uses information-theoretic entropy constraints to maintain diversity
+                    // and prevent collapse to 1-2 orders even under adverse conditions.
+                    let entropy_config = EntropyOptimizerConfig {
+                        distribution: EntropyDistributionConfig {
+                            min_entropy: market_params.entropy_min_entropy,
+                            base_temperature: market_params.entropy_base_temperature,
+                            min_allocation_floor: market_params.entropy_min_allocation_floor,
+                            thompson_samples: market_params.entropy_thompson_samples,
+                            ..Default::default()
+                        },
+                        min_notional: config.min_notional,
                         ..Default::default()
-                    },
-                    min_notional: config.min_notional,
-                    ..Default::default()
-                };
+                    };
 
-                let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
-                    entropy_config,
-                    market_params.microprice,
-                    margin_for_asks, // Use inventory-weighted margin split (not full margin)
-                    available_for_asks,
-                    leverage,
-                );
+                    let mut entropy_optimizer = EntropyConstrainedOptimizer::new(
+                        entropy_config,
+                        market_params.microprice,
+                        margin_for_asks, // Use inventory-weighted margin split (not full margin)
+                        available_for_asks,
+                        leverage,
+                    );
 
-                let regime = Self::build_market_regime(market_params);
-                let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
+                    let regime = Self::build_market_regime(market_params);
+                    let entropy_alloc = entropy_optimizer.optimize(&ask_level_params, &regime);
 
-                info!(
-                    entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
-                    effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
-                    entropy_floor_active = entropy_alloc.entropy_floor_active,
-                    active_levels = entropy_alloc.active_levels,
-                    "Entropy optimizer applied to asks"
-                );
+                    info!(
+                        entropy = %format!("{:.3}", entropy_alloc.distribution.entropy),
+                        effective_levels = %format!("{:.1}", entropy_alloc.distribution.effective_levels),
+                        entropy_floor_active = entropy_alloc.entropy_floor_active,
+                        active_levels = entropy_alloc.active_levels,
+                        "Entropy optimizer applied to asks"
+                    );
 
-                let allocation = entropy_alloc.to_legacy();
+                    let allocation = entropy_alloc.to_legacy();
 
-                for (i, &size) in allocation.sizes.iter().enumerate() {
-                    if i < ladder.asks.len() {
-                        // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
-                        ladder.asks[i].size = truncate_float(size, config.sz_decimals, false);
+                    for (i, &size) in allocation.sizes.iter().enumerate() {
+                        if i < ladder.asks.len() {
+                            // CRITICAL: Truncate to sz_decimals to prevent "Order has invalid size" rejections
+                            ladder.asks[i].size = truncate_float(size, config.sz_decimals, false);
+                        }
                     }
                 }
             }

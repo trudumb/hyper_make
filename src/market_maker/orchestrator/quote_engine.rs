@@ -6,8 +6,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::prelude::Result;
 
 use super::super::{
-    quoting, MarketMaker, TradingEnvironment, ParameterAggregator, ParameterSources, QuoteConfig,
-    QuotingStrategy, Side,
+    quoting, MarketMaker, Quote, TradingEnvironment, ParameterAggregator, ParameterSources,
+    QuoteConfig, QuotingStrategy, Side,
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 use crate::market_maker::control::{QuoteGateDecision, QuoteGateInput};
@@ -2119,7 +2119,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             l2_p_positive_edge: l2_p_positive,
             l2_model_health: l2_health_score,
             // L3 inputs from stochastic controller
-            l3_trust: market_params.bootstrap_confidence.min(1.0),
+            // Cap L3 trust based on capital-aware policy to prevent death spiral:
+            // with few fills, tautological edge causes L3 to ramp trust → kill quoting.
+            // Policy caps trust at e.g. 0.30 for Micro until min_fills_for_trust_ramp fills.
+            l3_trust: {
+                let raw_trust = market_params.bootstrap_confidence.min(1.0);
+                let policy = &market_params.capital_policy;
+                let fills = self.tier1.adverse_selection.fills_measured() as u64;
+                if fills < policy.min_fills_for_trust_ramp {
+                    raw_trust.min(policy.max_l3_trust_uncalibrated)
+                } else {
+                    raw_trust
+                }
+            },
             l3_belief: if market_params.should_quote_edge {
                 Some(0.6) // Favorable conditions
             } else {
@@ -2302,18 +2314,27 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Without this, market_params.capital_tier defaults to Large, causing
         // select_mode step 6 to return Flat instead of Maker for small accounts.
         market_params.capital_tier = capacity_budget.capital_tier;
+        market_params.capital_policy = capacity_budget.policy();
         market_params.capacity_budget = Some(capacity_budget.clone());
+        // Mirror policy to MarketMaker for components (reconciler) that don't receive MarketParams
+        self.capital_policy = capacity_budget.policy();
 
-        // Capital-tier-aware warmup bootstrap: small accounts get a warmup floor
+        // Capital-aware warmup bootstrap: small accounts get a warmup floor
         // to prevent the death spiral (no fills → 10% warmup → inflated gamma → no fills).
-        // Bayesian priors give sufficient starting estimates for Micro/Small tiers.
+        // Bayesian priors give sufficient starting estimates for bootstrap_from_book tiers.
+        // Fill-based progress: fills/warmup_fill_target (Micro: 5, Small: 10, Large: 50).
         {
-            use crate::market_maker::config::auto_derive::CapitalTier;
-            let warmup_floor = match capacity_budget.capital_tier {
-                CapitalTier::Micro => 0.40,  // Bayesian priors suffice
-                CapitalTier::Small => 0.25,
-                _ => 0.0,
+            let policy = &market_params.capital_policy;
+            // Bootstrap floor: tiers with bootstrap_from_book get a floor from priors
+            let bootstrap_floor: f64 = if policy.bootstrap_from_book { 0.40 } else { 0.0 };
+            // Fill-based progress scales by tier-specific target (not hardcoded 50)
+            let fills = self.tier1.adverse_selection.fills_measured() as f64;
+            let fill_progress = if policy.warmup_fill_target > 0 {
+                (fills / policy.warmup_fill_target as f64).min(1.0)
+            } else {
+                1.0
             };
+            let warmup_floor = bootstrap_floor.max(fill_progress);
             if warmup_floor > 0.0 {
                 market_params.adaptive_warmup_progress =
                     market_params.adaptive_warmup_progress.max(warmup_floor);
@@ -2887,11 +2908,33 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // Reconcile ladder quotes
+            // Capital-aware policy selects reconciliation strategy:
+            // - Micro/Small: batch reconcile (cancel-all + place-all = 2 API calls)
+            // - Medium/Large: smart reconcile with modify (preserves queue priority)
+            let use_batch = self.capital_policy.use_batch_reconcile;
             info!(
                 smart_reconcile = self.config.smart_reconcile,
+                batch_mode = use_batch,
                 "Submitting ladder quotes to reconciler"
             );
-            if self.config.smart_reconcile {
+            if use_batch {
+                // Batch reconciliation: cancel all, then place all.
+                // For Micro/Small accounts: 2 API calls vs 12+ for smart reconcile.
+                // Price drift tolerance: skip if all prices within threshold.
+                let policy = &self.capital_policy;
+                let drift_ok = self.check_price_drift_within_threshold(
+                    &bid_quotes,
+                    &ask_quotes,
+                    policy.price_drift_threshold_bps,
+                );
+                if drift_ok {
+                    debug!("Batch reconcile: prices within drift threshold, skipping");
+                } else {
+                    // Cancel all existing orders then place new batch
+                    self.reconcile_ladder_side(Side::Buy, bid_quotes).await?;
+                    self.reconcile_ladder_side(Side::Sell, ask_quotes).await?;
+                }
+            } else if self.config.smart_reconcile {
                 // Smart reconciliation with ORDER MODIFY for queue preservation
                 self.reconcile_ladder_smart(bid_quotes, ask_quotes).await?;
             } else {
@@ -3071,6 +3114,53 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.cached_market_params = Some(market_params);
 
         Ok(())
+    }
+
+    /// Check if all existing orders are within the drift threshold of target quotes.
+    /// Used by batch reconcile to skip unnecessary cancel/replace cycles.
+    fn check_price_drift_within_threshold(
+        &self,
+        bid_quotes: &[Quote],
+        ask_quotes: &[Quote],
+        threshold_bps: f64,
+    ) -> bool {
+        // If no existing orders, always need to place
+        let existing_bids: Vec<_> = self.orders.get_all_by_side(Side::Buy);
+        let existing_asks: Vec<_> = self.orders.get_all_by_side(Side::Sell);
+
+        if existing_bids.is_empty() && existing_asks.is_empty() {
+            return false; // No orders → need to place
+        }
+
+        // Check bid drift
+        if existing_bids.len() != bid_quotes.len() {
+            return false; // Different count → need reconcile
+        }
+        for (existing, target) in existing_bids.iter().zip(bid_quotes.iter()) {
+            let mid = (existing.price + target.price) / 2.0;
+            if mid > 0.0 {
+                let drift_bps = ((existing.price - target.price) / mid).abs() * 10_000.0;
+                if drift_bps > threshold_bps {
+                    return false;
+                }
+            }
+        }
+
+        // Check ask drift
+        if existing_asks.len() != ask_quotes.len() {
+            return false;
+        }
+        for (existing, target) in existing_asks.iter().zip(ask_quotes.iter()) {
+            let mid = (existing.price + target.price) / 2.0;
+            if mid > 0.0 {
+                let drift_bps = ((existing.price - target.price) / mid).abs() * 10_000.0;
+                if drift_bps > threshold_bps {
+                    return false;
+                }
+            }
+        }
+
+        true // All within threshold
     }
 }
 

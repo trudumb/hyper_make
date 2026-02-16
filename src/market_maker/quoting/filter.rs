@@ -16,6 +16,7 @@
 
 use crate::market_maker::config::Quote;
 use crate::market_maker::infra::ExchangePositionLimits;
+use crate::market_maker::risk::PositionLimits;
 use tracing::warn;
 
 /// Reason for entering reduce-only mode.
@@ -191,6 +192,19 @@ pub struct ReduceOnlyConfig {
     /// Unrealized P&L (USD). Negative = underwater.
     /// Used to prevent forcing sales at a loss when not at liquidation risk.
     pub unrealized_pnl: f64,
+}
+
+impl ReduceOnlyConfig {
+    /// Override `max_position` from the canonical `PositionLimits` source.
+    ///
+    /// Callers construct `ReduceOnlyConfig` with whatever default they have,
+    /// then call this to replace `max_position` with the single source of truth.
+    /// This ensures the filter always uses the same effective limit as every
+    /// other component in the quote cycle.
+    pub fn with_position_limits(mut self, limits: &PositionLimits) -> Self {
+        self.max_position = limits.effective();
+        self
+    }
 }
 
 /// Quote filtering utilities.

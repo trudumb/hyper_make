@@ -139,6 +139,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// FIRST check in every quote cycle — never overridden by margin-derived limits.
     pub(crate) inventory_governor: risk::InventoryGovernor,
 
+    /// Capital-aware policy, updated each cycle from CapacityBudget.
+    /// Accessible by reconciler and other components that don't receive MarketParams.
+    capital_policy: config::CapitalAwarePolicy,
+
     // === First-Principles Position Limit ===
     /// Effective max position SIZE (contracts), updated each quote cycle.
     ///
@@ -414,6 +418,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             infra,
             stochastic,
             inventory_governor,
+            capital_policy: config::CapitalAwarePolicy::default(),
             effective_max_position,
             effective_target_liquidity,
             last_ws_open_orders_snapshot: None,

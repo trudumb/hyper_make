@@ -431,6 +431,50 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn test_pure_buy_flow_nonzero_imbalance_30s() {
+        // P0-5 regression test: after one-sided buy trades, imbalance_30s must be > 0.
+        // With ALPHA_30S=0.01, buy_ewma_30s after N buys = 1 - 0.99^N.
+        // For N=10: buy_ewma ≈ 0.0956, sell_ewma = 0 → imbalance = 1.0.
+        let mut tracker = TradeFlowTracker::new();
+
+        // 10 buy trades of size 1.0, zero sell trades
+        for _ in 0..10 {
+            tracker.on_trade(1.0, true);
+        }
+
+        // All horizons must be positive (strongly)
+        assert!(
+            tracker.imbalance_at_30s() > 0.0,
+            "30s imbalance must be > 0 after 10 buys, got {}",
+            tracker.imbalance_at_30s()
+        );
+        assert!(
+            tracker.imbalance_at_5s() > 0.0,
+            "5s imbalance must be > 0 after 10 buys, got {}",
+            tracker.imbalance_at_5s()
+        );
+        // With zero sells, imbalance should be very close to 1.0
+        assert!(
+            tracker.imbalance_at_30s() > 0.99,
+            "30s imbalance should be ~1.0 with only buys, got {}",
+            tracker.imbalance_at_30s()
+        );
+
+        // avg_buy_size must be non-zero
+        assert!(
+            (tracker.avg_buy_size() - 1.0).abs() < 1e-10,
+            "avg_buy_size should be 1.0, got {}",
+            tracker.avg_buy_size()
+        );
+        // avg_sell_size should still be 0.0 (no sells)
+        assert_eq!(tracker.avg_sell_size(), 0.0);
+
+        // Verify trade count
+        assert_eq!(tracker.trade_count(), 10);
+    }
+
     #[test]
     fn test_default_impl() {
         let tracker = TradeFlowTracker::default();

@@ -236,6 +236,11 @@ impl CapacityBudget {
         self.quantum.clamp_to_viable(raw, true)
     }
 
+    /// Compute the capital-aware policy for this budget's tier.
+    pub fn policy(&self) -> CapitalAwarePolicy {
+        CapitalAwarePolicy::from_tier(self.capital_tier)
+    }
+
     fn determine_viability(
         account_value: f64,
         mark_px: f64,
@@ -311,6 +316,131 @@ impl CapacityBudget {
                 levels_per_side: max_levels,
             }
         }
+    }
+}
+
+/// Capital-aware policy computed once from `CapitalTier` and threaded through the pipeline.
+///
+/// Instead of scattered `if tier == Micro` conditionals in 15 files, this single policy
+/// object encodes all tier-dependent behavior. Computed at the top of the pipeline from
+/// `CapitalTier`, flows through `MarketParams.capital_policy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapitalAwarePolicy {
+    pub tier: CapitalTier,
+
+    // --- Ladder generation ---
+    /// Maximum ladder levels per side. Micro: 2, Small: 3, Medium: 5, Large: 8.
+    pub max_levels_per_side: usize,
+    /// Skip entropy optimization for Micro/Small (saves compute, predictable sizes).
+    pub skip_entropy_optimization: bool,
+    /// Minimum size as multiple of exchange minimum (1.0 = exactly exchange min).
+    pub min_level_size_mult: f64,
+
+    // --- Reconciliation ---
+    /// Use cancel-all + place-all (2 API calls) instead of smart reconcile (12+).
+    pub use_batch_reconcile: bool,
+    /// Tolerance (bps) before re-quoting. Higher = fewer API calls. Micro: 3.0, Large: 1.0.
+    pub price_drift_threshold_bps: f64,
+
+    // --- Controller ---
+    /// Cap L3 trust before sufficient fills. Prevents death spiral from tautological edge.
+    pub max_l3_trust_uncalibrated: f64,
+    /// Always maintain at least 1 level per side (never 0+0). Micro/Small: true.
+    pub always_quote_minimum: bool,
+    /// Fills needed before L3 trust can exceed cap.
+    pub min_fills_for_trust_ramp: u64,
+
+    // --- Warmup ---
+    /// Fill target for 100% warmup. Micro: 5, Large: 50.
+    pub warmup_fill_target: u64,
+    /// Use L2 book data for initial kappa/sigma estimates. Micro/Small: true.
+    pub bootstrap_from_book: bool,
+    /// Warmup spread floor (bps). Micro: 3.0, Large: 8.0. Tighter = more fills = faster warmup.
+    pub warmup_floor_bps: f64,
+
+    // --- Quota management ---
+    /// Override min_headroom_for_full_ladder. Micro: 0.05 vs default 0.20.
+    pub quota_min_headroom_for_full: f64,
+    /// Whether to truncate levels by sqrt(headroom). Micro/Small: false.
+    pub quota_density_scaling: bool,
+}
+
+impl CapitalAwarePolicy {
+    /// Construct policy from capital tier. This is the ONLY place tier → behavior mapping lives.
+    pub fn from_tier(tier: CapitalTier) -> Self {
+        match tier {
+            CapitalTier::Micro => Self {
+                tier,
+                max_levels_per_side: 2,
+                skip_entropy_optimization: true,
+                min_level_size_mult: 1.0,
+                use_batch_reconcile: true,
+                price_drift_threshold_bps: 3.0,
+                max_l3_trust_uncalibrated: 0.30,
+                always_quote_minimum: true,
+                min_fills_for_trust_ramp: 10,
+                warmup_fill_target: 5,
+                bootstrap_from_book: true,
+                warmup_floor_bps: 3.0,
+                quota_min_headroom_for_full: 0.05,
+                quota_density_scaling: false,
+            },
+            CapitalTier::Small => Self {
+                tier,
+                max_levels_per_side: 3,
+                skip_entropy_optimization: true,
+                min_level_size_mult: 1.0,
+                use_batch_reconcile: true,
+                price_drift_threshold_bps: 2.0,
+                max_l3_trust_uncalibrated: 0.50,
+                always_quote_minimum: true,
+                min_fills_for_trust_ramp: 20,
+                warmup_fill_target: 10,
+                bootstrap_from_book: true,
+                warmup_floor_bps: 4.0,
+                quota_min_headroom_for_full: 0.10,
+                quota_density_scaling: false,
+            },
+            CapitalTier::Medium => Self {
+                tier,
+                max_levels_per_side: 5,
+                skip_entropy_optimization: false,
+                min_level_size_mult: 1.5,
+                use_batch_reconcile: false,
+                price_drift_threshold_bps: 1.5,
+                max_l3_trust_uncalibrated: 0.80,
+                always_quote_minimum: false,
+                min_fills_for_trust_ramp: 30,
+                warmup_fill_target: 25,
+                bootstrap_from_book: false,
+                warmup_floor_bps: 6.0,
+                quota_min_headroom_for_full: 0.15,
+                quota_density_scaling: true,
+            },
+            CapitalTier::Large => Self {
+                tier,
+                max_levels_per_side: 8,
+                skip_entropy_optimization: false,
+                min_level_size_mult: 2.0,
+                use_batch_reconcile: false,
+                price_drift_threshold_bps: 1.0,
+                max_l3_trust_uncalibrated: 0.95,
+                always_quote_minimum: false,
+                min_fills_for_trust_ramp: 50,
+                warmup_fill_target: 50,
+                bootstrap_from_book: false,
+                warmup_floor_bps: 8.0,
+                quota_min_headroom_for_full: 0.20,
+                quota_density_scaling: true,
+            },
+        }
+    }
+}
+
+impl Default for CapitalAwarePolicy {
+    fn default() -> Self {
+        Self::from_tier(CapitalTier::Large)
     }
 }
 
@@ -689,5 +819,71 @@ mod tests {
             "QueueValue at min_viable_depth_bps={}: {} must be > 0",
             budget.min_viable_depth_bps, value,
         );
+    }
+
+    // =================================================================
+    // CapitalAwarePolicy tests
+    // =================================================================
+
+    #[test]
+    fn test_policy_micro_tier() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Micro);
+        assert_eq!(policy.max_levels_per_side, 2);
+        assert!(policy.skip_entropy_optimization);
+        assert!(policy.use_batch_reconcile);
+        assert!(policy.always_quote_minimum);
+        assert!(!policy.quota_density_scaling);
+        assert!((policy.max_l3_trust_uncalibrated - 0.30).abs() < 1e-10);
+        assert_eq!(policy.min_fills_for_trust_ramp, 10);
+        assert_eq!(policy.warmup_fill_target, 5);
+        assert!((policy.warmup_floor_bps - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_policy_small_tier() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Small);
+        assert_eq!(policy.max_levels_per_side, 3);
+        assert!(policy.skip_entropy_optimization);
+        assert!(policy.use_batch_reconcile);
+        assert!(policy.always_quote_minimum);
+        assert!(!policy.quota_density_scaling);
+        assert!((policy.max_l3_trust_uncalibrated - 0.50).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_policy_medium_tier() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Medium);
+        assert_eq!(policy.max_levels_per_side, 5);
+        assert!(!policy.skip_entropy_optimization);
+        assert!(!policy.use_batch_reconcile);
+        assert!(!policy.always_quote_minimum);
+        assert!(policy.quota_density_scaling);
+    }
+
+    #[test]
+    fn test_policy_large_tier() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Large);
+        assert_eq!(policy.max_levels_per_side, 8);
+        assert!(!policy.skip_entropy_optimization);
+        assert!(!policy.use_batch_reconcile);
+        assert!(!policy.always_quote_minimum);
+        assert!(policy.quota_density_scaling);
+        assert!((policy.max_l3_trust_uncalibrated - 0.95).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_policy_default_is_large() {
+        let policy = CapitalAwarePolicy::default();
+        assert_eq!(policy.tier, CapitalTier::Large);
+        assert_eq!(policy.max_levels_per_side, 8);
+    }
+
+    #[test]
+    fn test_budget_policy_matches_tier() {
+        let budget = CapacityBudget::compute(
+            100.0, 30.90, 10.0, 2, 0.388, 0.0, 0.33,
+        );
+        let policy = budget.policy();
+        assert_eq!(policy.tier, budget.capital_tier);
     }
 }

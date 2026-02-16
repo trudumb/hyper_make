@@ -61,6 +61,48 @@ pub struct PositionBudget {
     reductions: Vec<(&'static str, f64)>,
 }
 
+/// Single source of truth for position limits — computed ONCE per cycle.
+/// Replaces 6 independent position limit computations scattered across the codebase.
+///
+/// `hard_max` (from user config) is an absolute ceiling that can NEVER be exceeded.
+/// `margin_max` (from exchange solvency) may lower the effective limit.
+/// `regime_fraction` and `signal_fraction` apply further reductions in adverse conditions.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionLimits {
+    /// Absolute maximum from user config — NEVER exceeded
+    pub hard_max: f64,
+    /// Solvency floor from exchange margin — may be lower than hard_max
+    pub margin_max: f64,
+    /// Regime-dependent fraction [0.3, 1.0] — reduces limits in volatile regimes
+    pub regime_fraction: f64,
+    /// Signal-availability fraction [0.3, 1.0] — reduces limits when signals unavailable
+    pub signal_fraction: f64,
+}
+
+impl PositionLimits {
+    /// The effective position limit used for all quoting decisions.
+    /// Always <= hard_max (config.max_position).
+    pub fn effective(&self) -> f64 {
+        (self.hard_max.min(self.margin_max) * self.regime_fraction * self.signal_fraction)
+            .max(0.0)
+    }
+
+    /// Whether current position exceeds effective limit (reduce-only mode).
+    pub fn is_reduce_only(&self, current_position: f64) -> bool {
+        current_position.abs() >= self.effective()
+    }
+
+    /// Create with defaults (no regime/signal reduction).
+    pub fn new(hard_max: f64, margin_max: f64) -> Self {
+        Self {
+            hard_max,
+            margin_max,
+            regime_fraction: 1.0,
+            signal_fraction: 1.0,
+        }
+    }
+}
+
 impl PositionBudget {
     /// Create a new position budget.
     ///
@@ -237,6 +279,25 @@ impl InventoryGovernor {
         let fraction = regime_volatility_fraction.clamp(0.0, 1.0);
         let tightening = 1.0 - 0.7 * fraction; // [0.3, 1.0]
         self.max_position * tightening
+    }
+
+    /// Compute a single `PositionLimits` from exchange margin, regime, and signal state.
+    ///
+    /// This is the ONE place position limits are computed each cycle.
+    /// `regime_fraction` and `signal_fraction` are clamped to [0.3, 1.0] — even in
+    /// the worst conditions, we never reduce below 30% of hard_max (avoids zero-quoting).
+    pub fn compute_position_limits(
+        &self,
+        margin_max: f64,
+        regime_fraction: f64,
+        signal_fraction: f64,
+    ) -> PositionLimits {
+        PositionLimits {
+            hard_max: self.max_position,
+            margin_max,
+            regime_fraction: regime_fraction.clamp(0.3, 1.0),
+            signal_fraction: signal_fraction.clamp(0.3, 1.0),
+        }
     }
 }
 
@@ -602,5 +663,149 @@ mod tests {
         let budget = PositionBudget::new(0.0, 0.5);
         // max(0.0, 0.5) = 0.5, min(0.5, 0.0) = 0.0
         assert!((budget.effective()).abs() < 1e-9);
+    }
+
+    // === PositionLimits tests ===
+
+    #[test]
+    fn test_position_limits_effective_respects_hard_max() {
+        // effective() should never exceed hard_max, regardless of margin_max
+        let limits = PositionLimits::new(1.0, 100.0);
+        assert!(limits.effective() <= limits.hard_max);
+
+        let limits = PositionLimits::new(1.0, 0.5);
+        assert!(limits.effective() <= limits.hard_max);
+        assert!((limits.effective() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_limits_effective_uses_min_of_hard_and_margin() {
+        let limits = PositionLimits::new(2.0, 1.5);
+        assert!((limits.effective() - 1.5).abs() < 1e-9);
+
+        let limits = PositionLimits::new(1.5, 2.0);
+        assert!((limits.effective() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_limits_regime_fraction_reduces() {
+        let limits = PositionLimits {
+            hard_max: 10.0,
+            margin_max: 10.0,
+            regime_fraction: 0.5,
+            signal_fraction: 1.0,
+        };
+        assert!((limits.effective() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_limits_signal_fraction_reduces() {
+        let limits = PositionLimits {
+            hard_max: 10.0,
+            margin_max: 10.0,
+            regime_fraction: 1.0,
+            signal_fraction: 0.3,
+        };
+        assert!((limits.effective() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_limits_compound_reductions() {
+        // Both regime and signal reduce independently
+        let limits = PositionLimits {
+            hard_max: 10.0,
+            margin_max: 10.0,
+            regime_fraction: 0.5,
+            signal_fraction: 0.5,
+        };
+        assert!((limits.effective() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_limits_effective_never_negative() {
+        let limits = PositionLimits {
+            hard_max: -1.0, // pathological
+            margin_max: 10.0,
+            regime_fraction: 1.0,
+            signal_fraction: 1.0,
+        };
+        assert!(limits.effective() >= 0.0);
+    }
+
+    #[test]
+    fn test_position_limits_is_reduce_only() {
+        let limits = PositionLimits::new(1.0, 1.0);
+        assert!(!limits.is_reduce_only(0.5));
+        assert!(!limits.is_reduce_only(-0.5));
+        assert!(limits.is_reduce_only(1.0));
+        assert!(limits.is_reduce_only(-1.0));
+        assert!(limits.is_reduce_only(1.5));
+        assert!(limits.is_reduce_only(-1.5));
+    }
+
+    #[test]
+    fn test_position_limits_is_reduce_only_with_reductions() {
+        let limits = PositionLimits {
+            hard_max: 10.0,
+            margin_max: 10.0,
+            regime_fraction: 0.5,
+            signal_fraction: 1.0,
+        };
+        // effective = 5.0
+        assert!(!limits.is_reduce_only(4.9));
+        assert!(limits.is_reduce_only(5.0));
+        assert!(limits.is_reduce_only(5.1));
+    }
+
+    #[test]
+    fn test_compute_position_limits_clamps_fractions() {
+        let gov = InventoryGovernor::new(10.0);
+
+        // Below 0.3 gets clamped to 0.3
+        let limits = gov.compute_position_limits(10.0, 0.0, 0.0);
+        assert!((limits.regime_fraction - 0.3).abs() < 1e-9);
+        assert!((limits.signal_fraction - 0.3).abs() < 1e-9);
+        assert!((limits.effective() - 10.0 * 0.3 * 0.3).abs() < 1e-9);
+
+        // Above 1.0 gets clamped to 1.0
+        let limits = gov.compute_position_limits(10.0, 2.0, 2.0);
+        assert!((limits.regime_fraction - 1.0).abs() < 1e-9);
+        assert!((limits.signal_fraction - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_position_limits_uses_config_max() {
+        let gov = InventoryGovernor::new(3.0);
+        let limits = gov.compute_position_limits(100.0, 1.0, 1.0);
+        // hard_max should be 3.0 from config, margin_max is 100.0
+        // effective = min(3.0, 100.0) * 1.0 * 1.0 = 3.0
+        assert!((limits.hard_max - 3.0).abs() < 1e-9);
+        assert!((limits.effective() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_position_limits_effective_always_le_hard_max() {
+        // Exhaustive property: effective() <= hard_max for any inputs
+        let test_cases = [
+            (1.0, 100.0, 1.0, 1.0),
+            (1.0, 0.5, 0.3, 0.3),
+            (10.0, 10.0, 0.5, 0.5),
+            (5.0, 3.0, 1.0, 0.3),
+            (0.1, 1000.0, 1.0, 1.0),
+        ];
+        for (hard, margin, regime, signal) in test_cases {
+            let limits = PositionLimits {
+                hard_max: hard,
+                margin_max: margin,
+                regime_fraction: regime,
+                signal_fraction: signal,
+            };
+            assert!(
+                limits.effective() <= limits.hard_max + 1e-12,
+                "effective {} > hard_max {} for ({hard}, {margin}, {regime}, {signal})",
+                limits.effective(),
+                limits.hard_max
+            );
+        }
     }
 }

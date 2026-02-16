@@ -5,7 +5,8 @@
 # Examples:
 #   ./scripts/test_hip3.sh BTC hyna 60         # 1 minute test (default profile)
 #   ./scripts/test_hip3.sh HYPE hyna 3200 hip3  # 1 hour test with tight spreads
-#   ./scripts/test_hip3.sh HYPE hyna 14400 hip3   # 4 hour test with 15-25 bps target
+#   ./scripts/test_hip3.sh HYPE hyna 14400
+#    ./scripts/test_hip3.sh ETH hyna 14400 hip3   # 4 hour test with 15-25 bps target
 #   ./scripts/test_hip3.sh ETH flx 120         # 2 minute test on Felix
 #   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --dashboard  # With live dashboard
 #   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --capture    # With dashboard + screenshot capture

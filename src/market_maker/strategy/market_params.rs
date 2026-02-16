@@ -2,12 +2,81 @@
 
 use crate::market_maker::adverse_selection::DepthDecayAS;
 use crate::market_maker::config::auto_derive::CapitalTier;
-use crate::market_maker::config::CapacityBudget;
+use crate::market_maker::config::{CapacityBudget, CapitalAwarePolicy};
 use crate::market_maker::estimator::{MarketEstimator, VolatilityRegime};
 use crate::market_maker::process_models::SpreadRegime;
 
 use super::params;
 use super::regime_state::ControllerObjective;
+
+/// Additive spread composition replacing multiplicative spread factor chains.
+///
+/// Total half-spread = sum of all components, floored at fee_bps.
+/// Each component is individually bounded to prevent any single factor from dominating.
+///
+/// This replaces the old pattern of `base × bandit × widening × quota` which caused
+/// death spirals (e.g., 3.34x quota × 2x bandit = 6.7x blowup).
+#[derive(Debug, Clone)]
+pub struct SpreadComposition {
+    /// Core GLFT half-spread: (1/gamma) * ln(1 + gamma/kappa) + vol_comp + fee
+    /// This is the market-microstructure-optimal spread before any risk adjustments.
+    /// Units: basis points.
+    pub glft_half_spread_bps: f64,
+    /// Additive risk premium from regime detection, Hawkes excitation, toxicity, and staleness.
+    /// Built from individual additive components, NOT a multiplicative factor.
+    /// Units: basis points.
+    pub risk_premium_bps: f64,
+    /// Quota shadow spread: pressure from API rate limit constraints.
+    /// When quota headroom is low, widens spreads to reduce cancel/replace frequency.
+    /// Units: basis points. Capped at 50 bps.
+    pub quota_addon_bps: f64,
+    /// Warmup uncertainty premium: extra spread during early session when parameters
+    /// are estimated from priors rather than data.
+    /// Units: basis points. Decays to zero as warmup completes.
+    pub warmup_addon_bps: f64,
+    /// Maker fee on Hyperliquid (always 1.5 bps).
+    /// Included in GLFT computation already, tracked here for decomposition visibility.
+    /// Units: basis points.
+    pub fee_bps: f64,
+}
+
+impl Default for SpreadComposition {
+    fn default() -> Self {
+        Self {
+            glft_half_spread_bps: 0.0,
+            risk_premium_bps: 0.0,
+            quota_addon_bps: 0.0,
+            warmup_addon_bps: 0.0,
+            fee_bps: 1.5,
+        }
+    }
+}
+
+impl SpreadComposition {
+    /// Total half-spread in basis points, floored at fee_bps.
+    ///
+    /// The floor ensures we never quote tighter than the maker fee.
+    pub fn total_half_spread_bps(&self) -> f64 {
+        (self.glft_half_spread_bps
+            + self.risk_premium_bps
+            + self.quota_addon_bps
+            + self.warmup_addon_bps)
+            .max(self.fee_bps)
+    }
+
+    /// Diagnostic breakdown string for logging.
+    pub fn breakdown_string(&self) -> String {
+        format!(
+            "glft={:.1} risk={:.1} quota={:.1} warmup={:.1} fee={:.1} total={:.1}",
+            self.glft_half_spread_bps,
+            self.risk_premium_bps,
+            self.quota_addon_bps,
+            self.warmup_addon_bps,
+            self.fee_bps,
+            self.total_half_spread_bps()
+        )
+    }
+}
 
 /// Parameters estimated from live market data.
 ///
@@ -923,6 +992,11 @@ pub struct MarketParams {
     /// Contains min_viable_depth_bps, viable_levels_per_side, and tier info.
     /// Used by ladder and QueueValue for depth-aware decisions.
     pub capacity_budget: Option<CapacityBudget>,
+
+    /// Capital-aware policy derived from `CapitalTier`. Encodes ALL tier-dependent
+    /// behavior (ladder levels, reconcile mode, trust caps, warmup, quota) in one
+    /// place, threaded through the entire pipeline.
+    pub capital_policy: CapitalAwarePolicy,
 }
 
 impl Default for MarketParams {
@@ -1200,6 +1274,8 @@ impl Default for MarketParams {
             capital_tier: CapitalTier::Large,
             // Capacity budget — computed per cycle in quote_engine
             capacity_budget: None,
+            // Capital-aware policy — derived from tier, flows through entire pipeline
+            capital_policy: CapitalAwarePolicy::default(),
         }
     }
 }

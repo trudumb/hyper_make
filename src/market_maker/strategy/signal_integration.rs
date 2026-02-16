@@ -337,6 +337,41 @@ pub struct SignalContributionRecord {
     pub total_adj_bps: f64,
 }
 
+/// Unified skew — single source of truth for quote skewing.
+/// Two components only: GLFT q-term (inventory) + alpha_skew (signals).
+///
+/// The GLFT q-term is computed inside `glft.rs::inventory_skew_with_flow()` 
+/// and is the theoretically correct inventory skew from the GLFT paper.
+/// Alpha skew comes from `IntegratedSignals.combined_skew_bps` which contains
+/// cross-venue, buy pressure, and signal skew (but NOT inventory skew — that's GLFT's job).
+///
+/// Previously, inventory skew was triple-counted:
+/// 1. GLFT q-term (correct)
+/// 2. signal_integration inventory_skew_bps (removed)
+/// 3. position_guard.inventory_skew_bps() (deprecated, returns 0.0)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnifiedSkew {
+    /// GLFT q-term inventory skew (bps). Computed by glft.rs, not here.
+    pub inventory_skew_bps: f64,
+    /// Alpha/directional skew from cross-venue + signal sources (bps).
+    /// This is combined_skew_bps from IntegratedSignals.
+    pub alpha_skew_bps: f64,
+    /// Total clamped to 80% of half_spread.
+    pub total_skew_bps: f64,
+}
+
+impl UnifiedSkew {
+    pub fn new(inventory_skew_bps: f64, alpha_skew_bps: f64, half_spread_bps: f64) -> Self {
+        let raw = inventory_skew_bps + alpha_skew_bps;
+        let max_skew = half_spread_bps * 0.8;
+        Self {
+            inventory_skew_bps,
+            alpha_skew_bps,
+            total_skew_bps: raw.clamp(-max_skew, max_skew),
+        }
+    }
+}
+
 /// Integrated signals for quote generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IntegratedSignals {
@@ -1030,15 +1065,11 @@ impl SignalIntegrator {
             0.0
         };
 
-        // === INVENTORY SKEW: Always active when position != 0 ===
-        // Lean quotes away from inventory to encourage mean reversion.
-        // Negative when long (tighten asks), positive when short (tighten bids).
-        let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
-            let position_ratio = (self.position / self.max_position).clamp(-1.0, 1.0);
-            -position_ratio * self.config.inventory_skew_sensitivity * self.half_spread_estimate_bps
-        } else {
-            0.0
-        };
+        // INVENTORY SKEW REMOVED: Was double-counting with GLFT's own q-term
+        // (inventory_skew_with_flow in glft.rs). The GLFT q-term is the theoretically
+        // correct source from Guéant-Lehalle-Fernandez-Tapia. Keeping variable for
+        // backward compat with logging but set to 0.
+        let inventory_skew_bps = 0.0_f64;
 
         // === SIGNAL SKEW: Directional skew from alpha/trend signals ===
         // Alpha > 0.5 = bullish (lean bids), alpha < 0.5 = bearish (lean asks).
@@ -1055,6 +1086,8 @@ impl SignalIntegrator {
             0.0
         };
 
+        // Skew sources: base (cross-exchange) + cross-venue + buy pressure + signal
+        // Inventory skew deliberately excluded — handled by GLFT q-term
         let raw_skew = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps
             + inventory_skew_bps + signal_skew_bps;
 

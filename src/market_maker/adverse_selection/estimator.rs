@@ -150,9 +150,16 @@ impl AdverseSelectionEstimator {
         Self::new(AdverseSelectionConfig::default())
     }
 
-    /// Record a fill for future AS measurement.
+    /// Record a fill for future AS measurement via multi-horizon markout.
     ///
-    /// Call this immediately when a fill is received, with the current mid price.
+    /// `current_mid` should be the mid price at **order placement time** (mid_at_placement).
+    /// The AS estimator measures how much the market moved after placement by comparing
+    /// this anchor price against future mid prices at 500ms/1s/2s horizons.
+    ///
+    /// Previously this used mid_at_fill, which was tautological: both `fill_mid` and
+    /// the first `update()` call used nearly identical mid prices, giving AS ≈ 0 always.
+    /// Using mid_at_placement captures the full adverse selection cost including pre-fill
+    /// movement that occurred while the order was resting.
     pub fn record_fill(&mut self, tid: u64, size: f64, is_buy: bool, current_mid: f64) {
         // Enforce max pending fills (FIFO eviction)
         while self.pending_fills.len() >= self.config.max_pending_fills {

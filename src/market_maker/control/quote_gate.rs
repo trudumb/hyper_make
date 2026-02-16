@@ -898,8 +898,25 @@ impl QuoteGate {
     /// At 25% headroom:  max_levels/2
     /// At 4% headroom:   max_levels/5
     /// At 1% headroom:   1 level
-    pub fn continuous_ladder_levels(&self, max_levels: usize, headroom_pct: f64) -> usize {
-        let min_headroom = self.config.quota_shadow.min_headroom_for_full_ladder;
+    /// Compute continuous ladder density based on headroom.
+    ///
+    /// When `density_scaling_enabled` is false (Micro/Small capital-aware policy),
+    /// returns `max_levels` without sqrt truncation — small accounts can't afford
+    /// to lose levels from quota density scaling.
+    pub fn continuous_ladder_levels(
+        &self,
+        max_levels: usize,
+        headroom_pct: f64,
+        density_scaling_enabled: bool,
+        min_headroom_override: Option<f64>,
+    ) -> usize {
+        // Capital-aware policy can disable density scaling entirely
+        if !density_scaling_enabled {
+            return max_levels;
+        }
+
+        let min_headroom = min_headroom_override
+            .unwrap_or(self.config.quota_shadow.min_headroom_for_full_ladder);
         if headroom_pct >= min_headroom {
             return max_levels;
         }
@@ -3356,7 +3373,7 @@ mod tests {
     fn test_continuous_ladder_levels_at_full_headroom() {
         let gate = QuoteGate::default();
         // At 100% headroom: all levels
-        let levels = gate.continuous_ladder_levels(10, 1.0);
+        let levels = gate.continuous_ladder_levels(10, 1.0, true, None);
         assert_eq!(levels, 10, "At full headroom should get all levels");
     }
 
@@ -3364,7 +3381,7 @@ mod tests {
     fn test_continuous_ladder_levels_at_min_threshold() {
         let gate = QuoteGate::default();
         // At 20% headroom (min_headroom_for_full_ladder): all levels
-        let levels = gate.continuous_ladder_levels(10, 0.20);
+        let levels = gate.continuous_ladder_levels(10, 0.20, true, None);
         assert_eq!(levels, 10, "At min_headroom_for_full_ladder should get all levels");
     }
 
@@ -3372,7 +3389,7 @@ mod tests {
     fn test_continuous_ladder_levels_at_5pct() {
         let gate = QuoteGate::default();
         // At 5% headroom: sqrt(0.05/0.20) = sqrt(0.25) = 0.5 → 5 levels
-        let levels = gate.continuous_ladder_levels(10, 0.05);
+        let levels = gate.continuous_ladder_levels(10, 0.05, true, None);
         assert_eq!(levels, 5, "At 5% headroom with 10 max should get ~5 levels, got {}", levels);
     }
 
@@ -3380,7 +3397,7 @@ mod tests {
     fn test_continuous_ladder_levels_at_1pct() {
         let gate = QuoteGate::default();
         // At 1% headroom: sqrt(0.01/0.20) = sqrt(0.05) ≈ 0.224 → round(2.24) = 2 levels
-        let levels = gate.continuous_ladder_levels(10, 0.01);
+        let levels = gate.continuous_ladder_levels(10, 0.01, true, None);
         assert!(levels >= 1 && levels <= 3,
             "At 1% headroom with 10 max should get ~2 levels, got {}", levels);
     }
@@ -3389,7 +3406,7 @@ mod tests {
     fn test_continuous_ladder_levels_floor_at_1() {
         let gate = QuoteGate::default();
         // Even at extremely low headroom, should always get at least 1 level
-        let levels = gate.continuous_ladder_levels(10, 0.001);
+        let levels = gate.continuous_ladder_levels(10, 0.001, true, None);
         assert_eq!(levels, 1, "Should always get at least 1 level, got {}", levels);
     }
 
@@ -3400,11 +3417,34 @@ mod tests {
         let headrooms = [0.20, 0.15, 0.10, 0.07, 0.05, 0.03, 0.01];
         let mut prev_levels = 100;
         for &h in &headrooms {
-            let levels = gate.continuous_ladder_levels(25, h);
+            let levels = gate.continuous_ladder_levels(25, h, true, None);
             assert!(levels <= prev_levels,
                 "Levels should not increase as headroom drops: at {:.0}% got {}, prev {}",
                 h * 100.0, levels, prev_levels);
             prev_levels = levels;
         }
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_density_scaling_disabled() {
+        let gate = QuoteGate::default();
+        // With density_scaling=false (Micro/Small policy), should always return max_levels
+        let levels = gate.continuous_ladder_levels(2, 0.01, false, None);
+        assert_eq!(levels, 2, "With density scaling disabled, should get max_levels regardless of headroom");
+
+        let levels = gate.continuous_ladder_levels(3, 0.001, false, None);
+        assert_eq!(levels, 3, "With density scaling disabled at extreme low headroom");
+    }
+
+    #[test]
+    fn test_continuous_ladder_levels_custom_min_headroom() {
+        let gate = QuoteGate::default();
+        // With min_headroom override of 0.05 (Micro policy), full levels at 5%+ headroom
+        let levels = gate.continuous_ladder_levels(10, 0.05, true, Some(0.05));
+        assert_eq!(levels, 10, "At overridden min_headroom should get all levels");
+
+        // Below override threshold, sqrt scaling kicks in
+        let levels = gate.continuous_ladder_levels(10, 0.01, true, Some(0.05));
+        assert!(levels < 10 && levels >= 1, "Below override threshold, should scale: got {}", levels);
     }
 }

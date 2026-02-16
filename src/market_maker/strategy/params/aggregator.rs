@@ -732,6 +732,8 @@ impl ParameterAggregator {
             capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
             // Capacity budget — set by quote_engine after CapacityBudget::compute()
             capacity_budget: None,
+            // Capital-aware policy — set by quote_engine after CapacityBudget::compute()
+            capital_policy: crate::market_maker::config::CapitalAwarePolicy::default(),
         }
     }
 }

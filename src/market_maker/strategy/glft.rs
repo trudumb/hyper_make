@@ -8,7 +8,7 @@ use crate::market_maker::config::{Quote, QuoteConfig};
 
 use super::{
     CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
-    RiskModelConfig,
+    RiskModelConfig, SpreadComposition,
 };
 
 /// Taker price elasticity estimator for monopolist LP pricing.
@@ -594,6 +594,60 @@ impl GLFTStrategy {
         adjusted.max(self.risk_config.maker_fee_rate)
     }
 
+    /// Compute the additive spread composition from market parameters.
+    ///
+    /// Decomposes the half-spread into individually-bounded additive components:
+    /// - GLFT core: `(1/gamma) * ln(1 + gamma/kappa)` + vol_comp + fee
+    /// - Risk premium: from regime, Hawkes, toxicity, staleness (additive, not multiplicative)
+    /// - Quota addon: API rate limit pressure
+    /// - Warmup addon: early-session uncertainty premium
+    ///
+    /// The fee component is already included in the GLFT core (via `half_spread()`),
+    /// so `fee_bps` is tracked separately for decomposition visibility only.
+    pub fn compute_spread_composition(&self, market_params: &MarketParams) -> SpreadComposition {
+        let gamma = self.effective_gamma(market_params, 0.0, 1.0);
+        let kappa = if market_params.use_kappa_robust {
+            market_params.kappa_robust
+        } else {
+            market_params.kappa
+        };
+        let sigma = market_params.sigma_effective;
+        let tau = self.holding_time(market_params.arrival_intensity);
+
+        // Core GLFT half-spread in fraction
+        let glft_half_frac = self.half_spread(gamma, kappa, sigma, tau);
+        let glft_half_bps = glft_half_frac * 10_000.0;
+
+        // Risk premium: convert the widening_mult excess to additive bps
+        // spread_widening_mult of 1.5 on 5 bps GLFT = 2.5 bps addon.
+        // Capped at 100% of GLFT spread (at most doubles the base).
+        let widening_excess = (market_params.spread_widening_mult - 1.0).clamp(0.0, 1.0);
+        let risk_premium_bps = glft_half_bps * widening_excess
+            + market_params.regime_risk_premium_bps
+            + market_params.total_risk_premium_bps;
+
+        // Quota addon: already in bps, capped at 50
+        let quota_addon_bps = market_params.quota_shadow_spread_bps.min(50.0);
+
+        // Warmup addon: uncertainty premium decays as warmup progresses
+        // Policy-driven: Micro=3.0, Large=8.0 bps max, decays linearly with warmup
+        let warmup_addon_bps = if market_params.adaptive_warmup_progress < 1.0 {
+            let uncertainty_factor = 1.0 - market_params.adaptive_warmup_progress;
+            market_params.capital_policy.warmup_floor_bps * uncertainty_factor
+        } else {
+            0.0
+        };
+
+        let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
+
+        SpreadComposition {
+            glft_half_spread_bps: glft_half_bps,
+            risk_premium_bps,
+            quota_addon_bps,
+            warmup_addon_bps,
+            fee_bps,
+        }
+    }
 
     /// Proactive directional skew based on momentum predictions.
     ///

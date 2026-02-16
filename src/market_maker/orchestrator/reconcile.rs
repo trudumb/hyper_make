@@ -985,10 +985,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Replaces hard tier cliff (was: <20% → 2 levels, >=20% → full).
             // Uses sqrt scaling: at 25% headroom → ~half levels, at 4% → ~1/5th.
             let max_target_levels = bid_places.len().max(ask_places.len());
+            let policy = &self.capital_policy;
             let allowed_levels = self
                 .stochastic
                 .quote_gate
-                .continuous_ladder_levels(max_target_levels, headroom);
+                .continuous_ladder_levels(
+                    max_target_levels,
+                    headroom,
+                    policy.quota_density_scaling,
+                    Some(policy.quota_min_headroom_for_full),
+                );
             bid_places.truncate(allowed_levels);
             ask_places.truncate(allowed_levels);
             warn!(
@@ -1205,10 +1211,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .map(|c| c.headroom_pct())
                 .unwrap_or(1.0);
             let max_target = bid_levels.len().max(ask_levels.len());
+            let policy = &self.capital_policy;
             let allowed = self
                 .stochastic
                 .quote_gate
-                .continuous_ladder_levels(max_target, headroom);
+                .continuous_ladder_levels(
+                    max_target,
+                    headroom,
+                    policy.quota_density_scaling,
+                    Some(policy.quota_min_headroom_for_full),
+                );
             if allowed < max_target {
                 bid_levels.truncate(allowed);
                 ask_levels.truncate(allowed);

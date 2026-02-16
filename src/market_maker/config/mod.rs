@@ -24,7 +24,7 @@ mod stochastic;
 
 // Re-export everything for backward compatibility
 pub use auto_derive::{auto_derive, CapitalProfile, CapitalTier, DerivedParams, ExchangeContext};
-pub use capacity::{CapacityBudget, SizeQuantum, Viability};
+pub use capacity::{CapacityBudget, CapitalAwarePolicy, SizeQuantum, Viability};
 pub use core::*;
 pub use impulse::*;
 pub use multi_asset::*;

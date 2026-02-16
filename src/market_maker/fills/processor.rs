@@ -884,9 +884,18 @@ impl FillProcessor {
         let placement = placement_price.unwrap_or(fill.price);
 
         // Tier 1: Adverse selection measurement
+        // FIX: Use mid_at_placement (the mid when order was created) instead of latest_mid.
+        // Previously both record_fill and update() used latest_mid, making AS = 0 (tautological).
+        // Now we anchor to placement mid: AS = |mid_at_measurement - mid_at_placement| gives
+        // the full adverse movement since we posted the order.
+        let as_reference_mid = if fill.mid_at_placement > 0.0 {
+            fill.mid_at_placement
+        } else {
+            state.latest_mid // Fallback for fills without placement tracking
+        };
         state
             .adverse_selection
-            .record_fill(fill.tid, fill.size, fill.is_buy, state.latest_mid);
+            .record_fill(fill.tid, fill.size, fill.is_buy, as_reference_mid);
 
         // Stochastic: Depth-aware AS calibration
         if state.calibrate_depth_as {
@@ -895,7 +904,7 @@ impl FillProcessor {
                 fill.price,
                 fill.size,
                 fill.is_buy,
-                state.latest_mid,
+                as_reference_mid,
             );
         }
 

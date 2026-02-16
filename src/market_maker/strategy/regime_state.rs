@@ -773,6 +773,63 @@ impl RegimeState {
     pub fn effective_gamma_multiplier(&self) -> f64 {
         self.blended.gamma_multiplier.max(1.0)
     }
+
+    /// Produce a unified regime snapshot for downstream consumers.
+    /// Single source of truth: kappa_effective, gamma_multiplier, label, position fraction.
+    /// Replaces 4 independent regime channels (HMM, RegimeKappa, ThresholdKappa, BOCPD).
+    pub fn unified_regime(&self) -> UnifiedRegime {
+        UnifiedRegime {
+            kappa_effective: self.blended.kappa.max(1.0),
+            gamma_multiplier: self.effective_gamma_multiplier(),
+            regime_label: self.regime,
+            max_position_fraction: self.blended.max_position_fraction.clamp(0.3, 1.0),
+            risk_premium_bps: self.blended.risk_premium_bps.max(0.0),
+            spread_floor_bps: self.blended.spread_floor_bps.max(0.0),
+            conviction: self.conviction.clamp(0.0, 1.0),
+        }
+    }
+}
+
+
+/// Unified regime snapshot — single source of truth for all regime-dependent decisions.
+/// Replaces 4 independent regime channels (HMM, RegimeKappa, ThresholdKappa, BOCPD)
+/// with one coherent output.
+///
+/// Produced by `RegimeState::unified_regime()` once per quote cycle.
+/// All downstream consumers should use this instead of querying regime state directly.
+#[derive(Debug, Clone, Copy)]
+pub struct UnifiedRegime {
+    /// Blended kappa for GLFT spread formula. Always > 0.
+    /// Higher kappa = tighter spreads (kappa=3250 → 4.6 bps, kappa=8000 → 2.75 bps).
+    pub kappa_effective: f64,
+    /// Gamma multiplier for risk aversion [1.0, 3.0].
+    /// Routes regime risk through GLFT gamma: δ = (1/γ)ln(1 + γ/κ).
+    pub gamma_multiplier: f64,
+    /// Discrete label for logging and threshold-based decisions.
+    pub regime_label: MarketRegime,
+    /// Position limit fraction [0.3, 1.0] — feeds PositionLimits.regime_fraction.
+    pub max_position_fraction: f64,
+    /// Additive risk premium for this regime state (bps).
+    /// Feeds SpreadComposition.risk_premium_bps.
+    pub risk_premium_bps: f64,
+    /// Regime-conditioned spread floor (bps).
+    pub spread_floor_bps: f64,
+    /// Conviction in current regime [0.0, 1.0]. Higher = more confident.
+    pub conviction: f64,
+}
+
+impl Default for UnifiedRegime {
+    fn default() -> Self {
+        Self {
+            kappa_effective: 2000.0,
+            gamma_multiplier: 1.0,
+            regime_label: MarketRegime::Normal,
+            max_position_fraction: 1.0,
+            risk_premium_bps: 0.0,
+            spread_floor_bps: 0.0,
+            conviction: 0.5,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1434,5 +1491,40 @@ mod tests {
             "Missing conviction should default to 0.0"
         );
         assert!(deserialized.blended_kappa.is_none());
+    }
+
+    #[test]
+    fn test_unified_regime_from_normal() {
+        let state = state_with_conviction(MarketRegime::Normal, 100.0);
+        let unified = state.unified_regime();
+        assert_eq!(unified.regime_label, MarketRegime::Normal);
+        assert!(unified.kappa_effective >= 1.0, "kappa must be positive");
+        assert!(unified.gamma_multiplier >= 1.0, "gamma mult >= 1.0");
+        assert!(unified.max_position_fraction >= 0.3 && unified.max_position_fraction <= 1.0);
+        assert!(unified.conviction >= 0.0 && unified.conviction <= 1.0);
+    }
+
+    #[test]
+    fn test_unified_regime_from_extreme() {
+        let state = state_with_conviction(MarketRegime::Extreme, 100.0);
+        let unified = state.unified_regime();
+        assert_eq!(unified.regime_label, MarketRegime::Extreme);
+        // Extreme regime should have higher gamma multiplier and lower position fraction
+        let normal = state_with_conviction(MarketRegime::Normal, 100.0).unified_regime();
+        assert!(unified.gamma_multiplier >= normal.gamma_multiplier,
+            "extreme gamma_mult {} should >= normal {}",
+            unified.gamma_multiplier, normal.gamma_multiplier);
+        assert!(unified.max_position_fraction <= normal.max_position_fraction,
+            "extreme position fraction {} should <= normal {}",
+            unified.max_position_fraction, normal.max_position_fraction);
+    }
+
+    #[test]
+    fn test_unified_regime_default() {
+        let ur = UnifiedRegime::default();
+        assert_eq!(ur.regime_label, MarketRegime::Normal);
+        assert!(ur.kappa_effective > 0.0);
+        assert!((ur.gamma_multiplier - 1.0).abs() < f64::EPSILON);
+        assert!((ur.max_position_fraction - 1.0).abs() < f64::EPSILON);
     }
 }

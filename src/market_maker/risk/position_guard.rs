@@ -292,6 +292,12 @@ impl PositionGuard {
     ///
     /// Positive skew = widen asks, tighten bids (encourage selling)
     /// Negative skew = widen bids, tighten asks (encourage buying)
+    ///
+    /// NOTE: This is now DEPRECATED for quote skewing purposes.
+    /// Inventory skew is handled solely by the GLFT q-term in `glft.rs`.
+    /// The value computed here was previously double-counted with both
+    /// the GLFT q-term and signal_integration.inventory_skew_bps.
+    /// The quote_engine no longer adds this to lead_lag_signal_bps.
     pub fn inventory_skew_bps(&self) -> f64 {
         self.last_skew_bps
     }
