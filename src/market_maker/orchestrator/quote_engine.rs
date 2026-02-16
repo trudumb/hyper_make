@@ -6,7 +6,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::prelude::Result;
 
 use super::super::{
-    quoting, MarketMaker, TradingEnvironment, ParameterAggregator, ParameterSources, Quote, QuoteConfig,
+    quoting, MarketMaker, TradingEnvironment, ParameterAggregator, ParameterSources, QuoteConfig,
     QuotingStrategy, Side,
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
@@ -2404,17 +2404,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         );
 
         if !ladder.bids.is_empty() || !ladder.asks.is_empty() {
-            // Multi-level ladder mode
-            let mut bid_quotes: Vec<Quote> = ladder
-                .bids
-                .iter()
-                .map(|l| Quote::new(l.price, l.size))
-                .collect();
-            let mut ask_quotes: Vec<Quote> = ladder
-                .asks
-                .iter()
-                .map(|l| Quote::new(l.price, l.size))
-                .collect();
+            // Multi-level ladder mode — wrap in ViableQuoteLadder for exchange-minimum protection.
+            // All size reductions through reduce_sizes() guarantee surviving quotes meet
+            // min_notional, or convert defense intent to spread widening.
+            let quantum = crate::market_maker::config::SizeQuantum::compute(
+                MIN_ORDER_NOTIONAL,
+                quote_config.mid_price,
+                self.config.sz_decimals,
+            );
+            let mut viable = quoting::ViableQuoteLadder::from_ladder(
+                &ladder,
+                quantum,
+                quote_config.mid_price,
+            );
 
             // === EXECUTION MODE: structural side selection ===
             // Subsumes QuoteGate's QuoteOnlyBids/QuoteOnlyAsks decisions:
@@ -2426,31 +2428,28 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 use crate::market_maker::execution::ExecutionMode;
                 match execution_mode {
                     ExecutionMode::Flat => {
-                        bid_quotes.clear();
-                        ask_quotes.clear();
+                        viable.bids.clear();
+                        viable.asks.clear();
                     }
                     ExecutionMode::Maker { bid, ask } => {
                         if !bid {
-                            bid_quotes.clear();
+                            viable.bids.clear();
                         }
                         if !ask {
-                            ask_quotes.clear();
+                            viable.asks.clear();
                         }
                     }
                     ExecutionMode::InventoryReduce { urgency } => {
                         let pos = self.position.position();
+                        let vq = *viable.quantum();
                         if pos > 1e-9 {
-                            bid_quotes.clear();
-                            ask_quotes.truncate(1);
-                            for q in ask_quotes.iter_mut() {
-                                q.size *= 0.5 + 0.5 * urgency;
-                            }
+                            viable.bids.clear();
+                            viable.asks.truncate(1);
+                            viable.asks.reduce_sizes(0.5 + 0.5 * urgency, &vq);
                         } else if pos < -1e-9 {
-                            ask_quotes.clear();
-                            bid_quotes.truncate(1);
-                            for q in bid_quotes.iter_mut() {
-                                q.size *= 0.5 + 0.5 * urgency;
-                            }
+                            viable.asks.clear();
+                            viable.bids.truncate(1);
+                            viable.bids.reduce_sizes(0.5 + 0.5 * urgency, &vq);
                         }
                     }
                 }
@@ -2459,25 +2458,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // === TOXICITY-BASED DEFENSE (regime-aware) ===
             // Replaces hardcoded 0.75/0.50 thresholds with ToxicityRegime classification.
             // ToxicityRegime has built-in hysteresis, so no cooldown timer needed.
+            // Size reductions use viable.reduce_sizes() for exchange-minimum protection.
             {
                 use crate::market_maker::adverse_selection::ToxicityRegime;
+                let vq = *viable.quantum();
                 match current_toxicity_regime {
                     ToxicityRegime::Toxic => {
                         // Extreme: clear both sides, or only reducing side if positioned
                         let pos = self.position.position();
                         if pos.abs() < 1e-9 {
-                            bid_quotes.clear();
-                            ask_quotes.clear();
+                            viable.bids.clear();
+                            viable.asks.clear();
                         } else if pos > 0.0 {
-                            bid_quotes.clear(); // Cancel increasing side
-                            for q in ask_quotes.iter_mut() {
-                                q.size *= 0.5;
-                            } // Reduce reducing side
+                            viable.bids.clear(); // Cancel increasing side
+                            viable.asks.reduce_sizes(0.5, &vq); // Reduce reducing side
                         } else {
-                            ask_quotes.clear();
-                            for q in bid_quotes.iter_mut() {
-                                q.size *= 0.5;
-                            }
+                            viable.asks.clear();
+                            viable.bids.reduce_sizes(0.5, &vq);
                         }
                     }
                     ToxicityRegime::Normal => {
@@ -2486,12 +2483,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         let ask_tox = market_params.pre_fill_toxicity_ask;
                         let bid_mult = (1.5 - bid_tox * 2.0).clamp(0.3, 1.0);
                         let ask_mult = (1.5 - ask_tox * 2.0).clamp(0.3, 1.0);
-                        for q in bid_quotes.iter_mut() {
-                            q.size *= bid_mult;
-                        }
-                        for q in ask_quotes.iter_mut() {
-                            q.size *= ask_mult;
-                        }
+                        viable.bids.reduce_sizes(bid_mult, &vq);
+                        viable.asks.reduce_sizes(ask_mult, &vq);
                     }
                     ToxicityRegime::Benign => {} // No filtering
                 }
@@ -2500,9 +2493,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // === QUEUE VALUE: filter individual levels with negative expected edge ===
             // After mode selection and toxicity filtering, remove levels where quoting
             // has negative expected value (tight levels during Toxic periods).
+            // Uses viable.retain() which protects the last level on each side.
             {
                 let mid = quote_config.mid_price;
-                bid_quotes.retain(|q| {
+                viable.bids.retain(|q| {
                     let depth_bps = ((mid - q.price) / mid * 10_000.0).max(0.0);
                     self.queue_value_heuristic.should_quote(
                         depth_bps,
@@ -2510,7 +2504,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         feature_snapshot.queue_rank_bid,
                     )
                 });
-                ask_quotes.retain(|q| {
+                viable.asks.retain(|q| {
                     let depth_bps = ((q.price - mid) / mid * 10_000.0).max(0.0);
                     self.queue_value_heuristic.should_quote(
                         depth_bps,
@@ -2525,45 +2519,39 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // the system can unwind inventory.  The increasing side is cancelled;
             // the reducing side is kept but at 50% size.  Near-zero positions
             // keep both sides at 30% size.
+            // Size reductions use viable.reduce_sizes() for exchange-minimum protection.
             if risk_level == crate::market_maker::control::RiskLevel::Emergency {
                 let pos = self.position.position();
                 let max_pos = self.effective_max_position.max(0.01);
                 let position_ratio = pos / max_pos;
+                let vq = *viable.quantum();
 
                 if position_ratio > 0.01 {
                     // Long: cancel bids (would increase), keep asks at 50% (reduce)
-                    if !bid_quotes.is_empty() {
+                    if !viable.bids.is_empty() {
                         info!(
                             position = %format!("{:.4}", pos),
-                            cleared_bids = bid_quotes.len(),
+                            cleared_bids = viable.bids.len(),
                             "Emergency: clearing bids (long position, keeping asks to reduce)"
                         );
-                        bid_quotes.clear();
+                        viable.bids.clear();
                     }
-                    for q in ask_quotes.iter_mut() {
-                        q.size *= 0.5;
-                    }
+                    viable.asks.reduce_sizes(0.5, &vq);
                 } else if position_ratio < -0.01 {
                     // Short: cancel asks (would increase), keep bids at 50% (reduce)
-                    if !ask_quotes.is_empty() {
+                    if !viable.asks.is_empty() {
                         info!(
                             position = %format!("{:.4}", pos),
-                            cleared_asks = ask_quotes.len(),
+                            cleared_asks = viable.asks.len(),
                             "Emergency: clearing asks (short position, keeping bids to reduce)"
                         );
-                        ask_quotes.clear();
+                        viable.asks.clear();
                     }
-                    for q in bid_quotes.iter_mut() {
-                        q.size *= 0.5;
-                    }
+                    viable.bids.reduce_sizes(0.5, &vq);
                 } else {
                     // Near zero: keep both sides at 30% size
-                    for q in bid_quotes.iter_mut() {
-                        q.size *= 0.3;
-                    }
-                    for q in ask_quotes.iter_mut() {
-                        q.size *= 0.3;
-                    }
+                    viable.bids.reduce_sizes(0.3, &vq);
+                    viable.asks.reduce_sizes(0.3, &vq);
                 }
             }
 
@@ -2571,24 +2559,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // When we detect 3+ same-side fills in 60s, widen that side (5x).
             // When 5+ same-side fills, suppress that side entirely (reduce-only).
             // This prevents runaway accumulation during trending markets.
+            // Price modifications go through iter_mut() (safe — doesn't affect size viability).
             {
                 let buy_cascade_mult = self.fill_cascade_tracker.spread_multiplier(Side::Buy);
                 let sell_cascade_mult = self.fill_cascade_tracker.spread_multiplier(Side::Sell);
 
-                if self.fill_cascade_tracker.is_suppressed(Side::Buy) && !bid_quotes.is_empty() {
+                if self.fill_cascade_tracker.is_suppressed(Side::Buy) && !viable.bids.is_empty() {
                     // Check if we're short — buys would reduce position, so allow them
                     if self.position.position() >= 0.0 {
                         info!(
-                            cleared_bids = bid_quotes.len(),
+                            cleared_bids = viable.bids.len(),
                             "Fill cascade: suppressing BID side (5+ same-side buys in 60s)"
                         );
-                        bid_quotes.clear();
+                        viable.bids.clear();
                     }
                 } else if buy_cascade_mult > 1.0 && self.position.position() >= 0.0 {
                     // Only widen buys when accumulating (flat or already long).
                     // If short, buys REDUCE position — don't penalize reducing fills.
                     let mid = self.latest_mid;
-                    for quote in bid_quotes.iter_mut() {
+                    for quote in viable.bids.iter_mut() {
                         let dist = mid - quote.price;
                         quote.price = mid - dist * buy_cascade_mult;
                     }
@@ -2598,20 +2587,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
                 }
 
-                if self.fill_cascade_tracker.is_suppressed(Side::Sell) && !ask_quotes.is_empty() {
+                if self.fill_cascade_tracker.is_suppressed(Side::Sell) && !viable.asks.is_empty() {
                     // Check if we're long — sells would reduce position, so allow them
                     if self.position.position() <= 0.0 {
                         info!(
-                            cleared_asks = ask_quotes.len(),
+                            cleared_asks = viable.asks.len(),
                             "Fill cascade: suppressing ASK side (5+ same-side sells in 60s)"
                         );
-                        ask_quotes.clear();
+                        viable.asks.clear();
                     }
                 } else if sell_cascade_mult > 1.0 && self.position.position() <= 0.0 {
                     // Only widen sells when accumulating (flat or already short).
                     // If long, sells REDUCE position — don't penalize reducing fills.
                     let mid = self.latest_mid;
-                    for quote in ask_quotes.iter_mut() {
+                    for quote in viable.asks.iter_mut() {
                         let dist = quote.price - mid;
                         quote.price = mid + dist * sell_cascade_mult;
                     }
@@ -2626,6 +2615,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Smooth function of inventory fraction and momentum, no hysteresis state.
             // Both conditions must be present (product + sqrt). Pressure [0,1] scales
             // increasing-side sizes by (1 - pressure), preventing death spirals.
+            // Uses viable.reduce_sizes() for exchange-minimum protection.
             {
                 let pos = self.position.position();
                 let inventory_frac = if self.effective_max_position > 1e-10 {
@@ -2647,18 +2637,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 );
 
                 if pressure > 0.01 {
-                    let (increasing_quotes, label) = if pos > 0.0 {
-                        (&mut bid_quotes, "BID")
-                    } else {
-                        (&mut ask_quotes, "ASK")
-                    };
+                    let size_mult = 1.0 - pressure;
+                    let vq = *viable.quantum();
+                    let label = if pos > 0.0 { "BID" } else { "ASK" };
 
-                    if !increasing_quotes.is_empty() {
-                        let size_mult = 1.0 - pressure;
-                        for q in increasing_quotes.iter_mut() {
-                            q.size *= size_mult;
-                        }
-                        increasing_quotes.retain(|q| q.size > 0.0);
+                    if pos > 0.0 && !viable.bids.is_empty() {
+                        viable.bids.reduce_sizes(size_mult, &vq);
+                        info!(
+                            side = label,
+                            size_mult = %format!("{:.2}", size_mult),
+                            pressure = %format!("{:.2}", pressure),
+                            inventory_pct = %format!("{:.0}", inventory_frac * 100.0),
+                            momentum_bps = %format!("{:.1}", momentum_abs),
+                            "Inventory pressure: size_mult={:.2}", size_mult
+                        );
+                    } else if pos < 0.0 && !viable.asks.is_empty() {
+                        viable.asks.reduce_sizes(size_mult, &vq);
                         info!(
                             side = label,
                             size_mult = %format!("{:.2}", size_mult),
@@ -2674,6 +2668,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Reduce-only mode: when over max position, position value, OR margin utilization
             // Phase 3: Use exchange-aware reduce-only that checks exchange limits and signals escalation
             // CAPITAL-EFFICIENT: Use margin utilization as primary trigger (80% threshold)
+            // Note: reduce-only only calls clear() on the vectors — safe through quotes_mut().
             let margin_state = self.infra.margin_sizer.state();
             // Get unrealized P&L for underwater position protection
             let unrealized_pnl = self.tier2.pnl_tracker.unrealized_pnl(self.latest_mid);
@@ -2704,8 +2699,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 unrealized_pnl,
             };
             let reduce_only_result = quoting::QuoteFilter::apply_reduce_only_with_exchange_limits(
-                &mut bid_quotes,
-                &mut ask_quotes,
+                viable.bids.quotes_mut(),
+                viable.asks.quotes_mut(),
                 &reduce_only_config,
                 &self.infra.exchange_limits,
             );
@@ -2721,10 +2716,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 );
                 // Clear the side that would increase position
                 if reduce_only_result.filtered_bids {
-                    bid_quotes.clear();
+                    viable.bids.clear();
                 }
                 if reduce_only_result.filtered_asks {
-                    ask_quotes.clear();
+                    viable.asks.clear();
                 }
             }
 
@@ -2741,7 +2736,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Apply close bias to each surviving quote on the closing side
                     if position > 0.0 {
                         // Long: tighten asks (sell side)
-                        for quote in ask_quotes.iter_mut() {
+                        for quote in viable.asks.iter_mut() {
                             let (_, new_ask) = quoting::apply_close_bias(
                                 mid - 1.0, quote.price, mid, position, close_urgency,
                             );
@@ -2749,7 +2744,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         }
                     } else if position < 0.0 {
                         // Short: tighten bids (buy side)
-                        for quote in bid_quotes.iter_mut() {
+                        for quote in viable.bids.iter_mut() {
                             let (new_bid, _) = quoting::apply_close_bias(
                                 quote.price, mid + 1.0, mid, position, close_urgency,
                             );
@@ -2765,16 +2760,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             info!(
-                bid_levels = bid_quotes.len(),
-                ask_levels = ask_quotes.len(),
-                best_bid = ?bid_quotes.first().map(|q| (q.price, q.size)),
-                best_ask = ?ask_quotes.first().map(|q| (q.price, q.size)),
+                bid_levels = viable.bids.len(),
+                ask_levels = viable.asks.len(),
+                best_bid = ?viable.bids.first().map(|q| (q.price, q.size)),
+                best_ask = ?viable.asks.first().map(|q| (q.price, q.size)),
+                defense_bid_mult = %format!("{:.2}", viable.bids.defense_spread_mult()),
+                defense_ask_mult = %format!("{:.2}", viable.asks.defense_spread_mult()),
                 "Calculated ladder quotes"
             );
 
             // === Phase 5: REGISTER PENDING QUOTES for outcome tracking ===
             // Register best bid/ask as pending quotes for fill/expiry resolution.
             // Only track best level (most likely to fill) to keep overhead minimal.
+            // Done BEFORE finalize() so tracking uses pre-widening prices.
             {
                 use crate::market_maker::learning::quote_outcome::{CompactMarketState, PendingQuote};
                 let now_ms = std::time::SystemTime::now()
@@ -2790,7 +2788,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     toxicity_score: market_params.toxicity_score,
                     kappa: market_params.kappa,
                 };
-                if let Some(best_bid) = bid_quotes.first() {
+                if let Some(best_bid) = viable.bids.first() {
                     let half_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
                     self.quote_outcome_tracker.register_quote(PendingQuote {
                         timestamp_ms: now_ms,
@@ -2799,7 +2797,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         state: compact_state.clone(),
                     });
                 }
-                if let Some(best_ask) = ask_quotes.first() {
+                if let Some(best_ask) = viable.asks.first() {
                     let half_spread_bps = ((best_ask.price - mid) / mid) * 10000.0;
                     self.quote_outcome_tracker.register_quote(PendingQuote {
                         timestamp_ms: now_ms,
@@ -2811,8 +2809,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // === RECORD QUOTE DECISION FOR DASHBOARD ===
-            // Capture why this specific spread was chosen
-            if let (Some(best_bid), Some(best_ask)) = (bid_quotes.first(), ask_quotes.first()) {
+            // Capture why this specific spread was chosen (pre-widening)
+            if let (Some(best_bid), Some(best_ask)) = (viable.bids.first(), viable.asks.first()) {
                 let now = chrono::Utc::now();
                 let mid = self.latest_mid;
                 let bid_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
@@ -2864,6 +2862,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .dashboard()
                     .record_quote_decision(decision);
             }
+
+            // === FINALIZE: apply defense spread widening and extract raw quotes ===
+            // All quotes guaranteed to meet min_notional after finalize.
+            let (bid_quotes, ask_quotes) = viable.finalize();
 
             // DIAGNOSTIC: Warn when ladder is completely empty after processing
             // This helps diagnose min_notional and capacity issues at INFO level
@@ -3133,7 +3135,7 @@ fn compute_tick_size_bps(mid_price: f64) -> f64 {
 /// at pressure=1 all sizes go to zero and are removed. This replaces the discrete
 /// tier system (halve / keep-one / clear) that caused death spirals.
 #[cfg(test)]
-fn apply_inventory_pressure(pressure: f64, increasing_quotes: &mut Vec<Quote>) {
+fn apply_inventory_pressure(pressure: f64, increasing_quotes: &mut Vec<crate::market_maker::config::Quote>) {
     if pressure < 0.01 {
         return;
     }
@@ -3153,8 +3155,8 @@ fn apply_inventory_pressure(pressure: f64, increasing_quotes: &mut Vec<Quote>) {
 /// in `generate_and_emit_quotes()`.
 #[cfg(test)]
 fn apply_risk_emergency_filter(
-    bid_quotes: &mut Vec<Quote>,
-    ask_quotes: &mut Vec<Quote>,
+    bid_quotes: &mut Vec<crate::market_maker::config::Quote>,
+    ask_quotes: &mut Vec<crate::market_maker::config::Quote>,
     position: f64,
     max_position: f64,
 ) {
@@ -3187,6 +3189,7 @@ fn apply_risk_emergency_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::market_maker::config::Quote;
 
     // ---------------------------------------------------------------
     // Test 1: Continuous pressure — monotonic in inventory_frac

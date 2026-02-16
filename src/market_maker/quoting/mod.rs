@@ -8,6 +8,7 @@
 mod filter;
 pub mod kappa_spread;
 mod ladder;
+pub mod viable;
 
 pub use filter::{
     apply_close_bias, QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
@@ -18,3 +19,4 @@ pub use kappa_spread::{
     KappaSpreadResult,
 };
 pub use ladder::*;
+pub use viable::{ViableQuoteLadder, ViableQuoteSide};
