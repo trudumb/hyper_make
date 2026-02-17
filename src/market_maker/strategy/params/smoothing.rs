@@ -248,8 +248,15 @@ impl ParameterSmoother {
         // --- Sigma ---
         {
             let alpha = ramp_alpha(self.config.sigma_alpha, ramp_factor);
-            let smoothed = apply_ema(&mut self.sigma_ema, market_params.sigma, alpha);
-            if !within_deadband(smoothed, self.sigma_output, self.config.sigma_deadband_pct, true) {
+            let (smoothed, just_init) = apply_ema(&mut self.sigma_ema, market_params.sigma, alpha);
+            if just_init
+                || !within_deadband(
+                    smoothed,
+                    self.sigma_output,
+                    self.config.sigma_deadband_pct,
+                    true,
+                )
+            {
                 self.sigma_output = smoothed;
             } else {
                 self.deadband_suppressions += 1;
@@ -260,13 +267,16 @@ impl ParameterSmoother {
         // --- Kappa (only when Some) ---
         if let Some(raw_kappa) = market_params.regime_kappa {
             let alpha = ramp_alpha(self.config.kappa_alpha, ramp_factor);
-            let smoothed = apply_ema(&mut self.kappa_ema, raw_kappa, alpha);
-            if !within_deadband(
-                smoothed,
-                self.kappa_output.unwrap_or(raw_kappa),
-                self.config.kappa_deadband_pct,
-                true,
-            ) {
+            let (smoothed, just_init) = apply_ema(&mut self.kappa_ema, raw_kappa, alpha);
+            if just_init
+                || self.kappa_output.is_none()
+                || !within_deadband(
+                    smoothed,
+                    self.kappa_output.unwrap_or(raw_kappa),
+                    self.config.kappa_deadband_pct,
+                    true,
+                )
+            {
                 self.kappa_output = Some(smoothed);
             } else {
                 self.deadband_suppressions += 1;
@@ -281,14 +291,19 @@ impl ParameterSmoother {
         // --- Gamma multiplier ---
         {
             let alpha = ramp_alpha(self.config.gamma_mult_alpha, ramp_factor);
-            let smoothed =
-                apply_ema(&mut self.gamma_mult_ema, market_params.regime_gamma_multiplier, alpha);
-            if !within_deadband(
-                smoothed,
-                self.gamma_mult_output,
-                self.config.gamma_mult_deadband_pct,
-                true,
-            ) {
+            let (smoothed, just_init) = apply_ema(
+                &mut self.gamma_mult_ema,
+                market_params.regime_gamma_multiplier,
+                alpha,
+            );
+            if just_init
+                || !within_deadband(
+                    smoothed,
+                    self.gamma_mult_output,
+                    self.config.gamma_mult_deadband_pct,
+                    true,
+                )
+            {
                 self.gamma_mult_output = smoothed;
             } else {
                 self.deadband_suppressions += 1;
@@ -299,14 +314,19 @@ impl ParameterSmoother {
         // --- Lead-lag signal (absolute deadband in bps) ---
         {
             let alpha = ramp_alpha(self.config.lead_lag_alpha, ramp_factor);
-            let smoothed =
-                apply_ema(&mut self.lead_lag_ema, market_params.lead_lag_signal_bps, alpha);
-            if !within_deadband(
-                smoothed,
-                self.lead_lag_output,
-                self.config.lead_lag_deadband_bps,
-                false,
-            ) {
+            let (smoothed, just_init) = apply_ema(
+                &mut self.lead_lag_ema,
+                market_params.lead_lag_signal_bps,
+                alpha,
+            );
+            if just_init
+                || !within_deadband(
+                    smoothed,
+                    self.lead_lag_output,
+                    self.config.lead_lag_deadband_bps,
+                    false,
+                )
+            {
                 self.lead_lag_output = smoothed;
             } else {
                 self.deadband_suppressions += 1;
@@ -323,13 +343,15 @@ impl ParameterSmoother {
                 self.config.tail_risk_alpha_down
             };
             let alpha = ramp_alpha(base_alpha, ramp_factor);
-            let smoothed = apply_ema(&mut self.tail_risk_ema, raw, alpha);
-            if !within_deadband(
-                smoothed,
-                self.tail_risk_output,
-                self.config.tail_risk_deadband_pct,
-                true,
-            ) {
+            let (smoothed, just_init) = apply_ema(&mut self.tail_risk_ema, raw, alpha);
+            if just_init
+                || !within_deadband(
+                    smoothed,
+                    self.tail_risk_output,
+                    self.config.tail_risk_deadband_pct,
+                    true,
+                )
+            {
                 self.tail_risk_output = smoothed;
             } else {
                 self.deadband_suppressions += 1;
@@ -379,15 +401,17 @@ impl ParameterSmoother {
 
 /// Apply EWMA: `smoothed = alpha * raw + (1 - alpha) * prev`.
 /// On first call, seeds with the raw value (no smoothing).
-fn apply_ema(state: &mut EmaState, raw: f64, alpha: f64) -> f64 {
+/// Returns `(smoothed_value, just_initialized)` — callers should skip deadband
+/// when `just_initialized` is true to avoid false suppressions against stale output.
+fn apply_ema(state: &mut EmaState, raw: f64, alpha: f64) -> (f64, bool) {
     if !state.initialized {
         state.value = raw;
         state.initialized = true;
-        return raw;
+        return (raw, true);
     }
     let smoothed = alpha * raw + (1.0 - alpha) * state.value;
     state.value = smoothed;
-    smoothed
+    (smoothed, false)
 }
 
 /// Check whether a smoothed value is within the deadband of the current output.

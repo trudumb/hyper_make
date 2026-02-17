@@ -314,6 +314,17 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Snaps ladder prices to grid points to prevent sub-tick oscillations
     /// from triggering cancel+replace cycles.
     price_grid_config: quoting::PriceGridConfig,
+
+    // === Parameter Smoothing (L1: Churn Reduction) ===
+    /// EWMA + deadband smoothing for kappa/sigma/gamma before they reach the ladder.
+    /// Suppresses sub-deadband oscillations that cause unnecessary requotes.
+    /// Gated by `SmootherConfig.enabled` (default: false).
+    parameter_smoother: ParameterSmoother,
+
+    // === Churn Observability (L6: Churn Reduction) ===
+    /// Rolling-window tracker for cancel/fill ratios, latch effectiveness,
+    /// and budget suppression diagnostics.
+    churn_tracker: analytics::churn_tracker::ChurnTracker,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -500,7 +511,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Phase 5: Quote outcome tracking for unbiased edge estimation
             quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
             queue_value_heuristic: models::QueueValueHeuristic::new(),
-            price_grid_config: quoting::PriceGridConfig::default(),
+            price_grid_config: quoting::PriceGridConfig {
+                enabled: true,
+                ..quoting::PriceGridConfig::default()
+            },
+            parameter_smoother: ParameterSmoother::new(SmootherConfig {
+                enabled: true,
+                ..SmootherConfig::default()
+            }),
+            churn_tracker: analytics::churn_tracker::ChurnTracker::new(60),
         }
     }
 
@@ -613,6 +632,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             paper_max_position = %format!("{:.4}", paper_max_position),
             "Initialized paper balance for margin sizing and exchange limits"
         );
+        self
+    }
+
+    /// Configure parameter smoothing for churn reduction.
+    ///
+    /// When enabled, EWMA + deadband filtering on kappa/sigma/gamma
+    /// suppresses sub-threshold oscillations before they reach the ladder.
+    pub fn with_smoother_config(mut self, config: SmootherConfig) -> Self {
+        self.parameter_smoother = ParameterSmoother::new(config);
         self
     }
 

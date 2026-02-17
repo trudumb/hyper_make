@@ -35,11 +35,12 @@ use crate::market_maker::{
     execution::{FillTracker, OrderLifecycleTracker},
     fills::{FillProcessor, FillSignalStore},
     infra::{
-        ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig, DataQualityMonitor,
-        ExchangePositionLimits, ExecutionBudget, MarginAwareSizer, MarginConfig, OrphanTracker,
-        OrphanTrackerConfig, PositionReconciler, ProactiveRateLimitConfig,
-        ProactiveRateLimitTracker, PrometheusMetrics, ReconciliationConfig, RecoveryConfig,
-        RecoveryManager, RejectionRateLimitConfig, RejectionRateLimiter, SupervisorConfig,
+        BudgetPacer, ConnectionHealthMonitor, ConnectionSupervisor, DataQualityConfig,
+        DataQualityMonitor, ExchangePositionLimits, ExecutionBudget, MarginAwareSizer,
+        MarginConfig, OrphanTracker, OrphanTrackerConfig, PositionReconciler,
+        ProactiveRateLimitConfig, ProactiveRateLimitTracker, PrometheusMetrics,
+        ReconciliationConfig, RecoveryConfig, RecoveryManager, RejectionRateLimitConfig,
+        RejectionRateLimiter, SupervisorConfig,
     },
     learning::AdaptiveEnsemble,
     monitoring::{AlertConfig, Alerter, DashboardState},
@@ -270,6 +271,9 @@ pub struct InfraComponents {
     /// Fills are pushed here; on each mid update, expired entries are drained
     /// and fed to the pre-fill classifier and model gating.
     pub pending_fill_outcomes: std::collections::VecDeque<crate::market_maker::fills::PendingFillOutcome>,
+    /// Budget pacer for EV-aware API budget allocation (L5: Churn Reduction).
+    /// Filters low-value operations when API budget is tight.
+    pub budget_pacer: BudgetPacer,
 }
 
 /// Cached exchange rate limit with timestamp.
@@ -426,6 +430,7 @@ impl InfraComponents {
             fill_tracker: FillTracker::new(1000),
             order_lifecycle: OrderLifecycleTracker::new(1000),
             pending_fill_outcomes: std::collections::VecDeque::with_capacity(64),
+            budget_pacer: BudgetPacer::default(),
         }
     }
 }

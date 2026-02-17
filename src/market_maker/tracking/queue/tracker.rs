@@ -225,9 +225,8 @@ impl QueuePositionTracker {
             } else {
                 // Asks sorted low-to-high. Prices < ours are better asks (ahead of us).
                 // At our price, that size is also ahead.
-                if level_price < price - 1e-10 {
-                    depth += level_size;
-                } else if (level_price - price).abs() < 1e-10 {
+                // Asks sorted low-to-high: prices below ours or at our level are ahead.
+                if level_price < price + 1e-10 {
                     depth += level_size;
                 }
             }

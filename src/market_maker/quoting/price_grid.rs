@@ -135,6 +135,40 @@ impl PriceGrid {
         (snapped / self.tick_size).round() * self.tick_size
     }
 
+    /// Snap a bid price DOWN to the nearest grid point, then floor to tick.
+    ///
+    /// Bids snap conservatively downward so we never bid higher than intended.
+    pub fn snap_bid(&self, price: f64) -> f64 {
+        if self.step <= 0.0 || self.tick_size <= 0.0 {
+            return price;
+        }
+
+        // Floor to grid step (bid snaps DOWN)
+        let offset = price - self.reference_mid;
+        let grid_steps = (offset / self.step).floor();
+        let snapped = self.reference_mid + grid_steps * self.step;
+
+        // Floor-align to tick
+        (snapped / self.tick_size).floor() * self.tick_size
+    }
+
+    /// Snap an ask price UP to the nearest grid point, then ceil to tick.
+    ///
+    /// Asks snap conservatively upward so we never ask lower than intended.
+    pub fn snap_ask(&self, price: f64) -> f64 {
+        if self.step <= 0.0 || self.tick_size <= 0.0 {
+            return price;
+        }
+
+        // Ceil to grid step (ask snaps UP)
+        let offset = price - self.reference_mid;
+        let grid_steps = (offset / self.step).ceil();
+        let snapped = self.reference_mid + grid_steps * self.step;
+
+        // Ceil-align to tick
+        (snapped / self.tick_size).ceil() * self.tick_size
+    }
+
     /// Check if two prices resolve to the same grid point.
     pub fn same_point(&self, a: f64, b: f64) -> bool {
         if self.step <= 0.0 {
@@ -341,5 +375,146 @@ mod tests {
             grid.spacing_bps > 0.0,
             "spacing should be positive with zero headroom"
         );
+    }
+
+    #[test]
+    fn test_snap_bid_down_snap_ask_up() {
+        let mid = 30.0;
+        let tick = 0.01;
+        let grid = PriceGrid::for_current_state(mid, tick, 5.0, &default_cfg(), 1.0);
+
+        // A price between grid points: bid should snap down, ask should snap up
+        let price = mid + grid.step * 0.3; // 30% into the first grid cell above mid
+        let bid = grid.snap_bid(price);
+        let ask = grid.snap_ask(price);
+
+        assert!(
+            bid <= price,
+            "snap_bid({}) = {} should be <= price",
+            price,
+            bid
+        );
+        assert!(
+            ask >= price,
+            "snap_ask({}) = {} should be >= price",
+            price,
+            ask
+        );
+        assert!(
+            bid < ask,
+            "snap_bid ({}) should be < snap_ask ({}) for price between grid points",
+            bid,
+            ask
+        );
+    }
+
+    #[test]
+    fn test_snap_bid_ask_at_mid() {
+        let mid = 30.0;
+        let tick = 0.01;
+        let grid = PriceGrid::for_current_state(mid, tick, 5.0, &default_cfg(), 1.0);
+
+        // At exactly mid, floor(0 steps) = 0, ceil(0 steps) = 0 — both snap to mid
+        let bid = grid.snap_bid(mid);
+        let ask = grid.snap_ask(mid);
+
+        // Both should resolve to mid (floor and ceil of 0 are both 0)
+        assert!(
+            (bid - mid).abs() < tick,
+            "snap_bid at mid should be near mid, got {}",
+            bid
+        );
+        assert!(
+            (ask - mid).abs() < tick,
+            "snap_ask at mid should be near mid, got {}",
+            ask
+        );
+    }
+
+    #[test]
+    fn test_snap_bid_ask_tick_alignment() {
+        let mid = 100.0;
+        let tick = tick_for_mid(mid); // 0.01
+        let grid = PriceGrid::for_current_state(mid, tick, 10.0, &default_cfg(), 1.0);
+
+        for offset in [0.003, 0.007, 0.012, 0.025, 0.049, 0.1] {
+            let p = mid + offset;
+
+            let bid = grid.snap_bid(p);
+            let bid_remainder = (bid / tick) - (bid / tick).round();
+            assert!(
+                bid_remainder.abs() < 1e-9,
+                "snap_bid({}) = {} not on tick {}",
+                p,
+                bid,
+                tick
+            );
+
+            let ask = grid.snap_ask(p);
+            let ask_remainder = (ask / tick) - (ask / tick).round();
+            assert!(
+                ask_remainder.abs() < 1e-9,
+                "snap_ask({}) = {} not on tick {}",
+                p,
+                ask,
+                tick
+            );
+        }
+    }
+
+    #[test]
+    fn test_snap_bid_ask_degenerate_inputs() {
+        // Zero tick — should return price unchanged
+        let grid = PriceGrid::for_current_state(30.0, 0.0, 5.0, &default_cfg(), 1.0);
+        let p = 30.05;
+        assert_eq!(
+            grid.snap_bid(p),
+            p,
+            "snap_bid with zero tick should return price unchanged"
+        );
+        assert_eq!(
+            grid.snap_ask(p),
+            p,
+            "snap_ask with zero tick should return price unchanged"
+        );
+
+        // Zero step — construct directly
+        let grid = PriceGrid {
+            spacing_bps: 0.0,
+            reference_mid: 30.0,
+            tick_size: 0.01,
+            step: 0.0,
+        };
+        assert_eq!(
+            grid.snap_bid(p),
+            p,
+            "snap_bid with zero step should return price unchanged"
+        );
+        assert_eq!(
+            grid.snap_ask(p),
+            p,
+            "snap_ask with zero step should return price unchanged"
+        );
+    }
+
+    #[test]
+    fn test_snap_bid_always_le_snap_ask() {
+        let mid = 30.0;
+        let tick = 0.01;
+        let grid = PriceGrid::for_current_state(mid, tick, 5.0, &default_cfg(), 1.0);
+
+        // For many prices around mid, snap_bid should always be <= snap_ask
+        for i in -20..=20 {
+            let price = mid + (i as f64) * 0.007;
+            let bid = grid.snap_bid(price);
+            let ask = grid.snap_ask(price);
+            assert!(
+                bid <= ask,
+                "snap_bid({}) = {} > snap_ask = {} — invariant violated",
+                price,
+                bid,
+                ask
+            );
+        }
     }
 }

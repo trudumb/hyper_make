@@ -1323,7 +1323,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             None
         };
 
-        let bid_acts = priority_based_matching(
+        let (bid_acts, bid_latched) = priority_based_matching(
             &current_bids,
             &bid_levels,
             Side::Buy,
@@ -1333,7 +1333,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             price_grid.as_ref(),
         );
 
-        let ask_acts = priority_based_matching(
+        let (ask_acts, ask_latched) = priority_based_matching(
             &current_asks,
             &ask_levels,
             Side::Sell,
@@ -1372,10 +1372,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 })
                 .collect();
 
-            // Check skipped bids for queue refresh
+            // Check skipped bids for queue refresh (but never override deliberate latches)
             for order in &current_bids {
-                if !bid_action_oids.contains(&order.oid) {
-                    // This order was skipped - check if queue tracker says refresh
+                if !bid_action_oids.contains(&order.oid) && !bid_latched.contains(&order.oid) {
+                    // This order was skipped and NOT latched - check if queue tracker says refresh
                     if self
                         .tier1
                         .queue_tracker
@@ -1384,7 +1384,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         debug!(
                             oid = order.oid,
                             price = %order.price,
-                            "Queue-aware refresh: forcing bid order refresh due to low fill probability"
+                            "Queue-aware: forcing bid refresh (genuinely stale)"
                         );
                         // Add cancel action for this skipped order
                         bid_actions.push(LadderAction::Cancel { oid: order.oid });
@@ -1409,9 +1409,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
-            // Check skipped asks for queue refresh
+            // Check skipped asks for queue refresh (but never override deliberate latches)
             for order in &current_asks {
                 if !ask_action_oids.contains(&order.oid)
+                    && !ask_latched.contains(&order.oid)
                     && self
                         .tier1
                         .queue_tracker
@@ -1420,7 +1421,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     debug!(
                         oid = order.oid,
                         price = %order.price,
-                        "Queue-aware refresh: forcing ask order refresh due to low fill probability"
+                        "Queue-aware: forcing ask refresh (genuinely stale)"
                     );
                     ask_actions.push(LadderAction::Cancel { oid: order.oid });
                     // Find closest target level to place (using bps tolerance)
@@ -1439,6 +1440,52 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         }
                     }
                 }
+            }
+        }
+
+        // === L5: Budget-Aware Filtering ===
+        // Filter low-value operations when API budget is tight.
+        // Emergency actions (cancels during cascade) always pass.
+        let budget_suppressed;
+        {
+            use crate::market_maker::infra::{BudgetPacer, OperationPriority};
+
+            let classify_action = |action: &LadderAction, idx: usize| -> OperationPriority {
+                match action {
+                    LadderAction::Cancel { .. } => {
+                        BudgetPacer::priority_for_cancel(false, false)
+                    }
+                    LadderAction::Modify { .. } => {
+                        // Modifies preserve queue position — always at least Normal priority.
+                        OperationPriority::Normal
+                    }
+                    LadderAction::Place { .. } => {
+                        BudgetPacer::priority_for_placement(idx == 0)
+                    }
+                }
+            };
+
+            let budget_pre_bid = bid_actions.len();
+            let budget_pre_ask = ask_actions.len();
+            bid_actions = bid_actions
+                .into_iter()
+                .enumerate()
+                .filter(|(i, a)| self.infra.budget_pacer.should_spend(classify_action(a, *i)))
+                .map(|(_, a)| a)
+                .collect();
+            ask_actions = ask_actions
+                .into_iter()
+                .enumerate()
+                .filter(|(i, a)| self.infra.budget_pacer.should_spend(classify_action(a, *i)))
+                .map(|(_, a)| a)
+                .collect();
+            budget_suppressed = (budget_pre_bid + budget_pre_ask) - (bid_actions.len() + ask_actions.len());
+            if budget_suppressed > 0 {
+                info!(
+                    budget_suppressed,
+                    remaining_budget = self.infra.budget_pacer.remaining_budget(),
+                    "L5: Budget pacer suppressed low-value actions"
+                );
             }
         }
 
@@ -1529,8 +1576,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Convert modifies to cancel+place instead (will be handled in next cycle)
                 // Don't execute modifies during backoff
             } else if !self.infra.proactive_rate_tracker.can_modify() {
-                debug!("Skipping modify: minimum modify interval not elapsed (prevents OID churn)");
-                // Skip this cycle, will retry next time
+                info!(
+                    modify_count = all_modifies.len(),
+                    "Modify debounced: latching {} orders (preserving resting state and queue position)",
+                    all_modifies.len()
+                );
+                // Latch: keep resting orders untouched until next modify window.
+                // Do NOT fall through to cancel+place — that's 2x API cost and loses queue position.
             } else {
                 // Mark that we're doing a modify
                 self.infra.proactive_rate_tracker.mark_modify();
@@ -1903,6 +1955,28 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     "Impulse control: spent execution budget tokens"
                 );
             }
+        }
+
+        // === L5b: Record API spend in BudgetPacer ===
+        let total_api_calls =
+            (cancel_count + modify_count + bid_place_count + ask_place_count) as u32;
+        if total_api_calls > 0 {
+            self.infra.budget_pacer.record_spend(total_api_calls);
+        }
+
+        // === L6: Record churn metrics ===
+        {
+            use crate::market_maker::analytics::churn_tracker::CycleSummary;
+            let latched = _total_skips as u32;
+            self.churn_tracker.record_cycle(CycleSummary {
+                placed: (bid_place_count + ask_place_count) as u32,
+                cancelled: cancel_count as u32,
+                filled: 0, // fills tracked separately via fill processor
+                modified: modify_count as u32,
+                latched,
+                grid_preserved: 0, // TODO: track grid-snapped preservations
+                budget_suppressed: budget_suppressed as u32,
+            });
         }
 
         Ok(())

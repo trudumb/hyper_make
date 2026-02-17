@@ -8,6 +8,7 @@
 //! - **LiveAnalytics**: Bundled analytics for the live market maker
 
 pub mod attribution;
+pub mod churn_tracker;
 pub mod drift_calibration;
 pub mod edge_metrics;
 pub mod live;

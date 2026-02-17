@@ -252,3 +252,10 @@ Paper-to-Live EV Gap: Analysis & Improvement Hypotheses
   Want me to start implementing these fixes?
 
   if you were designing systems to address your concerns, examine the current system and design a principled solution that would have emerged if the change was a foundational assumption from the start using a team of 5-6 engineers
+
+  1. QUEUE-AWARE OVERRIDE: Orders successfully latched by matching are immediately cancelled by the queue-aware enhancement. See oid 4: matched at 0.0 bps, 2.1% size diff → latched →
+  then QUEUE-AWARE OVERRIDE: forcing ask refresh (overriding latch!)
+  2. Size volatility: Target sizes swing 20-100% between cycles (edge predictions fluctuate), exceeding the 30% latch_size_fraction.
+
+  Modifies ARE happening now (17 cycles with modifies). The stability floor and Case 2b are working. But queue-aware override is the remaining churn driver
+  

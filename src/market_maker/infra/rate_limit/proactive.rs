@@ -151,7 +151,7 @@ impl Default for ProactiveRateLimitConfig {
             address_initial_buffer: 10_000,
             requests_per_usd_traded: 1.0,
             min_requote_interval_ms: 100, // 10 requotes/second max
-            min_modify_interval_ms: 2000, // Modifies at most every 2 seconds
+            min_modify_interval_ms: 500, // Modifies at most every 500ms (was 2000ms — caused cancel+place fallback)
             initial_429_backoff: Duration::from_secs(10), // Per Hyperliquid docs: 1 req/10s when limited
             max_429_backoff: Duration::from_secs(60),     // Cap at 1 minute
             backoff_429_multiplier: 1.5,                  // Moderate exponential increase

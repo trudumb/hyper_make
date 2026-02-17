@@ -727,6 +727,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
+        // === L1: Parameter Smoothing (Churn Reduction) ===
+        // EWMA + deadband filtering on kappa/sigma/gamma before they reach the ladder.
+        // Suppresses sub-deadband oscillations (e.g. kappa 1169→1176, 0.6%) that would
+        // otherwise cause unnecessary requotes. Gated by SmootherConfig.enabled.
+        self.parameter_smoother.smooth(&mut market_params, false);
+
         // === Construct FeatureSnapshot for downstream models ===
         // Compact projection of market state for toxicity classification,
         // queue-value estimation, and execution mode selection.
@@ -2009,9 +2015,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Dynamic kappa cap: 2/kappa in bps (matches GLFT asymptotic spread when γ << κ).
         // High kappa (8000) → 2.5 bps cap (allows tight quoting).
         // Low kappa (2500) → 8 bps cap (stays wide).
-        // Min 1.5 bps to never go below fee.
+        //
+        // STABILITY FLOOR: The kappa cap must not narrow spreads below the noise floor.
+        // If half-spread < 2 × expected_mid_move_per_cycle, orders churn every cycle.
+        // Formula: stability_floor = 2 × sigma × √(cycle_dt) × 10000
+        // This ensures orders survive at least 2 cycles, giving tolerance bands room to work.
         let kappa_for_cap = market_params.kappa.max(1.0);
-        let kappa_cap_bps = (2.0 / kappa_for_cap * 10_000.0).max(1.5);
+        let raw_kappa_cap_bps = 2.0 / kappa_for_cap * 10_000.0;
+        let cycle_dt_s = 5.0_f64; // typical quote cycle interval
+        let stability_floor_bps =
+            (2.0 * market_params.sigma * cycle_dt_s.sqrt() * 10_000.0).max(5.0);
+        let kappa_cap_bps = raw_kappa_cap_bps.max(stability_floor_bps);
         market_params.kappa_spread_bps = Some(kappa_cap_bps);
         // Still update the kappa EMA for diagnostics
         self.stochastic.kappa_spread.update_avg_kappa(market_params.kappa);
@@ -2415,10 +2429,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 market_params.rate_limit_headroom_pct,
             );
             for level in ladder.bids.iter_mut() {
-                level.price = grid.snap(level.price);
+                level.price = grid.snap_bid(level.price);
             }
             for level in ladder.asks.iter_mut() {
-                level.price = grid.snap(level.price);
+                level.price = grid.snap_ask(level.price);
             }
         }
 

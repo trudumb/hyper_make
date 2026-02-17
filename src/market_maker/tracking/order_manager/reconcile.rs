@@ -4,6 +4,7 @@
 //! minimal cancel/place/modify actions for improved spread capturing.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::helpers::truncate_float;
 use crate::{bps_diff, EPSILON};
@@ -122,7 +123,7 @@ impl Default for DynamicReconcileConfig {
             optimal_spread_bps: 20.0,   // Default ~20 bps
             max_modify_price_bps: 50.0, // Default 50 bps
             use_priority_matching: true,
-            latch_threshold_bps: 2.5,   // Adaptive default
+            latch_threshold_bps: 3.0,   // Adaptive default
             latch_size_fraction: 0.10,  // 10% size change threshold
             // HJB queue value integration
             use_hjb_queue_value: true,
@@ -216,7 +217,7 @@ impl DynamicReconcileConfig {
             // Low quota: widen latch aggressively to reduce churn
             (base_latch * 2.0).clamp(5.0, 15.0)
         } else {
-            base_latch.clamp(2.0, 10.0)
+            base_latch.clamp(3.0, 10.0)
         };
 
         // Size hysteresis at 20%: only modify if size changes by >20%.
@@ -242,13 +243,15 @@ impl DynamicReconcileConfig {
         }
     }
 
-    /// Get tolerance for a given priority level (0 = best, higher = further out)
+    /// Get tolerance for a given priority level (0 = best, higher = further out).
+    ///
+    /// Progressive: best level tight, first outer moderate, far outer relaxed (1.5x).
     #[inline]
     pub fn tolerance_for_priority(&self, priority: usize) -> f64 {
-        if priority == 0 {
-            self.best_level_tolerance_bps
-        } else {
-            self.outer_level_tolerance_bps
+        match priority {
+            0 => self.best_level_tolerance_bps,
+            1 => self.outer_level_tolerance_bps,
+            _ => self.outer_level_tolerance_bps * 1.5,
         }
     }
 
@@ -657,12 +660,13 @@ pub fn priority_based_matching(
     queue_tracker: Option<&QueuePositionTracker>,
     sz_decimals: u32,
     grid: Option<&PriceGrid>,
-) -> Vec<LadderAction> {
+) -> (Vec<LadderAction>, HashSet<u64>) {
     use tracing::debug;
 
     let mut actions = Vec::new();
     let mut matched_orders: HashSet<u64> = HashSet::new();
     let mut matched_targets: HashSet<usize> = HashSet::new();
+    let mut latched_oids: HashSet<u64> = HashSet::new();
 
     // Phase 1: Match orders to targets in PRIORITY ORDER (best price first)
     // For bids: highest price = best = priority 0
@@ -692,6 +696,28 @@ pub fn priority_based_matching(
             // Order found within tolerance - check if we should preserve it
             matched_orders.insert(order.oid);
             matched_targets.insert(priority);
+
+            // === DIAGNOSTIC: Log matching decision at INFO ===
+            let _diag_price_diff = bps_diff(order.price, target.price) as f64;
+            let _diag_size_diff = if order.remaining() > EPSILON {
+                ((target.size - order.remaining()).abs() / order.remaining()).min(1.0)
+            } else {
+                1.0
+            };
+            debug!(
+                oid = order.oid,
+                priority = priority,
+                order_price = %format!("{:.4}", order.price),
+                target_price = %format!("{:.4}", target.price),
+                price_diff_bps = _diag_price_diff,
+                order_size = %format!("{:.4}", order.remaining()),
+                target_size = %format!("{:.4}", target.size),
+                size_diff_pct = %format!("{:.1}%", _diag_size_diff * 100.0),
+                latch_bps = %format!("{:.2}", config.latch_threshold_bps),
+                latch_size_frac = %format!("{:.2}", config.latch_size_fraction),
+                max_modify_bps = %format!("{:.2}", config.max_modify_price_bps),
+                "[Matching] Order matched to target — evaluating action"
+            );
 
             // === Grid Fast Path (Phase 2b: Churn Reduction) ===
             // If prices resolve to the same grid point AND size is close, keep the
@@ -793,17 +819,49 @@ pub fn priority_based_matching(
                 // Case 1: Adaptive quote latching — preserve queue for small changes.
                 // Threshold scales with optimal spread and API headroom instead of
                 // the fixed 2.5 bps / 10% that caused 86% cancellation rate.
-                if price_diff_bps <= config.latch_threshold_bps
+                // Orders resting >2s get +1.0 bps bonus (queue position is more valuable).
+                let age_bonus_bps = if order.placed_at.elapsed() > Duration::from_secs(2) {
+                    1.0
+                } else {
+                    0.0
+                };
+                let effective_latch_bps = config.latch_threshold_bps + age_bonus_bps;
+                if price_diff_bps <= effective_latch_bps
                     && size_diff_pct <= config.latch_size_fraction
                 {
                     debug!(
                         oid = order.oid,
                         price_diff_bps = %format!("{:.2}", price_diff_bps),
                         size_diff_pct = %format!("{:.1}%", size_diff_pct * 100.0),
-                        latch_bps = %format!("{:.2}", config.latch_threshold_bps),
-                        "Quote latched: preserving queue position"
+                        latch_bps = %format!("{:.2}", effective_latch_bps),
+                        age_bonus_bps = %format!("{:.1}", age_bonus_bps),
+                        "Case 1 LATCH: preserving queue position"
                     );
+                    latched_oids.insert(order.oid);
                     continue;
+                }
+
+                // Case 1b: Price is within latch, but size changed beyond fraction
+                // → MODIFY size at same price (preserves queue!)
+                // This prevents unnecessary cancel+place when only edge predictions fluctuate.
+                if price_diff_bps <= effective_latch_bps && size_diff_pct > config.latch_size_fraction {
+                    let truncated = truncate_float(target_size, sz_decimals, false);
+                    if truncated > 0.0 {
+                        debug!(
+                            oid = order.oid,
+                            price_diff_bps = %format!("{:.2}", price_diff_bps),
+                            size_diff_pct = %format!("{:.1}%", size_diff_pct * 100.0),
+                            "Case 1b: price latched, MODIFY size only (preserving queue)"
+                        );
+                        actions.push(LadderAction::Modify {
+                            oid: order.oid,
+                            new_price: order.price,  // keep same price = preserve queue
+                            new_size: truncated,
+                            side,
+                        });
+                        latched_oids.insert(order.oid);
+                        continue;
+                    }
                 }
 
                 // Case 2: Price is good, only SIZE REDUCTION needed
@@ -834,11 +892,38 @@ pub fn priority_based_matching(
                     continue;
                 }
 
-                // Case 3: Catch-all — drift beyond latch not handled by modify-down
-                // Price moved or size increased → must CANCEL+PLACE (loses queue, but necessary)
+                // Case 2b: Price drifted beyond latch but within modify range
+                // → Use MODIFY to change price+size in 1 API call (saves 1 call vs cancel+place)
+                // Queue position at old price is lost, but we gain immediate queue at new price.
+                // This is strictly better than cancel+place: same queue outcome, half the API cost.
+                if price_diff_bps <= config.max_modify_price_bps {
+                    let truncated_target = truncate_float(target_size, sz_decimals, false);
+                    if truncated_target <= 0.0 {
+                        actions.push(LadderAction::Cancel { oid: order.oid });
+                        continue;
+                    }
+                    debug!(
+                        oid = order.oid,
+                        price_diff_bps = %format!("{:.2}", price_diff_bps),
+                        old_price = order.price,
+                        new_price = target.price,
+                        new_size = truncated_target,
+                        "Priority matching: MODIFY (price+size) saves 1 API call"
+                    );
+                    actions.push(LadderAction::Modify {
+                        oid: order.oid,
+                        new_price: target.price,
+                        new_size: truncated_target,
+                        side,
+                    });
+                    continue;
+                }
+
+                // Case 3: Catch-all — drift beyond modify range
+                // Price moved too far for modify → must CANCEL+PLACE
                 {
                     let reason = if price_diff_bps > config.latch_threshold_bps {
-                        "price_drift"
+                        "price_drift_extreme"
                     } else {
                         "size_increase"
                     };
@@ -847,7 +932,8 @@ pub fn priority_based_matching(
                         price_diff_bps = price_diff_bps,
                         size_change_pct = %format!("{:.1}%", size_change / current_size * 100.0),
                         reason = reason,
-                        "Priority matching: CANCEL+PLACE (queue lost)"
+                        max_modify_price_bps = %format!("{:.2}", config.max_modify_price_bps),
+                        "Case 3 CANCEL+PLACE (queue lost)"
                     );
                     actions.push(LadderAction::Cancel { oid: order.oid });
                     if target.size > EPSILON {
@@ -865,9 +951,11 @@ pub fn priority_based_matching(
             if target.size > EPSILON {
                 debug!(
                     priority = priority,
-                    target_price = target.price,
+                    target_price = %format!("{:.4}", target.price),
                     tolerance_bps = tolerance_bps,
-                    "Priority matching: placing order for uncovered target"
+                    num_resting = current.len(),
+                    num_already_matched = matched_orders.len(),
+                    "NO MATCH: placing order for uncovered target"
                 );
                 actions.push(LadderAction::Place {
                     side,
@@ -897,7 +985,7 @@ pub fn priority_based_matching(
         }
     }
 
-    actions
+    (actions, latched_oids)
 }
 
 /// Reconcile a single side: match current orders to target levels.
@@ -1141,7 +1229,7 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 1);
+        let (actions, _latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 1, None);
 
         // Should get a Modify with truncated size 0.5
         assert_eq!(actions.len(), 1);
@@ -1187,7 +1275,7 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 2);
+        let (actions, _latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 2, None);
 
         // Should get Cancel (truncated to zero → don't send zero-size modify)
         assert_eq!(actions.len(), 1);
@@ -1292,7 +1380,7 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 4);
+        let (actions, latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 4, None);
 
         // Should produce NO actions — order is latched
         assert!(
@@ -1300,6 +1388,8 @@ mod tests {
             "Expected no actions (latched), got {:?}",
             actions
         );
+        // Latched set should contain the order
+        assert!(latched.contains(&1), "Expected oid 1 in latched set");
     }
 
     #[test]
@@ -1332,7 +1422,7 @@ mod tests {
             hjb_queue_modify_cost_bps: 0.0,
         };
 
-        let actions = priority_based_matching(&current, &target, Side::Buy, &config, None, 4);
+        let (actions, _latched) = priority_based_matching(&current, &target, Side::Buy, &config, None, 4, None);
 
         // Should produce an action (cancel+place) since drift exceeds latch
         assert!(
