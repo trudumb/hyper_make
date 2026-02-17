@@ -15,7 +15,9 @@ use crate::market_maker::quoting::ladder::tick_grid::{
     TickGridConfig, TickScoringParams, enumerate_bid_ticks, enumerate_ask_ticks,
     score_ticks, select_optimal_ticks,
 };
-use crate::market_maker::quoting::ladder::risk_budget::{SideRiskBudget, allocate_risk_budget};
+use crate::market_maker::quoting::ladder::risk_budget::{
+    SideRiskBudget, SoftmaxParams, allocate_risk_budget, compute_allocation_temperature,
+};
 
 use super::{
     CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
@@ -1840,12 +1842,25 @@ impl LadderStrategy {
                 let glft_touch_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
                 let touch_bps = glft_touch_bps.max(effective_floor_bps);
 
-                // Max depth from kappa cap or dynamic bounds
-                let max_depth_bps = market_params.kappa_spread_bps
-                    .unwrap_or(touch_bps * 4.0)
-                    .max(touch_bps * 2.0);
-
+                // WS2: Wider depth range using tier-dependent multiplier.
+                // Old: max(kappa_cap, touch * 2.0) — only 7.5 bps range for 5 levels.
+                // New: max(kappa_cap, touch * depth_range_multiplier) — 30+ bps for meaningful diversity.
                 let policy = &market_params.capital_policy;
+                let max_depth_bps = market_params.kappa_spread_bps
+                    .unwrap_or(touch_bps * policy.depth_range_multiplier)
+                    .max(touch_bps * policy.depth_range_multiplier)
+                    .min(100.0); // Absolute cap: never deeper than 100 bps
+
+                // WS3: API-budget-aware level count — generate fewer levels when
+                // headroom is low to avoid reconciler dropping excess.
+                let effective_levels = if market_params.rate_limit_headroom_pct < 0.15 {
+                    let scaled = (policy.max_levels_per_side as f64
+                        * (market_params.rate_limit_headroom_pct / 0.15))
+                        .ceil() as usize;
+                    scaled.max(2) // Always at least 2 levels
+                } else {
+                    policy.max_levels_per_side
+                };
 
                 // Build tick grid config
                 let grid_config = TickGridConfig::compute(
@@ -1853,7 +1868,7 @@ impl LadderStrategy {
                     tick_size,
                     touch_bps,
                     max_depth_bps,
-                    policy.max_levels_per_side,
+                    effective_levels,
                     config.sz_decimals,
                     policy.min_tick_spacing_mult,
                 );
@@ -1874,8 +1889,8 @@ impl LadderStrategy {
                 score_ticks(&mut bid_ticks, &scoring);
                 score_ticks(&mut ask_ticks, &scoring);
 
-                let selected_bids = select_optimal_ticks(&bid_ticks, policy.max_levels_per_side);
-                let selected_asks = select_optimal_ticks(&ask_ticks, policy.max_levels_per_side);
+                let selected_bids = select_optimal_ticks(&bid_ticks, effective_levels);
+                let selected_asks = select_optimal_ticks(&ask_ticks, effective_levels);
 
                 // Build risk budgets per side
                 let margin_per_contract = market_params.microprice / leverage.max(1.0);
@@ -1897,9 +1912,22 @@ impl LadderStrategy {
                     sz_decimals: config.sz_decimals,
                 };
 
-                // Allocate sizes via greedy water-filling
-                let bid_allocs = allocate_risk_budget(&selected_bids, &bid_budget);
-                let ask_allocs = allocate_risk_budget(&selected_asks, &ask_budget);
+                // WS4: Compute allocation temperature from regime + warmup
+                let in_yellow_zone = matches!(position_zone, PositionZone::Yellow);
+                let alloc_temperature = compute_allocation_temperature(
+                    market_params.regime_gamma_multiplier,
+                    market_params.adaptive_warmup_progress,
+                    in_yellow_zone,
+                );
+                let softmax_params = SoftmaxParams {
+                    temperature: alloc_temperature,
+                    min_entropy_bits: 1.0,
+                    min_level_fraction: 0.05,
+                };
+
+                // WS1: Allocate sizes via utility-proportional softmax
+                let (bid_allocs, bid_diag) = allocate_risk_budget(&selected_bids, &bid_budget, &softmax_params);
+                let (ask_allocs, ask_diag) = allocate_risk_budget(&selected_asks, &ask_budget, &softmax_params);
 
                 // Skip if Red zone cleared accumulating side
                 let bid_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
@@ -1954,16 +1982,41 @@ impl LadderStrategy {
                     }
                 }
 
+                // WS6: Diagnostic logging with size distribution
+                let bid_sizes_str: String = ladder.bids.iter()
+                    .map(|l| format!("{:.2}", l.size))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let ask_sizes_str: String = ladder.asks.iter()
+                    .map(|l| format!("{:.2}", l.size))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let bid_depths_str: String = ladder.bids.iter()
+                    .map(|l| format!("{:.1}", l.depth_bps))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let ask_depths_str: String = ladder.asks.iter()
+                    .map(|l| format!("{:.1}", l.depth_bps))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 tracing::info!(
                     tick_grid = true,
                     tier = ?policy.tier,
                     bid_levels = ladder.bids.len(),
                     ask_levels = ladder.asks.len(),
+                    bid_sizes = %bid_sizes_str,
+                    ask_sizes = %ask_sizes_str,
+                    bid_depths = %bid_depths_str,
+                    ask_depths = %ask_depths_str,
                     bid_total_size = %format!("{:.4}", ladder.bids.iter().map(|l| l.size).sum::<f64>()),
                     ask_total_size = %format!("{:.4}", ladder.asks.iter().map(|l| l.size).sum::<f64>()),
+                    temperature = %format!("{:.2}", alloc_temperature),
+                    entropy_bits = %format!("{:.2}", bid_diag.entropy_bits.max(ask_diag.entropy_bits)),
                     touch_bps = %format!("{:.2}", touch_bps),
                     max_depth_bps = %format!("{:.2}", max_depth_bps),
-                    "Tick-grid ladder generated (exchange-aligned, unique prices by construction)"
+                    effective_levels = effective_levels,
+                    headroom_pct = %format!("{:.1}%", market_params.rate_limit_headroom_pct * 100.0),
+                    "Tick-grid ladder: utility-weighted softmax allocation"
                 );
 
                 ladder

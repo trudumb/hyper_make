@@ -376,6 +376,10 @@ pub struct CapitalAwarePolicy {
     pub spread_compensation_mult: f64,
     /// Use greedy water-filling allocation (vs uniform). Micro/Small: true.
     pub use_greedy_allocation: bool,
+    /// Depth range multiplier: max_depth = touch_bps * depth_range_multiplier.
+    /// Wider range = more utility variation across levels = better size differentiation.
+    /// Micro: 2.5, Small: 3.0, Medium: 4.0, Large: 5.0.
+    pub depth_range_multiplier: f64,
 }
 
 impl CapitalAwarePolicy {
@@ -402,6 +406,7 @@ impl CapitalAwarePolicy {
                 max_single_order_fraction: 0.40,
                 spread_compensation_mult: 1.15,
                 use_greedy_allocation: true,
+                depth_range_multiplier: 2.5,
             },
             CapitalTier::Small => Self {
                 tier,
@@ -423,6 +428,7 @@ impl CapitalAwarePolicy {
                 max_single_order_fraction: 0.30,
                 spread_compensation_mult: 1.05,
                 use_greedy_allocation: true,
+                depth_range_multiplier: 3.0,
             },
             CapitalTier::Medium => Self {
                 tier,
@@ -444,6 +450,7 @@ impl CapitalAwarePolicy {
                 max_single_order_fraction: 0.25,
                 spread_compensation_mult: 1.0,
                 use_greedy_allocation: false,
+                depth_range_multiplier: 4.0,
             },
             CapitalTier::Large => Self {
                 tier,
@@ -465,6 +472,7 @@ impl CapitalAwarePolicy {
                 max_single_order_fraction: 0.20,
                 spread_compensation_mult: 1.0,
                 use_greedy_allocation: false,
+                depth_range_multiplier: 5.0,
             },
         }
     }
@@ -875,6 +883,7 @@ mod tests {
         assert!((policy.max_single_order_fraction - 0.40).abs() < 1e-10);
         assert!((policy.spread_compensation_mult - 1.15).abs() < 1e-10);
         assert!(policy.use_greedy_allocation);
+        assert!((policy.depth_range_multiplier - 2.5).abs() < 1e-10);
     }
 
     #[test]
