@@ -582,7 +582,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // Try to load and restore latest checkpoint
                 match mgr.load_latest() {
                     Ok(Some(bundle)) => {
-                        if bundle.metadata.asset == *self.config.asset {
+                        if checkpoint::asset_identity::assets_match(&bundle.metadata.asset, &self.config.asset) {
                             self.restore_from_bundle(&bundle);
                             info!(
                                 asset = %bundle.metadata.asset,

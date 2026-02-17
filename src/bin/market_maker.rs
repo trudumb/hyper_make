@@ -2267,6 +2267,12 @@ static LOG_GUARDS: std::sync::OnceLock<Vec<tracing_appender::non_blocking::Worke
     std::sync::OnceLock::new();
 
 fn setup_logging(config: &AppConfig, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Guard: if logging was already initialized (e.g., by auto-cal paper mode),
+    // skip re-initialization. The tracing global subscriber can only be set once.
+    if LOG_GUARDS.get().is_some() {
+        return Ok(());
+    }
+
     let level = cli.log_level.as_ref().unwrap_or(&config.logging.level);
 
     // Determine stdout format from CLI or config
