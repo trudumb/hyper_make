@@ -505,4 +505,90 @@ mod tests {
         assert!(status.contains("Calibration:"));
         assert!(status.contains("phase=Cold"));
     }
+
+    /// E2E: L2 profile → initialize → 100 fills → verify kappa converges, uncertainty drops.
+    #[test]
+    fn test_bootstrap_e2e_convergence() {
+        // Step 1: Create a MarketProfile from realistic L2 data
+        let mut profile = MarketProfile::new();
+        // Feed several L2 snapshots to stabilize the profile
+        for _ in 0..10 {
+            profile.on_l2_book(24.95, 25.05, 500.0, 500.0);
+        }
+        assert!(profile.is_initialized());
+
+        // Step 2: Seed coordinator from profile
+        let mut coord = CalibrationCoordinator::new();
+        assert!(!coord.is_seeded());
+        coord.initialize_from_profile(&profile);
+        assert!(coord.is_seeded());
+
+        let initial_kappa = coord.effective_kappa();
+        let initial_premium = coord.uncertainty_premium_bps();
+        assert!(initial_kappa > 10.0, "Initial kappa should be meaningful");
+        assert!(initial_premium > 3.0, "Cold phase should have significant premium");
+
+        // Step 3: Feed 100 fills at ~15 bps distance (mildly favorable fills)
+        let mut prev_kappa = initial_kappa;
+        for i in 0..100 {
+            let distance_bps = 15.0 + (i as f64 * 0.01); // slight variation
+            let was_adverse = i % 5 == 0; // 20% AS rate
+            coord.on_fill(distance_bps, was_adverse);
+
+            let k = coord.effective_kappa();
+            // After the first few fills, kappa should be growing (warmup factor increasing)
+            if i > 5 {
+                assert!(
+                    k >= prev_kappa * 0.95, // allow small float fluctuation
+                    "Kappa should generally grow: fill {i}, prev={prev_kappa:.0}, curr={k:.0}"
+                );
+            }
+            prev_kappa = k;
+        }
+
+        // Step 4: Verify convergence properties
+        let final_kappa = coord.effective_kappa();
+        let final_premium = coord.uncertainty_premium_bps();
+
+        assert!(
+            final_kappa > initial_kappa * 1.3,
+            "Final kappa ({final_kappa:.0}) should be significantly higher than initial ({initial_kappa:.0})"
+        );
+        assert!(
+            final_premium < 0.1,
+            "Confident phase premium should be near zero: {final_premium:.2}"
+        );
+        assert_eq!(coord.phase(), CalibrationPhase::Confident);
+        assert_eq!(coord.fill_count(), 100);
+    }
+
+    /// Verify coordinator checkpoint round-trip preserves all state.
+    #[test]
+    fn test_coordinator_checkpoint_round_trip() {
+        let mut profile = MarketProfile::new();
+        profile.on_l2_book(24.95, 25.05, 500.0, 500.0);
+
+        let mut coord = CalibrationCoordinator::new();
+        coord.initialize_from_profile(&profile);
+
+        // Feed 20 fills to get into Warming phase
+        for _ in 0..20 {
+            coord.on_fill(18.0, false);
+        }
+        for _ in 0..5 {
+            coord.on_fill(12.0, true); // some adverse
+        }
+
+        // Serialize (CalibrationCoordinatorCheckpoint == CalibrationCoordinator)
+        let json = serde_json::to_string(&coord).unwrap();
+        let restored: CalibrationCoordinator = serde_json::from_str(&json).unwrap();
+
+        // Verify all state matches
+        assert_eq!(restored.phase(), coord.phase());
+        assert_eq!(restored.fill_count(), coord.fill_count());
+        assert!(restored.is_seeded());
+        assert!((restored.effective_kappa() - coord.effective_kappa()).abs() < 0.01);
+        assert!((restored.uncertainty_premium_bps() - coord.uncertainty_premium_bps()).abs() < 0.01);
+        assert!((restored.as_rate() - coord.as_rate()).abs() < 0.001);
+    }
 }

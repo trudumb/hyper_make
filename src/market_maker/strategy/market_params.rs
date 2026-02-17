@@ -997,6 +997,17 @@ pub struct MarketParams {
     /// behavior (ladder levels, reconcile mode, trust caps, warmup, quota) in one
     /// place, threaded through the entire pipeline.
     pub capital_policy: CapitalAwarePolicy,
+
+    // === CalibrationCoordinator (Bootstrap from Book) ===
+    /// Kappa from CalibrationCoordinator (L2-derived, fill-refined).
+    /// Conservative during warmup (0.5x factor), converges to fill-based kappa.
+    /// Used in kappa priority chain: Robust > Adaptive > Coordinator > Legacy
+    pub coordinator_kappa: f64,
+    /// Uncertainty premium from CalibrationCoordinator (bps).
+    /// Added to spreads during Cold/Warming phase, decays as fills accumulate.
+    pub coordinator_uncertainty_premium_bps: f64,
+    /// Whether coordinator kappa is available (seeded from L2 profile).
+    pub use_coordinator_kappa: bool,
 }
 
 impl Default for MarketParams {
@@ -1276,6 +1287,10 @@ impl Default for MarketParams {
             capacity_budget: None,
             // Capital-aware policy — derived from tier, flows through entire pipeline
             capital_policy: CapitalAwarePolicy::default(),
+            // CalibrationCoordinator — inactive until seeded from L2 profile
+            coordinator_kappa: 0.0,
+            coordinator_uncertainty_premium_bps: 0.0,
+            use_coordinator_kappa: false,
         }
     }
 }

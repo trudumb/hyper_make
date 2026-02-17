@@ -1,8 +1,14 @@
 //! Calibration gate for paper-to-live transition.
 //!
-//! Assesses whether a checkpoint has sufficient learned state to safely
-//! drive live trading. The gate reads observation counts already stored
-//! in checkpoint component structs — no new tracking needed.
+//! Two-phase assessment:
+//! - **Phase 1 (Market Readiness)**: vol + regime estimators — converge from
+//!   market data alone, no fills required. Sufficient for Marginal (go live
+//!   with defensive spreads).
+//! - **Phase 2 (Execution Readiness)**: kappa + AS + fill_rate — require our
+//!   fills for calibration. All three must converge for Ready verdict.
+//!
+//! Thresholds are set to be achievable within 30 minutes on low-volume assets
+//! (~2 trades/min). The gate reads observation counts from checkpoint structs.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,13 +19,18 @@ use crate::market_maker::checkpoint::types::{CheckpointBundle, PriorReadiness, P
 pub struct CalibrationGateConfig {
     /// Minimum paper session duration in seconds (default: 1800 = 30 min)
     pub min_paper_duration_s: f64,
-    /// Minimum observations for vol/regime/fill_rate estimators
-    pub min_observations: usize,
-    /// Minimum observations for kappa estimator
+    /// Phase 1: Minimum observations for market-data estimators (vol, regime).
+    /// These accumulate from market trades, not our fills.
+    /// Default 50 — achievable in 30 min even at ~2 trades/min.
+    pub min_market_observations: usize,
+    /// Phase 2: Minimum fill-based observations for kappa estimator.
+    /// Needs our fills (paper or live). Default 10.
     pub min_kappa_observations: usize,
-    /// Minimum AS learning samples
+    /// Phase 2: Minimum AS learning samples (needs our fills). Default 15.
     pub min_as_samples: usize,
-    /// Minimum kelly fills (wins + losses)
+    /// Phase 2: Minimum fill rate observations (needs our fills). Default 15.
+    pub min_fill_rate_observations: usize,
+    /// Minimum kelly fills (wins + losses) for Ready verdict. Default 5.
     pub min_kelly_fills: usize,
     /// Maximum age of prior in seconds before considered stale (default: 14400 = 4h)
     pub max_prior_age_s: f64,
@@ -31,10 +42,11 @@ impl Default for CalibrationGateConfig {
     fn default() -> Self {
         Self {
             min_paper_duration_s: 1800.0,
-            min_observations: 200,
-            min_kappa_observations: 50,
-            min_as_samples: 100,
-            min_kelly_fills: 20,
+            min_market_observations: 50,
+            min_kappa_observations: 10,
+            min_as_samples: 15,
+            min_fill_rate_observations: 15,
+            min_kelly_fills: 5,
             max_prior_age_s: 14400.0,
             allow_marginal: true,
         }
@@ -57,39 +69,62 @@ impl CalibrationGate {
     }
 
     /// Assess a checkpoint bundle and return a PriorReadiness snapshot.
+    ///
+    /// Two-phase assessment:
+    /// - Phase 1 (Market): vol + regime — only needs market data
+    /// - Phase 2 (Execution): kappa + AS + fill_rate — needs our fills
     pub fn assess(&self, bundle: &CheckpointBundle) -> PriorReadiness {
         let vol_observations = bundle.vol_filter.observation_count;
-        let kappa_observations = bundle.kappa_own.observation_count;
+        // Use cumulative count (never decremented by rolling window expiry).
+        // Backward-compat: old checkpoints have total_observations=0, fall back to rolling.
+        let kappa_observations = if bundle.kappa_own.total_observations > 0 {
+            bundle.kappa_own.total_observations
+        } else {
+            bundle.kappa_own.observation_count
+        };
         let as_learning_samples = bundle.pre_fill.learning_samples;
         let regime_observations = bundle.regime_hmm.observation_count as usize;
         let fill_rate_observations = bundle.fill_rate.observation_count;
         let kelly_fills = (bundle.kelly_tracker.n_wins + bundle.kelly_tracker.n_losses) as usize;
         let session_duration_s = bundle.metadata.session_duration_s;
 
-        // Count how many of the 5 core estimators meet their thresholds
+        // Phase 1: Market readiness (market data only, no fills needed)
+        let vol_ready = vol_observations >= self.config.min_market_observations;
+        let regime_ready = regime_observations >= self.config.min_market_observations;
+        let phase1_ready = vol_ready && regime_ready;
+
+        // Phase 2: Execution readiness (needs our fills)
+        let kappa_ready = kappa_observations >= self.config.min_kappa_observations;
+        let as_ready = as_learning_samples >= self.config.min_as_samples;
+        let fill_rate_ready = fill_rate_observations >= self.config.min_fill_rate_observations;
+        let phase2_ready = kappa_ready && as_ready && fill_rate_ready;
+
+        // Count estimators for diagnostic reporting
         let mut estimators_ready: u8 = 0;
-        if vol_observations >= self.config.min_observations {
+        if vol_ready {
             estimators_ready += 1;
         }
-        if kappa_observations >= self.config.min_kappa_observations {
+        if kappa_ready {
             estimators_ready += 1;
         }
-        if as_learning_samples >= self.config.min_as_samples {
+        if as_ready {
             estimators_ready += 1;
         }
-        if regime_observations >= self.config.min_observations {
+        if regime_ready {
             estimators_ready += 1;
         }
-        if fill_rate_observations >= self.config.min_observations {
+        if fill_rate_ready {
             estimators_ready += 1;
         }
 
         let duration_met = session_duration_s >= self.config.min_paper_duration_s;
         let kelly_met = kelly_fills >= self.config.min_kelly_fills;
 
-        let verdict = if duration_met && estimators_ready == 5 && kelly_met {
+        let verdict = if duration_met && phase1_ready && phase2_ready && kelly_met {
             PriorVerdict::Ready
-        } else if duration_met && estimators_ready >= 3 {
+        } else if duration_met && phase1_ready {
+            // Market microstructure understood — safe to go live with defensive spreads.
+            // Execution calibration (AS, fill_rate) will converge from live fills.
             PriorVerdict::Marginal
         } else {
             PriorVerdict::Insufficient
@@ -127,34 +162,36 @@ impl CalibrationGate {
                 readiness.session_duration_s, self.config.min_paper_duration_s
             ));
         }
-        if readiness.vol_observations < self.config.min_observations {
+        // Phase 1: Market data estimators
+        if readiness.vol_observations < self.config.min_market_observations {
             issues.push(format!(
-                "vol observations insufficient ({} < {})",
-                readiness.vol_observations, self.config.min_observations
+                "vol observations insufficient ({} < {} [market])",
+                readiness.vol_observations, self.config.min_market_observations
             ));
         }
+        if readiness.regime_observations < self.config.min_market_observations {
+            issues.push(format!(
+                "regime observations insufficient ({} < {} [market])",
+                readiness.regime_observations, self.config.min_market_observations
+            ));
+        }
+        // Phase 2: Fill-based estimators
         if readiness.kappa_observations < self.config.min_kappa_observations {
             issues.push(format!(
-                "kappa observations insufficient ({} < {})",
+                "kappa observations insufficient ({} < {} [fill])",
                 readiness.kappa_observations, self.config.min_kappa_observations
             ));
         }
         if readiness.as_learning_samples < self.config.min_as_samples {
             issues.push(format!(
-                "AS learning samples insufficient ({} < {})",
+                "AS learning samples insufficient ({} < {} [fill])",
                 readiness.as_learning_samples, self.config.min_as_samples
             ));
         }
-        if readiness.regime_observations < self.config.min_observations {
+        if readiness.fill_rate_observations < self.config.min_fill_rate_observations {
             issues.push(format!(
-                "regime observations insufficient ({} < {})",
-                readiness.regime_observations, self.config.min_observations
-            ));
-        }
-        if readiness.fill_rate_observations < self.config.min_observations {
-            issues.push(format!(
-                "fill rate observations insufficient ({} < {})",
-                readiness.fill_rate_observations, self.config.min_observations
+                "fill rate observations insufficient ({} < {} [fill])",
+                readiness.fill_rate_observations, self.config.min_fill_rate_observations
             ));
         }
         if readiness.kelly_fills < self.config.min_kelly_fills {
@@ -293,7 +330,8 @@ mod tests {
     #[test]
     fn test_ready_verdict() {
         let gate = CalibrationGate::new(CalibrationGateConfig::default());
-        let bundle = make_bundle(2000.0, 300, 100, 200, 300, 250, 15, 10);
+        // All estimators above thresholds: vol≥50, regime≥50, kappa≥10, AS≥15, fill_rate≥15, kelly≥5
+        let bundle = make_bundle(2000.0, 100, 20, 30, 100, 30, 5, 5);
         let readiness = gate.assess(&bundle);
         assert_eq!(readiness.verdict, PriorVerdict::Ready);
         assert_eq!(readiness.estimators_ready, 5);
@@ -301,22 +339,35 @@ mod tests {
     }
 
     #[test]
-    fn test_marginal_verdict() {
+    fn test_marginal_phase1_only() {
         let gate = CalibrationGate::new(CalibrationGateConfig::default());
-        // 3/5 estimators ready (vol, kappa, AS ok; regime and fill_rate insufficient)
-        let bundle = make_bundle(2000.0, 300, 100, 200, 10, 10, 5, 3);
+        // Phase 1 ready (vol=100≥50, regime=60≥50), Phase 2 not ready (0 fills)
+        // This is the typical paper trading scenario: market data converged, no fills yet.
+        let bundle = make_bundle(2000.0, 100, 0, 0, 60, 0, 0, 0);
         let readiness = gate.assess(&bundle);
         assert_eq!(readiness.verdict, PriorVerdict::Marginal);
-        assert_eq!(readiness.estimators_ready, 3);
+        assert_eq!(readiness.estimators_ready, 2); // only vol + regime
         assert!(gate.passes(&readiness)); // allow_marginal = true by default
     }
 
     #[test]
-    fn test_insufficient_verdict() {
+    fn test_insufficient_phase1_not_met() {
         let gate = CalibrationGate::new(CalibrationGateConfig::default());
-        let bundle = make_bundle(100.0, 10, 5, 10, 5, 10, 0, 0); // too short, too few
+        // Phase 1 not ready: vol=10<50, regime=5<50
+        let bundle = make_bundle(2000.0, 10, 5, 10, 5, 10, 0, 0);
         let readiness = gate.assess(&bundle);
         assert_eq!(readiness.verdict, PriorVerdict::Insufficient);
+        assert!(!gate.passes(&readiness));
+    }
+
+    #[test]
+    fn test_insufficient_short_session() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        // All estimators ready, but session too short
+        let bundle = make_bundle(100.0, 100, 20, 30, 100, 30, 5, 5);
+        let readiness = gate.assess(&bundle);
+        assert_eq!(readiness.verdict, PriorVerdict::Insufficient);
+        assert_eq!(readiness.estimators_ready, 5);
         assert!(!gate.passes(&readiness));
     }
 
@@ -327,7 +378,7 @@ mod tests {
         let gate = CalibrationGate::new(config);
 
         // Marginal should NOT pass when allow_marginal is false
-        let bundle = make_bundle(2000.0, 300, 100, 200, 10, 10, 5, 3);
+        let bundle = make_bundle(2000.0, 100, 0, 0, 60, 0, 0, 0);
         let readiness = gate.assess(&bundle);
         assert_eq!(readiness.verdict, PriorVerdict::Marginal);
         assert!(!gate.passes(&readiness));
@@ -347,10 +398,9 @@ mod tests {
     #[test]
     fn test_duration_required_for_ready() {
         let gate = CalibrationGate::new(CalibrationGateConfig::default());
-        // All estimators have enough data but session is too short
-        let bundle = make_bundle(500.0, 300, 100, 200, 300, 250, 15, 10);
+        // All estimators ready but session too short → Insufficient (not Ready)
+        let bundle = make_bundle(500.0, 100, 20, 30, 100, 30, 5, 5);
         let readiness = gate.assess(&bundle);
-        // Short duration prevents Ready, but 5/5 estimators + duration -> Marginal not Ready
         assert_ne!(readiness.verdict, PriorVerdict::Ready);
     }
 
@@ -384,5 +434,73 @@ mod tests {
         // Fully calibrated: full size
         assert!((warmup_size_multiplier(200) - 1.0).abs() < 0.001);
         assert!((warmup_size_multiplier(500) - 1.0).abs() < 0.001);
+    }
+
+    /// Phase 1 (vol+regime) ready → Marginal, even with zero fills.
+    /// This is the key scenario: low-volume asset, paper trading for 30 min,
+    /// market data converged, zero fills — should still pass the gate.
+    #[test]
+    fn test_marginal_zero_fills_market_converged() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+
+        let bundle = make_bundle(
+            2000.0, // session long enough
+            80,     // vol_obs: meets 50 threshold (market data)
+            0,      // kappa_obs: zero fills
+            0,      // as_samples: zero fills
+            60,     // regime_obs: meets 50 threshold (market data)
+            0,      // fill_rate: zero fills
+            0,      // kelly wins
+            0,      // kelly losses
+        );
+
+        let readiness = gate.assess(&bundle);
+        assert_eq!(readiness.verdict, PriorVerdict::Marginal);
+        assert_eq!(readiness.estimators_ready, 2); // only vol + regime
+        assert!(gate.passes(&readiness)); // allow_marginal = true
+    }
+
+    /// Ready requires Phase 2 (fill-based) in addition to Phase 1.
+    #[test]
+    fn test_ready_requires_fills() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+
+        // Phase 1 ready, Phase 2 partial (only kappa met, AS and fill_rate not)
+        let bundle = make_bundle(
+            2000.0, // duration OK
+            100,    // vol: OK
+            15,     // kappa: OK (≥10)
+            5,      // AS: NOT OK (<15)
+            100,    // regime: OK
+            5,      // fill_rate: NOT OK (<15)
+            3,      // kelly wins
+            3,      // kelly losses (=6, ≥5 OK)
+        );
+
+        let readiness = gate.assess(&bundle);
+        // Phase 1 ready but Phase 2 not → Marginal, not Ready
+        assert_eq!(readiness.verdict, PriorVerdict::Marginal);
+        assert_eq!(readiness.estimators_ready, 3); // vol + regime + kappa
+    }
+
+    /// Insufficient when session too short despite all estimators ready.
+    #[test]
+    fn test_insufficient_short_session_all_estimators_ready() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+
+        let bundle = make_bundle(
+            500.0,  // too short (need 1800s)
+            100,    // vol_obs: ready
+            20,     // kappa_obs: ready
+            30,     // as_samples: ready
+            100,    // regime_obs: ready
+            30,     // fill_rate: ready
+            5,      // kelly wins
+            5,      // kelly losses
+        );
+
+        let readiness = gate.assess(&bundle);
+        assert_eq!(readiness.verdict, PriorVerdict::Insufficient);
+        assert_eq!(readiness.estimators_ready, 5);
     }
 }

@@ -2554,7 +2554,13 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     let paper_config = PaperEnvironmentConfig {
         asset: asset.clone(),
         user_address,
-        fill_sim_config: FillSimulatorConfig::default(),
+        fill_sim_config: FillSimulatorConfig {
+            // Paper orders don't exist in the real L2 book, so queue position
+            // estimation from book depth produces queue_frac=1.0 → P(fill)=0.
+            // Use flat age-based model instead.
+            ignore_book_depth: true,
+            ..FillSimulatorConfig::default()
+        },
         dex: dex.clone(),
     };
     let paper_env = PaperEnvironment::new(paper_config, info_client);
@@ -2579,7 +2585,14 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         decimals,
         sz_decimals,
         multi_asset: false,
-        stochastic: StochasticConfig::default(),
+        // Paper calibration needs full capacity immediately — ramp and
+        // performance gating are live risk-management tools, not useful
+        // during short calibration runs.
+        stochastic: StochasticConfig {
+            enable_position_ramp: false,
+            enable_performance_gating: false,
+            ..StochasticConfig::default()
+        },
         smart_reconcile: true,
         reconcile: ReconcileConfig::default(),
         runtime: runtime_config,

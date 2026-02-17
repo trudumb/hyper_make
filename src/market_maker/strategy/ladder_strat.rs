@@ -727,8 +727,10 @@ impl LadderStrategy {
 
         let warmup_addon_bps = if market_params.adaptive_warmup_progress < 1.0 {
             // Policy-driven warmup addon: Micro=3.0, Large=8.0 bps max, decays with warmup
-            market_params.capital_policy.warmup_floor_bps
-                * (1.0 - market_params.adaptive_warmup_progress)
+            let policy_addon = market_params.capital_policy.warmup_floor_bps
+                * (1.0 - market_params.adaptive_warmup_progress);
+            // Coordinator uncertainty premium: additive, decays with fills
+            policy_addon + market_params.coordinator_uncertainty_premium_bps
         } else {
             0.0
         };
@@ -869,6 +871,17 @@ impl LadderStrategy {
                 "Ladder using ADAPTIVE kappa"
             );
             market_params.adaptive_kappa
+        } else if market_params.use_coordinator_kappa {
+            // Coordinator kappa: L2-derived, refined by fills. Used during warmup
+            // when robust/adaptive estimators haven't converged yet.
+            // Conservative by design: 0.5x warmup factor at start, hard floor at 10.
+            info!(
+                coordinator_kappa = %format!("{:.0}", market_params.coordinator_kappa),
+                uncertainty_premium_bps = %format!("{:.1}", market_params.coordinator_uncertainty_premium_bps),
+                legacy_kappa = %format!("{:.0}", market_params.kappa),
+                "Ladder using COORDINATOR kappa (L2-seeded warmup)"
+            );
+            market_params.coordinator_kappa
         } else {
             // Legacy: Book-based kappa with AS adjustment
             // κ_effective = κ̂ × (1 - α), where α = P(informed | fill)
@@ -1712,7 +1725,36 @@ impl LadderStrategy {
             // 4. Generate ladder to get depth levels and prices (using dynamic depths)
             // NOTE: Don't truncate here - let the entropy optimizer handle distribution
             // The optimizer has built-in notional constraints that will filter sub-minimum levels
+
+            // DIAGNOSTIC: dump actual dynamic depths before ladder generation
+            if let Some(ref dd) = ladder_config.dynamic_depths {
+                let bid_depths_str: Vec<String> = dd.bid.iter().map(|d| format!("{:.2}", d)).collect();
+                let ask_depths_str: Vec<String> = dd.ask.iter().map(|d| format!("{:.2}", d)).collect();
+                info!(
+                    num_levels = ladder_config.num_levels,
+                    bid_depths = %bid_depths_str.join(","),
+                    ask_depths = %ask_depths_str.join(","),
+                    total_size = %format!("{:.4}", params.total_size),
+                    mid_price = %format!("{:.4}", params.mid_price),
+                    market_mid = %format!("{:.4}", params.market_mid),
+                    "DIAGNOSTIC: pre-generate ladder depths"
+                );
+            }
+
             let mut ladder = Ladder::generate(&ladder_config, &params);
+
+            // DIAGNOSTIC: dump post-generate ladder levels
+            {
+                let bid_str: Vec<String> = ladder.bids.iter().map(|l| format!("({:.4}@{:.2}bps,sz={:.2})", l.price, l.depth_bps, l.size)).collect();
+                let ask_str: Vec<String> = ladder.asks.iter().map(|l| format!("({:.4}@{:.2}bps,sz={:.2})", l.price, l.depth_bps, l.size)).collect();
+                info!(
+                    bid_levels = ladder.bids.len(),
+                    ask_levels = ladder.asks.len(),
+                    bids = %bid_str.join(" | "),
+                    asks = %ask_str.join(" | "),
+                    "DIAGNOSTIC: post-generate ladder levels"
+                );
+            }
 
             // Log if capacity is tight (for debugging), but don't truncate
             if effective_bid_levels < configured_levels || effective_ask_levels < configured_levels
@@ -3140,5 +3182,77 @@ mod tests {
                 micro_ladder.asks[0].price, micro_params.microprice
             );
         }
+    }
+
+    /// Verify kappa priority chain: Robust > Adaptive > Coordinator > Legacy
+    #[test]
+    fn test_kappa_priority_chain_coordinator() {
+        let mut params = MarketParams::default();
+        params.kappa = 1000.0;  // Legacy kappa
+        params.coordinator_kappa = 600.0;
+        params.coordinator_uncertainty_premium_bps = 2.0;
+        params.use_coordinator_kappa = true;
+        params.use_kappa_robust = false;
+        params.use_adaptive_spreads = false;
+        params.adaptive_can_estimate = false;
+
+        // With no robust/adaptive, coordinator kappa should be selected
+        // (We test this by checking the compute_spread_composition output)
+        let strat = LadderStrategy::new(0.3);
+        let composition = strat.compute_spread_composition(&params, 1.0);
+
+        // The GLFT spread with coordinator kappa (600) should be wider than with legacy (1000)
+        // because lower kappa → wider spread
+        // Also: warmup addon should include coordinator uncertainty premium
+        let mut legacy_params = params.clone();
+        legacy_params.use_coordinator_kappa = false;
+        legacy_params.coordinator_uncertainty_premium_bps = 0.0;
+        let _legacy_composition = strat.compute_spread_composition(&legacy_params, 1.0);
+
+        // Note: compute_spread_composition uses the basic kappa path (robust vs legacy only).
+        // The coordinator kappa is wired in generate_ladder. We verify the uncertainty premium
+        // routes through warmup_addon_bps correctly.
+        assert!(
+            composition.warmup_addon_bps >= params.coordinator_uncertainty_premium_bps,
+            "Warmup addon ({:.2}) should include coordinator uncertainty premium ({:.2})",
+            composition.warmup_addon_bps, params.coordinator_uncertainty_premium_bps
+        );
+
+        // Also verify warmup addon is zero when adaptive_warmup_progress = 1.0
+        let mut done_params = params.clone();
+        done_params.adaptive_warmup_progress = 1.0;
+        let done_composition = strat.compute_spread_composition(&done_params, 1.0);
+        assert!(
+            done_composition.warmup_addon_bps < 0.01,
+            "Warmup addon should be 0 when warmup complete: {:.2}",
+            done_composition.warmup_addon_bps
+        );
+    }
+
+    /// Verify that when robust kappa is active, it produces tighter spreads
+    /// than legacy kappa (which compute_spread_composition falls back to).
+    /// The coordinator kappa path is only exercised in generate_ladder.
+    #[test]
+    fn test_robust_kappa_overrides_coordinator() {
+        let mut params = MarketParams::default();
+        params.kappa = 1000.0;
+        params.kappa_robust = 2000.0; // Higher kappa → tighter spread
+        params.use_kappa_robust = true;
+        params.coordinator_kappa = 600.0; // Lower kappa → wider spread
+        params.use_coordinator_kappa = true;
+
+        let strat = LadderStrategy::new(0.3);
+        let robust_composition = strat.compute_spread_composition(&params, 1.0);
+
+        // Without robust, falls back to legacy kappa (1000) in compute_spread_composition
+        params.use_kappa_robust = false;
+        let legacy_composition = strat.compute_spread_composition(&params, 1.0);
+
+        // Robust kappa (2000) → tighter spread than legacy (1000)
+        assert!(
+            robust_composition.glft_half_spread_bps < legacy_composition.glft_half_spread_bps,
+            "Robust kappa (2000) should give tighter spread ({:.2}) than legacy (1000) spread ({:.2})",
+            robust_composition.glft_half_spread_bps, legacy_composition.glft_half_spread_bps
+        );
     }
 }

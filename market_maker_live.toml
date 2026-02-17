@@ -30,10 +30,10 @@ warmup_decay_secs = 300
 min_warmup_trades = 5
 
 [kill_switch]
-max_daily_loss = 5.0           # $5 max daily loss (Phase 1)
+max_daily_loss = 15.0          # $15 max daily loss (10 HYPE @ ~$30)
 max_drawdown = 0.10            # 10% max drawdown
-max_position_value = 50.0      # $50 max notional
-max_position_contracts = 2.0   # ~2 HYPE max
+max_position_value = 350.0     # $350 max notional (~10 HYPE @ $30+)
+max_position_contracts = 12.0  # 12 HYPE max (headroom above 10)
 
 [stochastic]
 # Core model features

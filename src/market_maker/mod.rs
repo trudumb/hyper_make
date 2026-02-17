@@ -143,6 +143,14 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Accessible by reconciler and other components that don't receive MarketParams.
     capital_policy: config::CapitalAwarePolicy,
 
+    // === Bootstrap from Book ===
+    /// L2-derived market microstructure profile for kappa/sigma estimation.
+    /// Fed by handle_l2_book(), seeds CalibrationCoordinator during warmup.
+    market_profile: estimator::market_profile::MarketProfile,
+    /// Coordinates L2-derived and fill-derived kappa estimates.
+    /// Provides conservative kappa during warmup before robust estimators converge.
+    calibration_coordinator: estimator::calibration_coordinator::CalibrationCoordinator,
+
     // === First-Principles Position Limit ===
     /// Effective max position SIZE (contracts), updated each quote cycle.
     ///
@@ -448,6 +456,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             stochastic,
             inventory_governor,
             capital_policy: config::CapitalAwarePolicy::default(),
+            market_profile: estimator::market_profile::MarketProfile::new(),
+            calibration_coordinator: estimator::calibration_coordinator::CalibrationCoordinator::new(),
             effective_max_position,
             effective_target_liquidity,
             last_ws_open_orders_snapshot: None,
@@ -733,7 +743,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             },
             kill_switch: self.safety.kill_switch.to_checkpoint(),
             readiness: checkpoint::PriorReadiness::default(),
-            calibration_coordinator: checkpoint::CalibrationCoordinatorCheckpoint::default(),
+            calibration_coordinator: self.calibration_coordinator.clone(),
         }
     }
 
@@ -764,6 +774,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.safety
             .kill_switch
             .restore_from_checkpoint(&bundle.kill_switch);
+        // Restore calibration coordinator (L2-derived kappa blending state)
+        self.calibration_coordinator = bundle.calibration_coordinator.clone();
     }
 
     // =========================================================================

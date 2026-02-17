@@ -538,6 +538,7 @@ impl BayesianKappaEstimator {
             sum_distances: self.sum_distances,
             sum_sq_distances: self.sum_sq_distances,
             kappa_posterior_mean: self.kappa_posterior_mean,
+            total_observations: self.update_count,
         }
     }
 
@@ -552,6 +553,12 @@ impl BayesianKappaEstimator {
         self.sum_distances = cp.sum_distances;
         self.sum_sq_distances = cp.sum_sq_distances;
         self.kappa_posterior_mean = cp.kappa_posterior_mean;
+        // Restore cumulative count (backward-compat: 0 from old checkpoints, fall back to rolling)
+        self.update_count = if cp.total_observations > 0 {
+            cp.total_observations
+        } else {
+            cp.observation_count
+        };
         // Recompute derived fields
         let post_alpha = self.prior_alpha + self.observation_count as f64;
         let post_beta = self.prior_beta + self.sum_distances;

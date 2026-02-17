@@ -1430,8 +1430,9 @@ pub struct QLearningAgent {
     /// instead of approximating prev_inventory_risk with the current value.
     pending_inventory_risks: VecDeque<f64>,
     /// EWMA baseline tracker for counterfactual reward centering.
-    /// Subtracts constant fee drag (~-1.5 bps) so Q-values differentiate actions.
-    /// Will be wired into `update_q_value` to center rewards around the running mean.
+    /// QLearningAgent is deprecated (replaced by SpreadBandit in stochastic module).
+    /// Production baseline tracker lives at stochastic.baseline_tracker, wired in
+    /// handlers.rs:1050-1055. This field is dead code since QL agent is unused.
     #[allow(dead_code)]
     baseline: BaselineTracker,
 }

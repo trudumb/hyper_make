@@ -217,6 +217,8 @@ pub struct FillSimulator {
     placement_latency_ns: u64,
     /// Per-order queue position estimators (oid -> estimator)
     queue_estimators: std::collections::HashMap<u64, QueuePositionEstimator>,
+    /// Total market trades processed (for diagnostic logging)
+    trade_count: usize,
 }
 
 impl FillSimulator {
@@ -234,6 +236,7 @@ impl FillSimulator {
             book_ask_depth: std::collections::HashMap::new(),
             placement_latency_ns,
             queue_estimators: std::collections::HashMap::new(),
+            trade_count: 0,
         }
     }
 
@@ -301,36 +304,61 @@ impl FillSimulator {
         // Get active orders from executor
         let orders = self.executor.get_active_orders();
 
+        // Periodic diagnostic: log trade vs order state every 50 trades
+        self.trade_count += 1;
+        if self.trade_count.is_multiple_of(50) {
+            let buy_orders: Vec<_> = orders
+                .iter()
+                .filter(|o| o.is_buy && o.status == SimulatedOrderStatus::Resting)
+                .map(|o| format!("{:.3}@{:.1}", o.price, o.size))
+                .collect();
+            let sell_orders: Vec<_> = orders
+                .iter()
+                .filter(|o| !o.is_buy && o.status == SimulatedOrderStatus::Resting)
+                .map(|o| format!("{:.3}@{:.1}", o.price, o.size))
+                .collect();
+            info!(
+                trade_count = self.trade_count,
+                trade_price = trade.price,
+                trade_size = trade.size,
+                trade_side = ?trade.side,
+                total_fills = self.total_fills,
+                active_orders = orders.len(),
+                buy_orders = ?buy_orders,
+                sell_orders = ?sell_orders,
+                "[SIM] Trade diagnostic"
+            );
+        }
+
         for order in orders {
             // Check if this trade could fill the order
             if let Some(fill) = self.check_fill(&order, trade) {
-                // Execute the fill in the executor
-                if self
-                    .executor
-                    .simulate_fill(fill.oid, fill.fill_size, fill.fill_price)
-                {
-                    info!(
-                        oid = fill.oid,
-                        side = ?fill.side,
-                        price = fill.fill_price,
-                        size = fill.fill_size,
-                        "[SIM] Fill simulated"
-                    );
+                // Don't call simulate_fill() here — that would mutate order state
+                // before apply_fill() in paper.rs gets a chance, causing a
+                // double-decrement where apply_fill() sees Filled status and
+                // returns None, silently dropping the fill event.
+                // Instead, just record bookkeeping; apply_fill() handles mutation.
+                info!(
+                    oid = fill.oid,
+                    side = ?fill.side,
+                    price = fill.fill_price,
+                    size = fill.fill_size,
+                    "[SIM] Fill decided"
+                );
 
-                    self.total_fills += 1;
-                    self.total_size_filled += fill.fill_size;
+                self.total_fills += 1;
+                self.total_size_filled += fill.fill_size;
 
-                    // Remove queue estimator for filled order
-                    self.queue_estimators.remove(&fill.oid);
+                // Remove queue estimator for filled order
+                self.queue_estimators.remove(&fill.oid);
 
-                    // Add to recent fills
-                    self.recent_fills.push_back(fill.clone());
-                    while self.recent_fills.len() > self.max_recent_fills {
-                        self.recent_fills.pop_front();
-                    }
-
-                    fills.push(fill);
+                // Add to recent fills
+                self.recent_fills.push_back(fill.clone());
+                while self.recent_fills.len() > self.max_recent_fills {
+                    self.recent_fills.pop_front();
                 }
+
+                fills.push(fill);
             }
         }
 

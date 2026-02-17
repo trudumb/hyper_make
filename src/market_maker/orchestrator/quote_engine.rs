@@ -682,6 +682,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Cached BBO from L2 book (same data reconciler validates against)
             cached_best_bid: self.cached_best_bid,
             cached_best_ask: self.cached_best_ask,
+            // CalibrationCoordinator for L2-derived warmup kappa
+            calibration_coordinator: &self.calibration_coordinator,
             // Exchange position limits
             exchange_limits_valid: exchange_limits.is_initialized(),
             exchange_effective_bid_limit: exchange_limits.effective_bid_limit(),
@@ -1404,17 +1406,35 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // === PHASE 3+4: effective_max_position from InventoryGovernor + regime tightening ===
         // config.max_position is the hard ceiling. Margin is solvency floor only.
         // Regime tightens further: Extreme → 30% of max (via max_position_fraction).
+        //
+        // FIX: Use unified_regime().max_position_fraction (clamped [0.3, 1.0]) instead
+        // of raw params.max_position_fraction. The raw value can be arbitrarily low
+        // from checkpoint deserialization or uncalibrated HMM states.
+        //
+        // COLD-START BYPASS: With 0 fills, the regime HMM has no fill-based data
+        // to calibrate position fractions. Using it would reduce effective_max by
+        // 30-70%, shrinking the ladder budget and preventing fills.
+        // "Quote First, Learn Second" — full capacity until first fills.
         let margin_effective = market_params.effective_max_position(self.config.max_position);
+        let unified = self.stochastic.regime_state.unified_regime();
+        let fill_count = self.tier1.adverse_selection.fills_measured();
+        let regime_fraction = if fill_count < 10 {
+            1.0 // No regime tightening until we have fill data
+        } else {
+            unified.max_position_fraction // Clamped to [0.3, 1.0] by unified_regime()
+        };
         let new_effective = margin_effective
             .min(self.config.max_position)
-            * market_params.max_position_fraction.clamp(0.1, 1.0);
+            * regime_fraction;
         if (new_effective - self.effective_max_position).abs() > 0.001 {
             debug!(
                 old = %format!("{:.6}", self.effective_max_position),
                 new = %format!("{:.6}", new_effective),
                 margin_derived = %format!("{:.6}", margin_effective),
                 config_max = %format!("{:.6}", self.config.max_position),
-                regime_fraction = %format!("{:.2}", market_params.max_position_fraction),
+                regime_fraction = %format!("{:.2}", regime_fraction),
+                raw_regime_fraction = %format!("{:.2}", market_params.max_position_fraction),
+                fill_count = fill_count,
                 "Effective max position updated (config cap × regime fraction)"
             );
         }
@@ -2487,7 +2507,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     || self.stochastic.signal_integrator.has_cusum_divergence(),
                 position: self.position.position(),
                 capital_tier: market_params.capital_tier,
-                is_warmup: !self.estimator.is_warmed_up(),
+                // Use fill-count warmup (not estimator.is_warmed_up which is TRUE
+                // from checkpoint vol_filter_obs). With 0 fills, models aren't
+                // calibrated yet — warmup protection must remain active.
+                is_warmup: self.tier1.adverse_selection.fills_measured() < 10,
             };
             select_mode(&input)
         };
@@ -2495,6 +2518,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             mode = %execution_mode,
             toxicity = ?current_toxicity_regime,
             zone = ?position_assessment.zone,
+            fills_measured = self.tier1.adverse_selection.fills_measured(),
             "Execution mode computed"
         );
 
@@ -2565,14 +2589,33 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // triggering the Sisyphean loop where viable.rs rounds up → toxicity reduces
             // → ExchangeRules rejects. Spread widening achieves the same protective
             // effect without hitting size floors.
+            //
+            // WARMUP BYPASS: During warmup the pre-fill classifier has 0 samples,
+            // so "Toxic" classification is noise from OFI spikes on a 0.35 prior.
+            // Clearing both sides at flat position prevents all fills → death spiral.
+            // Instead, use spread widening (same as Normal regime) during warmup.
             {
                 use crate::market_maker::adverse_selection::ToxicityRegime;
                 let vq = *viable.quantum();
+                let fill_count_for_warmup = self.tier1.adverse_selection.fills_measured();
+                let is_warmup = fill_count_for_warmup < 10;
                 match current_toxicity_regime {
                     ToxicityRegime::Toxic => {
-                        // Extreme: clear both sides, or only reducing side if positioned
                         let pos = self.position.position();
-                        if pos.abs() < 1e-9 {
+                        if is_warmup && pos.abs() < 1e-9 {
+                            // Warmup + flat: widen spreads 1.5x instead of clearing.
+                            // Provides protection without the death spiral.
+                            let mid = quote_config.mid_price;
+                            for quote in viable.bids.iter_mut() {
+                                let offset = (mid - quote.price).max(0.0);
+                                quote.price = mid - offset * 1.5;
+                            }
+                            for quote in viable.asks.iter_mut() {
+                                let offset = (quote.price - mid).max(0.0);
+                                quote.price = mid + offset * 1.5;
+                            }
+                        } else if pos.abs() < 1e-9 {
+                            // Calibrated + flat: clear both sides
                             viable.bids.clear();
                             viable.asks.clear();
                         } else if pos > 0.0 {

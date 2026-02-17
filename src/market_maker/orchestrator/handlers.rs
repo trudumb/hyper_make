@@ -306,6 +306,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .signal_integrator
                 .update_as_prediction(predicted_as_prob, was_adverse);
 
+            // === Bootstrap from Book: Feed markout outcome to CalibrationCoordinator ===
+            // Uses markout-based AS (not fill-time AS) to avoid the tautology bug.
+            // fill_distance_bps = distance from mid to fill price (already computed above).
+            {
+                let fill_dist_bps = ((pending.fill_price - pending.mid_at_fill).abs()
+                    / pending.mid_at_fill)
+                    * 10_000.0;
+                self.calibration_coordinator
+                    .on_fill(fill_dist_bps, was_adverse);
+            }
+
             // Close prediction→correction loop: if classifier overpredicts AS,
             // bias correction reduces effective toxicity in spread_multiplier().
             // predicted_as_bps_val and markout_as_bps computed below in EdgeSnapshot block.
@@ -1264,6 +1275,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // This refines depth_ahead estimates using min(current, book) to
             // preserve queue advancement from observed fills/cancellations.
             self.tier1.queue_tracker.update_depth_from_book(&bids, &asks);
+
+            // === Bootstrap from Book: Feed L2 to MarketProfile ===
+            // MarketProfile tracks BBO spread, depth, and trade rate for kappa estimation.
+            // When bootstrap_from_book is enabled AND coordinator not yet seeded,
+            // the profile seeds the CalibrationCoordinator with conservative L2-derived kappa.
+            if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
+                let bid_depth_50bps: f64 = bids.iter().map(|(_, sz)| sz).sum();
+                let ask_depth_50bps: f64 = asks.iter().map(|(_, sz)| sz).sum();
+                self.market_profile.on_l2_book(best_bid, best_ask, bid_depth_50bps, ask_depth_50bps);
+
+                // Seed coordinator once when profile is ready and bootstrap is enabled
+                if self.capital_policy.bootstrap_from_book
+                    && !self.calibration_coordinator.is_seeded()
+                    && self.market_profile.is_initialized()
+                {
+                    self.calibration_coordinator.initialize_from_profile(&self.market_profile);
+                    info!(
+                        profile_kappa = %format!("{:.0}", self.market_profile.conservative_kappa()),
+                        profile_sigma = %format!("{:.6}", self.market_profile.implied_sigma()),
+                        "CalibrationCoordinator seeded from L2 book profile"
+                    );
+                }
+            }
 
             // === Phase 3: Pre-Fill AS Classifier - Orderbook Imbalance Update ===
             // Feed bid/ask depth to pre-fill classifier for toxicity prediction

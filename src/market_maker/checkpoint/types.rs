@@ -478,6 +478,11 @@ pub struct KappaCheckpoint {
     /// Cached posterior mean κ̂ = α/β
     #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub kappa_posterior_mean: f64,
+    /// Cumulative observation count (never decremented by rolling window expiry).
+    /// Used by the calibration gate instead of `observation_count` which is
+    /// a rolling-window count that can drop below thresholds.
+    #[serde(default)]
+    pub total_observations: usize,
 }
 
 impl Default for KappaCheckpoint {
@@ -489,6 +494,7 @@ impl Default for KappaCheckpoint {
             sum_distances: 0.0,
             sum_sq_distances: 0.0,
             kappa_posterior_mean: 500.0,
+            total_observations: 0,
         }
     }
 }
@@ -682,6 +688,7 @@ mod tests {
                 sum_distances: 4.0,
                 sum_sq_distances: 0.08,
                 kappa_posterior_mean: 500.0,
+                total_observations: 200,
             },
             kappa_bid: KappaCheckpoint::default(),
             kappa_ask: KappaCheckpoint::default(),

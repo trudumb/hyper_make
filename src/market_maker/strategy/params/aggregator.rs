@@ -110,6 +110,10 @@ pub struct ParameterSources<'a> {
     pub cached_best_bid: f64,
     /// Cached best ask from L2 book (for bounding inventory skew offset).
     pub cached_best_ask: f64,
+
+    // === CalibrationCoordinator (Bootstrap from Book) ===
+    /// Reference to the CalibrationCoordinator for L2-derived kappa.
+    pub calibration_coordinator: &'a crate::market_maker::estimator::calibration_coordinator::CalibrationCoordinator,
 }
 
 /// Learned parameter values for use in quoting calculations.
@@ -734,6 +738,14 @@ impl ParameterAggregator {
             capacity_budget: None,
             // Capital-aware policy — set by quote_engine after CapacityBudget::compute()
             capital_policy: crate::market_maker::config::CapitalAwarePolicy::default(),
+            // CalibrationCoordinator — L2-derived kappa for warmup bootstrap
+            coordinator_kappa: if sources.calibration_coordinator.is_seeded() {
+                sources.calibration_coordinator.effective_kappa()
+            } else {
+                0.0
+            },
+            coordinator_uncertainty_premium_bps: sources.calibration_coordinator.uncertainty_premium_bps(),
+            use_coordinator_kappa: sources.calibration_coordinator.is_seeded(),
         }
     }
 }
