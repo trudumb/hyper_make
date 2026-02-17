@@ -308,6 +308,12 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Heuristic for level-by-level quote filtering based on expected edge.
     /// Used by ExecutionMode selection and per-level filtering in quote_engine.rs.
     queue_value_heuristic: models::QueueValueHeuristic,
+
+    // === Price Grid (Phase 2b: Churn Reduction) ===
+    /// Configuration for price grid quantization.
+    /// Snaps ladder prices to grid points to prevent sub-tick oscillations
+    /// from triggering cancel+replace cycles.
+    price_grid_config: quoting::PriceGridConfig,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -494,6 +500,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Phase 5: Quote outcome tracking for unbiased edge estimation
             quote_outcome_tracker: learning::quote_outcome::QuoteOutcomeTracker::new(),
             queue_value_heuristic: models::QueueValueHeuristic::new(),
+            price_grid_config: quoting::PriceGridConfig::default(),
         }
     }
 

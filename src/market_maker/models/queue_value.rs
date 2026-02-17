@@ -82,13 +82,18 @@ impl QueueValueHeuristic {
     }
 
     /// Returns true if quoting at this depth has positive expected value.
+    ///
+    /// During warmup (< 10 observations), uses a lenient threshold of -1.0 bps
+    /// to avoid filtering orders before the heuristic has calibrated. This prevents
+    /// the "no fills → no calibration → no fills" death spiral.
     pub fn should_quote(
         &self,
         depth_bps: f64,
         toxicity: ToxicityRegime,
         queue_rank: f64,
     ) -> bool {
-        self.queue_value(depth_bps, toxicity, queue_rank) > 0.0
+        let threshold = if self.outcome_count < 10 { -1.0 } else { 0.0 };
+        self.queue_value(depth_bps, toxicity, queue_rank) > threshold
     }
 
     /// Observe a fill outcome for online learning.
@@ -121,7 +126,8 @@ impl QueueValueHeuristic {
             ToxicityRegime::Normal => AS_COST_NORMAL_BPS,
             ToxicityRegime::Toxic => AS_COST_TOXIC_BPS,
         };
-        expected_as + MAKER_FEE_BPS + self.prediction_bias_bps + 0.5
+        let warmup_buffer = if self.outcome_count < 10 { 1.0 } else { 0.0 };
+        expected_as + MAKER_FEE_BPS + self.prediction_bias_bps + 0.5 - warmup_buffer
     }
 
     /// Create a QueueValueHeuristic calibrated for the given capital tier.
@@ -213,16 +219,28 @@ mod tests {
     fn test_minimum_viable_depth_normal() {
         let heuristic = QueueValueHeuristic::new();
         let depth = heuristic.minimum_viable_depth(ToxicityRegime::Normal);
-        // 3.0 (AS) + 1.5 (fee) + 0.0 (bias) + 0.5 (safety) = 5.0
-        assert!((depth - 5.0).abs() < 1e-10, "depth={}", depth);
+        // During warmup (0 observations): 3.0 (AS) + 1.5 (fee) + 0.0 (bias) + 0.5 (safety) - 1.0 (warmup buffer) = 4.0
+        assert!((depth - 4.0).abs() < 1e-10, "depth={}", depth);
+    }
+
+    #[test]
+    fn test_minimum_viable_depth_normal_calibrated() {
+        let mut heuristic = QueueValueHeuristic::new();
+        // Simulate 10+ observations to exit warmup
+        for _ in 0..10 {
+            heuristic.observe_outcome(5.0, 5.0); // zero-bias observations
+        }
+        let depth = heuristic.minimum_viable_depth(ToxicityRegime::Normal);
+        // Post-warmup: 3.0 (AS) + 1.5 (fee) + ~0.0 (bias) + 0.5 (safety) = 5.0
+        assert!((depth - 5.0).abs() < 0.1, "depth={}", depth);
     }
 
     #[test]
     fn test_minimum_viable_depth_toxic() {
         let heuristic = QueueValueHeuristic::new();
         let depth = heuristic.minimum_viable_depth(ToxicityRegime::Toxic);
-        // 8.0 (AS) + 1.5 (fee) + 0.0 (bias) + 0.5 (safety) = 10.0
-        assert!((depth - 10.0).abs() < 1e-10, "depth={}", depth);
+        // During warmup: 8.0 (AS) + 1.5 (fee) + 0.0 (bias) + 0.5 (safety) - 1.0 (warmup buffer) = 9.0
+        assert!((depth - 9.0).abs() < 1e-10, "depth={}", depth);
     }
 
     #[test]

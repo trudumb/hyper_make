@@ -2378,7 +2378,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // Critical staleness: pull quotes entirely (book >30s or limits >5min)
-            if book_age_ms > 30_000 || exchange_limits_age_ms > 300_000 {
+            // In paper mode, exchange limits are synthetically initialized and never update
+            // via websocket, so skip the limits staleness check to avoid pulling all quotes.
+            let limits_stale = exchange_limits_age_ms > 300_000 && self.environment.is_live();
+            if book_age_ms > 30_000 || limits_stale {
                 warn!(
                     book_age_ms = book_age_ms,
                     exchange_limits_age_ms = exchange_limits_age_ms,
@@ -2390,13 +2393,34 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
-        let ladder = self.strategy.calculate_ladder(
+        let mut ladder = self.strategy.calculate_ladder(
             &quote_config,
             self.position.position(),
             self.effective_max_position, // First-principles limit
             kelly_adjusted_liquidity, // Decision + Kelly-adjusted viable size
             &market_params,
         );
+
+        // Snap ladder prices to grid to prevent sub-tick oscillations from
+        // triggering cancel+replace cycles (Phase 2b: Churn Reduction).
+        if self.price_grid_config.enabled && self.latest_mid > 0.0 {
+            let tick_price = self.latest_mid * market_params.tick_size_bps / 10_000.0;
+            // 1-minute sigma in bps: sigma (per-sec fraction) × 10_000 × √60
+            let sigma_bps_1m = market_params.sigma_effective * 10_000.0 * 60.0_f64.sqrt();
+            let grid = quoting::PriceGrid::for_current_state(
+                self.latest_mid,
+                tick_price,
+                sigma_bps_1m,
+                &self.price_grid_config,
+                market_params.rate_limit_headroom_pct,
+            );
+            for level in ladder.bids.iter_mut() {
+                level.price = grid.snap(level.price);
+            }
+            for level in ladder.asks.iter_mut() {
+                level.price = grid.snap(level.price);
+            }
+        }
 
         // Post-condition: if capacity said viable but ladder is empty, something is wrong
         if capacity_budget.should_quote() && ladder.is_empty() {

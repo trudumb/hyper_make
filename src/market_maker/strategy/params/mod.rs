@@ -34,6 +34,7 @@ mod kelly;
 mod liquidity;
 mod margin;
 mod regime;
+pub mod smoothing;
 mod stochastic_constraints;
 mod volatility;
 
@@ -51,5 +52,6 @@ pub use kelly::*;
 pub use liquidity::*;
 pub use margin::*;
 pub use regime::*;
+pub use smoothing::*;
 pub use stochastic_constraints::*;
 pub use volatility::*;

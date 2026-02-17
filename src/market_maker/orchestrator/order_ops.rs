@@ -337,8 +337,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             ));
 
             // === Tier 1: Register with queue tracker ===
-            // Estimate depth ahead conservatively (2x our target liquidity)
-            let depth_ahead = self.config.target_liquidity * 2.0;
+            // Use L2-derived depth estimate when available, fall back to conservative heuristic.
+            let depth_ahead = self.tier1.queue_tracker.estimate_depth_at_price(quote.price, is_buy);
             self.tier1.queue_tracker.order_placed(
                 result.oid,
                 quote.price,

@@ -1373,12 +1373,12 @@ impl SignalIntegrator {
 
     /// Returns spread widening multiplier based on signal availability.
     ///
-    /// `NeverConfigured` widens spreads 1.5x to compensate for missing signal
+    /// `NeverConfigured` widens spreads 1.2x to compensate for missing signal
     /// (instead of reducing position limits which kills small accounts).
-    /// `Degraded` graduates from 1.0 to 1.5 over `max_reduction_after_secs`.
+    /// `Degraded` graduates from 1.0 to 1.2 over `max_reduction_after_secs`.
     pub fn signal_spread_widening_mult(&self) -> f64 {
         match self.signal_availability.get() {
-            SignalAvailability::NeverConfigured => 1.5,
+            SignalAvailability::NeverConfigured => 1.2,
             SignalAvailability::Available => 1.0,
             SignalAvailability::Degraded {
                 last_healthy_secs_ago,
@@ -1386,7 +1386,7 @@ impl SignalIntegrator {
             } => {
                 let progress =
                     (last_healthy_secs_ago / max_reduction_after_secs).clamp(0.0, 1.0);
-                1.0 + 0.5 * progress
+                1.0 + 0.2 * progress
             }
         }
     }
@@ -2207,7 +2207,7 @@ mod tests {
 
     #[test]
     fn test_never_configured_widens_spreads() {
-        // NeverConfigured returns spread_widening_mult=1.5
+        // NeverConfigured returns spread_widening_mult=1.2
         let config = SignalIntegratorConfig::disabled();
         let integrator = SignalIntegrator::new(config);
 
@@ -2215,7 +2215,7 @@ mod tests {
             integrator.signal_availability(),
             SignalAvailability::NeverConfigured
         );
-        assert!((integrator.signal_spread_widening_mult() - 1.5).abs() < f64::EPSILON);
+        assert!((integrator.signal_spread_widening_mult() - 1.2).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2265,22 +2265,22 @@ mod tests {
             });
         assert!((integrator.signal_spread_widening_mult() - 1.0).abs() < f64::EPSILON);
 
-        // At 150 seconds (halfway) → mult = 1.25
+        // At 150 seconds (halfway) → mult = 1.1
         integrator
             .signal_availability
             .set(SignalAvailability::Degraded {
                 last_healthy_secs_ago: 150.0,
                 max_reduction_after_secs: 300.0,
             });
-        assert!((integrator.signal_spread_widening_mult() - 1.25).abs() < f64::EPSILON);
+        assert!((integrator.signal_spread_widening_mult() - 1.1).abs() < f64::EPSILON);
 
-        // At 300+ seconds (fully degraded) → mult = 1.5
+        // At 300+ seconds (fully degraded) → mult = 1.2
         integrator
             .signal_availability
             .set(SignalAvailability::Degraded {
                 last_healthy_secs_ago: 500.0,
                 max_reduction_after_secs: 300.0,
             });
-        assert!((integrator.signal_spread_widening_mult() - 1.5).abs() < f64::EPSILON);
+        assert!((integrator.signal_spread_widening_mult() - 1.2).abs() < f64::EPSILON);
     }
 }

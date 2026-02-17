@@ -509,14 +509,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         );
                     }
 
-                    // Initialize queue tracking for this order
-                    // depth_ahead is 0.0 initially; will be updated on L2 book updates
+                    // Initialize queue tracking with L2-derived depth estimate.
+                    // Depth = total size ahead of us at our price level from the cached L2 book.
+                    let is_buy = side == Side::Buy;
+                    let depth_ahead = self.tier1.queue_tracker.estimate_depth_at_price(spec.price, is_buy);
                     self.tier1.queue_tracker.order_placed(
                         result.oid,
                         spec.price,
                         result.resting_size,
-                        0.0, // depth_ahead estimated; will be refined by L2 updates
-                        side == Side::Buy,
+                        depth_ahead,
+                        is_buy,
                     );
                 }
             }
@@ -1242,17 +1244,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Use actual gamma/kappa from cached market params when available.
         // Falls back to conservative defaults during early warmup before first quote cycle.
+        // IMPORTANT: gamma must include regime_gamma_multiplier to match ladder strategy.
+        // Without it, the reconciler uses base gamma (e.g. 0.3) while the ladder uses
+        // regime-adjusted gamma (e.g. 0.22), causing tolerance mismatches.
         let (gamma, kappa) = self
             .cached_market_params
             .as_ref()
             .map(|mp| {
                 // Prefer adaptive (learned) values, fall back to base estimator values
-                let g = if mp.adaptive_gamma > 0.0 {
+                let g_base = if mp.adaptive_gamma > 0.0 {
                     mp.adaptive_gamma
                 } else {
                     mp.calibration_gamma_mult.max(0.01)
                 };
-                let k = if mp.adaptive_kappa > 0.0 {
+                // Apply regime multiplier to match ladder strategy's gamma
+                let g = g_base * mp.regime_gamma_multiplier;
+                let k = if mp.use_kappa_robust && mp.kappa_robust > 0.0 {
+                    mp.kappa_robust
+                } else if mp.adaptive_kappa > 0.0 {
                     mp.adaptive_kappa
                 } else if mp.regime_kappa.unwrap_or(0.0) > 0.0 {
                     mp.regime_kappa.unwrap_or(0.0)
@@ -1298,6 +1307,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             "[Reconcile] Priority-based matching with dynamic thresholds"
         );
 
+        // Build price grid for churn reduction (only when enabled)
+        let price_grid = if self.price_grid_config.enabled && self.latest_mid > 0.0 {
+            let tick_price = self.latest_mid * tick_bps / 10_000.0;
+            // sigma is per-second fraction; convert to 1-minute bps
+            let sigma_bps_1m = sigma * 10_000.0 * 60.0_f64.sqrt();
+            Some(crate::market_maker::quoting::PriceGrid::for_current_state(
+                self.latest_mid,
+                tick_price,
+                sigma_bps_1m,
+                &self.price_grid_config,
+                headroom_pct,
+            ))
+        } else {
+            None
+        };
+
         let bid_acts = priority_based_matching(
             &current_bids,
             &bid_levels,
@@ -1305,6 +1330,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             &dynamic_config,
             Some(&self.tier1.queue_tracker),
             self.config.sz_decimals,
+            price_grid.as_ref(),
         );
 
         let ask_acts = priority_based_matching(
@@ -1314,6 +1340,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             &dynamic_config,
             Some(&self.tier1.queue_tracker),
             self.config.sz_decimals,
+            price_grid.as_ref(),
         );
 
         let (mut bid_actions, bid_stats, mut ask_actions, ask_stats): (
@@ -1361,15 +1388,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         );
                         // Add cancel action for this skipped order
                         bid_actions.push(LadderAction::Cancel { oid: order.oid });
-                        // Find matching target level to place
-                        for level in &bid_levels {
-                            if (level.price - order.price).abs() < crate::EPSILON * order.price {
+                        // Find closest target level to place (using bps tolerance, not EPSILON)
+                        // The target price may differ from the current order price by several bps
+                        // after ladder recalculation, so EPSILON matching is too tight.
+                        if let Some(closest) = bid_levels
+                            .iter()
+                            .min_by_key(|l| crate::bps_diff(l.price, order.price))
+                        {
+                            if crate::bps_diff(closest.price, order.price) as f64
+                                <= dynamic_config.best_level_tolerance_bps
+                            {
                                 bid_actions.push(LadderAction::Place {
                                     side: Side::Buy,
-                                    price: level.price,
-                                    size: level.size,
+                                    price: closest.price,
+                                    size: closest.size,
                                 });
-                                break;
                             }
                         }
                     }
@@ -1390,14 +1423,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         "Queue-aware refresh: forcing ask order refresh due to low fill probability"
                     );
                     ask_actions.push(LadderAction::Cancel { oid: order.oid });
-                    for level in &ask_levels {
-                        if (level.price - order.price).abs() < crate::EPSILON * order.price {
+                    // Find closest target level to place (using bps tolerance)
+                    if let Some(closest) = ask_levels
+                        .iter()
+                        .min_by_key(|l| crate::bps_diff(l.price, order.price))
+                    {
+                        if crate::bps_diff(closest.price, order.price) as f64
+                            <= dynamic_config.best_level_tolerance_bps
+                        {
                             ask_actions.push(LadderAction::Place {
                                 side: Side::Sell,
-                                price: level.price,
-                                size: level.size,
+                                price: closest.price,
+                                size: closest.size,
                             });
-                            break;
                         }
                     }
                 }
@@ -2340,12 +2378,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 };
                 self.ws_state.add_order(tracked);
 
-                // Initialize queue tracking for this order
+                // Initialize queue tracking with L2-derived depth estimate.
+                let depth_ahead = self.tier1.queue_tracker.estimate_depth_at_price(spec.price, is_buy);
                 self.tier1.queue_tracker.order_placed(
                     result.oid,
                     spec.price,
                     result.resting_size,
-                    0.0, // depth_ahead will be refined by L2 updates
+                    depth_ahead,
                     is_buy,
                 );
             }

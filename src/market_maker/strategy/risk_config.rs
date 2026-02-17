@@ -446,7 +446,7 @@ impl RiskConfig {
     /// - Reduced warmup penalty
     ///
     /// GLFT math: With κ=1500 and γ=0.15, δ* ≈ 1/κ ≈ 6.7 bps per side
-    /// Total spread: 2 × 6.7 + 3 bps fees = ~16.4 bps (within 15-25 target)
+    /// Total spread: 2 × (6.7 + 1.5) = ~16.4 bps (includes 1.5 bps HL maker fee)
     pub fn hip3() -> Self {
         Self {
             gamma_base: 0.15,               // Aggressive (vs 0.3 default)
@@ -459,10 +459,10 @@ impl RiskConfig {
             toxicity_sensitivity: 0.2,      // Less sensitive
             inventory_threshold: 0.4,       // Higher inventory tolerance
             inventory_sensitivity: 1.5,     // Less aggressive scaling
-            min_spread_floor: 0.0006,       // 6 bps floor (vs 8 bps)
+            min_spread_floor: 0.00015,      // 1.5 bps floor (HL maker fee — physical minimum)
             max_holding_time: 300.0,        // 5 minutes (slower markets)
             flow_sensitivity: 0.3,          // Less flow adjustment
-            maker_fee_rate: 0.00015,        // Same fee
+            maker_fee_rate: 0.00015,        // 1.5 bps — standard HL maker fee (add: 0.00015)
             // DISABLE time-of-day scaling for HIP-3 (different patterns)
             enable_time_of_day_scaling: false,
             toxic_hour_gamma_multiplier: 1.0,

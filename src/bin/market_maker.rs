@@ -1497,7 +1497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     account_value,
                     available_margin: account_value,
                     max_leverage: leverage as f64,
-                    fee_bps: 1.5,
+                    fee_bps: 1.5, // Standard HL maker fee (add: 0.00015)
                     sz_decimals,
                     min_notional: 10.0,
                 };
@@ -1652,6 +1652,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg
     };
 
+    // Standard HL maker fee: 1.5 bps (add: 0.00015) — same for all profiles
+    let live_fee_bps = 1.5_f64;
+
     let mm_config = MmConfig {
         asset: Arc::from(asset.as_str()),
         target_liquidity,
@@ -1744,8 +1747,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         // Spread profile for target spread ranges
         spread_profile: SpreadProfile::from_str(&cli.spread_profile),
-        // Trading fee in basis points (maker fee)
-        fee_bps: 1.5,
+        // Trading fee in basis points (maker fee) — derived from spread profile
+        fee_bps: live_fee_bps,
     };
 
     // Extract EMA config before mm_config is moved
@@ -1821,6 +1824,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let mut ladder_cfg = config.strategy.ladder_config.clone().unwrap_or_default();
+
+            // Ensure ladder fee matches HL exchange fee (1.5 bps)
+            ladder_cfg.fees_bps = 1.5;
 
             // Max spread handling: CLI override takes precedence, otherwise use dynamic bounds
             // Dynamic bounds are computed at runtime from fill rate controller + market spread p80
@@ -2556,6 +2562,12 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     // Build MmConfig (same struct literal pattern as live, simplified)
     // Paper trader uses conservative defaults when config values are None
     let risk_aversion = cli.risk_aversion.or(config.trading.risk_aversion).unwrap_or(0.3);
+    let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
+
+    // Fee based on spread profile (same logic as live path)
+    // Standard HL maker fee: 1.5 bps (add: 0.00015) — same for all profiles
+    let fee_bps = 1.5_f64;
+
     let mm_config = MmConfig {
         asset: Arc::from(asset.as_str()),
         target_liquidity: cli.target_liquidity.or(config.trading.target_liquidity).unwrap_or(0.01),
@@ -2575,20 +2587,85 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         dex: dex.clone(),
         collateral,
         impulse_control: ImpulseControlConfig::default(),
-        spread_profile: SpreadProfile::from_str(&cli.spread_profile),
-        fee_bps: 1.5,
+        spread_profile,
+        fee_bps,
     };
 
-    // Create strategy (Ladder with sensible defaults)
+    // Create strategy — respect spread profile (same logic as live path)
+    let risk_cfg = match spread_profile {
+        SpreadProfile::Hip3 => {
+            info!(
+                spread_profile = "hip3",
+                gamma_base = 0.15,
+                fee_bps = %fee_bps,
+                "Paper: Using HIP-3 RiskConfig for tighter spreads"
+            );
+            RiskConfig::hip3()
+        }
+        SpreadProfile::Aggressive => {
+            info!(
+                spread_profile = "aggressive",
+                gamma_base = 0.10,
+                "Paper: Using Aggressive RiskConfig (experimental)"
+            );
+            RiskConfig {
+                gamma_base: 0.10,
+                gamma_min: 0.05,
+                gamma_max: 1.5,
+                min_spread_floor: 0.0004,
+                enable_time_of_day_scaling: false,
+                enable_book_depth_scaling: false,
+                max_warmup_gamma_mult: 1.02,
+                ..RiskConfig::hip3()
+            }
+        }
+        SpreadProfile::Default => {
+            config
+                .strategy
+                .risk_config
+                .clone()
+                .unwrap_or_else(|| RiskConfig {
+                    gamma_base: risk_aversion,
+                    ..Default::default()
+                })
+        }
+    };
+
+    let mut ladder_cfg = config.strategy.ladder_config.clone().unwrap_or_default();
+    // Ensure ladder fee matches HL exchange fee (1.5 bps)
+    ladder_cfg.fees_bps = 1.5;
+
+    let risk_model_cfg = match spread_profile {
+        SpreadProfile::Hip3 | SpreadProfile::Aggressive => RiskModelConfig::hip3(),
+        SpreadProfile::Default => RiskModelConfig {
+            use_calibrated_risk_model: true,
+            risk_model_blend: 1.0,
+            ..Default::default()
+        },
+    };
+
+    info!(
+        gamma_base = risk_cfg.gamma_base,
+        maker_fee_rate = risk_cfg.maker_fee_rate,
+        fee_bps = %fee_bps,
+        spread_profile = ?spread_profile,
+        "Paper: LadderStrategy config"
+    );
+
     let strategy: Box<dyn QuotingStrategy> = Box::new(
-        LadderStrategy::new(risk_aversion),
+        LadderStrategy::with_full_config(
+            risk_cfg,
+            ladder_cfg,
+            risk_model_cfg,
+            Default::default(), // KellySizer
+        ),
     );
 
     // Create metrics
     let metrics = Arc::new(MarketMakerMetrics::new());
 
-    // Module configs (all defaults for paper)
-    let estimator_config = EstimatorConfig::from_legacy(
+    // Module configs — apply spread-profile-aware kappa prior
+    let mut estimator_config = EstimatorConfig::from_legacy(
         config.strategy.estimation_window_secs * 1000,
         config.strategy.min_trades,
         config.strategy.default_sigma,
@@ -2597,6 +2674,26 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         config.strategy.warmup_decay_secs,
         config.strategy.min_warmup_trades,
     );
+
+    // Kappa prior based on spread profile (same as live path)
+    match spread_profile {
+        SpreadProfile::Hip3 => {
+            estimator_config.kappa_prior_mean = 1500.0;
+            info!(
+                spread_profile = "hip3",
+                kappa_prior = 1500.0,
+                "Paper: Using HIP-3 kappa prior"
+            );
+        }
+        SpreadProfile::Aggressive => {
+            estimator_config.kappa_prior_mean = 2000.0;
+        }
+        SpreadProfile::Default => {
+            if dex.is_some() {
+                estimator_config.kappa_prior_mean = 500.0;
+            }
+        }
+    }
 
     let mut market_maker = MarketMaker::new(
         mm_config,

@@ -481,6 +481,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     mid: self.latest_mid,
                     timestamp_ms,
                 });
+
+                // Decrement queue depth for orders at this trade's price level.
+                // A buy trade lifts asks, a sell trade hits bids.
+                self.tier1.queue_tracker.on_market_trade(trade_price, size, is_buy);
             }
 
             // === Phase 1: Microstructure Signals - VPIN Update ===
@@ -1255,6 +1259,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .adaptive_spreads
                     .on_l2_update(&bids, &asks, self.latest_mid);
             }
+
+            // Update queue position tracker with full L2 depth snapshot.
+            // This refines depth_ahead estimates using min(current, book) to
+            // preserve queue advancement from observed fills/cancellations.
+            self.tier1.queue_tracker.update_depth_from_book(&bids, &asks);
 
             // === Phase 3: Pre-Fill AS Classifier - Orderbook Imbalance Update ===
             // Feed bid/ask depth to pre-fill classifier for toxicity prediction

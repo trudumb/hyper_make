@@ -24,6 +24,13 @@ pub struct QueuePositionTracker {
 
     /// Current volatility (sigma per second) for P(touch) calculation
     sigma: f64,
+
+    /// Cached L2 bid levels (price, size) sorted best-to-worst for depth estimation.
+    /// Updated on each L2 book snapshot.
+    cached_l2_bids: Vec<(f64, f64)>,
+
+    /// Cached L2 ask levels (price, size) sorted best-to-worst for depth estimation.
+    cached_l2_asks: Vec<(f64, f64)>,
 }
 
 impl QueuePositionTracker {
@@ -37,6 +44,8 @@ impl QueuePositionTracker {
             best_bid: None,
             best_ask: None,
             sigma: 0.0001, // Default sigma
+            cached_l2_bids: Vec::new(),
+            cached_l2_asks: Vec::new(),
         }
     }
 
@@ -126,6 +135,104 @@ impl QueuePositionTracker {
 
             position.last_update = now;
         }
+    }
+
+    /// Update depth estimates from full L2 book snapshot.
+    ///
+    /// For each tracked order, recalculates depth from the current L2 state.
+    /// Uses `min(current_depth, book_depth)` to preserve queue decay —
+    /// the book can only tell us an upper bound on our queue position, since
+    /// we may have advanced through fills and cancellations ahead of us.
+    ///
+    /// Also caches the L2 levels for use in `estimate_depth_at_price`.
+    pub fn update_depth_from_book(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
+        // Cache the L2 levels for depth-at-placement estimation
+        self.cached_l2_bids.clear();
+        self.cached_l2_bids.extend_from_slice(bids);
+        self.cached_l2_asks.clear();
+        self.cached_l2_asks.extend_from_slice(asks);
+
+        if self.positions.is_empty() {
+            return;
+        }
+
+        let min_depth = self.config.min_queue_position;
+
+        for position in self.positions.values_mut() {
+            let book_depth = if position.is_bid {
+                // For bids: depth = sum of sizes at prices >= our price (ahead in queue)
+                Self::compute_depth_from_levels(bids, position.price, true)
+            } else {
+                // For asks: depth = sum of sizes at prices <= our price (ahead in queue)
+                Self::compute_depth_from_levels(asks, position.price, false)
+            };
+
+            // Use min(current, book) to preserve queue advancement from decay/trades.
+            // The book gives us an upper bound; our tracked depth may be lower
+            // because we've observed fills and cancellations draining the queue.
+            position.depth_ahead = position.depth_ahead.min(book_depth).max(min_depth);
+        }
+    }
+
+    /// Update queue positions when a market trade executes.
+    ///
+    /// Decrements `depth_ahead` for orders at the same price on the same side.
+    /// This is a convenience wrapper over `trades_at_level`.
+    pub fn on_market_trade(&mut self, price: f64, size: f64, is_buy: bool) {
+        // A buy trade lifts asks (ask-side orders get filled).
+        // A sell trade hits bids (bid-side orders get filled).
+        // So the *opposite* side's queue drains.
+        let is_bid_side = !is_buy;
+        self.trades_at_level(price, size, is_bid_side);
+    }
+
+    /// Estimate the depth ahead of a hypothetical order at `price`.
+    ///
+    /// Uses the cached L2 book levels from the most recent `update_depth_from_book` call.
+    /// Returns the configured `default_queue_position` if no L2 data is cached.
+    pub fn estimate_depth_at_price(&self, price: f64, is_bid: bool) -> f64 {
+        let levels = if is_bid {
+            &self.cached_l2_bids
+        } else {
+            &self.cached_l2_asks
+        };
+
+        if levels.is_empty() {
+            return self.config.default_queue_position;
+        }
+
+        Self::compute_depth_from_levels(levels, price, is_bid)
+            .max(self.config.min_queue_position)
+    }
+
+    /// Compute depth ahead from L2 levels for a given price and side.
+    ///
+    /// For bids: sums sizes at prices strictly greater than `price` (those are ahead in queue).
+    /// For asks: sums sizes at prices strictly less than `price` (those are ahead in queue).
+    /// Orders at the *same* price are partially ahead (we assume we're at the back of our level).
+    fn compute_depth_from_levels(levels: &[(f64, f64)], price: f64, is_bid: bool) -> f64 {
+        let mut depth = 0.0;
+        for &(level_price, level_size) in levels {
+            if is_bid {
+                // Bids sorted high-to-low. Prices > ours are better bids (ahead of us).
+                // At our price, that size is also ahead (we join at the back).
+                if level_price > price + 1e-10 {
+                    depth += level_size;
+                } else if (level_price - price).abs() < 1e-10 {
+                    // At our price level: all existing size is ahead of us
+                    depth += level_size;
+                }
+            } else {
+                // Asks sorted low-to-high. Prices < ours are better asks (ahead of us).
+                // At our price, that size is also ahead.
+                if level_price < price - 1e-10 {
+                    depth += level_size;
+                } else if (level_price - price).abs() < 1e-10 {
+                    depth += level_size;
+                }
+            }
+        }
+        depth
     }
 
     /// Update queue positions when trades execute at a price level.

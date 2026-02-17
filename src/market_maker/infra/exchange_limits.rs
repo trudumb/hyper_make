@@ -71,6 +71,8 @@ struct ExchangeLimitsInner {
     last_refresh_epoch_ms: AtomicU64,
     /// Local max position used in last computation
     local_max_position: AtomicF64,
+    /// Paper trading mode: limits never go stale (no websocket refresh)
+    paper_mode: std::sync::atomic::AtomicBool,
 }
 
 impl ExchangePositionLimits {
@@ -88,6 +90,7 @@ impl ExchangePositionLimits {
                 effective_ask_limit: AtomicF64::new(0.0),
                 last_refresh_epoch_ms: AtomicU64::new(0),
                 local_max_position: AtomicF64::new(0.0),
+                paper_mode: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -104,6 +107,9 @@ impl ExchangePositionLimits {
         self.inner.effective_bid_limit.store(max_position);
         self.inner.effective_ask_limit.store(max_position);
         self.inner.local_max_position.store(max_position);
+        self.inner
+            .paper_mode
+            .store(true, Ordering::Relaxed);
         self.inner
             .last_refresh_epoch_ms
             .store(now_epoch_ms(), Ordering::Relaxed);
@@ -344,7 +350,13 @@ impl ExchangePositionLimits {
     // =========================================================================
 
     /// Time since last refresh in milliseconds.
+    ///
+    /// In paper mode, always returns 0 (never stale) because limits are
+    /// synthetically initialized and never refreshed via websocket.
     pub fn age_ms(&self) -> u64 {
+        if self.inner.paper_mode.load(Ordering::Relaxed) {
+            return 0; // Paper mode: limits never go stale
+        }
         let last = self.inner.last_refresh_epoch_ms.load(Ordering::Relaxed);
         if last == 0 {
             return u64::MAX; // Never initialized

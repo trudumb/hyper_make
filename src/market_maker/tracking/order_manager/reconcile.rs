@@ -10,7 +10,7 @@ use crate::{bps_diff, EPSILON};
 
 use super::impulse_filter::{ImpulseDecision, ImpulseFilter};
 use super::types::{LadderAction, Side, TrackedOrder};
-use crate::market_maker::quoting::LadderLevel;
+use crate::market_maker::quoting::{LadderLevel, PriceGrid};
 use crate::market_maker::tracking::queue::{
     QueueKeepReason, QueuePositionTracker, QueueValueComparator, QueueValueConfig,
     QueueValueDecision, QueueValueStats,
@@ -656,6 +656,7 @@ pub fn priority_based_matching(
     config: &DynamicReconcileConfig,
     queue_tracker: Option<&QueuePositionTracker>,
     sz_decimals: u32,
+    grid: Option<&PriceGrid>,
 ) -> Vec<LadderAction> {
     use tracing::debug;
 
@@ -691,6 +692,30 @@ pub fn priority_based_matching(
             // Order found within tolerance - check if we should preserve it
             matched_orders.insert(order.oid);
             matched_targets.insert(priority);
+
+            // === Grid Fast Path (Phase 2b: Churn Reduction) ===
+            // If prices resolve to the same grid point AND size is close, keep the
+            // resting order without any API calls. This prevents sub-tick oscillations
+            // from consuming quota.
+            if let Some(g) = grid {
+                if g.same_point(order.price, target.price) {
+                    let size_diff_pct = if order.remaining() > 0.0 {
+                        (target.size - order.remaining()).abs() / order.remaining()
+                    } else {
+                        1.0
+                    };
+                    if size_diff_pct <= 0.15 {
+                        debug!(
+                            oid = order.oid,
+                            price = order.price,
+                            target_price = target.price,
+                            size_diff_pct = %format!("{:.1}%", size_diff_pct * 100.0),
+                            "Grid snap: same point, preserving order"
+                        );
+                        continue; // Keep — zero API calls
+                    }
+                }
+            }
 
             // === HJB Queue Value Check (Phase 2: Churn Reduction) ===
             // Use HJB queue value formula if enabled and tracker available.

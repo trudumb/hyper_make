@@ -217,4 +217,203 @@ mod tests {
         // Refreshing with smaller queue should have higher value
         assert!(refresh > keep);
     }
+
+    // === Tests for L2 depth estimation (Phase 1: Queue Observability) ===
+
+    #[test]
+    fn test_update_depth_from_book_caps_at_book_depth() {
+        let mut tracker = make_tracker();
+
+        // Place a bid with large initial depth
+        tracker.order_placed(1, 99.5, 1.0, 100.0, true);
+
+        // Book shows only 8.0 units ahead at our price
+        let bids = vec![(100.0, 5.0), (99.5, 3.0)];
+        let asks = vec![(100.5, 4.0)];
+        tracker.update_depth_from_book(&bids, &asks);
+
+        let pos = tracker.get_position(1).unwrap();
+        // depth should be min(100.0, book_depth) = book_depth
+        // book_depth at 99.5 bid = 5.0 (at 100.0, ahead) + 3.0 (at 99.5, same level) = 8.0
+        assert!(
+            (pos.depth_ahead - 8.0).abs() < 0.01,
+            "depth should be capped at book depth 8.0, got {}",
+            pos.depth_ahead
+        );
+    }
+
+    #[test]
+    fn test_update_depth_from_book_preserves_lower_depth() {
+        let mut tracker = make_tracker();
+
+        // Place bid with small depth (already advanced through fills)
+        tracker.order_placed(1, 99.5, 1.0, 2.0, true);
+
+        // Book shows 8.0 units ahead, but we've already advanced past some
+        let bids = vec![(100.0, 5.0), (99.5, 3.0)];
+        let asks = vec![(100.5, 4.0)];
+        tracker.update_depth_from_book(&bids, &asks);
+
+        let pos = tracker.get_position(1).unwrap();
+        // depth should be min(2.0, 8.0) = 2.0 (preserve queue advancement)
+        assert!(
+            (pos.depth_ahead - 2.0).abs() < 0.01,
+            "depth should preserve lower tracked value 2.0, got {}",
+            pos.depth_ahead
+        );
+    }
+
+    #[test]
+    fn test_update_depth_from_book_ask_side() {
+        let mut tracker = make_tracker();
+
+        // Place an ask at 100.5 with large initial depth
+        tracker.order_placed(1, 100.5, 1.0, 50.0, false);
+
+        // Book shows 4.0 ahead at ask side
+        let bids = vec![(100.0, 5.0)];
+        let asks = vec![(100.0, 2.0), (100.5, 2.0)];
+        tracker.update_depth_from_book(&bids, &asks);
+
+        let pos = tracker.get_position(1).unwrap();
+        // For asks: prices < 100.5 are ahead (2.0 at 100.0) + same level (2.0 at 100.5) = 4.0
+        assert!(
+            (pos.depth_ahead - 4.0).abs() < 0.01,
+            "ask depth should be 4.0, got {}",
+            pos.depth_ahead
+        );
+    }
+
+    #[test]
+    fn test_on_market_trade_decrements_depth() {
+        let mut tracker = make_tracker();
+
+        // Place a bid at 100.0
+        tracker.order_placed(1, 100.0, 1.0, 10.0, true);
+        // Place an ask at 101.0
+        tracker.order_placed(2, 101.0, 1.0, 8.0, false);
+
+        // A sell trade at 100.0 hits bids — bid-side queue drains
+        tracker.on_market_trade(100.0, 3.0, false);
+
+        let bid_pos = tracker.get_position(1).unwrap();
+        assert!(
+            (bid_pos.depth_ahead - 7.0).abs() < 0.01,
+            "bid depth should decrease by 3.0 to 7.0, got {}",
+            bid_pos.depth_ahead
+        );
+
+        // Ask should be unaffected
+        let ask_pos = tracker.get_position(2).unwrap();
+        assert!(
+            (ask_pos.depth_ahead - 8.0).abs() < 0.01,
+            "ask depth should be unchanged at 8.0, got {}",
+            ask_pos.depth_ahead
+        );
+    }
+
+    #[test]
+    fn test_on_market_trade_buy_decrements_asks() {
+        let mut tracker = make_tracker();
+
+        // Place an ask at 101.0
+        tracker.order_placed(1, 101.0, 1.0, 10.0, false);
+
+        // A buy trade at 101.0 lifts asks — ask-side queue drains
+        tracker.on_market_trade(101.0, 4.0, true);
+
+        let pos = tracker.get_position(1).unwrap();
+        assert!(
+            (pos.depth_ahead - 6.0).abs() < 0.01,
+            "ask depth should decrease by 4.0 to 6.0, got {}",
+            pos.depth_ahead
+        );
+    }
+
+    #[test]
+    fn test_depth_never_negative() {
+        let mut tracker = make_tracker();
+
+        tracker.order_placed(1, 100.0, 1.0, 2.0, true);
+
+        // A sell at 100.0 hits bids — trade volume far exceeds depth ahead
+        tracker.on_market_trade(100.0, 100.0, false);
+
+        let pos = tracker.get_position(1).unwrap();
+        assert!(
+            pos.depth_ahead >= 0.0,
+            "depth should never be negative, got {}",
+            pos.depth_ahead
+        );
+        // Should be clamped at min_queue_position (0.01)
+        assert!(
+            (pos.depth_ahead - 0.01).abs() < 0.001,
+            "depth should be clamped at min_queue_position 0.01, got {}",
+            pos.depth_ahead
+        );
+    }
+
+    #[test]
+    fn test_estimate_depth_at_price_with_empty_book() {
+        let tracker = make_tracker();
+
+        // No L2 data cached — should return default
+        let depth = tracker.estimate_depth_at_price(100.0, true);
+        assert!(
+            (depth - 5.0).abs() < 0.01,
+            "should return default_queue_position (5.0) with no book, got {}",
+            depth
+        );
+    }
+
+    #[test]
+    fn test_estimate_depth_at_price_bid() {
+        let mut tracker = make_tracker();
+
+        // Cache L2 levels
+        let bids = vec![(100.0, 5.0), (99.5, 3.0), (99.0, 2.0)];
+        let asks = vec![(100.5, 4.0)];
+        tracker.update_depth_from_book(&bids, &asks);
+
+        // Depth at best bid (100.0): all size at 100.0 = 5.0 (we join at back)
+        let depth_best = tracker.estimate_depth_at_price(100.0, true);
+        assert!(
+            (depth_best - 5.0).abs() < 0.01,
+            "depth at best bid should be 5.0, got {}",
+            depth_best
+        );
+
+        // Depth at 99.5: size at 100.0 (5.0 ahead) + at 99.5 (3.0 same level) = 8.0
+        let depth_mid = tracker.estimate_depth_at_price(99.5, true);
+        assert!(
+            (depth_mid - 8.0).abs() < 0.01,
+            "depth at 99.5 bid should be 8.0, got {}",
+            depth_mid
+        );
+    }
+
+    #[test]
+    fn test_estimate_depth_at_price_ask() {
+        let mut tracker = make_tracker();
+
+        let bids = vec![(100.0, 5.0)];
+        let asks = vec![(100.5, 4.0), (101.0, 3.0), (101.5, 2.0)];
+        tracker.update_depth_from_book(&bids, &asks);
+
+        // Depth at best ask (100.5): all size at 100.5 = 4.0
+        let depth_best = tracker.estimate_depth_at_price(100.5, false);
+        assert!(
+            (depth_best - 4.0).abs() < 0.01,
+            "depth at best ask should be 4.0, got {}",
+            depth_best
+        );
+
+        // Depth at 101.0: size at 100.5 (4.0 ahead) + at 101.0 (3.0 same level) = 7.0
+        let depth_away = tracker.estimate_depth_at_price(101.0, false);
+        assert!(
+            (depth_away - 7.0).abs() < 0.01,
+            "depth at 101.0 ask should be 7.0, got {}",
+            depth_away
+        );
+    }
 }
