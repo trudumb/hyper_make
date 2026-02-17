@@ -59,15 +59,6 @@ impl CalibrationPhase {
         }
     }
 
-    /// Maximum uncertainty premium in bps.
-    fn max_uncertainty_premium_bps(self) -> f64 {
-        match self {
-            Self::Cold => 5.0,
-            Self::Warming => 3.0,
-            Self::Calibrated => 1.0,
-            Self::Confident => 0.0,
-        }
-    }
 }
 
 /// Fill count thresholds for phase transitions.
@@ -220,28 +211,12 @@ impl CalibrationCoordinator {
 
     /// Uncertainty premium in bps that should be added to spreads.
     ///
-    /// Decays within each phase as progress toward next phase increases.
+    /// Smooth exponential decay from 5.0 bps at 0 fills toward 0.
+    /// tau=25 gives: fill 5 → 4.1, fill 30 → 1.5, fill 100 → 0.09.
+    /// Eliminates phase-boundary discontinuities while preserving overall shape.
     pub fn uncertainty_premium_bps(&self) -> f64 {
-        let max = self.phase.max_uncertainty_premium_bps();
-
-        // Progress within current phase [0, 1]
-        let progress = match self.phase {
-            CalibrationPhase::Cold => {
-                (self.fill_count as f64) / (WARMING_FILLS as f64)
-            }
-            CalibrationPhase::Warming => {
-                ((self.fill_count - WARMING_FILLS) as f64)
-                    / ((CALIBRATED_FILLS - WARMING_FILLS) as f64)
-            }
-            CalibrationPhase::Calibrated => {
-                ((self.fill_count - CALIBRATED_FILLS) as f64)
-                    / ((CONFIDENT_FILLS - CALIBRATED_FILLS) as f64)
-            }
-            CalibrationPhase::Confident => 1.0,
-        };
-
-        let progress = progress.clamp(0.0, 1.0);
-        max * (1.0 - progress * progress)
+        let fills = self.fill_count as f64;
+        5.0 * (-fills / 25.0).exp()
     }
 
     /// Current calibration phase.
@@ -465,7 +440,7 @@ mod tests {
         }
         let premium_confident = coord.uncertainty_premium_bps();
         assert!(
-            premium_confident < 0.01,
+            premium_confident < 0.1,
             "Confident premium should be ~0: {premium_confident:.2}"
         );
     }

@@ -770,6 +770,9 @@ mod tests {
         let mut config = default_config();
         config.latch_threshold_bps = 5.0;
         config.max_modify_price_bps = 50.0;
+        // Widen tolerance so the 10 bps price diff still matches (not treated as unmatched)
+        config.best_level_tolerance_bps = 15.0;
+        config.outer_level_tolerance_bps = 30.0;
         let qv = default_queue_value();
 
         // With full headroom

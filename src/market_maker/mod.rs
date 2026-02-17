@@ -337,6 +337,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Rolling-window tracker for cancel/fill ratios, latch effectiveness,
     /// and budget suppression diagnostics.
     churn_tracker: analytics::churn_tracker::ChurnTracker,
+
+    // === Reconcile Outcome Learning (Economic Reconciliation) ===
+    /// Tracks reconcile decisions and correlates with fill outcomes to learn
+    /// fill rates, edge, and calibration bias per action type.
+    reconcile_outcome_tracker: tracking::ReconcileOutcomeTracker,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -535,6 +540,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 ..SmootherConfig::default()
             }),
             churn_tracker: analytics::churn_tracker::ChurnTracker::new(60),
+            reconcile_outcome_tracker: tracking::ReconcileOutcomeTracker::new(),
         }
     }
 

@@ -57,6 +57,8 @@ use std::time::Instant;
 pub struct PendingFillOutcome {
     /// Fill timestamp in milliseconds since epoch
     pub timestamp_ms: u64,
+    /// Order ID that was filled (for reconcile outcome tracking).
+    pub oid: u64,
     /// Fill price
     pub fill_price: f64,
     /// Whether this was a buy fill (our bid was filled)
@@ -338,6 +340,7 @@ mod tests {
     fn test_pending_fill_outcome_creation() {
         let outcome = PendingFillOutcome {
             timestamp_ms: 1_700_000_000_000,
+            oid: 1001,
             fill_price: 50_000.0,
             is_buy: true,
             mid_at_fill: 50_005.0,
@@ -363,6 +366,7 @@ mod tests {
         for i in 0..3 {
             queue.push_back(PendingFillOutcome {
                 timestamp_ms: base_ms + i * 3_000,
+                oid: 2000 + i,
                 fill_price: 50_000.0,
                 is_buy: i % 2 == 0,
                 mid_at_fill: 50_000.0,

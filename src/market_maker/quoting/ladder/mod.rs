@@ -36,6 +36,8 @@ mod entropy_optimizer;
 mod fill_probability;
 mod generator;
 mod optimizer;
+pub mod risk_budget;
+pub mod tick_grid;
 
 pub use depth_generator::{DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator, DynamicDepths};
 pub use entropy_distribution::{

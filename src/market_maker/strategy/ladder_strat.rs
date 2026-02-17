@@ -11,6 +11,11 @@ use crate::market_maker::quoting::{
     EntropyConstrainedOptimizer, EntropyDistributionConfig, EntropyOptimizerConfig, Ladder,
     LadderConfig, LadderLevel, LadderParams, LevelOptimizationParams, MarketRegime,
 };
+use crate::market_maker::quoting::ladder::tick_grid::{
+    TickGridConfig, TickScoringParams, enumerate_bid_ticks, enumerate_ask_ticks,
+    score_ticks, select_optimal_ticks,
+};
+use crate::market_maker::quoting::ladder::risk_budget::{SideRiskBudget, allocate_risk_budget};
 
 use super::{
     CalibratedRiskModel, KellySizer, MarketParams, QuotingStrategy, RiskConfig, RiskFeatures,
@@ -26,6 +31,55 @@ use crate::market_maker::risk::PositionZone;
 /// Capping at 25% ensures at least 4 fills are needed to reach max inventory,
 /// giving the gamma/skew feedback loop time to widen spreads defensively.
 const MAX_SINGLE_ORDER_FRACTION: f64 = 0.25;
+
+/// Compute regime-dependent margin utilization fraction.
+///
+/// | Regime (gamma_mult) | Utilization |
+/// |---------------------|------------|
+/// | Calm (≤ 1.1)        | 85%        |
+/// | Normal (≤ 1.5)      | 75%        |
+/// | Volatile (≤ 2.0)    | 65%        |
+/// | Extreme (> 2.0)     | 50%        |
+///
+/// Further scaled by:
+/// - Kill switch headroom: linear reduction below 50% headroom
+/// - Warmup boost: +5% during early warmup (progress < 0.3) to attract fills
+pub fn dynamic_margin_utilization(
+    regime_gamma_mult: f64,
+    kill_switch_headroom: f64,
+    warmup_progress: f64,
+) -> f64 {
+    // Base utilization from regime
+    let base = if regime_gamma_mult <= 1.1 {
+        0.85
+    } else if regime_gamma_mult <= 1.5 {
+        // Linear interpolation: 1.1→0.85, 1.5→0.75
+        0.85 - (regime_gamma_mult - 1.1) / 0.4 * 0.10
+    } else if regime_gamma_mult <= 2.0 {
+        // Linear interpolation: 1.5→0.75, 2.0→0.65
+        0.75 - (regime_gamma_mult - 1.5) / 0.5 * 0.10
+    } else {
+        // Linear interpolation: 2.0→0.65, 3.0→0.50 (capped)
+        (0.65 - (regime_gamma_mult - 2.0) / 1.0 * 0.15).max(0.50)
+    };
+
+    // Kill switch headroom scaling: reduce utilization when headroom < 50%
+    let headroom_factor = if kill_switch_headroom >= 0.50 {
+        1.0
+    } else {
+        // Linear: 50%→1.0, 0%→0.5
+        0.5 + kill_switch_headroom
+    };
+
+    // Warmup boost: slightly higher utilization early to attract fills
+    let warmup_boost = if warmup_progress < 0.3 {
+        0.05
+    } else {
+        0.0
+    };
+
+    ((base + warmup_boost) * headroom_factor).clamp(0.30, 0.90)
+}
 
 /// GLFT Ladder Strategy - multi-level quoting with depth-dependent sizing.
 ///
@@ -1409,12 +1463,15 @@ impl LadderStrategy {
             let leverage = market_params.leverage.max(1.0);
             let available_margin = market_params.margin_available;
 
-            // === MARGIN RESERVE BUFFER ===
-            // Only use a fraction of available margin for quoting to maintain safety buffer.
-            // 70% total utilization = 35% per side when flat.
-            // GLFT model handles risk through gamma scaling; reduce-only at 80% provides safety buffer.
-            const MAX_MARGIN_UTILIZATION: f64 = 0.70; // Use 70% of available margin (GLFT gamma handles risk)
-            let usable_margin = available_margin * MAX_MARGIN_UTILIZATION;
+            // === DYNAMIC MARGIN UTILIZATION ===
+            // Regime-dependent: calm→85%, normal→75%, volatile→65%, extreme→50%.
+            // Further scaled by kill switch headroom and warmup boost.
+            let margin_utilization = dynamic_margin_utilization(
+                market_params.regime_gamma_multiplier,
+                market_params.kill_switch_headroom,
+                market_params.adaptive_warmup_progress,
+            );
+            let usable_margin = available_margin * margin_utilization;
 
             // === TWO-SIDED MARGIN ALLOCATION (STOCHASTIC-WEIGHTED) ===
             // Split usable margin using three components:
@@ -1538,7 +1595,7 @@ impl LadderStrategy {
             info!(
                 available_margin = %format!("{:.2}", available_margin),
                 usable_margin = %format!("{:.2}", usable_margin),
-                utilization_pct = %format!("{:.0}%", MAX_MARGIN_UTILIZATION * 100.0),
+                utilization_pct = %format!("{:.0}%", margin_utilization * 100.0),
                 inventory_ratio = %format!("{:.3}", inventory_ratio),
                 flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
                 position_opposes = %market_params.position_opposes_momentum,
@@ -1769,6 +1826,149 @@ impl LadderStrategy {
                     "Reducing ladder levels due to tight exchange limits"
                 );
             }
+
+            // === TICK-GRID PATH: Exchange-tick-aligned level placement ===
+            // When use_tick_grid is enabled, skip legacy bps-space depth generation
+            // and instead enumerate exchange-aligned ticks directly (unique prices by
+            // construction), score them by fill probability × edge, and allocate risk
+            // budget via greedy water-filling. This eliminates the price-collapse problem
+            // where continuous bps depths round to duplicate exchange prices.
+            let ladder = if market_params.capital_policy.use_tick_grid {
+                let tick_size = 10f64.powi(-(config.decimals as i32));
+
+                // GLFT touch depth in bps (used as minimum depth for tick grid)
+                let glft_touch_bps = self.depth_generator.glft_optimal_spread(gamma, kappa) * 10_000.0;
+                let touch_bps = glft_touch_bps.max(effective_floor_bps);
+
+                // Max depth from kappa cap or dynamic bounds
+                let max_depth_bps = market_params.kappa_spread_bps
+                    .unwrap_or(touch_bps * 4.0)
+                    .max(touch_bps * 2.0);
+
+                let policy = &market_params.capital_policy;
+
+                // Build tick grid config
+                let grid_config = TickGridConfig::compute(
+                    market_params.microprice,
+                    tick_size,
+                    touch_bps,
+                    max_depth_bps,
+                    policy.max_levels_per_side,
+                    config.sz_decimals,
+                    policy.min_tick_spacing_mult,
+                );
+
+                // Enumerate and score bid ticks
+                let mut bid_ticks = enumerate_bid_ticks(&grid_config);
+                let mut ask_ticks = enumerate_ask_ticks(&grid_config);
+
+                let scoring = TickScoringParams {
+                    sigma: market_params.sigma,
+                    tau: market_params.kelly_time_horizon,
+                    as_at_touch_bps,
+                    as_decay_bps: 10.0, // AS decays over ~10 bps depth
+                    fee_bps: self.risk_config.maker_fee_rate * 10_000.0,
+                };
+
+                // score_ticks mutates in place (sets utility field)
+                score_ticks(&mut bid_ticks, &scoring);
+                score_ticks(&mut ask_ticks, &scoring);
+
+                let selected_bids = select_optimal_ticks(&bid_ticks, policy.max_levels_per_side);
+                let selected_asks = select_optimal_ticks(&ask_ticks, policy.max_levels_per_side);
+
+                // Build risk budgets per side
+                let margin_per_contract = market_params.microprice / leverage.max(1.0);
+
+                let bid_budget = SideRiskBudget {
+                    position_capacity: available_for_bids,
+                    margin_capacity: margin_for_bids,
+                    margin_per_contract,
+                    min_viable_size: quantum.min_viable_size,
+                    max_single_order_fraction: policy.max_single_order_fraction,
+                    sz_decimals: config.sz_decimals,
+                };
+                let ask_budget = SideRiskBudget {
+                    position_capacity: available_for_asks,
+                    margin_capacity: margin_for_asks,
+                    margin_per_contract,
+                    min_viable_size: quantum.min_viable_size,
+                    max_single_order_fraction: policy.max_single_order_fraction,
+                    sz_decimals: config.sz_decimals,
+                };
+
+                // Allocate sizes via greedy water-filling
+                let bid_allocs = allocate_risk_budget(&selected_bids, &bid_budget);
+                let ask_allocs = allocate_risk_budget(&selected_asks, &ask_budget);
+
+                // Skip if Red zone cleared accumulating side
+                let bid_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+                    && position > 0.0;
+                let ask_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+                    && position < 0.0;
+
+                // Build ladder from tick-grid allocations
+                let bids: smallvec::SmallVec<_> = if bid_cleared_by_zone {
+                    smallvec::smallvec![]
+                } else {
+                    bid_allocs.iter().map(|a| {
+                        LadderLevel {
+                            price: round_to_significant_and_decimal(a.tick.price, 5, config.decimals),
+                            size: a.size,
+                            depth_bps: a.tick.depth_bps,
+                        }
+                    }).collect()
+                };
+
+                let asks: smallvec::SmallVec<_> = if ask_cleared_by_zone {
+                    smallvec::smallvec![]
+                } else {
+                    ask_allocs.iter().map(|a| {
+                        LadderLevel {
+                            price: round_to_significant_and_decimal(a.tick.price, 5, config.decimals),
+                            size: a.size,
+                            depth_bps: a.tick.depth_bps,
+                        }
+                    }).collect()
+                };
+
+                // Apply spread compensation multiplier for small capital
+                let mut ladder = Ladder { bids, asks };
+                if (policy.spread_compensation_mult - 1.0).abs() > 0.001 {
+                    // Widen depths by compensation factor (adjusts price offsets)
+                    for level in ladder.bids.iter_mut() {
+                        let new_depth = level.depth_bps * policy.spread_compensation_mult;
+                        let offset = market_params.microprice * (new_depth / 10_000.0);
+                        level.price = round_to_significant_and_decimal(
+                            market_params.microprice - offset, 5, config.decimals,
+                        );
+                        level.depth_bps = new_depth;
+                    }
+                    for level in ladder.asks.iter_mut() {
+                        let new_depth = level.depth_bps * policy.spread_compensation_mult;
+                        let offset = market_params.microprice * (new_depth / 10_000.0);
+                        level.price = round_to_significant_and_decimal(
+                            market_params.microprice + offset, 5, config.decimals,
+                        );
+                        level.depth_bps = new_depth;
+                    }
+                }
+
+                tracing::info!(
+                    tick_grid = true,
+                    tier = ?policy.tier,
+                    bid_levels = ladder.bids.len(),
+                    ask_levels = ladder.asks.len(),
+                    bid_total_size = %format!("{:.4}", ladder.bids.iter().map(|l| l.size).sum::<f64>()),
+                    ask_total_size = %format!("{:.4}", ladder.asks.iter().map(|l| l.size).sum::<f64>()),
+                    touch_bps = %format!("{:.2}", touch_bps),
+                    max_depth_bps = %format!("{:.2}", max_depth_bps),
+                    "Tick-grid ladder generated (exchange-aligned, unique prices by construction)"
+                );
+
+                ladder
+            } else {
+            // === LEGACY PATH: bps-space depth generation + entropy optimization ===
 
             // 4. Generate ladder to get depth levels and prices (using dynamic depths)
             // NOTE: Don't truncate here - let the entropy optimizer handle distribution
@@ -2275,6 +2475,9 @@ impl LadderStrategy {
                     "Ladder completely empty: available size below min_notional (no fallback possible)"
                 );
             }
+
+            ladder
+            }; // close else (legacy path)
 
             ladder
         }

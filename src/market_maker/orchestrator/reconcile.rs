@@ -577,6 +577,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// - Number of levels has changed
     /// - Any level's price has moved more than max_bps_diff
     /// - Any level's size has changed by more than 10%
+    ///
     /// Superseded by economic scoring in `reconcile_unified()`.
     #[allow(dead_code)]
     pub(crate) fn ladder_needs_update(&self, side: Side, new_quotes: &[Quote]) -> bool {
@@ -2782,6 +2783,60 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 grid_preserved: 0,
                 budget_suppressed: allocation.suppressed_count,
             });
+        }
+
+        // === RECORD OUTCOME DECISIONS ===
+        // Record non-latch decisions in the outcome tracker for fill rate learning.
+        {
+            use crate::market_maker::tracking::{
+                ActionType, ReconcileActionType, ReconcileDecision,
+            };
+
+            for update in &all_scored {
+                // Only track actions that actually interact with the exchange
+                // (modifies, cancel+places, new placements). Latches are no-ops.
+                let action_type = match update.action {
+                    ActionType::Latch => continue,
+                    ActionType::ModifySize => ReconcileActionType::ModifySize,
+                    ActionType::ModifyPrice => ReconcileActionType::ModifyPrice,
+                    ActionType::CancelPlace => ReconcileActionType::CancelPlace,
+                    ActionType::NewPlace => ReconcileActionType::NewPlace,
+                    ActionType::StaleCancel => ReconcileActionType::StaleCancel,
+                };
+
+                if let Some(oid) = update.oid {
+                    let price_drift_bps = if self.latest_mid > crate::EPSILON {
+                        (update.target_price - update.current_price).abs()
+                            / self.latest_mid
+                            * 10_000.0
+                    } else {
+                        0.0
+                    };
+
+                    self.reconcile_outcome_tracker.record_decision(
+                        ReconcileDecision {
+                            oid,
+                            action: action_type,
+                            predicted_p_fill: update.p_fill_new,
+                            predicted_queue_value_bps: update.value_bps,
+                            price_drift_bps,
+                            decided_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // === ADAPTIVE CYCLE TIMING ===
+        // Set dynamic fallback interval based on volatility, latch threshold, and headroom.
+        {
+            use super::event_accumulator::compute_next_cycle_time;
+            let next_interval = compute_next_cycle_time(
+                sigma,
+                dynamic_config.latch_threshold_bps,
+                headroom_pct,
+            );
+            self.event_accumulator.set_dynamic_fallback(next_interval);
         }
 
         Ok(())

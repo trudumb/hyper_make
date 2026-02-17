@@ -364,6 +364,18 @@ pub struct CapitalAwarePolicy {
     pub quota_min_headroom_for_full: f64,
     /// Whether to truncate levels by sqrt(headroom). Micro/Small: false.
     pub quota_density_scaling: bool,
+
+    // --- Tick-grid quoting (WS5) ---
+    /// Enable tick-grid-first level placement (vs legacy bps-space).
+    pub use_tick_grid: bool,
+    /// Minimum tick spacing as multiple of tick_bps. Micro: 3.0 (wider gaps), Large: 1.0.
+    pub min_tick_spacing_mult: f64,
+    /// Maximum fraction of position_capacity in a single order. Micro: 0.40, Large: 0.20.
+    pub max_single_order_fraction: f64,
+    /// Spread compensation multiplier for small capital (widens to compensate execution risk).
+    pub spread_compensation_mult: f64,
+    /// Use greedy water-filling allocation (vs uniform). Micro/Small: true.
+    pub use_greedy_allocation: bool,
 }
 
 impl CapitalAwarePolicy {
@@ -385,10 +397,15 @@ impl CapitalAwarePolicy {
                 warmup_floor_bps: 3.0,
                 quota_min_headroom_for_full: 0.05,
                 quota_density_scaling: false,
+                use_tick_grid: true,
+                min_tick_spacing_mult: 3.0,
+                max_single_order_fraction: 0.40,
+                spread_compensation_mult: 1.15,
+                use_greedy_allocation: true,
             },
             CapitalTier::Small => Self {
                 tier,
-                max_levels_per_side: 3,
+                max_levels_per_side: 4,
                 skip_entropy_optimization: true,
                 min_level_size_mult: 1.0,
                 use_batch_reconcile: true,
@@ -401,10 +418,15 @@ impl CapitalAwarePolicy {
                 warmup_floor_bps: 4.0,
                 quota_min_headroom_for_full: 0.10,
                 quota_density_scaling: false,
+                use_tick_grid: true,
+                min_tick_spacing_mult: 2.0,
+                max_single_order_fraction: 0.30,
+                spread_compensation_mult: 1.05,
+                use_greedy_allocation: true,
             },
             CapitalTier::Medium => Self {
                 tier,
-                max_levels_per_side: 5,
+                max_levels_per_side: 8,
                 skip_entropy_optimization: false,
                 min_level_size_mult: 1.5,
                 use_batch_reconcile: false,
@@ -417,10 +439,15 @@ impl CapitalAwarePolicy {
                 warmup_floor_bps: 6.0,
                 quota_min_headroom_for_full: 0.15,
                 quota_density_scaling: true,
+                use_tick_grid: true,
+                min_tick_spacing_mult: 1.0,
+                max_single_order_fraction: 0.25,
+                spread_compensation_mult: 1.0,
+                use_greedy_allocation: false,
             },
             CapitalTier::Large => Self {
                 tier,
-                max_levels_per_side: 8,
+                max_levels_per_side: 15,
                 skip_entropy_optimization: false,
                 min_level_size_mult: 2.0,
                 use_batch_reconcile: false,
@@ -433,6 +460,11 @@ impl CapitalAwarePolicy {
                 warmup_floor_bps: 8.0,
                 quota_min_headroom_for_full: 0.20,
                 quota_density_scaling: true,
+                use_tick_grid: true,
+                min_tick_spacing_mult: 1.0,
+                max_single_order_fraction: 0.20,
+                spread_compensation_mult: 1.0,
+                use_greedy_allocation: false,
             },
         }
     }
@@ -837,45 +869,69 @@ mod tests {
         assert_eq!(policy.min_fills_for_trust_ramp, 10);
         assert_eq!(policy.warmup_fill_target, 5);
         assert!((policy.warmup_floor_bps - 3.0).abs() < 1e-10);
+        // Tick-grid fields
+        assert!(policy.use_tick_grid);
+        assert!((policy.min_tick_spacing_mult - 3.0).abs() < 1e-10);
+        assert!((policy.max_single_order_fraction - 0.40).abs() < 1e-10);
+        assert!((policy.spread_compensation_mult - 1.15).abs() < 1e-10);
+        assert!(policy.use_greedy_allocation);
     }
 
     #[test]
     fn test_policy_small_tier() {
         let policy = CapitalAwarePolicy::from_tier(CapitalTier::Small);
-        assert_eq!(policy.max_levels_per_side, 3);
+        assert_eq!(policy.max_levels_per_side, 4);
         assert!(policy.skip_entropy_optimization);
         assert!(policy.use_batch_reconcile);
         assert!(policy.always_quote_minimum);
         assert!(!policy.quota_density_scaling);
         assert!((policy.max_l3_trust_uncalibrated - 0.50).abs() < 1e-10);
+        // Tick-grid fields
+        assert!(policy.use_tick_grid);
+        assert!((policy.min_tick_spacing_mult - 2.0).abs() < 1e-10);
+        assert!((policy.max_single_order_fraction - 0.30).abs() < 1e-10);
+        assert!((policy.spread_compensation_mult - 1.05).abs() < 1e-10);
+        assert!(policy.use_greedy_allocation);
     }
 
     #[test]
     fn test_policy_medium_tier() {
         let policy = CapitalAwarePolicy::from_tier(CapitalTier::Medium);
-        assert_eq!(policy.max_levels_per_side, 5);
-        assert!(!policy.skip_entropy_optimization);
-        assert!(!policy.use_batch_reconcile);
-        assert!(!policy.always_quote_minimum);
-        assert!(policy.quota_density_scaling);
-    }
-
-    #[test]
-    fn test_policy_large_tier() {
-        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Large);
         assert_eq!(policy.max_levels_per_side, 8);
         assert!(!policy.skip_entropy_optimization);
         assert!(!policy.use_batch_reconcile);
         assert!(!policy.always_quote_minimum);
         assert!(policy.quota_density_scaling);
+        // Tick-grid fields
+        assert!(policy.use_tick_grid);
+        assert!((policy.min_tick_spacing_mult - 1.0).abs() < 1e-10);
+        assert!((policy.max_single_order_fraction - 0.25).abs() < 1e-10);
+        assert!((policy.spread_compensation_mult - 1.0).abs() < 1e-10);
+        assert!(!policy.use_greedy_allocation);
+    }
+
+    #[test]
+    fn test_policy_large_tier() {
+        let policy = CapitalAwarePolicy::from_tier(CapitalTier::Large);
+        assert_eq!(policy.max_levels_per_side, 15);
+        assert!(!policy.skip_entropy_optimization);
+        assert!(!policy.use_batch_reconcile);
+        assert!(!policy.always_quote_minimum);
+        assert!(policy.quota_density_scaling);
         assert!((policy.max_l3_trust_uncalibrated - 0.95).abs() < 1e-10);
+        // Tick-grid fields
+        assert!(policy.use_tick_grid);
+        assert!((policy.min_tick_spacing_mult - 1.0).abs() < 1e-10);
+        assert!((policy.max_single_order_fraction - 0.20).abs() < 1e-10);
+        assert!((policy.spread_compensation_mult - 1.0).abs() < 1e-10);
+        assert!(!policy.use_greedy_allocation);
     }
 
     #[test]
     fn test_policy_default_is_large() {
         let policy = CapitalAwarePolicy::default();
         assert_eq!(policy.tier, CapitalTier::Large);
-        assert_eq!(policy.max_levels_per_side, 8);
+        assert_eq!(policy.max_levels_per_side, 15);
     }
 
     #[test]

@@ -117,8 +117,13 @@ pub fn auto_derive(
 ) -> DerivedParams {
     let safety_factor = 0.5; // Leave 50% margin buffer for adverse moves
 
-    // === MAX POSITION: from capital and margin solvency ===
-    let max_from_capital = capital_usd / ctx.mark_px;
+    // === MAX POSITION: from capital allocation and margin solvency ===
+    // Both formulas are leverage-aware. The min() picks the binding constraint:
+    // - max_from_capital: how much the user's capital_usd can support at leverage
+    // - max_from_margin: how much the account's available_margin can support
+    // safety_factor (0.5) provides a 2x buffer for adverse price moves.
+    let max_from_capital =
+        (capital_usd * ctx.max_leverage * safety_factor) / ctx.mark_px;
     let max_from_margin =
         (ctx.available_margin * ctx.max_leverage * safety_factor) / ctx.mark_px;
     let max_position = max_from_capital.min(max_from_margin).max(0.0);
@@ -236,14 +241,16 @@ mod tests {
         let ctx = hype_context();
         let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
 
-        // max_position = min(50/20, 100*3*0.5/20) = min(2.5, 7.5) = 2.5
-        assert!((d.max_position - 2.5).abs() < 0.01, "max_pos={}", d.max_position);
+        // max_from_capital = 50*3*0.5/20 = 3.75
+        // max_from_margin  = 100*3*0.5/20 = 7.5
+        // max_position = min(3.75, 7.5) = 3.75
+        assert!((d.max_position - 3.75).abs() < 0.01, "max_pos={}", d.max_position);
         assert!(d.viable, "Should be viable with $50 for HYPE at $20");
         assert!(d.diagnostic.is_none());
 
-        // target_liquidity = max(2.5 * 0.30, min_order * 5) = max(0.75, 2.875)
+        // target_liquidity = max(3.75 * 0.30, min_order * 5) = max(1.125, 2.875)
         // min_order = (10 * 1.15) / 20 = 0.575
-        // 0.575 * 5 = 2.875 > 0.75, so target_liquidity = 2.5 (capped by max_position)
+        // 0.575 * 5 = 2.875 > 1.125, so target_liquidity = 2.875
         assert!(d.target_liquidity <= d.max_position + 0.01,
             "target_liquidity ({}) should not exceed max_position ({})",
             d.target_liquidity, d.max_position);
@@ -259,16 +266,18 @@ mod tests {
         let ctx = btc_context();
         let d = auto_derive(10_000.0, SpreadProfile::Default, &ctx);
 
-        // max_position = min(10000/100000, 50000*50*0.5/100000) = min(0.1, 12.5) = 0.1
-        assert!((d.max_position - 0.1).abs() < 0.001, "max_pos={}", d.max_position);
+        // max_from_capital = 10000*50*0.5/100000 = 2.5
+        // max_from_margin  = 50000*50*0.5/100000 = 12.5
+        // max_position = min(2.5, 12.5) = 2.5
+        assert!((d.max_position - 2.5).abs() < 0.001, "max_pos={}", d.max_position);
         assert!(d.viable);
 
         // Default gamma
         assert!((d.risk_aversion - 0.3).abs() < 0.01);
-        // target_liquidity = max(0.1 * 0.20, min_order * 5)
+        // target_liquidity = max(2.5 * 0.20, min_order * 5)
         // min_order = (10 * 1.15) / 100000 = 0.000115
         // 0.000115 * 5 = 0.000575
-        // 0.1 * 0.20 = 0.02 > 0.000575, so target_liquidity = 0.02
+        // 2.5 * 0.20 = 0.50 > 0.000575, so target_liquidity = 0.50
         assert!(d.target_liquidity > 0.0);
         assert!(d.target_liquidity <= d.max_position + 0.001);
     }
@@ -276,11 +285,11 @@ mod tests {
     #[test]
     fn test_auto_derive_insufficient_capital() {
         let ctx = btc_context();
-        let d = auto_derive(5.0, SpreadProfile::Default, &ctx);
+        // With 50x leverage: $0.40 * 50 * 0.5 / 100000 = 0.0001 BTC
+        // min_order = 11.5/100000 = 0.000115 BTC → not viable
+        let d = auto_derive(0.40, SpreadProfile::Default, &ctx);
 
-        // max_position = 5/100000 = 0.00005 BTC = $5 notional
-        // min_order = 11.5/100000 = 0.000115 BTC = $11.5 notional
-        assert!(!d.viable, "Should NOT be viable with $5 for BTC");
+        assert!(!d.viable, "Should NOT be viable with $0.40 for BTC at 50x");
         assert!(d.diagnostic.is_some());
         let diag = d.diagnostic.unwrap();
         assert!(diag.contains("Capital too small"), "diagnostic: {}", diag);
@@ -306,10 +315,12 @@ mod tests {
         assert!(d_default.risk_aversion > d_hip3.risk_aversion);
         assert!(d_hip3.risk_aversion > d_aggressive.risk_aversion);
 
-        // max_position = min(500/20, 10000*3*0.5/20) = min(25, 750) = 25
-        // Default: 25 * 0.20 = 5.0 > min_order*5 = 2.875
-        // Hip3: 25 * 0.30 = 7.5
-        // Aggressive: 25 * 0.40 = 10.0
+        // max_from_capital = 500*3*0.5/20 = 37.5
+        // max_from_margin  = 10000*3*0.5/20 = 750
+        // max_position = min(37.5, 750) = 37.5
+        // Default: 37.5 * 0.20 = 7.5
+        // Hip3: 37.5 * 0.30 = 11.25
+        // Aggressive: 37.5 * 0.40 = 15.0
         assert!(d_aggressive.target_liquidity > d_hip3.target_liquidity,
             "aggressive {} > hip3 {}", d_aggressive.target_liquidity, d_hip3.target_liquidity);
         assert!(d_hip3.target_liquidity > d_default.target_liquidity,
@@ -318,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_auto_derive_margin_caps_position() {
-        // When margin is limited, it should cap max_position below capital/price
+        // When margin is limited, it should cap max_position below leveraged capital
         let ctx = ExchangeContext {
             mark_px: 20.0,
             account_value: 10.0, // Only $10 in account
@@ -330,9 +341,9 @@ mod tests {
         };
         let d = auto_derive(1000.0, SpreadProfile::Default, &ctx);
 
-        // max_from_capital = 1000/20 = 50
-        // max_from_margin = 10*3*0.5/20 = 0.75
-        // max_position = min(50, 0.75) = 0.75
+        // max_from_capital = 1000*3*0.5/20 = 75
+        // max_from_margin  = 10*3*0.5/20 = 0.75
+        // max_position = min(75, 0.75) = 0.75 (margin is the binding constraint)
         assert!((d.max_position - 0.75).abs() < 0.01, "max_pos={}", d.max_position);
     }
 
@@ -381,64 +392,72 @@ mod tests {
     }
 
     #[test]
-    fn test_capital_tier_micro_25_usd() {
+    fn test_capital_tier_micro() {
         let ctx = hype30_context();
-        let d = auto_derive(25.0, SpreadProfile::Hip3, &ctx);
-        // max_position = 25/30 = 0.833
+        // With 10x leverage: max_from_capital = 5*10*0.5/30 = 0.833
         // notional_per_side = 0.833 * 30 / 2 = 12.5
         // min_viable_notional = 10 * 1.15 = 11.5
         // viable_levels = floor(12.5 / 11.5) = 1
-        assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
+        let d = auto_derive(5.0, SpreadProfile::Hip3, &ctx);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Micro,
+            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
         assert_eq!(d.capital_profile.viable_levels_per_side, 1);
         assert!(d.viable);
     }
 
     #[test]
-    fn test_capital_tier_micro_50_usd() {
+    fn test_capital_tier_micro_10_usd() {
         let ctx = hype30_context();
-        let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
-        // max_position = 50/30 = 1.667
+        // max_from_capital = 10*10*0.5/30 = 1.667
         // notional_per_side = 1.667 * 30 / 2 = 25.0
         // viable_levels = floor(25.0 / 11.5) = 2
-        assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
+        let d = auto_derive(10.0, SpreadProfile::Hip3, &ctx);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Micro,
+            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
         assert_eq!(d.capital_profile.viable_levels_per_side, 2);
     }
 
     #[test]
-    fn test_capital_tier_small_100_usd() {
+    fn test_capital_tier_small_20_usd() {
         let ctx = hype30_context();
-        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
-        // max_position = 100/30 = 3.333
+        // max_from_capital = 20*10*0.5/30 = 3.333
         // notional_per_side = 3.333 * 30 / 2 = 50.0
         // viable_levels = floor(50.0 / 11.5) = 4
-        assert_eq!(d.capital_profile.tier, CapitalTier::Small, "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        let d = auto_derive(20.0, SpreadProfile::Hip3, &ctx);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Small,
+            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
         assert_eq!(d.capital_profile.viable_levels_per_side, 4);
     }
 
     #[test]
-    fn test_capital_tier_medium_500_usd() {
+    fn test_capital_tier_medium_50_usd() {
         let ctx = hype30_context();
-        let d = auto_derive(500.0, SpreadProfile::Hip3, &ctx);
-        // max_position = 500/30 = 16.667
-        // notional_per_side = 16.667 * 30 / 2 = 250.0
-        // viable_levels = floor(250.0 / 11.5) = 21
-        // Wait, 21 > 15, that's Large
-        assert_eq!(d.capital_profile.tier, CapitalTier::Large, "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        // max_from_capital = 50*10*0.5/30 = 8.333
+        // notional_per_side = 8.333 * 30 / 2 = 125.0
+        // viable_levels = floor(125.0 / 11.5) = 10
+        let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Medium,
+            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
+        assert_eq!(d.capital_profile.viable_levels_per_side, 10);
     }
 
     #[test]
-    fn test_capital_tier_large_5000_usd() {
+    fn test_capital_tier_large_100_usd() {
         let ctx = hype30_context();
-        let d = auto_derive(5000.0, SpreadProfile::Hip3, &ctx);
-        assert_eq!(d.capital_profile.tier, CapitalTier::Large);
+        // max_from_capital = 100*10*0.5/30 = 16.667
+        // notional_per_side = 16.667 * 30 / 2 = 250.0
+        // viable_levels = floor(250.0 / 11.5) = 21
+        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
+        assert_eq!(d.capital_profile.tier, CapitalTier::Large,
+            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
         assert!(d.capital_profile.viable_levels_per_side >= 16);
     }
 
     #[test]
     fn test_capital_profile_min_viable_position() {
         let ctx = hype30_context();
-        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
-        // min_viable_position = (10 * 1.15) / 30 = 0.383
+        let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
+        // min_viable_position = (10 * 1.15) / 30 = 0.383 (independent of leverage)
         let expected = (10.0 * 1.15) / 30.0;
         assert!((d.capital_profile.min_viable_position - expected).abs() < 0.001,
             "min_viable={}, expected={}", d.capital_profile.min_viable_position, expected);
@@ -447,7 +466,7 @@ mod tests {
     #[test]
     fn test_capital_profile_staleness_detection() {
         let ctx = hype30_context();
-        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
+        let d = auto_derive(50.0, SpreadProfile::Hip3, &ctx);
         // Not stale at same price
         assert!(!d.capital_profile.is_stale(30.0));
         // Not stale at 5% move
@@ -459,14 +478,39 @@ mod tests {
     }
 
     #[test]
-    fn test_capital_tier_5_usd_not_viable() {
+    fn test_capital_not_viable_very_small() {
         let ctx = hype30_context();
-        let d = auto_derive(5.0, SpreadProfile::Hip3, &ctx);
-        // max_position = 5/30 = 0.167
-        // notional_per_side = 0.167 * 30 / 2 = 2.5
-        // viable_levels = floor(2.5 / 11.5) = 0
+        // With 10x leverage: max_from_capital = 1*10*0.5/30 = 0.167
+        // min_order = (10*1.15)/30 = 0.383
+        // 0.167 < 0.383 → not viable
+        let d = auto_derive(1.0, SpreadProfile::Hip3, &ctx);
         assert_eq!(d.capital_profile.tier, CapitalTier::Micro);
         assert_eq!(d.capital_profile.viable_levels_per_side, 0);
         assert!(!d.viable);
+    }
+
+    #[test]
+    fn test_leverage_multiplies_capital() {
+        // Core test: $100 on HYPE at $29.63, 10x leverage
+        // This is the exact scenario from the bug report
+        let ctx = ExchangeContext {
+            mark_px: 29.63,
+            account_value: 100.0,
+            available_margin: 100.0,
+            max_leverage: 10.0,
+            fee_bps: 1.5,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let d = auto_derive(100.0, SpreadProfile::Hip3, &ctx);
+
+        // max_from_capital = 100*10*0.5/29.63 = 16.87
+        // max_from_margin  = 100*10*0.5/29.63 = 16.87 (same when capital == margin)
+        let expected = (100.0 * 10.0 * 0.5) / 29.63;
+        assert!((d.max_position - expected).abs() < 0.01,
+            "max_pos={} expected={}", d.max_position, expected);
+        assert!(d.max_position > 15.0, "Should have >15 HYPE max position with leverage");
+        assert_eq!(d.capital_profile.tier, CapitalTier::Large,
+            "tier={:?} levels={}", d.capital_profile.tier, d.capital_profile.viable_levels_per_side);
     }
 }

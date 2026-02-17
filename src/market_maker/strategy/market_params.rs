@@ -998,6 +998,12 @@ pub struct MarketParams {
     /// place, threaded through the entire pipeline.
     pub capital_policy: CapitalAwarePolicy,
 
+    // === Kill Switch Headroom (for dynamic margin utilization) ===
+    /// Kill switch headroom [0, 1]. Fraction of drawdown budget remaining.
+    /// 1.0 = no drawdown, 0.0 = at kill switch threshold.
+    /// Used by tick grid for dynamic margin utilization scaling.
+    pub kill_switch_headroom: f64,
+
     // === CalibrationCoordinator (Bootstrap from Book) ===
     /// Kappa from CalibrationCoordinator (L2-derived, fill-refined).
     /// Conservative during warmup (0.5x factor), converges to fill-based kappa.
@@ -1287,6 +1293,8 @@ impl Default for MarketParams {
             capacity_budget: None,
             // Capital-aware policy — derived from tier, flows through entire pipeline
             capital_policy: CapitalAwarePolicy::default(),
+            // Kill switch headroom
+            kill_switch_headroom: 1.0, // Full headroom initially
             // CalibrationCoordinator — inactive until seeded from L2 profile
             coordinator_kappa: 0.0,
             coordinator_uncertainty_premium_bps: 0.0,

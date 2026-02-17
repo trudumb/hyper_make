@@ -1190,6 +1190,7 @@ mod tests {
     fn test_drawdown_trigger() {
         let config = KillSwitchConfig {
             max_drawdown: 0.10, // 10%
+            max_absolute_drawdown: f64::MAX, // Bypass absolute check to test percentage
             ..Default::default()
         };
         let ks = KillSwitch::new(config);

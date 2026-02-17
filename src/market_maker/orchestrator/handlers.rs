@@ -398,6 +398,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 );
                 self.queue_value_heuristic.observe_outcome(predicted_qv, markout_fill_pnl * 10_000.0);
 
+                // Feed fill outcome to reconcile outcome tracker for action-type learning
+                self.reconcile_outcome_tracker.record_fill(
+                    pending.oid,
+                    resolved_snap.realized_edge_bps,
+                );
+
                 // Feed resolved snapshot to learning systems
                 self.tier2.edge_tracker.add_snapshot(resolved_snap.clone());
                 let fill_pnl_bps = resolved_snap.realized_edge_bps;
@@ -927,6 +933,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.infra.pending_fill_outcomes.push_back(
                     crate::market_maker::fills::PendingFillOutcome {
                         timestamp_ms: fill.time,
+                        oid: fill.oid,
                         fill_price,
                         is_buy,
                         mid_at_fill: self.latest_mid,
@@ -1616,6 +1623,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.safety.fill_processor.record_cancelled_order(
                     *oid, order.side, order.price, order.size,
                 );
+                // Record unfilled outcome for reconcile action-type learning
+                self.reconcile_outcome_tracker.record_unfilled(*oid);
                 removed_count += 1;
                 debug!(
                     oid = oid,

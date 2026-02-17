@@ -8,7 +8,7 @@
 pub mod exchange_rules;
 mod filter;
 pub mod kappa_spread;
-mod ladder;
+pub mod ladder;
 pub mod price_grid;
 pub mod viable;
 

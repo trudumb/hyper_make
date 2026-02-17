@@ -157,7 +157,8 @@ mod tests {
 
     #[test]
     fn test_small_drawdown() {
-        let monitor = DrawdownMonitor::new(0.10); // 10% limit
+        let monitor = DrawdownMonitor::new(0.10) // 10% limit
+            .with_max_absolute_drawdown(1000.0); // Bypass absolute check
         let state = RiskState {
             account_value: 1000.0,
             peak_pnl: 1000.0,
@@ -171,7 +172,9 @@ mod tests {
 
     #[test]
     fn test_warning_drawdown() {
-        let monitor = DrawdownMonitor::new(0.10).with_warning_threshold(0.7); // 10% limit
+        let monitor = DrawdownMonitor::new(0.10) // 10% limit
+            .with_warning_threshold(0.7)
+            .with_max_absolute_drawdown(1000.0); // Bypass absolute check
         let state = RiskState {
             account_value: 1000.0,
             peak_pnl: 1000.0,

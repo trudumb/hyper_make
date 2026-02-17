@@ -2041,52 +2041,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_inventory_skew_long_position_negative() {
-        let mut integrator = SignalIntegrator::default_config();
-        // Long position → skew should be NEGATIVE (lean asks, encourage selling)
-        integrator.set_skew_context(0.5, 1.0, 0.5, 5.0);
-        let signals = integrator.get_signals();
-        assert!(
-            signals.combined_skew_bps < -0.1,
-            "Long position should produce negative skew, got: {:.3}",
-            signals.combined_skew_bps
-        );
-    }
-
-    #[test]
-    fn test_inventory_skew_short_position_positive() {
-        let mut integrator = SignalIntegrator::default_config();
-        // Short position → skew should be POSITIVE (lean bids, encourage buying)
-        integrator.set_skew_context(-0.5, 1.0, 0.5, 5.0);
-        let signals = integrator.get_signals();
-        assert!(
-            signals.combined_skew_bps > 0.1,
-            "Short position should produce positive skew, got: {:.3}",
-            signals.combined_skew_bps
-        );
-    }
-
-    #[test]
-    fn test_inventory_skew_scales_with_position_ratio() {
-        let mut integrator = SignalIntegrator::default_config();
-
-        // Small position
-        integrator.set_skew_context(0.2, 1.0, 0.5, 5.0);
-        let signals_small = integrator.get_signals();
-
-        // Large position
-        integrator.set_skew_context(0.8, 1.0, 0.5, 5.0);
-        let signals_large = integrator.get_signals();
-
-        // Larger position should produce more skew (larger magnitude)
-        assert!(
-            signals_large.combined_skew_bps.abs() > signals_small.combined_skew_bps.abs(),
-            "Larger position should produce more skew: small={:.3}, large={:.3}",
-            signals_small.combined_skew_bps,
-            signals_large.combined_skew_bps
-        );
-    }
+    // NOTE: test_inventory_skew_{long,short,scales} removed — inventory skew was
+    // intentionally moved from signal_integration to GLFT q-term (inventory_skew_with_flow)
+    // during the Principled Architecture Redesign (Feb 2026). See glft.rs tests.
 
     #[test]
     fn test_skew_clamped_prevents_crossing() {

@@ -9,7 +9,7 @@
 #    ./scripts/test_hip3.sh ETH hyna 14400 hip3   # 4 hour test with 15-25 bps target
 #   ./scripts/test_hip3.sh ETH flx 120         # 2 minute test on Felix
 #   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --dashboard  # With live dashboard
-#   ./scripts/test_hip3.sh HYPE hyna 300 hip3 --capture    # With dashboard + screenshot capture
+#   ./scripts/test_hip3.sh HYPE hyna 14400 --capture    # With dashboard + screenshot capture
 #
 # Options:
 #   --dashboard    Starts HTTP server for live dashboard at http://localhost:3000

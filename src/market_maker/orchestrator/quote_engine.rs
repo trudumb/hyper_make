@@ -2382,6 +2382,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Mirror policy to MarketMaker for components (reconciler) that don't receive MarketParams
         self.capital_policy = capacity_budget.policy();
 
+        // Wire kill switch headroom for dynamic margin utilization.
+        // Headroom = 1 - (current_drawdown / max_drawdown_threshold).
+        {
+            let ks_config = self.safety.kill_switch.config();
+            let risk_state = self.build_risk_state();
+            let drawdown = if risk_state.peak_pnl < ks_config.min_peak_for_drawdown {
+                0.0
+            } else {
+                risk_state.drawdown()
+            };
+            market_params.kill_switch_headroom = if ks_config.max_drawdown > 0.0 {
+                (1.0 - drawdown / ks_config.max_drawdown).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+        }
+
         // Capital-aware warmup bootstrap: small accounts get a warmup floor
         // to prevent the death spiral (no fills → 10% warmup → inflated gamma → no fills).
         // Bayesian priors give sufficient starting estimates for bootstrap_from_book tiers.
