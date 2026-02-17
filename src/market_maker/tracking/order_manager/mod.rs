@@ -15,15 +15,21 @@
 
 mod impulse_filter;
 mod manager;
+pub mod outcome_tracker;
 mod reconcile;
+pub mod scorer;
 mod types;
 
 pub use impulse_filter::{ImpulseDecision, ImpulseFilter, ImpulseFilterConfig, ImpulseFilterStats};
 pub use manager::OrderManager;
+pub use outcome_tracker::{
+    OutcomeStats, ReconcileActionType, ReconcileDecision, ReconcileOutcomeTracker,
+};
 pub use reconcile::{
     priority_based_matching, reconcile_side_smart, reconcile_side_smart_with_impulse,
     DynamicReconcileConfig, ReconcileConfig, ReconcileStats,
 };
+pub use scorer::{score_all as score_reconcile_actions, ActionType, ScoredUpdate};
 pub use types::{LadderAction, OrderManagerConfig, OrderState, PendingOrder, Side, TrackedOrder};
 
 #[cfg(test)]

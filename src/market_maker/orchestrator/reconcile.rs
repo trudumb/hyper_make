@@ -30,6 +30,7 @@ pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 /// When API quota headroom is low (< 30%), the latch widens to let orders ride
 /// rather than burning quota to move them. A resting order 3 bps off-center is
 /// better than burning quota to move it 2 bps.
+#[allow(dead_code)]
 fn latch_threshold_bps(quoted_half_spread_bps: f64, headroom_pct: f64) -> f64 {
     let base = quoted_half_spread_bps * 0.3;
     if headroom_pct < 0.30 {
@@ -122,6 +123,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     ///
     /// Manages multiple orders per side for ladder quoting strategy.
     /// Uses bulk order placement for efficiency (single API call for all levels).
+    /// Superseded by `reconcile_unified()` — kept for fallback/reference.
+    #[allow(dead_code)]
     pub(crate) async fn reconcile_ladder_side(
         &mut self,
         side: Side,
@@ -574,6 +577,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// - Number of levels has changed
     /// - Any level's price has moved more than max_bps_diff
     /// - Any level's size has changed by more than 10%
+    /// Superseded by economic scoring in `reconcile_unified()`.
+    #[allow(dead_code)]
     pub(crate) fn ladder_needs_update(&self, side: Side, new_quotes: &[Quote]) -> bool {
         let current = self.orders.get_all_by_side(side);
 
@@ -670,6 +675,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// - SKIP: Order unchanged (price ≤1 bps, size ≤5%)
     /// - MODIFY: Small change (price ≤10 bps, size ≤50%) - preserves queue
     /// - CANCEL+PLACE: Large change - fresh queue position
+    ///
+    /// Superseded by `reconcile_unified()` — kept for fallback/reference.
+    #[allow(dead_code)]
     pub(crate) async fn reconcile_ladder_smart(
         &mut self,
         bid_quotes: Vec<Quote>,
@@ -1976,6 +1984,803 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 latched,
                 grid_preserved: 0, // TODO: track grid-snapped preservations
                 budget_suppressed: budget_suppressed as u32,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Unified reconciliation using economic scoring and budget-constrained allocation.
+    ///
+    /// Replaces both `reconcile_ladder_side()` (batch) and the priority_based_matching path
+    /// in `reconcile_ladder_smart()` with a single pipeline:
+    ///
+    /// ```text
+    /// targets + orders → SCORE (EV-based) → ALLOCATE (greedy knapsack) → EXECUTE
+    /// ```
+    ///
+    /// All safety checks (rate limits, BBO crossing, drift detection, empty ladder recovery)
+    /// are preserved from `reconcile_ladder_smart()`. The scoring and allocation phases
+    /// replace `priority_based_matching()` + `BudgetPacer` with principled economic decisions.
+    pub(crate) async fn reconcile_unified(
+        &mut self,
+        bid_quotes: Vec<Quote>,
+        ask_quotes: Vec<Quote>,
+    ) -> Result<()> {
+        use crate::market_maker::quoting::LadderLevel;
+        use crate::market_maker::tracking::{
+            score_reconcile_actions, DynamicReconcileConfig,
+        };
+        use super::budget_allocator::{allocate, ApiBudget};
+
+        let reconcile_config = &self.config.reconcile;
+
+        // === UNCONDITIONAL RATE LIMIT CHECK ===
+        // (Identical to reconcile_ladder_smart — preserves all safety behavior)
+        {
+            use crate::market_maker::core::CachedRateLimit;
+            use std::time::Duration;
+
+            let cache_max_age = Duration::from_secs(60);
+            let should_refresh = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .is_none_or(|c| c.is_stale(cache_max_age));
+
+            if should_refresh {
+                if let Ok(response) = self.info_client.user_rate_limit(self.user_address).await {
+                    self.infra.cached_rate_limit = Some(CachedRateLimit::from_response(&response));
+                    debug!(
+                        used = response.n_requests_used,
+                        cap = response.n_requests_cap,
+                        headroom_pct = %format!("{:.1}%", response.headroom_pct() * 100.0),
+                        "Rate limit status"
+                    );
+                }
+            }
+
+            if let Some(ref cache) = self.infra.cached_rate_limit {
+                let headroom = cache.headroom_pct();
+                let stale = cache.is_stale(std::time::Duration::from_secs(60));
+
+                if headroom < 0.10 && !self.infra.proactive_rate_tracker.can_modify() && !stale {
+                    debug!(
+                        headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                        "Rate limit headroom low (<10%) - throttling reconciliation"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Convert Quote to LadderLevel
+        let mut bid_levels: Vec<LadderLevel> = bid_quotes
+            .iter()
+            .map(|q| LadderLevel {
+                price: q.price,
+                size: q.size,
+                depth_bps: 0.0,
+            })
+            .collect();
+
+        let mut ask_levels: Vec<LadderLevel> = ask_quotes
+            .iter()
+            .map(|q| LadderLevel {
+                price: q.price,
+                size: q.size,
+                depth_bps: 0.0,
+            })
+            .collect();
+
+        // === PRE-PLACEMENT BBO CROSSING VALIDATION ===
+        // (Identical to reconcile_ladder_smart)
+        {
+            let book_age = self.last_l2_update_time.elapsed();
+            let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
+
+            const MAX_BOOK_AGE_SECS: u64 = 5;
+            const STALENESS_BUFFER_SECS: u64 = 2;
+
+            if bbo_valid {
+                if book_age.as_secs() >= MAX_BOOK_AGE_SECS {
+                    warn!(
+                        book_age_ms = book_age.as_millis() as u64,
+                        max_age_ms = MAX_BOOK_AGE_SECS * 1000,
+                        "Skipping quote cycle: L2 book data too stale for safe order placement"
+                    );
+                    return Ok(());
+                }
+
+                let actual_tick = 10f64.powi(-(self.config.decimals as i32));
+                let safety_margin = actual_tick * 2.0;
+                let staleness_ticks = if book_age.as_secs() >= STALENESS_BUFFER_SECS {
+                    (book_age.as_secs() - STALENESS_BUFFER_SECS + 1) as f64
+                } else {
+                    0.0
+                };
+                let staleness_buffer = staleness_ticks * actual_tick;
+
+                let effective_ask_limit = self.cached_best_ask - safety_margin - staleness_buffer;
+                let effective_bid_limit = self.cached_best_bid + safety_margin + staleness_buffer;
+
+                let bid_count_before = bid_levels.len();
+                let ask_count_before = ask_levels.len();
+
+                bid_levels.retain(|l| l.price < effective_ask_limit);
+                ask_levels.retain(|l| l.price > effective_bid_limit);
+
+                let bids_filtered = bid_count_before - bid_levels.len();
+                let asks_filtered = ask_count_before - ask_levels.len();
+
+                if bids_filtered > 0 || asks_filtered > 0 {
+                    warn!(
+                        bids_filtered = bids_filtered,
+                        asks_filtered = asks_filtered,
+                        bids_remaining = bid_levels.len(),
+                        asks_remaining = ask_levels.len(),
+                        "BBO crossing: filtered crossing levels instead of skipping cycle"
+                    );
+                    self.infra.prometheus.record_bbo_crossing_skip();
+                }
+
+                if bid_levels.is_empty() && ask_levels.is_empty() {
+                    warn!(
+                        "Skipping quote cycle: ALL levels filtered by BBO crossing"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Get current order counts (drop references immediately for borrow safety)
+        let num_current_bids = self.orders.get_all_by_side(Side::Buy).len();
+        let num_current_asks = self.orders.get_all_by_side(Side::Sell).len();
+
+        info!(
+            local_bids = num_current_bids,
+            local_asks = num_current_asks,
+            target_bid_levels = bid_levels.len(),
+            target_ask_levels = ask_levels.len(),
+            "[Unified] Order counts"
+        );
+
+        // === EMPTY LADDER RECOVERY ===
+        // (Identical to reconcile_ladder_smart)
+        let ladder_empty = num_current_bids == 0 && num_current_asks == 0;
+        let has_targets = !bid_levels.is_empty() || !ask_levels.is_empty();
+
+        if ladder_empty && has_targets {
+            const EMPTY_LADDER_COOLDOWN_SECS: u64 = 2;
+            if let Some(last_recovery) = self.last_empty_ladder_recovery {
+                if last_recovery.elapsed().as_secs() < EMPTY_LADDER_COOLDOWN_SECS {
+                    debug!("EMPTY LADDER recovery in cooldown - skipping");
+                    return Ok(());
+                }
+            }
+
+            let headroom = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .map(|c| c.headroom_pct())
+                .unwrap_or(1.0);
+
+            let in_backoff = self.infra.proactive_rate_tracker.is_cumulative_backoff();
+            if in_backoff {
+                warn!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    "EMPTY LADDER but in quota backoff - SKIPPING recovery"
+                );
+                return Ok(());
+            }
+
+            if headroom < 0.01 {
+                let backoff = self
+                    .infra
+                    .proactive_rate_tracker
+                    .record_cumulative_exhaustion();
+                warn!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    backoff_secs = %format!("{:.1}", backoff.as_secs_f64()),
+                    "EMPTY LADDER but quota exhausted (<1%) - conservation mode"
+                );
+                return Ok(());
+            }
+
+            let mut bid_places: Vec<(f64, f64)> =
+                bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let mut ask_places: Vec<(f64, f64)> =
+                ask_levels.iter().map(|l| (l.price, l.size)).collect();
+
+            let max_target_levels = bid_places.len().max(ask_places.len());
+            let policy = &self.capital_policy;
+            let allowed_levels = self
+                .stochastic
+                .quote_gate
+                .continuous_ladder_levels(
+                    max_target_levels,
+                    headroom,
+                    policy.quota_density_scaling,
+                    Some(policy.quota_min_headroom_for_full),
+                );
+            bid_places.truncate(allowed_levels);
+            ask_places.truncate(allowed_levels);
+
+            if !bid_places.is_empty() {
+                self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
+            }
+            if !ask_places.is_empty() {
+                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+            }
+
+            self.last_empty_ladder_recovery = Some(std::time::Instant::now());
+            return Ok(());
+        }
+
+        // === DRIFT DETECTION ===
+        // (Identical to reconcile_ladder_smart — borrow scoped to avoid aliasing)
+        const MAX_ACCEPTABLE_DRIFT_BPS: f64 = 100.0;
+
+        let (bid_drift, ask_drift) = {
+            let cb: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Buy);
+            let ca: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
+
+            let bd = if !cb.is_empty() && !bid_levels.is_empty() {
+                cb.iter()
+                    .filter_map(|order| {
+                        bid_levels
+                            .iter()
+                            .map(|level| crate::bps_diff(order.price, level.price) as f64)
+                            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    })
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            let ad = if !ca.is_empty() && !ask_levels.is_empty() {
+                ca.iter()
+                    .filter_map(|order| {
+                        ask_levels
+                            .iter()
+                            .map(|level| crate::bps_diff(order.price, level.price) as f64)
+                            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    })
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            (bd, ad)
+        }; // borrow of self.orders dropped here
+
+        let max_drift = bid_drift.max(ask_drift);
+        if max_drift > MAX_ACCEPTABLE_DRIFT_BPS {
+            warn!(
+                bid_drift_bps = %format!("{:.1}", bid_drift),
+                ask_drift_bps = %format!("{:.1}", ask_drift),
+                "[Unified] Large drift - forcing full cancel + replace"
+            );
+
+            let all_oids: Vec<u64> = {
+                let cb: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Buy);
+                let ca: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
+                cb.iter().chain(ca.iter()).map(|o| o.oid).collect()
+            };
+
+            if !all_oids.is_empty() {
+                self.initiate_bulk_cancel(all_oids).await;
+            }
+
+            let bid_places: Vec<(f64, f64)> =
+                bid_levels.iter().map(|l| (l.price, l.size)).collect();
+            let ask_places: Vec<(f64, f64)> =
+                ask_levels.iter().map(|l| (l.price, l.size)).collect();
+
+            if !bid_places.is_empty() {
+                self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
+            }
+            if !ask_places.is_empty() {
+                self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+            }
+
+            return Ok(());
+        }
+
+        // === IMPULSE CONTROL ===
+        // (Identical to reconcile_ladder_smart)
+        let impulse_enabled =
+            self.infra.impulse_control_enabled && reconcile_config.use_impulse_filter;
+        if impulse_enabled {
+            use crate::market_maker::core::CachedRateLimit;
+            use std::time::Duration;
+
+            let cache_max_age = Duration::from_secs(60);
+            let should_refresh = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .is_none_or(|c| c.is_stale(cache_max_age));
+
+            if should_refresh {
+                if let Ok(response) = self.info_client.user_rate_limit(self.user_address).await {
+                    self.infra.cached_rate_limit =
+                        Some(CachedRateLimit::from_response(&response));
+                }
+            }
+
+            if let Some(ref cache) = self.infra.cached_rate_limit {
+                let headroom = cache.headroom_pct();
+                let stale = cache.is_stale(std::time::Duration::from_secs(60));
+
+                if headroom < 0.01 && !stale {
+                    warn!(
+                        headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                        "Rate limit exhausted (<1%) - hard throttling"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // === CONTINUOUS LADDER DENSITY ===
+        {
+            let headroom = self
+                .infra
+                .cached_rate_limit
+                .as_ref()
+                .map(|c| c.headroom_pct())
+                .unwrap_or(1.0);
+            let max_target = bid_levels.len().max(ask_levels.len());
+            let policy = &self.capital_policy;
+            let allowed = self
+                .stochastic
+                .quote_gate
+                .continuous_ladder_levels(
+                    max_target,
+                    headroom,
+                    policy.quota_density_scaling,
+                    Some(policy.quota_min_headroom_for_full),
+                );
+            if allowed < max_target {
+                bid_levels.truncate(allowed);
+                ask_levels.truncate(allowed);
+                debug!(
+                    headroom_pct = %format!("{:.1}%", headroom * 100.0),
+                    allowed = allowed,
+                    "Continuous ladder density: reduced levels"
+                );
+            }
+        }
+
+        // =====================================================================
+        // === ECONOMIC SCORING + BUDGET ALLOCATION (replaces priority_based_matching) ===
+        // =====================================================================
+
+        let sigma = self.tier1.queue_tracker.sigma();
+
+        let (gamma, kappa) = self
+            .cached_market_params
+            .as_ref()
+            .map(|mp| {
+                let g_base = if mp.adaptive_gamma > 0.0 {
+                    mp.adaptive_gamma
+                } else {
+                    mp.calibration_gamma_mult.max(0.01)
+                };
+                let g = g_base * mp.regime_gamma_multiplier;
+                let k = if mp.use_kappa_robust && mp.kappa_robust > 0.0 {
+                    mp.kappa_robust
+                } else if mp.adaptive_kappa > 0.0 {
+                    mp.adaptive_kappa
+                } else if mp.regime_kappa.unwrap_or(0.0) > 0.0 {
+                    mp.regime_kappa.unwrap_or(0.0)
+                } else {
+                    mp.kappa.max(1.0)
+                };
+                (g, k)
+            })
+            .unwrap_or((0.1, 1500.0));
+
+        let tick_bps = self
+            .cached_market_params
+            .as_ref()
+            .map(|mp| mp.tick_size_bps)
+            .unwrap_or(0.5);
+
+        let headroom_pct = self
+            .infra
+            .cached_rate_limit
+            .as_ref()
+            .map(|c| c.headroom_pct())
+            .unwrap_or(1.0);
+
+        let dynamic_config = DynamicReconcileConfig::from_market_params_with_context(
+            gamma,
+            kappa,
+            sigma,
+            reconcile_config.queue_horizon_seconds,
+            tick_bps,
+            headroom_pct,
+        );
+
+        // Toxicity regime for queue value scoring
+        let ofi_1s = self.stochastic.trade_flow_tracker.imbalance_at_1s();
+        let ofi_5s = self.stochastic.trade_flow_tracker.imbalance_at_5s();
+        let toxicity = self
+            .tier1
+            .pre_fill_classifier
+            .toxicity_regime(ofi_1s, ofi_5s);
+
+        info!(
+            gamma = %format!("{:.4}", gamma),
+            kappa = %format!("{:.0}", kappa),
+            sigma = %format!("{:.6}", sigma),
+            optimal_spread_bps = %format!("{:.2}", dynamic_config.optimal_spread_bps),
+            headroom_pct = %format!("{:.1}%", headroom_pct * 100.0),
+            toxicity = ?toxicity,
+            "[Unified] Economic scoring with dynamic thresholds"
+        );
+
+        // Score all bid + ask updates (scoped borrow of self.orders)
+        let (mut bid_scored, mut ask_scored) = {
+            let current_bids: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Buy);
+            let current_asks: Vec<&TrackedOrder> = self.orders.get_all_by_side(Side::Sell);
+
+            let bs = score_reconcile_actions(
+                &current_bids,
+                &bid_levels,
+                Side::Buy,
+                &dynamic_config,
+                Some(&self.tier1.queue_tracker),
+                &self.queue_value_heuristic,
+                headroom_pct,
+                toxicity,
+                self.latest_mid,
+                self.config.sz_decimals,
+            );
+
+            let as_ = score_reconcile_actions(
+                &current_asks,
+                &ask_levels,
+                Side::Sell,
+                &dynamic_config,
+                Some(&self.tier1.queue_tracker),
+                &self.queue_value_heuristic,
+                headroom_pct,
+                toxicity,
+                self.latest_mid,
+                self.config.sz_decimals,
+            );
+
+            (bs, as_)
+        }; // borrow of self.orders dropped here
+
+        // Compute API budget from headroom
+        let rate_cap = self
+            .infra
+            .cached_rate_limit
+            .as_ref()
+            .map(|c| c.n_requests_cap as u32)
+            .unwrap_or(1200);
+        // Estimate cycle interval from last cycle or use conservative default.
+        // The exact value only affects budget sizing (how many calls per cycle).
+        let cycle_interval_s = 5.0;
+        let budget = ApiBudget::from_headroom(headroom_pct, rate_cap, cycle_interval_s);
+
+        // Merge both sides and allocate within budget
+        let mut all_scored: Vec<_> = bid_scored.drain(..).chain(ask_scored.drain(..)).collect();
+        let allocation = allocate(&mut all_scored, &budget, self.config.sz_decimals);
+
+        info!(
+            calls_used = allocation.calls_used,
+            calls_budget = allocation.calls_budget,
+            latched = allocation.latched_count,
+            budget_exhausted = allocation.budget_exhausted,
+            total_value_bps = %format!("{:.2}", allocation.total_value_bps),
+            suppressed = allocation.suppressed_count,
+            actions = allocation.actions.len(),
+            "[Unified] Budget allocation result"
+        );
+
+        // Partition actions by type and side for execution
+        let (bid_cancels, bid_modifies, bid_places) =
+            partition_ladder_actions(&allocation.actions, Side::Buy);
+        let (ask_cancels, ask_modifies, ask_places) =
+            partition_ladder_actions(&allocation.actions, Side::Sell);
+
+        let cancel_count = bid_cancels.len() + ask_cancels.len();
+        let modify_count = bid_modifies.len() + ask_modifies.len();
+
+        info!(
+            bid_cancel = bid_cancels.len(),
+            bid_modify = bid_modifies.len(),
+            bid_place = bid_places.len(),
+            ask_cancel = ask_cancels.len(),
+            ask_modify = ask_modifies.len(),
+            ask_place = ask_places.len(),
+            "[Unified] Actions partitioned"
+        );
+
+        // === EXECUTE CANCELS ===
+        let all_cancels: Vec<u64> = bid_cancels.into_iter().chain(ask_cancels).collect();
+        if !all_cancels.is_empty() {
+            self.initiate_bulk_cancel(all_cancels.clone()).await;
+            for oid in &all_cancels {
+                if let Some(order) = self.ws_state.remove_order(*oid) {
+                    self.safety.fill_processor.record_cancelled_order(
+                        *oid, order.side, order.price, order.size,
+                    );
+                }
+            }
+        }
+
+        // === EXECUTE MODIFIES ===
+        let actual_tick = 10f64.powi(-(self.config.decimals as i32));
+        let safety_margin = actual_tick * 2.0;
+        let bbo_valid = self.cached_best_bid > 0.0 && self.cached_best_ask > 0.0;
+        let all_modifies: Vec<ModifySpec> = bid_modifies
+            .into_iter()
+            .chain(ask_modifies)
+            .filter(|spec| {
+                if !bbo_valid {
+                    return true;
+                }
+                if spec.is_buy && spec.new_price >= self.cached_best_ask - safety_margin {
+                    warn!(oid = spec.oid, "Filtering modify: bid would cross exchange ask");
+                    return false;
+                }
+                if !spec.is_buy && spec.new_price <= self.cached_best_bid + safety_margin {
+                    warn!(oid = spec.oid, "Filtering modify: ask would cross exchange bid");
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        if !all_modifies.is_empty() {
+            if self.infra.proactive_rate_tracker.is_rate_limited() {
+                debug!("Skipping modify: rate limited (429 backoff active)");
+            } else if !self.infra.proactive_rate_tracker.can_modify() {
+                info!(
+                    modify_count = all_modifies.len(),
+                    "Modify debounced: latching orders"
+                );
+            } else {
+                self.infra.proactive_rate_tracker.mark_modify();
+
+                let num_modifies = all_modifies.len() as u32;
+                let modify_results = self
+                    .environment
+                    .modify_bulk_orders(&self.config.asset, all_modifies.clone())
+                    .await;
+
+                self.infra
+                    .proactive_rate_tracker
+                    .record_call(1, num_modifies);
+
+                let mut oid_remap_count = 0u32;
+                let mut modify_success_count = 0u32;
+
+                for (i, result) in modify_results.iter().enumerate() {
+                    let spec = &all_modifies[i];
+                    if result.success {
+                        let effective_oid = if result.oid > 0 && result.oid != spec.oid {
+                            if self.orders.replace_oid(spec.oid, result.oid) {
+                                oid_remap_count += 1;
+                            } else {
+                                let side = if spec.is_buy { tracking::Side::Buy } else { tracking::Side::Sell };
+                                let new_order = tracking::TrackedOrder::new(
+                                    result.oid, side, spec.new_price, spec.new_size, self.latest_mid,
+                                );
+                                self.orders.add_order(new_order);
+                                oid_remap_count += 1;
+                            }
+                            result.oid
+                        } else {
+                            spec.oid
+                        };
+
+                        self.orders.on_modify_success(effective_oid, spec.new_price, spec.new_size);
+                        self.infra.prometheus.record_order_modified();
+                        modify_success_count += 1;
+                    } else {
+                        warn!(
+                            oid = spec.oid,
+                            error = ?result.error,
+                            "Modify failed, falling back to cancel+place"
+                        );
+                        self.infra.prometheus.record_modify_fallback();
+
+                        let error_msg = result.error.as_deref().unwrap_or("");
+                        let is_already_canceled = error_msg.contains("canceled");
+                        let is_already_filled = !is_already_canceled && error_msg.contains("filled");
+
+                        if is_already_canceled {
+                            self.orders.remove_order(spec.oid);
+                            continue;
+                        }
+                        if is_already_filled {
+                            if let Some(order) = self.orders.get_order_mut(spec.oid) {
+                                order.transition_to(OrderState::FilledImmediately);
+                            }
+                            continue;
+                        }
+
+                        // Cancel + place fallback
+                        self.orders.initiate_cancel(spec.oid);
+                        let cancel_result = self
+                            .environment
+                            .cancel_order(&self.config.asset, spec.oid)
+                            .await;
+
+                        match cancel_result {
+                            CancelResult::Cancelled | CancelResult::AlreadyCancelled => {
+                                self.orders.on_cancel_confirmed(spec.oid);
+                            }
+                            CancelResult::AlreadyFilled => {
+                                self.orders.on_cancel_already_filled(spec.oid);
+                                continue;
+                            }
+                            CancelResult::Failed => {
+                                self.orders.on_cancel_failed(spec.oid);
+                                continue;
+                            }
+                        }
+
+                        let side = if spec.is_buy { Side::Buy } else { Side::Sell };
+                        let cloid = uuid::Uuid::new_v4().to_string();
+                        let mid_price = self.latest_mid;
+                        let depth_bps = if mid_price > 0.0 {
+                            ((spec.new_price - mid_price).abs() / mid_price) * 10000.0
+                        } else {
+                            0.0
+                        };
+                        let regime_str = format!("{:?}", self.estimator.volatility_regime());
+                        let (_, fill_pred_id) = self
+                            .stochastic
+                            .model_calibration
+                            .fill_model
+                            .predict_with_regime(depth_bps, &regime_str);
+                        let (_, as_pred_id) = self
+                            .stochastic
+                            .model_calibration
+                            .as_model
+                            .predict_with_regime(&regime_str);
+
+                        self.orders.add_pending_with_calibration(
+                            side, spec.new_price, spec.new_size,
+                            cloid.clone(), Some(fill_pred_id), Some(as_pred_id),
+                            Some(depth_bps), mid_price,
+                        );
+                        self.infra.orphan_tracker.register_expected_cloids(std::slice::from_ref(&cloid));
+
+                        let safe_size = truncate_float(spec.new_size, self.config.sz_decimals, false);
+                        if safe_size <= 0.0 {
+                            self.orders.remove_pending_by_cloid(&cloid);
+                            self.infra.orphan_tracker.mark_failed(&cloid);
+                            continue;
+                        }
+
+                        let place_result = self
+                            .environment
+                            .place_order(
+                                &self.config.asset, spec.new_price, safe_size,
+                                spec.is_buy, Some(cloid.clone()), true,
+                            )
+                            .await;
+
+                        if place_result.oid > 0 {
+                            self.infra.orphan_tracker.record_oid_for_cloid(&cloid, place_result.oid);
+
+                            if place_result.filled {
+                                self.orders.remove_pending_by_cloid(&cloid);
+                                self.infra.orphan_tracker.mark_finalized(&cloid, place_result.oid);
+
+                                let resting_size = place_result.resting_size;
+                                let actual_fill = if resting_size < crate::EPSILON {
+                                    spec.new_size
+                                } else {
+                                    spec.new_size - resting_size
+                                };
+
+                                self.position.process_fill(actual_fill, spec.is_buy);
+                                self.safety.fill_processor.pre_register_immediate_fill(place_result.oid, actual_fill);
+
+                                let mut tracked = TrackedOrder::with_cloid(
+                                    place_result.oid, cloid, side,
+                                    spec.new_price, spec.new_size, self.latest_mid,
+                                );
+                                tracked.filled = actual_fill;
+
+                                if resting_size > crate::EPSILON {
+                                    tracked.transition_to(OrderState::PartialFilled);
+                                    tracked.size = resting_size;
+                                } else {
+                                    tracked.transition_to(OrderState::FilledImmediately);
+                                }
+                                self.orders.add_order(tracked);
+                            } else {
+                                self.orders.finalize_pending_by_cloid(
+                                    &cloid, place_result.oid, place_result.resting_size,
+                                );
+                                self.infra.orphan_tracker.mark_finalized(&cloid, place_result.oid);
+                            }
+                        } else {
+                            self.orders.remove_pending_by_cloid(&cloid);
+                            self.infra.orphan_tracker.mark_failed(&cloid);
+                        }
+                    }
+                }
+
+                if modify_success_count > 0 {
+                    let (best_bid, best_ask, bid_levels_count, ask_levels_count) =
+                        self.orders.get_quote_summary();
+                    let mid = if best_bid > 0.0 && best_ask > 0.0 {
+                        (best_bid + best_ask) / 2.0
+                    } else {
+                        0.0
+                    };
+                    let spread_bps = if mid > 0.0 {
+                        (best_ask - best_bid) / mid * 10000.0
+                    } else {
+                        0.0
+                    };
+
+                    info!(
+                        modified = modify_success_count,
+                        oid_remaps = oid_remap_count,
+                        spread_bps = %format!("{:.2}", spread_bps),
+                        bid_levels = bid_levels_count,
+                        ask_levels = ask_levels_count,
+                        position = %format!("{:.6}", self.position.position()),
+                        "Quote cycle complete"
+                    );
+                }
+            }
+        }
+
+        // === EXECUTE PLACES ===
+        let bid_place_count = bid_places.len();
+        let ask_place_count = ask_places.len();
+        if !bid_places.is_empty() {
+            self.place_bulk_ladder_orders(Side::Buy, bid_places).await?;
+        }
+        if !ask_places.is_empty() {
+            self.place_bulk_ladder_orders(Side::Sell, ask_places).await?;
+        }
+
+        // === IMPULSE CONTROL BUDGET ===
+        if impulse_enabled {
+            let total_actions = cancel_count + modify_count + bid_place_count + ask_place_count;
+            if total_actions > 0 {
+                self.infra.execution_budget.spend(total_actions);
+            }
+        }
+
+        // === RECORD API SPEND ===
+        let total_api_calls =
+            (cancel_count + modify_count + bid_place_count + ask_place_count) as u32;
+        if total_api_calls > 0 {
+            self.infra.budget_pacer.record_spend(total_api_calls);
+        }
+
+        // === CHURN METRICS ===
+        {
+            use crate::market_maker::analytics::churn_tracker::CycleSummary;
+            let total_existing = num_current_bids + num_current_asks;
+            let latched = total_existing.saturating_sub(cancel_count + modify_count) as u32;
+            self.churn_tracker.record_cycle(CycleSummary {
+                placed: (bid_place_count + ask_place_count) as u32,
+                cancelled: cancel_count as u32,
+                filled: 0,
+                modified: modify_count as u32,
+                latched,
+                grid_preserved: 0,
+                budget_suppressed: allocation.suppressed_count,
             });
         }
 

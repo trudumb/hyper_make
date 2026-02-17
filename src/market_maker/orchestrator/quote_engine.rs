@@ -135,15 +135,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .as_ref()
             .map(|c| c.headroom_pct())
             .unwrap_or(1.0);
-        let min_cycle_interval_ms: u64 = if headroom_for_throttle >= 0.30 {
-            1000 // Normal: every 1s
-        } else if headroom_for_throttle >= 0.10 {
-            3000 // Low: every 3s
-        } else if headroom_for_throttle >= 0.05 {
-            5000 // Critical: every 5s
-        } else {
-            10000 // Emergency: every 10s
-        };
+        // Adaptive cycle interval from market conditions.
+        // Replaces fixed tiers with sigma-based staleness estimate.
+        let sigma_for_cycle = self.estimator.sigma();
+        let latch_bps_for_cycle = self
+            .cached_market_params
+            .as_ref()
+            .map(|mp| {
+                let half_spread = mp.market_spread_bps / 2.0;
+                (half_spread * 0.3).clamp(1.0, 10.0)
+            })
+            .unwrap_or(3.0);
+        let min_cycle_interval_ms = super::event_accumulator::compute_next_cycle_time(
+            sigma_for_cycle,
+            latch_bps_for_cycle,
+            headroom_for_throttle,
+        ).as_millis() as u64;
         if let Some(last) = self.last_quote_cycle_time {
             let elapsed_ms = last.elapsed().as_millis() as u64;
             if elapsed_ms < min_cycle_interval_ms {
@@ -3088,41 +3095,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 return Ok(());
             }
 
-            // Reconcile ladder quotes
-            // Capital-aware policy selects reconciliation strategy:
-            // - Micro/Small: batch reconcile (cancel-all + place-all = 2 API calls)
-            // - Medium/Large: smart reconcile with modify (preserves queue priority)
-            let use_batch = self.capital_policy.use_batch_reconcile;
-            info!(
-                smart_reconcile = self.config.smart_reconcile,
-                batch_mode = use_batch,
-                "Submitting ladder quotes to reconciler"
-            );
-            if use_batch {
-                // Batch reconciliation: cancel all, then place all.
-                // For Micro/Small accounts: 2 API calls vs 12+ for smart reconcile.
-                // Price drift tolerance: skip if all prices within threshold.
-                let policy = &self.capital_policy;
-                let drift_ok = self.check_price_drift_within_threshold(
-                    &bid_quotes,
-                    &ask_quotes,
-                    policy.price_drift_threshold_bps,
-                );
-                if drift_ok {
-                    debug!("Batch reconcile: prices within drift threshold, skipping");
-                } else {
-                    // Cancel all existing orders then place new batch
-                    self.reconcile_ladder_side(Side::Buy, bid_quotes).await?;
-                    self.reconcile_ladder_side(Side::Sell, ask_quotes).await?;
-                }
-            } else if self.config.smart_reconcile {
-                // Smart reconciliation with ORDER MODIFY for queue preservation
-                self.reconcile_ladder_smart(bid_quotes, ask_quotes).await?;
-            } else {
-                // Legacy all-or-nothing reconciliation
-                self.reconcile_ladder_side(Side::Buy, bid_quotes).await?;
-                self.reconcile_ladder_side(Side::Sell, ask_quotes).await?;
-            }
+            // Unified reconciliation: economic scoring + budget-constrained allocation.
+            // Replaces batch/smart/legacy routing with single principled pipeline.
+            // Every API call is an economic decision: update_value = EV_new - EV_keep - api_cost.
+            // Budget adapts to headroom: abundant → aggressive updates, scarce → only highest-value.
+            self.reconcile_unified(bid_quotes, ask_quotes).await?;
         } else {
             // Fallback to single-quote mode for non-ladder strategies
             // HARMONIZED: Use decision-adjusted values (first-principles derived, decision-scaled)
@@ -3347,7 +3324,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     }
 
     /// Check if all existing orders are within the drift threshold of target quotes.
-    /// Used by batch reconcile to skip unnecessary cancel/replace cycles.
+    /// Previously used by batch reconcile; kept for potential future use.
+    #[allow(dead_code)]
     fn check_price_drift_within_threshold(
         &self,
         bid_quotes: &[Quote],

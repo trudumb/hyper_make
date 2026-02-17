@@ -143,6 +143,9 @@ pub(crate) struct EventAccumulator {
 
     /// Events filtered (not triggering reconcile).
     events_filtered: u64,
+
+    /// Dynamic fallback interval (overrides config.fallback_interval when set).
+    dynamic_fallback: Option<Duration>,
 }
 
 #[allow(dead_code)] // WIP: Methods will be used when event handlers are wired
@@ -159,12 +162,23 @@ impl EventAccumulator {
             total_events: 0,
             total_reconciles: 0,
             events_filtered: 0,
+            dynamic_fallback: None,
         }
     }
 
     /// Create with default configuration.
     pub(crate) fn default_config() -> Self {
         Self::new(EventDrivenConfig::default())
+    }
+
+    /// Set dynamic fallback interval computed from market conditions.
+    pub(crate) fn set_dynamic_fallback(&mut self, interval: Duration) {
+        self.dynamic_fallback = Some(interval);
+    }
+
+    /// Clear dynamic fallback (revert to config default).
+    pub(crate) fn clear_dynamic_fallback(&mut self) {
+        self.dynamic_fallback = None;
     }
 
     /// Record a mid price update.
@@ -296,7 +310,8 @@ impl EventAccumulator {
         }
 
         let elapsed = self.last_reconcile.elapsed();
-        if elapsed >= self.config.fallback_interval {
+        let fallback = self.dynamic_fallback.unwrap_or(self.config.fallback_interval);
+        if elapsed >= fallback {
             // Unconditionally trigger after fallback interval to guarantee minimum quote frequency.
             // Even without accumulated events, we must ensure quotes exist on the book.
             let scope = if self.affected.bids_affected || self.affected.asks_affected || !self.events.is_empty() {
@@ -457,6 +472,32 @@ impl EventAccumulatorStats {
     }
 }
 
+/// Compute adaptive cycle interval from market conditions.
+///
+/// Based on expected time for price to drift beyond latch threshold.
+/// From Brownian motion: E[first passage time] = (threshold / sigma)^2
+///
+/// Properties:
+/// - High volatility -> short interval (quotes go stale faster)
+/// - Low volatility -> long interval (quotes stay fresh longer)
+/// - Low headroom -> longer minimum floor (conserve API budget)
+///
+/// # Arguments
+/// * `sigma` - Price volatility (per-second, fractional, e.g. 0.001 = 10 bps/s)
+/// * `latch_bps` - Current latch threshold in basis points
+/// * `headroom` - API headroom fraction [0, 1]
+pub(crate) fn compute_next_cycle_time(sigma: f64, latch_bps: f64, headroom: f64) -> Duration {
+    let sigma_bps = sigma * 10_000.0;
+    let t_stale = if sigma_bps > 0.001 {
+        (latch_bps / sigma_bps).powi(2)
+    } else {
+        30.0 // Very low vol -> long interval
+    };
+    // Headroom floor: lower headroom -> longer minimum interval
+    let headroom_floor = (0.5 / headroom.max(0.01)).clamp(0.5, 30.0);
+    Duration::from_secs_f64(t_stale.max(headroom_floor).clamp(1.0, 30.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +568,56 @@ mod tests {
 
         let scope = tracker.to_scope();
         assert!(scope.is_full());
+    }
+
+    #[test]
+    fn test_compute_next_cycle_time_high_vol() {
+        // sigma=0.001 (10 bps/s), latch=3 bps
+        // t_stale = (3/10)^2 = 0.09s -> clamps to 1.0s
+        let d = compute_next_cycle_time(0.001, 3.0, 0.5);
+        assert_eq!(d, Duration::from_secs(1)); // Minimum clamp
+    }
+
+    #[test]
+    fn test_compute_next_cycle_time_low_vol() {
+        // sigma=0.00001 (0.1 bps/s), latch=3 bps
+        // t_stale = (3/0.1)^2 = 900s -> clamps to 30s
+        let d = compute_next_cycle_time(0.00001, 3.0, 0.5);
+        assert_eq!(d, Duration::from_secs(30)); // Maximum clamp
+    }
+
+    #[test]
+    fn test_compute_next_cycle_time_low_headroom() {
+        // headroom=0.05 -> floor = 0.5/0.05 = 10s
+        let d = compute_next_cycle_time(0.0001, 3.0, 0.05);
+        assert!(d.as_secs_f64() >= 10.0);
+    }
+
+    #[test]
+    fn test_compute_next_cycle_time_normal() {
+        // sigma=0.0001 (1 bps/s), latch=5 bps, headroom=0.5
+        // t_stale = (5/1)^2 = 25s
+        // headroom_floor = 0.5/0.5 = 1.0s
+        // max(25, 1) = 25, clamp(1,30) = 25
+        let d = compute_next_cycle_time(0.0001, 5.0, 0.5);
+        assert!((d.as_secs_f64() - 25.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_dynamic_fallback_overrides_config() {
+        let mut acc = EventAccumulator::default_config();
+        acc.set_dynamic_fallback(Duration::from_secs(15));
+        // Force time passage by resetting last_reconcile to the past
+        acc.last_reconcile = Instant::now() - Duration::from_secs(20);
+        // Should trigger because 20s > 15s dynamic fallback
+        assert!(acc.check_fallback().is_some());
+    }
+
+    #[test]
+    fn test_dynamic_fallback_none_uses_config() {
+        let mut acc = EventAccumulator::default_config();
+        // No dynamic fallback set -- uses config.fallback_interval (default 5s)
+        acc.last_reconcile = Instant::now() - Duration::from_secs(3);
+        assert!(acc.check_fallback().is_none()); // 3s < 5s default
     }
 }

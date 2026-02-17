@@ -9,6 +9,7 @@
 //! - `recovery`: Recovery logic, safety sync, and state refresh
 //! - `event_accumulator`: Event-driven quote update triggering (Phase 3: Churn Reduction)
 
+pub(crate) mod budget_allocator;
 pub(crate) mod diagnosis;
 mod event_loop;
 pub(crate) mod event_accumulator;

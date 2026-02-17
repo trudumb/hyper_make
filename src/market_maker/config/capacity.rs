@@ -337,7 +337,8 @@ pub struct CapitalAwarePolicy {
     pub min_level_size_mult: f64,
 
     // --- Reconciliation ---
-    /// Use cancel-all + place-all (2 API calls) instead of smart reconcile (12+).
+    /// Deprecated: unified reconcile now handles all tiers economically.
+    /// Kept for checkpoint backward compatibility (`#[serde(default)]` equivalent).
     pub use_batch_reconcile: bool,
     /// Tolerance (bps) before re-quoting. Higher = fewer API calls. Micro: 3.0, Large: 1.0.
     pub price_drift_threshold_bps: f64,
