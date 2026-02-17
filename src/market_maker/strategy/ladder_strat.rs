@@ -890,20 +890,34 @@ impl LadderStrategy {
         };
 
         // === REGIME KAPPA BLENDING ===
-        // Regime kappa is the PRIMARY driver of spread width (60% weight).
-        // Captures structural differences: Calm → 3000, Normal → 2000,
-        // Volatile → 1000, Extreme → 500. This makes spreads naturally widen
-        // in volatile regimes without relying on multiplicative spread chain.
+        // Regime kappa captures structural differences: Calm→3000, Normal→2000,
+        // Volatile→1000, Extreme→500. Makes spreads widen in volatile regimes.
+        //
+        // WARMUP RAMP: During warmup the regime classifier hasn't converged, so
+        // the regime_kappa is just the default (Normal=2000). Giving it 60% weight
+        // pulls the market-derived kappa DOWN, widening spreads and preventing
+        // fills (cold-start death spiral). Ramp from 20% at 0% warmup → 60% at
+        // 100% warmup so that market-derived kappa dominates early, and regime
+        // kappa takes over once calibrated.
         if let Some(regime_kappa) = market_params.regime_kappa {
             let kappa_before_regime = kappa;
-            const REGIME_BLEND_WEIGHT: f64 = 0.6;
-            kappa = (1.0 - REGIME_BLEND_WEIGHT) * kappa + REGIME_BLEND_WEIGHT * regime_kappa;
+            const REGIME_BLEND_WEIGHT_FULL: f64 = 0.6;
+            const REGIME_BLEND_WEIGHT_WARMUP: f64 = 0.2;
+            let regime_blend_weight = if market_params.adaptive_warmup_progress < 1.0 {
+                let t = market_params.adaptive_warmup_progress;
+                REGIME_BLEND_WEIGHT_WARMUP + t * (REGIME_BLEND_WEIGHT_FULL - REGIME_BLEND_WEIGHT_WARMUP)
+            } else {
+                REGIME_BLEND_WEIGHT_FULL
+            };
+            kappa = (1.0 - regime_blend_weight) * kappa + regime_blend_weight * regime_kappa;
             info!(
                 kappa_before = %format!("{:.0}", kappa_before_regime),
                 regime_kappa = %format!("{:.0}", regime_kappa),
                 kappa_after = %format!("{:.0}", kappa),
                 regime = market_params.regime_kappa_current_regime,
-                "[SPREAD TRACE] regime kappa blending (60% regime weight)"
+                regime_blend_weight = %format!("{:.2}", regime_blend_weight),
+                warmup_pct = %format!("{:.2}", market_params.adaptive_warmup_progress),
+                "[SPREAD TRACE] regime kappa blending (warmup-ramped weight)"
             );
         }
         // NOTE: Agent 3's alpha-based kappa adjustment follows below.
@@ -1269,16 +1283,50 @@ impl LadderStrategy {
         // Apply asymmetric spread widening from pre-fill adverse selection classifier.
         // These multipliers are [1.0, 3.0] where >1.0 indicates predicted toxicity on that side.
         // Widen depths (not gamma) to get direct, per-side spread control.
-        if market_params.pre_fill_spread_mult_bid > 1.01 {
+        //
+        // WARMUP CAP: During warmup the AS model is uncalibrated — update_count rises from
+        // book/trade events (not fills), so the warmup prior gets overridden before any fills
+        // arrive. Without a cap, raw signal noise produces 1.5-2x multipliers that push the
+        // touch from ~7 bps to ~14 bps, preventing fills entirely (cold-start death spiral).
+        // Cap at 1.15x during warmup (mild protection); full multiplier after warmup graduates.
+        let warmup_as_cap = if market_params.adaptive_warmup_progress < 1.0 {
+            // Linear ramp: 1.0x at 0% warmup → 3.0x at 100% warmup
+            // At cold start, disable AS widening entirely — the AS model is
+            // uncalibrated (update_count rises from book events, not fills) and
+            // any multiplier > 1.0 pushes quotes further from BBO, preventing
+            // the fills we need to calibrate. "Quote First, Learn Second."
+            let t = market_params.adaptive_warmup_progress;
+            1.0 + t * (3.0 - 1.0)
+        } else {
+            3.0 // No cap post-warmup
+        };
+        let capped_bid_mult = market_params.pre_fill_spread_mult_bid.min(warmup_as_cap);
+        let capped_ask_mult = market_params.pre_fill_spread_mult_ask.min(warmup_as_cap);
+
+        if capped_bid_mult > 1.01 {
             for depth in dynamic_depths.bid.iter_mut() {
-                *depth *= market_params.pre_fill_spread_mult_bid;
+                *depth *= capped_bid_mult;
             }
         }
-        if market_params.pre_fill_spread_mult_ask > 1.01 {
+        if capped_ask_mult > 1.01 {
             for depth in dynamic_depths.ask.iter_mut() {
-                *depth *= market_params.pre_fill_spread_mult_ask;
+                *depth *= capped_ask_mult;
             }
         }
+
+        // [SPREAD TRACE] Phase 6: after pre-fill AS multipliers
+        tracing::info!(
+            phase = "pre_fill_as",
+            raw_mult_bid = %format!("{:.3}", market_params.pre_fill_spread_mult_bid),
+            raw_mult_ask = %format!("{:.3}", market_params.pre_fill_spread_mult_ask),
+            capped_mult_bid = %format!("{:.3}", capped_bid_mult),
+            capped_mult_ask = %format!("{:.3}", capped_ask_mult),
+            warmup_as_cap = %format!("{:.3}", warmup_as_cap),
+            touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
+            touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
+            total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
+            "[SPREAD TRACE] after pre-fill AS multipliers (warmup-capped)"
+        );
 
         // === REMOVED: L2 SPREAD MULTIPLIER ===
         // The l2_spread_multiplier has been removed. All uncertainty is now handled

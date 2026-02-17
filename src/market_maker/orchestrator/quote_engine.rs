@@ -2627,27 +2627,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         }
                     }
                     ToxicityRegime::Normal => {
-                        // Moderate: WIDEN SPREADS instead of reducing sizes.
-                        // Converts toxicity defense to price protection, preserving
-                        // order sizes that are already at/near exchange minimum.
-                        let bid_tox = market_params.pre_fill_toxicity_bid;
-                        let ask_tox = market_params.pre_fill_toxicity_ask;
-                        // toxicity 0.25→widen 1.0x (none), 0.50→1.15x, 0.75→1.50x
-                        let bid_widen = (1.0 + bid_tox).clamp(1.0, 1.5);
-                        let ask_widen = (1.0 + ask_tox).clamp(1.0, 1.5);
-                        let mid = quote_config.mid_price;
-                        if bid_widen > 1.001 {
-                            for quote in viable.bids.iter_mut() {
-                                let offset = (mid - quote.price).max(0.0);
-                                quote.price = mid - offset * bid_widen;
-                            }
-                        }
-                        if ask_widen > 1.001 {
-                            for quote in viable.asks.iter_mut() {
-                                let offset = (quote.price - mid).max(0.0);
-                                quote.price = mid + offset * ask_widen;
-                            }
-                        }
+                        // REMOVED: Normal-regime spread widening was double-counting
+                        // pre-fill toxicity. The pre-fill AS classifier already applies
+                        // per-side depth multipliers in ladder_strat.rs (lines 1268-1281),
+                        // so applying toxicity-based widening HERE too compounds the effect:
+                        //   depth_mult (1.5x) × regime_widen (1.5x) = 2.25x total
+                        // This pushed the touch from ~7 bps to ~21 bps, preventing fills.
+                        //
+                        // The depth multiplier IS the principled Normal-regime response.
+                        // Additional widening belongs only in Toxic regime (which clears
+                        // sides or does 1.5x emergency widening).
                     }
                     ToxicityRegime::Benign => {} // No filtering
                 }
