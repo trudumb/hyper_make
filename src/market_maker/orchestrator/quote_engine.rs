@@ -750,20 +750,42 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // During warmup (few fills), quote tighter to attract fills and limit size.
         // Warmup discount reduces gamma → tighter GLFT spreads (more fills for learning).
         // Size multiplier limits loss from miscalibrated models during learning.
+        //
+        // Prior confidence blending: if a prior was injected, its confidence provides
+        // a floor that replaces the fill-count-only warmup. This means a 139h-old prior
+        // with ~0.2 confidence still starts more aggressively than cold-start.
         let warmup_size_mult = {
             let fill_count = self.tier1.adverse_selection.fills_measured();
             let warmup_gamma_discount = crate::market_maker::calibration::gate::warmup_spread_discount(fill_count);
             let warmup_sz = crate::market_maker::calibration::gate::warmup_size_multiplier(fill_count);
-            if warmup_gamma_discount < 1.0 || warmup_sz < 1.0 {
-                market_params.hjb_gamma_multiplier *= warmup_gamma_discount;
+
+            // Blend fill-count warmup with prior confidence (take the better of the two).
+            let prior_conf = self.prior_confidence;
+            let (effective_gamma, effective_sz) = if prior_conf > 0.0 {
+                use crate::market_maker::calibration::gate::{
+                    spread_multiplier_from_confidence, size_multiplier_from_confidence,
+                };
+                // Prior confidence gives a spread multiplier (>= 1.0).
+                // Convert to gamma discount: gamma_discount = 1/spread_mult.
+                let prior_gamma = 1.0 / spread_multiplier_from_confidence(prior_conf);
+                let prior_sz = size_multiplier_from_confidence(prior_conf);
+                // Take the LESS conservative of fill-based and prior-based
+                (warmup_gamma_discount.max(prior_gamma), warmup_sz.max(prior_sz))
+            } else {
+                (warmup_gamma_discount, warmup_sz)
+            };
+
+            if effective_gamma < 1.0 || effective_sz < 1.0 {
+                market_params.hjb_gamma_multiplier *= effective_gamma;
                 debug!(
                     fill_count,
-                    gamma_discount = %format!("{:.2}", warmup_gamma_discount),
-                    size_mult = %format!("{:.2}", warmup_sz),
-                    "Warmup graduated uncertainty active"
+                    gamma_discount = %format!("{:.2}", effective_gamma),
+                    size_mult = %format!("{:.2}", effective_sz),
+                    prior_confidence = %format!("{:.2}", prior_conf),
+                    "Warmup graduated uncertainty active (prior-blended)"
                 );
             }
-            warmup_sz
+            effective_sz
         };
 
         // === V2 INTEGRATION: BOCPD Kappa Relationship Tracking ===

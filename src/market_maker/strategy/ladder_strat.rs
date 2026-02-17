@@ -1776,8 +1776,8 @@ impl LadderStrategy {
 
             // DIAGNOSTIC: dump actual dynamic depths before ladder generation
             if let Some(ref dd) = ladder_config.dynamic_depths {
-                let bid_depths_str: Vec<String> = dd.bid.iter().map(|d| format!("{:.2}", d)).collect();
-                let ask_depths_str: Vec<String> = dd.ask.iter().map(|d| format!("{:.2}", d)).collect();
+                let bid_depths_str: Vec<String> = dd.bid.iter().map(|d| format!("{d:.2}")).collect();
+                let ask_depths_str: Vec<String> = dd.ask.iter().map(|d| format!("{d:.2}")).collect();
                 info!(
                     num_levels = ladder_config.num_levels,
                     bid_depths = %bid_depths_str.join(","),

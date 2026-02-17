@@ -292,6 +292,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     checkpoint_manager: Option<checkpoint::CheckpointManager>,
     /// Last time a checkpoint was saved (for periodic save interval).
     last_checkpoint_save: std::time::Instant,
+    /// Prior confidence [0,1] from injection — populated by inject_prior.
+    /// Used by quote_engine to blend with fill-count warmup.
+    /// 0.0 = cold-start (no prior), 1.0 = fully calibrated fresh prior.
+    prior_confidence: f64,
 
     // === RL Agent Control ===
     // REMOVED — RL superseded by SpreadBandit (contextual bandit).
@@ -504,6 +508,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Checkpoint persistence (disabled by default, enabled via with_checkpoint_dir)
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
+            prior_confidence: 0.0, // Updated by inject_prior
             // Phase 4: RL agent control fields removed (now SpreadBandit)
             // Experience logging (disabled by default, enabled via with_experience_logging)
             experience_logger: None,
@@ -707,6 +712,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .unwrap_or(0),
                 asset: self.config.asset.to_string(),
                 session_duration_s: self.session_start_time.elapsed().as_secs_f64(),
+                base_symbol: checkpoint::asset_identity::base_symbol(&self.config.asset)
+                    .to_string(),
+                source_mode: String::new(),
+                parent_timestamp_ms: 0,
+                chain_depth: 0,
             },
             learned_params: self.stochastic.learned_params.clone(),
             pre_fill: self.tier1.pre_fill_classifier.to_checkpoint(),
@@ -744,6 +754,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             kill_switch: self.safety.kill_switch.to_checkpoint(),
             readiness: checkpoint::PriorReadiness::default(),
             calibration_coordinator: self.calibration_coordinator.clone(),
+            prior_confidence: 0.0,
         }
     }
 
@@ -803,8 +814,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
     ) -> usize {
         use tracing::{info, warn};
 
-        // Validate asset match.
-        if config.require_asset_match && *prior.metadata.asset != *self.config.asset {
+        // Validate asset match (using base symbol for cross-DEX compatibility).
+        if config.require_asset_match
+            && !checkpoint::asset_identity::assets_match(
+                &prior.metadata.asset,
+                &self.config.asset,
+            )
+        {
             warn!(
                 prior_asset = %prior.metadata.asset,
                 our_asset = %self.config.asset,
@@ -813,19 +829,30 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
             return 0;
         }
 
-        // Validate age.
+        // Compute age and age-based confidence (soft decay replaces hard cutoff).
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let age_s = (now_ms.saturating_sub(prior.metadata.timestamp_ms)) as f64 / 1000.0;
-        if age_s > config.max_prior_age_s {
+        let age_confidence =
+            checkpoint::transfer::prior_age_confidence(age_s, &config.age_policy);
+
+        if age_confidence <= 0.0 {
             warn!(
                 age_s = age_s,
-                max_age_s = config.max_prior_age_s,
-                "Prior too old — skipping injection"
+                hard_reject_s = config.age_policy.hard_reject_age_s,
+                "Prior beyond hard reject age — skipping injection"
             );
             return 0;
+        }
+
+        if age_confidence < 1.0 {
+            info!(
+                age_s = %format!("{:.0}", age_s),
+                age_confidence = %format!("{:.2}", age_confidence),
+                "Prior age-decayed — injecting with reduced confidence"
+            );
         }
 
         // Inject all components via restore_from_bundle.
@@ -838,9 +865,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
         // Restore all standard components (including quote outcomes).
         self.restore_from_bundle(&injection_bundle);
 
+        // Compute and store continuous confidence for quote_engine blending.
+        let gate = crate::market_maker::calibration::gate::CalibrationGate::new(
+            crate::market_maker::calibration::gate::CalibrationGateConfig::default(),
+        );
+        let prior_conf = gate.confidence(prior, age_s);
+        self.prior_confidence = prior_conf.overall;
+
         info!(
             asset = %prior.metadata.asset,
             prior_age_s = %format!("{:.0}", age_s),
+            age_confidence = %format!("{:.2}", age_confidence),
+            prior_confidence = %format!("{:.2}", prior_conf.overall),
+            structural = %format!("{:.2}", prior_conf.structural),
+            execution = %format!("{:.2}", prior_conf.execution),
             session_duration_s = %format!("{:.0}", prior.metadata.session_duration_s),
             skip_kill_switch = config.skip_kill_switch,
             "Prior injected successfully"
@@ -863,6 +901,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Get latest mid price.
     pub fn latest_mid(&self) -> f64 {
         self.latest_mid
+    }
+
+    /// Get prior confidence [0,1] from injection.
+    /// 0.0 = cold-start, >0 = prior was injected with this confidence level.
+    pub fn prior_confidence(&self) -> f64 {
+        self.prior_confidence
     }
 
     /// Get kill switch reference for monitoring.

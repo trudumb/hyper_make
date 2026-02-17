@@ -146,6 +146,10 @@ pub struct CheckpointBundle {
     /// Calibration coordinator state for L2-derived kappa blending
     #[serde(default)]
     pub calibration_coordinator: CalibrationCoordinatorCheckpoint,
+    /// Prior confidence [0,1] from injection — how much to trust this prior.
+    /// 0.0 = cold-start, 1.0 = fully calibrated and fresh.
+    #[serde(default)]
+    pub prior_confidence: f64,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -157,12 +161,24 @@ pub struct CheckpointMetadata {
     /// Timestamp when checkpoint was saved (ms since epoch)
     #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub timestamp_ms: u64,
-    /// Asset this checkpoint is for (e.g., "ETH")
+    /// Asset this checkpoint is for (e.g., "ETH" or "hyna:HYPE")
     #[serde(default)]
     pub asset: String,
     /// How long the session ran before this checkpoint (seconds)
     #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub session_duration_s: f64,
+    /// Canonical base symbol without DEX prefix (e.g., "HYPE" for both "HYPE" and "hyna:HYPE")
+    #[serde(default)]
+    pub base_symbol: String,
+    /// Source mode: "paper", "live", or "cold"
+    #[serde(default)]
+    pub source_mode: String,
+    /// Timestamp of parent prior used at injection time (ms since epoch), 0 if cold-start
+    #[serde(default)]
+    pub parent_timestamp_ms: u64,
+    /// Cumulative session count in the prior chain (0 = first session)
+    #[serde(default)]
+    pub chain_depth: u32,
 }
 
 impl Default for CheckpointMetadata {
@@ -172,6 +188,10 @@ impl Default for CheckpointMetadata {
             timestamp_ms: 0,
             asset: String::new(),
             session_duration_s: 0.0,
+            base_symbol: String::new(),
+            source_mode: String::new(),
+            parent_timestamp_ms: 0,
+            chain_depth: 0,
         }
     }
 }
@@ -661,6 +681,7 @@ mod tests {
                 timestamp_ms: 1700000000000,
                 asset: "ETH".to_string(),
                 session_duration_s: 3600.0,
+                ..Default::default()
             },
             learned_params: LearnedParameters::default(),
             pre_fill: PreFillCheckpoint {
@@ -720,6 +741,7 @@ mod tests {
             },
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            prior_confidence: 0.0,
         };
 
         // Serialize to JSON
@@ -787,6 +809,7 @@ mod tests {
                 timestamp_ms: 1700000000000,
                 asset: "ETH".to_string(),
                 session_duration_s: 100.0,
+                ..Default::default()
             },
             learned_params: LearnedParameters::default(),
             pre_fill: PreFillCheckpoint::default(),
@@ -807,6 +830,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            prior_confidence: 0.0,
         };
 
         // Serialize to JSON
@@ -838,6 +862,7 @@ mod tests {
                 timestamp_ms: 1700000000000,
                 asset: "ETH".to_string(),
                 session_duration_s: 100.0,
+                ..Default::default()
             },
             learned_params: LearnedParameters::default(),
             pre_fill: PreFillCheckpoint::default(),
@@ -858,6 +883,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            prior_confidence: 0.0,
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -876,6 +902,7 @@ mod tests {
                 timestamp_ms: 1700000000000,
                 asset: "ETH".to_string(),
                 session_duration_s: 100.0,
+                ..Default::default()
             },
             learned_params: LearnedParameters::default(),
             pre_fill: PreFillCheckpoint::default(),
@@ -896,6 +923,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            prior_confidence: 0.0,
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");

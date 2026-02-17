@@ -145,16 +145,16 @@ impl PositionBudget {
     pub fn diagnostic(&self) -> String {
         let mut parts = vec![format!("base={:.4}", self.base_max)];
         for (source, mult) in &self.reductions {
-            parts.push(format!("{}={:.2}x", source, mult));
+            parts.push(format!("{source}={mult:.2}x"));
         }
         let product: f64 = self.reductions.iter().map(|(_, m)| m).product();
         let raw = self.base_max * product;
         let eff = self.effective();
-        parts.push(format!("raw={:.4}", raw));
+        parts.push(format!("raw={raw:.4}"));
         if self.floor_is_binding() {
-            parts.push(format!("FLOORED→{:.4} (min_viable={:.4})", eff, self.min_viable));
+            parts.push(format!("FLOORED→{eff:.4} (min_viable={:.4})", self.min_viable));
         } else {
-            parts.push(format!("effective={:.4}", eff));
+            parts.push(format!("effective={eff:.4}"));
         }
         parts.join(" | ")
     }

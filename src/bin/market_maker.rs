@@ -895,84 +895,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Run) | None => {
             // === Auto-Calibration Pipeline ===
-            // Unless --force or --skip-calibration, check for calibrated priors
-            // and auto-paper if needed.
+            // Unless --force or --skip-calibration, discover and assess calibrated priors.
+            // Uses multi-path discovery to find priors across asset naming conventions.
             if !cli.force && !cli.skip_calibration {
                 use hyperliquid_rust_sdk::market_maker::calibration::gate::{
                     CalibrationGate, CalibrationGateConfig,
                 };
-                use hyperliquid_rust_sdk::market_maker::checkpoint::types::CheckpointBundle;
+                use hyperliquid_rust_sdk::market_maker::checkpoint::discovery::discover_prior;
 
                 let asset_raw = cli.asset.clone().unwrap_or_else(|| "BTC".to_string());
-                let resolved_asset = if let Some(ref dex_name) = cli.dex {
-                    if asset_raw.contains(':') {
-                        asset_raw.clone()
-                    } else {
-                        format!("{dex_name}:{asset_raw}")
-                    }
-                } else {
-                    asset_raw.clone()
-                };
-
-                // Auto-resolve prior path from --paper-checkpoint or default location
-                let prior_path = cli
-                    .paper_checkpoint
-                    .as_ref()
-                    .map(|p| std::path::PathBuf::from(p).join("prior.json"))
-                    .unwrap_or_else(|| {
-                        std::path::PathBuf::from(format!(
-                            "data/checkpoints/paper/{resolved_asset}/prior.json"
-                        ))
-                    });
 
                 let gate = CalibrationGate::new(CalibrationGateConfig::default());
 
-                // Try to load and assess existing prior
-                let prior_ok = if prior_path.exists() {
-                    match std::fs::read_to_string(&prior_path) {
-                        Ok(json) => match serde_json::from_str::<CheckpointBundle>(&json) {
-                            Ok(bundle) => {
-                                let readiness = &bundle.readiness;
-                                // Check age
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64;
-                                let age_s = (now_ms.saturating_sub(bundle.metadata.timestamp_ms))
-                                    as f64
-                                    / 1000.0;
-                                if age_s > gate.config().max_prior_age_s {
-                                    println!(
-                                        "Prior is stale ({:.0}s old, max {:.0}s)",
-                                        age_s,
-                                        gate.config().max_prior_age_s
-                                    );
-                                    false
-                                } else if gate.passes(readiness) {
-                                    println!(
-                                        "Prior calibration: {:?} ({}/5 estimators ready, {:.0}s session)",
-                                        readiness.verdict,
-                                        readiness.estimators_ready,
-                                        readiness.session_duration_s
-                                    );
-                                    true
-                                } else {
-                                    println!(
-                                        "Prior insufficient: {}",
-                                        gate.explain_failure(readiness)
-                                    );
-                                    false
-                                }
-                            }
-                            Err(e) => {
-                                println!("Failed to parse prior: {e}");
-                                false
-                            }
-                        },
-                        Err(_) => false,
+                // Discover prior across multiple candidate paths (base symbol, dex-prefixed, etc.)
+                let discovered = discover_prior(
+                    &asset_raw,
+                    cli.dex.as_deref(),
+                    "data/checkpoints/paper",
+                    cli.paper_checkpoint.as_deref(),
+                );
+
+                let prior_ok = if let Some(ref found) = discovered {
+                    let readiness = &found.bundle.readiness;
+                    let confidence = gate.confidence(&found.bundle, found.age_s);
+
+                    // Accept priors with overall confidence > 0.3 even if verdict is technically
+                    // Insufficient — a stale-but-learned prior still beats cold-start.
+                    if confidence.overall > 0.3 || gate.passes(readiness) {
+                        println!(
+                            "Prior found at {} (age {:.1}h, confidence {:.2}, verdict {:?}, {}/5 estimators)",
+                            found.path.display(),
+                            found.age_s / 3600.0,
+                            confidence.overall,
+                            readiness.verdict,
+                            readiness.estimators_ready,
+                        );
+                        true
+                    } else if confidence.overall > 0.0 {
+                        println!(
+                            "Prior found but low confidence ({:.2}): {}",
+                            confidence.overall,
+                            gate.explain_failure(readiness)
+                        );
+                        false
+                    } else {
+                        println!(
+                            "Prior too stale (age {:.1}h): {}",
+                            found.age_s / 3600.0,
+                            gate.explain_failure(readiness)
+                        );
+                        false
                     }
                 } else {
-                    println!("No prior found at {}", prior_path.display());
+                    println!("No prior found (searched base symbol and DEX-prefixed paths)");
                     false
                 };
 
@@ -992,24 +967,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     run_paper_mode(&cli, cli.calibration_duration).await?;
                     println!("\n=== Auto-calibration complete, proceeding to live ===\n");
 
-                    // Re-check the saved prior
-                    if prior_path.exists() {
-                        if let Ok(json) = std::fs::read_to_string(&prior_path) {
-                            if let Ok(bundle) = serde_json::from_str::<CheckpointBundle>(&json) {
-                                if !gate.passes(&bundle.readiness) {
-                                    return Err(format!(
-                                        "Auto-calibration completed but prior still insufficient: {}\n\
-                                         Use --force to override.",
-                                        gate.explain_failure(&bundle.readiness)
-                                    )
-                                    .into());
-                                }
-                                println!(
-                                    "Post-calibration verdict: {:?}",
-                                    bundle.readiness.verdict
-                                );
-                            }
+                    // Re-check via discovery
+                    let post_cal = discover_prior(
+                        &asset_raw,
+                        cli.dex.as_deref(),
+                        "data/checkpoints/paper",
+                        cli.paper_checkpoint.as_deref(),
+                    );
+                    if let Some(ref found) = post_cal {
+                        let confidence = gate.confidence(&found.bundle, found.age_s);
+                        if confidence.overall < 0.3 && !gate.passes(&found.bundle.readiness) {
+                            return Err(format!(
+                                "Auto-calibration completed but prior still insufficient (confidence {:.2}): {}\n\
+                                 Use --force to override.",
+                                confidence.overall,
+                                gate.explain_failure(&found.bundle.readiness)
+                            )
+                            .into());
                         }
+                        println!(
+                            "Post-calibration: confidence {:.2}, verdict {:?}",
+                            confidence.overall,
+                            found.bundle.readiness.verdict,
+                        );
                     }
                 }
             }
@@ -2138,52 +2118,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
     }
 
-    // === Prior Injection: Load paper checkpoint and inject full prior (φ→ψ) ===
-    // Auto-resolve: use --paper-checkpoint if given, else check default paper prior path
-    let paper_ckpt_path_resolved = cli.paper_checkpoint.clone().or_else(|| {
-        let default_path = format!("data/checkpoints/paper/{asset}");
-        if std::path::Path::new(&default_path).join("prior.json").exists() {
-            Some(default_path)
+    // === Prior Injection: Discover and inject paper prior (φ→ψ) ===
+    // Uses multi-path discovery to find priors across asset naming conventions.
+    {
+        use hyperliquid_rust_sdk::market_maker::checkpoint::{
+            PriorInject,
+            discovery::discover_prior,
+            transfer::InjectionConfig,
+        };
+
+        let discovered = discover_prior(
+            &asset,
+            cli.dex.as_deref(),
+            "data/checkpoints/paper",
+            cli.paper_checkpoint.as_deref(),
+        );
+
+        if let Some(found) = discovered {
+            let config = InjectionConfig::default();
+            let _ = market_maker.inject_prior(&found.bundle, &config);
+            tracing::info!(
+                path = %found.path.display(),
+                age_h = %format!("{:.1}", found.age_s / 3600.0),
+                prior_confidence = %format!("{:.2}", market_maker.prior_confidence()),
+                "Injected paper prior into live state (φ→ψ transfer via discovery)"
+            );
         } else {
-            None
-        }
-    });
-    if let Some(ref paper_ckpt_path) = paper_ckpt_path_resolved {
-        use hyperliquid_rust_sdk::market_maker::checkpoint::{PriorInject, transfer::InjectionConfig};
-
-        // Try multiple candidate paths (paper mode saves to prior.json, old path used latest/checkpoint.json)
-        let candidates = [
-            std::path::Path::new(paper_ckpt_path).join("prior.json"),
-            std::path::Path::new(paper_ckpt_path).join("latest/checkpoint.json"),
-            std::path::PathBuf::from(paper_ckpt_path), // direct file path
-        ];
-
-        let mut loaded = false;
-        for candidate in &candidates {
-            if let Ok(json) = std::fs::read_to_string(candidate) {
-                match serde_json::from_str::<hyperliquid_rust_sdk::market_maker::checkpoint::CheckpointBundle>(&json) {
-                    Ok(bundle) => {
-                        let config = InjectionConfig::default();
-                        let _ = market_maker.inject_prior(&bundle, &config);
-                        tracing::info!(
-                            path = %candidate.display(),
-                            "Injected paper prior into live state (full φ→ψ transfer)"
-                        );
-                        loaded = true;
-                        break;
-                    }
-                    Err(e) => tracing::warn!(
-                        path = %candidate.display(),
-                        error = %e,
-                        "Failed to parse checkpoint JSON, trying next candidate"
-                    ),
-                }
-            }
-        }
-        if !loaded {
-            tracing::warn!(
-                paper_ckpt_path = %paper_ckpt_path,
-                "No valid paper checkpoint found (tried prior.json, latest/checkpoint.json, and direct path)"
+            tracing::info!(
+                asset = %asset,
+                "No paper prior discovered — starting from cold state"
             );
         }
     }
@@ -2735,8 +2698,9 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     // Enable experience logging for offline RL training
     market_maker = market_maker.with_experience_logging("logs/experience");
 
-    // Wire checkpoint persistence
-    let checkpoint_dir = PathBuf::from(format!("data/checkpoints/paper/{asset}"));
+    // Wire checkpoint persistence (use canonical base symbol for consistent paths)
+    let base_sym = hyperliquid_rust_sdk::market_maker::checkpoint::asset_identity::base_symbol(&asset);
+    let checkpoint_dir = PathBuf::from(format!("data/checkpoints/paper/{base_sym}"));
     market_maker = market_maker.with_checkpoint_dir(checkpoint_dir);
 
     // Disable Binance signals for paper (no cross-venue feed)
@@ -2774,11 +2738,15 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
                     estimators_ready = prior.readiness.estimators_ready,
                     "Prior readiness assessed"
                 );
-                let checkpoint_path = format!("data/checkpoints/paper/{asset}/prior.json");
+                // Save using canonical base symbol for cross-mode discovery
+                let base_sym = hyperliquid_rust_sdk::market_maker::checkpoint::asset_identity::base_symbol(&asset);
+                // Stamp source_mode for prior chain tracking
+                prior.metadata.source_mode = "paper".to_string();
+                let checkpoint_path = format!("data/checkpoints/paper/{base_sym}/prior.json");
                 if let Ok(json) = serde_json::to_string_pretty(&prior) {
-                    std::fs::create_dir_all(format!("data/checkpoints/paper/{asset}"))?;
+                    std::fs::create_dir_all(format!("data/checkpoints/paper/{base_sym}"))?;
                     std::fs::write(&checkpoint_path, json)?;
-                    info!(path = %checkpoint_path, "Paper prior saved");
+                    info!(path = %checkpoint_path, "Paper prior saved (canonical path)");
                 }
             }
         }

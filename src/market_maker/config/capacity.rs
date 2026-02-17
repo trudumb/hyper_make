@@ -307,8 +307,7 @@ impl CapacityBudget {
         if max_levels <= 2 {
             Viability::Concentrated {
                 reason: format!(
-                    "Only {} viable levels (bid={}, ask={}); concentrated quoting",
-                    max_levels, bid_levels, ask_levels,
+                    "Only {max_levels} viable levels (bid={bid_levels}, ask={ask_levels}); concentrated quoting",
                 ),
             }
         } else {

@@ -12,7 +12,49 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::market_maker::checkpoint::transfer::{PriorAgePolicy, prior_age_confidence};
 use crate::market_maker::checkpoint::types::{CheckpointBundle, PriorReadiness, PriorVerdict};
+
+/// Continuous confidence assessment for a prior checkpoint.
+///
+/// Replaces binary Ready/Marginal/Insufficient with smooth [0,1] scores
+/// that drive spread/size multipliers. A prior with 8 kappa observations
+/// (threshold=10) gets ~0.8 confidence, not zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PriorConfidence {
+    /// Structural confidence: vol + regime estimator saturation [0,1].
+    /// Geometric mean of (obs / threshold) for market-data estimators.
+    pub structural: f64,
+    /// Execution confidence: kappa + AS + fill_rate saturation [0,1].
+    /// Geometric mean of (obs / threshold) for fill-based estimators.
+    pub execution: f64,
+    /// Age confidence: freshness of the prior [0,1].
+    /// From `prior_age_confidence()`.
+    pub age: f64,
+    /// Overall confidence: combined score [0,1].
+    /// `min(structural, age) × (0.5 + 0.5 × execution)`.
+    pub overall: f64,
+}
+
+/// Spread multiplier from confidence: wider spreads when confidence is low.
+///
+/// Returns [1.0, 3.0] — at confidence=1.0 returns 1.0 (no widening),
+/// at confidence=0.0 returns 3.0 (3x wider spreads for safety).
+pub fn spread_multiplier_from_confidence(confidence: f64) -> f64 {
+    let c = confidence.clamp(0.0, 1.0);
+    // Linear: 3.0 - 2.0 * c
+    3.0 - 2.0 * c
+}
+
+/// Size multiplier from confidence: smaller size when confidence is low.
+///
+/// Returns [0.1, 1.0] — at confidence=1.0 returns 1.0 (full size),
+/// at confidence=0.0 returns 0.1 (10% size to limit risk).
+pub fn size_multiplier_from_confidence(confidence: f64) -> f64 {
+    let c = confidence.clamp(0.0, 1.0);
+    // Linear: 0.1 + 0.9 * c
+    0.1 + 0.9 * c
+}
 
 /// Configuration for the calibration gate thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +182,55 @@ impl CalibrationGate {
             kelly_fills,
             session_duration_s,
             estimators_ready,
+        }
+    }
+
+    /// Compute continuous confidence for a checkpoint bundle.
+    ///
+    /// Returns a `PriorConfidence` with structural, execution, age, and overall scores.
+    /// This replaces the binary Ready/Marginal/Insufficient with smooth [0,1] values.
+    pub fn confidence(&self, bundle: &CheckpointBundle, age_s: f64) -> PriorConfidence {
+        let age_policy = PriorAgePolicy::default();
+
+        // Structural confidence: geometric mean of vol/regime saturation
+        let vol_sat = (bundle.vol_filter.observation_count as f64
+            / self.config.min_market_observations.max(1) as f64)
+            .min(1.0);
+        let regime_obs = bundle.regime_hmm.observation_count as f64;
+        let regime_sat =
+            (regime_obs / self.config.min_market_observations.max(1) as f64).min(1.0);
+        let structural = (vol_sat * regime_sat).sqrt();
+
+        // Execution confidence: geometric mean of kappa/AS/fill_rate saturation
+        let kappa_obs = if bundle.kappa_own.total_observations > 0 {
+            bundle.kappa_own.total_observations
+        } else {
+            bundle.kappa_own.observation_count
+        };
+        let kappa_sat =
+            (kappa_obs as f64 / self.config.min_kappa_observations.max(1) as f64).min(1.0);
+        let as_sat = (bundle.pre_fill.learning_samples as f64
+            / self.config.min_as_samples.max(1) as f64)
+            .min(1.0);
+        let fill_sat = (bundle.fill_rate.observation_count as f64
+            / self.config.min_fill_rate_observations.max(1) as f64)
+            .min(1.0);
+        // Use cubic root for 3 factors
+        let execution = (kappa_sat * as_sat * fill_sat).cbrt();
+
+        // Age confidence from policy
+        let age = prior_age_confidence(age_s, &age_policy);
+
+        // Overall: min(structural, age) × (0.5 + 0.5 × execution)
+        // Structural and age are both required foundations.
+        // Execution is additive on top — zero execution still gets 50% base.
+        let overall = structural.min(age) * (0.5 + 0.5 * execution);
+
+        PriorConfidence {
+            structural,
+            execution,
+            age,
+            overall,
         }
     }
 
@@ -285,6 +376,7 @@ mod tests {
                 timestamp_ms: 1700000000000,
                 asset: "HYPE".to_string(),
                 session_duration_s,
+                ..Default::default()
             },
             learned_params: LearnedParameters::default(),
             pre_fill: PreFillCheckpoint {
@@ -324,6 +416,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: crate::market_maker::checkpoint::types::CalibrationCoordinatorCheckpoint::default(),
+            prior_confidence: 0.0,
         }
     }
 
@@ -502,5 +595,78 @@ mod tests {
         let readiness = gate.assess(&bundle);
         assert_eq!(readiness.verdict, PriorVerdict::Insufficient);
         assert_eq!(readiness.estimators_ready, 5);
+    }
+
+    // === PriorConfidence tests ===
+
+    #[test]
+    fn test_confidence_zero_observations() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        let bundle = make_bundle(0.0, 0, 0, 0, 0, 0, 0, 0);
+        let conf = gate.confidence(&bundle, 0.0);
+        assert_eq!(conf.structural, 0.0);
+        assert_eq!(conf.execution, 0.0);
+        assert_eq!(conf.age, 1.0); // fresh
+        assert_eq!(conf.overall, 0.0); // min(0, 1) * (0.5+0) = 0
+    }
+
+    #[test]
+    fn test_confidence_full_calibration() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        let bundle = make_bundle(2000.0, 100, 20, 30, 100, 30, 5, 5);
+        let conf = gate.confidence(&bundle, 100.0); // fresh
+        assert!((conf.structural - 1.0).abs() < 0.01);
+        assert!((conf.execution - 1.0).abs() < 0.01);
+        assert_eq!(conf.age, 1.0);
+        assert!((conf.overall - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_confidence_structural_only() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        // Market data converged, zero fills
+        let bundle = make_bundle(2000.0, 80, 0, 0, 60, 0, 0, 0);
+        let conf = gate.confidence(&bundle, 100.0);
+        assert!(conf.structural > 0.9, "structural should be ~1.0: {}", conf.structural);
+        assert_eq!(conf.execution, 0.0);
+        // overall = min(1.0, 1.0) * (0.5 + 0.5*0) = 0.5
+        assert!((conf.overall - 0.5).abs() < 0.05, "overall ~0.5: {}", conf.overall);
+    }
+
+    #[test]
+    fn test_confidence_partial_execution() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        // 8/10 kappa (below threshold but close), other execution at 0
+        let bundle = make_bundle(2000.0, 100, 8, 0, 100, 0, 0, 0);
+        let conf = gate.confidence(&bundle, 100.0);
+        assert!(conf.structural > 0.9);
+        // kappa: 8/10=0.8, AS: 0/15=0, fill: 0/15=0 → geomean = 0
+        assert_eq!(conf.execution, 0.0);
+    }
+
+    #[test]
+    fn test_confidence_aged_prior() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        let bundle = make_bundle(2000.0, 100, 20, 30, 100, 30, 5, 5);
+        // 48h old
+        let conf = gate.confidence(&bundle, 48.0 * 3600.0);
+        assert!(conf.age < 1.0, "Should be age-decayed: {}", conf.age);
+        assert!(conf.age > 0.15, "Should be above floor: {}", conf.age);
+        assert!(conf.overall < 1.0);
+        assert!(conf.overall > 0.1);
+    }
+
+    #[test]
+    fn test_spread_multiplier_boundaries() {
+        assert!((spread_multiplier_from_confidence(1.0) - 1.0).abs() < 0.001);
+        assert!((spread_multiplier_from_confidence(0.0) - 3.0).abs() < 0.001);
+        assert!((spread_multiplier_from_confidence(0.5) - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_size_multiplier_boundaries() {
+        assert!((size_multiplier_from_confidence(1.0) - 1.0).abs() < 0.001);
+        assert!((size_multiplier_from_confidence(0.0) - 0.1).abs() < 0.001);
+        assert!((size_multiplier_from_confidence(0.5) - 0.55).abs() < 0.001);
     }
 }

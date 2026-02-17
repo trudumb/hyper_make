@@ -22,6 +22,8 @@
 //! - **Atomic writes**: Write to `.tmp`, then `fs::rename` to prevent corruption
 //! - **7-day retention**: ~100KB each, old checkpoints cleaned up automatically
 
+pub mod asset_identity;
+pub mod discovery;
 pub mod types;
 pub mod prediction_reader;
 pub mod transfer;
@@ -213,6 +215,10 @@ mod tests {
                 timestamp_ms: 1700000000000,
                 asset: "ETH".to_string(),
                 session_duration_s: 3600.0,
+                base_symbol: "ETH".to_string(),
+                source_mode: "paper".to_string(),
+                parent_timestamp_ms: 0,
+                chain_depth: 0,
             },
             learned_params: LearnedParameters::default(),
             pre_fill: PreFillCheckpoint {
@@ -240,6 +246,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            prior_confidence: 0.0,
         }
     }
 
