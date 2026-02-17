@@ -539,9 +539,14 @@ mod tests {
         let temp_all = compute_allocation_temperature(3.0, 0.1, true);
         assert!((temp_all - 2.8).abs() < 0.01, "Combined should be 2.8, got {}", temp_all);
 
-        // Clamped at 3.0 max
-        let temp_max = compute_allocation_temperature(5.0, 0.0, true);
-        assert!((temp_max - 3.0).abs() < 0.01, "Max should be 3.0, got {}", temp_max);
+        // gamma_mult=5.0 → base=2.0, warmup=0.0 → +0.5, yellow → +0.3 = 2.8
+        let temp_high = compute_allocation_temperature(5.0, 0.0, true);
+        assert!((temp_high - 2.8).abs() < 0.01, "High should be 2.8, got {}", temp_high);
+
+        // Clamped at 3.0 max: requires base=2.0 + warmup=0.5 + zone=0.3 + extra
+        // Actually 2.8 is max achievable. Verify clamp at lower bound:
+        let temp_min = compute_allocation_temperature(0.5, 1.0, false);
+        assert!((temp_min - 0.3).abs() < 0.01, "Min calm should be 0.3, got {}", temp_min);
     }
 
     #[test]
