@@ -1741,9 +1741,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .or_else(|| auto_detect_reference(&asset)),
     };
 
-    // Extract EMA config before mm_config is moved
+    // Extract values before mm_config is moved
     let microprice_ema_alpha = mm_config.stochastic.microprice_ema_alpha;
     let microprice_ema_min_change_bps = mm_config.stochastic.microprice_ema_min_change_bps;
+    let has_reference_symbol = mm_config.reference_symbol.is_some();
 
     // Create strategy based on config
     let strategy: Box<dyn QuotingStrategy> = match config.strategy.strategy_type {
@@ -2115,10 +2116,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 binance_symbol = %sym,
                 "Binance lead-lag feed active (auto-derived from asset)"
             );
+        } else if has_reference_symbol {
+            // HIP-3: No Binance feed, but reference perp available.
+            // Keep lead_lag enabled — reference perp mid from AllMids feeds it.
+            // Only disable cross_venue (Binance trade flow dependent).
+            tracing::info!(
+                asset = %asset,
+                "No Binance feed — using reference perp for lead-lag signal"
+            );
+            market_maker.disable_cross_venue_only();
         } else {
             tracing::warn!(
                 asset = %asset,
-                "No Binance equivalent for asset — cross-venue signal disabled. \
+                "No Binance equivalent and no reference symbol — cross-venue signal disabled. \
                  Use --binance-symbol to override if a correlated pair exists."
             );
             market_maker.disable_binance_signals();

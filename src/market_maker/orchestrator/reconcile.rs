@@ -2457,6 +2457,31 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let cycle_interval_s = 5.0;
         let budget = ApiBudget::from_headroom(headroom_pct, rate_cap, cycle_interval_s);
 
+        // === EMERGENCY REPLENISHMENT ===
+        // When we have significantly fewer orders than target (deficit ≥ 3 levels),
+        // mark NewPlace actions as emergency to bypass the budget allocator's value
+        // filter. This prevents the local_bids=0 death spiral where the scorer
+        // can't justify placements but the MM has no resting orders.
+        {
+            use crate::market_maker::tracking::ActionType;
+            let bid_deficit = bid_levels.len().saturating_sub(num_current_bids);
+            let ask_deficit = ask_levels.len().saturating_sub(num_current_asks);
+            let needs_emergency_replenish = bid_deficit >= 2 || ask_deficit >= 2;
+
+            if needs_emergency_replenish {
+                for action in bid_scored.iter_mut().chain(ask_scored.iter_mut()) {
+                    if matches!(action.action, ActionType::NewPlace) {
+                        action.is_emergency = true;
+                    }
+                }
+                info!(
+                    bid_deficit,
+                    ask_deficit,
+                    "Emergency replenishment: marking NewPlace as emergency (deficit >= 2)"
+                );
+            }
+        }
+
         // Merge both sides and allocate within budget
         let mut all_scored: Vec<_> = bid_scored.drain(..).chain(ask_scored.drain(..)).collect();
 

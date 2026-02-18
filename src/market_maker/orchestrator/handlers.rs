@@ -189,11 +189,33 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // === Cross-Exchange Signal Integration: Feed HL price ===
             // Update SignalIntegrator with Hyperliquid mid price for lead-lag calculation.
-            // This pairs with Binance prices from handle_binance_price_update().
+            // This pairs with Binance prices from handle_binance_price_update(),
+            // OR reference perp prices for HIP-3 tokens (below).
             self.stochastic.signal_integrator.on_hl_price(
                 self.latest_mid,
                 current_time_ms as i64,
             );
+
+            // === Reference Perp Lead-Lag (Fix C) ===
+            // For HIP-3 tokens (e.g. hyna:HYPE), the main perp (HYPE) is the
+            // leading signal. Extract its mid from AllMids and feed it to the
+            // signal integrator's lead-lag system, replacing the Binance feed.
+            if let Some(ref ref_sym) = self.config.reference_symbol {
+                if let Some(ref_mid_str) = all_mids.data.mids.get(ref_sym) {
+                    if let Ok(ref_mid) = ref_mid_str.parse::<f64>() {
+                        if ref_mid > 0.0 {
+                            self.prev_reference_perp_mid = self.reference_perp_mid;
+                            self.reference_perp_mid = ref_mid;
+
+                            // Feed reference perp as the leading signal for lead-lag
+                            self.stochastic.signal_integrator.on_binance_price(
+                                ref_mid,
+                                current_time_ms as i64,
+                            );
+                        }
+                    }
+                }
+            }
 
             // === Phase 3: Event-Driven Quote Updates ===
             // Instead of calling update_quotes() on every AllMids, record the event

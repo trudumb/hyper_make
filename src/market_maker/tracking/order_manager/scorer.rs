@@ -112,6 +112,9 @@ pub struct ScoredUpdate {
     pub target_size: f64,
     /// Current price (0.0 for new placements).
     pub current_price: f64,
+    /// Whether this action is emergency priority (bypasses budget).
+    /// Set by the reconciler when ladder has large deficit (≥3 levels missing).
+    pub is_emergency: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +388,7 @@ pub fn score_all(
                 target_price: target.price,
                 target_size: target.size,
                 current_price: order.price,
+                is_emergency: false,
             });
         } else {
             // Unmatched target: needs a new placement.
@@ -403,12 +407,19 @@ pub fn score_all(
                 );
                 let ev_new = p_fill_new * spread_capture.max(0.0);
                 let api_cost = flat_api_cost_bps(ActionType::NewPlace);
+                // Floor: new placements always have at least 1.0 bps value.
+                // Having orders on the book captures optionality (fills, information,
+                // maker rebate) that the EV model underestimates for back-of-queue
+                // placements. Without this floor, the budget allocator filters
+                // NewPlace actions as negative-value, causing the local_bids=0 death spiral.
+                let raw_value = ev_new - api_cost;
+                let value_bps = raw_value.max(1.0);
 
                 results.push(ScoredUpdate {
                     oid: None,
                     target_idx,
                     action: ActionType::NewPlace,
-                    value_bps: ev_new - api_cost,
+                    value_bps,
                     api_calls: ActionType::NewPlace.api_calls(),
                     p_fill_keep: 0.0,
                     p_fill_new,
@@ -416,6 +427,7 @@ pub fn score_all(
                     target_price: target.price,
                     target_size: target.size,
                     current_price: 0.0,
+                    is_emergency: false,
                 });
             }
         }
@@ -470,6 +482,7 @@ pub fn score_all(
                 target_price: 0.0,
                 target_size: 0.0,
                 current_price: order.price,
+                is_emergency: false,
             });
         }
     }

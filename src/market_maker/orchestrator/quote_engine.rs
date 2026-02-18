@@ -2605,49 +2605,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
-        // === CANCEL-ON-TOXICITY (Sprint 2.2) ===
-        // When pre-fill toxicity exceeds 0.75 on a side, clear that side of the
-        // ladder entirely. The reconciler will cancel resting orders. This prevents
-        // getting filled at minimum tick spread during toxic flow bursts.
-        // 5s cooldown prevents oscillation from noisy toxicity signals.
-        const TOXICITY_CANCEL_THRESHOLD: f64 = 0.75;
-        const TOXICITY_CANCEL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
-
-        let now_tox = std::time::Instant::now();
-        if market_params.pre_fill_toxicity_bid > TOXICITY_CANCEL_THRESHOLD {
-            let should_cancel = self.last_toxicity_cancel_bid
-                .is_none_or(|t| now_tox.duration_since(t) >= TOXICITY_CANCEL_COOLDOWN);
-            if should_cancel {
-                let cleared = ladder.bids.len();
-                ladder.bids.clear();
-                self.last_toxicity_cancel_bid = Some(now_tox);
-                if cleared > 0 {
-                    tracing::warn!(
-                        toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
-                        cleared_levels = cleared,
-                        "TOXICITY CANCEL: bid side cleared (toxicity > {:.0}%)",
-                        TOXICITY_CANCEL_THRESHOLD * 100.0
-                    );
-                }
-            }
-        }
-        if market_params.pre_fill_toxicity_ask > TOXICITY_CANCEL_THRESHOLD {
-            let should_cancel = self.last_toxicity_cancel_ask
-                .is_none_or(|t| now_tox.duration_since(t) >= TOXICITY_CANCEL_COOLDOWN);
-            if should_cancel {
-                let cleared = ladder.asks.len();
-                ladder.asks.clear();
-                self.last_toxicity_cancel_ask = Some(now_tox);
-                if cleared > 0 {
-                    tracing::warn!(
-                        toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
-                        cleared_levels = cleared,
-                        "TOXICITY CANCEL: ask side cleared (toxicity > {:.0}%)",
-                        TOXICITY_CANCEL_THRESHOLD * 100.0
-                    );
-                }
-            }
-        }
+        // === TOXICITY HANDLING ===
+        // Toxicity routes through GLFT parameter space (AS multipliers on spread),
+        // NOT binary side-clearing. The pre-fill AS multipliers already handle toxic
+        // flow correctly: raw_mult_bid/ask widen the spread proportionally.
+        // Binary side-clearing was the root cause of the bid=0 death spiral.
 
         // Post-condition: if capacity said viable but ladder is empty, something is wrong
         if capacity_budget.should_quote() && ladder.is_empty() {
@@ -2804,32 +2766,53 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let position_ratio = pos / max_pos;
                 let vq = *viable.quantum();
 
-                if position_ratio > 0.01 {
-                    // Long: cancel bids (would increase), keep asks at 50% (reduce)
+                // Regime-dependent clearing threshold: use max_position_fraction
+                // from blended regime params. Extreme regime clears at 50%,
+                // Normal at 80%, Calm at 90%. Clamped to [0.40, 0.90] for safety.
+                let regime_clear_threshold = self.stochastic.regime_state.params
+                    .max_position_fraction
+                    .clamp(0.40, 0.90);
+
+                if position_ratio > regime_clear_threshold {
+                    // Extreme long: cancel bids, keep asks at 50%
                     if !viable.bids.is_empty() {
                         info!(
                             position = %format!("{:.4}", pos),
+                            position_ratio = %format!("{:.2}", position_ratio),
+                            regime_threshold = %format!("{:.2}", regime_clear_threshold),
                             cleared_bids = viable.bids.len(),
-                            "Emergency: clearing bids (long position, keeping asks to reduce)"
+                            "Emergency: clearing bids (long > regime threshold, keeping asks to reduce)"
                         );
                         viable.bids.clear();
                     }
                     viable.asks.reduce_sizes(0.5, &vq);
-                } else if position_ratio < -0.01 {
-                    // Short: cancel asks (would increase), keep bids at 50% (reduce)
+                } else if position_ratio < -regime_clear_threshold {
+                    // Extreme short: cancel asks, keep bids at 50%
                     if !viable.asks.is_empty() {
                         info!(
                             position = %format!("{:.4}", pos),
+                            position_ratio = %format!("{:.2}", position_ratio),
+                            regime_threshold = %format!("{:.2}", regime_clear_threshold),
                             cleared_asks = viable.asks.len(),
-                            "Emergency: clearing asks (short position, keeping bids to reduce)"
+                            "Emergency: clearing asks (short > regime threshold, keeping bids to reduce)"
                         );
                         viable.asks.clear();
                     }
                     viable.bids.reduce_sizes(0.5, &vq);
                 } else {
-                    // Near zero: keep both sides at 30% size
-                    viable.bids.reduce_sizes(0.3, &vq);
-                    viable.asks.reduce_sizes(0.3, &vq);
+                    // Moderate position or near-zero: route through σ spike.
+                    // 2x σ → ~1.4x wider both sides via GLFT, preserves two-sided quoting.
+                    market_params.sigma_cascade_mult = market_params.sigma_cascade_mult.max(2.0);
+                    let size_mult = if position_ratio.abs() > 0.01 { 0.5 } else { 0.3 };
+                    viable.bids.reduce_sizes(size_mult, &vq);
+                    viable.asks.reduce_sizes(size_mult, &vq);
+                    info!(
+                        position = %format!("{:.4}", pos),
+                        position_ratio = %format!("{:.2}", position_ratio),
+                        sigma_cascade_mult = %format!("{:.2}", market_params.sigma_cascade_mult),
+                        size_mult = %format!("{:.2}", size_mult),
+                        "Emergency: σ spike + size reduction (moderate position, preserving two-sided)"
+                    );
                 }
             }
 

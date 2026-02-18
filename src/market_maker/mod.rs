@@ -353,12 +353,9 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// fill rates, edge, and calibration bias per action type.
     reconcile_outcome_tracker: tracking::ReconcileOutcomeTracker,
 
-    // === Toxicity-Based Cancel (Sprint 2.2) ===
-    /// Last time high toxicity triggered ladder clearing on bid side.
-    /// 5s cooldown prevents churn from oscillating toxicity signals.
-    last_toxicity_cancel_bid: Option<std::time::Instant>,
-    /// Last time high toxicity triggered ladder clearing on ask side.
-    last_toxicity_cancel_ask: Option<std::time::Instant>,
+    // === Toxicity-Based Cancel (Sprint 2.2) === REMOVED
+    // Binary side-clearing replaced by GLFT parameter routing (AS multipliers).
+    // See quote_engine.rs TOXICITY HANDLING comment.
 
     // === Cross-Asset Signals (Sprint 4.1) ===
     /// BTC lead-lag, funding divergence, and OI-vol signals for altcoins.
@@ -366,6 +363,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     pub cross_asset_signals: learning::cross_asset::CrossAssetSignals,
     /// Last Binance mid price for computing BTC returns.
     last_binance_mid: f64,
+    /// Last reference perp mid price for HIP-3 cross-venue drift.
+    /// When trading hyna:HYPE, this tracks the HYPE perp mid from AllMids.
+    reference_perp_mid: f64,
+    /// Previous reference perp mid for computing returns.
+    prev_reference_perp_mid: f64,
 
     // === Cancel-Race AS Tracking (Sprint 6.3) ===
     /// Tracks adverse selection from cancel-race events (cancel sent, fill arrived first).
@@ -584,10 +586,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }),
             churn_tracker: analytics::churn_tracker::ChurnTracker::new(60),
             reconcile_outcome_tracker: tracking::ReconcileOutcomeTracker::new(),
-            last_toxicity_cancel_bid: None,
-            last_toxicity_cancel_ask: None,
             cross_asset_signals,
             last_binance_mid: 0.0,
+            reference_perp_mid: 0.0,
+            prev_reference_perp_mid: 0.0,
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
         }
     }
@@ -720,6 +722,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// permanent signal staleness widening.
     pub fn disable_binance_signals(&mut self) {
         self.stochastic.signal_integrator.disable_binance_signals();
+    }
+
+    /// Disable only cross-venue trade flow, keep lead-lag active for reference perp.
+    pub fn disable_cross_venue_only(&mut self) {
+        self.stochastic.signal_integrator.disable_cross_venue_only();
     }
 
     /// Enable experience logging for RL SARSA tuples.

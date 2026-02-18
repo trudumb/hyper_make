@@ -1374,6 +1374,15 @@ impl SignalIntegrator {
         self.signal_availability.set(SignalAvailability::NeverConfigured);
     }
 
+    /// Disable only cross-venue trade flow signal, keeping lead-lag active.
+    /// Used when a reference perp (e.g. HYPE for hyna:HYPE) feeds lead-lag
+    /// via AllMids, but Binance trade flow is unavailable.
+    pub fn disable_cross_venue_only(&mut self) {
+        self.config.use_cross_venue = false;
+        // Keep use_lead_lag = true — reference perp mid feeds it
+        // Don't mark NeverConfigured — lead-lag IS configured
+    }
+
     /// Returns position limit multiplier based on signal availability.
     ///
     /// Key change from old behavior: `NeverConfigured` returns 1.0 (was 0.30),

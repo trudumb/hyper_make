@@ -160,7 +160,10 @@ fn is_emergency(update: &ScoredUpdate) -> bool {
     // of value_bps (which is always negative: -ev_keep - api_cost). A stale order
     // has no matching target and wastes a resting slot. W2 audit fix: was > 10.0
     // which is unreachable since StaleCancel.value_bps is always negative.
-    matches!(update.action, ActionType::StaleCancel)
+    //
+    // is_emergency field: set by reconciler when ladder has large deficit (≥3 levels
+    // missing). Ensures replenishment bypasses budget even when per-order EV is low.
+    matches!(update.action, ActionType::StaleCancel) || update.is_emergency
 }
 
 /// Convert a ScoredUpdate to one or more LadderActions.
@@ -265,6 +268,7 @@ mod tests {
             target_price,
             target_size,
             current_price: target_price, // Same for simplicity
+            is_emergency: false,
         }
     }
 
