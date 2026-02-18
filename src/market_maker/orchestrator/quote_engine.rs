@@ -745,6 +745,47 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // otherwise cause unnecessary requotes. Gated by SmootherConfig.enabled.
         self.parameter_smoother.smooth(&mut market_params, false);
 
+        // === Fix 4: Hawkes σ_conditional — per-cycle HWM decay ===
+        // On each cycle: compute new σ_cascade_mult from Hawkes intensity.
+        // Can raise above HWM, but cannot lower below HWM during 15s cooldown.
+        // After cooldown, HWM decays exponentially toward 1.0.
+        {
+            let hawkes_ratio = self.tier2.hawkes.intensity_ratio();
+            let new_mult = if hawkes_ratio > 1.0 {
+                hawkes_ratio.sqrt().min(3.0)
+            } else {
+                1.0
+            };
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let since_last_fill_ms = now_ms.saturating_sub(self.sigma_cascade_hwm_set_at);
+            let decay_ms: u64 = 15_000; // 15s cooldown before HWM decays
+
+            let decayed_hwm = if since_last_fill_ms > decay_ms {
+                let elapsed_after_cooldown = (since_last_fill_ms - decay_ms) as f64;
+                let decay_factor = (-elapsed_after_cooldown / 10_000.0).exp();
+                1.0 + (self.sigma_cascade_hwm - 1.0) * decay_factor
+            } else {
+                self.sigma_cascade_hwm // Hold HWM during cooldown
+            };
+
+            // Cycle can raise above HWM, but not lower below it during cooldown
+            market_params.sigma_cascade_mult = new_mult.max(decayed_hwm);
+        }
+
+        // === Fix 2: Wire AS floor from estimator ===
+        {
+            let as_floor = self.tier1.adverse_selection.as_floor_bps();
+            market_params.as_floor_bps = as_floor.max(self.as_floor_hwm);
+        }
+
+        // === Fix 3: Wire ghost liquidity gamma mult from kappa orchestrator ===
+        market_params.ghost_liquidity_gamma_mult =
+            self.estimator.kappa_orchestrator().ghost_liquidity_gamma_mult();
+
         // === Construct FeatureSnapshot for downstream models ===
         // Compact projection of market state for toxicity classification,
         // queue-value estimation, and execution mode selection.
@@ -1507,6 +1548,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.config.risk_aversion, // User preference (γ)
             DEFAULT_NUM_LEVELS,        // Ladder config (default 25 levels)
             MIN_ORDER_NOTIONAL,        // Exchange minimum ($10)
+            self.config.target_liquidity, // Fix 6: config target for geometric blend
         );
 
         // === PHASE 3+4: effective_max_position from InventoryGovernor + regime tightening ===
@@ -1679,11 +1721,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let risk_size_mult = risk_overlay.size_multiplier;
         let combined_size_mult = risk_size_mult * warmup_size_mult;
         let new_effective_liquidity = if market_params.derived_target_liquidity > 0.0 {
-            // GLFT-derived is available: use it, capped by user config
+            // Fix 6: GLFT-derived liquidity is already geometrically blended
+            // with config target in market_params derivation. No double-cap here.
+            // Config is INPUT to geometric blend, not a post-cap.
             (market_params
                 .derived_target_liquidity
                 * combined_size_mult)  // Scale by controller trust + warmup
-                .min(self.config.target_liquidity) // User cap
                 .max(min_viable_liquidity) // Exchange minimum
                 .min(self.effective_max_position) // Position limit
         } else {
@@ -2694,11 +2737,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             );
 
             // === EXECUTION MODE: structural side selection ===
-            // Subsumes QuoteGate's QuoteOnlyBids/QuoteOnlyAsks decisions:
-            // - PositionZone::Yellow + long → Maker { bid: false, ask: true }
-            // - ToxicityRegime::Toxic + positioned → InventoryReduce
-            // QuoteGate's spread-width decisions (WidenSpreads, NoQuote) are untouched
-            // (applied earlier via market_params.spread_widening_mult).
+            // Fix 1: Trust GLFT's continuous γ·q·σ²·(T-t) inventory penalty.
+            // Only Kill zone (HJB constraint boundary) clears sides.
+            // All other zones: GLFT handles asymmetry through reservation price skew.
+            // Red/Yellow → elevated γ (regime_gamma_multiplier) widens proportionally.
+            // Toxic → routes through σ_conditional (Hawkes) and AS floor (Fix 4).
             {
                 use crate::market_maker::execution::ExecutionMode;
                 match execution_mode {
@@ -2706,91 +2749,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         viable.bids.clear();
                         viable.asks.clear();
                     }
-                    ExecutionMode::Maker { bid, ask } => {
-                        if !bid {
-                            viable.bids.clear();
-                        }
-                        if !ask {
-                            viable.asks.clear();
-                        }
+                    ExecutionMode::Maker { .. } => {
+                        // GLFT γ·q skew handles all asymmetry continuously.
+                        // No side clearing — both sides always quoted.
                     }
-                    ExecutionMode::InventoryReduce { urgency } => {
-                        let pos = self.position.position();
-                        let vq = *viable.quantum();
-                        if pos > 1e-9 {
-                            viable.bids.clear();
-                            viable.asks.truncate(1);
-                            viable.asks.reduce_sizes(0.5 + 0.5 * urgency, &vq);
-                        } else if pos < -1e-9 {
-                            viable.asks.clear();
-                            viable.bids.truncate(1);
-                            viable.bids.reduce_sizes(0.5 + 0.5 * urgency, &vq);
-                        }
+                    ExecutionMode::InventoryReduce { .. } => {
+                        // With Fix 1, select_mode() only returns Flat or Maker{both}.
+                        // InventoryReduce is kept for backward compat but shouldn't trigger.
+                        // If it does, treat as Maker{both} — GLFT handles the skew.
                     }
                 }
             }
 
-            // === TOXICITY-BASED DEFENSE (regime-aware) ===
-            // Replaces hardcoded 0.75/0.50 thresholds with ToxicityRegime classification.
-            // ToxicityRegime has built-in hysteresis, so no cooldown timer needed.
-            //
-            // DESIGN: Normal regime uses SPREAD WIDENING instead of SIZE REDUCTION.
-            // Size reduction on small accounts pushes sizes below exchange minimum,
-            // triggering the Sisyphean loop where viable.rs rounds up → toxicity reduces
-            // → ExchangeRules rejects. Spread widening achieves the same protective
-            // effect without hitting size floors.
-            //
-            // WARMUP BYPASS: During warmup the pre-fill classifier has 0 samples,
-            // so "Toxic" classification is noise from OFI spikes on a 0.35 prior.
-            // Clearing both sides at flat position prevents all fills → death spiral.
-            // Instead, use spread widening (same as Normal regime) during warmup.
-            {
-                use crate::market_maker::adverse_selection::ToxicityRegime;
-                let vq = *viable.quantum();
-                let fill_count_for_warmup = self.tier1.adverse_selection.fills_measured();
-                let is_warmup = fill_count_for_warmup < 10;
-                match current_toxicity_regime {
-                    ToxicityRegime::Toxic => {
-                        let pos = self.position.position();
-                        if is_warmup && pos.abs() < 1e-9 {
-                            // Warmup + flat: widen spreads 1.5x instead of clearing.
-                            // Provides protection without the death spiral.
-                            let mid = quote_config.mid_price;
-                            for quote in viable.bids.iter_mut() {
-                                let offset = (mid - quote.price).max(0.0);
-                                quote.price = mid - offset * 1.5;
-                            }
-                            for quote in viable.asks.iter_mut() {
-                                let offset = (quote.price - mid).max(0.0);
-                                quote.price = mid + offset * 1.5;
-                            }
-                        } else if pos.abs() < 1e-9 {
-                            // Calibrated + flat: clear both sides
-                            viable.bids.clear();
-                            viable.asks.clear();
-                        } else if pos > 0.0 {
-                            viable.bids.clear(); // Cancel increasing side
-                            viable.asks.reduce_sizes(0.5, &vq); // Reduce reducing side
-                        } else {
-                            viable.asks.clear();
-                            viable.bids.reduce_sizes(0.5, &vq);
-                        }
-                    }
-                    ToxicityRegime::Normal => {
-                        // REMOVED: Normal-regime spread widening was double-counting
-                        // pre-fill toxicity. The pre-fill AS classifier already applies
-                        // per-side depth multipliers in ladder_strat.rs (lines 1268-1281),
-                        // so applying toxicity-based widening HERE too compounds the effect:
-                        //   depth_mult (1.5x) × regime_widen (1.5x) = 2.25x total
-                        // This pushed the touch from ~7 bps to ~21 bps, preventing fills.
-                        //
-                        // The depth multiplier IS the principled Normal-regime response.
-                        // Additional widening belongs only in Toxic regime (which clears
-                        // sides or does 1.5x emergency widening).
-                    }
-                    ToxicityRegime::Benign => {} // No filtering
-                }
-            }
+            // === TOXICITY DEFENSE ===
+            // Fix 1: Toxicity no longer clears sides. Instead it routes through:
+            // - σ_conditional (Fix 4): Hawkes intensity → √(λ/λ₀) → uniform widening
+            // - AS floor (Fix 2): dynamic floor from markout history → minimum spread
+            // - Pre-fill AS classifier: per-side depth multipliers in ladder_strat.rs
+            // These three principled channels replace the binary Toxic→clear heuristic.
 
             // === QUEUE VALUE: filter individual levels with negative expected edge ===
             // After mode selection and toxicity filtering, remove levels where quoting
@@ -2857,61 +2833,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
-            // === FILL CASCADE FILTER ===
-            // When we detect 5+ same-side fills in 60s, widen that side (2x).
-            // When 8+ same-side fills, suppress that side entirely (reduce-only).
-            // This prevents runaway accumulation during trending markets.
-            // Price modifications go through iter_mut() (safe — doesn't affect size viability).
-            {
-                let buy_cascade_mult = self.fill_cascade_tracker.spread_multiplier(Side::Buy);
-                let sell_cascade_mult = self.fill_cascade_tracker.spread_multiplier(Side::Sell);
-
-                if self.fill_cascade_tracker.is_suppressed(Side::Buy) && !viable.bids.is_empty() {
-                    // Check if we're short — buys would reduce position, so allow them
-                    if self.position.position() > 0.01 {
-                        info!(
-                            cleared_bids = viable.bids.len(),
-                            "Fill cascade: suppressing BID side (8+ same-side buys in 60s)"
-                        );
-                        viable.bids.clear();
-                    }
-                } else if buy_cascade_mult > 1.0 && self.position.position() > 0.01 {
-                    // Only widen buys when accumulating (flat or already long).
-                    // If short, buys REDUCE position — don't penalize reducing fills.
-                    let mid = self.latest_mid;
-                    for quote in viable.bids.iter_mut() {
-                        let dist = mid - quote.price;
-                        quote.price = mid - dist * buy_cascade_mult;
-                    }
-                    debug!(
-                        cascade_mult = %format!("{:.1}x", buy_cascade_mult),
-                        "Fill cascade: widening BID side"
-                    );
-                }
-
-                if self.fill_cascade_tracker.is_suppressed(Side::Sell) && !viable.asks.is_empty() {
-                    // Check if we're long — sells would reduce position, so allow them
-                    if self.position.position() < -0.01 {
-                        info!(
-                            cleared_asks = viable.asks.len(),
-                            "Fill cascade: suppressing ASK side (8+ same-side sells in 60s)"
-                        );
-                        viable.asks.clear();
-                    }
-                } else if sell_cascade_mult > 1.0 && self.position.position() < -0.01 {
-                    // Only widen sells when accumulating (flat or already short).
-                    // If long, sells REDUCE position — don't penalize reducing fills.
-                    let mid = self.latest_mid;
-                    for quote in viable.asks.iter_mut() {
-                        let dist = quote.price - mid;
-                        quote.price = mid + dist * sell_cascade_mult;
-                    }
-                    debug!(
-                        cascade_mult = %format!("{:.1}x", sell_cascade_mult),
-                        "Fill cascade: widening ASK side"
-                    );
-                }
-            }
+            // === FILL CASCADE ===
+            // Fix 1: Cascades route through σ_conditional (Fix 4), not side clearing.
+            // The FillCascadeTracker still tracks same-side fill runs for diagnostics,
+            // but its spread_multiplier and is_suppressed outputs are no longer used
+            // to clear or widen individual sides. Instead, fill bursts elevate Hawkes
+            // intensity → σ_cascade_mult → uniform spread widening through GLFT.
 
             // === CONTINUOUS INVENTORY PRESSURE ===
             // Smooth function of inventory fraction and momentum, no hysteresis state.

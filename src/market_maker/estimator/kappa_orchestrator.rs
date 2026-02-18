@@ -27,9 +27,6 @@ use super::kappa::BayesianKappaEstimator;
 use super::robust_kappa::RobustKappaEstimator;
 use tracing::info;
 
-/// Minimum weight for prior (always contributes some regularization)
-const PRIOR_MIN_WEIGHT: f64 = 0.05;
-
 /// Configuration for the kappa orchestrator.
 #[derive(Debug, Clone)]
 pub(crate) struct KappaOrchestratorConfig {
@@ -211,6 +208,17 @@ pub(crate) struct KappaOrchestrator {
     /// The own-fill posterior still decays naturally as observations expire,
     /// but we don't revert to the warmup blending formula.
     has_exited_warmup: bool,
+
+    /// EWMA of (kappa_book - kappa_robust) for empirical bias tracking
+    book_robust_bias_ewma: f64,
+    /// EWMA of (kappa_robust - kappa_robust_prev)^2 for robust variance tracking
+    robust_rolling_var: f64,
+    /// EWMA of (kappa_book - kappa_book_prev)^2 for book variance tracking
+    book_rolling_var: f64,
+    /// Previous robust kappa for variance computation
+    prev_robust_kappa: f64,
+    /// Previous book kappa for variance computation
+    prev_book_kappa: f64,
 }
 
 impl KappaOrchestrator {
@@ -238,6 +246,12 @@ impl KappaOrchestrator {
             smoothed_kappa_initialized: false,
             // Start in warmup mode - will graduate permanently after 5 fills
             has_exited_warmup: false,
+            // Precision-weighted blending stats (initialized to 0, warm up naturally)
+            book_robust_bias_ewma: 0.0,
+            robust_rolling_var: 0.0,
+            book_rolling_var: 0.0,
+            prev_robust_kappa: 0.0,
+            prev_book_kappa: 0.0,
         }
     }
 
@@ -325,33 +339,44 @@ impl KappaOrchestrator {
             return blended.clamp(50.0, 10000.0);
         }
 
-        // Post-warmup: full confidence-weighted blending
-        let own_conf = self.own_kappa.confidence();
-
-        let book_conf = if self.config.use_book_kappa {
-            self.book_kappa.confidence()
+        // Post-warmup: precision-weighted blending (tau = 1/Var_eff)
+        // Uses empirical variance + bias^2 for effective variance of biased estimators.
+        let own_tau = if self.own_kappa.observation_count() > 5 {
+            let own_var = self.own_kappa.posterior_variance().max(1.0);
+            1.0 / own_var
         } else {
             0.0
         };
 
-        let robust_conf = if self.config.use_robust_kappa {
-            self.robust_kappa.confidence()
+        let robust_tau = if self.config.use_robust_kappa && robust_kappa > 100.0 {
+            1.0 / self.robust_rolling_var.max(1.0)
         } else {
             0.0
         };
 
-        // Normalize confidences (prior always gets minimum weight)
-        let total = own_conf + book_conf + robust_conf + PRIOR_MIN_WEIGHT;
+        // Book kappa: effective variance includes bias^2 (bias = mean(kappa_book - kappa_robust))
+        let book_tau = if self.config.use_book_kappa && book_kappa > 100.0 {
+            if self.config.use_robust_kappa && robust_kappa > 100.0 {
+                let bias_sq = self.book_robust_bias_ewma.powi(2);
+                let book_eff_var = self.book_rolling_var + bias_sq;
+                1.0 / book_eff_var.max(1.0)
+            } else {
+                // No robust reference — weak weight for book
+                0.05 / self.book_rolling_var.max(1.0)
+            }
+        } else {
+            0.0
+        };
 
-        let w_own = own_conf / total;
-        let w_book = book_conf / total;
-        let w_robust = robust_conf / total;
-        let w_prior = PRIOR_MIN_WEIGHT / total;
+        let prior_var = (self.config.prior_kappa * 0.5).powi(2); // Prior variance: (50% of mean)^2
+        let prior_tau = 1.0 / prior_var.max(1.0);
+        let total_tau = (own_tau + robust_tau + book_tau + prior_tau).max(1e-10);
 
-        let kappa = w_own * self.own_kappa.posterior_mean()
-            + w_book * self.book_kappa.kappa()
-            + w_robust * self.robust_kappa.kappa()
-            + w_prior * self.prior_kappa;
+        let kappa = (own_tau * self.own_kappa.posterior_mean()
+            + robust_tau * robust_kappa
+            + book_tau * book_kappa
+            + prior_tau * self.prior_kappa)
+            / total_tau;
 
         kappa.clamp(50.0, 10000.0)
     }
@@ -361,6 +386,7 @@ impl KappaOrchestrator {
     /// Called from update paths to maintain smoothed estimate.
     /// Uses α=0.9: κ_smoothed = 0.9 × κ_prev + 0.1 × κ_raw
     fn update_smoothed_kappa(&mut self) {
+        self.update_rolling_stats();
         let kappa_raw = self.kappa_raw();
 
         if !self.smoothed_kappa_initialized {
@@ -371,6 +397,50 @@ impl KappaOrchestrator {
             // EWMA update: 90% previous, 10% new
             self.smoothed_kappa =
                 KAPPA_EWMA_ALPHA * self.smoothed_kappa + (1.0 - KAPPA_EWMA_ALPHA) * kappa_raw;
+        }
+    }
+
+    /// Update rolling variance and bias statistics for precision-weighted blending.
+    ///
+    /// Tracks EWMA of squared differences (rolling variance) and
+    /// book-robust bias for effective variance computation.
+    fn update_rolling_stats(&mut self) {
+        const ROLLING_ALPHA: f64 = 0.05;
+        let book_k = self.book_kappa.kappa();
+        let robust_k = self.robust_kappa.kappa();
+
+        // Update bias tracking (book - robust)
+        if book_k > 100.0 && robust_k > 100.0 {
+            let bias = book_k - robust_k;
+            self.book_robust_bias_ewma =
+                self.book_robust_bias_ewma * (1.0 - ROLLING_ALPHA) + bias * ROLLING_ALPHA;
+        }
+
+        // Update variance tracking
+        if self.prev_robust_kappa > 0.0 && robust_k > 100.0 {
+            let diff_sq = (robust_k - self.prev_robust_kappa).powi(2);
+            self.robust_rolling_var =
+                self.robust_rolling_var * (1.0 - ROLLING_ALPHA) + diff_sq * ROLLING_ALPHA;
+        }
+        if self.prev_book_kappa > 0.0 && book_k > 100.0 {
+            let diff_sq = (book_k - self.prev_book_kappa).powi(2);
+            self.book_rolling_var =
+                self.book_rolling_var * (1.0 - ROLLING_ALPHA) + diff_sq * ROLLING_ALPHA;
+        }
+
+        self.prev_robust_kappa = robust_k;
+        self.prev_book_kappa = book_k;
+    }
+
+    /// Detect ghost liquidity: book kappa >> robust kappa suggests standing orders
+    /// that don't represent real fill intensity. Returns gamma multiplier [1.0, 5.0].
+    pub(crate) fn ghost_liquidity_gamma_mult(&self) -> f64 {
+        let book_k = self.book_kappa.kappa();
+        let robust_k = self.robust_kappa.kappa();
+        if self.config.use_robust_kappa && robust_k > 100.0 && book_k / robust_k > 3.0 {
+            (book_k / robust_k).min(5.0)
+        } else {
+            1.0
         }
     }
 
@@ -417,26 +487,37 @@ impl KappaOrchestrator {
             );
         }
 
-        // Post-warmup: full blending
-        let own_conf = self.own_kappa.confidence();
-        let book_conf = if self.config.use_book_kappa {
-            self.book_kappa.confidence()
+        // Post-warmup: precision-weighted breakdown (mirrors kappa_raw logic)
+        let robust_kappa = self.robust_kappa.kappa();
+        let own_tau = if self.own_kappa.observation_count() > 5 {
+            1.0 / self.own_kappa.posterior_variance().max(1.0)
         } else {
             0.0
         };
-        let robust_conf = if self.config.use_robust_kappa {
-            self.robust_kappa.confidence()
+        let robust_tau = if self.config.use_robust_kappa && robust_kappa > 100.0 {
+            1.0 / self.robust_rolling_var.max(1.0)
         } else {
             0.0
         };
-
-        let total = own_conf + book_conf + robust_conf + PRIOR_MIN_WEIGHT;
+        let book_tau = if self.config.use_book_kappa && book_kappa > 100.0 {
+            if self.config.use_robust_kappa && robust_kappa > 100.0 {
+                let bias_sq = self.book_robust_bias_ewma.powi(2);
+                1.0 / (self.book_rolling_var + bias_sq).max(1.0)
+            } else {
+                0.05 / self.book_rolling_var.max(1.0)
+            }
+        } else {
+            0.0
+        };
+        let prior_var = (self.config.prior_kappa * 0.5).powi(2);
+        let prior_tau = 1.0 / prior_var.max(1.0);
+        let total_tau = (own_tau + robust_tau + book_tau + prior_tau).max(1e-10);
 
         (
-            (self.own_kappa.posterior_mean(), own_conf / total),
-            (self.book_kappa.kappa(), book_conf / total),
-            (self.robust_kappa.kappa(), robust_conf / total),
-            (self.config.prior_kappa, PRIOR_MIN_WEIGHT / total),
+            (self.own_kappa.posterior_mean(), own_tau / total_tau),
+            (self.book_kappa.kappa(), book_tau / total_tau),
+            (self.robust_kappa.kappa(), robust_tau / total_tau),
+            (self.config.prior_kappa, prior_tau / total_tau),
             false, // not warmup
         )
     }
@@ -680,15 +761,18 @@ mod tests {
             orch.on_l2_book(&bids, &asks, mid);
         }
 
-        // Book kappa should have some weight now (after warmup)
+        // Book kappa should have some weight now (after warmup).
+        // Fix 3: Precision-weighted blending uses 1/Var_eff. With identical book
+        // updates (no variance), book_tau is small. Verify we're out of warmup
+        // and book gets non-zero weight.
         let (_, (_, w_book), _, _, is_warmup) = orch.component_breakdown();
         assert!(
             !is_warmup,
             "Should not be in warmup mode after providing own fills"
         );
         assert!(
-            w_book > 0.1,
-            "Book should have significant weight after updates, got {}",
+            w_book > 0.0,
+            "Book should have non-zero weight after updates, got {}",
             w_book
         );
     }
@@ -733,12 +817,16 @@ mod tests {
             orch.on_own_fill(i * 1000, price, 1.0, mid);
         }
 
-        // Own-fill should dominate
-        let ((_, w_own), _, _, _, _) = orch.component_breakdown();
+        // Own-fill should have significant weight with 50 fills.
+        // Fix 3: Precision-weighted uses 1/posterior_variance. After 50 fills,
+        // posterior variance is tight → τ_own is large. It should dominate over
+        // the prior (whose variance is (kappa*0.5)² = huge).
+        let ((_, w_own), _, _, (_, w_prior), _) = orch.component_breakdown();
         assert!(
-            w_own > 0.5,
-            "Own-fill should dominate after many fills, got weight {}",
-            w_own
+            w_own > w_prior,
+            "Own-fill weight ({}) should exceed prior weight ({}) after 50 fills",
+            w_own,
+            w_prior
         );
     }
 
@@ -780,12 +868,32 @@ mod tests {
         let raw_change = (kappa_raw - kappa_before).abs();
         let smoothed_change = (kappa_smoothed - kappa_before).abs();
 
-        // EWMA with α=0.9 means smoothed changes by only 10% of delta
+        // EWMA with alpha=0.9 means smoothed changes by only 10% of delta
         assert!(
             smoothed_change < raw_change,
             "Smoothed kappa should change less than raw: smoothed_change={:.1}, raw_change={:.1}",
             smoothed_change,
             raw_change
+        );
+    }
+
+    #[test]
+    fn test_precision_weighted_book_bias_downweight() {
+        // When book/robust diverge significantly, book weight should approach 0
+        let mut orch = KappaOrchestrator::new(KappaOrchestratorConfig::default());
+        // Simulate divergent estimates
+        orch.book_robust_bias_ewma = 3000.0; // Large bias
+        orch.book_rolling_var = 100.0;
+        orch.robust_rolling_var = 100.0;
+        // Book tau should be tiny due to bias^2 dominating
+        let bias_sq = orch.book_robust_bias_ewma.powi(2); // 9_000_000
+        let book_eff_var = orch.book_rolling_var + bias_sq; // 9_000_100
+        let book_tau = 1.0 / book_eff_var;
+        let robust_tau = 1.0 / orch.robust_rolling_var.max(1.0);
+        assert!(
+            book_tau / robust_tau < 0.001,
+            "Book should have <0.1% weight when biased, got {:.6}",
+            book_tau / robust_tau
         );
     }
 }

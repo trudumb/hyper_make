@@ -403,48 +403,32 @@ impl AdaptiveSpreadCalculator {
 
     /// Get warmup progress as a fraction (0.0 to 1.0).
     ///
-    /// This can be used to scale uncertainty margins during warmup.
-    /// Higher = more confident in learned values.
+    /// Uses information-gain weighted warmup:
+    /// - L2 observations (50%): fast, abundant, informs sigma and kappa
+    /// - Fill observations (30%): scarce but high-value for kappa/AS calibration
+    /// - Time elapsed (20%): pure clock fallback (10 min to full)
     ///
-    /// Thresholds adapt based on observed fill rate:
-    /// - Liquid markets (≥0.005 fills/sec): standard thresholds (20 floor, 10 kappa)
-    /// - Illiquid markets (<0.005 fills/sec): relaxed thresholds (10 floor, 5 kappa)
+    /// Fill target adapts to observed fill rate (min 5 fills).
+    /// Result is floored at time_progress to prevent stalls at low fill rates.
     pub fn warmup_progress(&self) -> f64 {
-        // Adapt thresholds based on observed market activity
+        // L2: fast, abundant, informs sigma (O(1/n) posterior var) and kappa (O(1/n^0.6))
+        let l2_obs = self.floor.observation_count() as f64;
+        let l2_progress = l2_obs.min(100.0) / 100.0;
+
+        // Fills: scarce but gold for kappa confirmation and AS calibration
+        // Adaptive target: adjusts to observed fill rate, not hardcoded
         let fill_rate = self.observed_fill_rate();
-        let (floor_target, kappa_target): (usize, usize) = if fill_rate < 0.005 {
-            (10, 5) // Low activity: relax thresholds
-        } else {
-            (20, 10) // Normal activity: standard thresholds
-        };
+        let target_fills = (fill_rate * 600.0).max(5.0); // Expected fills in 10 min, at least 5
+        let fill_count = self.kappa.own_fill_count() as f64;
+        let fill_progress = (fill_count / target_fills).min(1.0);
 
-        // Components contribute to overall progress
-        let floor_progress =
-            (self.floor.observation_count().min(floor_target) as f64) / floor_target as f64;
-        let kappa_progress =
-            (self.kappa.own_fill_count().min(kappa_target) as f64) / kappa_target as f64;
-        // Gamma uses standardizers which need ~20 observations
-        let gamma_progress = if self.gamma.is_warmed_up() { 1.0 } else { 0.5 };
-
-        // Fill-based warmup (original formula)
-        let fill_warmup = floor_progress * 0.4 + kappa_progress * 0.4 + gamma_progress * 0.2;
-
-        // Time-based warmup floor: ensures system reaches 80% within 30 minutes
-        // even with low fill rates. Fills still needed for last 20%.
-        //
-        // At 4.5% fill rate, fill-based warmup requires 20 fills which takes 6+ hours.
-        // A 4-hour session was stuck at 90% warmup. Time-based floor ensures the priors
-        // (which are well-calibrated) get used at near-full capacity after 30 minutes,
-        // while still incentivizing fill data for the final convergence.
+        // Time: pure clock fallback
         let session_age_s = self.session_start.elapsed().as_secs_f64();
-        let time_progress = if session_age_s > 0.0 {
-            (session_age_s / 1800.0).min(1.0) // 30 min to full time progress
-        } else {
-            0.0
-        };
-        let time_warmup = time_progress * 0.8; // Time can get to 80%
+        let time_progress = (session_age_s / 600.0).min(1.0); // 10 min
 
-        fill_warmup.max(time_warmup)
+        // Information-gain weighted
+        let info_warmup = l2_progress * 0.50 + fill_progress * 0.30 + time_progress * 0.20;
+        info_warmup.max(time_progress)
     }
 
     /// Get an uncertainty scaling factor for warmup period.
@@ -864,22 +848,22 @@ mod tests {
             at_15min
         );
 
-        // Simulate 30 minutes elapsed with 0 fills
+        // Simulate 10+ minutes elapsed with 0 fills — time reaches 100%
+        // Fix 7: time_progress = (600/600).min(1.0) = 1.0, info_warmup.max(time_progress) = 1.0
         calc.session_start = Instant::now() - Duration::from_secs(1800);
         let at_30min = calc.warmup_progress();
-        // time_warmup = (1800 / 1800) * 0.8 = 0.8
         assert!(
-            at_30min >= 0.79,
-            "At 30 minutes, warmup should be at least ~80%: {:.3}",
+            at_30min >= 0.99,
+            "At 30 minutes, time_progress floor should reach 100%: {:.3}",
             at_30min
         );
 
-        // Simulate 60 minutes elapsed with 0 fills — time floor caps at 80%
+        // At 60 minutes: same — time floor already 100%
         calc.session_start = Instant::now() - Duration::from_secs(3600);
         let at_60min = calc.warmup_progress();
         assert!(
-            at_60min >= 0.79 && at_60min <= 0.81,
-            "At 60 minutes with no fills, warmup should cap at ~80%: {:.3}",
+            at_60min >= 0.99,
+            "At 60 minutes with no fills, warmup should be 100% from time floor: {:.3}",
             at_60min
         );
 

@@ -1020,6 +1020,24 @@ pub struct MarketParams {
     pub coordinator_uncertainty_premium_bps: f64,
     /// Whether coordinator kappa is available (seeded from L2 profile).
     pub use_coordinator_kappa: bool,
+
+    // === Fix 2: Inviolable Spread Floor ===
+    /// Dynamic AS floor in bps from AdverseSelectionEstimator.
+    /// Added to physical floor: fee + latency + AS → solve_min_gamma().
+    /// Seeded from checkpoint when no live markout data yet.
+    pub as_floor_bps: f64,
+
+    // === Fix 4: Proactive AS — Hawkes σ_conditional ===
+    /// σ cascade multiplier from Hawkes intensity ratio: √(λ(t)/λ₀).
+    /// Applied to sigma_effective before GLFT computation.
+    /// Uses high-water-mark with 15s cooldown to prevent sawtooth decay.
+    pub sigma_cascade_mult: f64,
+
+    // === Fix 3: Ghost liquidity detection ===
+    /// Ghost liquidity gamma multiplier [1.0, 5.0].
+    /// When book kappa >> robust kappa (>3x), book shows standing orders
+    /// that don't represent real fill intensity. Inflate γ to widen spread.
+    pub ghost_liquidity_gamma_mult: f64,
 }
 
 impl Default for MarketParams {
@@ -1307,6 +1325,15 @@ impl Default for MarketParams {
             coordinator_kappa: 0.0,
             coordinator_uncertainty_premium_bps: 0.0,
             use_coordinator_kappa: false,
+
+            // Fix 2: AS floor
+            as_floor_bps: 0.0,
+
+            // Fix 4: Hawkes σ_conditional
+            sigma_cascade_mult: 1.0,
+
+            // Fix 3: Ghost liquidity
+            ghost_liquidity_gamma_mult: 1.0,
         }
     }
 }
@@ -1720,6 +1747,7 @@ impl MarketParams {
         gamma: f64,
         num_levels: usize,
         min_notional: f64,
+        config_target: f64,
     ) {
         // Sanity check inputs
         if self.account_value <= 0.0 || self.leverage <= 0.0 || self.microprice <= 0.0 {
@@ -1766,17 +1794,24 @@ impl MarketParams {
         // Must be at least min_notional in USD, with 50% buffer
         let min_viable = (min_notional * 1.5) / self.microprice;
 
-        // === Final Derived Liquidity ===
-        // Take minimum of all constraints, but ensure at least exchange minimum
-        self.derived_target_liquidity = q_hard
-            .min(q_soft_adjusted)
-            .min(per_level_cap)
+        // === Fix 6: Geometric Blend ===
+        // Position sizes have multiplicative risk effects → geometric mean is the
+        // appropriate interpolator. More conservative when config and derived disagree.
+        // α = warmup_progress [0.01, 0.99]: starts near config, converges to derived.
+        let margin_capped = config_target.max(0.01).min(q_hard);
+        let derived_constrained = q_soft_adjusted.min(per_level_cap).max(0.01);
+        let alpha = self.adaptive_warmup_progress.clamp(0.01, 0.99);
+        self.derived_target_liquidity = (margin_capped.ln() * (1.0 - alpha)
+            + derived_constrained.ln() * alpha)
+            .exp()
             .max(min_viable);
 
         tracing::debug!(
             q_hard = %format!("{:.6}", q_hard),
             q_soft = %format!("{:.6}", q_soft),
             q_soft_adjusted = %format!("{:.6}", q_soft_adjusted),
+            config_target = %format!("{:.6}", config_target),
+            alpha = %format!("{:.2}", alpha),
             latency_penalty = %format!("{:.2}", latency_penalty),
             per_level_cap = %format!("{:.6}", per_level_cap),
             min_viable = %format!("{:.6}", min_viable),
@@ -1786,7 +1821,7 @@ impl MarketParams {
             sigma = %format!("{:.6}", self.sigma),
             latency_ms = %format!("{:.1}", tau_ms),
             fill_rate = %format!("{:.4}", self.estimated_fill_rate),
-            "GLFT-derived target liquidity (all inputs from measured data)"
+            "Fix 6: geometric blend target liquidity"
         );
     }
 }

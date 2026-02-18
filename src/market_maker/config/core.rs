@@ -117,6 +117,10 @@ pub struct MarketMakerConfig {
     /// Fill cascade detection configuration.
     /// Controls thresholds, multipliers, and cooldowns for same-side fill mitigation.
     pub cascade: super::risk::CascadeConfig,
+
+    /// Reference symbol for cross-market signals (e.g., HYPE perp for HIP-3).
+    /// Auto-detected from hyna: prefix, or set via CLI --reference-symbol.
+    pub reference_symbol: Option<String>,
 }
 
 impl MarketMakerConfig {
@@ -248,6 +252,7 @@ mod tests {
             spread_profile: SpreadProfile::Default,
             fee_bps: 1.5,
             cascade: CascadeConfig::default(),
+            reference_symbol: None,
         }
     }
 

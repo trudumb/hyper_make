@@ -54,6 +54,51 @@ const MAX_SINGLE_ORDER_FRACTION: f64 = 0.25;
 /// Type alias for depth values using SmallVec for stack allocation
 type DepthVec = SmallVec<[f64; DEPTH_INLINE_CAPACITY]>;
 
+/// Enforce inviolable spread floor on **total spread** (best_ask - best_bid).
+///
+/// Glosten-Milgrom break-even: `s* = 2α(V_h - V_l)/[(1-α)(V_h + V_l)]`.
+/// Floor enforced on total spread (not half-spread from mid) to preserve
+/// reservation-price skew from GLFT's γ·q inventory penalty.
+///
+/// Deficit is split proportionally to current offsets:
+/// - When long (bids far, asks tight): most deficit pushes ask up.
+///   This is correct: we want to sell, just not below cost.
+/// - When short: symmetric opposite.
+/// - Deeper levels (placed by GLFT δ_k = δ_1 + k·Δ) are NOT moved.
+fn enforce_spread_floor(ladder: &mut Ladder, mid: f64, floor_bps: f64) {
+    if floor_bps <= 0.0 || mid <= 0.0 {
+        return;
+    }
+    let best_bid = match ladder.bids.first() {
+        Some(b) => b.price,
+        None => return,
+    };
+    let best_ask = match ladder.asks.first() {
+        Some(a) => a.price,
+        None => return,
+    };
+    let total_spread = best_ask - best_bid;
+    let min_total_spread = mid * floor_bps / 10_000.0;
+
+    if total_spread >= min_total_spread {
+        return; // Already above floor
+    }
+
+    let deficit = min_total_spread - total_spread;
+    let bid_offset = (mid - best_bid).max(0.0);
+    let ask_offset = (best_ask - mid).max(0.0);
+    let total_offset = (bid_offset + ask_offset).max(1e-12);
+    let bid_frac = bid_offset / total_offset;
+
+    // Push best bid down and best ask up by proportional deficit
+    if let Some(b) = ladder.bids.first_mut() {
+        b.price -= deficit * bid_frac;
+    }
+    if let Some(a) = ladder.asks.first_mut() {
+        a.price += deficit * (1.0 - bid_frac);
+    }
+}
+
 impl Ladder {
     /// Generate a ladder using the GLFT-based approach.
     ///
@@ -167,6 +212,10 @@ impl Ladder {
                 warmup_pct: params.warmup_pct,
             },
         );
+
+        // 7. Enforce inviolable spread floor on total spread (best_ask - best_bid).
+        // Post-hoc: preserves GLFT reservation-price skew by proportional deficit split.
+        enforce_spread_floor(&mut ladder, params.mid_price, params.effective_floor_bps);
 
         ladder
     }
@@ -295,6 +344,9 @@ impl Ladder {
                 warmup_pct: params.warmup_pct,
             },
         );
+
+        // 8. Enforce inviolable spread floor (same as symmetric path)
+        enforce_spread_floor(&mut ladder, params.mid_price, params.effective_floor_bps);
 
         ladder
     }

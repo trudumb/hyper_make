@@ -976,6 +976,11 @@ impl ParameterEstimator {
         self.kappa_orchestrator.confidence()
     }
 
+    /// Access the kappa orchestrator for ghost liquidity detection (Fix 3).
+    pub(crate) fn kappa_orchestrator(&self) -> &super::kappa_orchestrator::KappaOrchestrator {
+        &self.kappa_orchestrator
+    }
+
     /// Check if robust kappa orchestrator is warmed up.
     pub fn kappa_robust_warmed_up(&self) -> bool {
         self.kappa_orchestrator.is_warmed_up()

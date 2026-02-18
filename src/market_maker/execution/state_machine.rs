@@ -90,84 +90,24 @@ pub struct ModeSelectionInput {
 
 /// Pure function: select execution mode from inputs.
 ///
-/// Priority order (highest to lowest):
-/// 1. Kill zone → Flat
-/// 2. Red zone → InventoryReduce (urgency 1.0)
-/// 3. Toxic + flat → Flat
-/// 4. Toxic + positioned → InventoryReduce
-/// 5. Yellow zone → Maker (reducing side only)
-/// 6. No value and no alpha → Flat
-/// 7. Default → Maker (quote sides with value or alpha)
+/// Only Kill zone is a hard cutoff. Everything else lets GLFT's continuous
+/// γ·q·σ²·(T-t) penalty handle inventory asymmetry:
+/// - Red zone → wider spreads via elevated γ (from regime_gamma_multiplier)
+/// - Yellow zone → γ·q penalty already biases against accumulation
+/// - Toxic regime → routes through σ_conditional (Hawkes) and AS floor
+/// - No value/alpha → GLFT still produces valid spreads from γ/κ/σ
 pub fn select_mode(input: &ModeSelectionInput) -> ExecutionMode {
-    // 1. Kill zone — cancel everything
+    // Kill zone: HJB constraint boundary — the ONLY hard cutoff.
+    // All other inventory management flows through GLFT's continuous
+    // γ·q·σ²·(T-t) penalty, which widens the accumulating side proportionally.
     if input.position_zone == PositionZone::Kill {
         return ExecutionMode::Flat;
     }
-
-    // 2. Red zone — urgent inventory reduction
-    if input.position_zone == PositionZone::Red {
-        return ExecutionMode::InventoryReduce { urgency: 1.0 };
-    }
-
-    // 3-4. Toxic regime
-    if input.toxicity_regime == ToxicityRegime::Toxic {
-        if input.position.abs() < 1e-9 {
-            if input.is_warmup {
-                // During warmup: don't go Flat even in Toxic regime.
-                // Toxicity classifier is uncalibrated — "toxic" may be noise.
-                // Quote both sides with wide spreads (toxicity filter widens further).
-                return ExecutionMode::Maker { bid: true, ask: true };
-            }
-            // Flat position → go flat
-            return ExecutionMode::Flat;
-        }
-        // Positioned → reduce
-        return ExecutionMode::InventoryReduce { urgency: 0.7 };
-    }
-
-    // 5. Yellow zone — only quote reducing side
-    if input.position_zone == PositionZone::Yellow {
-        let (bid, ask) = reducing_sides(input.position);
-        return ExecutionMode::Maker { bid, ask };
-    }
-
-    // 6. No value and no alpha
-    if !input.bid_has_value && !input.ask_has_value && !input.has_alpha {
-        if input.is_warmup {
-            // During warmup: NEVER go Flat. The system needs fills to calibrate
-            // its models, but going Flat prevents all fills — a death spiral.
-            // Quote with wide spreads (downstream spread_widening_mult handles this).
-            return ExecutionMode::Maker { bid: true, ask: true };
-        }
-        match input.capital_tier {
-            CapitalTier::Micro | CapitalTier::Small => {
-                // Small capital: quote both sides with widened spreads instead of going Flat.
-                // Spread widening provides protection; Flat prevents all learning.
-                return ExecutionMode::Maker { bid: true, ask: true };
-            }
-            _ => return ExecutionMode::Flat,
-        }
-    }
-
-    // 7. Default: Maker with sides that have value or alpha
-    let bid = input.bid_has_value || input.has_alpha;
-    let ask = input.ask_has_value || input.has_alpha;
-    ExecutionMode::Maker { bid, ask }
-}
-
-/// Determine which sides are reducing for a given position.
-/// Returns (quote_bids, quote_asks).
-fn reducing_sides(position: f64) -> (bool, bool) {
-    if position > 1e-9 {
-        // Long → asks reduce, bids increase
-        (false, true)
-    } else if position < -1e-9 {
-        // Short → bids reduce, asks increase
-        (true, false)
-    } else {
-        // Flat → neither side reduces, but allow both for exit flexibility
-        (true, true)
-    }
+    // Everything else: GLFT γ·q penalty handles all asymmetry continuously.
+    // Red zone → wider spreads via elevated γ (from regime_gamma_multiplier).
+    // Yellow zone → γ·q penalty already biases against accumulation.
+    // Toxic regime → routes through σ_conditional (Hawkes) and AS floor.
+    ExecutionMode::Maker { bid: true, ask: true }
 }
 
 #[cfg(test)]
@@ -197,47 +137,59 @@ mod tests {
     }
 
     #[test]
-    fn test_red_zone_inventory_reduce() {
+    fn test_red_zone_maker_both() {
+        // Red zone routes through elevated γ, not InventoryReduce
         let input = ModeSelectionInput {
             position_zone: PositionZone::Red,
             position: 1.0,
             ..default_input()
         };
-        match select_mode(&input) {
-            ExecutionMode::InventoryReduce { urgency } => {
-                assert!((urgency - 1.0).abs() < 1e-10);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
             }
-            other => panic!("Expected InventoryReduce, got {other}"),
-        }
+        );
     }
 
     #[test]
-    fn test_toxic_flat_goes_flat() {
+    fn test_toxic_flat_maker_both() {
+        // Toxic regime routes through σ_conditional and AS floor, not Flat
         let input = ModeSelectionInput {
             toxicity_regime: ToxicityRegime::Toxic,
             position: 0.0,
             ..default_input()
         };
-        assert_eq!(select_mode(&input), ExecutionMode::Flat);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
     }
 
     #[test]
-    fn test_toxic_positioned_reduces() {
+    fn test_toxic_positioned_maker_both() {
+        // Toxic + positioned routes through σ_conditional and AS floor
         let input = ModeSelectionInput {
             toxicity_regime: ToxicityRegime::Toxic,
             position: 1.5,
             ..default_input()
         };
-        match select_mode(&input) {
-            ExecutionMode::InventoryReduce { urgency } => {
-                assert!((urgency - 0.7).abs() < 1e-10);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
             }
-            other => panic!("Expected InventoryReduce, got {other}"),
-        }
+        );
     }
 
     #[test]
-    fn test_yellow_long_only_asks() {
+    fn test_yellow_long_maker_both() {
+        // Yellow zone: γ·q penalty handles asymmetry continuously
         let input = ModeSelectionInput {
             position_zone: PositionZone::Yellow,
             position: 1.0, // Long
@@ -246,14 +198,15 @@ mod tests {
         assert_eq!(
             select_mode(&input),
             ExecutionMode::Maker {
-                bid: false,
+                bid: true,
                 ask: true
             }
         );
     }
 
     #[test]
-    fn test_yellow_short_only_bids() {
+    fn test_yellow_short_maker_both() {
+        // Yellow zone: γ·q penalty handles asymmetry continuously
         let input = ModeSelectionInput {
             position_zone: PositionZone::Yellow,
             position: -1.0, // Short
@@ -263,20 +216,27 @@ mod tests {
             select_mode(&input),
             ExecutionMode::Maker {
                 bid: true,
-                ask: false
+                ask: true
             }
         );
     }
 
     #[test]
-    fn test_no_value_no_alpha_flat() {
+    fn test_no_value_no_alpha_maker_both() {
+        // GLFT produces valid spreads from γ/κ/σ even without alpha signals
         let input = ModeSelectionInput {
             bid_has_value: false,
             ask_has_value: false,
             has_alpha: false,
             ..default_input()
         };
-        assert_eq!(select_mode(&input), ExecutionMode::Flat);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
     }
 
     #[test]
@@ -309,7 +269,8 @@ mod tests {
     }
 
     #[test]
-    fn test_one_sided_value() {
+    fn test_one_sided_value_maker_both() {
+        // GLFT quotes both sides; value/alpha no longer gates individual sides
         let input = ModeSelectionInput {
             bid_has_value: true,
             ask_has_value: false,
@@ -320,7 +281,7 @@ mod tests {
             select_mode(&input),
             ExecutionMode::Maker {
                 bid: true,
-                ask: false
+                ask: true
             }
         );
     }
@@ -367,19 +328,21 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_red_over_yellow() {
+    fn test_priority_red_over_yellow_maker_both() {
+        // Red zone routes through elevated γ, same as all non-Kill zones
         let input = ModeSelectionInput {
             position_zone: PositionZone::Red,
             toxicity_regime: ToxicityRegime::Benign,
             position: 1.0,
             ..default_input()
         };
-        match select_mode(&input) {
-            ExecutionMode::InventoryReduce { urgency } => {
-                assert!((urgency - 1.0).abs() < 1e-10);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
             }
-            other => panic!("Expected InventoryReduce, got {other}"),
-        }
+        );
     }
 
     #[test]
@@ -420,7 +383,8 @@ mod tests {
     }
 
     #[test]
-    fn test_medium_tier_no_value_no_alpha_flat() {
+    fn test_medium_tier_no_value_no_alpha_maker_both() {
+        // Medium tier: GLFT produces valid spreads regardless of value/alpha
         let input = ModeSelectionInput {
             bid_has_value: false,
             ask_has_value: false,
@@ -428,7 +392,13 @@ mod tests {
             capital_tier: CapitalTier::Medium,
             ..default_input()
         };
-        assert_eq!(select_mode(&input), ExecutionMode::Flat);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
+            }
+        );
     }
 
     #[test]
@@ -515,36 +485,58 @@ mod tests {
     }
 
     #[test]
-    fn test_warmup_red_zone_still_reduces() {
-        // Red zone overrides warmup — position safety is absolute
+    fn test_warmup_red_zone_maker_both() {
+        // Red zone + warmup: GLFT γ·q penalty handles inventory continuously
         let input = ModeSelectionInput {
             position_zone: PositionZone::Red,
             position: 1.0,
             is_warmup: true,
             ..default_input()
         };
-        match select_mode(&input) {
-            ExecutionMode::InventoryReduce { urgency } => {
-                assert!((urgency - 1.0).abs() < 1e-10);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
             }
-            other => panic!("Expected InventoryReduce, got {other}"),
-        }
+        );
     }
 
     #[test]
-    fn test_warmup_toxic_positioned_still_reduces() {
-        // Even during warmup, toxic+positioned → reduce (not flat, which is fine)
+    fn test_warmup_toxic_positioned_maker_both() {
+        // Warmup + toxic + positioned: GLFT handles via σ_conditional and AS floor
         let input = ModeSelectionInput {
             toxicity_regime: ToxicityRegime::Toxic,
             position: 1.5,
             is_warmup: true,
             ..default_input()
         };
-        match select_mode(&input) {
-            ExecutionMode::InventoryReduce { urgency } => {
-                assert!((urgency - 0.7).abs() < 1e-10);
+        assert_eq!(
+            select_mode(&input),
+            ExecutionMode::Maker {
+                bid: true,
+                ask: true
             }
-            other => panic!("Expected InventoryReduce, got {other}"),
+        );
+    }
+
+    #[test]
+    fn test_only_kill_goes_flat() {
+        // Verify ALL non-Kill zones return Maker{both}
+        for zone in [PositionZone::Green, PositionZone::Yellow, PositionZone::Red] {
+            let input = ModeSelectionInput {
+                position_zone: zone,
+                ..default_input()
+            };
+            assert_eq!(
+                select_mode(&input),
+                ExecutionMode::Maker {
+                    bid: true,
+                    ask: true
+                },
+                "Non-Kill zone {:?} should return Maker(both)",
+                zone
+            );
         }
     }
 }

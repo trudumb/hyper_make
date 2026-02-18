@@ -170,6 +170,11 @@ struct Cli {
     #[arg(long)]
     dex: Option<String>,
 
+    /// Reference symbol for cross-market signals (auto-detected for HIP-3)
+    /// E.g., HYPE perp as reference when trading hyna:HYPE on a HIP-3 DEX
+    #[arg(long)]
+    reference_symbol: Option<String>,
+
     /// Spread profile for target spread ranges (default, hip3, aggressive)
     /// - default: 40-50 bps for liquid perps
     /// - hip3: 15-25 bps for HIP-3 DEX (tighter spreads)
@@ -1731,6 +1736,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fee_bps: live_fee_bps,
         // Fill cascade detection (configurable thresholds, multipliers, cooldowns)
         cascade: CascadeConfig::default(),
+        // Reference symbol for cross-market signals (auto-detected for HIP-3)
+        reference_symbol: cli.reference_symbol.clone()
+            .or_else(|| auto_detect_reference(&asset)),
     };
 
     // Extract EMA config before mm_config is moved
@@ -2251,6 +2259,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Helper Functions
 // ============================================================================
 
+/// Auto-detect a reference symbol for cross-market signals.
+/// HIP-3 tokens (hyna:SYMBOL) should use the main perp (SYMBOL) as reference.
+fn auto_detect_reference(asset: &str) -> Option<String> {
+    if asset.starts_with("hyna:") {
+        Some(asset.trim_start_matches("hyna:").to_string())
+    } else {
+        None
+    }
+}
+
 fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn std::error::Error>> {
     let config_path = &cli.config;
     if Path::new(config_path).exists() {
@@ -2574,6 +2592,8 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         spread_profile,
         fee_bps,
         cascade: CascadeConfig::default(),
+        reference_symbol: cli.reference_symbol.clone()
+            .or_else(|| auto_detect_reference(&asset)),
     };
 
     // Create strategy — respect spread profile (same logic as live path)

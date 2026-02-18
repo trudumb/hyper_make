@@ -119,6 +119,10 @@ pub struct AdverseSelectionEstimator {
     /// EWMA of recent adverse selection magnitude (in bps) for spread widening.
     /// Smoothed over ~10 fills (alpha ≈ 0.1) to react to AS regime changes.
     recent_as_ewma_bps: f64,
+
+    /// Checkpoint-seeded AS floor in bps, used during cold start when no live
+    /// markout data is available yet. Set from prior checkpoint on init.
+    checkpoint_as_floor_bps: Option<f64>,
 }
 
 impl AdverseSelectionEstimator {
@@ -142,6 +146,7 @@ impl AdverseSelectionEstimator {
             uninformed_fills_count: 0,
             informed_threshold_bps: 5.0, // Default: 5 bps = "informed"
             recent_as_ewma_bps: 0.0,
+            checkpoint_as_floor_bps: None,
         }
     }
 
@@ -390,6 +395,24 @@ impl AdverseSelectionEstimator {
     /// Get realized AS in basis points.
     pub fn realized_as_bps(&self) -> f64 {
         self.realized_as_total * 10000.0
+    }
+
+    /// Dynamic AS floor in bps for spread floor computation.
+    /// Uses checkpoint seed when no live markout data yet (critical for Fix 1 window).
+    /// After enough markouts, uses max(ewma/2, checkpoint_seed).
+    pub fn as_floor_bps(&self) -> f64 {
+        let markout_count = self.fills_measured;
+        if markout_count < 3 {
+            // No live markout data — use checkpoint seed or conservative fallback
+            return self.checkpoint_as_floor_bps.unwrap_or(2.0);
+        }
+        let ewma_half = self.realized_as_bps().abs() * 0.5;
+        ewma_half.max(self.checkpoint_as_floor_bps.unwrap_or(2.0))
+    }
+
+    /// Set checkpoint-seeded AS floor (called during prior injection).
+    pub fn set_checkpoint_as_floor_bps(&mut self, floor_bps: f64) {
+        self.checkpoint_as_floor_bps = Some(floor_bps);
     }
 
     /// Get recommended spread adjustment (as fraction of mid price).
@@ -800,5 +823,21 @@ mod tests {
         
         assert_eq!(est.informed_fills_count(), 0);
         assert_eq!(est.uninformed_fills_count(), 1);
+    }
+
+    #[test]
+    fn test_as_floor_bps_cold_start() {
+        let mut est = make_estimator();
+        // Cold start: no fills, no checkpoint
+        assert!(
+            (est.as_floor_bps() - 2.0).abs() < 1e-10,
+            "Default floor should be 2.0 bps"
+        );
+        // With checkpoint seed
+        est.set_checkpoint_as_floor_bps(5.0);
+        assert!(
+            (est.as_floor_bps() - 5.0).abs() < 1e-10,
+            "Should use checkpoint seed"
+        );
     }
 }

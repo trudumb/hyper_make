@@ -545,7 +545,7 @@ impl ParameterAggregator {
             adaptive_warmup_progress: {
                 let raw = sources.adaptive_spreads.warmup_progress();
                 if sources.cached_best_bid > 0.0 && sources.cached_best_ask > 0.0 {
-                    raw.max(0.50)
+                    raw.max(0.30) // Reduced from 0.50 — L2-weighted warmup reaches useful levels faster
                 } else {
                     raw
                 }
@@ -771,6 +771,15 @@ impl ParameterAggregator {
             },
             coordinator_uncertainty_premium_bps: sources.calibration_coordinator.uncertainty_premium_bps(),
             use_coordinator_kappa: sources.calibration_coordinator.is_seeded(),
+
+            // Fix 2: AS floor — populated later by quote engine from AS estimator
+            as_floor_bps: 0.0,
+
+            // Fix 4: σ cascade — populated by quote engine from Hawkes HWM
+            sigma_cascade_mult: 1.0,
+
+            // Fix 3: Ghost liquidity — populated by quote engine from kappa orchestrator
+            ghost_liquidity_gamma_mult: 1.0,
         }
     }
 }

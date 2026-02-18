@@ -269,6 +269,16 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     position_velocity_1m: f64,
     /// Fill cascade tracker: detects and mitigates same-side fill runs.
     fill_cascade_tracker: FillCascadeTracker,
+
+    // === Fix 4: Hawkes σ_conditional High Water Mark ===
+    /// σ cascade multiplier HWM — set on fills, decays after 15s cooldown.
+    /// Prevents sawtooth: fill spikes σ → next cycle reads decayed Hawkes → relaxes too fast.
+    sigma_cascade_hwm: f64,
+    /// Timestamp (ms) when sigma_cascade_hwm was last set/raised.
+    sigma_cascade_hwm_set_at: u64,
+    /// AS floor HWM — same pattern as sigma cascade.
+    as_floor_hwm: f64,
+
     /// Last time a quote cycle completed (for quota-aware frequency throttling).
     last_quote_cycle_time: Option<std::time::Instant>,
     /// Last time an empty ladder recovery was attempted (2s cooldown prevents churn).
@@ -534,6 +544,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             position_velocity_1m: 0.0,
             // Fill cascade tracker for same-side fill run detection (config-driven)
             fill_cascade_tracker,
+            sigma_cascade_hwm: 1.0,
+            sigma_cascade_hwm_set_at: 0,
+            as_floor_hwm: 0.0,
             last_quote_cycle_time: None,
             last_empty_ladder_recovery: None,
             // Signal diagnostics cache (updated each quote cycle)

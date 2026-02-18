@@ -387,10 +387,14 @@ impl GLFTStrategy {
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
         //
-        // The floor is physical constraints only: fee + tick + latency.
-        // Regime risk routes through gamma_multiplier, not floor clamping.
+        // The floor includes physical constraints AND dynamic AS floor:
+        //   fee + latency_cost + AS_floor → minimum viable half-spread.
+        // AS floor is seeded from checkpoint when no live markout data yet,
+        // providing defense during Fix 1 window (no binary filters).
         let time_horizon = self.holding_time(market_params.arrival_intensity);
-        let physical_floor_frac = cfg.maker_fee_rate.max(cfg.min_spread_floor);
+        let as_floor_frac = market_params.as_floor_bps / 10_000.0;
+        let physical_floor_frac = (cfg.maker_fee_rate + as_floor_frac)
+            .max(cfg.min_spread_floor);
         let min_gamma = solve_min_gamma(
             physical_floor_frac,
             market_params.kappa.max(1.0),
@@ -398,8 +402,14 @@ impl GLFTStrategy {
             time_horizon,
             cfg.maker_fee_rate,
         );
-        // Apply regime gamma multiplier: routes regime risk through gamma
-        let gamma_with_floor = gamma_final.max(min_gamma) * market_params.regime_gamma_multiplier;
+        // Apply regime gamma multiplier BEFORE floor: regime risk inflates γ,
+        // then floor catches if the result is still too small.
+        // Ghost liquidity: when book kappa >> robust kappa, book shows standing
+        // orders that don't represent real fill intensity → widen via γ.
+        let gamma_pre_floor = gamma_final
+            * market_params.regime_gamma_multiplier
+            * market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0);
+        let gamma_with_floor = gamma_pre_floor.max(min_gamma);
 
         let gamma_clamped = gamma_with_floor.clamp(cfg.gamma_min, cfg.gamma_max);
 
@@ -611,7 +621,8 @@ impl GLFTStrategy {
         } else {
             market_params.kappa
         };
-        let sigma = market_params.sigma_effective;
+        let sigma = market_params.sigma_effective
+            * market_params.sigma_cascade_mult.max(1.0);
         let tau = self.holding_time(market_params.arrival_intensity);
 
         // Core GLFT half-spread in fraction
@@ -939,7 +950,12 @@ impl QuotingStrategy for GLFTStrategy {
         // δ_bid = (1/γ) × ln(1 + γ/κ_bid) + (1/2) × γ × σ² × T - wider if κ_bid < κ_ask (sell pressure)
         // δ_ask = (1/γ) × ln(1 + γ/κ_ask) + (1/2) × γ × σ² × T - wider if κ_ask < κ_bid (buy pressure)
         // The volatility compensation term ensures spreads widen appropriately in volatile markets.
-        let sigma = market_params.sigma_effective;
+        // σ_conditional: Hawkes intensity ratio inflates σ during cascades.
+        // √(λ(t)/λ₀) widens BOTH GLFT terms uniformly (liquidity + vol_comp),
+        // unlike γ multiplication which partially cancels (wider inventory penalty
+        // but narrower edge capture via 1/γ).
+        let sigma = market_params.sigma_effective
+            * market_params.sigma_cascade_mult.max(1.0);
         let tau = time_horizon;
         let mut half_spread_bid = self.half_spread(gamma, kappa_bid, sigma, tau);
         let mut half_spread_ask = self.half_spread(gamma, kappa_ask, sigma, tau);
