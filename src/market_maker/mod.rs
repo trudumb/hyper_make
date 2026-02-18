@@ -233,6 +233,7 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     // === Exchange Price Validation ===
     /// Exchange pricing rules for quote validation.
     /// Used by `place_bulk_ladder_orders` to debug_assert price validity.
+    #[allow(dead_code)] // Read only in #[cfg(debug_assertions)] blocks
     exchange_rules: quoting::ExchangeRules,
 
     // === Event-Driven Churn Reduction (Phase 3) ===
