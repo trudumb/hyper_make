@@ -29,6 +29,7 @@ pub mod adaptive_ensemble;
 pub mod baseline_tracker;
 pub mod competitor_model;
 pub mod confidence;
+pub mod cross_asset;
 pub mod decision;
 pub mod ensemble;
 pub mod execution;

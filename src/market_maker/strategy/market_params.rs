@@ -248,6 +248,10 @@ pub struct MarketParams {
     /// Spread adjustment from AS estimator (as fraction of mid price).
     /// Add to half-spread to compensate for informed flow.
     pub as_spread_adjustment: f64,
+    /// Per-side AS spread adjustment for bids (from buy-side realized AS).
+    pub as_spread_adjustment_bid: f64,
+    /// Per-side AS spread adjustment for asks (from sell-side realized AS).
+    pub as_spread_adjustment_ask: f64,
 
     /// Predicted alpha: P(next trade is informed) in [0, 1].
     /// Use for diagnostics and future alpha-aware sizing.
@@ -283,6 +287,14 @@ pub struct MarketParams {
 
     /// Pre-fill spread multiplier for ask side [1.0, 3.0].
     pub pre_fill_spread_mult_ask: f64,
+
+    /// Pre-fill size multiplier for bid side [0.3, 1.0].
+    /// Reduces order sizes when toxic flow expected on bid side.
+    /// Computed from toxicity: if toxicity > 0.5, mult = (1.0 - (tox - 0.5)).clamp(0.3, 1.0)
+    pub pre_fill_size_mult_bid: f64,
+
+    /// Pre-fill size multiplier for ask side [0.3, 1.0].
+    pub pre_fill_size_mult_ask: f64,
 
     // === Tier 1: Liquidation Cascade ===
     /// Tail risk multiplier for gamma [1.0, 5.0].
@@ -801,12 +813,6 @@ pub struct MarketParams {
     /// Below this threshold, proactive skew is 0.
     pub proactive_min_momentum_bps: f64,
 
-    // ==================== Kappa-Driven Spread (Phase 3) ====================
-    /// Kappa-driven spread target (bps).
-    /// When kappa is high, spread can be tighter. Used to cap GLFT optimal spread.
-    /// None = no kappa spread adjustment applied.
-    pub kappa_spread_bps: Option<f64>,
-
     // ==================== Regime-Conditioned Kappa ====================
     /// Effective kappa from regime-conditioned estimator (blended across regimes).
     /// Per-regime priors: Low=3000, Normal=2000, High=1000, Extreme=500.
@@ -1057,6 +1063,8 @@ impl Default for MarketParams {
             beta_flow: 0.0,            // Will be learned from data
             // Tier 1: Adverse Selection
             as_spread_adjustment: 0.0, // No adjustment until warmed up
+            as_spread_adjustment_bid: 0.0,
+            as_spread_adjustment_ask: 0.0,
             predicted_alpha: 0.0,      // Default: no informed flow detected
             as_warmed_up: false,       // Starts not warmed up
             depth_decay_as: None,      // No calibrated model initially
@@ -1066,6 +1074,8 @@ impl Default for MarketParams {
             pre_fill_toxicity_ask: 0.0,      // No toxicity initially
             pre_fill_spread_mult_bid: 1.0,   // No multiplier initially
             pre_fill_spread_mult_ask: 1.0,   // No multiplier initially
+            pre_fill_size_mult_bid: 1.0,     // Full size initially
+            pre_fill_size_mult_ask: 1.0,     // Full size initially
             // Tier 1: Liquidation Cascade
             tail_risk_multiplier: 1.0, // Default: no tail risk scaling
             should_pull_quotes: false, // Default: don't pull quotes
@@ -1236,8 +1246,6 @@ impl Default for MarketParams {
             proactive_skew_sensitivity: 2.0,         // 2 bps per unit momentum×confidence
             proactive_min_momentum_confidence: 0.6,  // Need 60% confidence
             proactive_min_momentum_bps: 5.0,         // Need 5 bps minimum momentum
-            // Kappa-Driven Spread (Phase 3)
-            kappa_spread_bps: None, // No kappa spread cap until computed
             // Regime-Conditioned Kappa
             regime_kappa: None,                // Not available until regime estimator warmed up
             regime_kappa_current_regime: 1,    // Normal regime default

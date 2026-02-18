@@ -146,6 +146,22 @@ pub fn allocate_risk_budget(
         return (Vec::new(), empty_diag);
     }
 
+    // Small-capital bypass: when we can only fill <= 4 levels, softmax
+    // concentration gives 0 to one side. Use uniform allocation instead,
+    // which ensures at least 1 level per side gets the min_viable_size.
+    let max_levels = (total_capacity / budget.min_viable_size).floor() as usize;
+    if max_levels <= 4 {
+        let uniform = allocate_risk_budget_uniform(levels, budget);
+        let n = levels.len().max(1);
+        let uniform_weights = vec![1.0 / n as f64; n];
+        let diag = AllocationDiagnostics {
+            effective_temperature: softmax.temperature,
+            entropy_bits: (n as f64).log2(),
+            weights: uniform_weights,
+        };
+        return (uniform, diag);
+    }
+
     let per_level_cap = budget.position_capacity * budget.max_single_order_fraction;
 
     // Step 1: Compute softmax weights with entropy floor

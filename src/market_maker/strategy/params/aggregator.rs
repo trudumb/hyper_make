@@ -255,8 +255,14 @@ impl ParameterAggregator {
 
             // === Tier 1: Adverse Selection ===
             as_spread_adjustment: sources.adverse_selection.spread_adjustment(),
+            as_spread_adjustment_bid: sources.adverse_selection.spread_adjustment_bid(),
+            as_spread_adjustment_ask: sources.adverse_selection.spread_adjustment_ask(),
             predicted_alpha: sources.adverse_selection.predicted_alpha(),
-            as_warmed_up: sources.adverse_selection.is_warmed_up(),
+            // Break AS↔fill↔quoting deadlock: declare AS warmed up after
+            // calibration has made progress (L2 data observed) even without fills.
+            // AS estimator needs fills, but fills need quotes, and quotes need AS warmup.
+            as_warmed_up: sources.adverse_selection.is_warmed_up()
+                || sources.calibration_progress >= 0.25,
             depth_decay_as: Some(sources.depth_decay_as.clone()),
             // Conditional AS posterior mean from Bayesian fill AS tracker.
             // E[AS | fill] from Normal posterior updated on each fill.
@@ -272,6 +278,16 @@ impl ParameterAggregator {
             pre_fill_toxicity_ask: sources.pre_fill_classifier.predict_toxicity(false),
             pre_fill_spread_mult_bid: sources.pre_fill_classifier.spread_multiplier(true),
             pre_fill_spread_mult_ask: sources.pre_fill_classifier.spread_multiplier(false),
+            // Per-side size reduction from toxicity (Sprint 2.3):
+            // When toxicity > 0.5, linearly reduce size from 1.0 to 0.3
+            pre_fill_size_mult_bid: {
+                let tox = sources.pre_fill_classifier.predict_toxicity(true);
+                if tox > 0.5 { (1.0 - (tox - 0.5)).clamp(0.3, 1.0) } else { 1.0 }
+            },
+            pre_fill_size_mult_ask: {
+                let tox = sources.pre_fill_classifier.predict_toxicity(false);
+                if tox > 0.5 { (1.0 - (tox - 0.5)).clamp(0.3, 1.0) } else { 1.0 }
+            },
 
             // === Tier 1: Liquidation Cascade ===
             tail_risk_multiplier: sources.liquidation_detector.tail_risk_multiplier(),
@@ -523,7 +539,17 @@ impl ParameterAggregator {
 
             adaptive_warmed_up: sources.adaptive_spreads.is_warmed_up(),
             adaptive_can_estimate: sources.adaptive_spreads.can_provide_estimates(),
-            adaptive_warmup_progress: sources.adaptive_spreads.warmup_progress(),
+            // Floor warmup_progress at 0.50 once we have valid L2 data.
+            // This prevents extreme warmup-widening from creating a death spiral
+            // where wide spreads → no fills → no warmup progress → wider spreads.
+            adaptive_warmup_progress: {
+                let raw = sources.adaptive_spreads.warmup_progress();
+                if sources.cached_best_bid > 0.0 && sources.cached_best_ask > 0.0 {
+                    raw.max(0.50)
+                } else {
+                    raw
+                }
+            },
             adaptive_uncertainty_factor: sources.adaptive_spreads.warmup_uncertainty_factor(),
 
             // === Entropy-Based Distribution (always enabled) ===
@@ -600,9 +626,6 @@ impl ParameterAggregator {
                 .stochastic_config
                 .proactive_min_momentum_confidence,
             proactive_min_momentum_bps: sources.stochastic_config.proactive_min_momentum_bps,
-
-            // Kappa-Driven Spread (Phase 3) - computed separately in quote_engine
-            kappa_spread_bps: None,
 
             // Regime-Conditioned Kappa - wired from SignalIntegration in quote_engine
             regime_kappa: None,

@@ -414,6 +414,28 @@ impl AdverseSelectionEstimator {
         self.spread_adjustment() * 10000.0
     }
 
+    /// Per-side spread adjustment for bids (based on buy-side AS).
+    /// When buy fills show high AS, widen bid side more.
+    pub fn spread_adjustment_bid(&self) -> f64 {
+        if !self.is_warmed_up() {
+            return 0.0;
+        }
+        let raw = self.realized_as_buy * self.config.spread_adjustment_multiplier;
+        raw.max(self.config.min_spread_adjustment)
+            .min(self.config.max_spread_adjustment)
+    }
+
+    /// Per-side spread adjustment for asks (based on sell-side AS).
+    /// When sell fills show high AS, widen ask side more.
+    pub fn spread_adjustment_ask(&self) -> f64 {
+        if !self.is_warmed_up() {
+            return 0.0;
+        }
+        let raw = self.realized_as_sell * self.config.spread_adjustment_multiplier;
+        raw.max(self.config.min_spread_adjustment)
+            .min(self.config.max_spread_adjustment)
+    }
+
     /// Get predicted alpha: P(next trade is informed).
     ///
     /// Uses a simple weighted combination of signals:

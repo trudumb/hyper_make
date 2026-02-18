@@ -404,6 +404,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     resolved_snap.realized_edge_bps,
                 );
 
+                // Feed fill to cancel-race AS tracker (Sprint 6.3)
+                // Uses markout AS (not fill-time) for true adverse selection measurement
+                self.cancel_race_tracker.record_fill(
+                    pending.oid,
+                    markout_as_bps,
+                    pending.timestamp_ms,
+                );
+
                 // Feed resolved snapshot to learning systems
                 self.tier2.edge_tracker.add_snapshot(resolved_snap.clone());
                 let fill_pnl_bps = resolved_snap.realized_edge_bps;
@@ -2003,6 +2011,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             update.mid_price,
             update.timestamp_ms,
         );
+
+        // Feed BTC returns to CrossAssetSignals (Sprint 4.1)
+        if self.last_binance_mid > 0.0 && update.mid_price > 0.0 {
+            let return_bps =
+                (update.mid_price / self.last_binance_mid - 1.0) * 10_000.0;
+            self.cross_asset_signals
+                .update_btc_return(update.timestamp_ms as u64, return_bps);
+        }
+        self.last_binance_mid = update.mid_price;
 
         // Log periodically (every 1000 updates ≈ every 10 seconds at 100 updates/sec)
         static BINANCE_UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

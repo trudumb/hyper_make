@@ -114,8 +114,11 @@ pub(crate) fn allocate(
         }
     }
 
-    // Phase 3: Filter out negative-value actions (never execute).
-    budgeted.retain(|u| u.value_bps > 0.0);
+    // Phase 3: Filter out deeply negative-value actions.
+    // Allow slightly negative EV (-2 bps) so guaranteed quotes can still be placed
+    // even when API cost makes them marginally negative. A MM with 0 resting
+    // orders MUST place quotes.
+    budgeted.retain(|u| u.value_bps > -2.0);
 
     // Phase 4: Sort by value_bps descending (highest value first).
     budgeted.sort_by(|a, b| {
@@ -153,8 +156,11 @@ pub(crate) fn allocate(
 
 /// Check if an action is emergency priority (always executes).
 fn is_emergency(update: &ScoredUpdate) -> bool {
-    // StaleCancel with high positive value = genuinely stale, must clean up
-    matches!(update.action, ActionType::StaleCancel) && update.value_bps > 10.0
+    // StaleCancel is always emergency — stale orders MUST be cleaned up regardless
+    // of value_bps (which is always negative: -ev_keep - api_cost). A stale order
+    // has no matching target and wastes a resting slot. W2 audit fix: was > 10.0
+    // which is unreachable since StaleCancel.value_bps is always negative.
+    matches!(update.action, ActionType::StaleCancel)
 }
 
 /// Convert a ScoredUpdate to one or more LadderActions.

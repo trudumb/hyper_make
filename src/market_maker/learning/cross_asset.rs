@@ -37,7 +37,9 @@ impl BayesianEstimate {
         let new_mean = (prior_precision * self.mean + obs_precision * observation) / new_precision;
 
         self.mean = new_mean;
-        self.variance = 1.0 / new_precision;
+        // Floor prevents division-by-zero in downstream confidence calculations
+        // after many convergent updates collapse variance toward zero
+        self.variance = (1.0 / new_precision).max(1e-10);
         self.n_observations += 1;
     }
 
@@ -247,7 +249,7 @@ impl OIVolModel {
 }
 
 /// Aggregated cross-asset signals.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CrossAssetSignals {
     /// BTC → Altcoin lead-lag model
     pub btc_alt_lead: Option<LeadLagModel>,
@@ -255,16 +257,6 @@ pub struct CrossAssetSignals {
     pub funding_divergence: FundingDivergenceModel,
     /// OI → vol predictor
     pub oi_vol_predictor: OIVolModel,
-}
-
-impl Default for CrossAssetSignals {
-    fn default() -> Self {
-        Self {
-            btc_alt_lead: None,
-            funding_divergence: FundingDivergenceModel::default(),
-            oi_vol_predictor: OIVolModel::default(),
-        }
-    }
 }
 
 impl CrossAssetSignals {

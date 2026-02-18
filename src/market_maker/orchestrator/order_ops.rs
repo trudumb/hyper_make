@@ -44,6 +44,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             return;
         }
 
+        // Record cancel requests for cancel-race AS tracking (Sprint 6.3)
+        let cancel_ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        for &oid in &cancellable_oids {
+            self.cancel_race_tracker.record_cancel_request(oid, cancel_ts_ms);
+        }
+
         // Debug level here since executor.rs logs at INFO level
         debug!("Bulk cancelling {} orders", cancellable_oids.len());
 
@@ -92,6 +101,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     pub(crate) async fn initiate_and_track_cancel(&mut self, oid: u64) {
         // Get order price before cancel for Bayesian learning
         let order_price = self.orders.get_order(oid).map(|o| o.price);
+
+        // Record cancel request for cancel-race AS tracking (Sprint 6.3 fix F2)
+        // Must happen before cancel is sent so we can detect fills-after-cancel
+        let cancel_ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.cancel_race_tracker.record_cancel_request(oid, cancel_ts_ms);
 
         // Mark as CancelPending before sending request
         if !self.orders.initiate_cancel(oid) {

@@ -22,25 +22,6 @@ pub(crate) const MIN_ORDER_NOTIONAL: f64 = 10.0;
 
 /// Compute adaptive quote latch threshold based on quoted spread and API quota headroom.
 ///
-/// Orders within this threshold are preserved to reduce cancellation churn
-/// and maintain queue position. Proportional to spread: at 3 bps half-spread
-/// the latch is 1.0 bps; at 20 bps it's 6.0 bps. This replaces the fixed
-/// 2.5 bps constant that caused 87% cancel rate.
-///
-/// When API quota headroom is low (< 30%), the latch widens to let orders ride
-/// rather than burning quota to move them. A resting order 3 bps off-center is
-/// better than burning quota to move it 2 bps.
-#[allow(dead_code)]
-fn latch_threshold_bps(quoted_half_spread_bps: f64, headroom_pct: f64) -> f64 {
-    let base = quoted_half_spread_bps * 0.3;
-    if headroom_pct < 0.30 {
-        // Low quota: widen latch to reduce churn
-        (base * 2.0).clamp(3.0, 15.0)
-    } else {
-        base.clamp(1.0, 10.0)
-    }
-}
-
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Reconcile a single order per side (legacy single-order mode).
     pub(crate) async fn reconcile_side(
@@ -629,7 +610,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .as_ref()
             .map(|c| c.headroom_pct())
             .unwrap_or(1.0);
-        let latch_bps = latch_threshold_bps(quoted_half_spread_bps, headroom_pct);
+        // Inline latch computation (spread-proportional with quota widening).
+        let latch_bps = {
+            let base = quoted_half_spread_bps * 0.3;
+            if headroom_pct < 0.30 {
+                (base * 2.0).clamp(3.0, 15.0)
+            } else {
+                base.clamp(1.0, 10.0)
+            }
+        };
 
         // Check each level for meaningful price/size changes
         for (order, quote) in sorted_current.iter().zip(new_quotes.iter()) {
@@ -718,20 +707,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
-            // Throttle if headroom < 10% (more aggressive than impulse control's 5%)
-            // This gives buffer before we hit the hard 5% limit
-            // Uses proactive_rate_tracker's minimum interval check
-            // BUT: If cache is stale, proceed anyway to break potential deadlock
+            // Only hard-block at 1% headroom (truly exhausted).
+            // Previous 10% threshold caused 94% zero-action cycles. The budget
+            // allocator now handles quota conservation; reconciler should always
+            // attempt to maintain market presence.
             if let Some(ref cache) = self.infra.cached_rate_limit {
                 let headroom = cache.headroom_pct();
                 let stale = cache.is_stale(std::time::Duration::from_secs(60));
 
-                if headroom < 0.10 && !self.infra.proactive_rate_tracker.can_modify() && !stale {
-                    // Rate limit is tight AND we're within the minimum modify interval AND cache is fresh
-                    // Skip this cycle to conserve rate limit budget
+                if headroom < 0.01 && !stale {
                     debug!(
                         headroom_pct = %format!("{:.1}%", headroom * 100.0),
-                        "Rate limit headroom low (<10%) - throttling reconciliation"
+                        "Rate limit headroom critically low (<1%) - hard block"
                     );
                     return Ok(());
                 }
@@ -2045,10 +2032,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let headroom = cache.headroom_pct();
                 let stale = cache.is_stale(std::time::Duration::from_secs(60));
 
-                if headroom < 0.10 && !self.infra.proactive_rate_tracker.can_modify() && !stale {
+                if headroom < 0.01 && !stale {
                     debug!(
                         headroom_pct = %format!("{:.1}%", headroom * 100.0),
-                        "Rate limit headroom low (<10%) - throttling reconciliation"
+                        "Rate limit headroom critically low (<1%) - hard block"
                     );
                     return Ok(());
                 }
@@ -2438,7 +2425,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &dynamic_config,
                 Some(&self.tier1.queue_tracker),
                 &self.queue_value_heuristic,
-                headroom_pct,
                 toxicity,
                 self.latest_mid,
                 self.config.sz_decimals,
@@ -2451,7 +2437,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 &dynamic_config,
                 Some(&self.tier1.queue_tracker),
                 &self.queue_value_heuristic,
-                headroom_pct,
                 toxicity,
                 self.latest_mid,
                 self.config.sz_decimals,
@@ -2474,6 +2459,35 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Merge both sides and allocate within budget
         let mut all_scored: Vec<_> = bid_scored.drain(..).chain(ask_scored.drain(..)).collect();
+
+        // Priority-filtered execution: when headroom is tight, drop low-value actions
+        // to preserve quota for high-value ones (new placements, large price moves).
+        // Low-value = small price moves (<5 bps) or size-only modifications with value < 1 bps.
+        if headroom_pct < 0.20 {
+            let pre_filter = all_scored.len();
+            all_scored.retain(|s| {
+                use crate::market_maker::tracking::ActionType;
+                // Always keep: latches (0 API cost), stale cancels (cleanup), new placements
+                match s.action {
+                    ActionType::Latch => true,
+                    ActionType::StaleCancel | ActionType::NewPlace => true,
+                    // Size-only mods: keep only if value > 1 bps
+                    ActionType::ModifySize => s.value_bps > 1.0,
+                    // Price moves & cancel+place: keep only if value > 0.5 bps
+                    ActionType::ModifyPrice | ActionType::CancelPlace => s.value_bps > 0.5,
+                }
+            });
+            let filtered = pre_filter - all_scored.len();
+            if filtered > 0 {
+                info!(
+                    filtered_count = filtered,
+                    remaining = all_scored.len(),
+                    headroom_pct = %format!("{:.1}%", headroom_pct * 100.0),
+                    "[Unified] Priority-filtered low-value actions under quota pressure"
+                );
+            }
+        }
+
         let allocation = allocate(&mut all_scored, &budget, self.config.sz_decimals);
 
         info!(

@@ -947,17 +947,23 @@ impl QuotingStrategy for GLFTStrategy {
         // Symmetric half-spread for logging (average of bid/ask)
         let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
 
-        // === 2a. ADVERSE SELECTION SPREAD ADJUSTMENT ===
-        // Add measured AS cost to half-spreads (only when warmed up)
-        if market_params.as_warmed_up && market_params.as_spread_adjustment > 0.0 {
-            half_spread_bid += market_params.as_spread_adjustment;
-            half_spread_ask += market_params.as_spread_adjustment;
-            half_spread += market_params.as_spread_adjustment;
-            debug!(
-                as_adj_bps = %format!("{:.2}", market_params.as_spread_adjustment * 10000.0),
-                predicted_alpha = %format!("{:.3}", market_params.predicted_alpha),
-                "AS spread adjustment applied"
-            );
+        // === 2a. ADVERSE SELECTION SPREAD ADJUSTMENT (per-side) ===
+        // Add measured AS cost to half-spreads using per-side realized AS.
+        // Buy-side AS affects bids (we're buying), sell-side AS affects asks.
+        if market_params.as_warmed_up {
+            let as_bid = market_params.as_spread_adjustment_bid;
+            let as_ask = market_params.as_spread_adjustment_ask;
+            if as_bid > 0.0 || as_ask > 0.0 {
+                half_spread_bid += as_bid;
+                half_spread_ask += as_ask;
+                half_spread += (as_bid + as_ask) / 2.0;
+                debug!(
+                    as_bid_bps = %format!("{:.2}", as_bid * 10000.0),
+                    as_ask_bps = %format!("{:.2}", as_ask * 10000.0),
+                    predicted_alpha = %format!("{:.3}", market_params.predicted_alpha),
+                    "Per-side AS spread adjustment applied"
+                );
+            }
         }
 
         // === 2a''. PRE-FILL TOXICITY ASYMMETRIC WIDENING (Phase 3) ===

@@ -573,6 +573,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 .hjb_controller
                 .update_funding(funding_rate_8h);
 
+            // Feed funding rate to cross-asset signals (Sprint 4.1)
+            self.cross_asset_signals.update_funding(funding_rate_8h);
+
             // Calibrate terminal penalty from observed market spread
             let market_spread_bps = self.tier2.spread_tracker.current_spread_bps();
             self.stochastic
@@ -1149,7 +1152,77 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // - Informed flow decomposition
         // - Regime-conditioned kappa
         // - Model gating (IR-based confidence)
-        let signals = self.stochastic.signal_integrator.get_signals();
+        let mut signals = self.stochastic.signal_integrator.get_signals();
+
+        // Inject cross-asset signals (Sprint 4.1): BTC lead-lag + funding divergence
+        {
+            let funding_rate = self.tier2.funding.current_rate();
+            let cross_signal = self.cross_asset_signals.aggregate_signal(funding_rate);
+            signals.cross_asset_expected_move_bps = cross_signal.expected_move_bps;
+            signals.cross_asset_confidence = cross_signal.confidence;
+            signals.cross_asset_vol_mult = self.cross_asset_signals.vol_multiplier();
+
+            // Blend cross-asset skew into combined_skew_bps (additive, confidence-gated)
+            // Regime-dependent clamp: cross-asset signal is most valuable during cascades
+            if cross_signal.confidence > 0.3 {
+                let cross_asset_skew_bps = cross_signal.expected_move_bps
+                    * cross_signal.confidence
+                    * 0.5; // 50% weight — conservative blending
+                let cross_asset_clamp = match self.stochastic.regime_state.regime {
+                    crate::market_maker::strategy::regime_state::MarketRegime::Calm
+                    | crate::market_maker::strategy::regime_state::MarketRegime::Normal => 3.0,
+                    crate::market_maker::strategy::regime_state::MarketRegime::Volatile => 5.0,
+                    crate::market_maker::strategy::regime_state::MarketRegime::Extreme => 6.0,
+                };
+                signals.combined_skew_bps += cross_asset_skew_bps.clamp(-cross_asset_clamp, cross_asset_clamp);
+            }
+
+            // OI-based vol multiplier flows into additive risk premium
+            if signals.cross_asset_vol_mult > 1.2 {
+                let oi_excess = signals.cross_asset_vol_mult - 1.0;
+                // 3 bps per unit of OI excess vol (e.g., vol_mult=1.5 → +1.5 bps)
+                signals.signal_risk_premium_bps += oi_excess * 3.0;
+            }
+        }
+
+        // Inject funding rate signals (Sprint 4.2)
+        {
+            let funding = &self.tier2.funding;
+            signals.funding_basis_velocity = funding.basis_velocity();
+            signals.funding_premium_alpha = funding.premium_alpha();
+
+            // Funding skew: positive funding → market pays longs → skew asks tighter (attract shorts)
+            // Negative funding → market pays shorts → skew bids tighter (attract longs)
+            // Scale: 1% annualized funding ≈ 0.3 bps skew
+            let funding_rate = funding.current_rate();
+            let funding_skew = -funding_rate * 3000.0; // rate is 8h fraction, *3000 → ~bps
+            signals.funding_skew_bps = funding_skew.clamp(-2.0, 2.0);
+
+            // Blend funding skew into combined_skew_bps when warmed up
+            if funding.is_warmed_up() {
+                signals.combined_skew_bps += signals.funding_skew_bps * 0.3; // 30% weight
+            }
+
+            // Widen near settlement (last 30 min of 8h cycle): flow becomes unpredictable
+            // Additive risk premium: up to +1.5 bps at settlement
+            if let Some(ttf) = funding.time_to_next_funding() {
+                let time_to_funding_s = ttf.as_secs_f64();
+                if time_to_funding_s < 1800.0 && time_to_funding_s > 0.0 {
+                    let settlement_proximity = 1.0 - (time_to_funding_s / 1800.0);
+                    signals.signal_risk_premium_bps += settlement_proximity * 1.5;
+                }
+            }
+        }
+
+        // Cancel-race excess AS → additive risk premium (Sprint 6.3)
+        // If fills arriving after cancel requests show higher AS than normal fills,
+        // widen spreads by the excess amount to compensate for cancel-race toxicity.
+        self.cancel_race_tracker.update_momentum(signals.combined_skew_bps);
+        let cancel_race_excess = self.cancel_race_tracker.excess_race_as_bps();
+        if cancel_race_excess > 0.5 {
+            // Direct additive: excess AS bps → risk premium, capped at 5 bps
+            signals.signal_risk_premium_bps += cancel_race_excess.min(5.0);
+        }
 
         // Record signal contributions for analytics attribution
         self.live_analytics.record_quote_cycle(&signals);
@@ -1348,6 +1421,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
         total_risk_premium += staleness_addon_bps;
 
+        // Signal-derived risk premium: OI vol, funding settlement, cancel-race AS
+        // Accumulated on signals.signal_risk_premium_bps during signal injection above
+        total_risk_premium += signals.signal_risk_premium_bps;
+
         // Hidden liquidity discount: when iceberg detected on both sides, reduce premium by 20%
         // IcebergDetector is not yet wired on StochasticComponents — use TODO for future integration
         // TODO: Wire IcebergDetector to StochasticComponents for hidden liquidity discount
@@ -1452,9 +1529,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         } else {
             unified.max_position_fraction // Clamped to [0.3, 1.0] by unified_regime()
         };
+        // Kelly-aware position scaling (Sprint 5.3): when Kelly tracker recommends
+        // reducing exposure (low win rate or bad odds), scale down position limits.
+        // Gated by kelly_warmed_up() to avoid reducing limits during warmup.
+        let kelly_position_mult = if self.stochastic.stochastic_config.use_kelly_sizing {
+            if let Some(raw_kelly) = self.learning.kelly_recommendation() {
+                // Scale: full Kelly of 0.25 → mult 1.0, Kelly of 0.05 → mult 0.2
+                // Floor at 0.1 to always keep some market presence
+                (raw_kelly / self.stochastic.stochastic_config.kelly_fraction)
+                    .clamp(0.1, 1.0)
+            } else {
+                1.0 // Not warmed up yet
+            }
+        } else {
+            1.0
+        };
         let new_effective = margin_effective
             .min(self.config.max_position)
-            * regime_fraction;
+            * regime_fraction
+            * kelly_position_mult;
         if (new_effective - self.effective_max_position).abs() > 0.001 {
             debug!(
                 old = %format!("{:.6}", self.effective_max_position),
@@ -1849,28 +1942,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             * proactive_size_mult;
 
         // === KELLY CRITERION SIZING ===
-        // When Kelly tracker is warmed up (50+ fills), scale liquidity by optimal fraction.
-        // Clamped to [5%, 30%] — never go below 5% to stay visible on the book.
-        const KELLY_MIN_FRACTION: f64 = 0.05;
-        const KELLY_MAX_FRACTION: f64 = 0.30;
-        let kelly_adjusted_liquidity = if self.stochastic.stochastic_config.use_kelly_sizing {
-            if let Some(raw_kelly) = self.learning.kelly_recommendation() {
-                let kelly_fraction = raw_kelly.clamp(KELLY_MIN_FRACTION, KELLY_MAX_FRACTION);
-                let adjusted = decision_adjusted_liquidity * kelly_fraction;
-                info!(
-                    raw_kelly = %format!("{:.1}%", raw_kelly * 100.0),
-                    clamped_kelly = %format!("{:.1}%", kelly_fraction * 100.0),
-                    base_liquidity = %format!("{:.6}", decision_adjusted_liquidity),
-                    adjusted_liquidity = %format!("{:.6}", adjusted),
-                    "Kelly criterion sizing active"
-                );
-                adjusted
-            } else {
-                decision_adjusted_liquidity
-            }
-        } else {
-            decision_adjusted_liquidity
-        };
+        // Kelly is applied once to effective_max_position (line ~1540) which governs
+        // how much capital to deploy. Applying it again here to liquidity would compound
+        // the reduction (W1 audit fix). Use decision_adjusted_liquidity directly.
+        let kelly_adjusted_liquidity = decision_adjusted_liquidity;
 
         // === LAYER 3: STOCHASTIC CONTROLLER ===
         // When enabled, provides POMDP-based sequential decision-making on top of Layer 2
@@ -2060,23 +2135,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             None
         };
 
-        // === Phase 3: Compute kappa-driven spread cap ===
-        // Dynamic kappa cap: 2/kappa in bps (matches GLFT asymptotic spread when γ << κ).
-        // High kappa (8000) → 2.5 bps cap (allows tight quoting).
-        // Low kappa (2500) → 8 bps cap (stays wide).
-        //
-        // STABILITY FLOOR: The kappa cap must not narrow spreads below the noise floor.
-        // If half-spread < 2 × expected_mid_move_per_cycle, orders churn every cycle.
-        // Formula: stability_floor = 2 × sigma × √(cycle_dt) × 10000
-        // This ensures orders survive at least 2 cycles, giving tolerance bands room to work.
-        let kappa_for_cap = market_params.kappa.max(1.0);
-        let raw_kappa_cap_bps = 2.0 / kappa_for_cap * 10_000.0;
-        let cycle_dt_s = 5.0_f64; // typical quote cycle interval
-        let stability_floor_bps =
-            (2.0 * market_params.sigma * cycle_dt_s.sqrt() * 10_000.0).max(5.0);
-        let kappa_cap_bps = raw_kappa_cap_bps.max(stability_floor_bps);
-        market_params.kappa_spread_bps = Some(kappa_cap_bps);
-        // Still update the kappa EMA for diagnostics
+        // Kappa-driven spread cap removed — circular with GLFT (which already uses kappa).
+        // GLFT delta = (1/gamma) * ln(1 + gamma/kappa) is the self-consistent spread.
         self.stochastic.kappa_spread.update_avg_kappa(market_params.kappa);
 
         // === Phase 8: Contextual Bandit Spread Selection ===
@@ -2499,6 +2559,50 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             for level in ladder.asks.iter_mut() {
                 level.price = grid.snap_ask(level.price);
+            }
+        }
+
+        // === CANCEL-ON-TOXICITY (Sprint 2.2) ===
+        // When pre-fill toxicity exceeds 0.75 on a side, clear that side of the
+        // ladder entirely. The reconciler will cancel resting orders. This prevents
+        // getting filled at minimum tick spread during toxic flow bursts.
+        // 5s cooldown prevents oscillation from noisy toxicity signals.
+        const TOXICITY_CANCEL_THRESHOLD: f64 = 0.75;
+        const TOXICITY_CANCEL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let now_tox = std::time::Instant::now();
+        if market_params.pre_fill_toxicity_bid > TOXICITY_CANCEL_THRESHOLD {
+            let should_cancel = self.last_toxicity_cancel_bid
+                .is_none_or(|t| now_tox.duration_since(t) >= TOXICITY_CANCEL_COOLDOWN);
+            if should_cancel {
+                let cleared = ladder.bids.len();
+                ladder.bids.clear();
+                self.last_toxicity_cancel_bid = Some(now_tox);
+                if cleared > 0 {
+                    tracing::warn!(
+                        toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
+                        cleared_levels = cleared,
+                        "TOXICITY CANCEL: bid side cleared (toxicity > {:.0}%)",
+                        TOXICITY_CANCEL_THRESHOLD * 100.0
+                    );
+                }
+            }
+        }
+        if market_params.pre_fill_toxicity_ask > TOXICITY_CANCEL_THRESHOLD {
+            let should_cancel = self.last_toxicity_cancel_ask
+                .is_none_or(|t| now_tox.duration_since(t) >= TOXICITY_CANCEL_COOLDOWN);
+            if should_cancel {
+                let cleared = ladder.asks.len();
+                ladder.asks.clear();
+                self.last_toxicity_cancel_ask = Some(now_tox);
+                if cleared > 0 {
+                    tracing::warn!(
+                        toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
+                        cleared_levels = cleared,
+                        "TOXICITY CANCEL: ask side cleared (toxicity > {:.0}%)",
+                        TOXICITY_CANCEL_THRESHOLD * 100.0
+                    );
+                }
             }
         }
 

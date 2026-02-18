@@ -1073,32 +1073,9 @@ impl LadderStrategy {
         let size_for_initial_ladder =
             effective_max_position * market_params.cascade_size_factor * zone_size_mult;
 
-        // === L2 RESERVATION SHIFT (Avellaneda-Stoikov Framework) ===
-        // Edge enters through the reservation price, not sizing.
-        // δ_μ = μ/(γσ²) shifts where we center quotes:
-        // - Positive edge → shift UP → aggressive asks, capturing positive drift
-        // - Negative edge → shift DOWN → aggressive bids, capturing negative drift
-        //
-        // l2_reservation_shift is now a FRACTION (±0.005 max = ±50 bps)
-        // Use multiplicative adjustment: adjusted = microprice × (1 + shift_fraction)
-        let adjusted_microprice = market_params.microprice * (1.0 + market_params.l2_reservation_shift);
-
-        // SAFETY: Validate adjusted microprice doesn't diverge from market_mid
-        let microprice_ratio = adjusted_microprice / market_params.market_mid;
-        let adjusted_microprice = if !(0.8..=1.2).contains(&microprice_ratio) {
-            // This should never happen with the new bounded shift formula
-            tracing::error!(
-                adjusted = %format!("{:.4}", adjusted_microprice),
-                microprice = %format!("{:.4}", market_params.microprice),
-                market_mid = %format!("{:.4}", market_params.market_mid),
-                l2_reservation_shift = %format!("{:.6}", market_params.l2_reservation_shift),
-                ratio = %format!("{:.2}", microprice_ratio),
-                "CRITICAL: Adjusted microprice diverged >20% from market_mid - using microprice directly"
-            );
-            market_params.microprice
-        } else {
-            adjusted_microprice
-        };
+        // L2 reservation shift removed — double-counts skew already handled
+        // by lead_lag_signal_bps in the directional skew section below.
+        let adjusted_microprice = market_params.microprice;
 
         // === DIRECTIONAL SKEW: Apply combined skew as mid-price offset ===
         // lead_lag_signal_bps carries combined_skew_bps + position_guard_skew_bps
@@ -1305,35 +1282,8 @@ impl LadderStrategy {
             );
         }
 
-        // === KAPPA-DRIVEN SPREAD CAP (Phase 3) ===
-        // When kappa is high (lots of fill intensity), cap spreads to be tighter.
-        // This allows us to be more aggressive when the market is active.
-        if let Some(kappa_cap_bps) = market_params.kappa_spread_bps {
-            // Only apply if kappa cap is meaningful (above floor)
-            if kappa_cap_bps > effective_floor_bps {
-                for depth in dynamic_depths.bid.iter_mut() {
-                    if *depth > kappa_cap_bps {
-                        *depth = kappa_cap_bps;
-                    }
-                }
-                for depth in dynamic_depths.ask.iter_mut() {
-                    if *depth > kappa_cap_bps {
-                        *depth = kappa_cap_bps;
-                    }
-                }
-            }
-        }
-
-        // [SPREAD TRACE] Phase 5: kappa cap applied (2/kappa formula)
-        tracing::info!(
-            phase = "kappa_cap",
-            kappa_cap_bps = %format!("{:.1}", market_params.kappa_spread_bps.unwrap_or(0.0)),
-            kappa_used = %format!("{:.0}", kappa),
-            touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
-            touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
-            total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
-            "[SPREAD TRACE] after kappa spread cap (2/kappa formula)"
-        );
+        // Kappa-driven spread cap removed — circular with GLFT.
+        // GLFT delta = (1/gamma) * ln(1 + gamma/kappa) IS the self-consistent spread.
 
         // === PRE-FILL AS MULTIPLIERS ===
         // Apply asymmetric spread widening from pre-fill adverse selection classifier.
@@ -1447,7 +1397,7 @@ impl LadderStrategy {
                 .and_then(|d| d.spread_at_touch())
                 .unwrap_or(0.0)),
             effective_floor_bps = %format!("{:.1}", effective_floor_bps),
-            kappa_spread_cap_bps = %format!("{:.1}", market_params.kappa_spread_bps.unwrap_or(0.0)),
+            kappa = %format!("{:.0}", kappa),
             book_depth_usd = %format!("{:.0}", market_params.near_touch_depth_usd),
             warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
             adaptive_mode = market_params.use_adaptive_spreads && market_params.adaptive_can_estimate,
@@ -1486,152 +1436,41 @@ impl LadderStrategy {
             // - When positioned: prioritize mean-reversion
             // - When position opposes momentum: urgently reduce exposure
 
+            // Simple inventory-driven margin split.
+            // Long → more margin to asks (mean-revert), Short → more to bids.
+            // Directional skew is already in the microprice offset above.
             let inventory_ratio = if effective_max_position > EPSILON {
                 (position / effective_max_position).clamp(-1.0, 1.0)
             } else {
                 0.0
             };
-
-            // Component weights (sum to 1.0)
-            const INVENTORY_WEIGHT: f64 = 0.50; // Primary: inventory reduction
-            const MOMENTUM_WEIGHT: f64 = 0.25; // Secondary: follow flow direction
-            const URGENCY_WEIGHT: f64 = 0.10; // Amplifier: danger detection
-            const DIRECTIONAL_WEIGHT: f64 = 0.15; // Directional: alpha + knife + flow
-
-            // Sensitivity factors
-            const INVENTORY_SENSITIVITY: f64 = 0.4; // How much inventory affects split
-            const MOMENTUM_SENSITIVITY: f64 = 0.3; // How much flow affects split (when flat)
-
-            // 1. INVENTORY COMPONENT: Mean-revert position
-            // Long → more margin to asks, Short → more margin to bids
-            let inventory_signal = inventory_ratio * INVENTORY_SENSITIVITY;
-
-            // 2. MOMENTUM COMPONENT: Follow flow direction
-            // Positive flow (bullish) → allocate more to asks to capture rises
-            // Negative flow (bearish) → allocate more to bids to capture falls
-            // Scale by (1 - |inventory_ratio|) so momentum matters more when flat
-            let inventory_flat_factor = 1.0 - inventory_ratio.abs();
-            let momentum_signal =
-                market_params.flow_imbalance * MOMENTUM_SENSITIVITY * inventory_flat_factor;
-
-            // 3. URGENCY COMPONENT: Amplify when position opposes momentum
-            // If long and price falling, or short and price rising → urgent reduction needed
-            let mut urgency_score_adj = market_params.urgency_score;
-
-            // 3a. Falling knife / rising knife amplification (mirrors glft.rs:1037-1068)
-            // MarketParams carries falling_knife_score and rising_knife_score from momentum estimator.
-            // If position opposes the dominant momentum direction AND severity > 0.5,
-            // amplify inventory reduction urgency to avoid getting run over.
-            let momentum_severity = market_params
-                .falling_knife_score
-                .max(market_params.rising_knife_score);
-            let momentum_direction =
-                if market_params.falling_knife_score > market_params.rising_knife_score {
-                    -1.0 // Market falling
-                } else if market_params.rising_knife_score > market_params.falling_knife_score {
-                    1.0 // Market rising
-                } else {
-                    0.0 // Neutral
-                };
-            let knife_opposes_position = (inventory_ratio > 0.0 && momentum_direction < 0.0)
-                || (inventory_ratio < 0.0 && momentum_direction > 0.0);
-
-            if knife_opposes_position && momentum_severity > 0.5 {
-                // Amplify urgency: at severity=1.5 → adds 0.5 urgency
-                urgency_score_adj = (urgency_score_adj + momentum_severity / 3.0).min(1.0);
-                if momentum_severity > 1.0 {
-                    info!(
-                        inventory_ratio = %format!("{:.3}", inventory_ratio),
-                        falling_knife = %format!("{:.2}", market_params.falling_knife_score),
-                        rising_knife = %format!("{:.2}", market_params.rising_knife_score),
-                        urgency_adj = %format!("{:.2}", urgency_score_adj),
-                        "Momentum-opposed position: amplifying urgency via falling/rising knife"
-                    );
-                }
-            }
-
-            let urgency_signal = if market_params.position_opposes_momentum || knife_opposes_position
-            {
-                // Use HJB drift urgency direction with urgency score magnitude
-                // This gives strong directional pressure when in danger
-                let urgency_direction = if inventory_ratio > 0.0 { 1.0 } else { -1.0 };
-                urgency_direction * urgency_score_adj.min(1.0) * 0.2
-            } else {
-                0.0
-            };
-
-            // 4. DIRECTIONAL COMPONENT: Use alpha + knife + flow for asymmetry
-            // When position is flat and cross-venue signals are unavailable,
-            // directional signals (alpha, knife, flow) still indicate where the market
-            // is headed. This component ensures we lean quotes toward the strong side.
-            let directional_signal = {
-                let knife_dir =
-                    market_params.rising_knife_score - market_params.falling_knife_score;
-                let knife_strength = knife_dir.abs().min(2.0) / 2.0;
-                // Alpha amplifies directional conviction — higher alpha = stronger lean
-                let alpha_amp = 1.0 + market_params.predicted_alpha.min(0.5) * 2.0;
-                const KNIFE_COMPONENT: f64 = 0.4;
-                const FLOW_COMPONENT: f64 = 0.4;
-                const LEAD_LAG_COMPONENT: f64 = 0.2;
-                const DIRECTIONAL_SENSITIVITY: f64 = 0.3;
-                let raw = (knife_dir.signum() * knife_strength * KNIFE_COMPONENT
-                    + market_params.flow_imbalance * FLOW_COMPONENT
-                    + market_params.lead_lag_signal_bps / 5.0 * LEAD_LAG_COMPONENT)
-                    * alpha_amp;
-                raw.clamp(-1.0, 1.0) * DIRECTIONAL_SENSITIVITY
-            };
-
-            // Combine weighted components
-            let combined_signal = inventory_signal * INVENTORY_WEIGHT
-                + momentum_signal * MOMENTUM_WEIGHT
-                + urgency_signal * URGENCY_WEIGHT
-                + directional_signal * DIRECTIONAL_WEIGHT;
-
-            // Apply to base 0.5 split with wider clamp range [0.25, 0.75]
-            // This allows stronger skew when signals are aligned
-            let ask_margin_weight = (0.5 + combined_signal).clamp(0.25, 0.75);
+            let inv_factor = (inventory_ratio * 0.3).clamp(-0.20, 0.20);
+            let ask_margin_weight = (0.5 + inv_factor).clamp(0.30, 0.70);
             let bid_margin_weight = 1.0 - ask_margin_weight;
             let margin_for_bids = usable_margin * bid_margin_weight;
             let margin_for_asks = usable_margin * ask_margin_weight;
 
             info!(
-                available_margin = %format!("{:.2}", available_margin),
                 usable_margin = %format!("{:.2}", usable_margin),
-                utilization_pct = %format!("{:.0}%", margin_utilization * 100.0),
                 inventory_ratio = %format!("{:.3}", inventory_ratio),
-                flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
-                position_opposes = %market_params.position_opposes_momentum,
-                urgency_score = %format!("{:.2}", market_params.urgency_score),
-                directional = %format!("{:.3}", directional_signal),
+                inv_factor = %format!("{:.3}", inv_factor),
                 margin_for_bids = %format!("{:.2}", margin_for_bids),
                 margin_for_asks = %format!("{:.2}", margin_for_asks),
-                "Margin allocation (stochastic-weighted split)"
-            );
-
-            // [SIGNALS] Diagnostic: all activated signal values per quote cycle
-            info!(
-                alpha = %format!("{:.3}", market_params.predicted_alpha),
-                falling_knife = %format!("{:.1}", market_params.falling_knife_score),
-                rising_knife = %format!("{:.1}", market_params.rising_knife_score),
-                momentum_severity = %format!("{:.2}", momentum_severity),
-                knife_opposes = %knife_opposes_position,
-                urgency_adj = %format!("{:.3}", urgency_score_adj),
-                directional = %format!("{:.3}", directional_signal),
-                kappa_used = %format!("{:.0}", kappa),
-                as_warmed_up = %market_params.as_warmed_up,
-                "[SIGNALS] signal contribution summary"
+                "Margin allocation (inventory-driven split)"
             );
 
             // SAFETY CHECK: If margin is not available (warmup incomplete), log and fall through
-            // This prevents the optimizer from producing empty ladders due to margin=0
-            if available_margin < EPSILON {
+            // This prevents the optimizer from producing empty ladders due to margin=0.
+            // Instead of early-returning, fall through to the legacy path which will
+            // produce an empty ladder, then the guaranteed quote floor ensures we still
+            // have at least 1 bid + 1 ask.
+            let margin_skip = available_margin < EPSILON;
+            if margin_skip {
                 warn!(
                     margin_available = %format!("{:.2}", available_margin),
                     leverage = %format!("{:.1}", leverage),
-                    "Constrained optimizer skipped: margin not yet available (warmup incomplete?)"
+                    "Constrained optimizer skipped: margin not yet available (falling through to guaranteed quotes)"
                 );
-                // Fall through to legacy path at end of function
-                return Ladder::generate(&ladder_config, &params);
             }
 
             // 2. Calculate ASYMMETRIC position limits per side
@@ -1759,6 +1598,23 @@ impl LadderStrategy {
                 (available_for_bids, available_for_asks)
             };
 
+            // === TOXICITY-BASED SIZE REDUCTION (Sprint 2.3) ===
+            // When pre-fill toxicity > 0.5 on a side, reduce that side's capacity
+            // proportionally. This shrinks order sizes to limit adverse selection losses
+            // while keeping quotes active (unlike cancel-on-toxicity which removes them).
+            let available_for_bids = available_for_bids * market_params.pre_fill_size_mult_bid;
+            let available_for_asks = available_for_asks * market_params.pre_fill_size_mult_ask;
+
+            if market_params.pre_fill_size_mult_bid < 0.99 || market_params.pre_fill_size_mult_ask < 0.99 {
+                tracing::info!(
+                    bid_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_bid),
+                    ask_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_ask),
+                    bid_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
+                    ask_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
+                    "Toxicity size reduction applied"
+                );
+            }
+
             if over_limit {
                 if position > 0.0 {
                     tracing::debug!(
@@ -1835,7 +1691,10 @@ impl LadderStrategy {
             // construction), score them by fill probability × edge, and allocate risk
             // budget via greedy water-filling. This eliminates the price-collapse problem
             // where continuous bps depths round to duplicate exchange prices.
-            let ladder = if market_params.capital_policy.use_tick_grid {
+            let mut ladder = if margin_skip {
+                // No margin available — produce empty ladder so guaranteed quote floor applies
+                Ladder::default()
+            } else if market_params.capital_policy.use_tick_grid {
                 let tick_size = 10f64.powi(-(config.decimals as i32));
 
                 // GLFT touch depth in bps (used as minimum depth for tick grid)
@@ -1846,9 +1705,7 @@ impl LadderStrategy {
                 // Old: max(kappa_cap, touch * 2.0) — only 7.5 bps range for 5 levels.
                 // New: max(kappa_cap, touch * depth_range_multiplier) — 30+ bps for meaningful diversity.
                 let policy = &market_params.capital_policy;
-                let max_depth_bps = market_params.kappa_spread_bps
-                    .unwrap_or(touch_bps * policy.depth_range_multiplier)
-                    .max(touch_bps * policy.depth_range_multiplier)
+                let max_depth_bps = (touch_bps * policy.depth_range_multiplier)
                     .min(100.0); // Absolute cap: never deeper than 100 bps
 
                 // WS3: API-budget-aware level count — generate fewer levels when
@@ -2532,6 +2389,98 @@ impl LadderStrategy {
             ladder
             }; // close else (legacy path)
 
+            // === GUARANTEED QUOTE FLOOR ===
+            // THE critical invariant: the market maker ALWAYS has >= 1 bid + 1 ask resting.
+            // If after all ladder generation + concentration fallback we still have empty
+            // sides, create wide guaranteed quotes at min_viable size.
+            //
+            // Spread: max(fee + tick, GLFT optimal) — wide enough to be safe, never
+            //         tighter than the physical floor.
+            // Size:   min_viable — the smallest exchange-legal order.
+            // Skew:   inventory-proportional offset to favor mean-reversion.
+            //
+            // Respect position zones: Red/Kill zones may intentionally clear one side
+            // (reduce-only). Do NOT force guaranteed quotes on the accumulating side
+            // when the governor has explicitly cleared it.
+            let guaranteed_half_spread_bps = (fee_bps + market_params.tick_size_bps)
+                .max(glft_optimal_bps)
+                .max(effective_floor_bps);
+
+            // Inventory skew: shift mid toward mean-reversion
+            // Long → push bid down, ask down (attract sells)
+            // Short → push bid up, ask up (attract buys)
+            let guaranteed_inv_ratio = if effective_max_position > EPSILON {
+                (position / effective_max_position).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            // Skew = up to 30% of half-spread, proportional to inventory
+            let guaranteed_skew_bps = guaranteed_inv_ratio * guaranteed_half_spread_bps * 0.3;
+
+            let bid_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+                && position > 0.0;
+            let ask_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+                && position < 0.0;
+
+            // Also skip guaranteed quotes when should_pull_quotes is set (circuit breaker)
+            if !market_params.should_pull_quotes {
+                if ladder.bids.is_empty() && !bid_cleared_by_zone {
+                    let bid_depth_bps = guaranteed_half_spread_bps + guaranteed_skew_bps;
+                    let offset = market_params.microprice * (bid_depth_bps / 10_000.0);
+                    let bid_price = round_to_significant_and_decimal(
+                        market_params.microprice - offset,
+                        5,
+                        config.decimals,
+                    );
+                    let bid_size = quantum.min_viable_size;
+
+                    if bid_size > 0.0 && bid_price > 0.0 {
+                        ladder.bids.push(LadderLevel {
+                            price: bid_price,
+                            size: bid_size,
+                            depth_bps: bid_depth_bps,
+                        });
+                        tracing::info!(
+                            price = %format!("{:.4}", bid_price),
+                            size = %format!("{:.6}", bid_size),
+                            depth_bps = %format!("{:.2}", bid_depth_bps),
+                            half_spread_bps = %format!("{:.2}", guaranteed_half_spread_bps),
+                            skew_bps = %format!("{:.2}", guaranteed_skew_bps),
+                            "GUARANTEED BID: floor quote placed (min_viable size)"
+                        );
+                    }
+                }
+
+                if ladder.asks.is_empty() && !ask_cleared_by_zone {
+                    let ask_depth_bps = guaranteed_half_spread_bps - guaranteed_skew_bps;
+                    // Ensure ask depth is at least fee + tick (never tighter than cost)
+                    let ask_depth_bps = ask_depth_bps.max(fee_bps + market_params.tick_size_bps);
+                    let offset = market_params.microprice * (ask_depth_bps / 10_000.0);
+                    let ask_price = round_to_significant_and_decimal(
+                        market_params.microprice + offset,
+                        5,
+                        config.decimals,
+                    );
+                    let ask_size = quantum.min_viable_size;
+
+                    if ask_size > 0.0 && ask_price > 0.0 {
+                        ladder.asks.push(LadderLevel {
+                            price: ask_price,
+                            size: ask_size,
+                            depth_bps: ask_depth_bps,
+                        });
+                        tracing::info!(
+                            price = %format!("{:.4}", ask_price),
+                            size = %format!("{:.6}", ask_size),
+                            depth_bps = %format!("{:.2}", ask_depth_bps),
+                            half_spread_bps = %format!("{:.2}", guaranteed_half_spread_bps),
+                            skew_bps = %format!("{:.2}", guaranteed_skew_bps),
+                            "GUARANTEED ASK: floor quote placed (min_viable size)"
+                        );
+                    }
+                }
+            }
+
             ladder
         }
     }
@@ -2710,161 +2659,43 @@ fn adverse_selection_at_depth(depth_bps: f64, params: &LadderParams) -> f64 {
 mod tests {
     use super::*;
 
-    /// Compute the directional signal exactly as in `generate_ladder` margin split.
-    /// Extracted to a helper so we can unit test it without constructing a full ladder.
-    fn compute_directional_signal(market_params: &MarketParams) -> f64 {
-        let knife_dir = market_params.rising_knife_score - market_params.falling_knife_score;
-        let knife_strength = knife_dir.abs().min(2.0) / 2.0;
-        let alpha_amp = 1.0 + market_params.predicted_alpha.min(0.5) * 2.0;
-        const KNIFE_COMPONENT: f64 = 0.4;
-        const FLOW_COMPONENT: f64 = 0.4;
-        const LEAD_LAG_COMPONENT: f64 = 0.2;
-        const DIRECTIONAL_SENSITIVITY: f64 = 0.3;
-        let raw = (knife_dir.signum() * knife_strength * KNIFE_COMPONENT
-            + market_params.flow_imbalance * FLOW_COMPONENT
-            + market_params.lead_lag_signal_bps / 5.0 * LEAD_LAG_COMPONENT)
-            * alpha_amp;
-        raw.clamp(-1.0, 1.0) * DIRECTIONAL_SENSITIVITY
-    }
-
-    /// Compute the ask_margin_weight as in `generate_ladder` margin split,
-    /// using position=0 (flat) and no urgency.
-    fn compute_ask_margin_weight(market_params: &MarketParams) -> f64 {
-        const INVENTORY_WEIGHT: f64 = 0.50;
-        const MOMENTUM_WEIGHT: f64 = 0.25;
-        const URGENCY_WEIGHT: f64 = 0.10;
-        const DIRECTIONAL_WEIGHT: f64 = 0.15;
-        const MOMENTUM_SENSITIVITY: f64 = 0.3;
-
-        let inventory_signal = 0.0; // flat position
-        let inventory_flat_factor = 1.0; // flat means full momentum weight
-        let momentum_signal = market_params.flow_imbalance * MOMENTUM_SENSITIVITY * inventory_flat_factor;
-        let urgency_signal = 0.0; // no urgency when flat
-        let directional_signal = compute_directional_signal(market_params);
-
-        let combined_signal = inventory_signal * INVENTORY_WEIGHT
-            + momentum_signal * MOMENTUM_WEIGHT
-            + urgency_signal * URGENCY_WEIGHT
-            + directional_signal * DIRECTIONAL_WEIGHT;
-
-        (0.5 + combined_signal).clamp(0.25, 0.75)
+    /// Compute simplified inventory-driven margin split weight.
+    fn compute_margin_split(inventory_ratio: f64) -> (f64, f64) {
+        let inv_factor = (inventory_ratio * 0.3).clamp(-0.20, 0.20);
+        let ask_w = (0.5 + inv_factor).clamp(0.30, 0.70);
+        (1.0 - ask_w, ask_w) // (bid_weight, ask_weight)
     }
 
     #[test]
-    fn test_margin_split_bullish_no_binance() {
-        // Scenario: alpha=0.166, rising_knife=0.1, flow=0.083, position=0
-        // This is the exact scenario from the mainnet HYPE incident.
-        // Without the directional component, ask_margin_weight would be ~0.5.
-        // With it, bullish signals should push ask_margin_weight above 0.50.
-        let mut params = MarketParams::default();
-        params.predicted_alpha = 0.166;
-        params.rising_knife_score = 0.1;
-        params.falling_knife_score = 0.0;
-        params.flow_imbalance = 0.083;
-        params.lead_lag_signal_bps = 0.0; // No Binance
-
-        let ask_weight = compute_ask_margin_weight(&params);
-
-        assert!(
-            ask_weight > 0.50,
-            "Bullish signals (alpha=0.166, rising_knife=0.1, flow=0.083) should \
-             push ask_margin_weight above 0.50, got: {:.4}",
-            ask_weight
-        );
+    fn test_margin_split_flat_is_equal() {
+        let (bid_w, ask_w) = compute_margin_split(0.0);
+        assert!((bid_w - 0.5).abs() < 1e-10);
+        assert!((ask_w - 0.5).abs() < 1e-10);
     }
 
     #[test]
-    fn test_margin_split_strong_bullish() {
-        // Scenario: strong bullish with alpha=0.5, rising_knife=1.5, flow=0.5
-        let mut params = MarketParams::default();
-        params.predicted_alpha = 0.5;
-        params.rising_knife_score = 1.5;
-        params.falling_knife_score = 0.0;
-        params.flow_imbalance = 0.5;
-        params.lead_lag_signal_bps = 0.0;
-
-        let ask_weight = compute_ask_margin_weight(&params);
-
-        assert!(
-            ask_weight > 0.53,
-            "Strong bullish signals should push ask_margin_weight above 0.53, got: {:.4}",
-            ask_weight
-        );
+    fn test_margin_split_long_favors_asks() {
+        // Long position → more margin to asks (mean-revert)
+        let (bid_w, ask_w) = compute_margin_split(0.5);
+        assert!(ask_w > bid_w, "Long should favor asks: bid={bid_w:.3}, ask={ask_w:.3}");
     }
 
     #[test]
-    fn test_directional_signal_symmetric() {
-        // Mirror bullish and bearish should produce symmetric results
-        let mut bullish = MarketParams::default();
-        bullish.rising_knife_score = 1.0;
-        bullish.falling_knife_score = 0.0;
-        bullish.flow_imbalance = 0.5;
-        bullish.predicted_alpha = 0.3;
-
-        let mut bearish = MarketParams::default();
-        bearish.rising_knife_score = 0.0;
-        bearish.falling_knife_score = 1.0;
-        bearish.flow_imbalance = -0.5;
-        bearish.predicted_alpha = 0.3;
-
-        let bull_signal = compute_directional_signal(&bullish);
-        let bear_signal = compute_directional_signal(&bearish);
-
-        assert!(
-            (bull_signal + bear_signal).abs() < 0.01,
-            "Symmetric bullish/bearish should cancel: bull={:.4}, bear={:.4}",
-            bull_signal,
-            bear_signal
-        );
+    fn test_margin_split_short_favors_bids() {
+        // Short position → more margin to bids (mean-revert)
+        let (bid_w, ask_w) = compute_margin_split(-0.5);
+        assert!(bid_w > ask_w, "Short should favor bids: bid={bid_w:.3}, ask={ask_w:.3}");
     }
 
     #[test]
-    fn test_directional_signal_clamped() {
-        // Extreme values should be clamped to [-0.3, 0.3]
-        let mut extreme = MarketParams::default();
-        extreme.rising_knife_score = 5.0;
-        extreme.falling_knife_score = 0.0;
-        extreme.flow_imbalance = 1.0;
-        extreme.lead_lag_signal_bps = 50.0;
-        extreme.predicted_alpha = 1.0;
-
-        let signal = compute_directional_signal(&extreme);
-
-        assert!(
-            signal <= 0.3 + f64::EPSILON,
-            "Directional signal should be capped at 0.3, got: {:.4}",
-            signal
-        );
-        assert!(signal > 0.0, "Should be positive for bullish inputs");
-    }
-
-    #[test]
-    fn test_directional_signal_zero_when_neutral() {
-        // All neutral inputs should produce zero directional signal
-        let params = MarketParams::default();
-        let signal = compute_directional_signal(&params);
-
-        assert!(
-            signal.abs() < 0.01,
-            "Neutral inputs should produce near-zero signal, got: {:.4}",
-            signal
-        );
-    }
-
-    #[test]
-    fn test_weights_sum_to_one() {
-        // Verify the component weights sum to 1.0
-        const INVENTORY_WEIGHT: f64 = 0.50;
-        const MOMENTUM_WEIGHT: f64 = 0.25;
-        const URGENCY_WEIGHT: f64 = 0.10;
-        const DIRECTIONAL_WEIGHT: f64 = 0.15;
-
-        let sum = INVENTORY_WEIGHT + MOMENTUM_WEIGHT + URGENCY_WEIGHT + DIRECTIONAL_WEIGHT;
-        assert!(
-            (sum - 1.0).abs() < f64::EPSILON,
-            "Weights should sum to 1.0, got: {}",
-            sum
-        );
+    fn test_margin_split_clamped() {
+        // Even extreme inventory, split stays within [0.30, 0.70]
+        let (bid_w, ask_w) = compute_margin_split(1.0);
+        assert!(ask_w <= 0.70 + 1e-10);
+        assert!(bid_w >= 0.30 - 1e-10);
+        let (bid_w2, ask_w2) = compute_margin_split(-1.0);
+        assert!(bid_w2 <= 0.70 + 1e-10);
+        assert!(ask_w2 >= 0.30 - 1e-10);
     }
 
     #[test]
@@ -3557,6 +3388,193 @@ mod tests {
             robust_composition.glft_half_spread_bps < legacy_composition.glft_half_spread_bps,
             "Robust kappa (2000) should give tighter spread ({:.2}) than legacy (1000) spread ({:.2})",
             robust_composition.glft_half_spread_bps, legacy_composition.glft_half_spread_bps
+        );
+    }
+
+    // ====================================================================
+    // Guaranteed Quote Floor Tests
+    // ====================================================================
+
+    #[test]
+    fn test_guaranteed_quote_half_spread_formula() {
+        // Guaranteed half-spread = max(fee + tick, GLFT optimal, effective floor)
+        let fee_bps = 1.5_f64;
+        let tick_bps = 0.5_f64;
+        let glft_optimal_bps = 3.0_f64;
+        let effective_floor_bps = 2.0_f64;
+
+        let guaranteed = (fee_bps + tick_bps).max(glft_optimal_bps).max(effective_floor_bps);
+        assert!(
+            (guaranteed - 3.0).abs() < 1e-10,
+            "Should be max(2.0, 3.0, 2.0) = 3.0, got {guaranteed}"
+        );
+
+        // When GLFT is narrow, fee+tick dominates
+        let glft_narrow = 1.0_f64;
+        let guaranteed2 = (fee_bps + tick_bps).max(glft_narrow).max(effective_floor_bps);
+        assert!(
+            (guaranteed2 - 2.0).abs() < 1e-10,
+            "Should be max(2.0, 1.0, 2.0) = 2.0, got {guaranteed2}"
+        );
+    }
+
+    #[test]
+    fn test_guaranteed_quote_inventory_skew() {
+        // Skew = inventory_ratio × half_spread × 0.3
+        let half_spread = 5.0_f64; // bps
+
+        // Flat: no skew
+        let skew_flat = 0.0 * half_spread * 0.3;
+        assert!(skew_flat.abs() < 1e-10);
+
+        // Long 50%: push bid down, ask tighter (attract sells)
+        let skew_long = 0.5 * half_spread * 0.3;
+        assert!((skew_long - 0.75).abs() < 1e-10, "Long skew should be +0.75 bps, got {skew_long}");
+        // bid_depth = half_spread + skew = 5.75 (wider)
+        // ask_depth = half_spread - skew = 4.25 (tighter to attract fills)
+        let bid_depth = half_spread + skew_long;
+        let ask_depth = half_spread - skew_long;
+        assert!(bid_depth > ask_depth, "Long: bid should be deeper than ask");
+
+        // Short 50%: push bid tighter, ask down (attract buys)
+        let skew_short = -0.5 * half_spread * 0.3;
+        assert!(skew_short < 0.0, "Short skew should be negative");
+        let bid_depth_short = half_spread + skew_short; // tighter
+        let ask_depth_short = half_spread - skew_short; // wider
+        assert!(ask_depth_short > bid_depth_short, "Short: ask should be deeper than bid");
+    }
+
+    #[test]
+    fn test_guaranteed_quote_ask_depth_never_below_cost() {
+        // Even with large long inventory skew, ask depth must be >= fee + tick
+        let fee_bps = 1.5_f64;
+        let tick_bps = 0.5_f64;
+        let half_spread = 3.0_f64;
+        let skew = 1.0 * half_spread * 0.3; // Max long: 0.9 bps
+
+        let raw_ask_depth = half_spread - skew; // 3.0 - 0.9 = 2.1
+        let ask_depth = raw_ask_depth.max(fee_bps + tick_bps);
+        assert!(
+            ask_depth >= fee_bps + tick_bps,
+            "Ask depth {ask_depth} must be >= fee+tick={}",
+            fee_bps + tick_bps
+        );
+    }
+
+    #[test]
+    fn test_guaranteed_quotes_respect_zone_clearing() {
+        // Red zone with long position: bids cleared (accumulating side)
+        // Guaranteed quotes should NOT override zone clearing
+        let position = 1.0_f64;
+        let bid_cleared_by_zone =
+            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position > 0.0;
+        let ask_cleared_by_zone =
+            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position < 0.0;
+
+        assert!(bid_cleared_by_zone, "Long in Red: bids should be cleared");
+        assert!(!ask_cleared_by_zone, "Long in Red: asks should NOT be cleared");
+
+        // Short in Red: asks cleared
+        let position_short = -1.0_f64;
+        let bid_cleared_short =
+            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position_short > 0.0;
+        let ask_cleared_short =
+            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position_short < 0.0;
+
+        assert!(!bid_cleared_short, "Short in Red: bids should NOT be cleared");
+        assert!(ask_cleared_short, "Short in Red: asks should be cleared");
+    }
+
+    #[test]
+    fn test_guaranteed_quotes_produce_both_sides_on_empty_ladder() {
+        use crate::market_maker::config::auto_derive::CapitalTier;
+        use crate::market_maker::strategy::QuotingStrategy;
+
+        // Scenario: zero margin, zero position — should produce guaranteed quotes
+        let strategy = LadderStrategy::new(0.07);
+        let config = QuoteConfig {
+            mid_price: 25.0,
+            decimals: 2,    // $0.01 tick = 0.4 bps — fine-grained enough for GLFT offsets
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+
+        let mut market_params = MarketParams::default();
+        market_params.microprice = 25.0;
+        market_params.market_mid = 25.0;
+        market_params.capital_tier = CapitalTier::Micro;
+        market_params.margin_available = 0.0; // No margin!
+        market_params.leverage = 3.0;
+        market_params.margin_quoting_capacity = 0.0;
+        market_params.sigma = 0.001;
+        market_params.sigma_effective = 0.001;
+        market_params.kappa = 2000.0;
+        market_params.tick_size_bps = 0.4; // Matches decimals=2 at $25
+
+        let ladder = strategy.calculate_ladder(
+            &config,
+            0.0,  // flat
+            5.0,  // max position
+            1.0,
+            &market_params,
+        );
+
+        // With zero margin, normal ladder is empty, but guaranteed quotes should fire
+        assert!(
+            !ladder.bids.is_empty(),
+            "Guaranteed quotes should produce at least 1 bid even with 0 margin"
+        );
+        assert!(
+            !ladder.asks.is_empty(),
+            "Guaranteed quotes should produce at least 1 ask even with 0 margin"
+        );
+
+        // Bid < mid < ask
+        assert!(
+            ladder.bids[0].price < market_params.microprice,
+            "Guaranteed bid {:.4} should be below mid {:.4}",
+            ladder.bids[0].price, market_params.microprice
+        );
+        assert!(
+            ladder.asks[0].price > market_params.microprice,
+            "Guaranteed ask {:.4} should be above mid {:.4}",
+            ladder.asks[0].price, market_params.microprice
+        );
+    }
+
+    #[test]
+    fn test_guaranteed_quotes_not_placed_when_circuit_breaker() {
+        use crate::market_maker::strategy::QuotingStrategy;
+
+        // When should_pull_quotes = true, NO quotes at all (not even guaranteed)
+        let strategy = LadderStrategy::new(0.07);
+        let config = QuoteConfig {
+            mid_price: 25.0,
+            decimals: 2,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+
+        let mut market_params = MarketParams::default();
+        market_params.microprice = 25.0;
+        market_params.market_mid = 25.0;
+        market_params.margin_available = 0.0;
+        market_params.should_pull_quotes = true; // Circuit breaker!
+        market_params.sigma = 0.001;
+        market_params.kappa = 2000.0;
+
+        let ladder = strategy.calculate_ladder(
+            &config,
+            0.0,
+            5.0,
+            1.0,
+            &market_params,
+        );
+
+        assert!(
+            ladder.bids.is_empty() && ladder.asks.is_empty(),
+            "Circuit breaker should produce empty ladder, got {} bids + {} asks",
+            ladder.bids.len(), ladder.asks.len()
         );
     }
 }

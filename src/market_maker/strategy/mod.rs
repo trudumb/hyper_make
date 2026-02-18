@@ -692,7 +692,9 @@ mod tests {
         };
 
         let as_params = MarketParams {
-            as_spread_adjustment: 0.001, // 10 bps AS adjustment
+            as_spread_adjustment: 0.001, // 10 bps AS adjustment (total)
+            as_spread_adjustment_bid: 0.001, // 10 bps per-side
+            as_spread_adjustment_ask: 0.001,
             ..base_params.clone()
         };
 

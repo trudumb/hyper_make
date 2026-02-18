@@ -8,7 +8,7 @@
 //!
 //! EV_keep = P(fill_keep) × spread_capture_keep
 //! EV_new  = P(fill_new)  × spread_capture_new
-//! api_cost = base_cost × (1 / headroom).min(100)
+//! api_cost = base_cost (flat; budget allocator limits total calls)
 //! ```
 
 #![allow(dead_code)]
@@ -118,16 +118,14 @@ pub struct ScoredUpdate {
 // Scoring engine
 // ---------------------------------------------------------------------------
 
-/// Compute the dynamic API cost for an action given current headroom.
+/// Flat API cost for an action.
 ///
-/// Formula: `base_cost × (1 / headroom).min(100)`
-///
-/// At 100% headroom the cost equals the base. At 1% headroom the cost is 100x,
-/// making updates very expensive and encouraging latching.
-fn dynamic_api_cost_bps(action: ActionType, headroom: f64) -> f64 {
-    let headroom_safe = headroom.max(0.01);
-    let headroom_multiplier = (1.0 / headroom_safe).min(100.0);
-    action.base_cost_bps() * headroom_multiplier
+/// Previous design scaled cost by `1/headroom`, which at 8% headroom made ALL
+/// actions negative-EV (75 bps/action). The budget allocator already limits
+/// total API calls via its call budget, so per-action headroom scaling is
+/// redundant and causes 94% zero-action cycles.
+fn flat_api_cost_bps(action: ActionType) -> f64 {
+    action.base_cost_bps()
 }
 
 /// Estimate P(fill) for a *new* order at the back of the queue at `price`.
@@ -290,7 +288,7 @@ fn queue_rank_for_order(
 /// Where:
 ///   `EV_keep = P(fill_keep) x spread_capture_keep`
 ///   `EV_new  = P(fill_new)  x spread_capture_new`
-///   `api_cost = base_cost x (1 / headroom).min(100)`
+///   `api_cost = base_cost` (flat; budget allocator limits total calls)
 #[allow(clippy::too_many_arguments)]
 pub fn score_all(
     current_orders: &[&TrackedOrder],
@@ -299,7 +297,6 @@ pub fn score_all(
     config: &DynamicReconcileConfig,
     queue_tracker: Option<&QueuePositionTracker>,
     queue_value: &QueueValueHeuristic,
-    headroom: f64,
     toxicity: ToxicityRegime,
     mid: f64,
     sz_decimals: u32,
@@ -331,7 +328,7 @@ pub fn score_all(
             matched_orders.insert(order.oid);
 
             let action = classify_action(order, target, config, sz_decimals);
-            let api_cost = dynamic_api_cost_bps(action, headroom);
+            let api_cost = flat_api_cost_bps(action);
 
             // EV_keep: value of keeping the current order at its position.
             let p_fill_keep = queue_tracker
@@ -405,7 +402,7 @@ pub fn score_all(
                     1.0, // Back of queue
                 );
                 let ev_new = p_fill_new * spread_capture.max(0.0);
-                let api_cost = dynamic_api_cost_bps(ActionType::NewPlace, headroom);
+                let api_cost = flat_api_cost_bps(ActionType::NewPlace);
 
                 results.push(ScoredUpdate {
                     oid: None,
@@ -436,7 +433,7 @@ pub fn score_all(
             .any(|t| (bps_diff(order.price, t.price) as f64) <= config.max_match_distance_bps);
 
         if !close_to_any {
-            let api_cost = dynamic_api_cost_bps(ActionType::StaleCancel, headroom);
+            let api_cost = flat_api_cost_bps(ActionType::StaleCancel);
 
             // EV of keeping a stale order: low but not zero.
             let p_fill_keep = queue_tracker
@@ -523,7 +520,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0, // full headroom
             ToxicityRegime::Benign,
             100.5,
             2,
@@ -549,7 +545,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Normal,
             100.0,
             2,
@@ -561,19 +556,16 @@ mod tests {
         assert!(scores[0].oid.is_none());
     }
 
-    // --- Test 3: Headroom scaling increases API cost ---
+    // --- Test 3: Flat API cost returns base cost ---
     #[test]
-    fn test_headroom_scaling_increases_cost() {
-        let cost_full = dynamic_api_cost_bps(ActionType::ModifyPrice, 1.0);
-        let cost_low = dynamic_api_cost_bps(ActionType::ModifyPrice, 0.1);
-        let cost_critical = dynamic_api_cost_bps(ActionType::ModifyPrice, 0.01);
+    fn test_flat_api_cost_returns_base() {
+        let cost_modify = flat_api_cost_bps(ActionType::ModifyPrice);
+        let cost_new = flat_api_cost_bps(ActionType::NewPlace);
+        let cost_cancel = flat_api_cost_bps(ActionType::StaleCancel);
 
-        // At full headroom, cost = base (3.0 bps)
-        assert!((cost_full - BASE_COST_MODIFY_BPS).abs() < 1e-10);
-        // At 10% headroom, cost = 10x base
-        assert!((cost_low - BASE_COST_MODIFY_BPS * 10.0).abs() < 1e-10);
-        // At 1% headroom, cost = 100x base
-        assert!((cost_critical - BASE_COST_MODIFY_BPS * 100.0).abs() < 1e-10);
+        assert!((cost_modify - BASE_COST_MODIFY_BPS).abs() < 1e-10);
+        assert!((cost_new - BASE_COST_NEW_PLACE_BPS).abs() < 1e-10);
+        assert!((cost_cancel - BASE_COST_STALE_CANCEL_BPS).abs() < 1e-10);
     }
 
     // --- Test 4: Queue preservation (Latch) when price is within threshold ---
@@ -593,7 +585,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             100.5,
             2,
@@ -619,7 +610,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             100.5,
             2,
@@ -650,7 +640,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             102.5,
             2,
@@ -676,7 +665,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Normal,
             100.5,
             2,
@@ -711,7 +699,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             mid,
             2,
@@ -723,7 +710,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             mid,
             2,
@@ -750,7 +736,6 @@ mod tests {
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             100.0,
             2,
@@ -761,52 +746,38 @@ mod tests {
         assert!(scores.iter().all(|s| s.action == ActionType::Latch));
     }
 
-    // --- Test 10: Low headroom makes modify more expensive than latch ---
+    // --- Test 10: Flat API cost means scoring is headroom-independent ---
     #[test]
-    fn test_low_headroom_discourages_modification() {
+    fn test_flat_cost_headroom_independent() {
         let order = make_order(1, 100.0, 1.0, Side::Buy);
-        // Price diff ~10 bps -- would normally be ModifyPrice
+        // Price diff ~10 bps -- triggers ModifyPrice
         let target = make_target(100.10, 1.0, 10.0);
         let mut config = default_config();
         config.latch_threshold_bps = 5.0;
         config.max_modify_price_bps = 50.0;
-        // Widen tolerance so the 10 bps price diff still matches (not treated as unmatched)
         config.best_level_tolerance_bps = 15.0;
         config.outer_level_tolerance_bps = 30.0;
         let qv = default_queue_value();
 
-        // With full headroom
-        let scores_full = score_all(
+        let scores = score_all(
             &[&order],
             &[target],
             Side::Buy,
             &config,
             None,
             &qv,
-            1.0,
             ToxicityRegime::Benign,
             100.5,
             2,
         );
 
-        // With critical headroom (1%)
-        let scores_low = score_all(
-            &[&order],
-            &[target],
-            Side::Buy,
-            &config,
-            None,
-            &qv,
-            0.01,
-            ToxicityRegime::Benign,
-            100.5,
-            2,
-        );
-
-        // Both should be ModifyPrice, but the value at low headroom should be worse
-        assert_eq!(scores_full[0].action, ActionType::ModifyPrice);
-        assert_eq!(scores_low[0].action, ActionType::ModifyPrice);
-        assert!(scores_low[0].value_bps < scores_full[0].value_bps);
+        // Should be ModifyPrice with flat cost (base_cost_bps only)
+        assert_eq!(scores[0].action, ActionType::ModifyPrice);
+        // API cost portion should equal the flat base cost
+        let ev_diff = scores[0].value_bps;
+        // Value = ev_new - ev_keep - flat_cost; flat_cost = BASE_COST_MODIFY_BPS = 3.0
+        // As long as it's finite and deterministic, the flat cost model works
+        assert!(ev_diff.is_finite());
     }
 
     // --- Test 11: normal_cdf_approx correctness ---

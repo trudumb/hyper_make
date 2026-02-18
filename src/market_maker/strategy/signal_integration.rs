@@ -433,6 +433,22 @@ pub struct IntegratedSignals {
     /// Whether cross-venue signals are valid.
     pub cross_venue_valid: bool,
 
+    // === Cross-Asset Signals (Sprint 4.1) ===
+    /// Expected move from BTC lead-lag and funding divergence (bps).
+    pub cross_asset_expected_move_bps: f64,
+    /// Confidence in the cross-asset signal [0, 1].
+    pub cross_asset_confidence: f64,
+    /// OI-based volatility multiplier (>= 1.0 means elevated vol).
+    pub cross_asset_vol_mult: f64,
+
+    // === Funding Rate Signals (Sprint 4.2) ===
+    /// Basis velocity: rate of change of mark-index premium [-1, +1].
+    pub funding_basis_velocity: f64,
+    /// Premium alpha: predicted return from premium mean-reversion.
+    pub funding_premium_alpha: f64,
+    /// Funding skew bias: positive = positive funding (skew short), negative = vice versa.
+    pub funding_skew_bps: f64,
+
     // === VPIN Blend ===
     /// Hyperliquid VPIN value [0, 1] (volume-synchronized toxicity).
     pub hl_vpin: f64,
@@ -469,7 +485,14 @@ pub struct IntegratedSignals {
 
     // === Combined ===
     /// Total spread multiplier (from capped additive adjustments, excludes staleness).
+    /// NOTE: Also mutated by OI vol, funding settlement, and cancel-race in quote_engine.rs
+    /// but those mutations are for analytics logging only. The actual spread impact flows
+    /// through `signal_risk_premium_bps` → `total_risk_premium_bps`.
     pub total_spread_mult: f64,
+    /// Additive risk premium from signal-derived sources (OI vol, funding settlement,
+    /// cancel-race AS). Accumulated in quote_engine.rs and added to total_risk_premium_bps
+    /// which flows through solve_min_gamma() for self-consistent spreads.
+    pub signal_risk_premium_bps: f64,
     /// Combined skew in bps (positive = bullish).
     pub combined_skew_bps: f64,
 

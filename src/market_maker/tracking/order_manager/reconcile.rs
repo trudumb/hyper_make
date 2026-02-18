@@ -209,20 +209,22 @@ impl DynamicReconcileConfig {
             .clamp(20.0, 100.0);
 
         // Adaptive latch: proportional to half-spread, widens under quota pressure.
-        // At 5 bps half-spread → 1.5 bps latch (normal), 3.0 bps (low quota)
-        // At 20 bps half-spread → 6.0 bps latch (normal), 12.0 bps (low quota)
+        // Continuous quota scaling: 1.0x at >=30% headroom, ramps to 3.0x at <=5%.
+        // Creates virtuous cycle: less churn → more quota → tighter latch → better queue position.
         let half_spread_bps = optimal_spread_bps / 2.0;
         let base_latch = half_spread_bps * 0.3;
-        let latch_threshold_bps = if headroom_pct < 0.30 {
-            // Low quota: widen latch aggressively to reduce churn
-            (base_latch * 2.0).clamp(5.0, 15.0)
+        let quota_mult = if headroom_pct >= 0.30 {
+            1.0
+        } else if headroom_pct <= 0.05 {
+            3.0
         } else {
-            base_latch.clamp(3.0, 10.0)
+            // Linear ramp: 1.0 at 30% → 3.0 at 5%
+            1.0 + 2.0 * (0.30 - headroom_pct) / 0.25
         };
+        let latch_threshold_bps = (base_latch * quota_mult).clamp(3.0, 15.0);
 
-        // Size hysteresis at 20%: only modify if size changes by >20%.
-        // Queue priority is valuable — small size adjustments don't justify losing it.
-        let latch_size_fraction = if headroom_pct < 0.30 { 0.30 } else { 0.20 };
+        // Size hysteresis scales with quota pressure too: 20% normal, up to 35% under pressure.
+        let latch_size_fraction = (0.20 * quota_mult).clamp(0.20, 0.35);
 
         Self {
             best_level_tolerance_bps,
@@ -820,12 +822,29 @@ pub fn priority_based_matching(
                 // Threshold scales with optimal spread and API headroom instead of
                 // the fixed 2.5 bps / 10% that caused 86% cancellation rate.
                 // Orders resting >2s get +1.0 bps bonus (queue position is more valuable).
+                // Front-of-queue orders (depth_ahead < 20% of avg) get +50% latch bonus.
                 let age_bonus_bps = if order.placed_at.elapsed() > Duration::from_secs(2) {
                     1.0
                 } else {
                     0.0
                 };
-                let effective_latch_bps = config.latch_threshold_bps + age_bonus_bps;
+                // Queue-position bonus: orders near front of queue are more valuable
+                let queue_bonus_frac = if let Some(qt) = queue_tracker {
+                    if let Some(depth) = qt.queue_depth(order.oid) {
+                        // Front-of-queue: depth < 1.0 units → +50% latch
+                        // Mid-queue: depth 1-5 units → +25% latch
+                        // Back-of-queue: depth > 5 → no bonus
+                        if depth < 1.0 { 0.50 }
+                        else if depth < 5.0 { 0.25 }
+                        else { 0.0 }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let effective_latch_bps = (config.latch_threshold_bps + age_bonus_bps)
+                    * (1.0 + queue_bonus_frac);
                 if price_diff_bps <= effective_latch_bps
                     && size_diff_pct <= config.latch_size_fraction
                 {
