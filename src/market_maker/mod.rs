@@ -445,6 +445,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             10.0, // MIN_ORDER_NOTIONAL
         );
 
+        // Build fill cascade tracker before moving config into Self
+        let fill_cascade_tracker = FillCascadeTracker::new_with_config(&config.cascade);
+
         Self {
             config,
             strategy,
@@ -502,8 +505,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Position velocity tracking for rapid accumulation detection
             position_history: std::collections::VecDeque::with_capacity(120),
             position_velocity_1m: 0.0,
-            // Fill cascade tracker for same-side fill run detection
-            fill_cascade_tracker: FillCascadeTracker::new(),
+            // Fill cascade tracker for same-side fill run detection (config-driven)
+            fill_cascade_tracker,
             last_quote_cycle_time: None,
             last_empty_ladder_recovery: None,
             // Signal diagnostics cache (updated each quote cycle)
@@ -1182,25 +1185,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     }
 }
 
-/// Number of same-side fills in window to trigger spread widening.
-const CASCADE_WIDEN_THRESHOLD: usize = 2;
-/// Number of same-side fills in window to trigger position suppression.
-const CASCADE_SUPPRESS_THRESHOLD: usize = 4;
-
 /// Event emitted when a fill cascade threshold is newly crossed.
 /// Used by handlers to trigger immediate cancel of resting accumulating orders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadeEvent {
-    /// 2+ same-side fills: widen that side's spread
+    /// 5+ same-side fills: widen that side's spread
     Widen(Side),
-    /// 4+ same-side fills: suppress (reduce-only) that side
+    /// 8+ same-side fills: suppress (reduce-only) that side
     Suppress(Side),
 }
 
 /// Tracks consecutive same-side fills to detect and mitigate fill cascades.
 ///
-/// When the MM receives fills on one side (e.g., 2+ shorts in 60s),
-/// this tracker widens that side's spread (5x) or suppresses it entirely (after 4+),
+/// When the MM receives fills on one side (e.g., 5+ same-side fills in 60s),
+/// this tracker widens that side's spread (2x) or suppresses it entirely (after 8+),
 /// preventing runaway position accumulation during trending markets.
 ///
 /// ALL same-side fills are counted, including reducing fills. Even "reducing" fills
@@ -1215,7 +1213,7 @@ pub struct FillCascadeTracker {
     recent_fills: std::collections::VecDeque<(std::time::Instant, Side)>,
     /// Rolling window for cascade detection
     window: std::time::Duration,
-    /// Number of same-side fills to trigger widening (5x spread)
+    /// Number of same-side fills to trigger widening
     widen_threshold: usize,
     /// Number of same-side fills to trigger suppression (reduce-only mode)
     suppress_threshold: usize,
@@ -1225,20 +1223,31 @@ pub struct FillCascadeTracker {
     widen_cooldown: std::time::Duration,
     /// Cooldown duration for suppress mode
     suppress_cooldown: std::time::Duration,
+    /// Spread multiplier when widening (default 2.0).
+    widen_multiplier: f64,
+    /// Spread multiplier when suppressing (default 3.0).
+    suppress_multiplier: f64,
 }
 
 impl FillCascadeTracker {
-    /// Create a new fill cascade tracker with default parameters.
-    pub fn new() -> Self {
+    /// Create a fill cascade tracker from a CascadeConfig.
+    pub fn new_with_config(cfg: &CascadeConfig) -> Self {
         Self {
             recent_fills: std::collections::VecDeque::with_capacity(32),
             window: std::time::Duration::from_secs(60),
-            widen_threshold: CASCADE_WIDEN_THRESHOLD,
-            suppress_threshold: CASCADE_SUPPRESS_THRESHOLD,
+            widen_threshold: cfg.widen_threshold,
+            suppress_threshold: cfg.suppress_threshold,
             cooldown_until: None,
-            widen_cooldown: std::time::Duration::from_secs(30),
-            suppress_cooldown: std::time::Duration::from_secs(60),
+            widen_cooldown: std::time::Duration::from_secs(cfg.widen_cooldown_secs),
+            suppress_cooldown: std::time::Duration::from_secs(cfg.suppress_cooldown_secs),
+            widen_multiplier: cfg.widen_multiplier,
+            suppress_multiplier: cfg.suppress_multiplier,
         }
+    }
+
+    /// Create a new fill cascade tracker with default parameters.
+    pub fn new() -> Self {
+        Self::new_with_config(&CascadeConfig::default())
     }
 
     /// Record a fill event. ALL same-side fills are counted regardless of current position.
@@ -1291,16 +1300,16 @@ impl FillCascadeTracker {
         None
     }
 
-    /// Get spread multiplier for a side (1.0 = normal, 5.0 = widened due to cascade).
+    /// Get spread multiplier for a side (1.0 = normal, configurable widening due to cascade).
     pub fn spread_multiplier(&self, side: Side) -> f64 {
         let now = std::time::Instant::now();
         if let Some((expiry, cooldown_side)) = self.cooldown_until {
             if now < expiry && cooldown_side == side {
                 let same_side_count = self.count_same_side(side, now);
                 if same_side_count >= self.suppress_threshold {
-                    return 10.0; // Extreme widening before suppress
+                    return self.suppress_multiplier;
                 }
-                return 5.0;
+                return self.widen_multiplier;
             }
         }
         1.0
@@ -1358,16 +1367,19 @@ mod fill_cascade_tests {
     #[test]
     fn test_all_same_side_fills_counted() {
         let mut tracker = FillCascadeTracker::new();
-        // Long position (+5.0), selling to reduce — ALL same-side fills counted now
-        assert!(tracker.record_fill(Side::Sell, 5.0).is_none()); // 1st sell
-        let event = tracker.record_fill(Side::Sell, 5.0); // 2nd sell → WIDEN
+        // ALL same-side fills counted regardless of position
+        for i in 0..4 {
+            assert!(tracker.record_fill(Side::Sell, 5.0).is_none(), "fill {} should not trigger", i + 1);
+        }
+        let event = tracker.record_fill(Side::Sell, 5.0); // 5th sell -> WIDEN
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Sell)));
         assert!(tracker.spread_multiplier(Side::Sell) > 1.0);
 
-        // Short position (-5.0), buying to reduce — ALL same-side fills counted now
         let mut tracker2 = FillCascadeTracker::new();
-        assert!(tracker2.record_fill(Side::Buy, -5.0).is_none()); // 1st buy
-        let event2 = tracker2.record_fill(Side::Buy, -5.0); // 2nd buy → WIDEN
+        for i in 0..4 {
+            assert!(tracker2.record_fill(Side::Buy, -5.0).is_none(), "fill {} should not trigger", i + 1);
+        }
+        let event2 = tracker2.record_fill(Side::Buy, -5.0); // 5th buy -> WIDEN
         assert_eq!(event2, Some(CascadeEvent::Widen(Side::Buy)));
         assert!(tracker2.spread_multiplier(Side::Buy) > 1.0);
     }
@@ -1375,36 +1387,39 @@ mod fill_cascade_tests {
     #[test]
     fn test_accumulating_fills_trigger_cascade() {
         let mut tracker = FillCascadeTracker::new();
-        // First buy: no cascade yet
-        assert!(tracker.record_fill(Side::Buy, 0.0).is_none()); // 1
-        // 2nd buy triggers WIDEN (threshold = 2)
-        let event = tracker.record_fill(Side::Buy, 1.0);
+        for i in 0..4 {
+            assert!(tracker.record_fill(Side::Buy, i as f64).is_none());
+        }
+        // 5th buy triggers WIDEN (threshold = 5)
+        let event = tracker.record_fill(Side::Buy, 4.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
         assert!(tracker.spread_multiplier(Side::Buy) > 1.0);
     }
 
     #[test]
-    fn test_suppress_at_four_same_side_fills() {
+    fn test_suppress_at_eight_same_side_fills() {
         let mut tracker = FillCascadeTracker::new();
-        // 3 sells → last should be Widen
-        assert!(tracker.record_fill(Side::Sell, 0.0).is_none()); // 1
-        let event2 = tracker.record_fill(Side::Sell, -1.0); // 2 → Widen
-        assert_eq!(event2, Some(CascadeEvent::Widen(Side::Sell)));
-        tracker.record_fill(Side::Sell, -2.0); // 3 → already widened, no new event
-        // 4th sell → Suppress (threshold = 4)
-        let event4 = tracker.record_fill(Side::Sell, -3.0);
-        assert_eq!(event4, Some(CascadeEvent::Suppress(Side::Sell)));
+        // 4 sells -> no trigger yet
+        for _ in 0..4 {
+            assert!(tracker.record_fill(Side::Sell, 0.0).is_none());
+        }
+        // 5th sell -> Widen
+        let event5 = tracker.record_fill(Side::Sell, -1.0);
+        assert_eq!(event5, Some(CascadeEvent::Widen(Side::Sell)));
+        // 6th and 7th -> no new event
+        for _ in 0..2 {
+            assert!(tracker.record_fill(Side::Sell, -2.0).is_none());
+        }
+        // 8th sell -> Suppress (threshold = 8)
+        let event8 = tracker.record_fill(Side::Sell, -3.0);
+        assert_eq!(event8, Some(CascadeEvent::Suppress(Side::Sell)));
         assert!(tracker.is_suppressed(Side::Sell));
     }
 
     #[test]
     fn test_widen_skips_reducing_side() {
-        // This tests the quote_engine logic conceptually:
-        // If position is +5.0 (long) and sell cascade fires,
-        // WIDEN should NOT apply because sells reduce the long.
         let mut tracker = FillCascadeTracker::new();
-        // Simulate: sells accumulate (position doesn't matter for tracker now)
-        for _ in 0..2 {
+        for _ in 0..5 {
             tracker.record_fill(Side::Sell, -1.0);
         }
         let mult = tracker.spread_multiplier(Side::Sell);
@@ -1419,18 +1434,21 @@ mod fill_cascade_tests {
     #[test]
     fn test_cooldown_durations() {
         let tracker = FillCascadeTracker::new();
-        assert_eq!(tracker.widen_cooldown.as_secs(), 30);
-        assert_eq!(tracker.suppress_cooldown.as_secs(), 60);
+        assert_eq!(tracker.widen_cooldown.as_secs(), 15);
+        assert_eq!(tracker.suppress_cooldown.as_secs(), 30);
     }
 
     #[test]
     fn test_mixed_sides_all_counted() {
         let mut tracker = FillCascadeTracker::new();
-        // Buy at flat → counted (1 buy)
-        tracker.record_fill(Side::Buy, 0.0);
-        // Sell at +1.0 → counted for sells (1 sell) — was "reducing" before, now counted
-        tracker.record_fill(Side::Sell, 1.0);
-        // Buy at 0.0 → 2nd buy → triggers WIDEN
+        // Mix of sides -- each side counted independently
+        tracker.record_fill(Side::Buy, 0.0); // 1 buy
+        tracker.record_fill(Side::Sell, 1.0); // 1 sell
+        tracker.record_fill(Side::Buy, 0.0); // 2 buys
+        tracker.record_fill(Side::Sell, 1.0); // 2 sells
+        tracker.record_fill(Side::Buy, 0.0); // 3 buys
+        tracker.record_fill(Side::Buy, 0.0); // 4 buys
+        // 5th buy -> WIDEN
         let event = tracker.record_fill(Side::Buy, 0.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
     }

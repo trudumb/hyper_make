@@ -2754,8 +2754,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // === FILL CASCADE FILTER ===
-            // When we detect 3+ same-side fills in 60s, widen that side (5x).
-            // When 5+ same-side fills, suppress that side entirely (reduce-only).
+            // When we detect 5+ same-side fills in 60s, widen that side (2x).
+            // When 8+ same-side fills, suppress that side entirely (reduce-only).
             // This prevents runaway accumulation during trending markets.
             // Price modifications go through iter_mut() (safe — doesn't affect size viability).
             {
@@ -2764,14 +2764,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                 if self.fill_cascade_tracker.is_suppressed(Side::Buy) && !viable.bids.is_empty() {
                     // Check if we're short — buys would reduce position, so allow them
-                    if self.position.position() >= 0.0 {
+                    if self.position.position() > 0.01 {
                         info!(
                             cleared_bids = viable.bids.len(),
-                            "Fill cascade: suppressing BID side (5+ same-side buys in 60s)"
+                            "Fill cascade: suppressing BID side (8+ same-side buys in 60s)"
                         );
                         viable.bids.clear();
                     }
-                } else if buy_cascade_mult > 1.0 && self.position.position() >= 0.0 {
+                } else if buy_cascade_mult > 1.0 && self.position.position() > 0.01 {
                     // Only widen buys when accumulating (flat or already long).
                     // If short, buys REDUCE position — don't penalize reducing fills.
                     let mid = self.latest_mid;
@@ -2787,14 +2787,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                 if self.fill_cascade_tracker.is_suppressed(Side::Sell) && !viable.asks.is_empty() {
                     // Check if we're long — sells would reduce position, so allow them
-                    if self.position.position() <= 0.0 {
+                    if self.position.position() < -0.01 {
                         info!(
                             cleared_asks = viable.asks.len(),
-                            "Fill cascade: suppressing ASK side (5+ same-side sells in 60s)"
+                            "Fill cascade: suppressing ASK side (8+ same-side sells in 60s)"
                         );
                         viable.asks.clear();
                     }
-                } else if sell_cascade_mult > 1.0 && self.position.position() <= 0.0 {
+                } else if sell_cascade_mult > 1.0 && self.position.position() < -0.01 {
                     // Only widen sells when accumulating (flat or already short).
                     // If long, sells REDUCE position — don't penalize reducing fills.
                     let mid = self.latest_mid;

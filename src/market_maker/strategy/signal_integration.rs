@@ -1076,8 +1076,8 @@ impl SignalIntegrator {
         // Convert alpha [0, 1] to normalized signal [-1, 1].
         let signal_skew_bps = if self.config.use_signal_skew {
             let signal_normalized = (self.predicted_alpha - 0.5) * 2.0;
-            // Only apply when alpha deviates meaningfully from 0.5 (neutral)
-            if signal_normalized.abs() > 0.1 {
+            // Only apply when alpha deviates from 0.5 (neutral) — lower threshold enables earlier directional skew
+            if signal_normalized.abs() > 0.05 {
                 signal_normalized * self.config.signal_skew_max_bps
             } else {
                 0.0
@@ -2091,12 +2091,12 @@ mod tests {
     #[test]
     fn test_signal_skew_neutral_alpha_no_effect() {
         let mut integrator = SignalIntegrator::default_config();
-        // Neutral alpha (0.5) → signal skew should be zero (below 0.1 threshold)
+        // Neutral alpha (0.5) → signal skew should be zero (below 0.05 threshold)
         integrator.set_skew_context(0.0, 1.0, 0.5, 5.0);
         let signals_neutral = integrator.get_signals();
 
-        // Slightly off-neutral (0.54 → normalized = 0.08, below 0.1 threshold)
-        integrator.set_skew_context(0.0, 1.0, 0.54, 5.0);
+        // Slightly off-neutral (0.52 → normalized = 0.04, below 0.05 threshold)
+        integrator.set_skew_context(0.0, 1.0, 0.52, 5.0);
         let signals_slight = integrator.get_signals();
 
         assert!(

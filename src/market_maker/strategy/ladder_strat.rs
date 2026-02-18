@@ -1346,13 +1346,13 @@ impl LadderStrategy {
         // touch from ~7 bps to ~14 bps, preventing fills entirely (cold-start death spiral).
         // Cap at 1.15x during warmup (mild protection); full multiplier after warmup graduates.
         let warmup_as_cap = if market_params.adaptive_warmup_progress < 1.0 {
-            // Linear ramp: 1.0x at 0% warmup → 3.0x at 100% warmup
-            // At cold start, disable AS widening entirely — the AS model is
-            // uncalibrated (update_count rises from book events, not fills) and
-            // any multiplier > 1.0 pushes quotes further from BBO, preventing
-            // the fills we need to calibrate. "Quote First, Learn Second."
+            // Linear ramp: 1.2x at 0% warmup → 3.0x at 100% warmup
+            // At cold start, allow mild AS widening (1.2x floor ≈ +1.6 bps on 8 bps spread)
+            // as a Bayesian prior for adverse selection defense. The AS model is
+            // uncalibrated initially, but zero protection leaves us exposed. The
+            // 1.2x floor passes the warmup prior (~1.14x) through while capping noise.
             let t = market_params.adaptive_warmup_progress;
-            1.0 + t * (3.0 - 1.0)
+            1.2 + t * (3.0 - 1.2)
         } else {
             3.0 // No cap post-warmup
         };

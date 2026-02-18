@@ -113,6 +113,10 @@ pub struct MarketMakerConfig {
     /// Used for edge calculation: edge = spread_captured - AS - fee_bps.
     /// Default: 1.5 bps (maker fee on Hyperliquid)
     pub fee_bps: f64,
+
+    /// Fill cascade detection configuration.
+    /// Controls thresholds, multipliers, and cooldowns for same-side fill mitigation.
+    pub cascade: super::risk::CascadeConfig,
 }
 
 impl MarketMakerConfig {
@@ -214,6 +218,7 @@ impl Default for MonitoringConfig {
 mod tests {
     use super::*;
     use crate::market_maker::config::ImpulseControlConfig;
+    use crate::market_maker::config::risk::CascadeConfig;
     use crate::market_maker::config::runtime::AssetRuntimeConfig;
     use crate::market_maker::config::stochastic::StochasticConfig;
     use crate::market_maker::tracking::ReconcileConfig;
@@ -242,6 +247,7 @@ mod tests {
             impulse_control: ImpulseControlConfig::default(),
             spread_profile: SpreadProfile::Default,
             fee_bps: 1.5,
+            cascade: CascadeConfig::default(),
         }
     }
 

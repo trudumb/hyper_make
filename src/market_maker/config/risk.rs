@@ -102,6 +102,65 @@ impl DynamicRiskConfig {
     }
 }
 
+/// Configuration for fill cascade detection and mitigation.
+///
+/// When the MM receives clustered fills on one side, this controls
+/// how aggressively to widen spreads (widen) or suppress quoting (suppress)
+/// to prevent runaway position accumulation.
+#[derive(Debug, Clone)]
+pub struct CascadeConfig {
+    /// Number of same-side fills in 60s window to trigger spread widening.
+    pub widen_threshold: usize,
+    /// Number of same-side fills in 60s window to trigger suppress (reduce-only).
+    pub suppress_threshold: usize,
+    /// Spread multiplier when in widen mode.
+    pub widen_multiplier: f64,
+    /// Spread multiplier when in suppress mode (extreme widening before full suppress).
+    pub suppress_multiplier: f64,
+    /// Cooldown duration in seconds for widen mode.
+    pub widen_cooldown_secs: u64,
+    /// Cooldown duration in seconds for suppress mode.
+    pub suppress_cooldown_secs: u64,
+}
+
+impl Default for CascadeConfig {
+    fn default() -> Self {
+        Self {
+            widen_threshold: 5,
+            suppress_threshold: 8,
+            widen_multiplier: 2.0,
+            suppress_multiplier: 3.0,
+            widen_cooldown_secs: 15,
+            suppress_cooldown_secs: 30,
+        }
+    }
+}
+
+impl CascadeConfig {
+    /// Validate cascade configuration invariants.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.suppress_threshold <= self.widen_threshold {
+            return Err(format!(
+                "suppress_threshold ({}) must be > widen_threshold ({})",
+                self.suppress_threshold, self.widen_threshold
+            ));
+        }
+        if self.widen_multiplier < 1.0 {
+            return Err(format!(
+                "widen_multiplier must be >= 1.0, got {}",
+                self.widen_multiplier
+            ));
+        }
+        if self.suppress_multiplier < 1.0 {
+            return Err(format!(
+                "suppress_multiplier must be >= 1.0, got {}",
+                self.suppress_multiplier
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +190,18 @@ mod tests {
         let cfg = DynamicRiskConfig::default().with_max_leverage(0.0);
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("max_leverage"), "error should mention max_leverage: {err}");
+    }
+
+    #[test]
+    fn test_cascade_config_validate_accepts_defaults() {
+        let cfg = CascadeConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cascade_config_validate_rejects_bad_thresholds() {
+        let mut cfg = CascadeConfig::default();
+        cfg.suppress_threshold = cfg.widen_threshold; // equal -> invalid
+        assert!(cfg.validate().is_err());
     }
 }

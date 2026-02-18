@@ -42,6 +42,8 @@ pub use market_maker::{
     AssetRuntimeConfig,
     // Execution Quality Tracking
     CancelAnalysis,
+    // Fill Cascade Detection
+    CascadeConfig,
     // Tier 1: Liquidation Cascade
     CascadeDirection,
     // WebSocket Reconnection

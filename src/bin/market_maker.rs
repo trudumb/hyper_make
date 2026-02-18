@@ -19,7 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use hyperliquid_rust_sdk::{
-    init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CollateralInfo,
+    init_logging, AdverseSelectionConfig, AssetRuntimeConfig, BaseUrl, CascadeConfig, CollateralInfo,
     DataQualityConfig, DynamicRiskConfig, EstimatorConfig, ExchangeClient, ExchangeResponseStatus,
     ExchangeContext, FundingConfig, GLFTStrategy, HawkesConfig, HyperliquidExecutor,
     ImpulseControlConfig, InfoClient, InventoryAwareStrategy, KillSwitchConfig, LadderConfig,
@@ -1729,6 +1729,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spread_profile: SpreadProfile::from_str(&cli.spread_profile),
         // Trading fee in basis points (maker fee) — derived from spread profile
         fee_bps: live_fee_bps,
+        // Fill cascade detection (configurable thresholds, multipliers, cooldowns)
+        cascade: CascadeConfig::default(),
     };
 
     // Extract EMA config before mm_config is moved
@@ -2571,6 +2573,7 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         impulse_control: ImpulseControlConfig::default(),
         spread_profile,
         fee_bps,
+        cascade: CascadeConfig::default(),
     };
 
     // Create strategy — respect spread profile (same logic as live path)
