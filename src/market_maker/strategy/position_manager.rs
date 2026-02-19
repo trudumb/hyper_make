@@ -364,12 +364,13 @@ impl PositionDecisionEngine {
 
 /// Convert PositionAction to effective inventory_ratio for GLFT.
 ///
-/// This function takes the raw inventory_ratio and transforms it based
-/// on the position action:
+/// With the principled AS architecture (γσ²qτ), this function passes
+/// the TRUE inventory ratio for all actions. The γ_eff utilization²
+/// curve handles risk scaling — no discrete damping needed.
 ///
-/// - HOLD: Returns 0.0 (no skew)
-/// - ADD: Returns negative ratio (reverse skew to build position)
-/// - REDUCE: Returns positive ratio scaled by urgency (normal mean-reversion)
+/// - HOLD: Returns raw_inventory_ratio (true q for natural γσ²qτ skew)
+/// - ADD: Returns reduced ratio scaled by (1 - kelly_frac) — reduce skew toward zero when building
+/// - REDUCE: Returns ratio scaled by urgency (normal mean-reversion)
 ///
 /// # Arguments
 /// * `action` - The decided position action
@@ -382,10 +383,12 @@ pub fn action_to_inventory_ratio(action: PositionAction, raw_inventory_ratio: f6
     let sign = raw_inventory_ratio.signum();
 
     match action {
-        PositionAction::Hold => 0.0,
+        PositionAction::Hold => raw_inventory_ratio,
         PositionAction::Add { kelly_frac } => {
-            // Reverse skew: negative ratio encourages position building
-            -kelly_frac * abs_ratio * sign
+            // Reduce skew toward zero when adding (not reverse it).
+            // kelly_frac=1.0 → full conviction → 0 skew (let position build)
+            // kelly_frac=0.5 → moderate → 50% skew (slight mean-reversion)
+            (1.0 - kelly_frac).max(0.0) * abs_ratio * sign
         }
         PositionAction::Reduce { urgency } => {
             // Normal skew: positive ratio encourages position reduction

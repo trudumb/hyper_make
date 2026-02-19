@@ -379,11 +379,16 @@ impl GLFTStrategy {
         let gamma_with_calib = gamma_base * market_params.calibration_gamma_mult;
         let gamma_with_tail = gamma_with_calib * market_params.tail_risk_multiplier;
 
+        // Drawdown: increase γ when losing money (more conservative).
+        // At 5% drawdown: ×1.1. At 10%: ×1.2. Smooth linear ramp.
+        let drawdown_mult = 1.0 + market_params.current_drawdown_frac * 2.0;
+        let gamma_with_drawdown = gamma_with_tail * drawdown_mult;
+
         // RL policy multiplier: allows learned risk aversion scaling.
         // Clamped to [0.1, 10.0] to prevent blow-ups even if RL outputs garbage.
         // Default 1.0 = no-op until RL is explicitly enabled.
         let rl_gamma_mult = market_params.rl_gamma_multiplier.clamp(0.1, 10.0);
-        let gamma_final = gamma_with_tail * rl_gamma_mult;
+        let gamma_final = gamma_with_drawdown * rl_gamma_mult;
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
         //
@@ -478,17 +483,18 @@ impl GLFTStrategy {
         let toxicity_scalar = legacy_toxicity.max(pre_fill_mult);
 
         // === INVENTORY SCALING ===
-        let utilization = if max_position > EPSILON {
+        // Continuous utilization-based γ that replaces BOTH legacy inventory_scalar
+        // AND the PCM's discrete Hold/Reduce/Add damping chain.
+        // At 0% utilization: 1.0 (neutral)
+        // At 50% utilization: 1.75 (moderate conservatism)
+        // At 100% utilization: 4.0 (strong mean-reversion through skew)
+        // Smooth monotonic ramp — no thresholds, no discrete states.
+        let utilization = if max_position > 1e-9 {
             (position.abs() / max_position).min(1.0)
         } else {
             0.0
         };
-        let inventory_scalar = if utilization <= cfg.inventory_threshold {
-            1.0
-        } else {
-            let excess = utilization - cfg.inventory_threshold;
-            1.0 + cfg.inventory_sensitivity * excess.powi(2)
-        };
+        let inventory_scalar = 1.0 + utilization.powi(2) * 3.0;
 
         // === HAWKES ACTIVITY SCALING ===
         let hawkes_baseline = 0.5;
@@ -574,14 +580,13 @@ impl GLFTStrategy {
     /// GLFT half-spread with classical drift (mu*T) asymmetry.
     ///
     /// Extends `half_spread()` with the Avellaneda-Stoikov drift term:
-    /// - Positive drift (price rising) widens bids, tightens asks
-    /// - Negative drift (price falling) tightens bids, widens asks
+    /// - Positive drift (price rising) → tightens bids (buy into uptrend), widens asks (don't sell into uptrend)
+    /// - Negative drift (price falling) → widens bids (don't buy into downtrend), tightens asks (sell into downtrend)
     ///
-    /// Formula: `delta_bid = base + mu*T/2`, `delta_ask = base - mu*T/2`
+    /// Formula: `delta_bid = base - mu*T/2`, `delta_ask = base + mu*T/2`
     ///
     /// The drift adjustment is clamped so the half-spread never goes below
     /// the maker fee rate (no negative-EV quotes).
-    #[allow(dead_code)] // Will be wired in signal_integration.rs
     pub(crate) fn half_spread_with_drift(
         &self,
         gamma: f64,
@@ -593,12 +598,13 @@ impl GLFTStrategy {
     ) -> f64 {
         let base = self.half_spread(gamma, kappa, sigma, time_horizon);
         // Classical GLFT mu*T term: drift shifts spread asymmetrically
-        // Positive drift -> widen bids (buying into uptrend risky), tighten asks
+        // Positive drift → tighter bid (higher bid price → buy into uptrend)
+        //                 → wider ask (higher ask price → protect from selling into uptrend)
         let drift_adjustment = drift_rate * time_horizon / 2.0;
         let adjusted = if is_bid {
-            base + drift_adjustment
+            base - drift_adjustment  // Tighter bid → higher bid → buy into uptrend ✓
         } else {
-            base - drift_adjustment
+            base + drift_adjustment  // Wider ask → higher ask → don't sell into uptrend ✓
         };
         // Floor at maker fee to avoid negative-EV quotes
         adjusted.max(self.risk_config.maker_fee_rate)
@@ -692,6 +698,7 @@ impl GLFTStrategy {
     /// This allows more aggressive positioning in the predicted direction.
     ///
     /// Returns skew in fractional terms (divide by 10000 to get bps).
+    #[allow(dead_code)] // Kept for analytics comparison; drift μ replaces this in quote pipeline
     fn proactive_directional_skew(&self, market_params: &MarketParams) -> f64 {
         // Check if proactive skew is enabled
         if !market_params.enable_proactive_skew {
@@ -957,8 +964,11 @@ impl QuotingStrategy for GLFTStrategy {
         let sigma = market_params.sigma_effective
             * market_params.sigma_cascade_mult.max(1.0);
         let tau = time_horizon;
-        let mut half_spread_bid = self.half_spread(gamma, kappa_bid, sigma, tau);
-        let mut half_spread_ask = self.half_spread(gamma, kappa_ask, sigma, tau);
+        // Use drift-aware half-spreads: μ > 0 → tighter bids (buy into uptrend),
+        // wider asks (don't sell into uptrend). Falls back to symmetric when μ=0.
+        let drift_rate = market_params.drift_rate_per_sec;
+        let mut half_spread_bid = self.half_spread_with_drift(gamma, kappa_bid, sigma, tau, drift_rate, true);
+        let mut half_spread_ask = self.half_spread_with_drift(gamma, kappa_ask, sigma, tau, drift_rate, false);
 
         // Symmetric half-spread for logging (average of bid/ask)
         let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
@@ -1489,50 +1499,29 @@ impl QuotingStrategy for GLFTStrategy {
         // - funding_skew: Perpetual funding cost pressure
         // - momentum amplification: variance-derived multiplier when opposed
 
-        // === 6.0: PROACTIVE DIRECTIONAL SKEW (Small Fish Strategy) ===
-        // When inventory is LOW, add proactive skew to BUILD position with momentum
-        // When inventory is HIGH, inventory skew dominates to REDUCE position
-        // The blend is additive: inventory_skew + proactive contribution
-        let proactive_skew = self.proactive_directional_skew(market_params);
-
-        // Inventory-reactive skew (existing behavior)
+        // === 6.0: INVENTORY SKEW (γσ²qτ does the work) ===
+        // No damping, no proactive bolt-on. The drift term in half_spread_with_drift()
+        // handles directional intent via μ. The γ_eff utilization² curve (Phase 2)
+        // replaces discrete HOLD/ADD/REDUCE damping.
+        //
         // RL omega multiplier: allows learned skew scaling.
         // Clamped to [0.1, 10.0] to prevent sign-flipping or blow-ups.
         // Default 1.0 = no-op until RL is explicitly enabled.
         let rl_omega_mult = market_params.rl_omega_multiplier.clamp(0.1, 10.0);
-        let inventory_skew = (base_skew + drift_urgency + hawkes_skew + funding_skew)
+        let skew = (base_skew + drift_urgency + hawkes_skew + funding_skew)
             * momentum_skew_multiplier
             * rl_omega_mult;
 
-        // Blend: inventory skew dampened by position action, proactive skew fades with inventory
-        // inventory_weight: 0 at zero inventory → 1 at max position
-        let inventory_weight = (position.abs() / effective_max_position).min(1.0);
-
-        // Dampen inventory skew based on position manager decision:
-        // - HOLD: minimize inventory skew (0.3x) — position is trend-aligned
-        // - ADD: nearly suppress inventory skew (0.1x) — building position
-        // - REDUCE: scale by urgency — reducing position, inventory skew drives direction
-        let inventory_dampen = match market_params.position_action {
-            super::PositionAction::Hold => 0.3,
-            super::PositionAction::Add { .. } => 0.1,
-            super::PositionAction::Reduce { urgency } => urgency.min(1.0),
-        };
-
-        // Proactive skew is additive when inventory is low, fades to zero at max inventory
-        // Inventory skew scaled by position action dampen factor
-        let skew = inventory_skew * inventory_dampen
-            + proactive_skew * (1.0 - inventory_weight * 0.5);
-
-        if proactive_skew.abs() > 1e-8 {
+        // Diagnostic logging: track inventory skew magnitude for calibration verification.
+        // Expected: 50% utilization → 3-8 bps, 80% → 8-15 bps.
+        // If skew < 2 bps at 50% utilization → γ needs recalibration (increase gamma_base).
+        if position.abs() > 0.001 {
             tracing::info!(
-                proactive_skew_bps = %format!("{:.2}", proactive_skew * 10000.0),
-                inventory_skew_bps = %format!("{:.2}", inventory_skew * 10000.0),
-                inventory_weight = %format!("{:.2}", inventory_weight),
-                proactive_contribution_bps = %format!("{:.2}", proactive_skew * (1.0 - inventory_weight) * 10000.0),
-                blended_skew_bps = %format!("{:.2}", skew * 10000.0),
-                momentum_bps = %format!("{:.2}", market_params.momentum_bps),
-                p_continue = %format!("{:.2}", market_params.p_momentum_continue),
-                "Proactive skew active (Small Fish)"
+                inventory_skew_bps = %format!("{:.2}", skew * 10000.0),
+                utilization_pct = %format!("{:.1}", (position.abs() / effective_max_position).min(1.0) * 100.0),
+                gamma = %format!("{:.4}", gamma),
+                drift_bps = %format!("{:.2}", market_params.drift_rate_per_sec * 10000.0),
+                "Inventory skew magnitude check"
             );
         }
 
@@ -2496,15 +2485,17 @@ mod tests {
         );
         let base = strategy.half_spread(gamma, kappa, sigma, time_horizon);
 
-        // Positive drift: bid should be wider than base (buying into uptrend is risky)
+        // Positive drift (price rising): bid should be TIGHTER than base
+        // (buy into uptrend → higher bid → tighter half-spread)
         assert!(
-            bid_half > base,
-            "bid half-spread should widen with positive drift: bid={bid_half}, base={base}"
+            bid_half < base,
+            "bid half-spread should tighten with positive drift: bid={bid_half}, base={base}"
         );
-        // Positive drift: ask should be tighter than base (selling into uptrend is favorable)
+        // Positive drift (price rising): ask should be WIDER than base
+        // (don't sell into uptrend → higher ask → wider half-spread)
         assert!(
-            ask_half < base,
-            "ask half-spread should tighten with positive drift: ask={ask_half}, base={base}"
+            ask_half > base,
+            "ask half-spread should widen with positive drift: ask={ask_half}, base={base}"
         );
     }
 

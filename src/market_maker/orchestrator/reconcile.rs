@@ -2931,7 +2931,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // CRITICAL: Also check is_initialized() - if not initialized, the available_buy/sell
         // values will be f64::MAX, which would pass all orders through without any filtering.
         let limits_initialized = self.infra.exchange_limits.is_initialized();
-        let total_available = if !limits_initialized {
+        let raw_available = if !limits_initialized {
             // Not initialized - be conservative and block all orders
             // This prevents mass rejections when we don't know actual limits
             0.0
@@ -2939,6 +2939,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.infra.exchange_limits.available_buy()
         } else {
             self.infra.exchange_limits.available_sell()
+        };
+
+        // Defense-in-depth: clamp sentinel/absurd values to effective_max_position.
+        // Catches any residual f64::MAX from unparsed exchange data or future bugs.
+        let total_available = if !raw_available.is_finite() || raw_available > 1e15 {
+            let fallback = self.effective_max_position;
+            warn!(
+                side = %side_str,
+                raw_available = %format!("{:.6e}", raw_available),
+                fallback = %format!("{:.6}", fallback),
+                has_full_exchange_data = self.infra.exchange_limits.has_full_exchange_data(),
+                "[PlaceBulk] Sentinel: clamping absurd available capacity to effective_max_position"
+            );
+            fallback
+        } else {
+            raw_available
         };
 
         info!(

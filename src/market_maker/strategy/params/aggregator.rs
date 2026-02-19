@@ -753,8 +753,10 @@ impl ParameterAggregator {
             learned_alpha_touch: sources.learned_params.map_or(0.25, |l| l.alpha_touch),
             learned_spread_floor_bps: sources.learned_params.map_or(5.0, |l| l.spread_floor_bps),
             learned_params_calibrated: sources.learned_params.is_some_and(|l| l.calibrated),
-            // Drift rate defaults to 0.0 (no drift); set by HJB controller
+            // Drift rate defaults to 0.0 (no drift); set by DriftEstimator
             drift_rate_per_sec: 0.0,
+            // Drawdown fraction — set by quote_engine from risk state
+            current_drawdown_frac: 0.0,
             // Capital tier — set by quote_engine after build, default Large
             capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
             // Kill switch headroom — set by quote_engine from drawdown state

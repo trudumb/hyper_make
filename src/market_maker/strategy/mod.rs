@@ -3,6 +3,7 @@
 //! This module provides different quoting strategies that implement the
 //! `QuotingStrategy` trait.
 
+pub mod drift_estimator;
 pub mod feature_store;
 mod glft;
 mod kelly;

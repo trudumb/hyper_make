@@ -307,13 +307,14 @@ impl MetricsInner {
             supervisor_reconnect_signals: AtomicU64::new(0),
             data_quality_issues_total: AtomicU64::new(0),
             message_loss_count: AtomicU64::new(0),
-            // Exchange Position Limits defaults
-            exchange_max_long: AtomicF64::new(f64::MAX),
-            exchange_max_short: AtomicF64::new(f64::MAX),
-            exchange_available_buy: AtomicF64::new(f64::MAX),
-            exchange_available_sell: AtomicF64::new(f64::MAX),
-            exchange_effective_bid: AtomicF64::new(f64::MAX),
-            exchange_effective_ask: AtomicF64::new(f64::MAX),
+            // Exchange Position Limits defaults — 0.0 is conservative (no capacity
+            // until exchange confirms), preventing f64::MAX from leaking into logs/metrics.
+            exchange_max_long: AtomicF64::new(0.0),
+            exchange_max_short: AtomicF64::new(0.0),
+            exchange_available_buy: AtomicF64::new(0.0),
+            exchange_available_sell: AtomicF64::new(0.0),
+            exchange_effective_bid: AtomicF64::new(0.0),
+            exchange_effective_ask: AtomicF64::new(0.0),
             exchange_limits_age_ms: AtomicU64::new(u64::MAX),
             exchange_limits_valid: AtomicU64::new(0),
             crossed_book_incidents: AtomicU64::new(0),

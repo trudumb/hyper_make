@@ -19,6 +19,9 @@ use crate::market_maker::analytics::ToxicityInput;
 use crate::market_maker::config::{CapacityBudget, Viability};
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 use crate::market_maker::strategy::action_to_inventory_ratio;
+use crate::market_maker::strategy::drift_estimator::{
+    SignalObservation, BASE_MOMENTUM_VAR, BASE_TREND_VAR, BASE_LL_VAR, BASE_FLOW_VAR,
+};
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
 pub(super) const MIN_ORDER_NOTIONAL: f64 = 10.0;
@@ -529,23 +532,61 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let position_value = (position.abs() * self.latest_mid).max(1.0);
         let trend_signal = self.estimator.trend_signal(position_value);
 
-        // Blend multi-timeframe momentum for drift estimator input.
-        // During smooth trends, short-term momentum oscillates near zero while
-        // the 5-min trend is clearly directional. Feed the stronger signal.
-        let effective_momentum = if trend_signal.is_warmed_up {
-            if trend_signal.long_momentum_bps.abs() > momentum_bps.abs()
-                && trend_signal.long_momentum_bps.abs() > 5.0
-            {
-                // Long-term trend dominates: blend 70/30
-                0.7 * trend_signal.long_momentum_bps + 0.3 * momentum_bps
-            } else if trend_signal.medium_momentum_bps.abs() > momentum_bps.abs()
-                && trend_signal.medium_momentum_bps.abs() > 3.0
-            {
-                // Medium-term trend dominates: blend 50/50
-                0.5 * trend_signal.medium_momentum_bps + 0.5 * momentum_bps
-            } else {
-                momentum_bps
-            }
+        // === DriftEstimator: Bayesian signal fusion ===
+        // Build signal observations for precision-weighted fusion.
+        // Each signal contributes (value, variance) — higher precision = more weight.
+        // Regime probabilities modulate variance: in trending markets momentum
+        // has low variance (high weight), trend has high variance (low weight).
+        let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
+        let p_stress = regime_probs[2] + regime_probs[3]; // P(Volatile) + P(Extreme)
+        let sigma_effective = self.estimator.sigma_effective();
+        let vol_ratio = sigma_effective / self.stochastic.stochastic_config.sigma_baseline.max(1e-9);
+
+        let mut drift_signals: Vec<SignalObservation> = Vec::with_capacity(5);
+
+        // 1. Short-term momentum
+        if momentum_bps.abs() > 0.1 {
+            drift_signals.push(SignalObservation {
+                value_bps_per_sec: momentum_bps,
+                variance: vol_ratio.powi(2) * BASE_MOMENTUM_VAR * (1.0 - p_continuation).max(0.1),
+                // CALIBRATION TARGET: BASE_MOMENTUM_VAR=100.0
+            });
+        }
+
+        // 2. Long-term trend
+        if trend_signal.is_warmed_up && trend_signal.long_momentum_bps.abs() > 1.0 {
+            drift_signals.push(SignalObservation {
+                value_bps_per_sec: trend_signal.long_momentum_bps,
+                variance: BASE_TREND_VAR * (1.0 + p_stress * 3.0),
+                // CALIBRATION TARGET: BASE_TREND_VAR=200.0
+            });
+        }
+
+        // 3. Lead-lag (reference perp)
+        if self.reference_perp_drift_ema.abs() > 1e-12 {
+            let ll_conf = self.stochastic.signal_integrator.lead_lag_signal().stability_confidence.max(0.01);
+            drift_signals.push(SignalObservation {
+                value_bps_per_sec: self.reference_perp_drift_ema * 10_000.0,
+                variance: BASE_LL_VAR / ll_conf,
+                // CALIBRATION TARGET: BASE_LL_VAR=50.0
+            });
+        }
+
+        // 4. Flow imbalance
+        let flow_imb = self.stochastic.signal_integrator.hl_flow_imbalance_5s();
+        if flow_imb.abs() > 0.1 {
+            drift_signals.push(SignalObservation {
+                value_bps_per_sec: flow_imb * 10.0, // imbalance → bps proxy
+                variance: vol_ratio.powi(2) * BASE_FLOW_VAR,
+                // CALIBRATION TARGET: BASE_FLOW_VAR=200.0
+            });
+        }
+
+        self.drift_estimator.update(&drift_signals);
+
+        // For HJB controller: still need effective_momentum for its internal EWMA
+        let effective_momentum = if !drift_signals.is_empty() {
+            self.drift_estimator.drift_bps_per_sec()
         } else {
             momentum_bps
         };
@@ -739,11 +780,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
-        // Wire reference perp drift rate for GLFT asymmetric bid/ask spreads.
-        // EMA-smoothed in handlers.rs on each AllMids update.
-        if self.reference_perp_drift_ema.abs() > 1e-12 {
-            market_params.drift_rate_per_sec = self.reference_perp_drift_ema;
-        }
+        // Wire DriftEstimator output for GLFT asymmetric bid/ask spreads.
+        // Bayesian fusion of momentum, trend, lead-lag, and flow signals (Phase 5).
+        // Falls back to 0.0 when no signals are active (symmetric quotes).
+        market_params.drift_rate_per_sec = self.drift_estimator.drift_rate_per_sec();
 
         // === L1: Parameter Smoothing (Churn Reduction) ===
         // EWMA + deadband filtering on kappa/sigma/gamma before they reach the ladder.
@@ -1464,6 +1504,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Previous cliff at 0.5 caused discontinuous spread jumps.
         let toxicity_addon_bps = (toxicity.composite_score * 6.0).min(5.0);
         total_risk_premium += toxicity_addon_bps;
+
+        // Phase 6: Toxicity vol premium — routes toxicity through Σ channel.
+        // Higher toxicity → inflated sigma → GLFT naturally widens spreads.
+        // Threshold 0.3: below is normal market noise; above adds up to 15% vol premium.
+        const TOXICITY_VOL_THRESHOLD: f64 = 0.3;
+        if toxicity.composite_score > TOXICITY_VOL_THRESHOLD {
+            let excess = (toxicity.composite_score - TOXICITY_VOL_THRESHOLD).min(0.3);
+            let toxicity_vol_premium = excess * 0.5; // Up to 15% vol premium at max toxicity
+            market_params.sigma_effective *= 1.0 + toxicity_vol_premium;
+        }
 
         // Staleness addon: 0-3 bps from signal staleness
         let staleness_mult = self.stochastic.signal_integrator.staleness_spread_multiplier();
@@ -2514,6 +2564,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             } else {
                 1.0
             };
+            // Wire drawdown fraction for continuous gamma scaling in GLFT
+            market_params.current_drawdown_frac = drawdown;
         }
 
         // Capital-aware warmup bootstrap: small accounts get a warmup floor

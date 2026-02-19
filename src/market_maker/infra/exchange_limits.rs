@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::info::response_structs::ActiveAssetDataResponse;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Exchange-enforced position limits with lock-free access.
 ///
@@ -73,6 +73,9 @@ struct ExchangeLimitsInner {
     local_max_position: AtomicF64,
     /// Paper trading mode: limits never go stale (no websocket refresh)
     paper_mode: std::sync::atomic::AtomicBool,
+    /// Whether the last update had complete exchange data (no parse failures).
+    /// `false` when any API field was missing/unparseable (e.g. HIP-3 assets).
+    has_full_exchange_data: std::sync::atomic::AtomicBool,
 }
 
 impl ExchangePositionLimits {
@@ -91,6 +94,7 @@ impl ExchangePositionLimits {
                 last_refresh_epoch_ms: AtomicU64::new(0),
                 local_max_position: AtomicF64::new(0.0),
                 paper_mode: std::sync::atomic::AtomicBool::new(false),
+                has_full_exchange_data: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -109,6 +113,9 @@ impl ExchangePositionLimits {
         self.inner.local_max_position.store(max_position);
         self.inner
             .paper_mode
+            .store(true, Ordering::Relaxed);
+        self.inner
+            .has_full_exchange_data
             .store(true, Ordering::Relaxed);
         self.inner
             .last_refresh_epoch_ms
@@ -137,33 +144,50 @@ impl ExchangePositionLimits {
         response: &ActiveAssetDataResponse,
         local_max_position: f64,
     ) {
-        // Parse exchange limits
-        // max_trade_szs: Maximum position SIZE in contracts (e.g., 0.016 BTC)
-        // available_to_trade: Available notional in USD to INCREASE exposure
-        //   [0] = capacity to increase LONG (buy more)
-        //   [1] = capacity to increase SHORT (sell more)
-        // NOTE: These limits apply to opening/increasing positions, NOT closing.
-        // Closing a position releases margin, so you can always close regardless
-        // of available_to_trade values.
-        let max_long = parse_f64_or_max(&response.max_trade_szs, 0);
-        let max_short = parse_f64_or_max(&response.max_trade_szs, 1);
-        let available_buy_usd = parse_f64_or_max(&response.available_to_trade, 0);
-        let available_sell_usd = parse_f64_or_max(&response.available_to_trade, 1);
-        let mark_price = response.mark_px.parse::<f64>().unwrap_or(f64::MAX);
+        // Parse exchange limits using Option-based parsing.
+        // On parse failure (empty, non-finite, negative), fall back to local_max_position
+        // instead of f64::MAX, so the exchange guardrail remains meaningful.
+        let max_long_opt = parse_f64_opt(&response.max_trade_szs, 0);
+        let max_short_opt = parse_f64_opt(&response.max_trade_szs, 1);
+        let available_buy_usd_opt = parse_f64_opt(&response.available_to_trade, 0);
+        let available_sell_usd_opt = parse_f64_opt(&response.available_to_trade, 1);
+        let mark_price_opt = parse_f64_opt_str(&response.mark_px);
 
-        // Convert available notional (USD) to position size (contracts)
-        // CRITICAL FIX: available_to_trade is in USD, not contracts!
-        // We must convert: available_size = available_usd / mark_price
-        let available_buy = if mark_price > 0.0 && mark_price < f64::MAX {
-            available_buy_usd / mark_price
-        } else {
-            f64::MAX
+        let max_long = max_long_opt.unwrap_or(local_max_position);
+        let max_short = max_short_opt.unwrap_or(local_max_position);
+
+        // Convert available notional (USD) to position size (contracts).
+        // If either USD amount or mark_px is missing, fall back to local_max_position.
+        let available_buy = match (available_buy_usd_opt, mark_price_opt) {
+            (Some(usd), Some(px)) if px > 0.0 => usd / px,
+            _ => local_max_position,
         };
-        let available_sell = if mark_price > 0.0 && mark_price < f64::MAX {
-            available_sell_usd / mark_price
-        } else {
-            f64::MAX
+        let available_sell = match (available_sell_usd_opt, mark_price_opt) {
+            (Some(usd), Some(px)) if px > 0.0 => usd / px,
+            _ => local_max_position,
         };
+
+        // Track whether we got complete data from the exchange
+        let has_full_data = max_long_opt.is_some()
+            && max_short_opt.is_some()
+            && available_buy_usd_opt.is_some()
+            && available_sell_usd_opt.is_some()
+            && mark_price_opt.is_some();
+        self.inner
+            .has_full_exchange_data
+            .store(has_full_data, Ordering::Relaxed);
+
+        if !has_full_data {
+            warn!(
+                max_long_parsed = max_long_opt.is_some(),
+                max_short_parsed = max_short_opt.is_some(),
+                available_buy_parsed = available_buy_usd_opt.is_some(),
+                available_sell_parsed = available_sell_usd_opt.is_some(),
+                mark_px_parsed = mark_price_opt.is_some(),
+                fallback = %format!("{:.6}", local_max_position),
+                "Exchange limits: partial/missing data, using local_max_position as fallback"
+            );
+        }
 
         // Store raw values (in contracts for consistency)
         self.inner.max_long.store(max_long);
@@ -171,13 +195,9 @@ impl ExchangePositionLimits {
         self.inner.available_buy.store(available_buy);
         self.inner.available_sell.store(available_sell);
 
-        // Pre-compute effective limits using ALL constraints:
-        // 1. local_max_position: User-configured max position
-        // 2. max_long/max_short: Exchange-enforced position limits (from leverage)
-        // 3. available_buy/sell: Exchange-enforced capacity (from margin)
-        //
-        // CRITICAL: For buy orders, we must respect both max_long AND available_buy
-        // For sell orders, we must respect both max_short AND available_sell
+        // Pre-compute effective limits: min(local_max, max_long, available_buy)
+        // All three values are now sensible (no f64::MAX), so min() always produces
+        // a real limit.
         let effective_bid = local_max_position.min(max_long).min(available_buy);
         let effective_ask = local_max_position.min(max_short).min(available_sell);
         self.inner.effective_bid_limit.store(effective_bid);
@@ -194,11 +214,9 @@ impl ExchangePositionLimits {
             max_short = %format!("{:.6}", max_short),
             available_buy = %format!("{:.6}", available_buy),
             available_sell = %format!("{:.6}", available_sell),
-            available_buy_usd = %format!("{:.2}", available_buy_usd),
-            available_sell_usd = %format!("{:.2}", available_sell_usd),
-            mark_price = %format!("{:.2}", mark_price),
             effective_bid = %format!("{:.6}", effective_bid),
             effective_ask = %format!("{:.6}", effective_ask),
+            has_full_data = has_full_data,
             "Exchange position limits updated"
         );
     }
@@ -218,22 +236,47 @@ impl ExchangePositionLimits {
         mark_price: f64,
         local_max_position: f64,
     ) {
-        let max_long = parse_f64_or_max(&data.max_trade_szs, 0);
-        let max_short = parse_f64_or_max(&data.max_trade_szs, 1);
-        let available_buy_usd = parse_f64_or_max(&data.available_to_trade, 0);
-        let available_sell_usd = parse_f64_or_max(&data.available_to_trade, 1);
+        let max_long_opt = parse_f64_opt(&data.max_trade_szs, 0);
+        let max_short_opt = parse_f64_opt(&data.max_trade_szs, 1);
+        let available_buy_usd_opt = parse_f64_opt(&data.available_to_trade, 0);
+        let available_sell_usd_opt = parse_f64_opt(&data.available_to_trade, 1);
 
-        // Convert available notional (USD) to position size (contracts)
-        let available_buy = if mark_price > 0.0 && mark_price < f64::MAX {
-            available_buy_usd / mark_price
-        } else {
-            f64::MAX
+        let max_long = max_long_opt.unwrap_or(local_max_position);
+        let max_short = max_short_opt.unwrap_or(local_max_position);
+
+        // Convert available notional (USD) to position size (contracts).
+        // mark_price is passed from local state; if invalid, fall back to local_max.
+        let mark_price_valid = mark_price > 0.0 && mark_price.is_finite();
+        let available_buy = match (available_buy_usd_opt, mark_price_valid) {
+            (Some(usd), true) => usd / mark_price,
+            _ => local_max_position,
         };
-        let available_sell = if mark_price > 0.0 && mark_price < f64::MAX {
-            available_sell_usd / mark_price
-        } else {
-            f64::MAX
+        let available_sell = match (available_sell_usd_opt, mark_price_valid) {
+            (Some(usd), true) => usd / mark_price,
+            _ => local_max_position,
         };
+
+        // Track whether we got complete data
+        let has_full_data = max_long_opt.is_some()
+            && max_short_opt.is_some()
+            && available_buy_usd_opt.is_some()
+            && available_sell_usd_opt.is_some()
+            && mark_price_valid;
+        self.inner
+            .has_full_exchange_data
+            .store(has_full_data, Ordering::Relaxed);
+
+        if !has_full_data {
+            warn!(
+                max_long_parsed = max_long_opt.is_some(),
+                max_short_parsed = max_short_opt.is_some(),
+                available_buy_parsed = available_buy_usd_opt.is_some(),
+                available_sell_parsed = available_sell_usd_opt.is_some(),
+                mark_price_valid = mark_price_valid,
+                fallback = %format!("{:.6}", local_max_position),
+                "Exchange limits WS: partial/missing data, using local_max_position as fallback"
+            );
+        }
 
         // Store raw values
         self.inner.max_long.store(max_long);
@@ -261,6 +304,7 @@ impl ExchangePositionLimits {
             mark_price = %format!("{:.2}", mark_price),
             effective_bid = %format!("{:.6}", effective_bid),
             effective_ask = %format!("{:.6}", effective_ask),
+            has_full_data = has_full_data,
             source = "WebSocket",
             "Exchange position limits updated from WS"
         );
@@ -382,6 +426,17 @@ impl ExchangePositionLimits {
     /// Check if limits are critically stale (> 5 minutes old).
     pub fn is_critically_stale(&self) -> bool {
         self.age_ms() > 300_000 // 5 minutes
+    }
+
+    /// Whether the last update had complete exchange data (no parse failures).
+    ///
+    /// `false` means some fields were missing/unparseable (e.g. HIP-3 assets
+    /// where `available_to_trade` or `mark_px` come back empty), and limits
+    /// fell back to `local_max_position`.
+    pub fn has_full_exchange_data(&self) -> bool {
+        self.inner
+            .has_full_exchange_data
+            .load(Ordering::Relaxed)
     }
 
     /// Calculate safe order size that won't exceed exchange limits.
@@ -525,6 +580,7 @@ impl ExchangePositionLimits {
             local_max_position: self.inner.local_max_position.load(),
             age_ms: self.age_ms(),
             is_stale: self.is_stale(),
+            has_full_exchange_data: self.has_full_exchange_data(),
         }
     }
 
@@ -631,6 +687,7 @@ impl ExchangePositionLimits {
             age_ms = self.age_ms(),
             initialized = self.is_initialized(),
             stale = self.is_stale(),
+            has_full_exchange_data = self.has_full_exchange_data(),
             "Exchange limits status"
         );
     }
@@ -654,17 +711,34 @@ pub struct ExchangeLimitsSummary {
     pub local_max_position: f64,
     pub age_ms: u64,
     pub is_stale: bool,
+    pub has_full_exchange_data: bool,
 }
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
 
-/// Parse f64 from string array, returning MAX on error.
-fn parse_f64_or_max(arr: &[String], index: usize) -> f64 {
-    arr.get(index)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(f64::MAX)
+/// Parse f64 from string array, returning `None` on failure.
+///
+/// Rejects empty strings, non-finite values (NaN, Inf), and negative values.
+/// `None` means "field unavailable" — callers should fall back to `local_max_position`.
+fn parse_f64_opt(arr: &[String], index: usize) -> Option<f64> {
+    let s = arr.get(index)?;
+    parse_f64_opt_str(s)
+}
+
+/// Parse f64 from a single string, returning `None` on failure.
+///
+/// Rejects empty strings, non-finite values (NaN, Inf), and negative values.
+fn parse_f64_opt_str(s: &str) -> Option<f64> {
+    if s.is_empty() {
+        return None;
+    }
+    let v = s.parse::<f64>().ok()?;
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    Some(v)
 }
 
 /// Get current epoch time in milliseconds.
@@ -869,5 +943,184 @@ mod tests {
 
         af.store(2.5);
         assert_eq!(af.load(), 2.5);
+    }
+
+    // =========================================================================
+    // parse_f64_opt tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_f64_opt_valid() {
+        let arr = vec!["1.5".to_string(), "100.0".to_string()];
+        assert_eq!(parse_f64_opt(&arr, 0), Some(1.5));
+        assert_eq!(parse_f64_opt(&arr, 1), Some(100.0));
+        // Zero is valid (means no capacity)
+        let arr_zero = vec!["0.0".to_string()];
+        assert_eq!(parse_f64_opt(&arr_zero, 0), Some(0.0));
+    }
+
+    #[test]
+    fn test_parse_f64_opt_empty_string() {
+        let arr = vec!["".to_string()];
+        assert_eq!(parse_f64_opt(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_parse_f64_opt_missing_index() {
+        let arr: Vec<String> = vec![];
+        assert_eq!(parse_f64_opt(&arr, 0), None);
+        let arr2 = vec!["1.0".to_string()];
+        assert_eq!(parse_f64_opt(&arr2, 1), None);
+    }
+
+    #[test]
+    fn test_parse_f64_opt_negative() {
+        let arr = vec!["-5.0".to_string()];
+        assert_eq!(parse_f64_opt(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_parse_f64_opt_infinity() {
+        let arr = vec!["inf".to_string(), "Infinity".to_string()];
+        assert_eq!(parse_f64_opt(&arr, 0), None);
+        assert_eq!(parse_f64_opt(&arr, 1), None);
+    }
+
+    #[test]
+    fn test_parse_f64_opt_nan() {
+        let arr = vec!["NaN".to_string()];
+        assert_eq!(parse_f64_opt(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_parse_f64_opt_str_garbage() {
+        assert_eq!(parse_f64_opt_str("abc"), None);
+        assert_eq!(parse_f64_opt_str(""), None);
+        assert_eq!(parse_f64_opt_str("--3"), None);
+    }
+
+    // =========================================================================
+    // Fallback behavior tests
+    // =========================================================================
+
+    #[test]
+    fn test_update_from_response_valid_data_has_full_flag() {
+        let limits = ExchangePositionLimits::new();
+        let response = make_response(1.5, 1.5, 100000.0, 50000.0);
+        limits.update_from_response(&response, 2.0);
+
+        // Standard perp data: all fields parse, flag should be true
+        assert!(limits.has_full_exchange_data());
+        assert_eq!(limits.max_long(), 1.5);
+        assert_eq!(limits.available_buy(), 1.0); // 100000 / 100000
+    }
+
+    /// Simulates HIP-3 asset where API returns empty fields.
+    #[test]
+    fn test_update_from_response_missing_all_fields() {
+        use crate::types::Leverage;
+        use alloy::primitives::Address;
+
+        let limits = ExchangePositionLimits::new();
+        let response = ActiveAssetDataResponse {
+            user: Address::ZERO,
+            coin: "HYPE".to_string(),
+            leverage: Leverage {
+                type_string: "cross".to_string(),
+                value: 5,
+                raw_usd: None,
+            },
+            max_trade_szs: vec![],        // empty array
+            available_to_trade: vec![],    // empty array
+            mark_px: "".to_string(),       // empty mark price
+        };
+
+        let local_max = 10.0;
+        limits.update_from_response(&response, local_max);
+
+        // All fields should fall back to local_max_position, NOT f64::MAX
+        assert!(!limits.has_full_exchange_data());
+        assert_eq!(limits.max_long(), local_max);
+        assert_eq!(limits.max_short(), local_max);
+        assert_eq!(limits.available_buy(), local_max);
+        assert_eq!(limits.available_sell(), local_max);
+        assert_eq!(limits.effective_bid_limit(), local_max);
+        assert_eq!(limits.effective_ask_limit(), local_max);
+    }
+
+    /// Simulates partial data: max_trade_szs present but available_to_trade or mark_px missing.
+    #[test]
+    fn test_update_from_response_partial_data_mark_px_missing() {
+        use crate::types::Leverage;
+        use alloy::primitives::Address;
+
+        let limits = ExchangePositionLimits::new();
+        let response = ActiveAssetDataResponse {
+            user: Address::ZERO,
+            coin: "HYPE".to_string(),
+            leverage: Leverage {
+                type_string: "cross".to_string(),
+                value: 5,
+                raw_usd: None,
+            },
+            max_trade_szs: vec!["50.0".to_string(), "50.0".to_string()],
+            available_to_trade: vec!["10000.0".to_string(), "10000.0".to_string()],
+            mark_px: "".to_string(), // mark price missing — can't convert USD to contracts
+        };
+
+        let local_max = 20.0;
+        limits.update_from_response(&response, local_max);
+
+        // max_long/max_short parsed fine
+        assert_eq!(limits.max_long(), 50.0);
+        assert_eq!(limits.max_short(), 50.0);
+        // available_buy/sell can't be computed without mark_px → fall back to local_max
+        assert_eq!(limits.available_buy(), local_max);
+        assert_eq!(limits.available_sell(), local_max);
+        // Effective = min(local_max=20, max_long=50, available=20) = 20
+        assert_eq!(limits.effective_bid_limit(), local_max);
+        assert_eq!(limits.effective_ask_limit(), local_max);
+        // Partial data
+        assert!(!limits.has_full_exchange_data());
+    }
+
+    #[test]
+    fn test_update_from_ws_missing_fields_uses_fallback() {
+        use crate::types::Leverage;
+        use alloy::primitives::Address;
+
+        let limits = ExchangePositionLimits::new();
+
+        let data = crate::types::ActiveAssetDataData {
+            user: Address::ZERO,
+            coin: "HYPE".to_string(),
+            leverage: Leverage {
+                type_string: "cross".to_string(),
+                value: 5,
+                raw_usd: None,
+            },
+            max_trade_szs: vec![],
+            available_to_trade: vec![],
+        };
+
+        let local_max = 15.0;
+        limits.update_from_ws(&data, 0.0, local_max); // mark_price = 0.0 → invalid
+
+        assert!(!limits.has_full_exchange_data());
+        assert_eq!(limits.max_long(), local_max);
+        assert_eq!(limits.max_short(), local_max);
+        assert_eq!(limits.available_buy(), local_max);
+        assert_eq!(limits.available_sell(), local_max);
+        assert_eq!(limits.effective_bid_limit(), local_max);
+        assert_eq!(limits.effective_ask_limit(), local_max);
+    }
+
+    #[test]
+    fn test_paper_init_has_full_data() {
+        let limits = ExchangePositionLimits::new();
+        limits.initialize_for_paper(100.0);
+        assert!(limits.has_full_exchange_data());
+        assert!(limits.is_initialized());
+        assert_eq!(limits.effective_bid_limit(), 100.0);
     }
 }

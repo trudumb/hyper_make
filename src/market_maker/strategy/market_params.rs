@@ -989,6 +989,11 @@ pub struct MarketParams {
     /// for asymmetric bid/ask spread (classical μ·T term).
     pub drift_rate_per_sec: f64,
 
+    /// Current drawdown as fraction of account value [0.0, 1.0+].
+    /// Used by GLFT effective_gamma for continuous risk aversion scaling.
+    /// Higher drawdown → higher gamma → wider spreads.
+    pub current_drawdown_frac: f64,
+
     // === Capital Tier ===
     /// Capital tier from CapitalProfile — used for logging, metrics, and warmup
     /// bootstrapping only. Does NOT drive code path selection in ladder generation.
@@ -1313,6 +1318,7 @@ impl Default for MarketParams {
             cached_best_ask: 0.0,
             // Drift rate
             drift_rate_per_sec: 0.0,
+            current_drawdown_frac: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,
             // Capacity budget — computed per cycle in quote_engine

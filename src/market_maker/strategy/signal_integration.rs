@@ -1120,21 +1120,14 @@ impl SignalIntegrator {
 
         // === HL-Native Directional Skew Fallback ===
         // When cross-venue signals are unavailable (no Binance feed for this asset),
-        // use HL-native flow imbalance to produce directional skew.
-        // This prevents symmetric quoting when HL flow data shows clear buying/selling pressure.
-        if !signals.lead_lag_actionable
-            && !signals.cross_venue_valid
-            && signals.combined_skew_bps.abs() < 0.01
-        {
-            // Blend short-term (5s) and medium-term (30s) imbalance for stability
-            const HL_IMBALANCE_SHORT_WEIGHT: f64 = 0.6;
-            const HL_IMBALANCE_MED_WEIGHT: f64 = 0.4;
-            const HL_NATIVE_SKEW_FRACTION: f64 = 0.6;
-            let flow_dir = self.latest_hl_flow.imbalance_5s * HL_IMBALANCE_SHORT_WEIGHT
-                + self.latest_hl_flow.imbalance_30s * HL_IMBALANCE_MED_WEIGHT;
-            let fallback_cap = self.config.max_lead_lag_skew_bps * HL_NATIVE_SKEW_FRACTION;
-            signals.combined_skew_bps =
-                (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
+        // use HL-native flow imbalance as ADDITIVE directional skew.
+        // No guard on combined_skew_bps — this is HIP-3's primary directional signal.
+        // Final clamp at line ~1194 prevents overflow.
+        if !signals.lead_lag_actionable && !signals.cross_venue_valid {
+            let flow_dir = self.latest_hl_flow.imbalance_5s * 0.6
+                + self.latest_hl_flow.imbalance_30s * 0.4;
+            let fallback_cap = self.config.max_lead_lag_skew_bps * 0.6;
+            signals.combined_skew_bps += (flow_dir * fallback_cap).clamp(-fallback_cap, fallback_cap);
         }
 
         // Update signal availability state machine
@@ -1177,12 +1170,12 @@ impl SignalIntegrator {
         }
 
         // === FLOW URGENCY SKEW: Aggressive skew when directional flow is strong ===
-        // When 5s imbalance exceeds 0.6 (strongly one-sided), add urgency skew
-        // up to flow_urgency_max_bps. This prevents accumulating into trends that
-        // the HL-native fallback's 0.9 bps cap is too gentle to address.
+        // When 5s imbalance exceeds threshold (moderately one-sided), add urgency skew
+        // up to flow_urgency_max_bps. Lower threshold (0.4 vs old 0.6) catches
+        // directional flow earlier — critical for HIP-3 where this is the primary signal.
         {
             let flow_imbalance = self.latest_hl_flow.imbalance_5s;
-            const FLOW_URGENCY_THRESHOLD: f64 = 0.6;
+            const FLOW_URGENCY_THRESHOLD: f64 = 0.4;
             if flow_imbalance.abs() > FLOW_URGENCY_THRESHOLD {
                 let urgency = (flow_imbalance.abs() - FLOW_URGENCY_THRESHOLD) / (1.0 - FLOW_URGENCY_THRESHOLD);
                 let flow_skew_bps = urgency * self.config.flow_urgency_max_bps * flow_imbalance.signum();
@@ -1268,6 +1261,11 @@ impl SignalIntegrator {
     /// Get current flow decomposition.
     pub fn flow_decomposition(&self) -> FlowDecomposition {
         self.last_flow_decomp
+    }
+
+    /// Get HL flow imbalance (5-second EWMA).
+    pub fn hl_flow_imbalance_5s(&self) -> f64 {
+        self.latest_hl_flow.imbalance_5s
     }
 
     /// Get regime kappa estimator for direct access.
