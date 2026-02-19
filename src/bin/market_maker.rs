@@ -2125,6 +2125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "No Binance feed — using reference perp for lead-lag signal"
             );
             market_maker.disable_cross_venue_only();
+            // Set changepoint detector to ThinDex regime: threshold 0.85, 2 confirmations
+            // Reduces false changepoints from noisy HIP-3 thin-book data
+            market_maker.set_changepoint_regime_thin_dex();
+            tracing::info!("Changepoint detector set to ThinDex regime (threshold=0.85, confirmations=2)");
         } else {
             tracing::warn!(
                 asset = %asset,

@@ -390,15 +390,39 @@ impl StochasticController {
     }
 
     /// Update changepoint detection.
+    ///
+    /// Uses regime-aware detection with confirmation (preferred for HIP-3).
+    /// Soft resets beliefs with confidence-scaled retention instead of hard 0.3.
     fn update_changepoint(&mut self, output: &LearningModuleOutput) {
         // Use edge prediction as observation
         let obs = output.edge_prediction.mean;
         self.changepoint.update(obs);
 
-        // Check if we should reset beliefs
-        if self.changepoint.should_reset_beliefs() {
-            warn!("Changepoint detected - resetting beliefs");
-            self.belief.soft_reset(0.3); // Keep 30% of learned information
+        // Regime-aware detection: ThinDex needs 2 confirmations at 0.85 threshold
+        let detection = self.changepoint.detect_with_confirmation();
+        match detection {
+            ChangePointResult::Confirmed => {
+                let cp_prob = self.changepoint.changepoint_probability(10);
+                // Confidence-scaled retention: high cp_prob → aggressive reset, marginal → preserve more
+                // At ThinDex threshold (0.85): retention = 0.15 (aggressive)
+                // At marginal (0.50): retention = 0.50 (preserve half)
+                let retention = 1.0 - cp_prob.clamp(0.5, 0.95);
+                warn!(
+                    retention = %format!("{:.2}", retention),
+                    cp_prob = %format!("{:.3}", cp_prob),
+                    regime = ?self.changepoint.current_regime(),
+                    "Changepoint confirmed - soft resetting beliefs"
+                );
+                self.belief.soft_reset(retention);
+            }
+            ChangePointResult::Pending(n) => {
+                debug!(
+                    consecutive = n,
+                    required = self.changepoint.confirmations_required(),
+                    "Changepoint pending, awaiting confirmation"
+                );
+            }
+            ChangePointResult::None => {}
         }
     }
 
@@ -566,7 +590,7 @@ impl StochasticController {
         //    KillSwitch is never set here — that comes from kill_switch.rs.
         const EMERGENCY_THRESHOLD: f64 = 0.95;
         const ELEVATED_THRESHOLD: f64 = 0.70;
-        const EMERGENCY_COOLDOWN_CYCLES: usize = 50;
+        const EMERGENCY_COOLDOWN_CYCLES: usize = 200;
         let cycles_since_last = self.cycle_count.saturating_sub(self.last_emergency_pull_cycle);
 
         let risk_level = if cp_prob > EMERGENCY_THRESHOLD
@@ -613,6 +637,15 @@ impl StochasticController {
     /// Get last action taken.
     pub fn last_action(&self) -> Option<&Action> {
         self.last_action.as_ref()
+    }
+
+    /// Set the changepoint detector's market regime.
+    ///
+    /// For HIP-3 (thin DEX) assets, use `MarketRegime::ThinDex` to raise
+    /// the detection threshold (0.85) and require 2 confirmations,
+    /// reducing false changepoints from noisy thin-book data.
+    pub fn set_changepoint_regime(&mut self, regime: MarketRegime) {
+        self.changepoint.set_regime(regime);
     }
 
     /// Reset the controller.

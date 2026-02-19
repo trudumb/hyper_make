@@ -1504,14 +1504,24 @@ impl QuotingStrategy for GLFTStrategy {
             * momentum_skew_multiplier
             * rl_omega_mult;
 
-        // Blend: inventory skew always applies, proactive skew fades as inventory grows
+        // Blend: inventory skew dampened by position action, proactive skew fades with inventory
         // inventory_weight: 0 at zero inventory → 1 at max position
         let inventory_weight = (position.abs() / effective_max_position).min(1.0);
 
+        // Dampen inventory skew based on position manager decision:
+        // - HOLD: minimize inventory skew (0.3x) — position is trend-aligned
+        // - ADD: nearly suppress inventory skew (0.1x) — building position
+        // - REDUCE: scale by urgency — reducing position, inventory skew drives direction
+        let inventory_dampen = match market_params.position_action {
+            super::PositionAction::Hold => 0.3,
+            super::PositionAction::Add { .. } => 0.1,
+            super::PositionAction::Reduce { urgency } => urgency.min(1.0),
+        };
+
         // Proactive skew is additive when inventory is low, fades to zero at max inventory
-        // This ensures inventory skew always applies (preserves existing behavior)
-        // while adding proactive component when we have room to build position
-        let skew = inventory_skew + proactive_skew * (1.0 - inventory_weight);
+        // Inventory skew scaled by position action dampen factor
+        let skew = inventory_skew * inventory_dampen
+            + proactive_skew * (1.0 - inventory_weight * 0.5);
 
         if proactive_skew.abs() > 1e-8 {
             tracing::info!(

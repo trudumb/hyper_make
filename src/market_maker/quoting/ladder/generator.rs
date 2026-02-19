@@ -162,12 +162,15 @@ impl Ladder {
         );
 
         // 4. Build raw ladder (before skew)
-        // Pass market_mid to prevent quotes crossing the actual market spread
+        // Pass exchange BBO to prevent quotes crossing the actual L2 spread
+        // (uses same price source as the BBO crossing filter in order_ops)
         let mut ladder = build_raw_ladder(
             &depths,
             &sizes,
             params.mid_price,
             params.market_mid,
+            params.cached_best_bid,
+            params.cached_best_ask,
             params.decimals,
             params.sz_decimals,
             params.min_notional,
@@ -604,13 +607,18 @@ pub(crate) fn allocate_sizes(
 /// # Safe Base Prices
 ///
 /// To prevent quotes crossing the market spread when microprice diverges from market_mid:
-/// - Bids use `min(mid, market_mid)` as base - never built above market_mid
-/// - Asks use `max(mid, market_mid)` as base - never built below market_mid
+/// - Bids use `min(mid, exchange_best_ask - tick)` as base - never above exchange ask
+/// - Asks use `max(mid, exchange_best_bid + tick)` as base - never below exchange bid
+///
+/// Uses exchange L2 BBO (same source as crossing filter in order_ops) to avoid
+/// the 307-order waste from AllMids vs L2 price source mismatch.
 pub(crate) fn build_raw_ladder(
     depths: &[f64],
     sizes: &[f64],
     mid: f64,
     market_mid: f64,
+    exchange_best_bid: f64,
+    exchange_best_ask: f64,
     decimals: u32,
     sz_decimals: u32,
     min_notional: f64,
@@ -623,6 +631,8 @@ pub(crate) fn build_raw_ladder(
         total_size = %format!("{:.6}", total_size),
         mid = %format!("{:.4}", mid),
         market_mid = %format!("{:.4}", market_mid),
+        exchange_best_bid = %format!("{:.4}", exchange_best_bid),
+        exchange_best_ask = %format!("{:.4}", exchange_best_ask),
         min_notional = %format!("{:.2}", min_notional),
         "build_raw_ladder called"
     );
@@ -630,11 +640,22 @@ pub(crate) fn build_raw_ladder(
     let mut bids = LadderLevels::new();
     let mut asks = LadderLevels::new();
 
-    // FIX: Use safe base prices to prevent crossing market spread
-    // When microprice < market_mid (selling pressure), asks must still be above market_mid
-    // When microprice > market_mid (buying pressure), bids must still be below market_mid
-    let bid_base = mid.min(market_mid);
-    let ask_base = mid.max(market_mid);
+    // Use exchange L2 BBO as safety cap (same source as crossing filter in order_ops).
+    // When exchange BBO is valid, use it. Otherwise fall back to market_mid.
+    let min_tick = 10.0_f64.powi(-(decimals as i32));
+    let effective_bid_cap = if exchange_best_ask > 0.0 {
+        exchange_best_ask - min_tick  // Never place bids at or above exchange ask
+    } else {
+        market_mid
+    };
+    let effective_ask_floor = if exchange_best_bid > 0.0 {
+        exchange_best_bid + min_tick  // Never place asks at or below exchange bid
+    } else {
+        market_mid
+    };
+
+    let bid_base = mid.min(effective_bid_cap);
+    let ask_base = mid.max(effective_ask_floor);
 
     for (&depth_bps, &size) in depths.iter().zip(sizes.iter()) {
         if size < EPSILON {
@@ -1389,7 +1410,7 @@ mod tests {
         let mid = 100.0;
         let market_mid = 100.0; // No divergence in test
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 2, 4, 10.0);
+        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 0.0, 0.0, 2, 4, 10.0);
 
         assert_eq!(ladder.bids.len(), 3);
         assert_eq!(ladder.asks.len(), 3);
@@ -1407,7 +1428,7 @@ mod tests {
         let mid = 100.0;
         let market_mid = 100.0; // No divergence in test
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 2, 4, 10.0);
+        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 0.0, 0.0, 2, 4, 10.0);
 
         // Only second level should make it (0.5 * $100 = $50 > $10)
         assert_eq!(ladder.bids.len(), 1);
@@ -1609,7 +1630,7 @@ mod tests {
         let small_total_size = 1.3;
         let small_sizes: Vec<f64> = vec![small_total_size / num_levels as f64; num_levels];
 
-        let ladder_small = build_raw_ladder(&depths, &small_sizes, mid, mid, 2, 4, min_notional);
+        let ladder_small = build_raw_ladder(&depths, &small_sizes, mid, mid, 0.0, 0.0, 2, 4, min_notional);
 
         // With small sizes, ALL individual levels fail min_notional
         // Concentration fallback should trigger → single order
@@ -1637,7 +1658,7 @@ mod tests {
         let large_total_size = 66.0;
         let large_sizes: Vec<f64> = vec![large_total_size / num_levels as f64; num_levels];
 
-        let ladder_large = build_raw_ladder(&depths, &large_sizes, mid, mid, 2, 4, min_notional);
+        let ladder_large = build_raw_ladder(&depths, &large_sizes, mid, mid, 0.0, 0.0, 2, 4, min_notional);
 
         // With large sizes, ALL levels should pass min_notional
         // No concentration fallback → multiple levels
@@ -1859,7 +1880,7 @@ mod tests {
         let depths: Vec<f64> = (0..10).map(|i| 5.0 + i as f64 * 3.0).collect();
         let sizes: Vec<f64> = vec![total_size / 10.0; 10];
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, mid, 2, 4, min_notional);
+        let ladder = build_raw_ladder(&depths, &sizes, mid, mid, 0.0, 0.0, 2, 4, min_notional);
 
         // Should have a fallback order, but capped at 25% of total_size
         // (or min exchange size at actual bid_price, whichever is larger)
@@ -1992,7 +2013,7 @@ mod tests {
         let sz_decimals = 1;
         let min_notional = 10.0;
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, decimals, sz_decimals, min_notional);
+        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 0.0, 0.0, decimals, sz_decimals, min_notional);
 
         // Check no duplicate prices on either side
         for i in 1..ladder.bids.len() {

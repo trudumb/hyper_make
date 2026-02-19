@@ -160,6 +160,9 @@ impl PositionDecisionEngine {
     /// * `belief_drift` - E[μ | data] from belief system (positive = bullish)
     /// * `belief_confidence` - Confidence in belief system [0, 1]
     /// * `edge_bps` - Expected edge in basis points
+    /// * `trend_momentum_bps` - Raw price momentum from TrendPersistenceEstimator
+    ///   (NOT from belief system — robust to changepoint resets)
+    /// * `unrealized_pnl_bps` - Unrealized P&L in basis points of position notional
     ///
     /// # Returns
     /// PositionAction indicating HOLD, ADD, or REDUCE
@@ -170,6 +173,8 @@ impl PositionDecisionEngine {
         belief_drift: f64,
         belief_confidence: f64,
         edge_bps: f64,
+        trend_momentum_bps: f64,
+        unrealized_pnl_bps: f64,
     ) -> PositionAction {
         let inv_ratio = if max_position > 1e-9 {
             (position / max_position).abs()
@@ -222,6 +227,16 @@ impl PositionDecisionEngine {
             return PositionAction::Hold;
         }
 
+        // === TREND-MOMENTUM GUARD ===
+        // When changepoint resets beliefs, belief_drift and belief_confidence drop to ~0.
+        // This guard reads raw price momentum (NOT from belief system) to prevent
+        // selling into a profitable, trend-aligned position.
+        let trend_aligned = trend_momentum_bps.signum() == position_sign
+            && trend_momentum_bps.abs() > 5.0; // Meaningful trend
+        if trend_aligned && unrealized_pnl_bps > -2.0 {
+            return PositionAction::Hold;
+        }
+
         // === REDUCE: Default behavior with urgency scaling ===
         let urgency = self.compute_urgency(p_cont, inv_ratio, aligned);
         PositionAction::Reduce { urgency }
@@ -247,7 +262,7 @@ impl PositionDecisionEngine {
     /// - High inventory ratio → size_factor increases (quadratic+linear for aggressive decay)
     /// - Position opposed to beliefs → base urgency increases to 1.5
     fn compute_urgency(&self, p_cont: f64, inv_ratio: f64, aligned: bool) -> f64 {
-        let base = if aligned { 0.5 } else { 1.5 };
+        let base = if aligned { 0.3 } else { 1.0 };
         let fear_factor = (1.0 - p_cont).powi(2); // More urgent when p_cont low
         let size_factor = inv_ratio.powi(2) + inv_ratio; // Quadratic+linear: aggressive at high inventory
         (base + fear_factor * size_factor).clamp(0.0, 3.0)
@@ -395,11 +410,13 @@ mod tests {
         }
 
         let action = engine.decide(
-            0.3,  // position (long)
-            1.0,  // max_position
+            0.3,   // position (long)
+            1.0,   // max_position
             0.001, // belief_drift (positive = bullish)
-            0.8,  // belief_confidence
-            5.0,  // edge_bps
+            0.8,   // belief_confidence
+            5.0,   // edge_bps
+            0.0,   // trend_momentum_bps (neutral)
+            0.0,   // unrealized_pnl_bps
         );
 
         // With high p_cont, alignment, and confidence, should HOLD
@@ -412,11 +429,13 @@ mod tests {
         let engine = PositionDecisionEngine::default();
 
         let action = engine.decide(
-            0.3,   // position (long)
-            1.0,   // max_position
+            0.3,    // position (long)
+            1.0,    // max_position
             -0.001, // belief_drift (negative = bearish, opposed to long)
-            0.8,   // belief_confidence
-            5.0,   // edge_bps
+            0.8,    // belief_confidence
+            5.0,    // edge_bps
+            -10.0,  // trend_momentum_bps (bearish trend, opposed to long)
+            -5.0,   // unrealized_pnl_bps (underwater)
         );
 
         // Position opposes beliefs → should REDUCE
@@ -438,6 +457,8 @@ mod tests {
             0.001, // belief_drift (aligned)
             0.9,   // belief_confidence (high)
             10.0,  // edge_bps (high edge)
+            0.0,   // trend_momentum_bps
+            0.0,   // unrealized_pnl_bps
         );
 
         // High p_cont + high edge + aligned + not too big → could ADD
@@ -466,6 +487,8 @@ mod tests {
             0.001,
             0.8,
             5.0,
+            0.0,   // trend_momentum_bps
+            0.0,   // unrealized_pnl_bps
         );
 
         match action {
@@ -474,6 +497,45 @@ mod tests {
             }
             _ => panic!("Flat position should REDUCE"),
         }
+    }
+
+    #[test]
+    fn test_trend_momentum_guard_prevents_selling_into_rally() {
+        let engine = PositionDecisionEngine::default();
+
+        // Simulate: beliefs are reset (low confidence), but raw trend is bullish
+        let action = engine.decide(
+            0.3,   // position (long)
+            1.0,   // max_position
+            0.0,   // belief_drift (reset by changepoint → zero)
+            0.0,   // belief_confidence (reset → zero)
+            0.0,   // edge_bps (unknown after reset)
+            15.0,  // trend_momentum_bps (strong bullish trend from raw prices)
+            2.0,   // unrealized_pnl_bps (slightly profitable)
+        );
+
+        // Trend-momentum guard should fire: position aligned with trend, not underwater
+        assert!(action.is_hold(),
+            "Expected HOLD from trend-momentum guard, got {:?}", action);
+    }
+
+    #[test]
+    fn test_trend_momentum_guard_does_not_fire_when_underwater() {
+        let engine = PositionDecisionEngine::default();
+
+        let action = engine.decide(
+            0.3,   // position (long)
+            1.0,   // max_position
+            0.0,   // belief_drift (reset)
+            0.0,   // belief_confidence (reset)
+            0.0,   // edge_bps
+            15.0,  // trend_momentum_bps (bullish)
+            -5.0,  // unrealized_pnl_bps (deeply underwater)
+        );
+
+        // Underwater position should still reduce even with aligned trend
+        assert!(action.is_reduce(),
+            "Expected REDUCE when deeply underwater, got {:?}", action);
     }
 
     #[test]

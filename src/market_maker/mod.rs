@@ -730,6 +730,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         self.stochastic.signal_integrator.disable_cross_venue_only();
     }
 
+    /// Set changepoint detector to ThinDex regime for HIP-3 assets.
+    ///
+    /// Raises threshold from 0.50 → 0.85 and requires 2 confirmations,
+    /// reducing false changepoints from noisy thin-book data.
+    pub fn set_changepoint_regime_thin_dex(&mut self) {
+        use control::MarketRegime;
+        self.stochastic.controller.set_changepoint_regime(MarketRegime::ThinDex);
+    }
+
     /// Enable experience logging for RL SARSA tuples.
     ///
     /// Creates a JSONL file writer in the specified directory. Each fill

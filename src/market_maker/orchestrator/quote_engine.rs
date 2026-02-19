@@ -1018,6 +1018,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Compute expected edge from current AS model (approximate)
             let edge_bps = market_params.current_edge_bps;
 
+            // Compute raw trend momentum from price returns (NOT from belief system)
+            // Robust to changepoint resets that zero belief_drift/confidence
+            let trend_momentum_bps = 0.5 * trend_signal.short_momentum_bps
+                + 0.3 * trend_signal.medium_momentum_bps
+                + 0.2 * trend_signal.long_momentum_bps;
+
             // Decide position action using the engine
             let position_action = self.stochastic.position_decision.decide(
                 position,
@@ -1025,6 +1031,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 belief_drift,
                 belief_confidence,
                 edge_bps,
+                trend_momentum_bps,
+                market_params.unrealized_pnl_bps,
             );
 
             // Compute raw inventory ratio
