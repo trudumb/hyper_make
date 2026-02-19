@@ -1249,6 +1249,28 @@ impl LadderStrategy {
             );
         }
 
+        // === DRIFT ADJUSTMENT: Asymmetric bid/ask from reference perp drift ===
+        // Classical Avellaneda-Stoikov μ*T/2 term: positive drift (price rising)
+        // widens bids (buying into uptrend is risky) and tightens asks (selling is favorable).
+        // Clamped to ±3 bps to prevent extreme asymmetry from noisy drift.
+        if market_params.drift_rate_per_sec.abs() > 1e-10 {
+            let drift_adj_bps = (market_params.drift_rate_per_sec * time_horizon * 10_000.0 / 2.0)
+                .clamp(-3.0, 3.0);
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth = (*depth + drift_adj_bps).max(effective_floor_bps);
+            }
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth = (*depth - drift_adj_bps).max(effective_floor_bps);
+            }
+            if drift_adj_bps.abs() > 0.1 {
+                tracing::info!(
+                    drift_rate = %format!("{:.2e}", market_params.drift_rate_per_sec),
+                    drift_adj_bps = %format!("{:.2}", drift_adj_bps),
+                    "[SPREAD TRACE] drift asymmetry applied"
+                );
+            }
+        }
+
         // === POSITION ZONE: Apply graduated spread widening ===
         // Widen the accumulating side in Yellow/Red zones.
         // If long (position > 0), accumulating side = bids (buying more).
@@ -1333,6 +1355,22 @@ impl LadderStrategy {
             total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
             "[SPREAD TRACE] after pre-fill AS multipliers (warmup-capped)"
         );
+
+        // === SPREAD INFLATION CAP ===
+        // Prevent compounding multipliers (pre-fill AS, zone widening, drift, etc.)
+        // from pushing spreads beyond 4x GLFT optimal. Floor at 15 bps to allow
+        // reasonable widening in volatile regimes.
+        let inflation_cap_bps = (glft_optimal_bps * 4.0).max(15.0);
+        for depth in dynamic_depths.bid.iter_mut() {
+            if *depth > inflation_cap_bps {
+                *depth = inflation_cap_bps;
+            }
+        }
+        for depth in dynamic_depths.ask.iter_mut() {
+            if *depth > inflation_cap_bps {
+                *depth = inflation_cap_bps;
+            }
+        }
 
         // === REMOVED: L2 SPREAD MULTIPLIER ===
         // The l2_spread_multiplier has been removed. All uncertainty is now handled

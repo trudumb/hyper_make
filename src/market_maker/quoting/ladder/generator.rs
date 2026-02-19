@@ -164,17 +164,17 @@ impl Ladder {
         // 4. Build raw ladder (before skew)
         // Pass exchange BBO to prevent quotes crossing the actual L2 spread
         // (uses same price source as the BBO crossing filter in order_ops)
-        let mut ladder = build_raw_ladder(
-            &depths,
-            &sizes,
-            params.mid_price,
-            params.market_mid,
-            params.cached_best_bid,
-            params.cached_best_ask,
-            params.decimals,
-            params.sz_decimals,
-            params.min_notional,
-        );
+        let mut ladder = build_raw_ladder(&RawLadderInput {
+            depths: &depths,
+            sizes: &sizes,
+            mid: params.mid_price,
+            market_mid: params.market_mid,
+            exchange_best_bid: params.cached_best_bid,
+            exchange_best_ask: params.cached_best_ask,
+            decimals: params.decimals,
+            sz_decimals: params.sz_decimals,
+            min_notional: params.min_notional,
+        });
 
         // 5. Apply inventory skew with drift adjustment (re-rounds for exchange precision)
         // Use effective_inventory_ratio from Position Continuation Model (HOLD/ADD/REDUCE)
@@ -612,17 +612,28 @@ pub(crate) fn allocate_sizes(
 ///
 /// Uses exchange L2 BBO (same source as crossing filter in order_ops) to avoid
 /// the 307-order waste from AllMids vs L2 price source mismatch.
-pub(crate) fn build_raw_ladder(
-    depths: &[f64],
-    sizes: &[f64],
-    mid: f64,
-    market_mid: f64,
-    exchange_best_bid: f64,
-    exchange_best_ask: f64,
-    decimals: u32,
-    sz_decimals: u32,
-    min_notional: f64,
-) -> Ladder {
+/// Parameters for building a raw ladder from depths and sizes.
+pub(crate) struct RawLadderInput<'a> {
+    pub depths: &'a [f64],
+    pub sizes: &'a [f64],
+    pub mid: f64,
+    pub market_mid: f64,
+    pub exchange_best_bid: f64,
+    pub exchange_best_ask: f64,
+    pub decimals: u32,
+    pub sz_decimals: u32,
+    pub min_notional: f64,
+}
+
+pub(crate) fn build_raw_ladder(input: &RawLadderInput<'_>) -> Ladder {
+    let RawLadderInput {
+        depths, sizes, mid, market_mid, exchange_best_bid, exchange_best_ask,
+        decimals, sz_decimals, min_notional,
+    } = input;
+    let (mid, market_mid) = (*mid, *market_mid);
+    let (exchange_best_bid, exchange_best_ask) = (*exchange_best_bid, *exchange_best_ask);
+    let (decimals, sz_decimals, min_notional) = (*decimals, *sz_decimals, *min_notional);
+
     // DEBUG: log entry to verify code path
     let total_size: f64 = sizes.iter().sum();
     tracing::debug!(
@@ -1410,7 +1421,11 @@ mod tests {
         let mid = 100.0;
         let market_mid = 100.0; // No divergence in test
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 0.0, 0.0, 2, 4, 10.0);
+        let ladder = build_raw_ladder(&RawLadderInput {
+            depths: &depths, sizes: &sizes, mid, market_mid,
+            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
+            decimals: 2, sz_decimals: 4, min_notional: 10.0,
+        });
 
         assert_eq!(ladder.bids.len(), 3);
         assert_eq!(ladder.asks.len(), 3);
@@ -1428,7 +1443,11 @@ mod tests {
         let mid = 100.0;
         let market_mid = 100.0; // No divergence in test
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 0.0, 0.0, 2, 4, 10.0);
+        let ladder = build_raw_ladder(&RawLadderInput {
+            depths: &depths, sizes: &sizes, mid, market_mid,
+            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
+            decimals: 2, sz_decimals: 4, min_notional: 10.0,
+        });
 
         // Only second level should make it (0.5 * $100 = $50 > $10)
         assert_eq!(ladder.bids.len(), 1);
@@ -1630,7 +1649,11 @@ mod tests {
         let small_total_size = 1.3;
         let small_sizes: Vec<f64> = vec![small_total_size / num_levels as f64; num_levels];
 
-        let ladder_small = build_raw_ladder(&depths, &small_sizes, mid, mid, 0.0, 0.0, 2, 4, min_notional);
+        let ladder_small = build_raw_ladder(&RawLadderInput {
+            depths: &depths, sizes: &small_sizes, mid, market_mid: mid,
+            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
+            decimals: 2, sz_decimals: 4, min_notional,
+        });
 
         // With small sizes, ALL individual levels fail min_notional
         // Concentration fallback should trigger → single order
@@ -1658,7 +1681,11 @@ mod tests {
         let large_total_size = 66.0;
         let large_sizes: Vec<f64> = vec![large_total_size / num_levels as f64; num_levels];
 
-        let ladder_large = build_raw_ladder(&depths, &large_sizes, mid, mid, 0.0, 0.0, 2, 4, min_notional);
+        let ladder_large = build_raw_ladder(&RawLadderInput {
+            depths: &depths, sizes: &large_sizes, mid, market_mid: mid,
+            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
+            decimals: 2, sz_decimals: 4, min_notional,
+        });
 
         // With large sizes, ALL levels should pass min_notional
         // No concentration fallback → multiple levels
@@ -1880,7 +1907,11 @@ mod tests {
         let depths: Vec<f64> = (0..10).map(|i| 5.0 + i as f64 * 3.0).collect();
         let sizes: Vec<f64> = vec![total_size / 10.0; 10];
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, mid, 0.0, 0.0, 2, 4, min_notional);
+        let ladder = build_raw_ladder(&RawLadderInput {
+            depths: &depths, sizes: &sizes, mid, market_mid: mid,
+            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
+            decimals: 2, sz_decimals: 4, min_notional,
+        });
 
         // Should have a fallback order, but capped at 25% of total_size
         // (or min exchange size at actual bid_price, whichever is larger)
@@ -2013,7 +2044,11 @@ mod tests {
         let sz_decimals = 1;
         let min_notional = 10.0;
 
-        let ladder = build_raw_ladder(&depths, &sizes, mid, market_mid, 0.0, 0.0, decimals, sz_decimals, min_notional);
+        let ladder = build_raw_ladder(&RawLadderInput {
+            depths: &depths, sizes: &sizes, mid, market_mid,
+            exchange_best_bid: 0.0, exchange_best_ask: 0.0,
+            decimals, sz_decimals, min_notional,
+        });
 
         // Check no duplicate prices on either side
         for i in 1..ladder.bids.len() {

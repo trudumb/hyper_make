@@ -369,6 +369,17 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     reference_perp_mid: f64,
     /// Previous reference perp mid for computing returns.
     prev_reference_perp_mid: f64,
+    /// EMA-smoothed drift rate per second from reference perp returns.
+    /// Fed to market_params.drift_rate_per_sec for GLFT asymmetric spreads.
+    reference_perp_drift_ema: f64,
+    /// Timestamp (ms) of last reference perp mid update for dt computation.
+    reference_perp_last_update_ms: i64,
+
+    // === Cancel-on-Toxicity (Session 2 Sprint 2.2) ===
+    /// Last time bid ladder was cleared due to high toxicity.
+    last_toxicity_cancel_bid: Option<std::time::Instant>,
+    /// Last time ask ladder was cleared due to high toxicity.
+    last_toxicity_cancel_ask: Option<std::time::Instant>,
 
     // === Cancel-Race AS Tracking (Sprint 6.3) ===
     /// Tracks adverse selection from cancel-race events (cancel sent, fill arrived first).
@@ -591,6 +602,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             last_binance_mid: 0.0,
             reference_perp_mid: 0.0,
             prev_reference_perp_mid: 0.0,
+            reference_perp_drift_ema: 0.0,
+            reference_perp_last_update_ms: 0,
+            last_toxicity_cancel_bid: None,
+            last_toxicity_cancel_ask: None,
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
         }
     }

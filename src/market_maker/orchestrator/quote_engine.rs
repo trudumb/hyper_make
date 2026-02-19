@@ -739,6 +739,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
         let mut market_params = ParameterAggregator::build(&sources);
 
+        // Wire reference perp drift rate for GLFT asymmetric bid/ask spreads.
+        // EMA-smoothed in handlers.rs on each AllMids update.
+        if self.reference_perp_drift_ema.abs() > 1e-12 {
+            market_params.drift_rate_per_sec = self.reference_perp_drift_ema;
+        }
+
         // === L1: Parameter Smoothing (Churn Reduction) ===
         // EWMA + deadband filtering on kappa/sigma/gamma before they reach the ladder.
         // Suppresses sub-deadband oscillations (e.g. kappa 1169→1176, 0.6%) that would
@@ -1026,13 +1032,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Decide position action using the engine
             let position_action = self.stochastic.position_decision.decide(
-                position,
-                max_position,
-                belief_drift,
-                belief_confidence,
-                edge_bps,
-                trend_momentum_bps,
-                market_params.unrealized_pnl_bps,
+                &super::super::PositionDecisionInput {
+                    position,
+                    max_position,
+                    belief_drift,
+                    belief_confidence,
+                    edge_bps,
+                    trend_momentum_bps,
+                    unrealized_pnl_bps: market_params.unrealized_pnl_bps,
+                },
             );
 
             // Compute raw inventory ratio
@@ -1452,11 +1460,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             price_velocity_1s: self.price_velocity_1s,
         };
         let toxicity = self.tier2.toxicity.evaluate(&toxicity_input);
-        let toxicity_addon_bps = if toxicity.composite_score > 0.5 {
-            5.0 * (toxicity.composite_score - 0.5) * 2.0 // 0-5 bps
-        } else {
-            0.0
-        };
+        // Linear toxicity addon: 0→0, 0.3→1.8, 0.5→3.0, 0.83→5.0 (capped).
+        // Previous cliff at 0.5 caused discontinuous spread jumps.
+        let toxicity_addon_bps = (toxicity.composite_score * 6.0).min(5.0);
         total_risk_premium += toxicity_addon_bps;
 
         // Staleness addon: 0-3 bps from signal staleness
@@ -2614,10 +2620,39 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         // === TOXICITY HANDLING ===
-        // Toxicity routes through GLFT parameter space (AS multipliers on spread),
-        // NOT binary side-clearing. The pre-fill AS multipliers already handle toxic
-        // flow correctly: raw_mult_bid/ask widen the spread proportionally.
-        // Binary side-clearing was the root cause of the bid=0 death spiral.
+        // Normal toxicity routes through GLFT parameter space (AS multipliers on spread).
+        // Binary side-clearing at LOW thresholds was the root cause of the bid=0 death spiral.
+        //
+        // EXTREME toxicity (>0.75): cancel resting orders on the toxic side to avoid
+        // getting filled at minimum tick during a directional move. This is distinct from
+        // the death spiral case because: (1) threshold is very high, (2) 5s cooldown prevents
+        // oscillation, (3) only clears one side at a time.
+        const TOXICITY_CANCEL_THRESHOLD: f64 = 0.75;
+        const TOXICITY_CANCEL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+
+        if market_params.pre_fill_toxicity_bid > TOXICITY_CANCEL_THRESHOLD
+            && self.last_toxicity_cancel_bid
+                .is_none_or(|t| now.duration_since(t) > TOXICITY_CANCEL_COOLDOWN)
+        {
+            ladder.bids.clear();
+            self.last_toxicity_cancel_bid = Some(now);
+            tracing::warn!(
+                toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
+                "Cancel-on-toxicity: cleared bid ladder (extreme toxic flow on bid side)"
+            );
+        }
+        if market_params.pre_fill_toxicity_ask > TOXICITY_CANCEL_THRESHOLD
+            && self.last_toxicity_cancel_ask
+                .is_none_or(|t| now.duration_since(t) > TOXICITY_CANCEL_COOLDOWN)
+        {
+            ladder.asks.clear();
+            self.last_toxicity_cancel_ask = Some(now);
+            tracing::warn!(
+                toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
+                "Cancel-on-toxicity: cleared ask ladder (extreme toxic flow on ask side)"
+            );
+        }
 
         // Post-condition: if capacity said viable but ladder is empty, something is wrong
         if capacity_budget.should_quote() && ladder.is_empty() {

@@ -60,7 +60,8 @@
       "Bash(do head -5 \"$f\")",
       "Bash(done)",
       "Bash(for i in 1 2 3 4 5)",
-      "Bash(do echo \"=== Run $i ===\")"
+      "Bash(do echo \"=== Run $i ===\")",
+      "Bash(cut:*)"
     ]
   }
 }

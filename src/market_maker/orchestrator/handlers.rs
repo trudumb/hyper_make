@@ -207,6 +207,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                             self.prev_reference_perp_mid = self.reference_perp_mid;
                             self.reference_perp_mid = ref_mid;
 
+                            // Compute EMA-smoothed drift rate for GLFT asymmetric spreads
+                            if self.prev_reference_perp_mid > 0.0 && self.reference_perp_last_update_ms > 0 {
+                                let dt_secs = ((current_time_ms as i64 - self.reference_perp_last_update_ms) as f64 / 1000.0).max(0.1);
+                                let return_per_sec = (ref_mid / self.prev_reference_perp_mid - 1.0) / dt_secs;
+                                // EMA α=0.1: smooth over ~10 updates (~10-30s depending on AllMids frequency)
+                                self.reference_perp_drift_ema = 0.9 * self.reference_perp_drift_ema + 0.1 * return_per_sec;
+                            }
+                            self.reference_perp_last_update_ms = current_time_ms as i64;
+
                             // Feed reference perp as the leading signal for lead-lag
                             self.stochastic.signal_integrator.on_binance_price(
                                 ref_mid,

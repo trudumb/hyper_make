@@ -135,6 +135,25 @@ pub struct PositionDecisionEngine {
     fills_since_decay: u64,
 }
 
+/// Input parameters for position decision.
+#[derive(Debug, Clone, Copy)]
+pub struct PositionDecisionInput {
+    /// Current position (signed)
+    pub position: f64,
+    /// Maximum allowed position
+    pub max_position: f64,
+    /// E[μ | data] from belief system (positive = bullish)
+    pub belief_drift: f64,
+    /// Confidence in belief system [0, 1]
+    pub belief_confidence: f64,
+    /// Expected edge in basis points
+    pub edge_bps: f64,
+    /// Raw price momentum from TrendPersistenceEstimator (robust to changepoint resets)
+    pub trend_momentum_bps: f64,
+    /// Unrealized P&L in basis points of position notional
+    pub unrealized_pnl_bps: f64,
+}
+
 impl Default for PositionDecisionEngine {
     fn default() -> Self {
         Self::new(PositionDecisionConfig::default())
@@ -154,28 +173,13 @@ impl PositionDecisionEngine {
 
     /// Decide position action based on current state.
     ///
-    /// # Arguments
-    /// * `position` - Current position (signed)
-    /// * `max_position` - Maximum allowed position
-    /// * `belief_drift` - E[μ | data] from belief system (positive = bullish)
-    /// * `belief_confidence` - Confidence in belief system [0, 1]
-    /// * `edge_bps` - Expected edge in basis points
-    /// * `trend_momentum_bps` - Raw price momentum from TrendPersistenceEstimator
-    ///   (NOT from belief system — robust to changepoint resets)
-    /// * `unrealized_pnl_bps` - Unrealized P&L in basis points of position notional
-    ///
     /// # Returns
     /// PositionAction indicating HOLD, ADD, or REDUCE
-    pub fn decide(
-        &self,
-        position: f64,
-        max_position: f64,
-        belief_drift: f64,
-        belief_confidence: f64,
-        edge_bps: f64,
-        trend_momentum_bps: f64,
-        unrealized_pnl_bps: f64,
-    ) -> PositionAction {
+    pub fn decide(&self, input: &PositionDecisionInput) -> PositionAction {
+        let PositionDecisionInput {
+            position, max_position, belief_drift, belief_confidence,
+            edge_bps, trend_momentum_bps, unrealized_pnl_bps,
+        } = *input;
         let inv_ratio = if max_position > 1e-9 {
             (position / max_position).abs()
         } else {
@@ -409,15 +413,15 @@ mod tests {
             engine.observe_fill(1.0, 1.0, 1.0); // Buy fills for long position
         }
 
-        let action = engine.decide(
-            0.3,   // position (long)
-            1.0,   // max_position
-            0.001, // belief_drift (positive = bullish)
-            0.8,   // belief_confidence
-            5.0,   // edge_bps
-            0.0,   // trend_momentum_bps (neutral)
-            0.0,   // unrealized_pnl_bps
-        );
+        let action = engine.decide(&PositionDecisionInput {
+            position: 0.3,
+            max_position: 1.0,
+            belief_drift: 0.001,
+            belief_confidence: 0.8,
+            edge_bps: 5.0,
+            trend_momentum_bps: 0.0,
+            unrealized_pnl_bps: 0.0,
+        });
 
         // With high p_cont, alignment, and confidence, should HOLD
         assert!(action.is_hold() || action.is_add(),
@@ -428,15 +432,15 @@ mod tests {
     fn test_reduce_when_not_aligned() {
         let engine = PositionDecisionEngine::default();
 
-        let action = engine.decide(
-            0.3,    // position (long)
-            1.0,    // max_position
-            -0.001, // belief_drift (negative = bearish, opposed to long)
-            0.8,    // belief_confidence
-            5.0,    // edge_bps
-            -10.0,  // trend_momentum_bps (bearish trend, opposed to long)
-            -5.0,   // unrealized_pnl_bps (underwater)
-        );
+        let action = engine.decide(&PositionDecisionInput {
+            position: 0.3,
+            max_position: 1.0,
+            belief_drift: -0.001,
+            belief_confidence: 0.8,
+            edge_bps: 5.0,
+            trend_momentum_bps: -10.0,
+            unrealized_pnl_bps: -5.0,
+        });
 
         // Position opposes beliefs → should REDUCE
         assert!(action.is_reduce(), "Expected REDUCE when position opposes beliefs");
@@ -451,15 +455,15 @@ mod tests {
             engine.observe_fill(1.0, 1.0, 1.0);
         }
 
-        let action = engine.decide(
-            0.2,   // position (moderate long)
-            1.0,   // max_position
-            0.001, // belief_drift (aligned)
-            0.9,   // belief_confidence (high)
-            10.0,  // edge_bps (high edge)
-            0.0,   // trend_momentum_bps
-            0.0,   // unrealized_pnl_bps
-        );
+        let action = engine.decide(&PositionDecisionInput {
+            position: 0.2,
+            max_position: 1.0,
+            belief_drift: 0.001,
+            belief_confidence: 0.9,
+            edge_bps: 10.0,
+            trend_momentum_bps: 0.0,
+            unrealized_pnl_bps: 0.0,
+        });
 
         // High p_cont + high edge + aligned + not too big → could ADD
         // Note: depends on continuation posterior state
@@ -481,15 +485,15 @@ mod tests {
     fn test_flat_position_returns_zero_urgency() {
         let engine = PositionDecisionEngine::default();
 
-        let action = engine.decide(
-            0.005, // Nearly flat position
-            1.0,
-            0.001,
-            0.8,
-            5.0,
-            0.0,   // trend_momentum_bps
-            0.0,   // unrealized_pnl_bps
-        );
+        let action = engine.decide(&PositionDecisionInput {
+            position: 0.005,
+            max_position: 1.0,
+            belief_drift: 0.001,
+            belief_confidence: 0.8,
+            edge_bps: 5.0,
+            trend_momentum_bps: 0.0,
+            unrealized_pnl_bps: 0.0,
+        });
 
         match action {
             PositionAction::Reduce { urgency } => {
@@ -504,15 +508,15 @@ mod tests {
         let engine = PositionDecisionEngine::default();
 
         // Simulate: beliefs are reset (low confidence), but raw trend is bullish
-        let action = engine.decide(
-            0.3,   // position (long)
-            1.0,   // max_position
-            0.0,   // belief_drift (reset by changepoint → zero)
-            0.0,   // belief_confidence (reset → zero)
-            0.0,   // edge_bps (unknown after reset)
-            15.0,  // trend_momentum_bps (strong bullish trend from raw prices)
-            2.0,   // unrealized_pnl_bps (slightly profitable)
-        );
+        let action = engine.decide(&PositionDecisionInput {
+            position: 0.3,
+            max_position: 1.0,
+            belief_drift: 0.0,
+            belief_confidence: 0.0,
+            edge_bps: 0.0,
+            trend_momentum_bps: 15.0,
+            unrealized_pnl_bps: 2.0,
+        });
 
         // Trend-momentum guard should fire: position aligned with trend, not underwater
         assert!(action.is_hold(),
@@ -523,15 +527,15 @@ mod tests {
     fn test_trend_momentum_guard_does_not_fire_when_underwater() {
         let engine = PositionDecisionEngine::default();
 
-        let action = engine.decide(
-            0.3,   // position (long)
-            1.0,   // max_position
-            0.0,   // belief_drift (reset)
-            0.0,   // belief_confidence (reset)
-            0.0,   // edge_bps
-            15.0,  // trend_momentum_bps (bullish)
-            -5.0,  // unrealized_pnl_bps (deeply underwater)
-        );
+        let action = engine.decide(&PositionDecisionInput {
+            position: 0.3,
+            max_position: 1.0,
+            belief_drift: 0.0,
+            belief_confidence: 0.0,
+            edge_bps: 0.0,
+            trend_momentum_bps: 15.0,
+            unrealized_pnl_bps: -5.0,
+        });
 
         // Underwater position should still reduce even with aligned trend
         assert!(action.is_reduce(),

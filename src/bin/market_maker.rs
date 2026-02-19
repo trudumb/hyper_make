@@ -2140,6 +2140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         tracing::warn!("Binance lead-lag feed DISABLED - running without cross-exchange signal");
+        // DEX assets need ThinDex changepoint thresholds even without Binance
+        if asset.contains(':') {
+            market_maker.set_changepoint_regime_thin_dex();
+            tracing::info!("Changepoint detector set to ThinDex regime (Binance disabled)");
+        }
     }
 
     // === Prior Injection: Discover and inject paper prior (φ→ψ) ===
@@ -2748,6 +2753,12 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
 
     // Disable Binance signals for paper (no cross-venue feed)
     market_maker.disable_binance_signals();
+
+    // Set ThinDex regime for DEX assets in paper mode (same as live path)
+    if asset.contains(':') {
+        market_maker.set_changepoint_regime_thin_dex();
+        tracing::info!("Paper: Changepoint detector set to ThinDex regime");
+    }
 
     // Seed paper balance — without this, margin_available=0 and no orders are placed.
     // Paper balance should be a realistic account size, NOT the max_position_usd (which
