@@ -547,15 +547,23 @@ mod tests {
 
     #[test]
     fn test_action_to_inventory_ratio() {
-        // HOLD → 0
-        assert_eq!(action_to_inventory_ratio(PositionAction::Hold, 0.5), 0.0);
+        // HOLD → passes through raw ratio (true q for γσ²qτ)
+        assert_eq!(action_to_inventory_ratio(PositionAction::Hold, 0.5), 0.5);
 
-        // ADD with kelly=0.2 and ratio=0.3 → -0.2 * 0.3 = -0.06
+        // ADD with kelly=0.2 and ratio=0.3 → (1-0.2) * 0.3 = 0.24
+        // Reduces skew toward zero (not reverses it)
         let add_result = action_to_inventory_ratio(
             PositionAction::Add { kelly_frac: 0.2 },
             0.3,
         );
-        assert!((add_result - (-0.06)).abs() < 0.001);
+        assert!((add_result - 0.24).abs() < 0.001);
+
+        // ADD with kelly=1.0 → full conviction → 0 skew
+        let add_full = action_to_inventory_ratio(
+            PositionAction::Add { kelly_frac: 1.0 },
+            0.3,
+        );
+        assert!((add_full).abs() < 0.001);
 
         // REDUCE with urgency=1.5 and ratio=0.4 → 1.5 * 0.4 = 0.6
         let reduce_result = action_to_inventory_ratio(
