@@ -2490,6 +2490,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Low-value = small price moves (<5 bps) or size-only modifications with value < 1 bps.
         if headroom_pct < 0.20 {
             let pre_filter = all_scored.len();
+            let pre_scored = all_scored.clone();
             all_scored.retain(|s| {
                 use crate::market_maker::tracking::ActionType;
                 // Always keep: latches (0 API cost), stale cancels (cleanup), new placements
@@ -2502,6 +2503,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     ActionType::ModifyPrice | ActionType::CancelPlace => s.value_bps > 0.5,
                 }
             });
+
+            // Safety: don't let priority filter leave us with 0 active orders
+            let has_any_order = all_scored.iter().any(|s| {
+                use crate::market_maker::tracking::ActionType;
+                matches!(
+                    s.action,
+                    ActionType::Latch
+                        | ActionType::NewPlace
+                        | ActionType::ModifyPrice
+                        | ActionType::ModifySize
+                )
+            });
+            if !has_any_order && !pre_scored.is_empty() {
+                warn!(
+                    "[Unified] Priority filter would leave book empty — restoring all actions"
+                );
+                all_scored = pre_scored;
+            }
+
             let filtered = pre_filter - all_scored.len();
             if filtered > 0 {
                 info!(

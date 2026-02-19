@@ -162,7 +162,8 @@ pub fn allocate_risk_budget(
         return (uniform, diag);
     }
 
-    let per_level_cap = budget.position_capacity * budget.max_single_order_fraction;
+    let per_level_cap = (budget.position_capacity * budget.max_single_order_fraction)
+        .max(budget.min_viable_size); // Never cap below exchange minimum
 
     // Step 1: Compute softmax weights with entropy floor
     let (weights, effective_temp) = compute_softmax_weights(
@@ -274,7 +275,8 @@ pub fn allocate_risk_budget_uniform(
         return Vec::new();
     }
 
-    let per_level_cap = budget.position_capacity * budget.max_single_order_fraction;
+    let per_level_cap = (budget.position_capacity * budget.max_single_order_fraction)
+        .max(budget.min_viable_size); // Never cap below exchange minimum
     let mut remaining_position = budget.position_capacity;
     let mut remaining_margin = budget.margin_capacity;
     let mut allocations = Vec::with_capacity(levels.len());
