@@ -11,6 +11,59 @@ use super::{
     RiskModelConfig, SpreadComposition,
 };
 
+/// Per-level expected PnL computation for the E[PnL] filter (Phase 4).
+///
+/// E[PnL](δ, side) = λ(δ) × [δ - AS - fee - carry] + drift_contribution - inventory_penalty
+///
+/// When E[PnL] ≤ 0, optimal size at that level is zero.
+/// This naturally produces one-sided quoting without a binary gate.
+#[allow(clippy::too_many_arguments)]
+pub fn expected_pnl_bps(
+    depth_bps: f64,
+    is_bid: bool,
+    gamma: f64,
+    kappa_side: f64,
+    sigma: f64,
+    time_horizon: f64,
+    drift_rate: f64,
+    position: f64,
+    max_position: f64,
+    as_cost_bps: f64,
+    fee_bps: f64,
+    carry_cost_bps: f64,
+) -> f64 {
+    let depth_frac = depth_bps / 10_000.0;
+
+    // Fill intensity at this depth: λ(δ) = κ × exp(-κ × δ)
+    let lambda = kappa_side * (-kappa_side * depth_frac).exp();
+
+    // Spread capture net of costs
+    let capture = depth_bps - as_cost_bps - fee_bps - carry_cost_bps;
+
+    // Drift contribution: directional, mirrors GLFT ±μ̂×τ/2 asymmetry.
+    // Positive drift → buying favorable (bid positive), selling unfavorable (ask negative).
+    // Negative drift → selling favorable (ask positive), buying unfavorable (bid negative).
+    let drift_bps = drift_rate * 10_000.0 * time_horizon / 2.0;
+    let drift_contribution = if is_bid { drift_bps } else { -drift_bps };
+
+    // Inventory penalty (accumulating) or bonus (reducing)
+    let is_reducing = (is_bid && position < 0.0) || (!is_bid && position > 0.0);
+    let utilization = if max_position > 1e-9 {
+        (position.abs() / max_position).min(1.0)
+    } else {
+        0.0
+    };
+    let inv_penalty_bps = gamma * utilization * sigma.powi(2) * time_horizon * 10_000.0;
+    let inventory_adj = if is_reducing {
+        -0.5 * inv_penalty_bps // Bonus for reducing
+    } else {
+        inv_penalty_bps // Penalty for accumulating
+    };
+
+    // Total E[PnL] = fill_probability × capture + adjustments
+    lambda * capture + drift_contribution - inventory_adj
+}
+
 /// Taker price elasticity estimator for monopolist LP pricing.
 ///
 /// Tracks (spread_width, fill_rate) pairs over a rolling window and
@@ -494,7 +547,7 @@ impl GLFTStrategy {
         } else {
             0.0
         };
-        let inventory_scalar = 1.0 + utilization.powi(2) * 3.0;
+        let inventory_scalar = 1.0 + cfg.inventory_beta * utilization.powi(2);
 
         // === HAWKES ACTIVITY SCALING ===
         let hawkes_baseline = 0.5;
@@ -2658,5 +2711,139 @@ mod tests {
                 ratio, wide_spread_bps, base_spread_bps
             );
         }
+    }
+
+    // === E[PnL] Filter Tests (Phase 4) ===
+
+    #[test]
+    fn test_epnl_positive_at_touch_zero_inventory() {
+        // At GLFT depth with no position, E[PnL] should be positive
+        let depth_bps = 8.0; // typical touch depth
+        let gamma = 0.1;
+        let kappa = 3000.0;
+        let sigma = 0.005;
+        let time_horizon = 10.0;
+        let fee_bps = 1.5;
+
+        let epnl = expected_pnl_bps(
+            depth_bps, true, gamma, kappa, sigma, time_horizon,
+            0.0, // no drift
+            0.0, // no position
+            10.0, // max_position
+            2.0, // AS cost
+            fee_bps,
+            0.0, // no carry
+        );
+        assert!(
+            epnl > 0.0,
+            "E[PnL] should be positive at touch with zero inventory, got {:.4}",
+            epnl
+        );
+    }
+
+    #[test]
+    fn test_epnl_negative_accumulating_high_inventory() {
+        // At 80% long, bid E[PnL] should be negative (accumulating side)
+        // Need high gamma and sigma so inventory penalty dominates fill capture
+        let depth_bps = 8.0;
+        let gamma = 50.0;     // Very high risk aversion (volatile regime)
+        let kappa = 3000.0;
+        let sigma = 0.02;     // 200 bps vol
+        let time_horizon = 10.0;
+
+        let epnl = expected_pnl_bps(
+            depth_bps, true, gamma, kappa, sigma, time_horizon,
+            0.0, // no drift
+            8.0, // 80% of max
+            10.0,
+            2.0,
+            1.5,
+            0.0,
+        );
+        assert!(
+            epnl < 0.0,
+            "E[PnL] should be negative on accumulating side at 80% inventory, got {:.4}",
+            epnl
+        );
+    }
+
+    #[test]
+    fn test_epnl_positive_reducing_high_inventory() {
+        // At 80% long, ask E[PnL] should be positive (reducing side gets bonus)
+        let depth_bps = 8.0;
+        let gamma = 0.1;
+        let kappa = 3000.0;
+        let sigma = 0.005;
+        let time_horizon = 10.0;
+
+        let epnl = expected_pnl_bps(
+            depth_bps, false, gamma, kappa, sigma, time_horizon,
+            0.0, // no drift
+            8.0, // 80% long → ask is reducing
+            10.0,
+            2.0,
+            1.5,
+            0.0,
+        );
+        assert!(
+            epnl > 0.0,
+            "E[PnL] should be positive on reducing side at 80% inventory, got {:.4}",
+            epnl
+        );
+    }
+
+    #[test]
+    fn test_epnl_drift_skews_correctly() {
+        // Negative drift should make bid E[PnL] < ask E[PnL]
+        let depth_bps = 8.0;
+        let gamma = 0.1;
+        let kappa = 3000.0;
+        let sigma = 0.005;
+        let time_horizon = 10.0;
+        let drift_rate = -0.001; // bearish drift
+
+        let bid_epnl = expected_pnl_bps(
+            depth_bps, true, gamma, kappa, sigma, time_horizon,
+            drift_rate, 0.0, 10.0, 2.0, 1.5, 0.0,
+        );
+        let ask_epnl = expected_pnl_bps(
+            depth_bps, false, gamma, kappa, sigma, time_horizon,
+            drift_rate, 0.0, 10.0, 2.0, 1.5, 0.0,
+        );
+        assert!(
+            bid_epnl < ask_epnl,
+            "Bearish drift should make bid E[PnL] ({:.4}) < ask E[PnL] ({:.4})",
+            bid_epnl, ask_epnl
+        );
+    }
+
+    #[test]
+    fn test_epnl_all_negative_extreme_sigma() {
+        // With extreme sigma, all E[PnL] should be negative (matches NoQuote behavior)
+        let depth_bps = 8.0;
+        let gamma = 0.5;
+        let kappa = 3000.0;
+        let sigma = 0.05; // 5x normal — extreme vol
+        let time_horizon = 10.0;
+
+        let bid_epnl = expected_pnl_bps(
+            depth_bps, true, gamma, kappa, sigma, time_horizon,
+            0.0, 5.0, 10.0, 10.0, 1.5, 0.0,
+        );
+        let ask_epnl = expected_pnl_bps(
+            depth_bps, false, gamma, kappa, sigma, time_horizon,
+            0.0, -5.0, 10.0, 10.0, 1.5, 0.0,
+        );
+        // Both sides should have negative E[PnL] due to extreme vol + high AS
+        assert!(
+            bid_epnl < 0.0,
+            "Extreme sigma + inventory: bid E[PnL] should be negative, got {:.4}",
+            bid_epnl
+        );
+        assert!(
+            ask_epnl < 0.0,
+            "Extreme sigma + inventory: ask E[PnL] should be negative, got {:.4}",
+            ask_epnl
+        );
     }
 }

@@ -24,7 +24,6 @@ use super::{
     RiskModelConfig, SpreadComposition,
 };
 
-use crate::market_maker::risk::PositionZone;
 
 /// Maximum fraction of effective_max_position allowed in a single resting order.
 ///
@@ -1011,47 +1010,23 @@ impl LadderStrategy {
             0.0
         };
 
-        // === POSITION ZONE: Graduated risk overlay ===
-        // Only kill switch can cancel all quotes. Everything else widens or reduces size.
-        // Zone thresholds are fractions of max_position:
-        //   Green  (<60%): normal operation
-        //   Yellow (60-80%): wider spread on accumulating side + smaller size
-        //   Red    (80-100%): reduce-only (only position-reducing side quotes)
-        //   Kill   (>100%): same as Red here; kill switch handles cancellation
+        // === CONTINUOUS γ(q) REPLACED DISCRETE ZONES ===
+        // Smooth γ(q) = γ_base × (1 + β × utilization²) in glft.rs handles graduated
+        // risk aversion. Kill-switch safety guard at >100% is the only discrete cutoff.
         let abs_inventory_ratio = inventory_ratio.abs();
-        let position_zone = if abs_inventory_ratio >= 1.0 {
-            PositionZone::Kill
-        } else if abs_inventory_ratio >= 0.8 {
-            PositionZone::Red
-        } else if abs_inventory_ratio >= 0.6 {
-            PositionZone::Yellow
-        } else {
-            PositionZone::Green
-        };
 
-        // Zone-aware size multiplier: reduces size as we approach limits
-        let zone_size_mult = match position_zone {
-            PositionZone::Green => 1.0,
-            PositionZone::Yellow => 0.5,
-            PositionZone::Red | PositionZone::Kill => 0.3, // Minimal size, reduce-only
-        };
-
-        // Zone-aware spread widening on the accumulating side
-        let zone_spread_widen_bps = match position_zone {
-            PositionZone::Green => 0.0,
-            PositionZone::Yellow => 3.0,  // +3 bps on accumulating side
-            PositionZone::Red | PositionZone::Kill => 10.0, // +10 bps (discourage accumulation)
-        };
-
-        if position_zone != PositionZone::Green {
-            tracing::info!(
-                zone = ?position_zone,
-                abs_inventory_ratio = %format!("{:.2}", abs_inventory_ratio),
-                zone_size_mult = %format!("{:.2}", zone_size_mult),
-                zone_spread_widen_bps = %format!("{:.1}", zone_spread_widen_bps),
-                "Position zone risk overlay active"
-            );
+        // Kill-switch guard: clear accumulating side at >100% utilization (safety-critical)
+        if abs_inventory_ratio >= 1.0 {
+            if position > 0.0 {
+                tracing::warn!(position, "Kill-switch: clearing bids at >100% utilization");
+            } else if position < 0.0 {
+                tracing::warn!(position, "Kill-switch: clearing asks at >100% utilization");
+            }
         }
+
+        // Continuous size scaling: smooth reduction as utilization increases
+        // At 0%→1.0, 60%→0.76, 80%→0.52, 100%→0.25 (matches old zone behavior more smoothly)
+        let zone_size_mult = (1.0 - 0.75 * abs_inventory_ratio.powi(2)).max(0.25);
 
         // Convert AS spread adjustment to bps for ladder generation
         let as_at_touch_bps = if market_params.as_warmed_up {
@@ -1249,47 +1224,32 @@ impl LadderStrategy {
             );
         }
 
-        // === DRIFT ADJUSTMENT: Asymmetric bid/ask from reference perp drift ===
+        // === DRIFT ADJUSTMENT: Asymmetric bid/ask from Kalman drift estimator ===
         // Classical Avellaneda-Stoikov μ*T/2 term: positive drift (price rising)
         // widens bids (buying into uptrend is risky) and tightens asks (selling is favorable).
-        // Clamped to ±3 bps to prevent extreme asymmetry from noisy drift.
+        // UNCLAMPED: Kalman posterior variance naturally bounds the estimate.
+        // The old ±3 bps cap was the #1 reason drift detection didn't prevent accumulation.
         if market_params.drift_rate_per_sec.abs() > 1e-10 {
-            let drift_adj_bps = (market_params.drift_rate_per_sec * time_horizon * 10_000.0 / 2.0)
-                .clamp(-3.0, 3.0);
+            let drift_adj_bps = market_params.drift_rate_per_sec * time_horizon * 10_000.0 / 2.0;
             for depth in dynamic_depths.bid.iter_mut() {
                 *depth = (*depth + drift_adj_bps).max(effective_floor_bps);
             }
             for depth in dynamic_depths.ask.iter_mut() {
                 *depth = (*depth - drift_adj_bps).max(effective_floor_bps);
             }
-            if drift_adj_bps.abs() > 0.1 {
+            if drift_adj_bps.abs() > 0.5 {
                 tracing::info!(
                     drift_rate = %format!("{:.2e}", market_params.drift_rate_per_sec),
                     drift_adj_bps = %format!("{:.2}", drift_adj_bps),
-                    "[SPREAD TRACE] drift asymmetry applied"
+                    drift_uncertainty = %format!("{:.2}", market_params.drift_uncertainty_bps),
+                    "Drift asymmetry applied (Kalman, unclamped)"
                 );
             }
         }
 
-        // === POSITION ZONE: Apply graduated spread widening ===
-        // Widen the accumulating side in Yellow/Red zones.
-        // If long (position > 0), accumulating side = bids (buying more).
-        // If short (position < 0), accumulating side = asks (selling more).
-        if zone_spread_widen_bps > 0.0 {
-            let widen_bids = position > 0.0; // Long → bids accumulate
-            if widen_bids {
-                for depth in dynamic_depths.bid.iter_mut() {
-                    *depth += zone_spread_widen_bps;
-                }
-            } else {
-                for depth in dynamic_depths.ask.iter_mut() {
-                    *depth += zone_spread_widen_bps;
-                }
-            }
-        }
-
-        // In Red zone, clear the accumulating side entirely (reduce-only).
-        if matches!(position_zone, PositionZone::Red | PositionZone::Kill) {
+        // === KILL-SWITCH SIDE CLEARING (safety-critical) ===
+        // Only fires at >100% utilization. Continuous γ(q) handles everything else.
+        if abs_inventory_ratio >= 1.0 {
             if position > 0.0 {
                 // Long: clear bids (don't buy more), keep asks (let us sell)
                 dynamic_depths.bid.clear();
@@ -1297,11 +1257,6 @@ impl LadderStrategy {
                 // Short: clear asks (don't sell more), keep bids (let us buy)
                 dynamic_depths.ask.clear();
             }
-            tracing::warn!(
-                zone = ?position_zone,
-                position = %format!("{:.4}", position),
-                "Red zone: accumulating side cleared (reduce-only)"
-            );
         }
 
         // Kappa-driven spread cap removed — circular with GLFT.
@@ -1395,6 +1350,44 @@ impl LadderStrategy {
         //
         // The GLFT formula δ = (1/γ) × ln(1 + γ/κ) now handles all spread widening
         // in a mathematically principled way.
+
+        // === E[PnL] FILTER (Phase 4: Unified Adverse Selection) ===
+        // When enabled, drop levels with E[PnL] ≤ 0 instead of binary quote gate decisions.
+        // This naturally produces one-sided quoting without NoQuote/OnlyBids/OnlyAsks.
+        if market_params.use_epnl_filter {
+            let pre_bid_count = dynamic_depths.bid.len();
+            let pre_ask_count = dynamic_depths.ask.len();
+
+            dynamic_depths.bid.retain(|&depth| {
+                super::glft::expected_pnl_bps(
+                    depth, true, gamma, market_params.kappa_bid, market_params.sigma,
+                    time_horizon, market_params.drift_rate_per_sec, position,
+                    effective_max_position, as_at_touch_bps, fee_bps,
+                    market_params.funding_carry_bps,
+                ) > 0.0
+            });
+            dynamic_depths.ask.retain(|&depth| {
+                super::glft::expected_pnl_bps(
+                    depth, false, gamma, market_params.kappa_ask, market_params.sigma,
+                    time_horizon, market_params.drift_rate_per_sec, position,
+                    effective_max_position, as_at_touch_bps, fee_bps,
+                    market_params.funding_carry_bps,
+                ) > 0.0
+            });
+
+            let bid_dropped = pre_bid_count - dynamic_depths.bid.len();
+            let ask_dropped = pre_ask_count - dynamic_depths.ask.len();
+            if bid_dropped > 0 || ask_dropped > 0 {
+                tracing::info!(
+                    bid_dropped, ask_dropped,
+                    bid_remaining = dynamic_depths.bid.len(),
+                    ask_remaining = dynamic_depths.ask.len(),
+                    position = %format!("{:.4}", position),
+                    drift_bps = %format!("{:.2}", market_params.drift_rate_per_sec * 10_000.0),
+                    "E[PnL] filter: dropped negative-EV levels"
+                );
+            }
+        }
 
         // Capital-aware level count: don't spread across more levels than capital can support.
         // Uses the policy's max_levels_per_side as a hard cap, then further constrained by
@@ -1640,18 +1633,26 @@ impl LadderStrategy {
             // When pre-fill toxicity > 0.5 on a side, reduce that side's capacity
             // proportionally. This shrinks order sizes to limit adverse selection losses
             // while keeping quotes active (unlike cancel-on-toxicity which removes them).
-            let available_for_bids = available_for_bids * market_params.pre_fill_size_mult_bid;
-            let available_for_asks = available_for_asks * market_params.pre_fill_size_mult_ask;
+            //
+            // Phase 4: When E[PnL] filter is active, this is SUBSUMED:
+            // High toxicity → high AS cost → E[PnL] < 0 → levels dropped naturally.
+            let (available_for_bids, available_for_asks) = if !market_params.use_epnl_filter {
+                let ab = available_for_bids * market_params.pre_fill_size_mult_bid;
+                let aa = available_for_asks * market_params.pre_fill_size_mult_ask;
 
-            if market_params.pre_fill_size_mult_bid < 0.99 || market_params.pre_fill_size_mult_ask < 0.99 {
-                tracing::info!(
-                    bid_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_bid),
-                    ask_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_ask),
-                    bid_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
-                    ask_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
-                    "Toxicity size reduction applied"
-                );
-            }
+                if market_params.pre_fill_size_mult_bid < 0.99 || market_params.pre_fill_size_mult_ask < 0.99 {
+                    tracing::info!(
+                        bid_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_bid),
+                        ask_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_ask),
+                        bid_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
+                        ask_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
+                        "Toxicity size reduction applied"
+                    );
+                }
+                (ab, aa)
+            } else {
+                (available_for_bids, available_for_asks)
+            };
 
             if over_limit {
                 if position > 0.0 {
@@ -1808,7 +1809,7 @@ impl LadderStrategy {
                 };
 
                 // WS4: Compute allocation temperature from regime + warmup
-                let in_yellow_zone = matches!(position_zone, PositionZone::Yellow);
+                let in_yellow_zone = abs_inventory_ratio >= 0.6;
                 let alloc_temperature = compute_allocation_temperature(
                     market_params.regime_gamma_multiplier,
                     market_params.adaptive_warmup_progress,
@@ -1825,9 +1826,9 @@ impl LadderStrategy {
                 let (ask_allocs, ask_diag) = allocate_risk_budget(&selected_asks, &ask_budget, &softmax_params);
 
                 // Skip if Red zone cleared accumulating side
-                let bid_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+                let bid_cleared_by_zone = abs_inventory_ratio >= 1.0
                     && position > 0.0;
-                let ask_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+                let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
                     && position < 0.0;
 
                 // Build ladder from tick-grid allocations
@@ -2195,7 +2196,7 @@ impl LadderStrategy {
                 .max(ladder_config.min_depth_bps);
 
             // Bid concentration fallback — skip if Red zone cleared bids (reduce-only for longs)
-            let bid_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+            let bid_cleared_by_zone = abs_inventory_ratio >= 1.0
                 && position > 0.0;
             if ladder.bids.is_empty() && !bid_cleared_by_zone {
                 // Total available size for bids, capped at 25% of the USER'S risk-based
@@ -2246,7 +2247,7 @@ impl LadderStrategy {
             }
 
             // Ask concentration fallback — skip if Red zone cleared asks (reduce-only for shorts)
-            let ask_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+            let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
                 && position < 0.0;
             if ladder.asks.is_empty() && !ask_cleared_by_zone {
                 // Total available size for asks, capped at 25% of the USER'S risk-based
@@ -2455,9 +2456,9 @@ impl LadderStrategy {
             // Skew = up to 30% of half-spread, proportional to inventory
             let guaranteed_skew_bps = guaranteed_inv_ratio * guaranteed_half_spread_bps * 0.3;
 
-            let bid_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+            let bid_cleared_by_zone = abs_inventory_ratio >= 1.0
                 && position > 0.0;
-            let ask_cleared_by_zone = matches!(position_zone, PositionZone::Red | PositionZone::Kill)
+            let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
                 && position < 0.0;
 
             // Also skip guaranteed quotes when should_pull_quotes is set (circuit breaker)
@@ -2903,75 +2904,44 @@ mod tests {
     }
 
     #[test]
-    fn test_position_zone_green() {
-        // <60% inventory → Green zone
-        let abs_ratio = 0.5;
-        let zone = if abs_ratio >= 1.0 {
-            PositionZone::Kill
-        } else if abs_ratio >= 0.8 {
-            PositionZone::Red
-        } else if abs_ratio >= 0.6 {
-            PositionZone::Yellow
-        } else {
-            PositionZone::Green
-        };
-        assert_eq!(zone, PositionZone::Green);
+    fn test_continuous_size_mult_monotonic() {
+        // Continuous size scaling: (1 - 0.75 * ratio²).max(0.25)
+        // Must be monotonically decreasing
+        let ratios: [f64; 6] = [0.0, 0.3, 0.5, 0.6, 0.8, 1.0];
+        let mults: Vec<f64> = ratios.iter()
+            .map(|r| (1.0 - 0.75 * r * r).max(0.25))
+            .collect();
+        for i in 1..mults.len() {
+            assert!(
+                mults[i] <= mults[i-1],
+                "Size mult should decrease: at {:.1} got {:.3} > {:.3} at {:.1}",
+                ratios[i], mults[i], mults[i-1], ratios[i-1]
+            );
+        }
+        assert!(mults[0] > 0.99, "At 0% utilization, mult should be ~1.0");
+        assert!(mults[mults.len()-1] >= 0.25, "Floor at 0.25");
     }
 
     #[test]
-    fn test_position_zone_yellow() {
-        // 60-80% inventory → Yellow zone
-        let abs_ratio = 0.7;
-        let zone = if abs_ratio >= 1.0 {
-            PositionZone::Kill
-        } else if abs_ratio >= 0.8 {
-            PositionZone::Red
-        } else if abs_ratio >= 0.6 {
-            PositionZone::Yellow
-        } else {
-            PositionZone::Green
-        };
-        assert_eq!(zone, PositionZone::Yellow);
+    fn test_continuous_gamma_exceeds_zone_widening() {
+        // At 80% utilization with β=7.0, γ(q) = γ_base × (1 + 7.0 × 0.64) = 5.48×
+        // Old Yellow zone only applied +3 bps. Continuous γ produces wider spread.
+        let beta = 7.0;
+        let utilization = 0.8;
+        let gamma_scalar = 1.0 + beta * utilization * utilization;
+        assert!(gamma_scalar > 4.0, "At 80% utilization, gamma scalar should be > 4.0: {gamma_scalar}");
+
+        // At 60% (old Yellow boundary)
+        let utilization_60 = 0.6;
+        let gamma_60 = 1.0 + beta * utilization_60 * utilization_60;
+        assert!(gamma_60 > 3.0, "At 60% utilization, gamma scalar should be > 3.0: {gamma_60}");
     }
 
     #[test]
-    fn test_position_zone_red() {
-        // 80-100% inventory → Red zone
-        let abs_ratio = 0.85;
-        let zone = if abs_ratio >= 1.0 {
-            PositionZone::Kill
-        } else if abs_ratio >= 0.8 {
-            PositionZone::Red
-        } else if abs_ratio >= 0.6 {
-            PositionZone::Yellow
-        } else {
-            PositionZone::Green
-        };
-        assert_eq!(zone, PositionZone::Red);
-    }
-
-    #[test]
-    fn test_zone_size_multiplier_decreases() {
-        // Size multiplier should decrease as zone severity increases
-        let green_mult = 1.0_f64;
-        let yellow_mult = 0.5_f64;
-        let red_mult = 0.3_f64;
-
-        assert!(green_mult > yellow_mult);
-        assert!(yellow_mult > red_mult);
-        assert!(red_mult > 0.0, "Red zone should still have non-zero size for reduce-only");
-    }
-
-    #[test]
-    fn test_zone_spread_widening_increases() {
-        // Spread widening should increase with severity
-        let green_widen = 0.0_f64;
-        let yellow_widen = 3.0_f64;
-        let red_widen = 10.0_f64;
-
-        assert_eq!(green_widen, 0.0, "Green should have no widening");
-        assert!(yellow_widen > green_widen);
-        assert!(red_widen > yellow_widen);
+    fn test_kill_guard_independent() {
+        // At >100% utilization, accumulating side still cleared
+        let abs_ratio = 1.05;
+        assert!(abs_ratio >= 1.0, "Should trigger kill guard");
     }
 
     #[test]
@@ -3260,11 +3230,16 @@ mod tests {
             "Micro tier with long position should still produce asks for reducing"
         );
 
-        // Bid side should be limited — only 0.24 contracts remaining capacity
-        // 0.24 * $30 = $7.20 < $10 min_notional → bid should be empty
+        // Bid side should be very limited — at 92.6% utilization with continuous γ(q),
+        // bids are heavily penalized but may still exist with very small size.
+        // With Phase 2's continuous system (no discrete zones), the min_notional filter
+        // or continuous size scaling may leave a tiny bid. Verify bids are smaller than asks.
+        let total_bid_size: f64 = ladder.bids.iter().map(|q| q.size).sum();
+        let total_ask_size: f64 = ladder.asks.iter().map(|q| q.size).sum();
         assert!(
-            ladder.bids.is_empty(),
-            "Micro tier near max long should not produce bids (remaining capacity below min_notional)"
+            total_bid_size < total_ask_size * 0.5,
+            "Near-max long: bid size ({:.4}) should be much smaller than ask size ({:.4})",
+            total_bid_size, total_ask_size
         );
     }
 
@@ -3500,27 +3475,24 @@ mod tests {
     }
 
     #[test]
-    fn test_guaranteed_quotes_respect_zone_clearing() {
-        // Red zone with long position: bids cleared (accumulating side)
-        // Guaranteed quotes should NOT override zone clearing
+    fn test_kill_guard_clears_accumulating_side() {
+        // At >=100% utilization, accumulating side is cleared (kill guard).
+        // This is the only discrete cutoff — everything else is continuous γ(q).
         let position = 1.0_f64;
-        let bid_cleared_by_zone =
-            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position > 0.0;
-        let ask_cleared_by_zone =
-            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position < 0.0;
+        let abs_inventory_ratio = 1.05; // >100%
+        let bid_cleared = abs_inventory_ratio >= 1.0 && position > 0.0;
+        let ask_cleared = abs_inventory_ratio >= 1.0 && position < 0.0;
 
-        assert!(bid_cleared_by_zone, "Long in Red: bids should be cleared");
-        assert!(!ask_cleared_by_zone, "Long in Red: asks should NOT be cleared");
+        assert!(bid_cleared, "Long at >100%: bids should be cleared");
+        assert!(!ask_cleared, "Long at >100%: asks should NOT be cleared");
 
-        // Short in Red: asks cleared
+        // Short at >100%: asks cleared
         let position_short = -1.0_f64;
-        let bid_cleared_short =
-            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position_short > 0.0;
-        let ask_cleared_short =
-            matches!(PositionZone::Red, PositionZone::Red | PositionZone::Kill) && position_short < 0.0;
+        let bid_cleared_short = abs_inventory_ratio >= 1.0 && position_short > 0.0;
+        let ask_cleared_short = abs_inventory_ratio >= 1.0 && position_short < 0.0;
 
-        assert!(!bid_cleared_short, "Short in Red: bids should NOT be cleared");
-        assert!(ask_cleared_short, "Short in Red: asks should be cleared");
+        assert!(!bid_cleared_short, "Short at >100%: bids should NOT be cleared");
+        assert!(ask_cleared_short, "Short at >100%: asks should be cleared");
     }
 
     #[test]

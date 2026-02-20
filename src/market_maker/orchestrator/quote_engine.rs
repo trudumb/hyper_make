@@ -582,7 +582,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             });
         }
 
-        self.drift_estimator.update(&drift_signals);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.drift_estimator.update(&drift_signals, now_ms);
+
+        // Additional Kalman observations from trend detector
+        if trend_signal.is_warmed_up && trend_signal.trend_confidence > 0.2 {
+            self.drift_estimator.update_trend(
+                trend_signal.long_momentum_bps,
+                trend_signal.timeframe_agreement,
+                p_continuation,
+            );
+        }
 
         // For HJB controller: still need effective_momentum for its internal EWMA
         let effective_momentum = if !drift_signals.is_empty() {
@@ -784,6 +797,42 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Bayesian fusion of momentum, trend, lead-lag, and flow signals (Phase 5).
         // Falls back to 0.0 when no signals are active (symmetric quotes).
         market_params.drift_rate_per_sec = self.drift_estimator.drift_rate_per_sec();
+        market_params.drift_uncertainty_bps = self.drift_estimator.drift_uncertainty_bps();
+
+        // === Directional kappa from trade flow (Phase 3) ===
+        // Buy pressure → κ_ask UP (asks fill faster), κ_bid DOWN (bids fill slower).
+        let (flow_bid_mult, flow_ask_mult) = self
+            .stochastic
+            .trade_flow_tracker
+            .directional_kappa_multipliers(0.5);
+        market_params.kappa_bid *= flow_bid_mult;
+        market_params.kappa_ask *= flow_ask_mult;
+
+        // Flow imbalance as drift observation for Kalman filter
+        if let Some((z, r)) = self
+            .stochastic
+            .trade_flow_tracker
+            .drift_observation(market_params.kappa)
+        {
+            self.drift_estimator.update_single_observation(z, r);
+        }
+
+        // === Phase 6: Funding as drift observation (cold tier) ===
+        // Extreme funding rates signal expected price pressure:
+        // High positive funding → longs capitulate → expect downward drift.
+        // Only feed when funding estimator has enough observations.
+        if self.tier2.funding.is_warmed_up() {
+            let funding_rate = self.tier2.funding.current_rate();
+            let f_mean = self.tier2.funding.ewma_rate();
+            let f_std = self.tier2.funding.rate_std();
+            let funding_zscore = (funding_rate - f_mean) / f_std;
+            self.drift_estimator.update_funding(funding_zscore, 0.05);
+
+            // Funding carry cost for E[PnL] filter
+            // Holding period ≈ 1/kappa seconds (expected time to fill)
+            let tau_holding = 1.0 / market_params.kappa.max(100.0);
+            market_params.funding_carry_bps = funding_rate * tau_holding * 10_000.0;
+        }
 
         // === L1: Parameter Smoothing (Churn Reduction) ===
         // EWMA + deadband filtering on kappa/sigma/gamma before they reach the ladder.
@@ -2463,6 +2512,23 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         };
 
         // Handle quote gate decision
+        // Phase 4: When E[PnL] filter is active, bypass binary gate decisions.
+        // The per-level E[PnL] filter in ladder_strat handles side selection continuously.
+        // Keep gate for logging only — don't act on it.
+        if market_params.use_epnl_filter {
+            match &quote_gate_decision {
+                QuoteGateDecision::NoQuote { reason } => {
+                    debug!(
+                        reason = %reason,
+                        "Quote gate: NoQuote (BYPASSED — E[PnL] filter active)"
+                    );
+                }
+                QuoteGateDecision::QuoteOnlyBids { .. } | QuoteGateDecision::QuoteOnlyAsks { .. } => {
+                    debug!("Quote gate: one-sided (BYPASSED — E[PnL] filter active)");
+                }
+                _ => {}
+            }
+        } else {
         // Phase 7: NoQuote → graduated response (3x spread + reduce-only), not cancel all
         match &quote_gate_decision {
             QuoteGateDecision::NoQuote { reason } => {
@@ -2509,6 +2575,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 market_params.changepoint_prob = *changepoint_prob;
             }
         }
+        } // end else (non-E[PnL] quote gate path)
 
         // === QUOTA SHADOW SPREAD: Continuous penalty for low API headroom ===
         // Replaces discrete tier cliffs with smooth shadow pricing.

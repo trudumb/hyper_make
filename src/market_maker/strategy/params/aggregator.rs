@@ -753,8 +753,9 @@ impl ParameterAggregator {
             learned_alpha_touch: sources.learned_params.map_or(0.25, |l| l.alpha_touch),
             learned_spread_floor_bps: sources.learned_params.map_or(5.0, |l| l.spread_floor_bps),
             learned_params_calibrated: sources.learned_params.is_some_and(|l| l.calibrated),
-            // Drift rate defaults to 0.0 (no drift); set by DriftEstimator
+            // Drift rate defaults to 0.0 (no drift); set by KalmanDriftEstimator
             drift_rate_per_sec: 0.0,
+            drift_uncertainty_bps: 0.0,
             // Drawdown fraction — set by quote_engine from risk state
             current_drawdown_frac: 0.0,
             // Capital tier — set by quote_engine after build, default Large
@@ -782,6 +783,12 @@ impl ParameterAggregator {
 
             // Fix 3: Ghost liquidity — populated by quote engine from kappa orchestrator
             ghost_liquidity_gamma_mult: 1.0,
+
+            // === Unified Adverse Selection Framework (Phase 4) ===
+            // E[PnL] filter: default off during dual-run validation
+            use_epnl_filter: false,
+            // Funding carry cost: computed by quote engine from funding estimator
+            funding_carry_bps: 0.0,
         }
     }
 }

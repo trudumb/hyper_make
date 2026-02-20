@@ -983,11 +983,26 @@ pub struct MarketParams {
     /// Cached best ask from L2 book (for bounding inventory skew offset).
     pub cached_best_ask: f64,
 
-    // === Drift Rate (HJB / GLFT Drift Integration) ===
-    /// Smoothed price drift rate per second (fractional, not bps).
+    // === Drift Rate (Kalman / GLFT Drift Integration) ===
+    /// Kalman posterior drift rate per second (fractional, not bps).
     /// Positive = price rising. Used by GLFT half_spread_with_drift
     /// for asymmetric bid/ask spread (classical μ·T term).
+    /// UNCLAMPED: no ±3 bps cap. Kalman posterior variance naturally bounds.
     pub drift_rate_per_sec: f64,
+
+    /// Kalman posterior drift uncertainty √P (bps).
+    /// Lower = more confident. Used for logging and E[PnL] confidence.
+    pub drift_uncertainty_bps: f64,
+
+    /// Enable per-level E[PnL] filter (replaces binary quote gate).
+    /// When true, levels with E[PnL] ≤ 0 are dropped instead of using
+    /// NoQuote/OnlyBids/OnlyAsks binary decisions.
+    /// Default false during dual-run validation, true after confirmation.
+    pub use_epnl_filter: bool,
+
+    /// Funding carry cost in bps for E[PnL] computation.
+    /// Positive when we're on the paying side of funding.
+    pub funding_carry_bps: f64,
 
     /// Current drawdown as fraction of account value [0.0, 1.0+].
     /// Used by GLFT effective_gamma for continuous risk aversion scaling.
@@ -1316,8 +1331,9 @@ impl Default for MarketParams {
             // Cached BBO (0.0 = not yet received from L2 book)
             cached_best_bid: 0.0,
             cached_best_ask: 0.0,
-            // Drift rate
+            // Drift rate (Kalman)
             drift_rate_per_sec: 0.0,
+            drift_uncertainty_bps: 0.0,
             current_drawdown_frac: 0.0,
             // Capital tier
             capital_tier: CapitalTier::Large,
@@ -1340,6 +1356,10 @@ impl Default for MarketParams {
 
             // Fix 3: Ghost liquidity
             ghost_liquidity_gamma_mult: 1.0,
+
+            // Unified Adverse Selection Framework (Phase 4)
+            use_epnl_filter: false,
+            funding_carry_bps: 0.0,
         }
     }
 }

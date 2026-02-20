@@ -179,6 +179,45 @@ impl TradeFlowTracker {
         self.trade_count
     }
 
+    // ---- Directional kappa / drift integration ----
+
+    /// Flow-based directional kappa multipliers.
+    ///
+    /// Buy pressure → κ_ask UP (asks fill faster), κ_bid DOWN (bids fill slower).
+    /// Returns (bid_mult, ask_mult) in [0.5, 2.0].
+    ///
+    /// # Arguments
+    /// * `sensitivity` - How strongly flow imbalance affects kappa. 0.5 is moderate.
+    pub fn directional_kappa_multipliers(&self, sensitivity: f64) -> (f64, f64) {
+        if !self.is_warmed_up() {
+            return (1.0, 1.0);
+        }
+        let imb = self.imbalance_at_5s();
+        let ask_mult = (1.0 + sensitivity * imb).clamp(0.5, 2.0);
+        let bid_mult = (1.0 - sensitivity * imb).clamp(0.5, 2.0);
+        (bid_mult, ask_mult)
+    }
+
+    /// Flow imbalance as a drift observation (z, R) pair for Kalman filter.
+    ///
+    /// Buy pressure (positive imbalance) → positive z → bullish drift.
+    /// Sell pressure (negative imbalance) → negative z → bearish drift.
+    /// R scales inversely with total flow (more flow = more confidence).
+    pub fn drift_observation(&self, kappa_total: f64) -> Option<(f64, f64)> {
+        if !self.is_warmed_up() {
+            return None;
+        }
+        let imb = self.imbalance_at_5s();
+        if imb.abs() < 0.05 {
+            return None; // Negligible imbalance
+        }
+        let scale_factor = 0.5;
+        let z = imb * scale_factor; // Sell pressure (imb<0) → negative z → bearish
+        let sigma_flow = 2.0;
+        let r = sigma_flow * sigma_flow / kappa_total.max(0.1);
+        Some((z, r))
+    }
+
     // ---- Internal helpers ----
 
     /// Standard EWMA update: new = alpha * observation + (1 - alpha) * old.
@@ -480,6 +519,71 @@ mod tests {
         let tracker = TradeFlowTracker::default();
         assert_eq!(tracker.trade_count(), 0);
         assert!(!tracker.is_warmed_up());
+    }
+
+    #[test]
+    fn test_flow_neutral_gives_unit_multipliers() {
+        let tracker = TradeFlowTracker::new();
+        let (bid_mult, ask_mult) = tracker.directional_kappa_multipliers(0.5);
+        assert_eq!(bid_mult, 1.0, "Not warmed up → unit multipliers");
+        assert_eq!(ask_mult, 1.0);
+    }
+
+    #[test]
+    fn test_sell_pressure_lowers_kappa_bid() {
+        let mut tracker = TradeFlowTracker::new();
+        // Warmup + sell pressure
+        for _ in 0..5 {
+            tracker.on_trade(1.0, true);
+        }
+        for _ in 0..25 {
+            tracker.on_trade(1.0, false);
+        }
+        assert!(tracker.is_warmed_up());
+
+        let (bid_mult, ask_mult) = tracker.directional_kappa_multipliers(0.5);
+        // Sell pressure → negative imbalance → bid_mult > 1.0 (bids fill slower? No)
+        // Actually: sell pressure → imb < 0 → ask_mult = 1 + 0.5*(-neg) < 1 → asks slower
+        // bid_mult = 1 - 0.5*(-neg) = 1 + 0.5*abs(neg) > 1 → bids faster? That's wrong.
+        // Let me re-check the sign convention:
+        // Sell pressure → imbalance negative → more sell orders hitting bids
+        // Our bids get hit more (κ_bid UP), our asks get hit less (κ_ask DOWN)
+        // So bid_mult should be > 1 (more fills on bid side) and ask_mult < 1
+        // With imb < 0: bid_mult = 1 - sensitivity * imb = 1 - 0.5 * (-0.5) = 1.25 ✓
+        // ask_mult = 1 + sensitivity * imb = 1 + 0.5 * (-0.5) = 0.75 ✓
+        assert!(bid_mult > 1.0, "Sell pressure: bid_mult should be > 1.0 (bids fill faster): {bid_mult}");
+        assert!(ask_mult < 1.0, "Sell pressure: ask_mult should be < 1.0 (asks fill slower): {ask_mult}");
+    }
+
+    #[test]
+    fn test_multipliers_bounded() {
+        let mut tracker = TradeFlowTracker::new();
+        // Extreme one-sided flow
+        for _ in 0..100 {
+            tracker.on_trade(1.0, true);
+        }
+        let (bid_mult, ask_mult) = tracker.directional_kappa_multipliers(0.5);
+        assert!(bid_mult >= 0.5 && bid_mult <= 2.0, "bid_mult bounded: {bid_mult}");
+        assert!(ask_mult >= 0.5 && ask_mult <= 2.0, "ask_mult bounded: {ask_mult}");
+    }
+
+    #[test]
+    fn test_flow_drift_observation_sign() {
+        let mut tracker = TradeFlowTracker::new();
+        // Warmup + sell pressure
+        for _ in 0..5 {
+            tracker.on_trade(1.0, true);
+        }
+        for _ in 0..25 {
+            tracker.on_trade(1.0, false);
+        }
+
+        let obs = tracker.drift_observation(1000.0);
+        assert!(obs.is_some(), "Should produce observation when warmed up");
+        let (z, r) = obs.unwrap();
+        // Sell pressure → negative imbalance → z = imb * 0.5 → negative z (bearish)
+        assert!(z < 0.0, "Sell pressure should produce negative (bearish) z: {z}");
+        assert!(r > 0.0, "Positive variance");
     }
 
     #[test]

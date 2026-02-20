@@ -38,6 +38,13 @@ pub struct RiskConfig {
     /// Uses quadratic scaling: 1 + sensitivity × (utilization - threshold)²
     pub inventory_sensitivity: f64,
 
+    /// Continuous γ(q) = γ_base × (1 + β × (q/q_max)²) scaling coefficient.
+    /// Replaces discrete Green/Yellow/Red/Kill position zones with smooth scaling.
+    /// At β=7.0: 60%→3.52×, 80%→4.92×, 100%→8.0× (absorbs zone widening effects).
+    /// Set to 3.0 for legacy behavior (pre-zone-removal).
+    #[serde(default = "default_inventory_beta")]
+    pub inventory_beta: f64,
+
     /// Minimum γ floor
     pub gamma_min: f64,
 
@@ -185,6 +192,10 @@ pub struct RiskConfig {
     /// Default: 50.
     #[serde(default = "default_min_observations_for_elasticity")]
     pub min_observations_for_elasticity: usize,
+}
+
+fn default_inventory_beta() -> f64 {
+    7.0
 }
 
 fn default_monopolist_markup_cap_bps() -> f64 {
@@ -397,6 +408,7 @@ impl Default for RiskConfig {
             // MAINNET OPTIMIZED: Higher inventory tolerance for liquid markets
             inventory_threshold: 0.5, // Increased from 0.3 - easier to exit on liquid books
             inventory_sensitivity: 3.0, // Increased from 2.0 - stronger inventory effect on gamma
+            inventory_beta: 7.0,      // Smooth γ(q) scaling (replaces discrete zones)
             gamma_min: 0.05,
             gamma_max: 5.0,
             // FIRST PRINCIPLES: min_spread_floor = maker fee (physical minimum).
@@ -459,6 +471,7 @@ impl RiskConfig {
             toxicity_sensitivity: 0.2,      // Less sensitive
             inventory_threshold: 0.4,       // Higher inventory tolerance
             inventory_sensitivity: 1.5,     // Less aggressive scaling
+            inventory_beta: 7.0,            // Smooth γ(q) scaling (same as default)
             min_spread_floor: 0.00015,      // 1.5 bps floor (HL maker fee — physical minimum)
             max_holding_time: 300.0,        // 5 minutes (slower markets)
             flow_sensitivity: 0.3,          // Less flow adjustment

@@ -347,6 +347,13 @@ impl FundingRateEstimator {
         variance.sqrt()
     }
 
+    /// Rolling standard deviation of funding rate observations.
+    /// Alias for `funding_volatility()` — used by Phase 6 drift observation.
+    pub fn rate_std(&self) -> f64 {
+        let vol = self.funding_volatility();
+        if vol > 0.0 { vol } else { 0.001 } // Floor at 0.001 during warmup
+    }
+
     // === Premium Tracking Methods (First Principles Gap 6) ===
 
     /// Update premium from mark and index prices.

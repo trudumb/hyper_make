@@ -1,21 +1,24 @@
-//! Bayesian signal fusion for directional drift estimation.
+//! Kalman-filtered drift estimator with OU mean-reversion.
 //!
-//! Precision-weighted conjugate normal update fusing all directional signals
-//! into a single posterior drift rate (μ). Each signal contributes a
-//! `SignalObservation` with value and variance; the estimator produces a
-//! posterior mean that enters the GLFT pricer via the μ·τ term.
+//! Replaces the batch conjugate DriftEstimator with a Kalman filter using
+//! Ornstein-Uhlenbeck dynamics. Drift decays toward zero between observations
+//! via OU mean-reversion (rate θ), not ad-hoc 0.9× decay.
 //!
-//! Architecture: every directional signal touches quotes through exactly
-//! one channel — μ (drift). Variance modulation by regime happens at the
-//! observation level, not inside the estimator.
+//! Architecture: all directional signals enter as (z, R) observation pairs.
+//! The filter produces a posterior μ̂ that enters the GLFT pricer via the μ·τ term.
+//! No drift cap — posterior variance P naturally bounds the estimate.
+//!
+//! Feature tiers:
+//! - Hot (every cycle): BIM, ΔBIM, BPG, sweep → composite observation (Phase 7)
+//! - Warm (every 2-3 cycles): Hawkes, fill size, basis (Phase 8)
+//! - Cold (every 5-10 cycles): cross-asset lead, funding, OI (Phase 6/8)
 
-/// A single directional signal observation.
+/// A single directional signal observation (kept for backward compat with signal collection).
 #[derive(Debug, Clone, Copy)]
 pub struct SignalObservation {
     /// Drift signal value in bps/sec.
     pub value_bps_per_sec: f64,
     /// Variance of this signal estimate. Lower variance = higher precision = more weight.
-    /// CALIBRATION TARGET — bootstrap from paper trading MSE.
     pub variance: f64,
 }
 
@@ -24,36 +27,294 @@ pub struct SignalObservation {
 // CALIBRATION TARGET: replace with empirical MSE from paper trading.
 
 /// Base variance for short-term momentum signal.
-pub const BASE_MOMENTUM_VAR: f64 = 100.0; // CALIBRATION TARGET
+pub const BASE_MOMENTUM_VAR: f64 = 100.0;
 /// Base variance for long-term trend signal.
-pub const BASE_TREND_VAR: f64 = 200.0; // CALIBRATION TARGET
+pub const BASE_TREND_VAR: f64 = 200.0;
 /// Base variance for lead-lag signal.
-pub const BASE_LL_VAR: f64 = 50.0; // CALIBRATION TARGET
+pub const BASE_LL_VAR: f64 = 50.0;
 /// Base variance for flow imbalance signal.
-pub const BASE_FLOW_VAR: f64 = 200.0; // CALIBRATION TARGET
+pub const BASE_FLOW_VAR: f64 = 200.0;
 /// Base variance for belief system drift signal.
-pub const BASE_BELIEF_VAR: f64 = 150.0; // CALIBRATION TARGET
+pub const BASE_BELIEF_VAR: f64 = 150.0;
 
-/// Bayesian drift estimator using precision-weighted conjugate normal updates.
+/// Minimum posterior variance floor (bps²).
+/// Prevents overconfidence when many features feed the filter.
+/// At P_MIN=2.0, uncertainty floor is √2 ≈ 1.4 bps — filter can still track
+/// 5+ bps shifts but retains enough uncertainty to reverse within a few cycles.
+const P_MIN: f64 = 2.0;
+
+/// Kalman-filtered drift estimator with OU mean-reversion dynamics.
 ///
-/// Fuses multiple directional signals into a single posterior drift estimate.
-/// Between updates, the posterior decays toward the prior (zero drift) to
-/// prevent stale signals from persisting.
-#[derive(Debug, Clone)]
-pub struct DriftEstimator {
+/// State model: dμ = -θ·μ·dt + σ_μ·dW (OU process)
+/// Observation: z_k = μ_k + ε_k, ε_k ~ N(0, R_k)
+///
+/// Predict (every cycle): μ̂⁻ = μ̂·exp(-θΔt), P⁻ = P·exp(-2θΔt) + Q(Δt)
+/// Update (per observation): K = P⁻/(P⁻+R), μ̂ = μ̂⁻ + K(z-μ̂⁻), P = (1-K)P⁻
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KalmanDriftEstimator {
     /// Posterior mean drift (bps/sec).
+    state_mean: f64,
+    /// Posterior variance P (bps²).
+    state_variance: f64,
+    /// OU mean-reversion rate (1/sec). ~0.02 = 35s half-life.
+    theta: f64,
+    /// Process noise σ_μ² (bps²/sec³).
+    process_noise: f64,
+    /// Initial/prior variance P₀. Used for confidence calculation.
+    prior_variance: f64,
+    /// Last update timestamp (ms).
+    last_update_ms: u64,
+}
+
+impl KalmanDriftEstimator {
+    /// Create a new Kalman drift estimator.
+    ///
+    /// # Parameters
+    /// - `theta`: OU mean-reversion rate (1/sec). 0.02 = 35s half-life.
+    /// - `process_noise`: σ_μ² (bps²/sec³). Higher = more responsive to signals.
+    pub fn new(theta: f64, process_noise: f64) -> Self {
+        // Stationary variance = σ_μ²/(2θ). Initialize at 2× for faster cold-start:
+        // higher P means larger Kalman gain on first observations.
+        let stationary_var = process_noise / (2.0 * theta.max(1e-6));
+        let prior_variance = stationary_var * 2.0;
+        Self {
+            state_mean: 0.0,
+            state_variance: prior_variance,
+            theta,
+            process_noise,
+            prior_variance,
+            last_update_ms: 0,
+        }
+    }
+
+    /// OU propagation: drift decays toward zero, variance grows.
+    ///
+    /// μ̂⁻ = μ̂·exp(-θΔt)
+    /// P⁻ = P·exp(-2θΔt) + σ_μ²/(2θ)·(1 - exp(-2θΔt))
+    pub fn predict(&mut self, now_ms: u64) {
+        if self.last_update_ms == 0 {
+            self.last_update_ms = now_ms;
+            return;
+        }
+
+        let dt_ms = now_ms.saturating_sub(self.last_update_ms);
+        if dt_ms == 0 {
+            return;
+        }
+        let dt = dt_ms as f64 / 1000.0;
+
+        // OU mean-reversion: drift decays toward zero
+        let decay = (-self.theta * dt).exp();
+        self.state_mean *= decay;
+
+        // Variance propagation: P decays + process noise accumulates
+        let decay2 = (-2.0 * self.theta * dt).exp();
+        let stationary_var = self.process_noise / (2.0 * self.theta.max(1e-6));
+        self.state_variance = self.state_variance * decay2 + stationary_var * (1.0 - decay2);
+
+        // P_min floor prevents overconfidence from many feature updates
+        self.state_variance = self.state_variance.max(P_MIN);
+
+        self.last_update_ms = now_ms;
+    }
+
+    /// Kalman update with a single (z, R) observation.
+    ///
+    /// K = P⁻/(P⁻+R)
+    /// μ̂ = μ̂⁻ + K(z - μ̂⁻)
+    /// P = (1-K)P⁻
+    pub fn update_single_observation(&mut self, z: f64, r: f64) {
+        if !z.is_finite() || !r.is_finite() || r <= 0.0 {
+            return;
+        }
+
+        let k = self.state_variance / (self.state_variance + r);
+        self.state_mean += k * (z - self.state_mean);
+        self.state_variance *= 1.0 - k;
+
+        // P_min floor
+        self.state_variance = self.state_variance.max(P_MIN);
+    }
+
+    /// Batch update from legacy SignalObservation vec.
+    ///
+    /// Converts each signal to a (z, R) pair and runs sequential Kalman updates.
+    /// For hot-tier features, prefer composite observation (see Phase 7) to
+    /// prevent P collapse from too many updates per cycle.
+    pub fn update(&mut self, signals: &[SignalObservation], now_ms: u64) {
+        // Run predict step first
+        self.predict(now_ms);
+
+        if signals.is_empty() {
+            return;
+        }
+
+        for obs in signals {
+            if obs.variance <= 0.0 || !obs.variance.is_finite() || !obs.value_bps_per_sec.is_finite() {
+                continue;
+            }
+            self.update_single_observation(obs.value_bps_per_sec, obs.variance);
+        }
+    }
+
+    /// Fill observation: bid fill → bearish signal, ask fill → bullish.
+    ///
+    /// Bid fill means someone sold to us → selling pressure → bearish.
+    /// Ask fill means someone bought from us → buying pressure → bullish.
+    /// Scale by fill-to-mid distance: fills far from mid are more informative.
+    pub fn update_fill(&mut self, is_buy: bool, fill_price: f64, mid: f64, sigma: f64) {
+        if sigma < 1e-12 || mid < 1e-12 {
+            return;
+        }
+
+        // Distance from mid in sigma units (how aggressively someone hit our quote)
+        let distance_sigma = ((mid - fill_price).abs() / mid) / sigma.max(1e-10);
+        let scale = distance_sigma.min(3.0) * 0.5; // cap at 3σ, scale by 0.5
+
+        // Bid fill (we bought) → someone sold to us → bearish signal (negative z)
+        // Ask fill (we sold) → someone bought from us → bullish signal (positive z)
+        let z = if is_buy { -scale } else { scale };
+
+        let sigma_fill = 3.0; // Fill signal is noisy
+        let r = sigma_fill * sigma_fill;
+        self.update_single_observation(z, r);
+    }
+
+    /// Trend observation from multi-timeframe trend detector.
+    ///
+    /// z = -magnitude × agreement × p_continuation
+    /// R = σ_trend² / agreement² (higher agreement = lower noise = more weight)
+    pub fn update_trend(&mut self, magnitude: f64, agreement: f64, p_continuation: f64) {
+        if agreement < 0.1 || !magnitude.is_finite() {
+            return;
+        }
+
+        let z = -magnitude * agreement * p_continuation;
+        let sigma_trend = 2.0;
+        let r = sigma_trend * sigma_trend / (agreement * agreement).max(0.01);
+        self.update_single_observation(z, r);
+    }
+
+    /// Funding rate as drift observation.
+    ///
+    /// Extreme funding rates signal expected price pressure:
+    /// High positive funding → longs capitulate → expect downward pressure.
+    /// At low |funding_zscore|, R is large so Kalman gain is small (negligible update).
+    pub fn update_funding(&mut self, funding_zscore: f64, scale_factor: f64) {
+        if !funding_zscore.is_finite() || funding_zscore.abs() < 1e-6 {
+            return;
+        }
+
+        let z = -funding_zscore.signum() * funding_zscore.abs() * scale_factor;
+        let sigma_funding = 2.0;
+        // R inversely proportional to |zscore|: extreme funding = higher confidence.
+        let r = sigma_funding * sigma_funding / funding_zscore.abs().max(0.1);
+        self.update_single_observation(z, r);
+    }
+
+    /// Posterior drift rate in fractional units per second (NOT bps).
+    /// This is what enters the GLFT formula: r = S + μτ − γΣqτ
+    pub fn drift_rate_per_sec(&self) -> f64 {
+        self.state_mean / 10_000.0
+    }
+
+    /// Posterior drift in bps/sec (for logging).
+    pub fn drift_bps_per_sec(&self) -> f64 {
+        self.state_mean
+    }
+
+    /// Posterior uncertainty: √P (in bps).
+    pub fn drift_uncertainty_bps(&self) -> f64 {
+        self.state_variance.max(0.0).sqrt()
+    }
+
+    /// Confidence in the drift estimate [0, 1].
+    /// 1 - P/P₀: at prior → 0.0, with strong signals → approaches 1.0.
+    pub fn drift_confidence(&self) -> f64 {
+        if self.prior_variance <= 0.0 {
+            return 0.0;
+        }
+        (1.0 - self.state_variance / self.prior_variance).clamp(0.0, 1.0)
+    }
+
+    /// Posterior variance (for diagnostics).
+    pub fn state_variance(&self) -> f64 {
+        self.state_variance
+    }
+
+    /// Posterior mean (for diagnostics).
+    pub fn state_mean(&self) -> f64 {
+        self.state_mean
+    }
+
+    /// Online parameter adaptation from realized drift.
+    ///
+    /// After markout window completes, compare predicted drift with realized.
+    /// Prediction errors > expected → increase process_noise (more responsive).
+    /// Prediction errors < expected → decrease process_noise (more stable).
+    /// Also adapts theta: overshoots → increase θ (faster mean-reversion),
+    /// undershoots → decrease θ (slower decay).
+    ///
+    /// Bounded: θ ∈ [0.01, 1.0], process_noise ∈ [0.1, 10.0].
+    pub fn update_parameters(&mut self, realized_drift_bps: f64) {
+        if !realized_drift_bps.is_finite() {
+            return;
+        }
+
+        let prediction_error = (realized_drift_bps - self.state_mean).abs();
+        let expected_error = self.state_variance.max(0.01).sqrt();
+
+        // Normalized surprise: how many σ off was the prediction?
+        let surprise = prediction_error / expected_error.max(0.01);
+
+        if surprise > 1.5 {
+            // Under-confident: prediction errors larger than expected
+            // → increase process noise (more responsive to signals)
+            // → decrease θ (slower mean-reversion, trust drift longer)
+            self.process_noise = (self.process_noise * 1.05).min(10.0);
+            self.theta = (self.theta * 0.99).max(0.01);
+        } else if surprise < 0.5 {
+            // Over-confident: prediction errors smaller than expected
+            // → decrease process noise (less jittery)
+            // → increase θ (faster mean-reversion, less drift tracking)
+            self.process_noise = (self.process_noise * 0.95).max(0.1);
+            self.theta = (self.theta * 1.01).min(1.0);
+        }
+        // surprise ∈ [0.5, 1.5]: well-calibrated, no change
+    }
+
+    /// Current theta value (for diagnostics).
+    pub fn theta(&self) -> f64 {
+        self.theta
+    }
+
+    /// Current process noise (for diagnostics).
+    pub fn process_noise(&self) -> f64 {
+        self.process_noise
+    }
+}
+
+impl Default for KalmanDriftEstimator {
+    fn default() -> Self {
+        // theta=0.02 (35s half-life), process_noise=1.0
+        // Stationary variance = 1.0/(2×0.02) = 25.0
+        // Prior variance = 50.0 (2× stationary for cold-start)
+        Self::new(0.02, 1.0)
+    }
+}
+
+// === Legacy estimator kept for feature-gate rollback ===
+
+/// Legacy batch conjugate normal drift estimator (pre-Kalman).
+/// Kept for feature-gate rollback. Use `KalmanDriftEstimator` instead.
+#[derive(Debug, Clone)]
+pub struct LegacyDriftEstimator {
     posterior_mean: f64,
-    /// Posterior precision (1/variance).
     posterior_precision: f64,
-    /// Prior precision — posterior decays toward this between updates.
     prior_precision: f64,
 }
 
-impl DriftEstimator {
-    /// Create a new DriftEstimator with uninformative prior (zero drift).
-    ///
-    /// `prior_precision` controls how quickly the posterior reverts to zero
-    /// when no signals are present. Higher = faster reversion.
+impl LegacyDriftEstimator {
     pub fn new(prior_precision: f64) -> Self {
         Self {
             posterior_mean: 0.0,
@@ -62,29 +323,18 @@ impl DriftEstimator {
         }
     }
 
-    /// Bayesian conjugate normal update: fuse all signal observations.
-    ///
-    /// Posterior = Σ(precision_i × μ_i) / Σ(precision_i)
-    /// where precision_i = 1/variance_i for each signal, plus the prior.
-    ///
-    /// When no signals are provided, posterior reverts to prior (zero drift).
     pub fn update(&mut self, signals: &[SignalObservation]) {
         if signals.is_empty() {
-            // No signals: decay posterior toward prior
-            // Blend: posterior = 0.9 × old_posterior + 0.1 × prior
-            // This gives ~10 update half-life for stale signals
             self.posterior_mean *= 0.9;
             self.posterior_precision = self.prior_precision
                 + 0.9 * (self.posterior_precision - self.prior_precision);
             return;
         }
 
-        // Start with prior: zero mean, prior_precision
         let mut total_precision = self.prior_precision;
-        let mut weighted_sum = 0.0; // prior_mean = 0.0, so prior contribution = 0
+        let mut weighted_sum = 0.0;
 
         for obs in signals {
-            // Skip degenerate observations
             if obs.variance <= 0.0 || !obs.variance.is_finite() || !obs.value_bps_per_sec.is_finite() {
                 continue;
             }
@@ -99,39 +349,25 @@ impl DriftEstimator {
         }
     }
 
-    /// Posterior drift rate in fractional units per second (NOT bps).
-    /// This is what enters the GLFT formula: r = S + μτ − γΣqτ
     pub fn drift_rate_per_sec(&self) -> f64 {
         self.posterior_mean / 10_000.0
     }
 
-    /// Posterior drift in bps/sec (for logging).
     pub fn drift_bps_per_sec(&self) -> f64 {
         self.posterior_mean
     }
 
-    /// Confidence in the drift estimate [0, 1].
-    /// Higher when posterior precision >> prior precision (strong signal agreement).
     pub fn drift_confidence(&self) -> f64 {
         if self.posterior_precision <= self.prior_precision {
             0.0
         } else {
-            // Confidence = 1 - prior_precision/posterior_precision
-            // At prior only: 0.0. With strong signals: approaches 1.0.
             (1.0 - self.prior_precision / self.posterior_precision).clamp(0.0, 1.0)
         }
     }
-
-    /// Posterior precision (for diagnostics).
-    pub fn posterior_precision(&self) -> f64 {
-        self.posterior_precision
-    }
 }
 
-impl Default for DriftEstimator {
+impl Default for LegacyDriftEstimator {
     fn default() -> Self {
-        // Default prior precision: relatively uninformative
-        // 1/100 = variance of 100 bps²/sec² → wide prior
         Self::new(0.01)
     }
 }
@@ -140,128 +376,279 @@ impl Default for DriftEstimator {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_no_signals_returns_zero_drift() {
-        let est = DriftEstimator::default();
-        assert_eq!(est.drift_rate_per_sec(), 0.0);
-        assert_eq!(est.drift_confidence(), 0.0);
+    fn now_ms() -> u64 {
+        1_000_000 // Arbitrary starting time
     }
 
     #[test]
-    fn test_single_signal() {
-        let mut est = DriftEstimator::default();
-        est.update(&[SignalObservation {
-            value_bps_per_sec: 10.0,
-            variance: 100.0,
-        }]);
-        // With prior_precision=0.01 and signal precision=0.01,
-        // posterior = (0.01*0 + 0.01*10) / 0.02 = 5.0 bps/sec
-        let drift = est.drift_bps_per_sec();
-        assert!(drift > 0.0, "Drift should be positive: {drift}");
-        assert!(drift < 10.0, "Drift should be pulled toward zero by prior: {drift}");
-    }
+    fn test_kalman_predict_decays_toward_zero() {
+        let mut est = KalmanDriftEstimator::default();
+        // Set a non-zero drift
+        est.state_mean = 10.0;
+        est.last_update_ms = now_ms();
 
-    #[test]
-    fn test_multiple_signals_precision_weighted() {
-        let mut est = DriftEstimator::new(0.001); // Very weak prior
-        est.update(&[
-            SignalObservation {
-                value_bps_per_sec: 10.0,
-                variance: 10.0, // High precision (0.1)
-            },
-            SignalObservation {
-                value_bps_per_sec: -5.0,
-                variance: 100.0, // Low precision (0.01)
-            },
-        ]);
-        // High-precision signal (10.0) should dominate
-        let drift = est.drift_bps_per_sec();
-        assert!(drift > 0.0, "High-precision positive signal should dominate: {drift}");
-    }
+        // Predict 35 seconds later (one half-life at θ=0.02)
+        est.predict(now_ms() + 35_000);
 
-    #[test]
-    fn test_decay_without_signals() {
-        let mut est = DriftEstimator::default();
-        est.update(&[SignalObservation {
-            value_bps_per_sec: 10.0,
-            variance: 1.0, // Very precise
-        }]);
-        let initial_drift = est.drift_bps_per_sec();
-        assert!(initial_drift > 0.0);
-
-        // Multiple updates with no signals should decay toward zero
-        for _ in 0..50 {
-            est.update(&[]);
-        }
-        let decayed_drift = est.drift_bps_per_sec();
+        // Should decay to ~half (exp(-0.02*35) ≈ 0.497)
         assert!(
-            decayed_drift.abs() < initial_drift.abs() * 0.1,
-            "Drift should decay toward zero: initial={initial_drift}, decayed={decayed_drift}"
+            est.state_mean < 6.0 && est.state_mean > 4.0,
+            "Expected ~5.0 after one half-life, got {}",
+            est.state_mean
         );
     }
 
     #[test]
-    fn test_zero_drift_with_no_input_regression() {
-        // μ=0 regression test: when DriftEstimator receives no signals,
-        // drift_rate_per_sec must be exactly 0.0
-        let est = DriftEstimator::default();
-        assert_eq!(est.drift_rate_per_sec(), 0.0);
-        assert_eq!(est.posterior_mean, 0.0);
+    fn test_kalman_update_moves_toward_observation() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Single precise observation
+        est.update_single_observation(10.0, 5.0);
+
+        assert!(
+            est.state_mean > 0.0,
+            "Should shift toward positive observation: {}",
+            est.state_mean
+        );
+        assert!(
+            est.state_mean < 10.0,
+            "Should be pulled toward zero by prior: {}",
+            est.state_mean
+        );
     }
 
     #[test]
-    fn test_degenerate_observations_ignored() {
-        let mut est = DriftEstimator::default();
-        est.update(&[
-            SignalObservation {
-                value_bps_per_sec: 10.0,
-                variance: 0.0, // Degenerate: zero variance
-            },
-            SignalObservation {
-                value_bps_per_sec: f64::NAN,
-                variance: 100.0, // Degenerate: NaN value
-            },
-            SignalObservation {
-                value_bps_per_sec: 5.0,
-                variance: f64::INFINITY, // Degenerate: infinite variance
-            },
-        ]);
-        // All observations are degenerate → should stay at prior (zero)
-        assert_eq!(est.drift_bps_per_sec(), 0.0);
+    fn test_kalman_fill_observation_bearish() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Bid fill at 99 when mid is 100 → someone sold to us → bearish
+        est.update_fill(true, 99.0, 100.0, 0.001);
+
+        assert!(
+            est.state_mean < 0.0,
+            "Bid fill should produce bearish (negative) drift: {}",
+            est.state_mean
+        );
+    }
+
+    #[test]
+    fn test_kalman_trend_observation_high_agreement() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Strong bearish trend with high agreement
+        est.update_trend(5.0, 0.9, 0.8);
+
+        // z = -5.0 * 0.9 * 0.8 = -3.6, R = 4.0 / 0.81 ≈ 4.94
+        assert!(
+            est.state_mean < 0.0,
+            "Bearish trend should produce negative drift: {}",
+            est.state_mean
+        );
+    }
+
+    #[test]
+    fn test_drift_unclamped_exceeds_3bps() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Multiple strong bearish signals
+        for _ in 0..5 {
+            est.update_single_observation(-10.0, 5.0); // Strong, precise bearish
+        }
+
+        let drift_bps = est.drift_bps_per_sec().abs();
+        assert!(
+            drift_bps > 3.0,
+            "Strong drift should exceed old ±3 cap: {} bps",
+            drift_bps
+        );
+    }
+
+    #[test]
+    fn test_no_signals_decays_via_ou() {
+        let mut est = KalmanDriftEstimator::default();
+        est.state_mean = 10.0;
+        est.last_update_ms = now_ms();
+
+        // 100 seconds of decay (no signals)
+        est.predict(now_ms() + 100_000);
+
+        // exp(-0.02 * 100) = exp(-2) ≈ 0.135
+        assert!(
+            est.state_mean < 2.0,
+            "Should decay significantly via OU: {}",
+            est.state_mean
+        );
+        assert!(
+            est.state_mean > 0.0,
+            "Should still be positive (not zero): {}",
+            est.state_mean
+        );
+    }
+
+    #[test]
+    fn test_p_min_floor_prevents_overconfidence() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Many precise observations — P should not drop below P_MIN
+        for _ in 0..100 {
+            est.update_single_observation(5.0, 1.0);
+        }
+
+        assert!(
+            est.state_variance >= P_MIN,
+            "Variance should not drop below P_MIN: {}",
+            est.state_variance
+        );
     }
 
     #[test]
     fn test_confidence_increases_with_signals() {
-        let mut est = DriftEstimator::default();
-        assert_eq!(est.drift_confidence(), 0.0);
+        let mut est = KalmanDriftEstimator::default();
+        let initial_conf = est.drift_confidence();
+        assert!(initial_conf < 0.01, "Initial confidence should be ~0: {initial_conf}");
 
-        est.update(&[SignalObservation {
-            value_bps_per_sec: 5.0,
-            variance: 10.0,
-        }]);
+        est.last_update_ms = now_ms();
+        est.update_single_observation(5.0, 10.0);
+
         let conf = est.drift_confidence();
-        assert!(conf > 0.0, "Confidence should increase with signal: {conf}");
-        assert!(conf < 1.0, "Confidence should not be 1.0 yet: {conf}");
+        assert!(
+            conf > initial_conf,
+            "Confidence should increase: {} > {}",
+            conf,
+            initial_conf
+        );
     }
 
     #[test]
     fn test_opposing_signals_cancel() {
-        let mut est = DriftEstimator::new(0.001); // Very weak prior
-        est.update(&[
-            SignalObservation {
-                value_bps_per_sec: 10.0,
-                variance: 50.0,
-            },
-            SignalObservation {
-                value_bps_per_sec: -10.0,
-                variance: 50.0,
-            },
-        ]);
-        // Equal and opposite signals should roughly cancel
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        est.update_single_observation(10.0, 5.0);
+        est.update_single_observation(-10.0, 5.0);
+
         assert!(
-            est.drift_bps_per_sec().abs() < 1.0,
-            "Opposing signals should cancel: {}",
-            est.drift_bps_per_sec()
+            est.state_mean.abs() < 3.0,
+            "Opposing signals should roughly cancel: {}",
+            est.state_mean
         );
+    }
+
+    #[test]
+    fn test_degenerate_observations_ignored() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+        let initial = est.state_mean;
+
+        est.update_single_observation(f64::NAN, 5.0);
+        est.update_single_observation(5.0, 0.0);
+        est.update_single_observation(5.0, f64::INFINITY);
+        est.update_single_observation(5.0, -1.0);
+
+        assert_eq!(est.state_mean, initial, "Degenerate observations should be ignored");
+    }
+
+    #[test]
+    fn test_update_with_legacy_signals() {
+        let mut est = KalmanDriftEstimator::default();
+
+        est.update(
+            &[SignalObservation {
+                value_bps_per_sec: 10.0,
+                variance: 100.0,
+            }],
+            now_ms(),
+        );
+
+        assert!(est.state_mean > 0.0, "Legacy signal update should work");
+    }
+
+    #[test]
+    fn test_funding_observation_extreme_bearish() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // funding_zscore = +3.0 → longs paying heavily → expect downward pressure
+        est.update_funding(3.0, 0.5);
+
+        assert!(
+            est.state_mean < 0.0,
+            "High positive funding should produce bearish drift: {}",
+            est.state_mean
+        );
+    }
+
+    #[test]
+    fn test_default_starts_at_zero() {
+        let est = KalmanDriftEstimator::default();
+        assert_eq!(est.drift_rate_per_sec(), 0.0);
+        assert_eq!(est.drift_bps_per_sec(), 0.0);
+    }
+
+    // === Phase 5: Online Parameter Adaptation Tests ===
+
+    #[test]
+    fn test_theta_adapts_on_undershoot() {
+        let mut est = KalmanDriftEstimator::default();
+        let initial_theta = est.theta();
+        let initial_noise = est.process_noise();
+
+        // Large prediction error → surprise > 1.5 → increase noise, decrease theta
+        est.update_parameters(100.0);
+
+        assert!(
+            est.process_noise() > initial_noise,
+            "Large error should increase process_noise"
+        );
+        assert!(
+            est.theta() < initial_theta,
+            "Large error should decrease theta"
+        );
+    }
+
+    #[test]
+    fn test_theta_adapts_on_overshoot() {
+        let mut est = KalmanDriftEstimator::default();
+
+        // Push state_mean close to 10 with high confidence
+        est.state_mean = 10.0;
+        est.state_variance = P_MIN; // minimum variance = high confidence
+
+        let initial_noise = est.process_noise();
+
+        // Tiny prediction error → surprise < 0.5 → decrease noise, increase theta
+        est.update_parameters(10.1);
+
+        assert!(
+            est.process_noise() < initial_noise,
+            "Small error should decrease process_noise: {} vs {}",
+            est.process_noise(), initial_noise
+        );
+    }
+
+    #[test]
+    fn test_parameters_bounded() {
+        let mut est = KalmanDriftEstimator::default();
+
+        // Hammer with large errors to drive noise up
+        for _ in 0..1000 {
+            est.update_parameters(1000.0);
+        }
+        assert!(est.process_noise() <= 10.0, "process_noise bounded at 10.0");
+        assert!(est.theta() >= 0.01, "theta bounded at 0.01");
+
+        // Hammer with tiny errors to drive noise down
+        est.state_mean = 0.0;
+        est.state_variance = P_MIN;
+        for _ in 0..1000 {
+            est.update_parameters(0.0);
+        }
+        assert!(est.process_noise() >= 0.1, "process_noise bounded at 0.1");
+        assert!(est.theta() <= 1.0, "theta bounded at 1.0");
     }
 }

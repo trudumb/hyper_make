@@ -375,7 +375,7 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Timestamp (ms) of last reference perp mid update for dt computation.
     reference_perp_last_update_ms: i64,
     /// Bayesian drift estimator: fuses all directional signals into posterior μ.
-    drift_estimator: strategy::drift_estimator::DriftEstimator,
+    drift_estimator: strategy::drift_estimator::KalmanDriftEstimator,
 
     // === Cancel-on-Toxicity (Session 2 Sprint 2.2) ===
     /// Last time bid ladder was cleared due to high toxicity.
@@ -606,7 +606,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             prev_reference_perp_mid: 0.0,
             reference_perp_drift_ema: 0.0,
             reference_perp_last_update_ms: 0,
-            drift_estimator: strategy::drift_estimator::DriftEstimator::default(),
+            drift_estimator: strategy::drift_estimator::KalmanDriftEstimator::default(),
             last_toxicity_cancel_bid: None,
             last_toxicity_cancel_ask: None,
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),

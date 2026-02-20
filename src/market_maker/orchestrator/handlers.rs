@@ -37,6 +37,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             Message::WebData2(web_data2) => self.handle_web_data2(web_data2),
             Message::UserNonFundingLedgerUpdates(update) => self.handle_ledger_update(update),
+            Message::UserFundings(fundings) => self.handle_user_fundings(fundings),
             _ => Ok(()),
         }
     }
@@ -401,6 +402,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
                 // === PHASE 4: Close measurement loop — feed markout AS to regime state ===
                 self.stochastic.regime_state.params.update_as_from_markout(markout_as_bps);
+
+                // === PHASE 5: Online drift parameter adaptation ===
+                // Feed realized drift (mid movement in bps over markout window) to Kalman
+                // parameter adaptation. This adjusts θ and process_noise for better calibration.
+                let realized_drift_bps_per_sec = if pending.mid_at_fill > 0.0 {
+                    let mid_change_bps = (self.latest_mid - pending.mid_at_fill)
+                        / pending.mid_at_fill * 10_000.0;
+                    // Convert to bps/sec: markout window is 5 seconds
+                    mid_change_bps / 5.0
+                } else {
+                    0.0
+                };
+                self.drift_estimator.update_parameters(realized_drift_bps_per_sec);
 
                 // === PHASE 8: Adaptive spread learning at markout time ===
                 // Moved from fill-time handler where AS was tautological (AS ≈ depth).
@@ -869,16 +883,21 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
+            let fill_price = fill.px.parse().unwrap_or(0.0);
             let fill_event = WsFillEvent {
                 oid: fill.oid,
                 tid: fill.tid,
                 size: fill.sz.parse().unwrap_or(0.0),
-                price: fill.px.parse().unwrap_or(0.0),
+                price: fill_price,
                 is_buy,
                 coin: fill.coin.clone(),
                 cloid: fill.cloid.clone(),
                 timestamp: fill.time,
             };
+
+            // Feed fill to Kalman drift estimator: bid fill → bearish, ask fill → bullish
+            let sigma = self.estimator.sigma_effective();
+            self.drift_estimator.update_fill(is_buy, fill_price, self.latest_mid, sigma);
 
             // Note: ws_state.handle_fill would update position, but position is already
             // updated by the main fill processor. We call it with a no-op tracker.
@@ -1909,6 +1928,39 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Handle user funding settlement events.
+    ///
+    /// Phase 6: Wire UserFundings data feed to FundingRateEstimator.
+    /// This was previously dropped by the wildcard `_ => Ok(())` match arm.
+    fn handle_user_fundings(
+        &mut self,
+        fundings: crate::ws::message_types::UserFundings,
+    ) -> Result<()> {
+        let data = fundings.data;
+        if data.user != self.user_address {
+            return Ok(());
+        }
+
+        for f in &data.fundings {
+            let rate = f.funding_rate.parse::<f64>().unwrap_or(0.0);
+            if rate.abs() < 1e-12 {
+                continue;
+            }
+
+            self.tier2.funding.record_funding(rate, f.time);
+
+            tracing::debug!(
+                coin = %f.coin,
+                rate = %format!("{:.6}", rate),
+                usdc = %f.usdc,
+                time = f.time,
+                "Funding settlement recorded"
+            );
+        }
+
         Ok(())
     }
 
