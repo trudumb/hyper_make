@@ -1019,6 +1019,34 @@ pub struct MarketParams {
     /// When book kappa >> robust kappa (>3x), book shows standing orders
     /// that don't represent real fill intensity. Inflate γ to widen spread.
     pub ghost_liquidity_gamma_mult: f64,
+
+    // ==================== Governor Asymmetric Spread Widening ====================
+    /// Per-side governor spread multiplier for bids [1.0, 3.0].
+    /// When long, bids increase position → widen. When short, stays 1.0.
+    /// Source: InventoryGovernor.assess().increasing_side_spread_mult
+    pub governor_bid_spread_mult: f64,
+    /// Per-side governor spread multiplier for asks [1.0, 3.0].
+    /// When short, asks increase position → widen. When long, stays 1.0.
+    pub governor_ask_spread_mult: f64,
+
+    // ==================== Funding Carry Per-Side ====================
+    /// Funding carry cost for bid side (bps). Positive when longs pay funding.
+    /// At 0.01%/hr funding: ~0.003 bps (negligible). At 1%/hr: ~0.3 bps (meaningful).
+    pub funding_carry_bid_bps: f64,
+    /// Funding carry cost for ask side (bps). Positive when shorts pay funding.
+    pub funding_carry_ask_bps: f64,
+
+    // ==================== Options-Theoretic Volatility Floor ====================
+    /// Dynamic volatility-aware spread floor (bps).
+    /// Formula: safety_mult × sigma × sqrt(tau) × sqrt(2/pi).
+    /// Adapts to volatility — tight in calm, wide in stress.
+    pub option_floor_bps: f64,
+
+    // ==================== Self-Impact Estimator ====================
+    /// Additive spread widening from self-impact (bps).
+    /// Formula: coefficient × (our_fraction)^2.
+    /// At 40% book dominance: ~0.8 bps. At 80%: ~3.2 bps.
+    pub self_impact_addon_bps: f64,
 }
 
 impl Default for MarketParams {
@@ -1302,6 +1330,20 @@ impl Default for MarketParams {
 
             // Fix 3: Ghost liquidity
             ghost_liquidity_gamma_mult: 1.0,
+
+            // Governor Asymmetric Spread Widening
+            governor_bid_spread_mult: 1.0,
+            governor_ask_spread_mult: 1.0,
+
+            // Funding Carry Per-Side
+            funding_carry_bid_bps: 0.0,
+            funding_carry_ask_bps: 0.0,
+
+            // Options-Theoretic Volatility Floor
+            option_floor_bps: 0.0,
+
+            // Self-Impact Estimator
+            self_impact_addon_bps: 0.0,
 
             // Unified Adverse Selection Framework (Phase 4)
             use_epnl_filter: false,

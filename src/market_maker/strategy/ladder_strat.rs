@@ -941,10 +941,15 @@ impl LadderStrategy {
         let fee_bps = self.risk_config.maker_fee_rate * 10_000.0;
         let tick_floor_bps = market_params.tick_size_bps;
         let latency_floor_bps = market_params.latency_spread_floor * 10_000.0;
+
+        // Options-theoretic volatility floor (from market_params, computed by quote_engine).
+        let option_floor_bps = market_params.option_floor_bps;
+
         let effective_floor_bps = fee_bps
             .max(tick_floor_bps)
             .max(latency_floor_bps)
-            .max(self.risk_config.min_spread_floor * 10_000.0);
+            .max(self.risk_config.min_spread_floor * 10_000.0)
+            .max(option_floor_bps);
 
         let params = LadderParams {
             mid_price: effective_mid,
@@ -1099,6 +1104,55 @@ impl LadderStrategy {
                     drift_uncertainty = %format!("{:.2}", market_params.drift_uncertainty_bps),
                     "Drift asymmetry applied (Kalman, unclamped)"
                 );
+            }
+        }
+
+        // === GOVERNOR ASYMMETRIC SPREAD WIDENING ===
+        // Per-side multiplier from InventoryGovernor: increasing side widens, reducing side 1.0.
+        // Applied after drift adjustment so floor enforcement catches both.
+        if market_params.governor_bid_spread_mult > 1.001 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth *= market_params.governor_bid_spread_mult;
+            }
+        }
+        if market_params.governor_ask_spread_mult > 1.001 {
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth *= market_params.governor_ask_spread_mult;
+            }
+        }
+        if market_params.governor_bid_spread_mult > 1.001
+            || market_params.governor_ask_spread_mult > 1.001
+        {
+            tracing::debug!(
+                governor_bid_mult = %format!("{:.2}", market_params.governor_bid_spread_mult),
+                governor_ask_mult = %format!("{:.2}", market_params.governor_ask_spread_mult),
+                "Governor asymmetric spread widening applied"
+            );
+        }
+
+        // === FUNDING CARRY: Per-side cost in GLFT depths ===
+        // Positive funding → longs pay → widen bids. Negative → shorts pay → widen asks.
+        // Applied additively to depths (bps). Typically negligible (<0.1 bps) except during
+        // extreme funding events (>1%/hr) where it adds ~0.3 bps.
+        if market_params.funding_carry_bid_bps > 0.001 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth += market_params.funding_carry_bid_bps;
+            }
+        }
+        if market_params.funding_carry_ask_bps > 0.001 {
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth += market_params.funding_carry_ask_bps;
+            }
+        }
+
+        // Self-impact: additive spread widening when we dominate the book.
+        // Applied symmetrically to both sides (our_fraction is EWMA-smoothed).
+        if market_params.self_impact_addon_bps > 0.001 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth += market_params.self_impact_addon_bps;
+            }
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth += market_params.self_impact_addon_bps;
             }
         }
 
@@ -1474,6 +1528,26 @@ impl LadderStrategy {
                     );
                 }
             }
+
+            // === KELLY SIZING CAP ===
+            // If Kelly sizer is enabled and warmed up, cap total resting size per side
+            // to kelly_fraction × effective_max_position. Quarter-Kelly is the default.
+            // Feature-flagged: kelly_fraction() returns None when disabled or not warmed up.
+            let (available_for_bids, available_for_asks) = if let Some(kelly_f) = self.kelly_fraction() {
+                let kelly_budget = kelly_f * effective_max_position;
+                let capped_bids = available_for_bids.min(kelly_budget);
+                let capped_asks = available_for_asks.min(kelly_budget);
+                tracing::info!(
+                    kelly_fraction = %format!("{:.3}", kelly_f),
+                    kelly_budget = %format!("{:.6}", kelly_budget),
+                    bid_cap = %format!("{:.6} -> {:.6}", available_for_bids, capped_bids),
+                    ask_cap = %format!("{:.6} -> {:.6}", available_for_asks, capped_asks),
+                    "Kelly sizing cap applied"
+                );
+                (capped_bids, capped_asks)
+            } else {
+                (available_for_bids, available_for_asks)
+            };
 
             // === DYNAMIC LEVEL COUNT BASED ON EXCHANGE LIMITS ===
             // When exchange limits are tight, we must reduce the number of levels
@@ -2389,6 +2463,32 @@ impl QuotingStrategy for LadderStrategy {
 
     fn record_quote_cycle_no_fills(&mut self, depths_bps: &[f64]) {
         self.record_no_fill_cycle(depths_bps);
+    }
+
+    fn record_kelly_win(&mut self, win_bps: f64) {
+        self.kelly_sizer.record_win(win_bps);
+    }
+
+    fn record_kelly_loss(&mut self, loss_bps: f64) {
+        self.kelly_sizer.record_loss(loss_bps);
+    }
+
+    fn kelly_fraction(&self) -> Option<f64> {
+        if !self.kelly_sizer.enabled || !self.kelly_sizer.is_warmed_up() {
+            return None;
+        }
+        // Use realized win/loss statistics for Kelly fraction.
+        // Edge estimate: mean_win × win_rate - mean_loss × loss_rate
+        let tracker = &self.kelly_sizer.win_loss_tracker;
+        let edge_mean = tracker.avg_win() * tracker.win_rate()
+            - tracker.avg_loss() * (1.0 - tracker.win_rate());
+        let edge_std = (tracker.avg_win() + tracker.avg_loss()) * 0.5; // rough estimate
+        let (should_size, fraction, _confidence) = self.kelly_sizer.sizing_decision(edge_mean, edge_std);
+        if should_size {
+            Some(fraction)
+        } else {
+            None
+        }
     }
 }
 

@@ -2,6 +2,79 @@
 
 use chrono::{Timelike, Utc};
 
+/// Options-theoretic volatility floor for spread computation.
+///
+/// A market maker posting both bid and ask is implicitly short a straddle.
+/// The expected absolute move (simplified straddle premium) is:
+///   `premium = sigma × sqrt(tau) × sqrt(2/pi)`
+///
+/// where sigma is volatility (per-second) and tau is expected holding time (seconds).
+/// Quoting tighter than `safety_mult × premium` guarantees expected loss.
+///
+/// Feature-flagged: `enabled: false` by default for safe rollout.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OptionFloor {
+    /// Whether the options-theoretic floor is enabled.
+    /// When false, falls back to static min_spread_floor.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Minimum time horizon tau for floor computation (seconds).
+    /// Prevents floor from collapsing to zero in fast markets.
+    /// Default: 1.0 second.
+    #[serde(default = "default_option_floor_min_tau")]
+    pub min_tau_s: f64,
+
+    /// Safety multiplier applied to the straddle premium.
+    /// 1.0 = break-even, 1.5 = 50% safety margin (recommended).
+    /// Compensates for model risk, transaction costs, and adverse selection.
+    #[serde(default = "default_option_floor_safety_mult")]
+    pub safety_mult: f64,
+}
+
+impl Default for OptionFloor {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_tau_s: default_option_floor_min_tau(),
+            safety_mult: default_option_floor_safety_mult(),
+        }
+    }
+}
+
+impl OptionFloor {
+    /// Compute the options-theoretic spread floor in fractional terms.
+    ///
+    /// Returns: `safety_mult × sigma × sqrt(max(tau, min_tau)) × sqrt(2/pi)`
+    ///
+    /// Examples (sigma in per-second fractional, tau in seconds):
+    /// - sigma=0.0002 (2 bps/√s), tau=10s → 7.6 bps (reasonable)
+    /// - sigma=0.001 (10 bps/√s), tau=10s → 37.8 bps (defensive in stress)
+    /// - sigma=0.00005 (0.5 bps/√s), tau=10s → 1.9 bps (tight in calm)
+    pub fn compute_floor(&self, sigma: f64, tau_s: f64) -> f64 {
+        if !self.enabled || sigma <= 0.0 {
+            return 0.0;
+        }
+        let effective_tau = tau_s.max(self.min_tau_s);
+        // sqrt(2/pi) ≈ 0.7979
+        const SQRT_2_OVER_PI: f64 = 0.7978845608028654;
+        self.safety_mult * sigma * effective_tau.sqrt() * SQRT_2_OVER_PI
+    }
+
+    /// Compute the floor in basis points.
+    pub fn compute_floor_bps(&self, sigma: f64, tau_s: f64) -> f64 {
+        self.compute_floor(sigma, tau_s) * 10_000.0
+    }
+}
+
+fn default_option_floor_min_tau() -> f64 {
+    1.0
+}
+
+fn default_option_floor_safety_mult() -> f64 {
+    1.5
+}
+
 /// Configuration for dynamic risk aversion scaling.
 ///
 /// All parameters are explicit for future online optimization.
@@ -210,6 +283,15 @@ pub struct RiskConfig {
     /// Default: 50.
     #[serde(default = "default_min_observations_for_elasticity")]
     pub min_observations_for_elasticity: usize,
+
+    // ==================== Options-Theoretic Volatility Floor ====================
+    // FIRST PRINCIPLES: A market maker selling both sides is implicitly short a straddle.
+    // The fair premium for a short-dated straddle is: σ × √τ × √(2/π).
+    // Quoting tighter than this premium guarantees expected loss from adverse price movement.
+    // This replaces the static min_spread_floor with a volatility-adaptive floor.
+    /// Options-theoretic spread floor configuration.
+    #[serde(default)]
+    pub option_floor: OptionFloor,
 }
 
 fn default_inventory_beta() -> f64 {
@@ -463,6 +545,8 @@ impl Default for RiskConfig {
             use_monopolist_pricing: false,
             monopolist_markup_cap_bps: 5.0,
             min_observations_for_elasticity: 50,
+            // Options-theoretic volatility floor: DISABLED by default for safe rollout
+            option_floor: OptionFloor::default(),
         }
     }
 }
@@ -517,6 +601,8 @@ impl RiskConfig {
             use_monopolist_pricing: true,
             monopolist_markup_cap_bps: 5.0,
             min_observations_for_elasticity: 50,
+            // Options-theoretic volatility floor: DISABLED by default
+            option_floor: OptionFloor::default(),
         }
     }
 }

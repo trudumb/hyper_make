@@ -771,6 +771,20 @@ impl ParameterAggregator {
             // Fix 3: Ghost liquidity — populated by quote engine from kappa orchestrator
             ghost_liquidity_gamma_mult: 1.0,
 
+            // Governor asymmetric spread widening — populated by quote_engine from InventoryGovernor
+            governor_bid_spread_mult: 1.0,
+            governor_ask_spread_mult: 1.0,
+
+            // Funding carry per-side — populated by quote_engine from funding estimator
+            funding_carry_bid_bps: 0.0,
+            funding_carry_ask_bps: 0.0,
+
+            // Options-theoretic volatility floor — populated by quote_engine
+            option_floor_bps: 0.0,
+
+            // Self-impact addon — populated by quote_engine from SelfImpactEstimator
+            self_impact_addon_bps: 0.0,
+
             // === Unified Adverse Selection Framework (Phase 4) ===
             // E[PnL] filter: default off during dual-run validation
             use_epnl_filter: false,

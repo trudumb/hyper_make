@@ -280,19 +280,23 @@ impl MicropriceEstimator {
     pub(crate) fn on_book_update(
         &mut self,
         timestamp_ms: u64,
+        bids: &[(f64, f64)],
+        asks: &[(f64, f64)],
         mid: f64,
-        book_imbalance: f64,
         flow_imbalance: f64,
     ) {
+        // Calculate multi-layer Volume-Weighted Mid (VWM) and Book Imbalance
+        let (vwm, multi_depth_imbalance) = Self::compute_multi_layer_features(bids, asks, mid);
+
         // 1. Process pending observations that have reached forward horizon
-        self.process_completed(timestamp_ms, mid);
+        self.process_completed(timestamp_ms, vwm);
 
         // 2. Add new observation
         self.pending.push_back(MicropriceObservation {
             timestamp_ms,
-            book_imbalance,
+            book_imbalance: multi_depth_imbalance,
             flow_imbalance,
-            mid,
+            mid: vwm,
         });
 
         // 3. Expire old data outside regression window
@@ -300,6 +304,63 @@ impl MicropriceEstimator {
 
         // 4. Update regression coefficients
         self.update_betas();
+    }
+
+    /// Compute multi-layer volume-weighted mid and multi-depth imbalance.
+    /// Upgrades the estimator from simple midpoint to VWM and multi-depth BIM.
+    fn compute_multi_layer_features(bids: &[(f64, f64)], asks: &[(f64, f64)], mid: f64) -> (f64, f64) {
+        if bids.is_empty() || asks.is_empty() || mid <= 0.0 {
+            return (mid, 0.0);
+        }
+
+        // 1. Volume-Weighted Mid (VWM) over the top 3 levels
+        let mut bid_vol = 0.0;
+        let mut ask_vol = 0.0;
+        let mut bid_px_vol = 0.0;
+        let mut ask_px_vol = 0.0;
+        
+        for bid in bids.iter().take(3) {
+            bid_vol += bid.1;
+            bid_px_vol += bid.0 * bid.1;
+        }
+        for ask in asks.iter().take(3) {
+            ask_vol += ask.1;
+            ask_px_vol += ask.0 * ask.1;
+        }
+        
+        let avg_bid = if bid_vol > 0.0 { bid_px_vol / bid_vol } else { bids[0].0 };
+        let avg_ask = if ask_vol > 0.0 { ask_px_vol / ask_vol } else { asks[0].0 };
+        
+        let total_vol = bid_vol + ask_vol;
+        let vwm = if total_vol > 0.0 {
+            (avg_bid * ask_vol + avg_ask * bid_vol) / total_vol
+        } else {
+            mid
+        };
+        
+        // 2. Multi-depth weighting for imbalance (exponential decay weight by distance)
+        let mut bid_depth_weighted = 0.0;
+        let mut ask_depth_weighted = 0.0;
+        
+        for &(px, sz) in bids {
+            let dist_bps = ((mid - px) / mid) * 10_000.0;
+            let w = (-dist_bps * 0.1).exp().max(0.01); 
+            bid_depth_weighted += sz * w;
+        }
+        
+        for &(px, sz) in asks {
+            let dist_bps = ((px - mid) / mid) * 10_000.0;
+            let w = (-dist_bps * 0.1).exp().max(0.01);
+            ask_depth_weighted += sz * w;
+        }
+        
+        let multi_depth_imbalance = if bid_depth_weighted + ask_depth_weighted > 0.0 {
+            (bid_depth_weighted - ask_depth_weighted) / (bid_depth_weighted + ask_depth_weighted)
+        } else {
+            0.0
+        };
+
+        (vwm, multi_depth_imbalance)
     }
 
     /// Match completed observations with their realized returns.

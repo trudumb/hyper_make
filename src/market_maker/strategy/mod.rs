@@ -141,6 +141,30 @@ pub trait QuotingStrategy: Send + Sync {
     fn record_elasticity_observation(&mut self, _spread_bps: f64, _fill_rate: f64) {
         // Default: no-op for strategies without elasticity models
     }
+
+    /// Record a winning fill outcome for Kelly sizing.
+    ///
+    /// Called when a fill's markout is positive (we captured edge).
+    /// The win amount is the edge in basis points.
+    fn record_kelly_win(&mut self, _win_bps: f64) {
+        // Default: no-op for strategies without Kelly sizers
+    }
+
+    /// Record a losing fill outcome for Kelly sizing.
+    ///
+    /// Called when a fill's markout is negative (we suffered adverse selection).
+    /// The loss amount is the adverse selection in basis points (positive value).
+    fn record_kelly_loss(&mut self, _loss_bps: f64) {
+        // Default: no-op for strategies without Kelly sizers
+    }
+
+    /// Get current Kelly sizing fraction [0, 1].
+    ///
+    /// Returns None if Kelly is disabled or not warmed up.
+    /// Quarter-Kelly (0.25 × f*) is the default when enabled.
+    fn kelly_fraction(&self) -> Option<f64> {
+        None // Default: Kelly disabled
+    }
 }
 
 /// Blanket implementation for Box<dyn QuotingStrategy>.
@@ -201,6 +225,18 @@ impl QuotingStrategy for Box<dyn QuotingStrategy> {
 
     fn record_elasticity_observation(&mut self, spread_bps: f64, fill_rate: f64) {
         (**self).record_elasticity_observation(spread_bps, fill_rate)
+    }
+
+    fn record_kelly_win(&mut self, win_bps: f64) {
+        (**self).record_kelly_win(win_bps)
+    }
+
+    fn record_kelly_loss(&mut self, loss_bps: f64) {
+        (**self).record_kelly_loss(loss_bps)
+    }
+
+    fn kelly_fraction(&self) -> Option<f64> {
+        (**self).kelly_fraction()
     }
 }
 

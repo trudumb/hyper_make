@@ -143,6 +143,13 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Accessible by reconciler and other components that don't receive MarketParams.
     capital_policy: config::CapitalAwarePolicy,
 
+    /// Options-theoretic volatility floor config.
+    /// Stored on MarketMaker because the strategy trait is generic (no risk_config access).
+    option_floor: strategy::OptionFloor,
+
+    /// Self-impact estimator: tracks our book dominance and computes spread addon.
+    self_impact: estimator::self_impact::SelfImpactEstimator,
+
     // === Bootstrap from Book ===
     /// L2-derived market microstructure profile for kappa/sigma estimation.
     /// Fed by handle_l2_book(), seeds CalibrationCoordinator during warmup.
@@ -524,6 +531,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             stochastic,
             inventory_governor,
             capital_policy: config::CapitalAwarePolicy::default(),
+            option_floor: strategy::OptionFloor::default(),
+            self_impact: estimator::self_impact::SelfImpactEstimator::new(
+                estimator::self_impact::SelfImpactConfig::default(),
+            ),
             market_profile: estimator::market_profile::MarketProfile::new(),
             calibration_coordinator: estimator::calibration_coordinator::CalibrationCoordinator::new(),
             effective_max_position,
@@ -620,6 +631,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Set the dynamic risk configuration.
     pub fn with_dynamic_risk_config(mut self, config: DynamicRiskConfig) -> Self {
         self.stochastic.dynamic_risk_config = config;
+        self
+    }
+
+    /// Configure options-theoretic volatility floor.
+    pub fn with_option_floor(mut self, option_floor: strategy::OptionFloor) -> Self {
+        self.option_floor = option_floor;
+        self
+    }
+
+    /// Configure self-impact estimator.
+    pub fn with_self_impact(mut self, config: estimator::self_impact::SelfImpactConfig) -> Self {
+        self.self_impact = estimator::self_impact::SelfImpactEstimator::new(config);
         self
     }
 

@@ -23,6 +23,7 @@ use super::{EstimatorConfig, EstimatorV2Flags, MarketEstimator, VolatilityRegime
 use super::as_decomposition::{ASDecomposition, FillInfo as ASFillInfo};
 use super::fill_rate_model::{FillObservation, FillRateModel, MarketState as FillRateMarketState};
 use super::informed_flow::{InformedFlowEstimator, TradeFeatures};
+use super::latent_filter::LatentStateFilter;
 use super::volatility_filter::VolatilityFilter;
 use crate::market_maker::latent::{
     EdgeObservation, EdgeSurface, JointDynamics, JointObservation, MarketCondition,
@@ -156,6 +157,9 @@ pub struct ParameterEstimator {
     /// Force warmup complete (set by timeout fallback)
     warmup_override: bool,
 
+    /// Unscented Kalman Filter tracking V, mu, sigma natively
+    pub latent_filter: LatentStateFilter,
+
     // === Adaptive Kappa Prior ===
     /// Adapted kappa prior mean, initialized from config and slowly blended
     /// toward observed market kappa. Used by `dynamic_kappa_floor()` and
@@ -269,6 +273,7 @@ impl ParameterEstimator {
 
         // Multi-timeframe trend tracker (30s + 5min windows, underwater P&L tracking)
         let trend_tracker = TrendPersistenceTracker::new(TrendConfig::default());
+        let latent_filter = LatentStateFilter::new();
 
         // Capture prior mean before config is moved into Self
         let initial_kappa_prior = config.kappa_prior_mean;
@@ -317,6 +322,7 @@ impl ParameterEstimator {
             edge_surface: EdgeSurface::default_config(),
             last_trade_time_ms: 0,
             warmup_override: false,
+            latent_filter,
             // Adaptive kappa prior — starts at config value, adapts toward market
             adapted_kappa_prior: initial_kappa_prior,
             prior_adaptation_count: 0,
@@ -623,6 +629,15 @@ impl ParameterEstimator {
         };
         self.as_decomposition.on_fill(&fill_info);
 
+        // 1.5 Update Latent Filter with own fill (Glosten-Milgrom observation)
+        let depth_bps = if self.current_mid > 0.0 {
+            ((placement_price - self.current_mid).abs() / self.current_mid) * 10_000.0
+        } else {
+            5.0 // Default to 5 bps if no mid
+        };
+        let p_informed = self.informed_flow.decomposition().p_informed;
+        self.latent_filter.glosten_milgrom_update(timestamp_ms, is_buy, p_informed, depth_bps * 2.0);
+
         // 2. Feed fill rate model
         // Calculate depth from placement price vs mid
         let depth_bps = if self.current_mid > 0.0 {
@@ -695,10 +710,15 @@ impl ParameterEstimator {
         // Feed microprice estimator with current signals
         self.microprice_estimator.on_book_update(
             self.current_time_ms,
+            bids,
+            asks,
             mid,
-            self.book_structure.imbalance(),
             self.flow.imbalance(),
         );
+
+        // Update Latent Filter with observation
+        let r_noise = 1.0; 
+        self.latent_filter.update_microprice(self.current_time_ms, self.microprice(), r_noise);
 
         // === Hierarchical Kappa: Update market kappa as prior (always active) ===
         let market_kappa = self.market_kappa.posterior_mean();

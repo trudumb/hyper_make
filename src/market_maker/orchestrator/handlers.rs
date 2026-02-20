@@ -474,6 +474,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     );
                 }
 
+                // === Kelly Sizing: feed markout-based win/loss ===
+                // Positive realized edge = win (we captured spread minus AS minus fees).
+                // Negative = loss. Uses markout-based edge, not fill-time edge.
+                if fill_pnl_bps > 0.0 {
+                    self.strategy.record_kelly_win(fill_pnl_bps);
+                } else if fill_pnl_bps < 0.0 {
+                    self.strategy.record_kelly_loss(-fill_pnl_bps); // loss as positive magnitude
+                }
+
                 tracing::info!(
                     spread_bps = %format!("{:.2}", pending.quoted_spread_bps),
                     markout_as_bps = %format!("{:.2}", markout_as_bps),
@@ -1408,6 +1417,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     bid_depth_shallow, ask_depth_shallow,
                     bid_depth_deep, ask_depth_deep,
                 );
+            }
+
+            // === Self-Impact Estimator: Feed book depth + our resting sizes ===
+            // L2 depth includes our own orders, so subtract to get other-participant depth.
+            {
+                let (our_bid_size, our_ask_size) = self.orders.pending_exposure();
+                let total_bid_depth: f64 = bids.iter().map(|(_, sz)| sz).sum();
+                let total_ask_depth: f64 = asks.iter().map(|(_, sz)| sz).sum();
+                let other_bid_depth = (total_bid_depth - our_bid_size).max(0.0);
+                let other_ask_depth = (total_ask_depth - our_ask_size).max(0.0);
+                self.self_impact.update(our_bid_size, other_bid_depth, our_ask_size, other_ask_depth);
             }
 
             // === Phase 3: Pre-Fill AS Classifier - Orderbook Imbalance Update ===

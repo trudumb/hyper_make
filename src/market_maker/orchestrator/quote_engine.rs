@@ -205,23 +205,45 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let mut risk_size_reduction = 1.0_f64;
         let mut risk_reduce_only = false;
 
+        // === Governor per-side asymmetric spread widening ===
+        // Long position → bids increase exposure → widen bids only.
+        // Short position → asks increase exposure → widen asks only.
+        // Reducing side stays at 1.0 (no penalty for reducing position).
+        let mut governor_bid_mult = 1.0_f64;
+        let mut governor_ask_mult = 1.0_f64;
+        let current_position = self.position.position();
+
         // Yellow zone: widen increasing side, cap exposure
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Yellow {
-            risk_overlay_mult *= position_assessment.increasing_side_spread_mult;
+            if current_position > 0.0 {
+                // Long: bids increase position
+                governor_bid_mult = position_assessment.increasing_side_spread_mult;
+            } else if current_position < 0.0 {
+                // Short: asks increase position
+                governor_ask_mult = position_assessment.increasing_side_spread_mult;
+            }
             debug!(
                 zone = "Yellow",
-                spread_mult = %format!("{:.2}", position_assessment.increasing_side_spread_mult),
+                position = %format!("{:.4}", current_position),
+                governor_bid_mult = %format!("{:.2}", governor_bid_mult),
+                governor_ask_mult = %format!("{:.2}", governor_ask_mult),
                 max_new_exposure = %format!("{:.4}", position_assessment.max_new_exposure),
-                "InventoryGovernor: Yellow zone — widening increasing side"
+                "InventoryGovernor: Yellow zone — asymmetric widening"
             );
         }
-        // Red zone: reduce-only
+        // Red zone: reduce-only + widen increasing side
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Red {
             risk_reduce_only = true;
-            risk_overlay_mult *= position_assessment.increasing_side_spread_mult;
+            if current_position > 0.0 {
+                governor_bid_mult = position_assessment.increasing_side_spread_mult;
+            } else if current_position < 0.0 {
+                governor_ask_mult = position_assessment.increasing_side_spread_mult;
+            }
             info!(
                 zone = "Red",
-                "InventoryGovernor: Red zone — reduce-only mode"
+                governor_bid_mult = %format!("{:.2}", governor_bid_mult),
+                governor_ask_mult = %format!("{:.2}", governor_ask_mult),
+                "InventoryGovernor: Red zone — reduce-only mode + asymmetric widening"
             );
         }
 
@@ -880,6 +902,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Holding period ≈ 1/kappa seconds (expected time to fill)
             let tau_holding = 1.0 / market_params.kappa.max(100.0);
             market_params.funding_carry_bps = funding_rate * tau_holding * 10_000.0;
+
+            // Per-side funding carry for GLFT half-spread asymmetry:
+            // Positive funding rate → longs pay → penalize bids (buying increases long exposure)
+            // Negative funding rate → shorts pay → penalize asks (selling increases short exposure)
+            let carry_bps = funding_rate * tau_holding * 10_000.0;
+            market_params.funding_carry_bid_bps = carry_bps.max(0.0);
+            market_params.funding_carry_ask_bps = (-carry_bps).max(0.0);
         }
 
         // === Phase 8: Warm-tier features (every 2 cycles) ===
@@ -2627,6 +2656,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 return Ok(());
             }
         }
+
+        // Wire governor per-side spread mults to market_params for ladder consumption
+        market_params.governor_bid_spread_mult = governor_bid_mult;
+        market_params.governor_ask_spread_mult = governor_ask_mult;
+
+        // Per-side funding carry is already set on market_params in the funding section above.
+
+        // Compute options-theoretic volatility floor (σ × √τ × √(2/π) × safety_mult)
+        // Using expected holding time 1/kappa as tau, consistent with GLFT.
+        let tau_for_floor = 1.0 / market_params.kappa.max(100.0);
+        market_params.option_floor_bps = self.option_floor.compute_floor_bps(
+            market_params.sigma_effective,
+            tau_for_floor,
+        );
+
+        // Self-impact: additive spread widening based on our book dominance.
+        // Coefficient × fraction² (square-root impact law).
+        market_params.self_impact_addon_bps = self.self_impact.impact_addon_bps();
 
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
