@@ -1217,6 +1217,21 @@ impl ParameterEstimator {
         self.microprice_estimator.is_warmed_up()
     }
 
+    /// GM (Glosten-Milgrom) fill update on microprice V̂.
+    ///
+    /// Routes fill events to the internal MicropriceEstimator for
+    /// adversarial fair value updating. See `MicropriceEstimator::update_from_fill`.
+    pub fn update_microprice_from_fill(
+        &mut self,
+        fill_price: f64,
+        mid: f64,
+        is_ask_fill: bool,
+        p_informed: f64,
+        now_ms: u64,
+    ) {
+        self.microprice_estimator.update_from_fill(fill_price, mid, is_ask_fill, p_informed, now_ms);
+    }
+
     // === Regime Detection ===
 
     /// Get fast RV/BV jump ratio.

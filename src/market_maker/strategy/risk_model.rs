@@ -131,8 +131,10 @@ impl Default for CalibratedRiskModel {
             beta_volatility: 1.0,
             // toxicity=1 → exp(0.5) ≈ 1.65× gamma
             beta_toxicity: 0.5,
-            // full inventory → exp(0.3) ≈ 1.35× gamma
-            beta_inventory: 0.3,
+            // DISABLED: inventory scaling now handled by continuous γ(q) = γ_base × (1 + β×u²)
+            // in effective_gamma(). Setting non-zero here would double-count inventory.
+            // See effective_gamma() in glft.rs for the quadratic inventory scaling.
+            beta_inventory: 0.0,
             // 100% excess intensity → exp(0.4) ≈ 1.5× gamma
             beta_hawkes: 0.4,
             // empty book → exp(0.3) ≈ 1.35× gamma
@@ -178,7 +180,8 @@ impl CalibratedRiskModel {
             log_gamma_base: 0.20_f64.ln(), // Higher base during warmup
             beta_volatility: 1.5,          // 50% more conservative
             beta_toxicity: 0.75,
-            beta_inventory: 0.45,
+            // DISABLED: inventory scaling handled by continuous γ(q) quadratic in glft.rs
+            beta_inventory: 0.0,
             beta_hawkes: 0.6,
             beta_book_depth: 0.45,
             beta_uncertainty: 0.3,

@@ -924,6 +924,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let sigma = self.estimator.sigma_effective();
             self.drift_estimator.update_fill(is_buy, fill_price, self.latest_mid, sigma);
 
+            // GM fill update on microprice V̂: adversarial evidence shifts fair value
+            // Ask fill (they bought from us) → V̂ shifts upward
+            // Bid fill (they sold to us) → V̂ shifts downward
+            let is_ask_fill = !is_buy; // Our ask was hit = we sold = they bought
+            let fill_now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            // Use dynamic p_informed from InformedFlowEstimator (adaptive, not hardcoded)
+            let p_informed = self.estimator.p_informed();
+            self.estimator.update_microprice_from_fill(
+                fill_price,
+                self.latest_mid,
+                is_ask_fill,
+                p_informed,
+                fill_now_ms,
+            );
+
             // Note: ws_state.handle_fill would update position, but position is already
             // updated by the main fill processor. We call it with a no-op tracker.
             // The main benefit is order state tracking and dedup validation.

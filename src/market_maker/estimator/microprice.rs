@@ -146,6 +146,22 @@ pub(crate) struct MicropriceEstimator {
     /// When depth is between min_depth_usd and full_depth_usd, dampen imbalance adjustment.
     /// Default: $5000 (full confidence above this)
     full_depth_usd: f64,
+
+    // === GM Fill Bias (Glosten-Milgrom adversarial updating) ===
+    // When our quote is filled, the filler had information that fair value
+    // was beyond our quote:
+    //   - Ask fill at price P → V̂ should shift UP  (buyer knew V > P)
+    //   - Bid fill at price P → V̂ should shift DOWN (seller knew V < P)
+    //
+    // GM update: fill_bias += π̂ × (fill_price - mid) / mid
+    // where π̂ ∈ [0, 1] is estimated informed fraction (~0.3 default).
+    // Decays exponentially with half-life of ~10 seconds.
+    /// Accumulated Glosten-Milgrom fill bias (fractional, e.g. +0.0002 = +2 bps).
+    fill_bias_frac: f64,
+    /// Timestamp of last fill bias update (for exponential decay).
+    fill_bias_last_ms: u64,
+    /// Half-life of fill bias decay in milliseconds.
+    fill_bias_halflife_ms: f64,
 }
 
 impl MicropriceEstimator {
@@ -195,6 +211,10 @@ impl MicropriceEstimator {
             // Depth gating defaults (thin DEX environment)
             min_depth_usd: 1000.0,  // Minimum $1000 depth to use imbalance
             full_depth_usd: 5000.0, // Full confidence above $5000
+            // GM fill bias defaults
+            fill_bias_frac: 0.0,
+            fill_bias_last_ms: 0,
+            fill_bias_halflife_ms: 10_000.0, // 10 seconds
         }
     }
 
@@ -274,6 +294,95 @@ impl MicropriceEstimator {
     #[allow(dead_code)]
     pub(crate) fn forward_horizon_ms(&self) -> u64 {
         self.forward_horizon_ms
+    }
+
+    /// GM (Glosten-Milgrom) fill update: shift V̂ based on adversarial fill evidence.
+    ///
+    /// Theory: When our quote is filled, the counterparty had information about
+    /// fair value being beyond our quote price. This is an adversarial signal.
+    ///
+    /// - Ask fill at price P: buyer knew V ≥ P → V̂ shifts upward
+    /// - Bid fill at price P: seller knew V ≤ P → V̂ shifts downward
+    ///
+    /// Update: fill_bias += π̂ × (fill_price - mid) / mid
+    /// where π̂ is the dynamic informed fraction from InformedFlowEstimator.
+    ///
+    /// The bias decays exponentially with configurable half-life.
+    ///
+    /// # Arguments
+    /// * `fill_price` - Price at which our order was filled
+    /// * `mid` - Current mid price
+    /// * `is_ask_fill` - True if our ask was hit (we sold)
+    /// * `p_informed` - Dynamic informed fraction [0, 1] from InformedFlowEstimator
+    /// * `now_ms` - Current timestamp in milliseconds
+    pub(crate) fn update_from_fill(
+        &mut self,
+        fill_price: f64,
+        mid: f64,
+        is_ask_fill: bool,
+        p_informed: f64,
+        now_ms: u64,
+    ) {
+        if mid <= 0.0 || fill_price <= 0.0 {
+            return;
+        }
+
+        // First decay existing bias
+        self.decay_fill_bias(now_ms);
+
+        // Use dynamic p_informed, floored at 0.01 (always some informed component)
+        // and capped at 0.5 (even in toxic flow, not all fills are informed)
+        let pi_hat = p_informed.clamp(0.01, 0.5);
+
+        // GM update: shift V̂ in the direction of adversarial evidence
+        // Ask fill → buyer knew fair value was higher → positive shift
+        // Bid fill → seller knew fair value was lower → negative shift
+        let sign = if is_ask_fill { 1.0 } else { -1.0 };
+        let distance_frac = ((fill_price - mid) / mid).abs();
+
+        // Scale by informed fraction and clamp individual update
+        let shift = sign * pi_hat * distance_frac;
+        let shift_clamped = shift.clamp(-0.0005, 0.0005); // Max ±5 bps per fill
+
+        self.fill_bias_frac += shift_clamped;
+
+        // Clamp total accumulated bias to ±20 bps
+        self.fill_bias_frac = self.fill_bias_frac.clamp(-0.002, 0.002);
+
+        self.fill_bias_last_ms = now_ms;
+
+        debug!(
+            fill_price = %format!("{:.4}", fill_price),
+            mid = %format!("{:.4}", mid),
+            is_ask = is_ask_fill,
+            pi_hat = %format!("{:.3}", pi_hat),
+            shift_bps = %format!("{:.2}", shift_clamped * 10_000.0),
+            total_bias_bps = %format!("{:.2}", self.fill_bias_frac * 10_000.0),
+            "GM fill bias update"
+        );
+    }
+
+    /// Decay fill bias exponentially toward zero.
+    fn decay_fill_bias(&mut self, now_ms: u64) {
+        if self.fill_bias_last_ms == 0 || self.fill_bias_frac.abs() < 1e-10 {
+            return;
+        }
+
+        let dt_ms = now_ms.saturating_sub(self.fill_bias_last_ms) as f64;
+        if dt_ms <= 0.0 {
+            return;
+        }
+
+        // Exponential decay: bias × 2^(-dt/halflife)
+        let decay = (-dt_ms * (2.0_f64.ln()) / self.fill_bias_halflife_ms).exp();
+        self.fill_bias_frac *= decay;
+        self.fill_bias_last_ms = now_ms;
+    }
+
+    /// Get current fill bias in fractional terms (for diagnostics).
+    #[allow(dead_code)]
+    pub(crate) fn fill_bias_bps(&self) -> f64 {
+        self.fill_bias_frac * 10_000.0
     }
 
     /// Update with new book state.
@@ -715,8 +824,11 @@ impl MicropriceEstimator {
             }
         };
 
+        // Add GM fill bias (Glosten-Milgrom adversarial evidence from own fills)
+        let adjustment_with_fill = adjustment + self.fill_bias_frac;
+
         // Clamp adjustment to ±50 bps for safety
-        let adjustment_clamped = adjustment.clamp(-0.005, 0.005);
+        let adjustment_clamped = adjustment_with_fill.clamp(-0.005, 0.005);
 
         let raw_microprice = mid * (1.0 + adjustment_clamped);
 
@@ -830,8 +942,12 @@ impl MicropriceEstimator {
         // Apply depth dampening: thin books get reduced adjustment
         let dampened_adjustment = adjustment * dampening;
 
+        // Add GM fill bias — fill evidence is depth-independent
+        // (adversarial information from fills is valid regardless of book depth)
+        let dampened_with_fill = dampened_adjustment + self.fill_bias_frac;
+
         // Clamp adjustment to ±50 bps for safety
-        let adjustment_clamped = dampened_adjustment.clamp(-0.005, 0.005);
+        let adjustment_clamped = dampened_with_fill.clamp(-0.005, 0.005);
 
         let raw_microprice = mid * (1.0 + adjustment_clamped);
 

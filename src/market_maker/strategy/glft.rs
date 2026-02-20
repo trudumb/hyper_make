@@ -407,13 +407,28 @@ impl GLFTStrategy {
         let gamma_base = self.risk_model.compute_gamma(&features);
 
         // ============================================================
+        // CONTINUOUS γ(q) INVENTORY SCALING (RFC §4)
+        // ============================================================
+        // γ(q) = γ_base × (1 + β × (q/q_max)²)
+        // Replaces discrete position zones with smooth, convex scaling.
+        // At β=7.0: 60%→3.52×, 80%→4.92×, 100%→8.0×.
+        // Quadratic in utilization ensures gentle near zero, aggressive near limits.
+        let q_ratio = if max_position > 1e-9 {
+            (position.abs() / max_position).min(1.0)
+        } else {
+            0.0
+        };
+        let inventory_mult = 1.0 + cfg.inventory_beta * q_ratio.powi(2);
+        let gamma_inventory = gamma_base * inventory_mult;
+
+        // ============================================================
         // PHYSICALLY MOTIVATED POST-PROCESS (kept for explicit control)
         // ============================================================
 
         // Drawdown: increase γ when losing money (more conservative).
         // At 5% drawdown: ×1.1. At 10%: ×1.2. Smooth linear ramp.
         let drawdown_mult = 1.0 + market_params.current_drawdown_frac * 2.0;
-        let gamma_with_drawdown = gamma_base * drawdown_mult;
+        let gamma_with_drawdown = gamma_inventory * drawdown_mult;
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
         //
@@ -446,12 +461,15 @@ impl GLFTStrategy {
 
         debug!(
             gamma_calibrated = %format!("{:.4}", gamma_base),
+            q_ratio = %format!("{:.3}", q_ratio),
+            inventory_beta = %format!("{:.1}", cfg.inventory_beta),
+            inventory_mult = %format!("{:.3}", inventory_mult),
             drawdown_mult = %format!("{:.3}", drawdown_mult),
             regime_mult = %format!("{:.3}", market_params.regime_gamma_multiplier),
             ghost_mult = %format!("{:.3}", market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0)),
             min_gamma = %format!("{:.4}", min_gamma),
             gamma_final = %format!("{:.4}", gamma_clamped),
-            "Gamma: calibrated log-additive path"
+            "Gamma: calibrated log-additive + γ(q) inventory scaling"
         );
 
         gamma_clamped

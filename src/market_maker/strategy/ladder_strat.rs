@@ -663,9 +663,8 @@ impl LadderStrategy {
         max_position: f64,
     ) -> SpreadComposition {
         let effective_max_position = market_params.effective_max_position(max_position).min(max_position);
-        // Single log-additive gamma path (tail risk, liquidity captured by beta coefficients)
-        let gamma = self.effective_gamma(market_params, 0.0, effective_max_position)
-            * market_params.regime_gamma_multiplier;
+        // NOTE: regime_gamma_multiplier is already inside effective_gamma()
+        let gamma = self.effective_gamma(market_params, 0.0, effective_max_position);
 
         let kappa = if market_params.use_kappa_robust {
             market_params.kappa_robust
@@ -754,16 +753,13 @@ impl LadderStrategy {
         // No post-hoc multiplicative scalars needed.
         let gamma = self.effective_gamma(market_params, position, effective_max_position);
 
-        // Regime gamma multiplier: applied as post-hoc multiplication.
-        // Mathematically equivalent to log_gamma += ln(regime_gamma_multiplier)
-        // in the log-additive space. Kept separate because regime blending
-        // (from regime probabilities) is computed outside the risk model.
-        let gamma = gamma * market_params.regime_gamma_multiplier;
+        // NOTE: regime_gamma_multiplier is already applied inside effective_gamma()
+        // (L456) and participates in the gamma_max clamp. Do NOT re-apply here.
         debug!(
             gamma = %format!("{:.4}", gamma),
             regime_gamma_mult = %format!("{:.2}", market_params.regime_gamma_multiplier),
             warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-            "Ladder gamma from log-additive CalibratedRiskModel"
+            "Ladder gamma from log-additive CalibratedRiskModel (regime included)"
         );
 
         // === KAPPA: Robust V3 > Adaptive > Legacy ===
