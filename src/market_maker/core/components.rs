@@ -12,7 +12,7 @@ use crate::market_maker::{
     config::{ImpulseControlConfig, MetricsRecorder},
     control::{
         CalibratedEdgeConfig, CalibratedEdgeSignal, PositionPnLConfig, PositionPnLTracker,
-        QuoteGate, StochasticController, StochasticControllerConfig,
+        QuotaShadowPricer, StochasticController, StochasticControllerConfig,
         TheoreticalEdgeEstimator,
     },
     stochastic::{StochasticControlBuilder, StochasticControlConfig},
@@ -469,10 +469,10 @@ pub struct StochasticComponents {
     /// Performance-gated capacity: adjusts max position based on P&L
     pub performance_gating: super::super::PerformanceGatedCapacity,
 
-    // === Quote Gate (Directional Edge Gating) ===
-    /// Quote gate: decides WHETHER to quote based on directional edge.
-    /// Prevents whipsaw losses from random fills when no edge exists.
-    pub quote_gate: QuoteGate,
+    // === Quota Shadow Pricing ===
+    /// Continuous rate-limit-aware spread and ladder adjustments.
+    /// Replaces binary quota gating with smooth shadow pricing.
+    pub quota_shadow: QuotaShadowPricer,
 
     // === Calibrated Thresholds (IR-Based) ===
     /// Calibrated edge signal tracker.
@@ -677,9 +677,6 @@ impl StochasticComponents {
             PerformanceGatedCapacity::disabled(0.0)
         };
 
-        // Create quote gate from stochastic config
-        let quote_gate = QuoteGate::new(stochastic_config.quote_gate_config());
-
         Self {
             hjb_controller: HJBInventoryController::new(hjb_config),
             stochastic_config,
@@ -697,7 +694,7 @@ impl StochasticComponents {
             },
             position_ramp,
             performance_gating,
-            quote_gate,
+            quota_shadow: QuotaShadowPricer::default(),
             // Calibrated thresholds (IR-based)
             calibrated_edge: CalibratedEdgeSignal::new(CalibratedEdgeConfig::default()),
             position_pnl: PositionPnLTracker::new(PositionPnLConfig::default()),

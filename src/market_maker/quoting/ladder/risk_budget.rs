@@ -400,6 +400,22 @@ fn shannon_entropy_bits(weights: &[f64]) -> f64 {
         .sum()
 }
 
+/// Compute Kelly-constrained risk budget from capacity and Kelly fraction.
+///
+/// Scales the total available capacity by the Kelly-optimal fraction,
+/// clamped to [0, 1] for safety. Use with `correlation_discount()` to
+/// further shrink the fraction during fill-clustering regimes.
+///
+/// # Arguments
+/// * `capacity` - Total available position capacity (contracts)
+/// * `kelly_fraction` - Kelly-optimal bet fraction, typically 0.05-0.50
+///
+/// # Returns
+/// Effective capacity to allocate across the ladder.
+pub fn allocate_risk_budget_kelly(capacity: f64, kelly_fraction: f64) -> f64 {
+    capacity * kelly_fraction.clamp(0.0, 1.0)
+}
+
 /// Convenience: compute total allocated size.
 pub fn total_allocated_size(allocations: &[LevelAllocation]) -> f64 {
     allocations.iter().map(|a| a.size).sum()
@@ -859,5 +875,45 @@ mod tests {
         // Weights should sum to ~1.0
         let sum: f64 = weights.iter().sum();
         assert!((sum - 1.0).abs() < 0.001, "Weights should sum to 1.0, got {}", sum);
+    }
+
+    // =====================================================================
+    // Kelly risk budget allocation tests
+    // =====================================================================
+
+    #[test]
+    fn test_allocate_risk_budget_kelly_basic() {
+        // 50% Kelly on 10 contract capacity → 5 contracts
+        let result = allocate_risk_budget_kelly(10.0, 0.5);
+        assert!((result - 5.0).abs() < 0.001,
+            "50% Kelly of 10 should be 5.0, got {}", result);
+    }
+
+    #[test]
+    fn test_allocate_risk_budget_kelly_clamps() {
+        // Negative Kelly → clamped to 0
+        let result = allocate_risk_budget_kelly(10.0, -0.5);
+        assert!((result - 0.0).abs() < 0.001,
+            "Negative Kelly should clamp to 0, got {}", result);
+
+        // Over-sized Kelly → clamped to 1.0
+        let result = allocate_risk_budget_kelly(10.0, 1.5);
+        assert!((result - 10.0).abs() < 0.001,
+            "Kelly > 1.0 should clamp to capacity, got {}", result);
+    }
+
+    #[test]
+    fn test_allocate_risk_budget_kelly_zero_capacity() {
+        let result = allocate_risk_budget_kelly(0.0, 0.5);
+        assert!((result - 0.0).abs() < 0.001,
+            "Zero capacity should give zero, got {}", result);
+    }
+
+    #[test]
+    fn test_allocate_risk_budget_kelly_quarter_kelly() {
+        // Quarter Kelly (standard conservative): 25% of capacity
+        let result = allocate_risk_budget_kelly(8.0, 0.25);
+        assert!((result - 2.0).abs() < 0.001,
+            "Quarter Kelly of 8 should be 2.0, got {}", result);
     }
 }

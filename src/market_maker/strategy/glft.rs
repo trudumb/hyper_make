@@ -367,14 +367,18 @@ impl GLFTStrategy {
 
     /// Calculate effective γ based on current market conditions.
     ///
-    /// Supports two modes:
-    /// 1. **Legacy (Multiplicative)**: γ = γ_base × vol × tox × inv × ...
-    /// 2. **Calibrated (Log-Additive)**: log(γ) = log(γ_base) + Σ βᵢ × xᵢ
+    /// Compute effective gamma using the CalibratedRiskModel (log-additive).
     ///
-    /// Blending controlled by `risk_model_config.risk_model_blend`:
-    /// - blend=0.0: Pure legacy multiplicative
-    /// - blend=1.0: Pure log-additive calibrated
-    /// - blend=0.5: 50/50 blend
+    /// log(γ) = log(γ_base) + Σ βᵢ × xᵢ
+    ///
+    /// Post-process multipliers kept for physically motivated adjustments:
+    /// - `drawdown_multiplier`: explicit risk management lever (conservative when losing)
+    /// - `regime_gamma_multiplier`: continuous blend from regime probabilities
+    /// - `ghost_liquidity_gamma_mult`: book kappa >> robust kappa correction
+    /// - `solve_min_gamma()`: floor enforcement for minimum viable half-spread
+    ///
+    /// Removed (now captured by CalibratedRiskModel β coefficients):
+    /// - calibration_gamma_mult, tail_risk_multiplier, rl_gamma_multiplier
     fn effective_gamma(
         &self,
         market_params: &MarketParams,
@@ -384,64 +388,32 @@ impl GLFTStrategy {
         let cfg = &self.risk_config;
         let blend = self.risk_model_config.risk_model_blend.clamp(0.0, 1.0);
 
-        // ============================================================
-        // MODE 1: LEGACY MULTIPLICATIVE GAMMA
-        // ============================================================
-        let gamma_legacy = if blend < 1.0 {
-            self.compute_legacy_gamma(market_params, position, max_position)
-        } else {
-            0.0 // Not needed if pure log-additive
-        };
-
-        // ============================================================
-        // MODE 2: CALIBRATED LOG-ADDITIVE GAMMA
-        // ============================================================
-        let gamma_calibrated = if blend > 0.0 || self.risk_model_config.use_calibrated_risk_model {
-            // Build normalized risk features
-            let features = RiskFeatures::from_params(
-                market_params,
-                position,
-                max_position,
-                &self.risk_model_config,
+        if blend < 1.0 {
+            debug!(
+                blend = %format!("{:.2}", blend),
+                "risk_model_blend < 1.0 but legacy path removed; using calibrated-only"
             );
-
-            // Compute gamma via log-additive model
-            self.risk_model.compute_gamma(&features)
-        } else {
-            0.0 // Not needed if pure legacy
-        };
+        }
 
         // ============================================================
-        // BLEND BETWEEN MODELS
+        // CALIBRATED LOG-ADDITIVE GAMMA (only path)
         // ============================================================
-        let gamma_base = if blend <= 0.0 {
-            gamma_legacy
-        } else if blend >= 1.0 {
-            gamma_calibrated
-        } else {
-            // Linear blend in gamma space (not log space)
-            gamma_legacy * (1.0 - blend) + gamma_calibrated * blend
-        };
+        let features = RiskFeatures::from_params(
+            market_params,
+            position,
+            max_position,
+            &self.risk_model_config,
+        );
+        let gamma_base = self.risk_model.compute_gamma(&features);
 
         // ============================================================
-        // POST-PROCESS SCALARS (always applied)
+        // PHYSICALLY MOTIVATED POST-PROCESS (kept for explicit control)
         // ============================================================
-        // These are event-driven and can't be normalized into features:
-        // 1. calibration_gamma_mult: Fill rate controller during warmup
-        // 2. tail_risk_multiplier: Cascade detection (discrete event)
-        let gamma_with_calib = gamma_base * market_params.calibration_gamma_mult;
-        let gamma_with_tail = gamma_with_calib * market_params.tail_risk_multiplier;
 
         // Drawdown: increase γ when losing money (more conservative).
         // At 5% drawdown: ×1.1. At 10%: ×1.2. Smooth linear ramp.
         let drawdown_mult = 1.0 + market_params.current_drawdown_frac * 2.0;
-        let gamma_with_drawdown = gamma_with_tail * drawdown_mult;
-
-        // RL policy multiplier: allows learned risk aversion scaling.
-        // Clamped to [0.1, 10.0] to prevent blow-ups even if RL outputs garbage.
-        // Default 1.0 = no-op until RL is explicitly enabled.
-        let rl_gamma_mult = market_params.rl_gamma_multiplier.clamp(0.1, 10.0);
-        let gamma_final = gamma_with_drawdown * rl_gamma_mult;
+        let gamma_with_drawdown = gamma_base * drawdown_mult;
 
         // Self-consistent gamma: ensure GLFT output >= spread floor.
         //
@@ -460,126 +432,29 @@ impl GLFTStrategy {
             time_horizon,
             cfg.maker_fee_rate,
         );
+
         // Apply regime gamma multiplier BEFORE floor: regime risk inflates γ,
         // then floor catches if the result is still too small.
         // Ghost liquidity: when book kappa >> robust kappa, book shows standing
         // orders that don't represent real fill intensity → widen via γ.
-        let gamma_pre_floor = gamma_final
+        let gamma_pre_floor = gamma_with_drawdown
             * market_params.regime_gamma_multiplier
             * market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0);
         let gamma_with_floor = gamma_pre_floor.max(min_gamma);
 
         let gamma_clamped = gamma_with_floor.clamp(cfg.gamma_min, cfg.gamma_max);
 
-        // Log comparison for shadow mode validation
-        if self.risk_model_config.use_calibrated_risk_model || blend > 0.0 {
-            debug!(
-                gamma_legacy = %format!("{:.4}", gamma_legacy),
-                gamma_calibrated = %format!("{:.4}", gamma_calibrated),
-                blend = %format!("{:.2}", blend),
-                gamma_base = %format!("{:.4}", gamma_base),
-                calib_mult = %format!("{:.3}", market_params.calibration_gamma_mult),
-                tail_mult = %format!("{:.3}", market_params.tail_risk_multiplier),
-                rl_gamma_mult = %format!("{:.3}", rl_gamma_mult),
-                gamma_final = %format!("{:.4}", gamma_clamped),
-                "Gamma: legacy vs calibrated comparison"
-            );
-        } else {
-            debug!(
-                gamma_base = %format!("{:.3}", cfg.gamma_base),
-                gamma_raw = %format!("{:.4}", gamma_legacy),
-                calib_mult = %format!("{:.3}", market_params.calibration_gamma_mult),
-                tail_mult = %format!("{:.3}", market_params.tail_risk_multiplier),
-                rl_gamma_mult = %format!("{:.3}", rl_gamma_mult),
-                gamma_clamped = %format!("{:.4}", gamma_clamped),
-                "Gamma: legacy mode"
-            );
-        }
+        debug!(
+            gamma_calibrated = %format!("{:.4}", gamma_base),
+            drawdown_mult = %format!("{:.3}", drawdown_mult),
+            regime_mult = %format!("{:.3}", market_params.regime_gamma_multiplier),
+            ghost_mult = %format!("{:.3}", market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0)),
+            min_gamma = %format!("{:.4}", min_gamma),
+            gamma_final = %format!("{:.4}", gamma_clamped),
+            "Gamma: calibrated log-additive path"
+        );
 
         gamma_clamped
-    }
-
-    /// Compute gamma using legacy multiplicative model.
-    ///
-    /// γ = γ_base × vol × tox × inv × hawkes × time × book × uncertainty
-    fn compute_legacy_gamma(
-        &self,
-        market_params: &MarketParams,
-        position: f64,
-        max_position: f64,
-    ) -> f64 {
-        let cfg = &self.risk_config;
-
-        // === VOLATILITY SCALING ===
-        let vol_ratio = market_params.sigma_effective / cfg.sigma_baseline.max(1e-9);
-        let vol_scalar = if vol_ratio <= 1.0 {
-            1.0
-        } else {
-            let raw = 1.0 + cfg.volatility_weight * (vol_ratio - 1.0);
-            raw.min(cfg.max_volatility_multiplier)
-        };
-
-        // === TOXICITY SCALING ===
-        // Combine backward-looking (jump_ratio) and forward-looking (pre-fill classifier) signals
-        let legacy_toxicity = if market_params.jump_ratio <= cfg.toxicity_threshold {
-            1.0
-        } else {
-            1.0 + cfg.toxicity_sensitivity * (market_params.jump_ratio - 1.0)
-        };
-
-        // Pre-fill classifier provides forward-looking toxicity prediction [0, 1]
-        // Use the symmetric (max of bid/ask) for overall gamma scaling
-        let pre_fill_mult = market_params.pre_fill_spread_mult_bid.max(market_params.pre_fill_spread_mult_ask);
-
-        // Blend legacy and pre-fill: take the max (conservative approach)
-        // This ensures we widen spreads if EITHER signal indicates toxicity
-        let toxicity_scalar = legacy_toxicity.max(pre_fill_mult);
-
-        // === INVENTORY SCALING ===
-        // Continuous utilization-based γ that replaces BOTH legacy inventory_scalar
-        // AND the PCM's discrete Hold/Reduce/Add damping chain.
-        // At 0% utilization: 1.0 (neutral)
-        // At 50% utilization: 1.75 (moderate conservatism)
-        // At 100% utilization: 4.0 (strong mean-reversion through skew)
-        // Smooth monotonic ramp — no thresholds, no discrete states.
-        let utilization = if max_position > 1e-9 {
-            (position.abs() / max_position).min(1.0)
-        } else {
-            0.0
-        };
-        let inventory_scalar = 1.0 + cfg.inventory_beta * utilization.powi(2);
-
-        // === HAWKES ACTIVITY SCALING ===
-        let hawkes_baseline = 0.5;
-        let hawkes_sensitivity = 2.0;
-        let hawkes_scalar = 1.0
-            + hawkes_sensitivity
-                * (market_params.hawkes_activity_percentile - hawkes_baseline).max(0.0);
-
-        // === TIME-OF-DAY SCALING ===
-        let time_scalar = cfg.time_of_day_multiplier();
-
-        // === BOOK DEPTH SCALING ===
-        let book_depth_scalar = cfg.book_depth_multiplier(market_params.near_touch_depth_usd);
-
-        // === UNCERTAINTY SCALING ===
-        let uncertainty_scalar = if market_params.kappa_ci_width > 0.0 {
-            1.0 + (market_params.kappa_ci_width / 10.0).min(0.5)
-        } else {
-            1.0
-        };
-
-        // Combine (note: calibration and tail_risk applied in caller)
-        let gamma_effective = cfg.gamma_base
-            * vol_scalar
-            * toxicity_scalar
-            * inventory_scalar
-            * hawkes_scalar
-            * time_scalar
-            * book_depth_scalar
-            * uncertainty_scalar;
-
-        gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
     /// Calculate expected holding time from arrival intensity.
@@ -1470,16 +1345,15 @@ impl QuotingStrategy for GLFTStrategy {
         // we need URGENT position reduction. This is derived from the extended HJB equation
         // with price drift: dS = μdt + σdW
         //
-        // The drift-adjusted skew replaces the ad-hoc momentum_skew_multiplier with a
-        // first-principles approach based on:
+        // The drift-adjusted skew provides a first-principles approach based on:
         // - Drift rate (μ) estimated from momentum
         // - Continuation probability P(momentum continues)
         // - Directional variance (increased risk when opposed to momentum)
         //
         // When drift adjustment is enabled AND position opposes momentum:
         // - drift_urgency is added to base skew (accelerates position reduction)
-        // - directional_variance_mult scales effective variance (higher risk)
-        let (drift_urgency, momentum_skew_multiplier) = if market_params.use_drift_adjusted_skew
+        // - directional_variance_mult is logged for diagnostics only
+        let drift_urgency = if market_params.use_drift_adjusted_skew
             && market_params.position_opposes_momentum
             && market_params.urgency_score > 0.5
         {
@@ -1488,8 +1362,8 @@ impl QuotingStrategy for GLFTStrategy {
             // - sensitivity × drift_rate × P(continue) × |q| × T
             let drift_urg = market_params.hjb_drift_urgency;
 
-            // Variance multiplier also affects the effective gamma
-            // Higher variance when opposed = more risk aversion = wider spreads
+            // Variance multiplier logged for diagnostics (no longer applied as a multiplier;
+            // if higher risk aversion is needed, it should flow through gamma calibration)
             let var_mult = market_params.directional_variance_mult;
 
             if market_params.urgency_score > 1.5 {
@@ -1504,66 +1378,24 @@ impl QuotingStrategy for GLFTStrategy {
                 );
             }
 
-            // Convert variance multiplier to skew multiplier
-            // Higher variance = need stronger skew for same risk reduction
-            (drift_urg, var_mult.sqrt())
+            drift_urg
         } else {
-            // Fallback to legacy momentum_skew_multiplier (ad-hoc approach)
-            let pos_direction = position.signum();
-            let momentum_direction =
-                if market_params.falling_knife_score > market_params.rising_knife_score {
-                    -1.0 // Falling
-                } else if market_params.rising_knife_score > market_params.falling_knife_score {
-                    1.0 // Rising
-                } else {
-                    0.0 // Neutral
-                };
-
-            let momentum_severity = market_params
-                .falling_knife_score
-                .max(market_params.rising_knife_score);
-
-            let is_opposed = pos_direction * momentum_direction < 0.0;
-
-            let legacy_mult = if is_opposed && momentum_severity > 0.5 {
-                let amplification = 1.0 + (momentum_severity / 3.0).min(1.0);
-                if momentum_severity > 1.0 {
-                    debug!(
-                        position = %format!("{:.4}", position),
-                        falling_knife = %format!("{:.2}", market_params.falling_knife_score),
-                        rising_knife = %format!("{:.2}", market_params.rising_knife_score),
-                        skew_amplifier = %format!("{:.2}x", amplification),
-                        "Legacy momentum-opposed position: amplifying inventory skew"
-                    );
-                }
-                amplification
-            } else {
-                1.0
-            };
-
-            (0.0, legacy_mult)
+            // No drift signal available — zero drift urgency.
+            // The base skew from gamma * sigma^2 * q * T handles inventory alone.
+            0.0
         };
 
-        // === 6. COMBINED SKEW WITH TIER 2 ADJUSTMENTS ===
-        // Combine all skew components:
-        // - base_skew: GLFT inventory skew × flow modifier (exp(-β × alignment))
-        // - drift_urgency: First-principles urgency from momentum-position opposition (HJB)
+        // === 6. COMBINED SKEW (purely additive) ===
+        // All skew components are additive, in the same units (price fraction).
+        // No multipliers — if RL wants to adjust skew, it should output an additive
+        // rl_skew_adjustment_bps term (to be added in a future RL integration phase).
+        //
+        // Components:
+        // - base_skew: GLFT inventory skew gamma * sigma^2 * q * T × flow modifier
+        // - drift_urgency: First-principles urgency from HJB when position opposes momentum
         // - hawkes_skew: Hawkes flow-based directional adjustment
         // - funding_skew: Perpetual funding cost pressure
-        // - momentum amplification: variance-derived multiplier when opposed
-
-        // === 6.0: INVENTORY SKEW (γσ²qτ does the work) ===
-        // No damping, no proactive bolt-on. The drift term in half_spread_with_drift()
-        // handles directional intent via μ. The γ_eff utilization² curve (Phase 2)
-        // replaces discrete HOLD/ADD/REDUCE damping.
-        //
-        // RL omega multiplier: allows learned skew scaling.
-        // Clamped to [0.1, 10.0] to prevent sign-flipping or blow-ups.
-        // Default 1.0 = no-op until RL is explicitly enabled.
-        let rl_omega_mult = market_params.rl_omega_multiplier.clamp(0.1, 10.0);
-        let skew = (base_skew + drift_urgency + hawkes_skew + funding_skew)
-            * momentum_skew_multiplier
-            * rl_omega_mult;
+        let skew = base_skew + drift_urgency + hawkes_skew + funding_skew;
 
         // Diagnostic logging: track inventory skew magnitude for calibration verification.
         // Expected: 50% utilization → 3-8 bps, 80% → 8-15 bps.
@@ -1884,7 +1716,6 @@ mod tests {
         mp.calibration_gamma_mult = 1.0;
         mp.tail_risk_multiplier = 1.0;
         mp.rl_gamma_multiplier = 1.0;
-        mp.rl_omega_multiplier = 1.0;
         mp
     }
 
@@ -1906,34 +1737,25 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // RL Gamma Multiplier Tests
+    // Calibrated Gamma Tests (log-additive CalibratedRiskModel only)
     // ---------------------------------------------------------------
 
     #[test]
-    fn test_rl_gamma_multiplier_default_noop() {
+    fn test_effective_gamma_uses_calibrated_model() {
         let strategy = test_strategy();
         let mp = test_market_params();
         let position = 0.5;
         let max_position = 10.0;
 
-        // Default rl_gamma_multiplier = 1.0 should be identical to not having it
+        // effective_gamma must always produce positive gamma
         let gamma = strategy.effective_gamma(&mp, position, max_position);
-        assert!(gamma > 0.0, "gamma must be positive");
-
-        // Compare with explicit 1.0
-        let mut mp2 = mp.clone();
-        mp2.rl_gamma_multiplier = 1.0;
-        let gamma2 = strategy.effective_gamma(&mp2, position, max_position);
-        assert!(
-            (gamma - gamma2).abs() < 1e-12,
-            "rl_gamma_multiplier=1.0 should be no-op, got {} vs {}",
-            gamma,
-            gamma2
-        );
+        assert!(gamma > 0.0, "gamma must be positive, got {gamma}");
     }
 
     #[test]
-    fn test_rl_gamma_multiplier_gt1_increases_gamma() {
+    fn test_rl_gamma_multiplier_ignored_by_effective_gamma() {
+        // After B2: rl_gamma_multiplier is no longer applied in effective_gamma.
+        // It is captured by CalibratedRiskModel beta coefficients instead.
         let strategy = test_strategy();
         let mp_base = test_market_params();
         let position = 0.5;
@@ -1942,109 +1764,50 @@ mod tests {
         let gamma_base = strategy.effective_gamma(&mp_base, position, max_position);
 
         let mut mp_high = mp_base.clone();
-        mp_high.rl_gamma_multiplier = 2.0;
+        mp_high.rl_gamma_multiplier = 5.0;
         let gamma_high = strategy.effective_gamma(&mp_high, position, max_position);
 
         assert!(
-            gamma_high > gamma_base,
-            "rl_gamma_multiplier=2.0 should increase gamma: {} vs {}",
-            gamma_high,
-            gamma_base
-        );
-    }
-
-    #[test]
-    fn test_rl_gamma_multiplier_lt1_decreases_gamma() {
-        let strategy = test_strategy();
-        let mp_base = test_market_params();
-        let position = 0.5;
-        let max_position = 10.0;
-
-        let gamma_base = strategy.effective_gamma(&mp_base, position, max_position);
-
-        let mut mp_low = mp_base.clone();
-        mp_low.rl_gamma_multiplier = 0.5;
-        let gamma_low = strategy.effective_gamma(&mp_low, position, max_position);
-
-        assert!(
-            gamma_low < gamma_base,
-            "rl_gamma_multiplier=0.5 should decrease gamma: {} vs {}",
-            gamma_low,
-            gamma_base
-        );
-    }
-
-    #[test]
-    fn test_rl_gamma_multiplier_clamped_to_safe_range() {
-        let strategy = test_strategy();
-        let mp_base = test_market_params();
-        let position = 0.5;
-        let max_position = 10.0;
-
-        // Extreme high should be clamped to 10.0
-        let mut mp_extreme_high = mp_base.clone();
-        mp_extreme_high.rl_gamma_multiplier = 100.0;
-        let gamma_extreme = strategy.effective_gamma(&mp_extreme_high, position, max_position);
-
-        let mut mp_at_cap = mp_base.clone();
-        mp_at_cap.rl_gamma_multiplier = 10.0;
-        let gamma_at_cap = strategy.effective_gamma(&mp_at_cap, position, max_position);
-
-        assert!(
-            (gamma_extreme - gamma_at_cap).abs() < 1e-12,
-            "rl_gamma_multiplier=100.0 should be clamped to 10.0: {} vs {}",
-            gamma_extreme,
-            gamma_at_cap
-        );
-
-        // Extreme low should be clamped to 0.1
-        let mut mp_extreme_low = mp_base.clone();
-        mp_extreme_low.rl_gamma_multiplier = 0.001;
-        let gamma_extreme_low =
-            strategy.effective_gamma(&mp_extreme_low, position, max_position);
-
-        let mut mp_at_floor = mp_base.clone();
-        mp_at_floor.rl_gamma_multiplier = 0.1;
-        let gamma_at_floor = strategy.effective_gamma(&mp_at_floor, position, max_position);
-
-        assert!(
-            (gamma_extreme_low - gamma_at_floor).abs() < 1e-12,
-            "rl_gamma_multiplier=0.001 should be clamped to 0.1: {} vs {}",
-            gamma_extreme_low,
-            gamma_at_floor
+            (gamma_base - gamma_high).abs() < 1e-12,
+            "rl_gamma_multiplier should have no effect on effective_gamma: base={gamma_base} vs high={gamma_high}",
         );
     }
 
     // ---------------------------------------------------------------
-    // RL Omega Multiplier Tests (Position Skew)
+    // Additive Skew Tests (replaced RL Omega Multiplier tests)
     // ---------------------------------------------------------------
 
     #[test]
-    fn test_rl_omega_multiplier_default_noop() {
+    fn test_skew_is_purely_additive() {
+        // Verify that skew composition is additive: changing rl_omega_multiplier
+        // on MarketParams has NO effect on quotes (the field is no longer read).
         let strategy = test_strategy();
-        let mp = test_market_params();
         let config = test_quote_config();
+        let position = 2.0;
+        let max_position = 10.0;
         let target_liq = 1.0;
 
-        // With default rl_omega_multiplier = 1.0, quotes should be identical
-        let (bid1, ask1) = strategy.calculate_quotes(&config, 1.0, 10.0, target_liq, &mp);
+        let mp_base = test_market_params();
+        let (bid_base, ask_base) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_base);
 
-        let mut mp2 = mp.clone();
-        mp2.rl_omega_multiplier = 1.0;
-        let (bid2, ask2) = strategy.calculate_quotes(&config, 1.0, 10.0, target_liq, &mp2);
+        let mut mp_omega = test_market_params();
+        mp_omega.rl_omega_multiplier = 5.0; // Field still exists, should be ignored
+        let (bid_omega, ask_omega) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_omega);
 
-        if let (Some(b1), Some(b2)) = (&bid1, &bid2) {
+        if let (Some(b1), Some(b2)) = (&bid_base, &bid_omega) {
             assert!(
                 (b1.price - b2.price).abs() < 1e-10,
-                "bid prices differ with omega=1.0: {} vs {}",
+                "rl_omega_multiplier should have no effect: {} vs {}",
                 b1.price,
                 b2.price
             );
         }
-        if let (Some(a1), Some(a2)) = (&ask1, &ask2) {
+        if let (Some(a1), Some(a2)) = (&ask_base, &ask_omega) {
             assert!(
                 (a1.price - a2.price).abs() < 1e-10,
-                "ask prices differ with omega=1.0: {} vs {}",
+                "rl_omega_multiplier should have no effect on asks: {} vs {}",
                 a1.price,
                 a2.price
             );
@@ -2052,9 +1815,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rl_omega_multiplier_scales_skew() {
-        // Test at the effective_gamma/skew level: verify the omega multiplier
-        // affects the final quotes by using extreme vol and high-precision config.
+    fn test_no_legacy_momentum_skew_multiplier() {
+        // Verify that knife scores no longer amplify skew when drift adjustment is off.
+        // With the legacy multiplier removed, identical quotes should result regardless
+        // of falling_knife_score / rising_knife_score values.
         let strategy = test_strategy();
         let config = QuoteConfig {
             mid_price: 1000.0,
@@ -2062,91 +1826,42 @@ mod tests {
             sz_decimals: 4,
             min_notional: 0.01,
         };
-        let position = 8.0; // Near max for strong skew
+        let position = 5.0; // Long position
         let max_position = 10.0;
         let target_liq = 1.0;
 
         let mut mp_base = test_market_params();
         mp_base.microprice = 1000.0;
-        mp_base.sigma = 0.05; // 500 bps vol for large skew
+        mp_base.sigma = 0.05;
         mp_base.sigma_effective = 0.05;
-        mp_base.sigma_leverage_adjusted = 0.05;
-        mp_base.arrival_intensity = 0.1; // Long holding time = bigger skew
-        let (bid_base, _) =
+        mp_base.use_drift_adjusted_skew = false; // Force fallback path
+        mp_base.falling_knife_score = 0.0;
+        mp_base.rising_knife_score = 0.0;
+
+        let mut mp_knife = mp_base.clone();
+        mp_knife.falling_knife_score = 3.0; // Extreme falling knife, opposed to long position
+        mp_knife.rising_knife_score = 0.0;
+
+        let (bid_base, ask_base) =
             strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_base);
+        let (bid_knife, ask_knife) =
+            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_knife);
 
-        let mut mp_high = mp_base.clone();
-        mp_high.rl_omega_multiplier = 5.0;
-        let (bid_high, _) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_high);
-
-        // Higher omega amplifies inventory skew.
-        // With long position, skew pushes bid lower; omega=5 should push it even lower.
-        if let (Some(b_base), Some(b_high)) = (&bid_base, &bid_high) {
+        // With legacy multiplier removed, knife scores should NOT affect quotes
+        if let (Some(b1), Some(b2)) = (&bid_base, &bid_knife) {
             assert!(
-                (b_base.price - b_high.price).abs() > 0.001,
-                "omega=5.0 should meaningfully change bid price vs omega=1.0: base={}, high={}",
-                b_base.price,
-                b_high.price
-            );
-        } else {
-            // If either bid is None (skew pushed it negative), that also proves omega works
-            let base_has_bid = bid_base.is_some();
-            let high_has_bid = bid_high.is_some();
-            assert!(
-                base_has_bid != high_has_bid,
-                "omega=5.0 should change bid availability: base_has={}, high_has={}",
-                base_has_bid,
-                high_has_bid
+                (b1.price - b2.price).abs() < 1e-10,
+                "knife score should have no effect on bid: base={}, knife={}",
+                b1.price,
+                b2.price
             );
         }
-    }
-
-    #[test]
-    fn test_rl_omega_multiplier_clamped_to_safe_range() {
-        let strategy = test_strategy();
-        let config = test_quote_config();
-        let position = 2.0;
-        let max_position = 10.0;
-        let target_liq = 1.0;
-
-        // Extreme high should be clamped to 10.0
-        let mut mp_extreme = test_market_params();
-        mp_extreme.rl_omega_multiplier = 100.0;
-        let (bid_extreme, _) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_extreme);
-
-        let mut mp_cap = test_market_params();
-        mp_cap.rl_omega_multiplier = 10.0;
-        let (bid_cap, _) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_cap);
-
-        if let (Some(b_ext), Some(b_cap)) = (&bid_extreme, &bid_cap) {
+        if let (Some(a1), Some(a2)) = (&ask_base, &ask_knife) {
             assert!(
-                (b_ext.price - b_cap.price).abs() < 1e-10,
-                "omega=100.0 should be clamped to 10.0: {} vs {}",
-                b_ext.price,
-                b_cap.price
-            );
-        }
-
-        // Extreme low should be clamped to 0.1
-        let mut mp_low = test_market_params();
-        mp_low.rl_omega_multiplier = 0.001;
-        let (bid_low, _) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_low);
-
-        let mut mp_floor = test_market_params();
-        mp_floor.rl_omega_multiplier = 0.1;
-        let (bid_floor, _) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_floor);
-
-        if let (Some(b_low), Some(b_floor)) = (&bid_low, &bid_floor) {
-            assert!(
-                (b_low.price - b_floor.price).abs() < 1e-10,
-                "omega=0.001 should be clamped to 0.1: {} vs {}",
-                b_low.price,
-                b_floor.price
+                (a1.price - a2.price).abs() < 1e-10,
+                "knife score should have no effect on ask: base={}, knife={}",
+                a1.price,
+                a2.price
             );
         }
     }

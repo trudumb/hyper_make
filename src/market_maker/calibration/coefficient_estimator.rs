@@ -224,6 +224,8 @@ impl CoefficientEstimator {
                 // Keep default for confidence - not learned from AS data
                 // (position direction confidence is orthogonal to AS risk)
                 beta_confidence: -0.4,
+                // Cascade risk not learned from AS data - use default
+                beta_cascade: 0.8,
                 gamma_min: 0.05,
                 gamma_max: 5.0,
                 n_samples: self.samples.len(),

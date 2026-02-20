@@ -624,10 +624,6 @@ pub struct LearnedParameters {
     /// Prior: Normal(2.0, 0.5²) → E[β] = 2.0 bps per unit momentum
     pub proactive_skew_sensitivity: BayesianParam,
 
-    /// Quote gate edge threshold.
-    /// Prior: Beta(15, 85) → E = 0.15, from IR analysis
-    pub quote_gate_edge_threshold: BayesianParam,
-
     /// Toxic hour gamma multiplier.
     /// Prior: LogNormal(2.0, 0.3) → E[mult] = 2.0, CV = 0.3
     pub toxic_hour_gamma_mult: BayesianParam,
@@ -736,7 +732,6 @@ impl Default for LearnedParameters {
             gamma_base: BayesianParam::gamma("gamma_base", 0.15, 3.0),
             spread_floor_bps: BayesianParam::normal("spread_floor_bps", 5.0, 4.0),
             proactive_skew_sensitivity: BayesianParam::normal("proactive_skew_sensitivity", 2.0, 0.25),
-            quote_gate_edge_threshold: BayesianParam::beta("quote_gate_edge_threshold", 0.15, 100.0),
             toxic_hour_gamma_mult: BayesianParam::log_normal("toxic_hour_gamma_mult", 2.0, 0.3),
             predictive_bias_sensitivity: BayesianParam::normal("predictive_bias_sensitivity", 2.0, 1.0),
 
@@ -807,7 +802,6 @@ impl LearnedParameters {
         self.gamma_base.reset_to_prior();
         self.spread_floor_bps.reset_to_prior();
         self.proactive_skew_sensitivity.reset_to_prior();
-        self.quote_gate_edge_threshold.reset_to_prior();
         self.toxic_hour_gamma_mult.reset_to_prior();
         self.predictive_bias_sensitivity.reset_to_prior();
         self.max_daily_loss_fraction.reset_to_prior();
@@ -1078,7 +1072,7 @@ impl LearnedParameters {
             &self.gamma_base,
             &self.spread_floor_bps,
             &self.proactive_skew_sensitivity,
-            &self.quote_gate_edge_threshold,
+
             &self.toxic_hour_gamma_mult,
             &self.predictive_bias_sensitivity,
             &self.max_daily_loss_fraction,

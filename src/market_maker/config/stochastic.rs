@@ -382,73 +382,6 @@ pub struct StochasticConfig {
     /// Default: 0.3
     pub performance_min_capacity_fraction: f64,
 
-    // ==================== Quote Gate (Directional Edge Gating) ====================
-    /// Enable Quote Gate for directional edge-based quoting decisions.
-    /// When enabled, the system will NOT quote when there's no directional edge.
-    /// This prevents whipsaw losses from random fills.
-    ///
-    /// Default: true
-    pub enable_quote_gate: bool,
-
-    /// Minimum |flow_imbalance| to have directional edge.
-    /// Below this threshold, we consider ourselves "edgeless" and may not quote.
-    ///
-    /// Default: 0.25
-    pub quote_gate_min_edge_signal: f64,
-
-    /// Minimum momentum confidence to trust the edge signal.
-    /// Only required when signal is weak (below strong_signal_threshold).
-    ///
-    /// Default: 0.45 (below baseline 0.50)
-    pub quote_gate_min_edge_confidence: f64,
-
-    /// Signal strength that bypasses confidence requirement.
-    /// If |flow_imbalance| >= this, we trust it regardless of confidence.
-    ///
-    /// Default: 0.50 (strong signal = trust it)
-    pub quote_gate_strong_signal_threshold: f64,
-
-    /// Minimum position (as fraction of max) to trigger one-sided quoting.
-    /// Below this, position is considered "flat".
-    ///
-    /// Default: 0.05 (5%)
-    pub quote_gate_position_threshold: f64,
-
-    /// Maximum position (as fraction of max) before ONLY reducing.
-    /// Above this, we become very defensive and only quote to reduce position.
-    ///
-    /// Default: 0.7 (70%)
-    pub quote_gate_max_position_before_reduce_only: f64,
-
-    /// Enable cascade protection in Quote Gate (pull all quotes during cascade).
-    ///
-    /// Default: true
-    pub quote_gate_cascade_protection: bool,
-
-    /// Cascade threshold (cascade_size_factor below this = cascade).
-    ///
-    /// Default: 0.3 (70% cascade severity)
-    pub quote_gate_cascade_threshold: f64,
-
-    /// Quote both sides when flat, even without strong edge signal.
-    /// When true (market-making mode): quotes both sides for spread capture.
-    /// When false (API budget mode): only quotes when directional edge detected.
-    ///
-    /// Default: false (API budget conservation - prevents excessive API churn)
-    /// Use --quote-flat-without-edge to enable market-making mode.
-    pub quote_gate_flat_without_edge: bool,
-
-    // ==================== Calibrated Quote Gate (IR-Based Thresholds) ====================
-    /// Enable calibrated quote gate with IR-based thresholds.
-    /// When enabled, replaces arbitrary thresholds (0.15, 0.45, etc.) with:
-    /// - Edge signal: IR > 1.0 means signal adds value
-    /// - Position threshold: Derived from P&L data
-    /// - Reduce-only threshold: Regime-specific from P&L data
-    /// - Cascade detection: Uses changepoint probability
-    ///
-    /// Default: false (enable after collecting calibration data)
-    pub enable_calibrated_quote_gate: bool,
-
     // ==================== Predictive Bias Extension (A-S Model) ====================
     /// Sensitivity for predictive bias β_t calculation.
     /// β_t = -sensitivity × prob_excess × σ
@@ -597,24 +530,6 @@ impl Default for StochasticConfig {
             performance_loss_reduction_mult: 2.0,     // 2x loss ratio
             performance_min_capacity_fraction: 0.3,  // Never below 30%
 
-            // Quote Gate (Directional Edge Gating)
-            // ENABLED by default - optimized for API budget conservation
-            enable_quote_gate: true,
-            quote_gate_min_edge_signal: 0.15,               // Lower threshold for MM (was 0.25)
-            quote_gate_min_edge_confidence: 0.45,           // Below baseline (was 0.55)
-            quote_gate_strong_signal_threshold: 0.50,       // Strong signal bypasses confidence
-            quote_gate_position_threshold: 0.05,            // 5% of max = "flat"
-            quote_gate_max_position_before_reduce_only: 0.7, // 70% of max = reduce only
-            quote_gate_cascade_protection: true,
-            quote_gate_cascade_threshold: 0.3,              // 70% cascade severity
-            // MARKET MAKING MODE: Quote both sides even without edge signal
-            // Market makers profit from spread capture, not direction
-            quote_gate_flat_without_edge: true,             // Enable market-making mode
-
-            // Calibrated Quote Gate (IR-Based Thresholds)
-            // ENABLED: Uses IR > 1.0 instead of arbitrary 0.15 threshold
-            enable_calibrated_quote_gate: true,
-
             // Predictive Bias Extension (A-S Model)
             // Sensitivity and threshold for predictive skew from changepoint detection
             predictive_bias_sensitivity: 2.0, // 2σ expected move on confirmed changepoint
@@ -738,29 +653,4 @@ impl StochasticConfig {
         self
     }
 
-    /// Create a QuoteGateConfig from this StochasticConfig.
-    pub fn quote_gate_config(&self) -> crate::market_maker::control::QuoteGateConfig {
-        crate::market_maker::control::QuoteGateConfig {
-            enabled: self.enable_quote_gate,
-            min_edge_signal: self.quote_gate_min_edge_signal,
-            min_edge_confidence: self.quote_gate_min_edge_confidence,
-            strong_signal_threshold: self.quote_gate_strong_signal_threshold,
-            position_threshold: self.quote_gate_position_threshold,
-            max_position_before_reduce_only: self.quote_gate_max_position_before_reduce_only,
-            cascade_protection: self.quote_gate_cascade_protection,
-            cascade_threshold: self.quote_gate_cascade_threshold,
-            quote_flat_without_edge: self.quote_gate_flat_without_edge,
-            use_bayesian_warmup: true, // Enable Bayesian IR warmup by default
-            min_ir_outcomes_for_trust: 25, // Default: require meaningful IR data
-            probe_config: crate::market_maker::control::ProbeConfig::default(),
-            bootstrap_config: crate::market_maker::control::BayesianBootstrapConfig::default(),
-            // Default to ThinDex for conservative changepoint thresholds
-            market_regime: crate::market_maker::control::MarketRegime::ThinDex,
-            // Pre-fill AS toxicity gating - enabled by default
-            toxicity_gate_threshold: 0.75, // 75% toxicity = skip quoting
-            enable_toxicity_gate: true,
-            // Quota shadow pricing - use defaults
-            quota_shadow: crate::market_maker::control::quote_gate::QuotaShadowConfig::default(),
-        }
-    }
 }

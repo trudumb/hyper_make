@@ -69,7 +69,7 @@ impl fmt::Display for AnomalyType {
 
 /// Reason for gating (blocking) quotes due to data quality issues.
 #[derive(Debug, Clone, PartialEq)]
-pub enum QuoteGateReason {
+pub enum DataQualityGateReason {
     /// No data has been received for this asset yet
     NoDataReceived,
     /// Data is stale (age exceeds threshold)
@@ -78,15 +78,15 @@ pub enum QuoteGateReason {
     CrossedBook { best_bid: f64, best_ask: f64 },
 }
 
-impl fmt::Display for QuoteGateReason {
+impl fmt::Display for DataQualityGateReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            QuoteGateReason::NoDataReceived => write!(f, "no_data_received"),
-            QuoteGateReason::StaleData {
+            DataQualityGateReason::NoDataReceived => write!(f, "no_data_received"),
+            DataQualityGateReason::StaleData {
                 age_ms,
                 threshold_ms,
             } => write!(f, "stale_data(age={age_ms}ms, threshold={threshold_ms}ms)"),
-            QuoteGateReason::CrossedBook {
+            DataQualityGateReason::CrossedBook {
                 best_bid,
                 best_ask,
             } => write!(f, "crossed_book(bid={best_bid}, ask={best_ask})"),
@@ -284,17 +284,17 @@ impl DataQualityMonitor {
     /// 1. Whether any data has been received for this asset
     /// 2. Whether data is stale (age exceeds `max_data_age_ms`)
     /// 3. Whether the book is crossed (best bid >= best ask)
-    pub fn should_gate_quotes(&self, asset: &str) -> Option<QuoteGateReason> {
+    pub fn should_gate_quotes(&self, asset: &str) -> Option<DataQualityGateReason> {
         // 1. Check if we've ever received data for this asset
         let last_time = match self.last_update_times.get(asset) {
             Some(t) => t,
-            None => return Some(QuoteGateReason::NoDataReceived),
+            None => return Some(DataQualityGateReason::NoDataReceived),
         };
 
         // 2. Check if data is stale
         let age_ms = last_time.elapsed().as_millis() as u64;
         if age_ms > self.config.max_data_age_ms {
-            return Some(QuoteGateReason::StaleData {
+            return Some(DataQualityGateReason::StaleData {
                 age_ms,
                 threshold_ms: self.config.max_data_age_ms,
             });
@@ -306,7 +306,7 @@ impl DataQualityMonitor {
                 (self.last_best_bid.get(asset), self.last_best_ask.get(asset))
             {
                 if Self::is_crossed(best_bid, best_ask) {
-                    return Some(QuoteGateReason::CrossedBook {
+                    return Some(DataQualityGateReason::CrossedBook {
                         best_bid,
                         best_ask,
                     });
@@ -903,7 +903,7 @@ mod tests {
     fn test_should_gate_quotes_no_data_received() {
         let monitor = DataQualityMonitor::default();
         let result = monitor.should_gate_quotes("BTC");
-        assert_eq!(result, Some(QuoteGateReason::NoDataReceived));
+        assert_eq!(result, Some(DataQualityGateReason::NoDataReceived));
     }
 
     #[test]
@@ -922,7 +922,7 @@ mod tests {
 
         let result = monitor.should_gate_quotes("BTC");
         assert!(
-            matches!(result, Some(QuoteGateReason::StaleData { .. })),
+            matches!(result, Some(DataQualityGateReason::StaleData { .. })),
             "Expected StaleData gate, got {:?}",
             result,
         );
@@ -953,7 +953,7 @@ mod tests {
         let result = monitor.should_gate_quotes("BTC");
         assert_eq!(
             result,
-            Some(QuoteGateReason::CrossedBook {
+            Some(DataQualityGateReason::CrossedBook {
                 best_bid: 100.0,
                 best_ask: 99.0,
             }),
@@ -991,7 +991,7 @@ mod tests {
         // Wait for staleness
         std::thread::sleep(std::time::Duration::from_millis(150));
         assert!(
-            matches!(monitor.should_gate_quotes("BTC"), Some(QuoteGateReason::StaleData { .. })),
+            matches!(monitor.should_gate_quotes("BTC"), Some(DataQualityGateReason::StaleData { .. })),
             "Should be gated while stale",
         );
 
@@ -1006,15 +1006,15 @@ mod tests {
     #[test]
     fn test_quote_gate_reason_display() {
         assert_eq!(
-            format!("{}", QuoteGateReason::NoDataReceived),
+            format!("{}", DataQualityGateReason::NoDataReceived),
             "no_data_received",
         );
-        let stale = QuoteGateReason::StaleData {
+        let stale = DataQualityGateReason::StaleData {
             age_ms: 20000,
             threshold_ms: 15000,
         };
         assert!(format!("{stale}").contains("20000"));
-        let crossed = QuoteGateReason::CrossedBook {
+        let crossed = DataQualityGateReason::CrossedBook {
             best_bid: 100.5,
             best_ask: 100.0,
         };

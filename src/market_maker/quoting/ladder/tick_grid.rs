@@ -12,6 +12,13 @@
 //! select_optimal_ticks()    → top-K by utility (K = capital-limited levels)
 //! ```
 
+use serde::{Deserialize, Serialize};
+
+/// Helper for serde default of `true`.
+fn default_true() -> bool {
+    true
+}
+
 /// A candidate level at a specific exchange tick.
 #[derive(Debug, Clone, Copy)]
 pub struct TickLevel {
@@ -173,7 +180,7 @@ fn compute_spacing_ticks(config: &TickGridConfig) -> u32 {
 // ============================================================================
 
 /// Parameters for tick scoring.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TickScoringParams {
     /// Volatility (per-second).
     pub sigma: f64,
@@ -185,14 +192,35 @@ pub struct TickScoringParams {
     pub as_decay_bps: f64,
     /// Maker fee in basis points.
     pub fee_bps: f64,
+    /// When true, use spread-capture / adverse-selection ratio as the utility metric.
+    /// SC/AS ratio: touch (high AS) gets low score, intermediate depths hit sweet spot,
+    /// deep levels taper due to low fill probability.
+    /// When false, use legacy P(fill) * (depth - AS - fee) scoring.
+    #[serde(default = "default_true")]
+    pub use_sc_as_ratio: bool,
 }
 
-/// Score each tick level by expected utility: U(δ) = P_fill(δ) × (δ - AS(δ) - fee).
+/// Score each tick level by expected utility.
 ///
-/// - `P_fill(δ) = 2Φ(-δ / (σ√τ))` from first-passage Brownian motion
-/// - `AS(δ) = as_at_touch × exp(-δ / as_decay_bps)`
+/// Two modes:
+/// - **SC/AS ratio** (`use_sc_as_ratio = true`): `U(δ) = P_fill(δ) × SC(δ) / AS(δ)`
+///   where `SC(δ) = max(depth - AS - fee, spread_floor_vol)`. This gives:
+///   touch (high AS) → low SC/AS → less size. Intermediate depths → sweet spot → more size.
+///   Deep (low fill prob) → tapers.
+/// - **Legacy** (`use_sc_as_ratio = false`): `U(δ) = P_fill(δ) × (δ - AS(δ) - fee)`
+///
+/// Fill probability: `P_fill(δ) = 2Φ(-δ / (σ√τ))` from first-passage Brownian motion.
+/// AS decay: `AS(δ) = as_at_touch × exp(-δ / as_decay_bps)`.
 pub fn score_ticks(levels: &mut [TickLevel], params: &TickScoringParams) {
+    debug_assert!(params.fee_bps > 0.0, "fee_bps must be positive for unit consistency");
+
     let sigma_sqrt_tau = params.sigma * params.tau.sqrt();
+    let sigma_bps = params.sigma * 10_000.0;
+
+    // Volatility-based minimum spread capture: ensures levels aren't scored as zero
+    // in low-vol regimes where depth barely exceeds AS + fee.
+    let spread_floor_vol_bps =
+        sigma_bps * (params.tau / (2.0 * std::f64::consts::PI)).sqrt();
 
     for level in levels.iter_mut() {
         let depth = level.depth_bps;
@@ -209,11 +237,18 @@ pub fn score_ticks(levels: &mut [TickLevel], params: &TickScoringParams) {
         // Adverse selection decays with depth
         let as_cost = params.as_at_touch_bps * (-depth / params.as_decay_bps.max(1.0)).exp();
 
-        // Edge = depth - AS - fee
-        let edge = depth - as_cost - params.fee_bps;
-
-        // Utility = P(fill) × edge
-        level.utility = p_fill * edge;
+        if params.use_sc_as_ratio {
+            // SC/AS ratio scoring: utility = P(fill) × spread_capture / AS
+            // spread_capture = depth - AS - fee, floored by volatility-based minimum
+            let spread_capture_bps = (depth - as_cost - params.fee_bps).max(spread_floor_vol_bps);
+            // SC/AS ratio: higher is better (more spread captured per unit of adverse selection)
+            let sc_as_ratio = spread_capture_bps / as_cost.max(0.01);
+            level.utility = p_fill * sc_as_ratio;
+        } else {
+            // Legacy scoring: utility = P(fill) × (depth - AS - fee)
+            let edge = depth - as_cost - params.fee_bps;
+            level.utility = p_fill * edge;
+        }
     }
 }
 
@@ -381,6 +416,7 @@ mod tests {
             as_at_touch_bps: 3.0,
             as_decay_bps: 10.0,
             fee_bps: 1.5,
+            use_sc_as_ratio: false, // Test legacy scoring
         };
         score_ticks(&mut levels, &params);
 
@@ -471,6 +507,7 @@ mod tests {
             as_at_touch_bps: 3.0,
             as_decay_bps: 10.0,
             fee_bps: 1.5,
+            use_sc_as_ratio: false, // Test legacy scoring
         };
         score_ticks(&mut bids, &scoring);
         score_ticks(&mut asks, &scoring);
@@ -518,5 +555,121 @@ mod tests {
         for i in 1..bids.len() {
             assert!(bids[i].price < bids[i - 1].price);
         }
+    }
+
+    // =====================================================================
+    // SC/AS ratio scoring tests
+    // =====================================================================
+
+    #[test]
+    fn test_sc_as_ratio_scoring_sweet_spot() {
+        // SC/AS ratio should create a "sweet spot" at intermediate depths:
+        // - Touch (high AS) → low SC/AS → less size
+        // - Intermediate depths → AS decays but fill prob still reasonable → higher SC/AS
+        // - Deep levels → fill prob drops → tapers
+        let mut levels = vec![
+            TickLevel { price: 29.62, depth_bps: 3.0, tick_offset: 90, utility: 0.0 },   // Near touch: high AS
+            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 0.0 },  // Intermediate
+            TickLevel { price: 29.57, depth_bps: 20.0, tick_offset: 600, utility: 0.0 },  // Intermediate-deep
+            TickLevel { price: 29.55, depth_bps: 27.0, tick_offset: 800, utility: 0.0 },  // Deep
+        ];
+        let params = TickScoringParams {
+            sigma: 0.0003,
+            tau: 10.0,
+            as_at_touch_bps: 3.0,
+            as_decay_bps: 10.0,
+            fee_bps: 1.5,
+            use_sc_as_ratio: true,
+        };
+        score_ticks(&mut levels, &params);
+
+        // All should have positive utility
+        for level in &levels {
+            assert!(level.utility > 0.0,
+                "Level at {:.1} bps should have positive SC/AS utility: {}",
+                level.depth_bps, level.utility);
+        }
+
+        // Touch (3 bps) should have lower utility than the intermediate level (10 bps)
+        // because at touch, AS is high relative to spread capture
+        assert!(levels[0].utility < levels[1].utility,
+            "Touch ({:.4}) should have lower SC/AS utility than 10bps ({:.4})",
+            levels[0].utility, levels[1].utility);
+    }
+
+    #[test]
+    fn test_sc_as_ratio_vs_legacy_ordering() {
+        // With SC/AS ratio, touch should be penalized more than in legacy mode
+        let mut levels_ratio = vec![
+            TickLevel { price: 29.62, depth_bps: 3.0, tick_offset: 90, utility: 0.0 },
+            TickLevel { price: 29.60, depth_bps: 10.0, tick_offset: 300, utility: 0.0 },
+        ];
+        let mut levels_legacy = levels_ratio.clone();
+
+        let params_ratio = TickScoringParams {
+            sigma: 0.0003,
+            tau: 10.0,
+            as_at_touch_bps: 3.0,
+            as_decay_bps: 10.0,
+            fee_bps: 1.5,
+            use_sc_as_ratio: true,
+        };
+        let params_legacy = TickScoringParams {
+            use_sc_as_ratio: false,
+            ..params_ratio.clone()
+        };
+
+        score_ticks(&mut levels_ratio, &params_ratio);
+        score_ticks(&mut levels_legacy, &params_legacy);
+
+        // In SC/AS mode, the ratio of touch-to-intermediate utility should be smaller
+        // (touch is penalized more by AS denominator)
+        let ratio_touch_to_mid = levels_ratio[0].utility / levels_ratio[1].utility;
+        let legacy_touch_to_mid = levels_legacy[0].utility / levels_legacy[1].utility;
+
+        assert!(ratio_touch_to_mid < legacy_touch_to_mid,
+            "SC/AS ratio ({:.4}) should penalize touch more than legacy ({:.4})",
+            ratio_touch_to_mid, legacy_touch_to_mid);
+    }
+
+    #[test]
+    fn test_sc_as_spread_floor_vol() {
+        // When depth barely exceeds AS + fee, the volatility floor should prevent
+        // utility from being zero/negative
+        let mut levels = vec![
+            TickLevel { price: 29.62, depth_bps: 4.0, tick_offset: 120, utility: 0.0 },
+        ];
+        // AS=3 bps at touch, fee=1.5 bps → edge = 4.0 - 3.0 - 1.5 = -0.5 (negative)
+        // But spread_floor_vol should provide a positive floor
+        let params = TickScoringParams {
+            sigma: 0.001,  // Higher vol → larger floor
+            tau: 10.0,
+            as_at_touch_bps: 3.0,
+            as_decay_bps: 10.0,
+            fee_bps: 1.5,
+            use_sc_as_ratio: true,
+        };
+        score_ticks(&mut levels, &params);
+
+        // sigma_bps = 0.001 * 10000 = 10 bps
+        // spread_floor_vol = 10 * sqrt(10 / (2*PI)) = 10 * 1.262 = 12.62 bps
+        // The floor should make utility positive even when raw SC is negative
+        assert!(levels[0].utility > 0.0,
+            "Vol floor should make utility positive: {}", levels[0].utility);
+    }
+
+    #[test]
+    fn test_sc_as_default_true_serde() {
+        // Verify that deserializing without use_sc_as_ratio defaults to true
+        let json = r#"{
+            "sigma": 0.0003,
+            "tau": 10.0,
+            "as_at_touch_bps": 3.0,
+            "as_decay_bps": 10.0,
+            "fee_bps": 1.5
+        }"#;
+        let params: TickScoringParams = serde_json::from_str(json).unwrap();
+        assert!(params.use_sc_as_ratio,
+            "use_sc_as_ratio should default to true when not specified");
     }
 }

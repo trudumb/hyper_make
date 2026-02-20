@@ -18,24 +18,42 @@ pub struct RiskConfig {
 
     /// Weight for volatility scaling [0.0, 1.0]
     /// 0.0 = ignore volatility, 1.0 = full scaling
+    #[deprecated(
+        note = "Legacy multiplicative gamma chain removed. Use CalibratedRiskModel beta coefficients."
+    )]
     pub volatility_weight: f64,
 
     /// Maximum volatility multiplier
     /// Caps how much high volatility can increase γ
+    #[deprecated(
+        note = "Legacy multiplicative gamma chain removed. Use CalibratedRiskModel beta coefficients."
+    )]
     pub max_volatility_multiplier: f64,
 
     /// Toxicity threshold (jump_ratio above this triggers scaling)
+    #[deprecated(
+        note = "Legacy multiplicative gamma chain removed. Use CalibratedRiskModel beta coefficients."
+    )]
     pub toxicity_threshold: f64,
 
     /// How much toxicity increases γ per unit of jump_ratio above 1.0
+    #[deprecated(
+        note = "Legacy multiplicative gamma chain removed. Use CalibratedRiskModel beta coefficients."
+    )]
     pub toxicity_sensitivity: f64,
 
     /// Inventory utilization threshold for γ scaling [0.0, 1.0]
     /// Below this, no inventory scaling
+    #[deprecated(
+        note = "Legacy multiplicative gamma chain removed. Use CalibratedRiskModel beta coefficients."
+    )]
     pub inventory_threshold: f64,
 
     /// How aggressively γ increases near position limits
     /// Uses quadratic scaling: 1 + sensitivity × (utilization - threshold)²
+    #[deprecated(
+        note = "Legacy multiplicative gamma chain removed. Use CalibratedRiskModel beta coefficients."
+    )]
     pub inventory_sensitivity: f64,
 
     /// Continuous γ(q) = γ_base × (1 + β × (q/q_max)²) scaling coefficient.
@@ -330,6 +348,7 @@ impl RiskConfig {
     ///
     /// # Returns
     /// Optimal gamma for achieving target spread, clamped to [gamma_min, gamma_max]
+    #[allow(deprecated)]
     pub fn derive_gamma_from_glft(
         &self,
         target_half_spread_bps: f64,
@@ -392,6 +411,7 @@ impl RiskConfig {
     }
 }
 
+#[allow(deprecated)]
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
@@ -459,6 +479,7 @@ impl RiskConfig {
     ///
     /// GLFT math: With κ=1500 and γ=0.15, δ* ≈ 1/κ ≈ 6.7 bps per side
     /// Total spread: 2 × (6.7 + 1.5) = ~16.4 bps (includes 1.5 bps HL maker fee)
+    #[allow(deprecated)]
     pub fn hip3() -> Self {
         Self {
             gamma_base: 0.15,               // Aggressive (vs 0.3 default)

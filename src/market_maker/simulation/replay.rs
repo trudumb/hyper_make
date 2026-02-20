@@ -268,6 +268,14 @@ impl ReplayEngine {
             position: self.position,
             capital_tier: crate::market_maker::config::auto_derive::CapitalTier::Large,
             is_warmup: false, // Replay assumes calibrated state
+            // A2: Non-triggering defaults for replay
+            cascade_size_factor: 1.0,
+            cascade_threshold: 0.3,
+            hawkes_p_cluster: 0.0,
+            hawkes_branching_ratio: 0.0,
+            flow_direction: 0.0,
+            reduce_only_threshold: 0.7,
+            max_position: f64::MAX,
         };
         let new_mode = select_mode(&input);
         if new_mode != self.mode {

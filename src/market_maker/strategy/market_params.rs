@@ -291,9 +291,15 @@ pub struct MarketParams {
     /// Pre-fill size multiplier for bid side [0.3, 1.0].
     /// Reduces order sizes when toxic flow expected on bid side.
     /// Computed from toxicity: if toxicity > 0.5, mult = (1.0 - (tox - 0.5)).clamp(0.3, 1.0)
+    #[deprecated(
+        note = "Legacy multiplicative size reduction removed. Toxicity defense now handled by additive spread widening."
+    )]
     pub pre_fill_size_mult_bid: f64,
 
     /// Pre-fill size multiplier for ask side [0.3, 1.0].
+    #[deprecated(
+        note = "Legacy multiplicative size reduction removed. Toxicity defense now handled by additive spread widening."
+    )]
     pub pre_fill_size_mult_ask: f64,
 
     // === Tier 1: Liquidation Cascade ===
@@ -1005,7 +1011,7 @@ pub struct MarketParams {
     pub funding_carry_bps: f64,
 
     /// Short-term vs long-term realized vol ratio (σ_short / σ_long).
-    /// > 1.0 = volatility expansion → widen spreads.
+    /// \> 1.0 = volatility expansion → widen spreads.
     /// Phase 8: cold tier feature.
     pub vol_term_structure_ratio: f64,
 
@@ -1122,7 +1128,9 @@ impl Default for MarketParams {
             pre_fill_toxicity_ask: 0.0,      // No toxicity initially
             pre_fill_spread_mult_bid: 1.0,   // No multiplier initially
             pre_fill_spread_mult_ask: 1.0,   // No multiplier initially
+            #[allow(deprecated)]
             pre_fill_size_mult_bid: 1.0,     // Full size initially
+            #[allow(deprecated)]
             pre_fill_size_mult_ask: 1.0,     // Full size initially
             // Tier 1: Liquidation Cascade
             tail_risk_multiplier: 1.0, // Default: no tail risk scaling

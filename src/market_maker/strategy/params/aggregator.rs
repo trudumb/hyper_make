@@ -278,16 +278,11 @@ impl ParameterAggregator {
             pre_fill_toxicity_ask: sources.pre_fill_classifier.predict_toxicity(false),
             pre_fill_spread_mult_bid: sources.pre_fill_classifier.spread_multiplier(true),
             pre_fill_spread_mult_ask: sources.pre_fill_classifier.spread_multiplier(false),
-            // Per-side size reduction from toxicity (Sprint 2.3):
-            // When toxicity > 0.5, linearly reduce size from 1.0 to 0.3
-            pre_fill_size_mult_bid: {
-                let tox = sources.pre_fill_classifier.predict_toxicity(true);
-                if tox > 0.5 { (1.0 - (tox - 0.5)).clamp(0.3, 1.0) } else { 1.0 }
-            },
-            pre_fill_size_mult_ask: {
-                let tox = sources.pre_fill_classifier.predict_toxicity(false);
-                if tox > 0.5 { (1.0 - (tox - 0.5)).clamp(0.3, 1.0) } else { 1.0 }
-            },
+            // Legacy size reduction — deprecated, toxicity now handled by additive spread widening.
+            #[allow(deprecated)]
+            pre_fill_size_mult_bid: 1.0,
+            #[allow(deprecated)]
+            pre_fill_size_mult_ask: 1.0,
 
             // === Tier 1: Liquidation Cascade ===
             tail_risk_multiplier: sources.liquidation_detector.tail_risk_multiplier(),

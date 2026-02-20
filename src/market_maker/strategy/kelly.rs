@@ -14,6 +14,23 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Correlation discount for Kelly fraction under fill clustering.
+///
+/// During cascades/trends, fills cluster (correlation approaches 1.0), reducing the
+/// effective sample size. This means the Kelly fraction should shrink because our
+/// edge estimate is based on fewer independent observations than the raw fill count suggests.
+///
+/// Maps regime_gamma_multiplier to a discount factor:
+/// - Calm (1.0): discount = 1.0 (no adjustment, fills are independent)
+/// - Volatile (2.0): discount = 0.77 (fills cluster moderately)
+/// - Extreme (3.0): discount = 0.63 (fills cluster heavily)
+///
+/// Formula: `1 / (1 + rho_est)` where `rho_est = clamp(gamma_mult - 1, 0, 2) * 0.3`
+pub fn correlation_discount(regime_gamma_multiplier: f64) -> f64 {
+    let rho_est = (regime_gamma_multiplier - 1.0).clamp(0.0, 2.0) * 0.3;
+    1.0 / (1.0 + rho_est)
+}
+
 /// Standard normal CDF approximation (Abramowitz and Stegun).
 /// Internal function for Kelly calculations.
 fn normal_cdf(x: f64) -> f64 {
@@ -550,5 +567,55 @@ mod tests {
         // Low edge, high uncertainty -> should not trade
         let (should_trade, _, _) = sizer.sizing_decision(1.0, 5.0);
         assert!(!should_trade, "Should not trade with low edge ratio");
+    }
+
+    #[test]
+    fn test_correlation_discount_calm() {
+        // Calm regime (gamma_mult = 1.0): no discount
+        let d = correlation_discount(1.0);
+        assert!((d - 1.0).abs() < 0.001,
+            "Calm regime should have discount=1.0, got {}", d);
+    }
+
+    #[test]
+    fn test_correlation_discount_volatile() {
+        // Volatile regime (gamma_mult = 2.0): rho_est = 0.3, discount = 1/1.3 = 0.769
+        let d = correlation_discount(2.0);
+        assert!((d - 0.769).abs() < 0.01,
+            "Volatile regime should have discount~0.77, got {}", d);
+    }
+
+    #[test]
+    fn test_correlation_discount_extreme() {
+        // Extreme regime (gamma_mult = 3.0): rho_est = 0.6, discount = 1/1.6 = 0.625
+        let d = correlation_discount(3.0);
+        assert!((d - 0.625).abs() < 0.01,
+            "Extreme regime should have discount~0.63, got {}", d);
+    }
+
+    #[test]
+    fn test_correlation_discount_clamps() {
+        // Below calm: gamma_mult = 0.5 → rho_est = clamp(-0.5, 0, 2) * 0.3 = 0 → 1.0
+        let d_below = correlation_discount(0.5);
+        assert!((d_below - 1.0).abs() < 0.001,
+            "Below-calm should clamp to 1.0, got {}", d_below);
+
+        // Far above extreme: gamma_mult = 10.0 → rho_est = clamp(9.0, 0, 2) * 0.3 = 0.6 → 0.625
+        let d_above = correlation_discount(10.0);
+        assert!((d_above - 0.625).abs() < 0.01,
+            "Far-above-extreme should clamp to ~0.63, got {}", d_above);
+    }
+
+    #[test]
+    fn test_correlation_discount_monotonically_decreasing() {
+        // Higher gamma_mult → more fill clustering → lower discount
+        let d_calm = correlation_discount(1.0);
+        let d_normal = correlation_discount(1.5);
+        let d_volatile = correlation_discount(2.0);
+        let d_extreme = correlation_discount(3.0);
+
+        assert!(d_calm > d_normal, "calm {} > normal {}", d_calm, d_normal);
+        assert!(d_normal > d_volatile, "normal {} > volatile {}", d_normal, d_volatile);
+        assert!(d_volatile > d_extreme, "volatile {} > extreme {}", d_volatile, d_extreme);
     }
 }

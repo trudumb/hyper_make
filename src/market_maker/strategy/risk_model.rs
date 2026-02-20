@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 
 use super::MarketParams;
 
+fn default_beta_cascade() -> f64 {
+    0.8
+}
+
 /// Calibration state for the risk model.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CalibrationState {
@@ -76,6 +80,13 @@ pub struct CalibratedRiskModel {
     /// This replaces magic threshold logic in quote_gate with principled gamma modulation
     pub beta_confidence: f64,
 
+    /// Per unit cascade_intensity [0, 1].
+    /// Cascade intensity=1.0 → exp(0.8) ≈ 2.2× gamma widening.
+    /// Routes cascade defense through principled log-additive γ path
+    /// instead of arbitrary size multiplication.
+    #[serde(default = "default_beta_cascade")]
+    pub beta_cascade: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -120,6 +131,8 @@ impl Default for CalibratedRiskModel {
             // NEGATIVE: high confidence → lower gamma (more two-sided quoting)
             // confidence=1 → exp(-0.4) ≈ 0.67× gamma
             beta_confidence: -0.4,
+            // cascade_intensity=1 → exp(0.8) ≈ 2.2× gamma widening
+            beta_cascade: 0.8,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -158,6 +171,8 @@ impl CalibratedRiskModel {
             beta_uncertainty: 0.3,
             // Less negative during warmup (more cautious about confidence)
             beta_confidence: -0.2,
+            // More conservative cascade widening during warmup
+            beta_cascade: 1.2,
             ..Default::default()
         }
     }
@@ -180,7 +195,8 @@ impl CalibratedRiskModel {
             + self.beta_hawkes * features.excess_intensity
             + self.beta_book_depth * features.depth_depletion
             + self.beta_uncertainty * features.model_uncertainty
-            + self.beta_confidence * features.position_direction_confidence;
+            + self.beta_confidence * features.position_direction_confidence
+            + self.beta_cascade * features.cascade_intensity;
 
         log_gamma.exp().clamp(self.gamma_min, self.gamma_max)
     }
@@ -248,6 +264,7 @@ impl CalibratedRiskModel {
                 + defaults.beta_uncertainty * alpha,
             beta_confidence: self.beta_confidence * (1.0 - alpha)
                 + defaults.beta_confidence * alpha,
+            beta_cascade: self.beta_cascade * (1.0 - alpha) + defaults.beta_cascade * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -290,6 +307,11 @@ pub struct RiskFeatures {
     /// When high, beta_confidence (negative) REDUCES gamma → more two-sided quoting.
     /// When low, gamma stays high → natural urgency to reduce position.
     pub position_direction_confidence: f64,
+
+    /// Cascade intensity [0, 1]: derived from (1.0 - cascade_size_factor).
+    /// 0 = calm market, 1 = full cascade (OI dropping, depth evaporating).
+    /// Fed into beta_cascade coefficient for principled spread widening.
+    pub cascade_intensity: f64,
 }
 
 impl RiskFeatures {
@@ -356,6 +378,11 @@ impl RiskFeatures {
             params.compute_position_direction_confidence(position, max_position)
         };
 
+        // === Cascade Intensity ===
+        // Derived from cascade_size_factor: 1.0 = calm, 0.0 = full cascade
+        // Inverted so higher value = more risk
+        let cascade_intensity = (1.0 - params.cascade_size_factor).clamp(0.0, 1.0);
+
         Self {
             excess_volatility,
             toxicity_score,
@@ -364,6 +391,7 @@ impl RiskFeatures {
             depth_depletion,
             model_uncertainty,
             position_direction_confidence,
+            cascade_intensity,
         }
     }
 
@@ -377,6 +405,7 @@ impl RiskFeatures {
             depth_depletion: 0.0,
             model_uncertainty: 0.0,
             position_direction_confidence: 0.5, // Neutral confidence
+            cascade_intensity: 0.0,
         }
     }
 
@@ -390,6 +419,7 @@ impl RiskFeatures {
             depth_depletion: 1.0,
             model_uncertainty: 1.0,
             position_direction_confidence: 0.0, // No confidence → high gamma
+            cascade_intensity: 1.0,
         }
     }
 
@@ -453,6 +483,7 @@ impl RiskFeatures {
             depth_depletion,
             model_uncertainty,
             position_direction_confidence,
+            cascade_intensity: 0.0, // Not available from MarketState
         }
     }
 }
@@ -485,8 +516,8 @@ pub struct RiskModelConfig {
 impl Default for RiskModelConfig {
     fn default() -> Self {
         Self {
-            use_calibrated_risk_model: false, // Conservative: disabled by default
-            risk_model_blend: 0.0,            // Start with old model
+            use_calibrated_risk_model: true, // Log-additive model enabled
+            risk_model_blend: 1.0,           // Pure log-additive (no multiplicative explosion)
             sigma_baseline: 0.0002,           // 2 bps per √second
             kappa_baseline: 2500.0,           // Prior for liquid markets
             book_depth_baseline_usd: 100_000.0, // $100k baseline
@@ -565,6 +596,7 @@ mod tests {
             depth_depletion: 0.5,
             model_uncertainty: 0.5,
             position_direction_confidence: 0.5, // Neutral confidence
+            cascade_intensity: 0.0,
         };
 
         let gamma_neutral = model.compute_gamma(&neutral);
@@ -664,6 +696,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cascade_widens_gamma() {
+        let model = CalibratedRiskModel::default();
+        let calm = RiskFeatures {
+            cascade_intensity: 0.0,
+            ..RiskFeatures::neutral()
+        };
+        let cascade = RiskFeatures {
+            cascade_intensity: 1.0,
+            ..RiskFeatures::neutral()
+        };
+
+        let gamma_calm = model.compute_gamma(&calm);
+        let gamma_cascade = model.compute_gamma(&cascade);
+
+        // beta_cascade=0.8 → exp(0.8) ≈ 2.23x wider gamma during cascade
+        assert!(
+            gamma_cascade > gamma_calm * 2.0,
+            "Cascade should widen gamma by ~2.2x: calm={}, cascade={}",
+            gamma_calm,
+            gamma_cascade
+        );
+        assert!(
+            gamma_cascade < gamma_calm * 2.5,
+            "Cascade widening should be bounded: calm={}, cascade={}",
+            gamma_calm,
+            gamma_cascade
+        );
+    }
+
+    #[test]
     fn test_hip3_gamma_no_explosion() {
         // Under stressed conditions, gamma should stay bounded (not > 0.5)
         // The log-additive model prevents the 1.2^7 = 3.6x multiplicative explosion
@@ -676,6 +738,7 @@ mod tests {
             depth_depletion: 0.6,   // Thin book
             model_uncertainty: 0.8, // High uncertainty
             position_direction_confidence: 0.3, // Low confidence
+            cascade_intensity: 0.0,
         };
 
         let gamma = model.compute_gamma(&stressed);
@@ -699,6 +762,7 @@ mod tests {
             depth_depletion: 0.2,
             model_uncertainty: 0.3,
             position_direction_confidence: 0.5,
+            cascade_intensity: 0.0,
         };
         let gamma_moderate = model.compute_gamma(&moderate);
         assert!(

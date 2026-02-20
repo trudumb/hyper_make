@@ -38,7 +38,7 @@ pub mod hybrid_ev;
 pub mod information;
 pub mod interface;
 pub mod position_pnl_tracker;
-pub mod quote_gate;
+pub mod quota_shadow;
 pub mod simulation;
 pub mod state;
 pub mod theoretical_edge;
@@ -57,10 +57,7 @@ pub use changepoint::{
     ChangepointConfig, ChangepointDetector, ChangepointSummary, ChangePointResult, MarketRegime,
 };
 pub use position_pnl_tracker::{PositionPnLConfig, PositionPnLDiagnostics, PositionPnLTracker};
-pub use quote_gate::{
-    NoQuoteReason as QuoteGateNoQuoteReason, QuoteDecision as QuoteGateDecision, QuoteGate,
-    QuoteGateConfig, QuoteGateInput, ProbeConfig,
-};
+pub use quota_shadow::{QuotaShadowConfig, QuotaShadowPricer};
 pub use theoretical_edge::{
     AdverseSummary, BayesianAdverseTracker, CrossAssetSignal, EnhancedEdgeInput,
     RegimeAwareBayesianAdverse, TheoreticalEdgeConfig, TheoreticalEdgeEstimator,

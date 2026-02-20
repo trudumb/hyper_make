@@ -400,13 +400,17 @@ impl LadderStrategy {
         DynamicDepthGenerator::new(config)
     }
 
-    /// Calculate effective γ based on current market conditions.
+    /// Calculate effective γ using the CalibratedRiskModel (log-additive).
     ///
-    /// Supports two modes (same as GLFTStrategy):
-    /// 1. **Legacy (Multiplicative)**: γ = γ_base × vol × tox × inv × ...
-    /// 2. **Calibrated (Log-Additive)**: log(γ) = log(γ_base) + Σ βᵢ × xᵢ
+    /// log(γ) = log(γ_base) + Σ βᵢ × xᵢ
     ///
-    /// Blending controlled by `risk_model_config.risk_model_blend`.
+    /// The legacy multiplicative chain and post-process multipliers
+    /// (calibration_gamma_mult, tail_risk_multiplier) have been removed.
+    /// Those effects are now captured by CalibratedRiskModel β coefficients.
+    ///
+    /// Callers (generate_ladder, compute_spread_composition) may still apply
+    /// their own physically motivated multipliers (regime, liquidity, tail_risk)
+    /// on top of this base gamma.
     fn effective_gamma(
         &self,
         market_params: &MarketParams,
@@ -416,122 +420,25 @@ impl LadderStrategy {
         let cfg = &self.risk_config;
         let blend = self.risk_model_config.risk_model_blend.clamp(0.0, 1.0);
 
-        // ============================================================
-        // MODE 1: LEGACY MULTIPLICATIVE GAMMA
-        // ============================================================
-        let gamma_legacy = if blend < 1.0 {
-            self.compute_legacy_gamma(market_params, position, max_position)
-        } else {
-            0.0
-        };
-
-        // ============================================================
-        // MODE 2: CALIBRATED LOG-ADDITIVE GAMMA
-        // ============================================================
-        let gamma_calibrated = if blend > 0.0 || self.risk_model_config.use_calibrated_risk_model {
-            let features = RiskFeatures::from_params(
-                market_params,
-                position,
-                max_position,
-                &self.risk_model_config,
+        if blend < 1.0 {
+            tracing::debug!(
+                blend = %format!("{:.2}", blend),
+                "risk_model_blend < 1.0 but legacy path removed; using calibrated-only"
             );
-            self.risk_model.compute_gamma(&features)
-        } else {
-            0.0
-        };
+        }
 
         // ============================================================
-        // BLEND BETWEEN MODELS
+        // CALIBRATED LOG-ADDITIVE GAMMA (only path)
         // ============================================================
-        let gamma_base = if blend <= 0.0 {
-            gamma_legacy
-        } else if blend >= 1.0 {
-            gamma_calibrated
-        } else {
-            gamma_legacy * (1.0 - blend) + gamma_calibrated * blend
-        };
+        let features = RiskFeatures::from_params(
+            market_params,
+            position,
+            max_position,
+            &self.risk_model_config,
+        );
+        let gamma = self.risk_model.compute_gamma(&features);
 
-        // ============================================================
-        // POST-PROCESS SCALARS (always applied)
-        // ============================================================
-        let gamma_with_calib = gamma_base * market_params.calibration_gamma_mult;
-        let gamma_final = gamma_with_calib * market_params.tail_risk_multiplier;
-
-        gamma_final.clamp(cfg.gamma_min, cfg.gamma_max)
-    }
-
-    /// Compute gamma using legacy multiplicative model.
-    fn compute_legacy_gamma(
-        &self,
-        market_params: &MarketParams,
-        position: f64,
-        max_position: f64,
-    ) -> f64 {
-        let cfg = &self.risk_config;
-
-        // Volatility scaling
-        let vol_ratio = market_params.sigma_effective / cfg.sigma_baseline.max(1e-9);
-        let vol_scalar = if vol_ratio <= 1.0 {
-            1.0
-        } else {
-            let raw = 1.0 + cfg.volatility_weight * (vol_ratio - 1.0);
-            raw.min(cfg.max_volatility_multiplier)
-        };
-
-        // Toxicity scaling
-        let toxicity_scalar = if market_params.jump_ratio <= cfg.toxicity_threshold {
-            1.0
-        } else {
-            1.0 + cfg.toxicity_sensitivity * (market_params.jump_ratio - 1.0)
-        };
-
-        // Inventory scaling
-        let utilization = if max_position > EPSILON {
-            (position.abs() / max_position).min(1.0)
-        } else {
-            0.0
-        };
-        let inventory_scalar = if utilization <= cfg.inventory_threshold {
-            1.0
-        } else {
-            let excess = utilization - cfg.inventory_threshold;
-            1.0 + cfg.inventory_sensitivity * excess.powi(2)
-        };
-
-        // NOTE: regime_scalar REMOVED - was redundant with vol_scalar
-        // Both responded to volatility, causing double-scaling
-
-        // Hawkes activity scaling (continuous, not threshold-based)
-        let hawkes_baseline = 0.5;
-        let hawkes_sensitivity = 2.0;
-        let hawkes_scalar = 1.0
-            + hawkes_sensitivity
-                * (market_params.hawkes_activity_percentile - hawkes_baseline).max(0.0);
-
-        // Time-of-day scaling
-        let time_scalar = cfg.time_of_day_multiplier();
-
-        // Book depth scaling
-        let book_depth_scalar = cfg.book_depth_multiplier(market_params.near_touch_depth_usd);
-
-        // Uncertainty scaling
-        let uncertainty_scalar = if market_params.kappa_ci_width > 0.0 {
-            1.0 + (market_params.kappa_ci_width / 10.0).min(0.5)
-        } else {
-            1.0
-        };
-
-        // Combine (note: calibration and tail_risk applied in caller)
-        let gamma_effective = cfg.gamma_base
-            * vol_scalar
-            * toxicity_scalar
-            * inventory_scalar
-            * hawkes_scalar
-            * time_scalar
-            * book_depth_scalar
-            * uncertainty_scalar;
-
-        gamma_effective.clamp(cfg.gamma_min, cfg.gamma_max)
+        gamma.clamp(cfg.gamma_min, cfg.gamma_max)
     }
 
     /// Calculate holding time from arrival intensity.
@@ -1024,9 +931,9 @@ impl LadderStrategy {
             }
         }
 
-        // Continuous size scaling: smooth reduction as utilization increases
-        // At 0%→1.0, 60%→0.76, 80%→0.52, 100%→0.25 (matches old zone behavior more smoothly)
-        let zone_size_mult = (1.0 - 0.75 * abs_inventory_ratio.powi(2)).max(0.25);
+        // zone_size_mult REMOVED (B3): inventory penalty now captured by
+        // beta_inventory in CalibratedRiskModel via gamma. Double-penalizing
+        // through size is economically incorrect.
 
         // Convert AS spread adjustment to bps for ladder generation
         let as_at_touch_bps = if market_params.as_warmed_up {
@@ -1046,7 +953,7 @@ impl LadderStrategy {
         // quoting capacity (e.g., 1.3 HYPE vs 66 HYPE), causing ALL levels to fail
         // min_notional check, triggering concentration fallback BEFORE entropy optimizer.
         let size_for_initial_ladder =
-            effective_max_position * market_params.cascade_size_factor * zone_size_mult;
+            effective_max_position * market_params.cascade_size_factor;
 
         // L2 reservation shift removed — double-counts skew already handled
         // by lead_lag_signal_bps in the directional skew section below.
@@ -1262,53 +1169,21 @@ impl LadderStrategy {
         // Kappa-driven spread cap removed — circular with GLFT.
         // GLFT delta = (1/gamma) * ln(1 + gamma/kappa) IS the self-consistent spread.
 
-        // === PRE-FILL AS MULTIPLIERS ===
-        // Apply asymmetric spread widening from pre-fill adverse selection classifier.
-        // These multipliers are [1.0, 3.0] where >1.0 indicates predicted toxicity on that side.
-        // Widen depths (not gamma) to get direct, per-side spread control.
-        //
-        // WARMUP CAP: During warmup the AS model is uncalibrated — update_count rises from
-        // book/trade events (not fills), so the warmup prior gets overridden before any fills
-        // arrive. Without a cap, raw signal noise produces 1.5-2x multipliers that push the
-        // touch from ~7 bps to ~14 bps, preventing fills entirely (cold-start death spiral).
-        // Cap at 1.15x during warmup (mild protection); full multiplier after warmup graduates.
-        let warmup_as_cap = if market_params.adaptive_warmup_progress < 1.0 {
-            // Linear ramp: 1.2x at 0% warmup → 3.0x at 100% warmup
-            // At cold start, allow mild AS widening (1.2x floor ≈ +1.6 bps on 8 bps spread)
-            // as a Bayesian prior for adverse selection defense. The AS model is
-            // uncalibrated initially, but zero protection leaves us exposed. The
-            // 1.2x floor passes the warmup prior (~1.14x) through while capping noise.
-            let t = market_params.adaptive_warmup_progress;
-            1.2 + t * (3.0 - 1.2)
-        } else {
-            3.0 // No cap post-warmup
-        };
-        let capped_bid_mult = market_params.pre_fill_spread_mult_bid.min(warmup_as_cap);
-        let capped_ask_mult = market_params.pre_fill_spread_mult_ask.min(warmup_as_cap);
+        // === PRE-FILL AS MULTIPLIERS: REMOVED (B3) ===
+        // Multiplicative spread widening from pre-fill classifier deleted.
+        // Adverse selection defense now handled entirely by the additive E[PnL]
+        // filter below (which uses AS cost in bps, not unitless multipliers).
 
-        if capped_bid_mult > 1.01 {
-            for depth in dynamic_depths.bid.iter_mut() {
-                *depth *= capped_bid_mult;
-            }
-        }
-        if capped_ask_mult > 1.01 {
-            for depth in dynamic_depths.ask.iter_mut() {
-                *depth *= capped_ask_mult;
-            }
-        }
-
-        // [SPREAD TRACE] Phase 6: after pre-fill AS multipliers
+        // [SPREAD TRACE] Phase 6: pre-fill AS (multiplicative removed)
         tracing::info!(
             phase = "pre_fill_as",
             raw_mult_bid = %format!("{:.3}", market_params.pre_fill_spread_mult_bid),
             raw_mult_ask = %format!("{:.3}", market_params.pre_fill_spread_mult_ask),
-            capped_mult_bid = %format!("{:.3}", capped_bid_mult),
-            capped_mult_ask = %format!("{:.3}", capped_ask_mult),
-            warmup_as_cap = %format!("{:.3}", warmup_as_cap),
+            status = "bypassed (multiplicative removed, E[PnL] filter handles AS)",
             touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
             touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
             total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
-            "[SPREAD TRACE] after pre-fill AS multipliers (warmup-capped)"
+            "[SPREAD TRACE] pre-fill AS multipliers bypassed (B3: multiplicative removed)"
         );
 
         // === SPREAD INFLATION CAP ===
@@ -1629,30 +1504,10 @@ impl LadderStrategy {
                 (available_for_bids, available_for_asks)
             };
 
-            // === TOXICITY-BASED SIZE REDUCTION (Sprint 2.3) ===
-            // When pre-fill toxicity > 0.5 on a side, reduce that side's capacity
-            // proportionally. This shrinks order sizes to limit adverse selection losses
-            // while keeping quotes active (unlike cancel-on-toxicity which removes them).
-            //
-            // Phase 4: When E[PnL] filter is active, this is SUBSUMED:
-            // High toxicity → high AS cost → E[PnL] < 0 → levels dropped naturally.
-            let (available_for_bids, available_for_asks) = if !market_params.use_epnl_filter {
-                let ab = available_for_bids * market_params.pre_fill_size_mult_bid;
-                let aa = available_for_asks * market_params.pre_fill_size_mult_ask;
-
-                if market_params.pre_fill_size_mult_bid < 0.99 || market_params.pre_fill_size_mult_ask < 0.99 {
-                    tracing::info!(
-                        bid_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_bid),
-                        ask_size_mult = %format!("{:.2}", market_params.pre_fill_size_mult_ask),
-                        bid_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
-                        ask_toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
-                        "Toxicity size reduction applied"
-                    );
-                }
-                (ab, aa)
-            } else {
-                (available_for_bids, available_for_asks)
-            };
+            // === TOXICITY-BASED SIZE REDUCTION: REMOVED (B3) ===
+            // Multiplicative size reduction deleted. Adverse selection defense
+            // now handled by the additive E[PnL] filter which drops negative-EV
+            // levels entirely (more principled than shrinking sizes).
 
             if over_limit {
                 if position > 0.0 {
@@ -1779,6 +1634,7 @@ impl LadderStrategy {
                     as_at_touch_bps,
                     as_decay_bps: 10.0, // AS decays over ~10 bps depth
                     fee_bps: self.risk_config.maker_fee_rate * 10_000.0,
+                    use_sc_as_ratio: true,
                 };
 
                 // score_ticks mutates in place (sets utility field)

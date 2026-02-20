@@ -10,7 +10,7 @@ use super::super::{
     QuoteConfig, QuotingStrategy, Side,
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
-use crate::market_maker::control::{QuoteGateDecision, QuoteGateInput};
+// QuoteGate removed (A4) — replaced by ExecutionMode state machine + E[PnL] filter
 use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
@@ -885,7 +885,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // === Phase 8: Warm-tier features (every 2 cycles) ===
         // Hawkes intensity + cross-venue flow acceleration → individual drift observations.
         // These update less frequently to avoid over-shrinking Kalman P.
-        if self.quote_cycle_count % 2 == 0 {
+        if self.quote_cycle_count.is_multiple_of(2) {
             // Hawkes excess intensity as drift observation
             if let Some((z, r)) = self.tier2.hawkes.drift_observation() {
                 self.drift_estimator.update_single_observation(z, r);
@@ -904,7 +904,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === Phase 8: Cold-tier features (every 5 cycles) ===
         // Lead-lag signal from Binance → drift observation.
-        if self.quote_cycle_count % 5 == 0 {
+        if self.quote_cycle_count.is_multiple_of(5) {
             let ll = self.stochastic.signal_integrator.lead_lag_signal();
             if ll.is_actionable && ll.stability_confidence > 0.3 {
                 // diff_bps > 0 means Binance is higher → expect HL to follow up → bullish
@@ -2361,7 +2361,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === Phase 3: Compute MC EV for kappa-driven override ===
         // Only compute when IR not calibrated and kappa is strong
-        let mc_ev_bps = if market_params.kappa > 1500.0 && !self.stochastic.calibrated_edge.is_useful() {
+        let _mc_ev_bps = if market_params.kappa > 1500.0 && !self.stochastic.calibrated_edge.is_useful() {
             let mc_result = self.stochastic.mc_simulator.simulate_ev(
                 market_params.kappa,
                 enhanced_flow,
@@ -2458,95 +2458,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             (None, 0.0)
         };
 
-        let quote_gate_input = QuoteGateInput {
-            flow_imbalance: market_params.flow_imbalance,
-            momentum_confidence: market_params.p_momentum_continue,
-            momentum_bps: market_params.momentum_bps,
-            position: self.position.position(),
-            max_position: self.effective_max_position,
-            is_warmup: !self.estimator.is_warmed_up(),
-            cascade_size_factor: market_params.cascade_size_factor,
-            // Fields for theoretical edge calculation
-            book_imbalance: market_params.book_imbalance,
-            spread_bps: market_params.market_spread_bps.max(1.0), // Floor to 1 bps
-            sigma: market_params.sigma,
-            tau_seconds: 1.0, // Default holding horizon of 1 second
-            // Fields for enhanced flow and kappa-driven decisions
-            kappa_effective: market_params.kappa,
-            enhanced_flow,
-            mc_ev_bps,
-            // Hierarchical Edge Belief (L2/L3 Fusion)
-            // L2 inputs from learning module - NOW WIRED!
-            l2_p_positive_edge: l2_p_positive,
-            l2_model_health: l2_health_score,
-            // L3 inputs from stochastic controller
-            // Cap L3 trust based on capital-aware policy to prevent death spiral:
-            // with few fills, tautological edge causes L3 to ramp trust → kill quoting.
-            // Policy caps trust at e.g. 0.30 for Micro until min_fills_for_trust_ramp fills.
-            l3_trust: {
-                let raw_trust = market_params.bootstrap_confidence.min(1.0);
-                let policy = &market_params.capital_policy;
-                let fills = self.tier1.adverse_selection.fills_measured() as u64;
-                if fills < policy.min_fills_for_trust_ramp {
-                    raw_trust.min(policy.max_l3_trust_uncalibrated)
-                } else {
-                    raw_trust
-                }
-            },
-            l3_belief: if market_params.should_quote_edge {
-                Some(0.6) // Favorable conditions
-            } else {
-                Some(0.4) // Unfavorable conditions
-            },
-            urgency_score: market_params.urgency_score,
-            // Adverse selection variance from RegimeAwareBayesianAdverse
-            adverse_variance: market_params.adverse_uncertainty.powi(2),
-            // Phase 7: Hawkes Excitation fields from MarketParams
-            hawkes_p_cluster: market_params.hawkes_p_cluster,
-            hawkes_excitation_penalty: market_params.hawkes_excitation_penalty,
-            hawkes_is_high_excitation: market_params.hawkes_is_high_excitation,
-            hawkes_spread_widening: market_params.hawkes_spread_widening,
-            hawkes_branching_ratio: market_params.hawkes_branching_ratio,
-            // Phase 8: RL Policy Recommendations from MarketParams
-            rl_spread_delta_bps: market_params.rl_spread_delta_bps,
-            rl_bid_skew_bps: market_params.rl_bid_skew_bps,
-            rl_ask_skew_bps: market_params.rl_ask_skew_bps,
-            rl_confidence: market_params.rl_confidence,
-            rl_is_exploration: market_params.rl_is_exploration,
-            rl_expected_q: market_params.rl_expected_q,
-            // Phase 8: Competitor Model from MarketParams
-            competitor_snipe_prob: market_params.competitor_snipe_prob,
-            competitor_spread_factor: market_params.competitor_spread_factor,
-            competitor_count: market_params.competitor_count,
-            // Phase 9: Rate Limit Shadow Price
-            // Get headroom from cached rate limit info
-            rate_limit_headroom_pct: self
-                .infra
-                .cached_rate_limit
-                .as_ref()
-                .map(|c| c.headroom_pct())
-                .unwrap_or(1.0),
-            // Derive vol_regime from sigma relative to baseline
-            vol_regime: {
-                let vol_ratio = market_params.sigma / 0.0001; // Relative to 1bp/sec baseline
-                if vol_ratio < 0.5 {
-                    0 // Low
-                } else if vol_ratio < 2.0 {
-                    1 // Normal
-                } else if vol_ratio < 5.0 {
-                    2 // High
-                } else {
-                    3 // Extreme
-                }
-            },
-            // Phase 10: Pre-Fill AS Toxicity from MarketParams
-            pre_fill_toxicity_bid: market_params.pre_fill_toxicity_bid,
-            pre_fill_toxicity_ask: market_params.pre_fill_toxicity_ask,
-            // Check if pre-fill signals are stale (using 5 second threshold for critical signals)
-            pre_fill_signals_stale: self.tier1.pre_fill_classifier.has_stale_signals(5000),
-            // Phase 6: Pass centralized belief snapshot for unified decision making
-            beliefs: Some(belief_snapshot.clone()),
-        };
+        // QuoteGateInput removed (A4): replaced by ExecutionMode state machine + E[PnL] filter.
+        // The binary gate's functionality is now handled by:
+        // - ExecutionMode (state_machine.rs): cascade→Flat, Hawkes→Flat, InventoryReduce
+        // - E[PnL] filter (ladder_strat.rs): per-level P(fill)×(Spread - AS - Carry) ≤ 0 → size = 0
+        // - QuotaShadowPricer (quota_shadow.rs): continuous API rate limit pricing
 
         // Log L2 wiring status periodically (every 100 cycles or when p_positive is significant)
         if let Some(l2_p) = l2_p_positive {
@@ -2554,7 +2470,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 debug!(
                     l2_p_positive_edge = %format!("{:.3}", l2_p),
                     l2_model_health = %format!("{:.2}", l2_health_score),
-                    "L2 learning module wired to quote gate"
+                    "L2 learning module active"
                 );
             }
         }
@@ -2579,85 +2495,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
             0.0 // Ignore changepoint during warmup
         };
-        let quote_gate_decision = if self.stochastic.stochastic_config.enable_calibrated_quote_gate
-        {
-            // Use theoretical edge fallback when IR not calibrated
-            self.stochastic.quote_gate.decide_with_theoretical_fallback(
-                &quote_gate_input,
-                &self.stochastic.calibrated_edge,
-                &self.stochastic.position_pnl,
-                changepoint_prob,
-                &mut self.stochastic.theoretical_edge,
-            )
-        } else {
-            self.stochastic.quote_gate.decide(&quote_gate_input)
-        };
-
-        // Handle quote gate decision
-        // Phase 4: When E[PnL] filter is active, bypass binary gate decisions.
-        // The per-level E[PnL] filter in ladder_strat handles side selection continuously.
-        // Keep gate for logging only — don't act on it.
-        if market_params.use_epnl_filter {
-            match &quote_gate_decision {
-                QuoteGateDecision::NoQuote { reason } => {
-                    debug!(
-                        reason = %reason,
-                        "Quote gate: NoQuote (BYPASSED — E[PnL] filter active)"
-                    );
-                }
-                QuoteGateDecision::QuoteOnlyBids { .. } | QuoteGateDecision::QuoteOnlyAsks { .. } => {
-                    debug!("Quote gate: one-sided (BYPASSED — E[PnL] filter active)");
-                }
-                _ => {}
-            }
-        } else {
-        // Phase 7: NoQuote → graduated response (3x spread + reduce-only), not cancel all
-        match &quote_gate_decision {
-            QuoteGateDecision::NoQuote { reason } => {
-                info!(
-                    reason = %reason,
-                    flow_imbalance = %format!("{:.3}", market_params.flow_imbalance),
-                    position = %format!("{:.4}", self.position.position()),
-                    "Quote gate: NoQuote → graduated 3x spread + reduce-only"
-                );
-                // Phase 7: Apply 2x widening + reduce-only instead of cancelling
-                // Capped at 2.0 — multiplicative stacking beyond 2x is counterproductive
-                market_params.spread_widening_mult = (market_params.spread_widening_mult * 2.0).min(2.0);
-                risk_reduce_only = true;
-                // Fall through to quote generation with widened spreads
-            }
-            QuoteGateDecision::QuoteOnlyBids { urgency } => {
-                debug!(
-                    urgency = %format!("{:.2}", urgency),
-                    "Quote gate: ONLY BIDS (reducing short or bullish edge)"
-                );
-                // Will clear asks after ladder generation
-            }
-            QuoteGateDecision::QuoteOnlyAsks { urgency } => {
-                debug!(
-                    urgency = %format!("{:.2}", urgency),
-                    "Quote gate: ONLY ASKS (reducing long or bearish edge)"
-                );
-                // Will clear bids after ladder generation
-            }
-            QuoteGateDecision::QuoteBoth => {
-                // Normal path - quote both sides with skew
-            }
-            QuoteGateDecision::WidenSpreads { multiplier, changepoint_prob } => {
-                // Changepoint pending confirmation - apply spread widening
-                // Cap at 2.0x — beyond that is counterproductive (makes quotes uncompetitive)
-                let capped_mult = multiplier.min(2.0);
-                info!(
-                    raw_multiplier = %format!("{:.2}", multiplier),
-                    capped_multiplier = %format!("{:.2}", capped_mult),
-                    changepoint_prob = %format!("{:.3}", changepoint_prob),
-                    "Quote gate: widening spreads (changepoint pending, capped at 2.0x)"
-                );
-                market_params.spread_widening_mult = capped_mult;
-                market_params.changepoint_prob = *changepoint_prob;
-            }
-        }
-        } // end else (non-E[PnL] quote gate path)
+        // Wire changepoint probability directly to market_params (was previously inside QuoteGate WidenSpreads arm)
+        market_params.changepoint_prob = changepoint_prob;
 
         // === QUOTA SHADOW SPREAD: Continuous penalty for low API headroom ===
         // Replaces discrete tier cliffs with smooth shadow pricing.
@@ -2665,7 +2504,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // This naturally widens spreads as quota depletes, reducing order churn.
         {
             let headroom = market_params.rate_limit_headroom_pct;
-            let shadow_bps = self.stochastic.quote_gate.continuous_shadow_spread_bps(headroom);
+            let shadow_bps = self.stochastic.quota_shadow.continuous_shadow_spread_bps(headroom);
             market_params.quota_shadow_spread_bps = shadow_bps;
             if shadow_bps > 1.0 {
                 tracing::info!(
@@ -2910,6 +2749,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // from checkpoint vol_filter_obs). With 0 fills, models aren't
                 // calibrated yet — warmup protection must remain active.
                 is_warmup: self.tier1.adverse_selection.fills_measured() < 10,
+                // A2: Cascade + Hawkes circuit breakers
+                cascade_size_factor: market_params.cascade_size_factor,
+                cascade_threshold: 0.3,
+                hawkes_p_cluster: market_params.hawkes_p_cluster,
+                hawkes_branching_ratio: market_params.hawkes_branching_ratio,
+                flow_direction: market_params.flow_imbalance,
+                reduce_only_threshold: 0.7,
+                max_position: self.config.max_position,
             };
             select_mode(&input)
         };

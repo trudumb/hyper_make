@@ -986,7 +986,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let policy = &self.capital_policy;
             let allowed_levels = self
                 .stochastic
-                .quote_gate
+                .quota_shadow
                 .continuous_ladder_levels(
                     max_target_levels,
                     headroom,
@@ -1212,7 +1212,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let policy = &self.capital_policy;
             let allowed = self
                 .stochastic
-                .quote_gate
+                .quota_shadow
                 .continuous_ladder_levels(
                     max_target,
                     headroom,
@@ -2185,7 +2185,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let policy = &self.capital_policy;
             let allowed_levels = self
                 .stochastic
-                .quote_gate
+                .quota_shadow
                 .continuous_ladder_levels(
                     max_target_levels,
                     headroom,
@@ -2326,7 +2326,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let policy = &self.capital_policy;
             let allowed = self
                 .stochastic
-                .quote_gate
+                .quota_shadow
                 .continuous_ladder_levels(
                     max_target,
                     headroom,

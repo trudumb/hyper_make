@@ -108,11 +108,7 @@ pub struct RegimeProfile {
     /// ThinDex: 2.0, LiquidCex: 1.5
     pub degraded_spread_factor: f64,
 
-    // ==================== Quote Gate ====================
-    /// Minimum edge signal for quoting
-    /// ThinDex: 0.10 (lower bar), LiquidCex: 0.20
-    pub quote_gate_min_edge: f64,
-
+    // ==================== Quoting ====================
     /// Quote both sides when flat without edge
     /// ThinDex: true (spread capture), LiquidCex: false (API conservation)
     pub quote_flat_without_edge: bool,
@@ -159,8 +155,7 @@ impl RegimeProfile {
             risk_aversion_multiplier: 1.5,
             degraded_spread_factor: 2.0,
 
-            // Quote gate: low bar, spread capture focus
-            quote_gate_min_edge: 0.10,
+            // Quoting: spread capture focus
             quote_flat_without_edge: true,
         }
     }
@@ -205,8 +200,7 @@ impl RegimeProfile {
             risk_aversion_multiplier: 1.0,
             degraded_spread_factor: 1.5,
 
-            // Quote gate: higher bar, API conservation
-            quote_gate_min_edge: 0.20,
+            // Quoting: API conservation
             quote_flat_without_edge: false,
         }
     }
@@ -250,8 +244,7 @@ impl RegimeProfile {
             risk_aversion_multiplier: 3.0,
             degraded_spread_factor: 3.0,
 
-            // Quote gate: reduce-only preferred
-            quote_gate_min_edge: 0.5,
+            // Quoting: reduce-only preferred
             quote_flat_without_edge: false,
         }
     }
