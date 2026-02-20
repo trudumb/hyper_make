@@ -39,6 +39,7 @@ pub use microstructure_features::{
 };
 pub use pre_fill_classifier::{PreFillASClassifier, PreFillClassifierConfig, PreFillSummary};
 pub use toxicity_regime::{ToxicityRegime, ToxicityThresholds, OfiAccelerationSignals};
+pub use book_dynamics::{BookDynamicsTracker, IcebergDetector, SweepDetector};
 
 /// Configuration for adverse selection estimation.
 #[derive(Debug, Clone)]

@@ -1004,6 +1004,16 @@ pub struct MarketParams {
     /// Positive when we're on the paying side of funding.
     pub funding_carry_bps: f64,
 
+    /// Short-term vs long-term realized vol ratio (σ_short / σ_long).
+    /// > 1.0 = volatility expansion → widen spreads.
+    /// Phase 8: cold tier feature.
+    pub vol_term_structure_ratio: f64,
+
+    /// Kurtosis-based AS ratio scaling (≥ 1.0).
+    /// Fat tails (excess kurtosis > 0) → scale up adverse selection estimate.
+    /// Phase 8: cold tier feature.
+    pub as_ratio_adjustment: f64,
+
     /// Current drawdown as fraction of account value [0.0, 1.0+].
     /// Used by GLFT effective_gamma for continuous risk aversion scaling.
     /// Higher drawdown → higher gamma → wider spreads.
@@ -1360,6 +1370,10 @@ impl Default for MarketParams {
             // Unified Adverse Selection Framework (Phase 4)
             use_epnl_filter: false,
             funding_carry_bps: 0.0,
+
+            // Phase 8: Warm/Cold tier features
+            vol_term_structure_ratio: 1.0,
+            as_ratio_adjustment: 1.0,
         }
     }
 }

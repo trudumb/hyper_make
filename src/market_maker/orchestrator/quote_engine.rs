@@ -31,6 +31,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Update quotes based on current market state.
     #[tracing::instrument(name = "quote_cycle", skip_all, fields(asset = %self.config.asset))]
     pub(crate) async fn update_quotes(&mut self) -> Result<()> {
+        // Increment cycle counter for warm/cold tier scheduling (Phase 8)
+        self.quote_cycle_count = self.quote_cycle_count.wrapping_add(1);
+
         // === Data Quality Gate ===
         // Block quoting when data is stale, absent, or crossed.
         // This fills the gap between logging (immediate) and the 30s kill switch.
@@ -817,6 +820,51 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             self.drift_estimator.update_single_observation(z, r);
         }
 
+        // === Phase 7: Hot-tier book features → single composite drift observation ===
+        // Combines BIM, ΔBIM, BPG, and sweep detection into one precision-weighted
+        // Kalman update per cycle. Prevents P collapse from multiple separate updates.
+        if self.tier1.book_dynamics.is_warmed_up() {
+            let bim = self.tier1.book_dynamics.bim_shallow();
+            let dbim = self.tier1.book_dynamics.book_imbalance_delta();
+            let bpg = self.tier1.book_dynamics.book_pressure_gradient();
+
+            // Individual signal (z, R) pairs
+            let alpha_bim = 0.3;
+            let z_bim = bim * alpha_bim;
+            let r_bim = 1.5_f64.powi(2); // σ²_bim = 2.25
+
+            let z_dbim = dbim * 0.2;
+            let r_dbim = 2.0_f64.powi(2); // σ²_dbim = 4.0
+
+            // BPG: fragile support on our position side → bearish observation
+            let position = self.position.position();
+            let z_bpg = -bpg * position.signum() * 0.15;
+            let r_bpg = 3.0;
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let (z_sweep, r_sweep) = self.tier1.sweep_detector.drift_observation(now_ms)
+                .unwrap_or((0.0, 100.0)); // High R = no observation effect
+
+            // Combine into single composite: precision-weighted average
+            // z_composite = Σ(z_i / R_i) / Σ(1/R_i), R_composite = 1 / Σ(1/R_i)
+            let signals: [(f64, f64); 4] = [
+                (z_bim, r_bim), (z_dbim, r_dbim), (z_bpg, r_bpg), (z_sweep, r_sweep),
+            ];
+            let precision_sum: f64 = signals.iter().map(|(_, r)| 1.0 / r.max(1e-6)).sum();
+            if precision_sum > 1e-10 {
+                let z_composite: f64 = signals.iter()
+                    .map(|(z, r)| z / r.max(1e-6))
+                    .sum::<f64>() / precision_sum;
+                let r_composite = 1.0 / precision_sum;
+
+                // Single Kalman update per cycle — P shrinks once, not 4 times
+                self.drift_estimator.update_single_observation(z_composite, r_composite);
+            }
+        }
+
         // === Phase 6: Funding as drift observation (cold tier) ===
         // Extreme funding rates signal expected price pressure:
         // High positive funding → longs capitulate → expect downward drift.
@@ -832,6 +880,40 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Holding period ≈ 1/kappa seconds (expected time to fill)
             let tau_holding = 1.0 / market_params.kappa.max(100.0);
             market_params.funding_carry_bps = funding_rate * tau_holding * 10_000.0;
+        }
+
+        // === Phase 8: Warm-tier features (every 2 cycles) ===
+        // Hawkes intensity + cross-venue flow acceleration → individual drift observations.
+        // These update less frequently to avoid over-shrinking Kalman P.
+        if self.quote_cycle_count % 2 == 0 {
+            // Hawkes excess intensity as drift observation
+            if let Some((z, r)) = self.tier2.hawkes.drift_observation() {
+                self.drift_estimator.update_single_observation(z, r);
+            }
+
+            // Cross-venue flow acceleration as drift observation
+            if let Some((z, r)) = self
+                .stochastic
+                .signal_integrator
+                .cross_venue_analyzer()
+                .flow_acceleration_drift_observation()
+            {
+                self.drift_estimator.update_single_observation(z, r);
+            }
+        }
+
+        // === Phase 8: Cold-tier features (every 5 cycles) ===
+        // Lead-lag signal from Binance → drift observation.
+        if self.quote_cycle_count % 5 == 0 {
+            let ll = self.stochastic.signal_integrator.lead_lag_signal();
+            if ll.is_actionable && ll.stability_confidence > 0.3 {
+                // diff_bps > 0 means Binance is higher → expect HL to follow up → bullish
+                let alpha_lead = 0.3;
+                let z = ll.diff_bps * alpha_lead / 10.0; // Scale down: 5 bps diff → 0.15 z
+                let sigma_lead = 1.5;
+                let r = sigma_lead * sigma_lead / ll.stability_confidence.max(0.1);
+                self.drift_estimator.update_single_observation(z, r);
+            }
         }
 
         // === L1: Parameter Smoothing (Churn Reduction) ===

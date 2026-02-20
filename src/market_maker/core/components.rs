@@ -5,8 +5,8 @@
 use crate::market_maker::{
     adaptive::{AdaptiveBayesianConfig, AdaptiveSpreadCalculator},
     adverse_selection::{
-        AdverseSelectionConfig, AdverseSelectionEstimator, DepthDecayAS, EnhancedASClassifier,
-        PreFillASClassifier,
+        AdverseSelectionConfig, AdverseSelectionEstimator, BookDynamicsTracker, DepthDecayAS,
+        EnhancedASClassifier, PreFillASClassifier, SweepDetector,
     },
     analytics::{EdgeTracker, MarketToxicityComposite, MarketToxicityConfig},
     config::{ImpulseControlConfig, MetricsRecorder},
@@ -84,6 +84,10 @@ pub struct Tier1Components {
     pub liquidation_detector: LiquidationCascadeDetector,
     /// Circuit breaker for market condition monitoring
     pub circuit_breaker: CircuitBreakerMonitor,
+    /// Book dynamics tracker: thinning direction, ΔBIM, BPG (Phase 7).
+    pub book_dynamics: BookDynamicsTracker,
+    /// Sweep detector: multi-level fill detection for drift observations (Phase 7).
+    pub sweep_detector: SweepDetector,
 }
 
 impl Tier1Components {
@@ -116,6 +120,8 @@ impl Tier1Components {
             queue_tracker: QueuePositionTracker::new(queue_config),
             liquidation_detector: LiquidationCascadeDetector::new(liquidation_config),
             circuit_breaker: CircuitBreakerMonitor::new(circuit_breaker_config),
+            book_dynamics: BookDynamicsTracker::default(),
+            sweep_detector: SweepDetector::default(),
         }
     }
 }

@@ -579,6 +579,19 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Wire trade to EWMA flow tracker for FlowFeatureVec
             self.stochastic.trade_flow_tracker.on_trade(size, is_buy);
 
+            // === Phase 7: Sweep Detector ===
+            // Multi-level fills within a short window indicate aggressive informed trading.
+            // For now, use price impact as a proxy for levels crossed:
+            // impact > 1 tick ≈ swept through multiple levels.
+            let levels_crossed = if trade_price > 0.0 && self.latest_mid > 0.0 {
+                let impact_bps = ((trade_price - self.latest_mid).abs() / self.latest_mid) * 10_000.0;
+                // Assume ~5 bps per level for typical HIP assets
+                (impact_bps / 5.0).ceil().max(1.0) as u32
+            } else {
+                1
+            };
+            self.tier1.sweep_detector.record_fill(is_buy, size, levels_crossed, timestamp_ms);
+
             // === P0: Wire trade features to SignalIntegrator for informed flow classification ===
             {
                 use crate::market_maker::estimator::informed_flow::TradeFeatures;
@@ -1379,6 +1392,22 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         "CalibrationCoordinator seeded from L2 book profile"
                     );
                 }
+            }
+
+            // === Phase 7: Book Dynamics + Sweep Detector ===
+            // Feed depth to BookDynamicsTracker for thinning, ΔBIM, BPG.
+            {
+                let bid_depth_shallow: f64 = bids.iter().take(3).map(|(_, sz)| sz).sum();
+                let ask_depth_shallow: f64 = asks.iter().take(3).map(|(_, sz)| sz).sum();
+                let bid_depth_deep: f64 = bids.iter().map(|(_, sz)| sz).sum();
+                let ask_depth_deep: f64 = asks.iter().map(|(_, sz)| sz).sum();
+                self.tier1.book_dynamics.update(
+                    bid_depth_deep, ask_depth_deep, std::time::Instant::now(),
+                );
+                self.tier1.book_dynamics.update_imbalances(
+                    bid_depth_shallow, ask_depth_shallow,
+                    bid_depth_deep, ask_depth_deep,
+                );
             }
 
             // === Phase 3: Pre-Fill AS Classifier - Orderbook Imbalance Update ===

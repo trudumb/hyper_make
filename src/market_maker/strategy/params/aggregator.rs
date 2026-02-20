@@ -789,6 +789,9 @@ impl ParameterAggregator {
             use_epnl_filter: false,
             // Funding carry cost: computed by quote engine from funding estimator
             funding_carry_bps: 0.0,
+            // Phase 8: Warm/Cold tier features (set in quote_engine)
+            vol_term_structure_ratio: 1.0,
+            as_ratio_adjustment: 1.0,
         }
     }
 }

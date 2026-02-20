@@ -344,6 +344,25 @@ impl HawkesOrderFlowEstimator {
         }
     }
 
+    /// Excess intensity as drift observation (z, R) for the Kalman filter.
+    ///
+    /// When λ_sell >> λ_base, we're in a selling burst → bearish drift.
+    /// When λ_buy >> λ_base, buying burst → bullish drift.
+    /// Returns None if not warmed up.
+    pub fn drift_observation(&self) -> Option<(f64, f64)> {
+        if !self.is_warmed_up() {
+            return None;
+        }
+        let excess_sell = self.lambda_sell - self.config.mu;
+        let excess_buy = self.lambda_buy - self.config.mu;
+        // Net excess sell pressure → negative z (bearish)
+        let z = -(excess_sell - excess_buy) * 0.3; // 0.3 sensitivity scaling
+        let sigma_hawkes = 1.5;
+        let total_lambda = self.lambda_total().max(0.1);
+        let r = sigma_hawkes * sigma_hawkes / total_lambda;
+        Some((z, r))
+    }
+
     /// Reset the estimator.
     pub fn reset(&mut self) {
         self.events.clear();

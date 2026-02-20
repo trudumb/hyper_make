@@ -541,6 +541,25 @@ impl CrossVenueAnalyzer {
     pub fn config(&self) -> &CrossVenueConfig {
         &self.config
     }
+
+    /// Flow acceleration as a drift observation (z, R) for the Kalman filter.
+    ///
+    /// When Binance buy pressure is accelerating → expect HL to follow up → bullish.
+    /// Returns None if not warmed up.
+    pub fn flow_acceleration_drift_observation(&self) -> Option<(f64, f64)> {
+        if !self.is_warmed_up() {
+            return None;
+        }
+        let accel = self.flow_acceleration();
+        if accel.abs() < 0.05 {
+            return None; // Below noise threshold
+        }
+        let alpha_accel = 0.25;
+        let z = accel * alpha_accel; // Positive accel = bullish (buy pressure accelerating)
+        let sigma_accel = 2.0;
+        let r = sigma_accel * sigma_accel / accel.abs().max(0.1);
+        Some((z, r))
+    }
 }
 
 impl Default for CrossVenueAnalyzer {

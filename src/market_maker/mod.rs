@@ -282,6 +282,9 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
 
     /// Last time a quote cycle completed (for quota-aware frequency throttling).
     last_quote_cycle_time: Option<std::time::Instant>,
+
+    /// Quote cycle counter for warm/cold tier feature scheduling (Phase 8).
+    quote_cycle_count: u64,
     /// Last time an empty ladder recovery was attempted (2s cooldown prevents churn).
     last_empty_ladder_recovery: Option<std::time::Instant>,
 
@@ -564,6 +567,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             sigma_cascade_hwm_set_at: 0,
             as_floor_hwm: 0.0,
             last_quote_cycle_time: None,
+            quote_cycle_count: 0,
             last_empty_ladder_recovery: None,
             // Signal diagnostics cache (updated each quote cycle)
             cached_market_params: None,
