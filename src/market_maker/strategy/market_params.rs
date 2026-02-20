@@ -1031,10 +1031,8 @@ pub struct MarketParams {
     pub as_floor_bps: f64,
 
     // === Fix 4: Proactive AS — Hawkes σ_conditional ===
-    /// σ cascade multiplier from Hawkes intensity ratio: √(λ(t)/λ₀).
-    /// Applied to sigma_effective before GLFT computation.
-    /// Uses high-water-mark with 15s cooldown to prevent sawtooth decay.
-    pub sigma_cascade_mult: f64,
+    // REMOVED: sigma_cascade_mult — WS2 CovarianceTracker handles realized vol feedback.
+    // The Bayesian posterior on σ automatically inflates when realized vol > predicted.
 
     // === Fix 3: Ghost liquidity detection ===
     /// Ghost liquidity gamma multiplier [1.0, 5.0].
@@ -1070,19 +1068,9 @@ pub struct MarketParams {
     /// At 40% book dominance: ~0.8 bps. At 80%: ~3.2 bps.
     pub self_impact_addon_bps: f64,
 
-    // ==================== Directional Flow Defense (additive, bps) ====================
-    /// Quote staleness defense: additive widening on bid side (bps).
-    /// Between quote cycles, price displacement makes stale bids too generous.
-    /// Formula: max_addon × (1 - exp(-|move|/decay)), applied to the stale side.
-    pub staleness_addon_bid_bps: f64,
-    /// Quote staleness defense: additive widening on ask side (bps).
-    pub staleness_addon_ask_bps: f64,
-    /// Directional flow toxicity: additive widening on bid side (bps).
-    /// When sell-side flow is toxic (informed sellers), widens bids.
-    /// Source: InformedFlowEstimator per-side EWMA of p_informed.
-    pub flow_toxicity_addon_bid_bps: f64,
-    /// Directional flow toxicity: additive widening on ask side (bps).
-    pub flow_toxicity_addon_ask_bps: f64,
+    // REMOVED: staleness_addon_bid/ask_bps — WS5 latency-aware mid handles price displacement.
+    // REMOVED: flow_toxicity_addon_bid/ask_bps — β_toxicity in CalibratedRiskModel handles
+    //   informed flow through γ. Higher toxicity → higher γ → wider spreads automatically.
 }
 
 impl Default for MarketParams {
@@ -1364,9 +1352,6 @@ impl Default for MarketParams {
             // Fix 2: AS floor
             as_floor_bps: 0.0,
 
-            // Fix 4: Hawkes σ_conditional
-            sigma_cascade_mult: 1.0,
-
             // Fix 3: Ghost liquidity
             ghost_liquidity_gamma_mult: 1.0,
 
@@ -1383,12 +1368,6 @@ impl Default for MarketParams {
 
             // Self-Impact Estimator
             self_impact_addon_bps: 0.0,
-
-            // Directional Flow Defense (additive, bps)
-            staleness_addon_bid_bps: 0.0,
-            staleness_addon_ask_bps: 0.0,
-            flow_toxicity_addon_bid_bps: 0.0,
-            flow_toxicity_addon_ask_bps: 0.0,
 
             // Unified Adverse Selection Framework (Phase 4)
             use_epnl_filter: false,
@@ -2016,5 +1995,61 @@ impl MarketParams {
         let scaled = 0.2 + raw_confidence * 0.7;
 
         scaled.clamp(0.0, 1.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WS7: Estimator Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Unified diagnostics for all three estimators (drift, covariance, risk aversion)
+/// plus execution quality metrics.
+///
+/// Logged every 10 quote cycles or when any estimator is in unusual state.
+/// Replaces the scattered per-component logging with a single, structured record.
+#[derive(Debug, Clone)]
+pub struct EstimatorDiagnostics {
+    // --- Drift health ---
+    /// Current drift estimate in bps/sec.
+    pub drift_mean_bps: f64,
+    /// Posterior variance of drift estimate.
+    pub drift_variance: f64,
+    /// Fill-quote autocorrelation [0,1] — how much fills echo our own quotes.
+    pub fill_quote_autocorrelation: f64,
+
+    // --- Covariance health ---
+    /// Model-predicted σ effective (per-sec fraction).
+    pub sigma_effective_bps: f64,
+    /// σ correction factor from realized vol tracker (target: 1.0).
+    pub sigma_correction_factor: f64,
+
+    // --- Risk aversion health ---
+    /// Current log(γ) from calibrated risk model.
+    pub log_gamma: f64,
+    /// Tracking error between predicted and breakeven γ.
+    pub gamma_tracking_error: f64,
+    /// Signed bias (positive = over-estimating risk).
+    pub gamma_signed_bias: f64,
+
+    // --- Execution quality ---
+    /// Anticipated mid adjustment in bps.
+    pub anticipated_mid_shift_bps: f64,
+    /// Execution latency EWMA in milliseconds.
+    pub latency_ewma_ms: f64,
+
+    // --- Outcome ---
+    /// Current half-spread in bps (from GLFT).
+    pub spread_bps: f64,
+    /// Current skew in bps (from GLFT).
+    pub skew_bps: f64,
+}
+
+impl EstimatorDiagnostics {
+    /// Check if any estimator is in an unusual state warranting immediate logging.
+    pub fn is_unusual(&self) -> bool {
+        self.sigma_correction_factor > 1.5
+            || self.sigma_correction_factor < 0.5
+            || self.gamma_tracking_error > 0.5
+            || self.fill_quote_autocorrelation > 0.7
     }
 }

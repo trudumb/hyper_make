@@ -129,7 +129,8 @@ pub(crate) fn allocate(
 
     // Phase 5: Greedy fill — take from highest value until budget exhausted.
     let mut budget_exhausted = false;
-    for update in &budgeted {
+    let mut selected_indices = Vec::new();
+    for (i, update) in budgeted.iter().enumerate() {
         let cost = update.api_calls;
         if calls_used + cost <= budget.max_calls {
             if let Some(ladder_actions) = to_ladder_actions(update, sz_decimals) {
@@ -137,9 +138,44 @@ pub(crate) fn allocate(
             }
             calls_used += cost;
             total_value_bps += update.value_bps;
+            selected_indices.push(i);
         } else {
             budget_exhausted = true;
             suppressed_count += 1;
+        }
+    }
+
+    // Phase 6 (WS6a): Side balance guarantee.
+    // When budget >= 4 calls, ensure at least 1 action per side.
+    // A market maker with quotes on only one side cannot capture two-sided spread.
+    // Allow 1-2 call overrun to satisfy this guarantee.
+    if budget.max_calls >= 4 {
+        use crate::market_maker::tracking::Side;
+        let has_bid_action = actions.iter().any(|a| matches!(a,
+            LadderAction::Place { side: Side::Buy, .. } |
+            LadderAction::Modify { side: Side::Buy, .. }
+        ));
+        let has_ask_action = actions.iter().any(|a| matches!(a,
+            LadderAction::Place { side: Side::Sell, .. } |
+            LadderAction::Modify { side: Side::Sell, .. }
+        ));
+
+        // Find best unallocated action for the starved side
+        for (i, update) in budgeted.iter().enumerate() {
+            if selected_indices.contains(&i) {
+                continue; // Already selected
+            }
+            let is_needed_side = (!has_bid_action && update.side == Side::Buy)
+                || (!has_ask_action && update.side == Side::Sell);
+            if is_needed_side && update.value_bps > -2.0 {
+                if let Some(ladder_actions) = to_ladder_actions(update, sz_decimals) {
+                    actions.extend(ladder_actions);
+                }
+                calls_used += update.api_calls;
+                total_value_bps += update.value_bps;
+                // Only fill one side's gap per cycle
+                break;
+            }
         }
     }
 
@@ -382,5 +418,49 @@ mod tests {
         assert_eq!(result.calls_used, 0);
         assert!(result.budget_exhausted);
         assert_eq!(result.suppressed_count, 1);
+    }
+
+    // WS6a: Side balance guarantee tests
+    #[test]
+    fn test_side_balance_fills_starved_side() {
+        // Budget = 4, all high-value actions on Buy side, one low-value Sell
+        let mut scored = vec![
+            make_scored(None, ActionType::NewPlace, 8.0, Side::Buy, 99.0, 1.0),
+            make_scored(None, ActionType::NewPlace, 7.0, Side::Buy, 98.0, 1.0),
+            make_scored(None, ActionType::NewPlace, 6.0, Side::Buy, 97.0, 1.0),
+            make_scored(None, ActionType::NewPlace, 5.0, Side::Buy, 96.0, 1.0),
+            // Low-value sell — would normally be suppressed
+            make_scored(None, ActionType::NewPlace, 1.0, Side::Sell, 101.0, 1.0),
+        ];
+        let budget = ApiBudget {
+            max_calls: 4,
+            headroom_pct: 0.5,
+            seconds_to_next: 5.0,
+        };
+        let result = allocate(&mut scored, &budget, 2);
+
+        // Should have at least one Sell action from side balance
+        let has_sell = result.actions.iter().any(|a| matches!(a,
+            LadderAction::Place { side: Side::Sell, .. }
+        ));
+        assert!(has_sell, "Side balance should ensure at least one sell action");
+    }
+
+    #[test]
+    fn test_side_balance_not_triggered_with_small_budget() {
+        // Budget < 4: side balance should not trigger
+        let mut scored = vec![
+            make_scored(None, ActionType::NewPlace, 8.0, Side::Buy, 99.0, 1.0),
+            make_scored(None, ActionType::NewPlace, 1.0, Side::Sell, 101.0, 1.0),
+        ];
+        let budget = ApiBudget {
+            max_calls: 1, // Too small for side balance
+            headroom_pct: 0.5,
+            seconds_to_next: 5.0,
+        };
+        let result = allocate(&mut scored, &budget, 2);
+
+        // With budget=1, should only pick the highest value (Buy)
+        assert_eq!(result.calls_used, 1);
     }
 }

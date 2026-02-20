@@ -150,10 +150,10 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Self-impact estimator: tracks our book dominance and computes spread addon.
     self_impact: estimator::self_impact::SelfImpactEstimator,
 
-    // === Directional Flow Defense Configs ===
-    /// Asymmetric quote staleness: widen stale side between quote cycles.
+    // === Directional Flow Defense Configs (retained for checkpoint compat) ===
+    #[allow(dead_code)]
     staleness_config: config::StalenessConfig,
-    /// Directional flow toxicity: per-side informed flow defense.
+    #[allow(dead_code)]
     flow_toxicity_config: config::FlowToxicityConfig,
 
     // === Bootstrap from Book ===
@@ -255,9 +255,12 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     #[allow(dead_code)] // WIP: Will be used when event handlers are wired
     event_accumulator: orchestrator::EventAccumulator,
 
-    // === Asymmetric Quote Staleness Defense ===
-    /// Mid price when quotes were last placed. Used to detect inter-cycle price
-    /// displacement and widen the stale side (bids on down-move, asks on up-move).
+    // === Latency-Aware Mid (WS5) ===
+    /// EWMA of order acknowledgement latency in milliseconds.
+    /// Used to compute anticipated mid = latest_mid + drift_rate × latency.
+    latency_ewma_ms: f64,
+
+    /// Mid price when quotes were last placed. Used for latency-aware mid computation.
     mid_at_last_quote: f64,
 
     // === First-Principles Belief System (Bayesian Posterior Updates) ===
@@ -290,10 +293,12 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     fill_cascade_tracker: FillCascadeTracker,
 
     // === Fix 4: Hawkes σ_conditional High Water Mark ===
-    /// σ cascade multiplier HWM — set on fills, decays after 15s cooldown.
-    /// Prevents sawtooth: fill spikes σ → next cycle reads decayed Hawkes → relaxes too fast.
+    // WS4: sigma_cascade_hwm REMOVED from quoting path.
+    // CovarianceTracker (WS2) handles realized vol feedback via Bayesian posterior.
+    // Fields kept for struct compatibility but unused in quoting.
+    #[allow(dead_code)]
     sigma_cascade_hwm: f64,
-    /// Timestamp (ms) when sigma_cascade_hwm was last set/raised.
+    #[allow(dead_code)]
     sigma_cascade_hwm_set_at: u64,
     /// AS floor HWM — same pattern as sigma cascade.
     as_floor_hwm: f64,
@@ -493,6 +498,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             stochastic_config,
             DynamicRiskConfig::default(),
         );
+        // WS5: Extract latency config before stochastic is moved into struct
+        let initial_latency_ms = stochastic.stochastic_config.quote_update_latency_ms;
 
         // Initialize inventory governor from user's max_position (hard ceiling)
         let inventory_governor = risk::InventoryGovernor::new(config.max_position);
@@ -574,7 +581,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Directional flow defense configs
             staleness_config: config::StalenessConfig::default(),
             flow_toxicity_config: config::FlowToxicityConfig::default(),
-            // Asymmetric quote staleness defense
+            // WS5: Latency-aware mid — initialized from stochastic config
+            latency_ewma_ms: initial_latency_ms,
             mid_at_last_quote: 0.0,
             // First-principles belief system
             prev_mid_for_beliefs: 0.0,

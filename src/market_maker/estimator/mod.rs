@@ -33,6 +33,7 @@ pub mod bocpd_kappa;
 mod book_kappa;
 mod calibration_controller;
 mod covariance;
+pub mod covariance_tracker;
 pub mod cross_venue;
 mod directional_risk;
 pub mod enhanced_flow;

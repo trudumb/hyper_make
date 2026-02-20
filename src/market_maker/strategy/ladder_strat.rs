@@ -521,12 +521,8 @@ impl LadderStrategy {
         MarketRegime {
             toxicity: market_params.jump_ratio,
             volatility_ratio: market_params.sigma_effective / 0.0001, // Normalized to 1bp baseline
-            cascade_severity: if market_params.should_pull_quotes {
-                1.0
-            } else {
-                // Scale from tail_risk_intensity: 0.0 → 0.0, 1.0 → 1.0
-                market_params.tail_risk_intensity.clamp(0.0, 1.0)
-            },
+            // WS4: No binary should_pull_quotes gate. Use tail_risk_intensity directly.
+            cascade_severity: market_params.tail_risk_intensity.clamp(0.0, 1.0),
             book_imbalance: market_params.book_imbalance,
         }
     }
@@ -716,10 +712,9 @@ impl LadderStrategy {
         _target_liquidity: f64,
         market_params: &MarketParams,
     ) -> Ladder {
-        // Circuit breaker: pull all quotes during cascade
-        if market_params.should_pull_quotes {
-            return Ladder::default();
-        }
+        // WS4: Binary circuit breaker removed. γ(q) handles cascade risk continuously.
+        // At extreme risk, γ is 50+, producing 25+ bps spreads and minimal sizes.
+        // Only margin exhaustion (below) produces an empty ladder.
 
         // CONTROLLER-DERIVED POSITION SIZING:
         // Use margin-based quoting capacity for ladder allocation, BUT capped by
@@ -1131,42 +1126,34 @@ impl LadderStrategy {
             }
         }
 
-        // === DIRECTIONAL FLOW DEFENSE (additive bps, per-side) ===
-        // Four independent defense components summed additively, capped at 35 bps total.
-        // Governor + cascade + staleness + flow toxicity — all zero when inactive.
-        let defense_bid_addon_bps = (market_params.governor_bid_addon_bps
-            + market_params.cascade_bid_addon_bps
-            + market_params.staleness_addon_bid_bps
-            + market_params.flow_toxicity_addon_bid_bps)
-            .min(35.0);
-        let defense_ask_addon_bps = (market_params.governor_ask_addon_bps
-            + market_params.cascade_ask_addon_bps
-            + market_params.staleness_addon_ask_bps
-            + market_params.flow_toxicity_addon_ask_bps)
-            .min(35.0);
-        if defense_bid_addon_bps > 0.01 {
+        // === KEPT INFRASTRUCTURE ADDONS (correct AS extensions, not protection) ===
+        // Governor (API rate limit) + cascade (fill cascade tracker) + self_impact + funding_carry.
+        // WS4: staleness and flow_toxicity addons REMOVED — routed through estimators.
+        let kept_bid_addon_bps = (market_params.governor_bid_addon_bps
+            + market_params.cascade_bid_addon_bps)
+            .min(25.0);
+        let kept_ask_addon_bps = (market_params.governor_ask_addon_bps
+            + market_params.cascade_ask_addon_bps)
+            .min(25.0);
+        if kept_bid_addon_bps > 0.01 {
             for depth in dynamic_depths.bid.iter_mut() {
-                *depth += defense_bid_addon_bps;
+                *depth += kept_bid_addon_bps;
             }
         }
-        if defense_ask_addon_bps > 0.01 {
+        if kept_ask_addon_bps > 0.01 {
             for depth in dynamic_depths.ask.iter_mut() {
-                *depth += defense_ask_addon_bps;
+                *depth += kept_ask_addon_bps;
             }
         }
-        if defense_bid_addon_bps > 0.1 || defense_ask_addon_bps > 0.1 {
+        if kept_bid_addon_bps > 0.1 || kept_ask_addon_bps > 0.1 {
             tracing::info!(
                 governor_bid = %format!("{:.1}", market_params.governor_bid_addon_bps),
                 governor_ask = %format!("{:.1}", market_params.governor_ask_addon_bps),
                 cascade_bid = %format!("{:.1}", market_params.cascade_bid_addon_bps),
                 cascade_ask = %format!("{:.1}", market_params.cascade_ask_addon_bps),
-                staleness_bid = %format!("{:.1}", market_params.staleness_addon_bid_bps),
-                staleness_ask = %format!("{:.1}", market_params.staleness_addon_ask_bps),
-                flow_tox_bid = %format!("{:.1}", market_params.flow_toxicity_addon_bid_bps),
-                flow_tox_ask = %format!("{:.1}", market_params.flow_toxicity_addon_ask_bps),
-                total_bid = %format!("{:.1}", defense_bid_addon_bps),
-                total_ask = %format!("{:.1}", defense_ask_addon_bps),
-                "Directional flow defense applied (additive bps)"
+                total_bid = %format!("{:.1}", kept_bid_addon_bps),
+                total_ask = %format!("{:.1}", kept_ask_addon_bps),
+                "Infrastructure addons applied (additive bps)"
             );
         }
 
@@ -2351,8 +2338,9 @@ impl LadderStrategy {
             let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
                 && position < 0.0;
 
-            // Also skip guaranteed quotes when should_pull_quotes is set (circuit breaker)
-            if !market_params.should_pull_quotes {
+            // WS4: Guaranteed quotes always apply (no binary circuit breaker gate).
+            // At extreme γ, guaranteed quote spread is already very wide.
+            {
                 if ladder.bids.is_empty() && !bid_cleared_by_zone {
                     let bid_depth_bps = guaranteed_half_spread_bps + guaranteed_skew_bps;
                     let offset = market_params.microprice * (bid_depth_bps / 10_000.0);
@@ -3469,10 +3457,12 @@ mod tests {
     }
 
     #[test]
-    fn test_guaranteed_quotes_not_placed_when_circuit_breaker() {
+    fn test_zero_margin_produces_guaranteed_quotes_only() {
         use crate::market_maker::strategy::QuotingStrategy;
 
-        // When should_pull_quotes = true, NO quotes at all (not even guaranteed)
+        // With margin_available = 0.0, regular ladder levels have zero size,
+        // but guaranteed quotes still fire (needed to exit positions).
+        // Binary circuit breakers removed — γ(q) handles risk continuously.
         let strategy = LadderStrategy::new(0.07);
         let config = QuoteConfig {
             mid_price: 25.0,
@@ -3485,7 +3475,45 @@ mod tests {
         market_params.microprice = 25.0;
         market_params.market_mid = 25.0;
         market_params.margin_available = 0.0;
-        market_params.should_pull_quotes = true; // Circuit breaker!
+        market_params.sigma = 0.001;
+        market_params.kappa = 2000.0;
+
+        let ladder = strategy.calculate_ladder(
+            &config,
+            0.0,
+            5.0,
+            1.0,
+            &market_params,
+        );
+
+        // Guaranteed quotes produce minimal size on each side
+        // (margin=0 prevents additional levels but not guaranteed quotes)
+        assert!(
+            ladder.bids.len() <= 1 && ladder.asks.len() <= 1,
+            "Zero margin should produce at most guaranteed quotes, got {} bids + {} asks",
+            ladder.bids.len(), ladder.asks.len()
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_no_longer_blocks_quoting() {
+        use crate::market_maker::strategy::QuotingStrategy;
+
+        // should_pull_quotes = true no longer produces empty ladder
+        // γ(q) handles risk continuously instead of binary circuit breakers
+        let strategy = LadderStrategy::new(0.07);
+        let config = QuoteConfig {
+            mid_price: 25.0,
+            decimals: 2,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+
+        let mut market_params = MarketParams::default();
+        market_params.microprice = 25.0;
+        market_params.market_mid = 25.0;
+        market_params.margin_available = 100.0; // Solvent
+        market_params.should_pull_quotes = true; // Was circuit breaker, now diagnostic only
         market_params.sigma = 0.001;
         market_params.kappa = 2000.0;
 
@@ -3498,9 +3526,8 @@ mod tests {
         );
 
         assert!(
-            ladder.bids.is_empty() && ladder.asks.is_empty(),
-            "Circuit breaker should produce empty ladder, got {} bids + {} asks",
-            ladder.bids.len(), ladder.asks.len()
+            !ladder.bids.is_empty() || !ladder.asks.is_empty(),
+            "should_pull_quotes=true should NOT produce empty ladder when solvent"
         );
     }
 }

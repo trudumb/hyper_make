@@ -1386,39 +1386,18 @@ impl SignalIntegrator {
     /// Key change from old behavior: `NeverConfigured` returns 1.0 (was 0.30),
     /// preventing small accounts from being crushed below exchange minimums.
     /// `Degraded` graduates from 1.0 to 0.5 over `max_reduction_after_secs`.
+    /// WS6c: Always returns 1.0 — staleness routes through σ (CovarianceEstimator),
+    /// not position limits. Reducing position limits during signal degradation
+    /// creates a redundant channel that conflicts with the principled γσ²τ pipeline.
     pub fn signal_position_limit_mult(&self) -> f64 {
-        match self.signal_availability.get() {
-            SignalAvailability::NeverConfigured => 1.0,
-            SignalAvailability::Available => 1.0,
-            SignalAvailability::Degraded {
-                last_healthy_secs_ago,
-                max_reduction_after_secs,
-            } => {
-                let progress =
-                    (last_healthy_secs_ago / max_reduction_after_secs).clamp(0.0, 1.0);
-                1.0 - 0.5 * progress
-            }
-        }
+        1.0
     }
 
-    /// Returns spread widening multiplier based on signal availability.
-    ///
-    /// `NeverConfigured` widens spreads 1.2x to compensate for missing signal
-    /// (instead of reducing position limits which kills small accounts).
-    /// `Degraded` graduates from 1.0 to 1.2 over `max_reduction_after_secs`.
+    /// WS6c: Always returns 1.0 — signal staleness routes through σ
+    /// (CovarianceEstimator realized vol feedback), not multiplicative spread widening.
+    /// The GLFT formula γσ²τ automatically widens when σ increases.
     pub fn signal_spread_widening_mult(&self) -> f64 {
-        match self.signal_availability.get() {
-            SignalAvailability::NeverConfigured => 1.2,
-            SignalAvailability::Available => 1.0,
-            SignalAvailability::Degraded {
-                last_healthy_secs_ago,
-                max_reduction_after_secs,
-            } => {
-                let progress =
-                    (last_healthy_secs_ago / max_reduction_after_secs).clamp(0.0, 1.0);
-                1.0 + 0.2 * progress
-            }
-        }
+        1.0
     }
 
     /// Get current signal availability state.
@@ -2193,81 +2172,38 @@ mod tests {
     }
 
     #[test]
-    fn test_never_configured_widens_spreads() {
-        // NeverConfigured returns spread_widening_mult=1.2
+    fn test_ws6c_spread_widening_always_1() {
+        // WS6c: signal_spread_widening_mult always returns 1.0
+        // Staleness routes through σ (CovarianceEstimator), not multiplicative widening.
         let config = SignalIntegratorConfig::disabled();
         let integrator = SignalIntegrator::new(config);
-
-        assert_eq!(
-            integrator.signal_availability(),
-            SignalAvailability::NeverConfigured
-        );
-        assert!((integrator.signal_spread_widening_mult() - 1.2).abs() < f64::EPSILON);
+        assert!((integrator.signal_spread_widening_mult() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_degraded_graduates_position_reduction() {
+    fn test_ws6c_position_limit_mult_always_1() {
+        // WS6c: signal_position_limit_mult always returns 1.0 regardless of availability.
+        // Staleness routes through σ, not position limit reduction.
         let config = SignalIntegratorConfig::default();
         let integrator = SignalIntegrator::new(config);
 
-        // At 0 seconds → mult = 1.0
+        // All states return 1.0
+        integrator
+            .signal_availability
+            .set(SignalAvailability::Available);
+        assert!((integrator.signal_position_limit_mult() - 1.0).abs() < f64::EPSILON);
+
+        integrator
+            .signal_availability
+            .set(SignalAvailability::NeverConfigured);
+        assert!((integrator.signal_position_limit_mult() - 1.0).abs() < f64::EPSILON);
+
         integrator
             .signal_availability
             .set(SignalAvailability::Degraded {
-                last_healthy_secs_ago: 0.0,
+                last_healthy_secs_ago: 500.0,
                 max_reduction_after_secs: 300.0,
             });
         assert!((integrator.signal_position_limit_mult() - 1.0).abs() < f64::EPSILON);
-
-        // At 150 seconds (halfway) → mult = 0.75
-        integrator
-            .signal_availability
-            .set(SignalAvailability::Degraded {
-                last_healthy_secs_ago: 150.0,
-                max_reduction_after_secs: 300.0,
-            });
-        assert!((integrator.signal_position_limit_mult() - 0.75).abs() < f64::EPSILON);
-
-        // At 300+ seconds (fully degraded) → mult = 0.5
-        integrator
-            .signal_availability
-            .set(SignalAvailability::Degraded {
-                last_healthy_secs_ago: 500.0,
-                max_reduction_after_secs: 300.0,
-            });
-        assert!((integrator.signal_position_limit_mult() - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_degraded_graduates_spread_widening() {
-        let config = SignalIntegratorConfig::default();
-        let integrator = SignalIntegrator::new(config);
-
-        // At 0 seconds → mult = 1.0
-        integrator
-            .signal_availability
-            .set(SignalAvailability::Degraded {
-                last_healthy_secs_ago: 0.0,
-                max_reduction_after_secs: 300.0,
-            });
-        assert!((integrator.signal_spread_widening_mult() - 1.0).abs() < f64::EPSILON);
-
-        // At 150 seconds (halfway) → mult = 1.1
-        integrator
-            .signal_availability
-            .set(SignalAvailability::Degraded {
-                last_healthy_secs_ago: 150.0,
-                max_reduction_after_secs: 300.0,
-            });
-        assert!((integrator.signal_spread_widening_mult() - 1.1).abs() < f64::EPSILON);
-
-        // At 300+ seconds (fully degraded) → mult = 1.2
-        integrator
-            .signal_availability
-            .set(SignalAvailability::Degraded {
-                last_healthy_secs_ago: 500.0,
-                max_reduction_after_secs: 300.0,
-            });
-        assert!((integrator.signal_spread_widening_mult() - 1.2).abs() < f64::EPSILON);
     }
 }

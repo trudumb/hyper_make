@@ -573,8 +573,9 @@ impl GLFTStrategy {
         } else {
             market_params.kappa
         };
-        let sigma = market_params.sigma_effective
-            * market_params.sigma_cascade_mult.max(1.0);
+        // WS2: sigma_cascade_mult removed — CovarianceTracker's Bayesian posterior
+        // handles realized vol feedback. sigma_effective is used directly.
+        let sigma = market_params.sigma_effective;
         let tau = self.holding_time(market_params.arrival_intensity);
 
         // Core GLFT half-spread in fraction
@@ -776,36 +777,14 @@ impl QuotingStrategy for GLFTStrategy {
         target_liquidity: f64,
         market_params: &MarketParams,
     ) -> (Option<Quote>, Option<Quote>) {
-        // === 0. CIRCUIT BREAKERS ===
-        // Extreme liquidation cascade detected - pull all quotes immediately
-        if market_params.should_pull_quotes {
-            debug!(
-                tail_risk_intensity = %format!("{:.2}", market_params.tail_risk_intensity),
-                cascade_intensity = %format!("{:.2}", market_params.cascade_intensity),
-                "CIRCUIT BREAKER: Liquidation cascade detected - pulling all quotes"
-            );
-            return (None, None);
-        }
-
-        // Edge surface says don't quote (expected edge <= 0 or low confidence)
-        if !market_params.should_quote_edge && market_params.flow_decomp_confidence > 0.5 {
-            debug!(
-                current_edge_bps = %format!("{:.2}", market_params.current_edge_bps),
-                flow_decomp_confidence = %format!("{:.2}", market_params.flow_decomp_confidence),
-                "CIRCUIT BREAKER: Edge surface indicates no edge - pulling quotes"
-            );
-            return (None, None);
-        }
-
-        // Joint dynamics detects toxic state (high AS + high informed correlated with volatility)
-        if market_params.is_toxic_joint && market_params.flow_decomp_confidence > 0.6 {
-            debug!(
-                p_informed = %format!("{:.3}", market_params.p_informed),
-                sigma_kappa_corr = %format!("{:.2}", market_params.sigma_kappa_correlation),
-                "CIRCUIT BREAKER: Joint dynamics detects toxic state - pulling quotes"
-            );
-            return (None, None);
-        }
+        // === 0. SOLVENCY CHECK ===
+        // WS4: Binary circuit breakers removed. γ(q) handles all risk continuously:
+        // - Cascade risk → high cascade_intensity → high γ → wide spreads
+        // - No edge → toxicity features → high γ → wide spreads
+        // - Toxic joint → informed flow features → high γ → wide spreads
+        // The formula γσ²τ + (2/γ)ln(1+γ/κ) produces correct spreads when
+        // estimators are accurate. Only solvency (margin exhaustion) returns (None, None).
+        // should_pull_quotes and is_toxic_joint still set as diagnostics but don't gate quoting.
 
         // FIRST PRINCIPLES: Use dynamic max_position derived from equity/volatility
         // Falls back to static max_position if margin state hasn't been refreshed yet.
@@ -907,8 +886,8 @@ impl QuotingStrategy for GLFTStrategy {
         // √(λ(t)/λ₀) widens BOTH GLFT terms uniformly (liquidity + vol_comp),
         // unlike γ multiplication which partially cancels (wider inventory penalty
         // but narrower edge capture via 1/γ).
-        let sigma = market_params.sigma_effective
-            * market_params.sigma_cascade_mult.max(1.0);
+        // WS2: sigma_cascade_mult removed — CovarianceTracker handles vol feedback.
+        let sigma = market_params.sigma_effective;
         let tau = time_horizon;
         // Use drift-aware half-spreads: μ > 0 → tighter bids (buy into uptrend),
         // wider asks (don't sell into uptrend). Falls back to symmetric when μ=0.

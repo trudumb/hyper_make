@@ -777,7 +777,9 @@ mod tests {
     }
 
     #[test]
-    fn test_glft_should_pull_quotes() {
+    fn test_glft_should_pull_quotes_no_longer_binary() {
+        // WS4: Binary circuit breakers removed. should_pull_quotes is now
+        // diagnostic only — γ(q) handles all risk continuously.
         let strategy = GLFTStrategy::new(0.3);
         let quote_config = make_config(100.0);
 
@@ -793,9 +795,10 @@ mod tests {
 
         let (bid, ask) = strategy.calculate_quotes(&quote_config, 0.0, 1.0, 0.5, &pull_params);
 
-        // Should return no quotes when pull flag is set
-        assert!(bid.is_none());
-        assert!(ask.is_none());
+        // should_pull_quotes=true no longer returns (None, None)
+        // Quotes are always produced; risk is handled by γ(q) continuously
+        assert!(bid.is_some() || ask.is_some(),
+            "should_pull_quotes should NOT produce empty quotes — γ handles risk");
     }
 
     // === GLFT Implementation Fixes - Verification Tests ===

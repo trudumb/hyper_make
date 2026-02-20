@@ -769,9 +769,6 @@ impl ParameterAggregator {
             // Fix 2: AS floor — populated later by quote engine from AS estimator
             as_floor_bps: 0.0,
 
-            // Fix 4: σ cascade — populated by quote engine from Hawkes HWM
-            sigma_cascade_mult: 1.0,
-
             // Fix 3: Ghost liquidity — populated by quote engine from kappa orchestrator
             ghost_liquidity_gamma_mult: 1.0,
 
@@ -789,11 +786,8 @@ impl ParameterAggregator {
             // Self-impact addon — populated by quote_engine from SelfImpactEstimator
             self_impact_addon_bps: 0.0,
 
-            // Directional flow defense — populated by quote_engine
-            staleness_addon_bid_bps: 0.0,
-            staleness_addon_ask_bps: 0.0,
-            flow_toxicity_addon_bid_bps: 0.0,
-            flow_toxicity_addon_ask_bps: 0.0,
+            // REMOVED: staleness/flow_toxicity/sigma_cascade defense addons.
+            // σ feedback (CovarianceTracker) and γ (CalibratedRiskModel) handle these.
 
             // === Unified Adverse Selection Framework (Phase 4) ===
             // E[PnL] filter: default off during dual-run validation

@@ -854,20 +854,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         if result.fills_processed > 0 {
             self.safety.kill_switch.record_own_fill();
 
-            // Fix 4: σ_conditional HIGH WATER MARK on fill.
-            // Fills during cascade confirm elevated intensity — lock σ multiplier.
-            // HWM prevents sawtooth: fill spikes σ at t=0, cycle at t=5s reads
-            // decayed Hawkes and would relax σ before next quote reacts.
-            let intensity_ratio = self.tier2.hawkes.intensity_ratio().max(1.0);
-            let sigma_cascade_mult = intensity_ratio.sqrt().min(3.0);
-            self.sigma_cascade_hwm = self.sigma_cascade_hwm.max(sigma_cascade_mult);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            self.sigma_cascade_hwm_set_at = now_ms;
+            // WS4: sigma_cascade_hwm REMOVED — CovarianceTracker handles realized vol
+            // feedback via Bayesian posterior. Hawkes intensity is still tracked as a
+            // feature for CalibratedRiskModel but doesn't directly multiply σ.
 
             // Also update proactive AS floor HWM (same pattern)
+            let intensity_ratio = self.tier2.hawkes.intensity_ratio().max(1.0);
             let proactive_as = self.tier1.adverse_selection.as_floor_bps() * intensity_ratio;
             self.as_floor_hwm = self.as_floor_hwm.max(proactive_as);
         }

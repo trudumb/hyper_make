@@ -11,7 +11,7 @@ use super::super::{
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 // QuoteGate removed (A4) — replaced by ExecutionMode state machine + E[PnL] filter
-use crate::market_maker::estimator::{EnhancedFlowContext, MarketEstimator};
+use crate::market_maker::estimator::EnhancedFlowContext;
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
@@ -496,8 +496,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
+        // WS5: Update execution latency EWMA from last WS acknowledgement
+        let last_ack_ms = self.ws_state.last_ack_latency_ms();
+        if last_ack_ms > 0.0 {
+            // EWMA with α=0.1 (smooth, not jittery)
+            self.latency_ewma_ms = 0.9 * self.latency_ewma_ms + 0.1 * last_ack_ms;
+        }
+
+        // WS5: Latency-aware mid adjustment replaces deleted staleness addon.
+        // Shift mid in direction of drift to anticipate where price will be
+        // when our orders arrive at the exchange.
+        let anticipated_mid = self.anticipated_mid();
+
         let quote_config = QuoteConfig {
-            mid_price: self.latest_mid,
+            mid_price: anticipated_mid,
             decimals: self.config.decimals,
             sz_decimals: self.config.sz_decimals,
             min_notional: MIN_ORDER_NOTIONAL,
@@ -951,36 +963,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // otherwise cause unnecessary requotes. Gated by SmootherConfig.enabled.
         self.parameter_smoother.smooth(&mut market_params, false);
 
-        // === Fix 4: Hawkes σ_conditional — per-cycle HWM decay ===
-        // On each cycle: compute new σ_cascade_mult from Hawkes intensity.
-        // Can raise above HWM, but cannot lower below HWM during 15s cooldown.
-        // After cooldown, HWM decays exponentially toward 1.0.
-        {
-            let hawkes_ratio = self.tier2.hawkes.intensity_ratio();
-            let new_mult = if hawkes_ratio > 1.0 {
-                hawkes_ratio.sqrt().min(3.0)
-            } else {
-                1.0
-            };
-
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let since_last_fill_ms = now_ms.saturating_sub(self.sigma_cascade_hwm_set_at);
-            let decay_ms: u64 = 15_000; // 15s cooldown before HWM decays
-
-            let decayed_hwm = if since_last_fill_ms > decay_ms {
-                let elapsed_after_cooldown = (since_last_fill_ms - decay_ms) as f64;
-                let decay_factor = (-elapsed_after_cooldown / 10_000.0).exp();
-                1.0 + (self.sigma_cascade_hwm - 1.0) * decay_factor
-            } else {
-                self.sigma_cascade_hwm // Hold HWM during cooldown
-            };
-
-            // Cycle can raise above HWM, but not lower below it during cooldown
-            market_params.sigma_cascade_mult = new_mult.max(decayed_hwm);
-        }
+        // WS4: Hawkes σ_cascade_mult REMOVED — CovarianceTracker (WS2) handles
+        // realized vol feedback. When Hawkes intensity spikes, realized vol rises,
+        // CovarianceTracker observes it via markouts, and σ_effective inflates automatically.
 
         // === Fix 2: Wire AS floor from estimator ===
         {
@@ -1675,16 +1660,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             market_params.sigma_effective *= 1.0 + toxicity_vol_premium;
         }
 
-        // Staleness addon: 0-3 bps from signal staleness
-        let staleness_mult = self.stochastic.signal_integrator.staleness_spread_multiplier();
-        let staleness_addon_bps = if staleness_mult > 1.0 {
-            // Convert multiplicative staleness to additive: (mult - 1) * base_spread_bps
-            // Use 3 bps cap as proxy for staleness penalty
-            ((staleness_mult - 1.0) * 5.0).min(3.0)
-        } else {
-            0.0
-        };
-        total_risk_premium += staleness_addon_bps;
+        // WS4: Staleness addon REMOVED from risk premium.
+        // σ predict step (Kalman variance growth) handles uncertainty from stale data.
+        // CovarianceTracker (WS2) handles realized vol feedback.
+        // Latency-aware mid (WS5) handles price displacement between cycles.
 
         // Signal-derived risk premium: OI vol, funding settlement, cancel-race AS
         // Accumulated on signals.signal_risk_premium_bps during signal injection above
@@ -1712,7 +1691,6 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 regime_premium = %format!("{:.1}", market_params.regime_risk_premium_bps),
                 hawkes_addon = %format!("{:.1}", hawkes_addon_bps),
                 toxicity_addon = %format!("{:.1}", toxicity_addon_bps),
-                staleness_addon = %format!("{:.1}", staleness_addon_bps),
                 total_risk_premium = %format!("{:.1}", total_risk_premium),
                 risk_overlay = %format!("{:.2}x", spread_multiplier),
                 toxicity_score = %format!("{:.2}", toxicity.composite_score),
@@ -2675,53 +2653,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Coefficient × fraction² (square-root impact law).
         market_params.self_impact_addon_bps = self.self_impact.impact_addon_bps();
 
-        // === DIRECTIONAL FLOW DEFENSE (additive bps) ===
-        // Phase 1: Fill cascade — tracker already computes additive bps per side.
+        // === KEPT INFRASTRUCTURE ADDONS (not protection) ===
+        // Fill cascade tracker per-side addons (still useful for echo detection).
         market_params.cascade_bid_addon_bps =
             self.fill_cascade_tracker.spread_addon_bps(Side::Buy);
         market_params.cascade_ask_addon_bps =
             self.fill_cascade_tracker.spread_addon_bps(Side::Sell);
 
-        // Phase 2: Asymmetric quote staleness — widen stale side based on mid displacement.
-        // Between quote cycles (5-6s), the market may move, making one side too generous.
-        if self.mid_at_last_quote > 0.0 && self.latest_mid > 0.0 {
-            let move_bps =
-                (self.latest_mid - self.mid_at_last_quote) / self.mid_at_last_quote * 10_000.0;
-            let staleness_cfg = &self.staleness_config;
-            if staleness_cfg.enabled {
-                if move_bps < -staleness_cfg.min_move_bps {
-                    // Market dropped → bids are stale (too high) → widen bids
-                    let abs_move = move_bps.abs();
-                    market_params.staleness_addon_bid_bps = staleness_cfg.max_addon_bps
-                        * (1.0 - (-abs_move / staleness_cfg.decay_bps).exp());
-                }
-                if move_bps > staleness_cfg.min_move_bps {
-                    // Market rose → asks are stale (too low) → widen asks
-                    market_params.staleness_addon_ask_bps = staleness_cfg.max_addon_bps
-                        * (1.0 - (-move_bps / staleness_cfg.decay_bps).exp());
-                }
-            }
-        }
-        // Update mid_at_last_quote AFTER computing staleness (will be read next cycle)
+        // WS4: Staleness addon REMOVED — WS5 latency-aware mid handles price displacement.
+        // WS4: Flow toxicity addon REMOVED — β_toxicity in CalibratedRiskModel routes
+        //   informed flow through γ. Higher toxicity → higher γ → wider spreads automatically.
+        // Update mid_at_last_quote for latency-aware mid (WS5 uses this)
         self.mid_at_last_quote = self.latest_mid;
-
-        // Phase 3: Directional flow toxicity — per-side EWMA of p_informed.
-        let flow_tox_cfg = &self.flow_toxicity_config;
-        if flow_tox_cfg.enabled {
-            let (buy_tox, sell_tox) = self.estimator.directional_toxicity();
-            if sell_tox > flow_tox_cfg.threshold {
-                // Toxic sell flow → widen bids (don't buy into informed selling)
-                let excess = ((sell_tox - flow_tox_cfg.threshold) / (1.0 - flow_tox_cfg.threshold))
-                    .clamp(0.0, 1.0);
-                market_params.flow_toxicity_addon_bid_bps = flow_tox_cfg.max_addon_bps * excess;
-            }
-            if buy_tox > flow_tox_cfg.threshold {
-                // Toxic buy flow → widen asks (don't sell into informed buying)
-                let excess = ((buy_tox - flow_tox_cfg.threshold) / (1.0 - flow_tox_cfg.threshold))
-                    .clamp(0.0, 1.0);
-                market_params.flow_toxicity_addon_ask_bps = flow_tox_cfg.max_addon_bps * excess;
-            }
-        }
 
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)
@@ -2986,18 +2929,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     }
                     viable.bids.reduce_sizes(0.5, &vq);
                 } else {
-                    // Moderate position or near-zero: route through σ spike.
-                    // 2x σ → ~1.4x wider both sides via GLFT, preserves two-sided quoting.
-                    market_params.sigma_cascade_mult = market_params.sigma_cascade_mult.max(2.0);
+                    // Moderate position or near-zero: size reduction preserves two-sided quoting.
+                    // WS4: sigma_cascade_mult removed. γ(q) handles continuous risk aversion.
                     let size_mult = if position_ratio.abs() > 0.01 { 0.5 } else { 0.3 };
                     viable.bids.reduce_sizes(size_mult, &vq);
                     viable.asks.reduce_sizes(size_mult, &vq);
                     info!(
                         position = %format!("{:.4}", pos),
                         position_ratio = %format!("{:.2}", position_ratio),
-                        sigma_cascade_mult = %format!("{:.2}", market_params.sigma_cascade_mult),
                         size_mult = %format!("{:.2}", size_mult),
-                        "Emergency: σ spike + size reduction (moderate position, preserving two-sided)"
+                        "Emergency: size reduction (moderate position, preserving two-sided)"
                     );
                 }
             }
@@ -3534,10 +3475,73 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .dashboard
             .update_position(position, position_value);
 
+        // WS7: Estimator diagnostics — log every 10 cycles or when unusual
+        if self.quote_cycle_count % 10 == 0 || self.quote_cycle_count < 3 {
+            self.log_estimator_diagnostics(&market_params);
+        }
+
         // Cache market params for signal diagnostics (fill handler uses this)
         self.cached_market_params = Some(market_params);
 
         Ok(())
+    }
+
+    /// WS7: Build and log estimator diagnostics.
+    fn log_estimator_diagnostics(
+        &self,
+        market_params: &super::super::strategy::MarketParams,
+    ) {
+        let drift_mean_bps = self.drift_estimator.drift_bps_per_sec();
+        let drift_uncertainty = self.drift_estimator.drift_uncertainty_bps();
+        let fill_autocorr = self.drift_estimator.fill_quote_autocorrelation();
+
+        let sigma_eff_bps = market_params.sigma_effective * 10_000.0;
+        // σ ratio: compare sigma_effective to base sigma (proxy for correction factor)
+        let sigma_ratio = if market_params.sigma > 0.0 {
+            market_params.sigma_effective / market_params.sigma
+        } else {
+            1.0
+        };
+
+        let log_gamma = market_params.adaptive_gamma.max(1e-9).ln();
+
+        let drift_rate = self.drift_estimator.drift_rate_per_sec();
+        let latency_s = self.latency_ewma_ms / 1000.0;
+        let raw_shift = drift_rate * latency_s;
+        let max_shift = 5.0 / 10_000.0;
+        let shift_bps = raw_shift.clamp(-max_shift, max_shift) * 10_000.0;
+
+        let spread_bps = market_params.market_spread_bps;
+        let skew_bps = market_params.rl_bid_skew_bps - market_params.rl_ask_skew_bps;
+
+        // Check for unusual state
+        let is_unusual = !(0.5..=1.5).contains(&sigma_ratio)
+            || fill_autocorr > 0.7
+            || drift_uncertainty > 20.0;
+
+        if is_unusual || self.quote_cycle_count < 3 {
+            info!(
+                drift_bps = %format!("{:.2}", drift_mean_bps),
+                drift_unc = %format!("{:.2}", drift_uncertainty),
+                fill_autocorr = %format!("{:.2}", fill_autocorr),
+                sigma_eff_bps = %format!("{:.2}", sigma_eff_bps),
+                sigma_ratio = %format!("{:.3}", sigma_ratio),
+                log_gamma = %format!("{:.2}", log_gamma),
+                mid_shift_bps = %format!("{:.3}", shift_bps),
+                latency_ms = %format!("{:.1}", self.latency_ewma_ms),
+                spread_bps = %format!("{:.2}", spread_bps),
+                skew_bps = %format!("{:.2}", skew_bps),
+                "ESTIMATOR_DIAGNOSTICS"
+            );
+        } else {
+            debug!(
+                drift_bps = %format!("{:.2}", drift_mean_bps),
+                sigma_ratio = %format!("{:.3}", sigma_ratio),
+                mid_shift_bps = %format!("{:.3}", shift_bps),
+                spread_bps = %format!("{:.2}", spread_bps),
+                "ESTIMATOR_DIAGNOSTICS"
+            );
+        }
     }
 
     /// Check if all existing orders are within the drift threshold of target quotes.
@@ -3586,6 +3590,39 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         true // All within threshold
+    }
+
+    /// WS5: Compute anticipated mid price adjusted for drift and execution latency.
+    ///
+    /// Instead of widening spreads symmetrically (deleted staleness addon), this shifts
+    /// the mid price in the direction of estimated drift to anticipate where the price
+    /// will be when our orders arrive at the exchange.
+    ///
+    /// `anticipated_mid = latest_mid × (1 + drift_rate × latency_s)`
+    ///
+    /// The uncertainty buffer (σ√Δt) is already handled by the GLFT spread formula
+    /// through γσ²τ, so we only need the directional adjustment here.
+    fn anticipated_mid(&self) -> f64 {
+        if self.latest_mid <= 0.0 {
+            return self.latest_mid;
+        }
+
+        let latency_s = self.latency_ewma_ms / 1000.0;
+        let drift_per_s = self.drift_estimator.drift_rate_per_sec(); // fractional units/sec
+
+        // Shift mid by drift × latency. Clamp shift to ±5 bps to prevent
+        // extreme drift estimates from moving mid excessively.
+        let raw_shift = drift_per_s * latency_s;
+        let max_shift = 5.0 / 10_000.0; // ±5 bps
+        let shift = raw_shift.clamp(-max_shift, max_shift);
+
+        self.latest_mid * (1.0 + shift)
+    }
+
+    /// WS5: Current execution latency EWMA in milliseconds (for diagnostics).
+    #[allow(dead_code)]
+    fn execution_latency_ewma_ms(&self) -> f64 {
+        self.latency_ewma_ms
     }
 }
 
@@ -4058,5 +4095,61 @@ mod tests {
         // Both very stale: 2.0 * 2.0 = 4.0, capped at 3.0
         let p = compute_staleness_spread_penalty(20_000, 200_000);
         assert!((p - 3.0).abs() < f64::EPSILON, "Expected 3.0 cap, got {p}");
+    }
+
+    // ---------------------------------------------------------------
+    // WS5: Anticipated mid logic tests
+    // ---------------------------------------------------------------
+
+    /// Standalone anticipated mid computation for testability.
+    /// Mirrors the logic in MarketMaker::anticipated_mid().
+    fn compute_anticipated_mid(latest_mid: f64, drift_rate_per_sec: f64, latency_ms: f64) -> f64 {
+        if latest_mid <= 0.0 {
+            return latest_mid;
+        }
+        let latency_s = latency_ms / 1000.0;
+        let raw_shift = drift_rate_per_sec * latency_s;
+        let max_shift = 5.0 / 10_000.0;
+        let shift = raw_shift.clamp(-max_shift, max_shift);
+        latest_mid * (1.0 + shift)
+    }
+
+    #[test]
+    fn test_anticipated_mid_positive_drift_shifts_up() {
+        // Positive drift of 10 bps/sec, 50ms latency
+        let drift = 10.0 / 10_000.0; // 10 bps/sec in fractional
+        let mid = compute_anticipated_mid(100.0, drift, 50.0);
+        // Expected shift: 0.001 * 0.05 = 0.00005 → mid * 1.00005 = 100.005
+        assert!(mid > 100.0, "Positive drift should shift mid up: {mid}");
+        assert!((mid - 100.005).abs() < 0.001, "Expected ~100.005, got {mid}");
+    }
+
+    #[test]
+    fn test_anticipated_mid_negative_drift_shifts_down() {
+        let drift = -10.0 / 10_000.0;
+        let mid = compute_anticipated_mid(100.0, drift, 50.0);
+        assert!(mid < 100.0, "Negative drift should shift mid down: {mid}");
+    }
+
+    #[test]
+    fn test_anticipated_mid_clamp_at_5bps() {
+        // Extreme drift: 1000 bps/sec, 1s latency → would be 10% shift
+        // Clamped to ±5 bps
+        let drift = 1000.0 / 10_000.0; // 10% per sec
+        let mid = compute_anticipated_mid(100.0, drift, 1000.0);
+        let max_expected = 100.0 * (1.0 + 5.0 / 10_000.0); // 100.05
+        assert!(
+            (mid - max_expected).abs() < 0.001,
+            "Should be clamped at +5 bps: got {mid}, expected {max_expected}"
+        );
+    }
+
+    #[test]
+    fn test_anticipated_mid_zero_latency_no_shift() {
+        let mid = compute_anticipated_mid(100.0, 0.001, 0.0);
+        assert!(
+            (mid - 100.0).abs() < 1e-10,
+            "Zero latency should produce no shift: {mid}"
+        );
     }
 }

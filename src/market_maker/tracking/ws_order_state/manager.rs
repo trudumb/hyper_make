@@ -51,6 +51,10 @@ pub struct WsOrderStateManager {
 
     /// Last cleanup time
     last_cleanup: Instant,
+
+    /// Last measured acknowledgement latency in milliseconds (sent → response).
+    /// WS5: Used for latency-aware mid adjustment.
+    last_ack_latency_ms: f64,
 }
 
 impl WsOrderStateManager {
@@ -71,6 +75,7 @@ impl WsOrderStateManager {
             request_id_gen: RequestIdGenerator::new(),
             config,
             last_cleanup: Instant::now(),
+            last_ack_latency_ms: 0.0,
         }
     }
 
@@ -229,6 +234,9 @@ impl WsOrderStateManager {
             );
             return vec![ActionResult::empty()];
         };
+
+        // WS5: Record acknowledgement latency
+        self.last_ack_latency_ms = inflight.sent_at.elapsed().as_secs_f64() * 1000.0;
 
         // Clean up CLOID mapping
         self.cloid_to_request.remove(&inflight.cloid);
@@ -691,6 +699,12 @@ impl WsOrderStateManager {
         self.cloid_to_request.contains_key(cloid)
     }
 
+    /// Last measured order acknowledgement latency in milliseconds.
+    /// WS5: Used for latency-aware mid adjustment EWMA.
+    pub fn last_ack_latency_ms(&self) -> f64 {
+        self.last_ack_latency_ms
+    }
+
     // =========================================================================
     // Cleanup and Maintenance
     // =========================================================================
@@ -1000,5 +1014,11 @@ mod tests {
         let removed = mgr.cleanup();
         assert_eq!(removed, vec![123]);
         assert!(mgr.get_order(123).is_none());
+    }
+
+    #[test]
+    fn test_last_ack_latency_initially_zero() {
+        let mgr = WsOrderStateManager::new();
+        assert!((mgr.last_ack_latency_ms() - 0.0).abs() < f64::EPSILON);
     }
 }

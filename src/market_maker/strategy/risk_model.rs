@@ -579,6 +579,160 @@ impl RiskModelConfig {
     }
 }
 
+// === WS3: Gamma Self-Calibration Tracker ===
+
+/// EWMA alpha for gamma tracking error.
+const GAMMA_TRACKING_ALPHA: f64 = 0.1;
+
+/// Tracks breakeven gamma for each fill markout and measures systematic bias.
+///
+/// For each fill, computes the γ that would have made the fill break-even at 5s markout.
+/// Uses the small γ/κ approximation: for small γ/κ, ln(1+γ/κ) ≈ γ/κ,
+/// so spread ≈ γσ²τ + 2/κ, which inverts to:
+///   γ_breakeven = (spread_bps - 2/κ × 10000) / (σ² × τ × 10000)
+///
+/// This is diagnostics-only — no automated β update. The tracking error
+/// EWMA measures persistent bias that can inform future β recalibration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GammaCalibrationTracker {
+    /// EWMA of |log(predicted_gamma) - log(breakeven_gamma)|.
+    tracking_error_ewma: f64,
+    /// EWMA of signed error (positive = predicted too high, negative = too low).
+    signed_bias_ewma: f64,
+    /// Number of observations.
+    observation_count: usize,
+    /// Most recent breakeven gamma (for diagnostics).
+    last_breakeven_gamma: f64,
+}
+
+impl Default for GammaCalibrationTracker {
+    fn default() -> Self {
+        Self {
+            tracking_error_ewma: 0.0,
+            signed_bias_ewma: 0.0,
+            observation_count: 0,
+            last_breakeven_gamma: 0.0,
+        }
+    }
+}
+
+impl GammaCalibrationTracker {
+    /// Create a new tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compute breakeven gamma using small γ/κ approximation.
+    ///
+    /// spread_bps: half-spread at fill time (bps).
+    /// markout_as_bps: 5s markout adverse selection (bps, unsigned).
+    /// fee_bps: maker fee (typically 1.5 bps).
+    /// sigma: σ_effective at fill time (per-second, fractional).
+    /// kappa: effective kappa at fill time.
+    /// tau: GLFT time horizon in seconds (typically 1/fill_rate).
+    ///
+    /// Returns None if inputs are degenerate.
+    pub fn breakeven_gamma(
+        _spread_bps: f64,
+        markout_as_bps: f64,
+        fee_bps: f64,
+        sigma: f64,
+        kappa: f64,
+        tau: f64,
+    ) -> Option<f64> {
+        if sigma < 1e-10 || kappa < 1.0 || tau < 0.01 {
+            return None;
+        }
+
+        // Target spread = markout_as + fee (what we need to capture to break even)
+        let target_bps = markout_as_bps + fee_bps;
+        // Kappa contribution: 2/κ in bps ≈ 2/κ × 10000
+        let kappa_term_bps = 2.0 / kappa * 10_000.0;
+        // Vol-risk contribution must be non-negative
+        let numerator = target_bps - kappa_term_bps;
+        if numerator <= 0.0 {
+            // Kappa term alone covers the spread — γ can be near 0
+            return Some(0.01);
+        }
+
+        // γ_breakeven = numerator / (σ² × τ × 10000)
+        let denominator = sigma * sigma * tau * 10_000.0;
+        if denominator < 1e-12 {
+            return None;
+        }
+
+        let gamma = numerator / denominator;
+        Some(gamma.max(0.001))
+    }
+
+    /// Record a fill markout observation.
+    ///
+    /// `predicted_gamma`: the γ used when the fill was placed.
+    /// `spread_bps`: half-spread at fill time.
+    /// `markout_as_bps`: realized 5s AS (unsigned bps).
+    /// `fee_bps`: maker fee.
+    /// `sigma`, `kappa`, `tau`: market parameters at fill time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_markout(
+        &mut self,
+        predicted_gamma: f64,
+        spread_bps: f64,
+        markout_as_bps: f64,
+        fee_bps: f64,
+        sigma: f64,
+        kappa: f64,
+        tau: f64,
+    ) {
+        let breakeven = match Self::breakeven_gamma(spread_bps, markout_as_bps, fee_bps, sigma, kappa, tau) {
+            Some(g) => g,
+            None => return,
+        };
+
+        if predicted_gamma < 0.001 || !predicted_gamma.is_finite() {
+            return;
+        }
+
+        self.last_breakeven_gamma = breakeven;
+
+        // Signed error: positive = predicted too high (too conservative)
+        let signed_error = predicted_gamma.ln() - breakeven.ln();
+        let abs_error = signed_error.abs();
+
+        if self.observation_count == 0 {
+            self.tracking_error_ewma = abs_error;
+            self.signed_bias_ewma = signed_error;
+        } else {
+            self.tracking_error_ewma = GAMMA_TRACKING_ALPHA * abs_error
+                + (1.0 - GAMMA_TRACKING_ALPHA) * self.tracking_error_ewma;
+            self.signed_bias_ewma = GAMMA_TRACKING_ALPHA * signed_error
+                + (1.0 - GAMMA_TRACKING_ALPHA) * self.signed_bias_ewma;
+        }
+
+        self.observation_count += 1;
+    }
+
+    /// Tracking error EWMA (absolute log-gamma error).
+    /// Target: < 0.3 means γ is well-calibrated.
+    pub fn tracking_error(&self) -> f64 {
+        self.tracking_error_ewma
+    }
+
+    /// Signed bias: positive = consistently too conservative, negative = too aggressive.
+    pub fn signed_bias(&self) -> f64 {
+        self.signed_bias_ewma
+    }
+
+    /// Most recent breakeven gamma (for diagnostics).
+    pub fn last_breakeven_gamma(&self) -> f64 {
+        self.last_breakeven_gamma
+    }
+
+    /// Number of markout observations.
+    pub fn observation_count(&self) -> usize {
+        self.observation_count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +958,71 @@ mod tests {
         assert!(
             gamma_moderate < 0.5,
             "moderate stress gamma should stay below 0.5: got {gamma_moderate}"
+        );
+    }
+
+    // === WS3: Gamma Calibration Tracker Tests ===
+
+    #[test]
+    fn test_breakeven_gamma_known_values() {
+        // spread=5 bps, AS=3 bps, fee=1.5 bps → target=4.5 bps
+        // kappa=2000 → 2/2000*10000 = 10 bps kappa term
+        // target(4.5) < kappa_term(10) → gamma can be near 0
+        let g = GammaCalibrationTracker::breakeven_gamma(5.0, 3.0, 1.5, 0.0002, 2000.0, 10.0);
+        assert!(g.is_some());
+        assert!(g.unwrap() < 0.1, "Low target → near-zero gamma: {}", g.unwrap());
+
+        // spread=20 bps, AS=5 bps, fee=1.5 bps → target=6.5 bps
+        // kappa=500 → 2/500*10000 = 40 bps kappa term
+        // target(6.5) < kappa_term(40) → gamma near 0
+        let g2 = GammaCalibrationTracker::breakeven_gamma(20.0, 5.0, 1.5, 0.0003, 500.0, 5.0);
+        assert!(g2.is_some());
+    }
+
+    #[test]
+    fn test_tracking_error_responds_to_bias() {
+        let mut tracker = GammaCalibrationTracker::new();
+
+        // Predicted gamma consistently 2x higher than breakeven
+        for _ in 0..20 {
+            tracker.record_markout(
+                0.2,   // predicted
+                5.0,   // spread
+                2.0,   // markout AS
+                1.5,   // fee
+                0.001, // sigma (high vol so denominator is meaningful)
+                5000.0, // kappa
+                5.0,   // tau
+            );
+        }
+
+        assert!(
+            tracker.tracking_error() > 0.01,
+            "Persistent bias should produce non-zero tracking error: {}",
+            tracker.tracking_error()
+        );
+    }
+
+    #[test]
+    fn test_tracking_error_low_when_calibrated() {
+        let mut tracker = GammaCalibrationTracker::new();
+
+        // sigma=0.001, kappa=5000, tau=5
+        // kappa_term = 2/5000 * 10000 = 4.0 bps
+        // target = AS(2) + fee(1.5) = 3.5 bps
+        // target(3.5) < kappa_term(4.0) → breakeven near 0.01 (floor)
+        // Feed predicted gamma that matches breakeven
+        let be = GammaCalibrationTracker::breakeven_gamma(5.0, 2.0, 1.5, 0.001, 5000.0, 5.0)
+            .unwrap();
+
+        for _ in 0..20 {
+            tracker.record_markout(be, 5.0, 2.0, 1.5, 0.001, 5000.0, 5.0);
+        }
+
+        assert!(
+            tracker.tracking_error() < 0.05,
+            "Well-calibrated gamma should have near-zero tracking error: {}",
+            tracker.tracking_error()
         );
     }
 }

@@ -13,6 +13,16 @@
 //! - Warm (every 2-3 cycles): Hawkes, fill size, basis (Phase 8)
 //! - Cold (every 5-10 cycles): cross-asset lead, funding, OI (Phase 6/8)
 
+use std::collections::VecDeque;
+
+/// Default autocorrelation prior during warmup (< 20 fills).
+/// Moderate value slightly dampens fill impact until enough data to measure.
+/// Gets washed out by data within a few minutes.
+const AUTOCORRELATION_WARMUP_PRIOR: f64 = 0.3;
+
+/// Number of fills needed for meaningful autocorrelation measurement.
+const MIN_FILLS_FOR_AUTOCORRELATION: usize = 20;
+
 /// A single directional signal observation (kept for backward compat with signal collection).
 #[derive(Debug, Clone, Copy)]
 pub struct SignalObservation {
@@ -64,6 +74,14 @@ pub struct KalmanDriftEstimator {
     prior_variance: f64,
     /// Last update timestamp (ms).
     last_update_ms: u64,
+
+    // === Fill-Quote Autocorrelation (WS1: Observation-Quality-Aware R) ===
+    /// Rolling window of (fill_direction, quote_skew_at_fill_time) pairs.
+    /// fill_direction: +1.0 for buy fill, -1.0 for sell fill.
+    /// quote_skew: sign(ask_depth - bid_depth) at fill time, range [-1, 1].
+    /// High correlation = fills are echoes of our own quotes (less informative).
+    #[serde(default)]
+    fill_skew_history: VecDeque<(f64, f64)>,
 }
 
 impl KalmanDriftEstimator {
@@ -84,6 +102,7 @@ impl KalmanDriftEstimator {
             process_noise,
             prior_variance,
             last_update_ms: 0,
+            fill_skew_history: VecDeque::with_capacity(MIN_FILLS_FOR_AUTOCORRELATION + 5),
         }
     }
 
@@ -162,6 +181,10 @@ impl KalmanDriftEstimator {
     /// Bid fill means someone sold to us → selling pressure → bearish.
     /// Ask fill means someone bought from us → buying pressure → bullish.
     /// Scale by fill-to-mid distance: fills far from mid are more informative.
+    ///
+    /// R is scaled by fill-quote autocorrelation: when fills are echoes of our
+    /// own quote skew, R increases and the Kalman gain drops. This replaces
+    /// the FillCascadeTracker's influence on drift with measured autocorrelation.
     pub fn update_fill(&mut self, is_buy: bool, fill_price: f64, mid: f64, sigma: f64) {
         if sigma < 1e-12 || mid < 1e-12 {
             return;
@@ -176,7 +199,9 @@ impl KalmanDriftEstimator {
         let z = if is_buy { -scale } else { scale };
 
         let sigma_fill = 3.0; // Fill signal is noisy
-        let r = sigma_fill * sigma_fill;
+        let base_r = sigma_fill * sigma_fill;
+        // WS1: Scale R by fill-quote autocorrelation
+        let r = self.observation_variance_scaled(base_r);
         self.update_single_observation(z, r);
     }
 
@@ -300,6 +325,75 @@ impl KalmanDriftEstimator {
     /// naturally decay it back when realized drift matches predictions.
     pub fn boost_responsiveness(&mut self, factor: f64) {
         self.process_noise = (self.process_noise * factor).min(10.0);
+    }
+
+    // === Fill-Quote Autocorrelation (WS1) ===
+
+    /// Record a fill event for autocorrelation tracking.
+    ///
+    /// `fill_direction`: +1.0 for buy fill, -1.0 for sell fill.
+    /// `quote_skew`: current quote asymmetry at fill time, range [-1, 1].
+    ///   Computed as sign(ask_depth - bid_depth) or normalized inventory skew.
+    pub fn record_fill_for_autocorrelation(&mut self, fill_direction: f64, quote_skew: f64) {
+        if !fill_direction.is_finite() || !quote_skew.is_finite() {
+            return;
+        }
+        self.fill_skew_history
+            .push_back((fill_direction.signum(), quote_skew.clamp(-1.0, 1.0)));
+        // Keep rolling window at MIN_FILLS_FOR_AUTOCORRELATION size
+        while self.fill_skew_history.len() > MIN_FILLS_FOR_AUTOCORRELATION {
+            self.fill_skew_history.pop_front();
+        }
+    }
+
+    /// Measured fill-quote autocorrelation [0, 1].
+    ///
+    /// High correlation = fills are echoes of our own quote skew (less informative).
+    /// Range [0, 1]: 0 = independent (fully informative), 1 = pure echo.
+    ///
+    /// During warmup (< MIN_FILLS_FOR_AUTOCORRELATION fills), returns
+    /// AUTOCORRELATION_WARMUP_PRIOR (0.3) to slightly dampen fills
+    /// until enough data to measure. Gets washed out by data quickly.
+    pub fn fill_quote_autocorrelation(&self) -> f64 {
+        if self.fill_skew_history.len() < MIN_FILLS_FOR_AUTOCORRELATION {
+            return AUTOCORRELATION_WARMUP_PRIOR;
+        }
+
+        let n = self.fill_skew_history.len() as f64;
+        let (sum_x, sum_y, sum_xy, sum_x2, sum_y2) = self.fill_skew_history.iter().fold(
+            (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64),
+            |(sx, sy, sxy, sx2, sy2), &(x, y)| {
+                (sx + x, sy + y, sxy + x * y, sx2 + x * x, sy2 + y * y)
+            },
+        );
+
+        let denom = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
+        if denom < 1e-10 {
+            return AUTOCORRELATION_WARMUP_PRIOR;
+        }
+
+        let r = (n * sum_xy - sum_x * sum_y) / denom;
+        // Map correlation [-1, 1] to echo metric [0, 1]:
+        // positive correlation = fills align with skew = echo
+        // negative/zero correlation = independent
+        r.clamp(0.0, 1.0)
+    }
+
+    /// Compute observation variance R scaled by fill-quote autocorrelation.
+    ///
+    /// When fills are echoes of our own quotes (high autocorrelation),
+    /// R increases → Kalman gain drops → drift updates slower.
+    /// At 80% echo: R is 5× base → Kalman gain drops to ~20%.
+    /// At 0% echo: R is 1× base → full Kalman gain.
+    fn observation_variance_scaled(&self, base_r: f64) -> f64 {
+        let echo = self.fill_quote_autocorrelation();
+        let informativeness = (1.0 - echo).max(0.05); // floor at 5%
+        base_r / informativeness
+    }
+
+    /// Current fill-skew history length (for diagnostics).
+    pub fn fill_skew_history_len(&self) -> usize {
+        self.fill_skew_history.len()
     }
 }
 
@@ -659,5 +753,156 @@ mod tests {
         }
         assert!(est.process_noise() >= 0.1, "process_noise bounded at 0.1");
         assert!(est.theta() <= 1.0, "theta bounded at 1.0");
+    }
+
+    // === WS1: Fill-Quote Autocorrelation Tests ===
+
+    #[test]
+    fn test_autocorrelation_zero_when_independent() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Alternating: buy fills with positive skew, sell fills with negative skew
+        // This is anti-correlated (fills oppose skew), so autocorrelation should be low
+        for i in 0..20 {
+            let dir = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let skew = if i % 2 == 0 { -0.5 } else { 0.5 }; // opposite of fill dir
+            est.record_fill_for_autocorrelation(dir, skew);
+        }
+
+        let ac = est.fill_quote_autocorrelation();
+        assert!(
+            ac < 0.2,
+            "Anti-correlated fills should have near-zero autocorrelation: {}",
+            ac
+        );
+    }
+
+    #[test]
+    fn test_autocorrelation_high_when_echo() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Fills align with skew: buy fills when skew is positive,
+        // sell fills when skew is negative. This is echo behavior.
+        // Need variance in both x and y for Pearson correlation to be defined.
+        for _ in 0..10 {
+            est.record_fill_for_autocorrelation(1.0, 0.8);  // buy fill, positive skew
+            est.record_fill_for_autocorrelation(-1.0, -0.8); // sell fill, negative skew
+        }
+
+        let ac = est.fill_quote_autocorrelation();
+        assert!(
+            ac > 0.7,
+            "Echo fills should have high autocorrelation: {}",
+            ac
+        );
+    }
+
+    #[test]
+    fn test_autocorrelation_r_scaling() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // No fills yet → warmup prior (0.3)
+        assert!(
+            (est.fill_quote_autocorrelation() - AUTOCORRELATION_WARMUP_PRIOR).abs() < 0.01,
+            "Should return warmup prior with no fills"
+        );
+
+        // Base R = 9.0 (sigma_fill=3.0)
+        let base_r = 9.0;
+
+        // With warmup prior (0.3): informativeness = 0.7, scaled_r = 9/0.7 ≈ 12.9
+        let scaled_r = est.observation_variance_scaled(base_r);
+        assert!(
+            scaled_r > base_r,
+            "Warmup prior should slightly inflate R: {} > {}",
+            scaled_r,
+            base_r
+        );
+
+        // Fill with high echo (fills align with skew direction — echo behavior)
+        // Need variance in both x and y for Pearson r to be defined
+        for _ in 0..10 {
+            est.record_fill_for_autocorrelation(1.0, 0.9);   // buy fill, positive skew
+            est.record_fill_for_autocorrelation(-1.0, -0.9);  // sell fill, negative skew
+        }
+
+        let high_echo_r = est.observation_variance_scaled(base_r);
+        assert!(
+            high_echo_r > 3.0 * base_r,
+            "High echo should inflate R by 3x+: {} vs base {}",
+            high_echo_r,
+            base_r
+        );
+    }
+
+    #[test]
+    fn test_autocorrelation_mixed_fills_near_zero() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Random-ish pattern: fills and skew uncorrelated
+        let fills = [
+            (1.0, 0.3),
+            (-1.0, 0.5),
+            (1.0, -0.2),
+            (-1.0, -0.8),
+            (1.0, 0.1),
+            (-1.0, 0.4),
+            (1.0, -0.6),
+            (-1.0, 0.2),
+            (1.0, 0.7),
+            (-1.0, -0.3),
+            (1.0, -0.1),
+            (-1.0, 0.6),
+            (1.0, 0.2),
+            (-1.0, -0.5),
+            (1.0, -0.4),
+            (-1.0, 0.1),
+            (1.0, 0.5),
+            (-1.0, -0.7),
+            (1.0, -0.3),
+            (-1.0, 0.8),
+        ];
+        for (dir, skew) in &fills {
+            est.record_fill_for_autocorrelation(*dir, *skew);
+        }
+
+        let ac = est.fill_quote_autocorrelation();
+        assert!(
+            ac < 0.4,
+            "Mixed fills should have low autocorrelation: {}",
+            ac
+        );
+    }
+
+    #[test]
+    fn test_drift_recovery_after_cascade_echo() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Simulate cascade: 20 same-direction fills with matching skew (echo)
+        for _ in 0..20 {
+            est.record_fill_for_autocorrelation(-1.0, -0.7); // sell fills with sell skew
+        }
+
+        // Push drift negative with fill observations
+        for _ in 0..5 {
+            est.update_fill(true, 99.0, 100.0, 0.001); // buy fills = bearish
+        }
+        let cascade_drift = est.drift_bps_per_sec();
+
+        // Now let OU decay for 35s (one half-life)
+        est.predict(now_ms() + 35_000);
+        let recovered_drift = est.drift_bps_per_sec();
+
+        assert!(
+            recovered_drift.abs() < cascade_drift.abs(),
+            "Drift should recover after cascade: cascade={:.2}, recovered={:.2}",
+            cascade_drift,
+            recovered_drift
+        );
     }
 }
