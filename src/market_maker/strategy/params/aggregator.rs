@@ -227,7 +227,7 @@ impl ParameterAggregator {
             param_correlation: est.kappa_sigma_correlation(),
             as_factor: est.hierarchical_as_factor(),
             arrival_intensity,
-            liquidity_gamma_mult: est.liquidity_gamma_multiplier(),
+            // liquidity_gamma_mult deleted — routed through beta_depth in CalibratedRiskModel
 
             // === Regime detection ===
             is_toxic_regime: est.is_toxic_regime(),
@@ -276,18 +276,13 @@ impl ParameterAggregator {
             // === Tier 1: Pre-Fill AS Classifier (Phase 3) ===
             pre_fill_toxicity_bid: sources.pre_fill_classifier.predict_toxicity(true),
             pre_fill_toxicity_ask: sources.pre_fill_classifier.predict_toxicity(false),
-            pre_fill_spread_mult_bid: sources.pre_fill_classifier.spread_multiplier(true),
-            pre_fill_spread_mult_ask: sources.pre_fill_classifier.spread_multiplier(false),
-            // Legacy size reduction — deprecated, toxicity now handled by additive spread widening.
-            #[allow(deprecated)]
-            pre_fill_size_mult_bid: 1.0,
-            #[allow(deprecated)]
-            pre_fill_size_mult_ask: 1.0,
+            // pre_fill_spread_mult_bid/ask deleted — AS defense via log-odds additive path
+            // pre_fill_size_mult_bid/ask deleted — toxicity handled by additive spread widening
 
-            // === Tier 1: Liquidation Cascade ===
-            tail_risk_multiplier: sources.liquidation_detector.tail_risk_multiplier(),
+            // Phase 3: Tail risk is additive log-odds in strategy, but we still pass intensity
+            tail_risk_intensity: ((sources.liquidation_detector.tail_risk_multiplier() - 1.0) / 4.0).clamp(0.0, 1.0),
             should_pull_quotes: sources.liquidation_detector.should_pull_quotes(),
-            cascade_size_factor: sources.liquidation_detector.size_reduction_factor(),
+            cascade_intensity: 1.0 - sources.liquidation_detector.size_reduction_factor(),
 
             // === Tier 2: Hawkes Order Flow ===
             hawkes_buy_intensity: sources.hawkes.lambda_buy(),
@@ -313,11 +308,10 @@ impl ParameterAggregator {
             rl_is_exploration: false,
             rl_expected_q: 0.0,
             rl_action_applied: false,
-            rl_gamma_multiplier: 1.0,
-            rl_omega_multiplier: 1.0,
+            // rl_gamma_multiplier/rl_omega_multiplier deleted — RL policy uses additive spread_delta_bps
 
             // Contextual Bandit SpreadOptimizer
-            bandit_spread_multiplier: 1.0,
+            bandit_spread_additive_bps: 0.0,
             bandit_is_exploration: false,
 
             // Phase 8: Competitor Model
@@ -368,8 +362,7 @@ impl ParameterAggregator {
             calibrated_cancel_rate: 0.2,
 
             // Momentum Protection (Gap 10) - defaults until MomentumModel integrated
-            bid_protection_factor: 1.0,
-            ask_protection_factor: 1.0,
+            // bid_protection_factor/ask_protection_factor deleted — momentum protection via flow params
             p_momentum_continue: 0.5,
 
             // === Stochastic Module: HJB Controller ===
@@ -377,7 +370,6 @@ impl ParameterAggregator {
             hjb_optimal_skew: sources
                 .hjb_controller
                 .optimal_skew(sources.position, sources.max_position),
-            hjb_gamma_multiplier: sources.hjb_controller.gamma_multiplier(),
             hjb_inventory_target: sources.hjb_controller.optimal_inventory_target(),
             hjb_is_terminal_zone: sources.hjb_controller.is_terminal_zone(),
 
@@ -385,7 +377,7 @@ impl ParameterAggregator {
             // Compute drift-adjusted skew if momentum data available
             use_drift_adjusted_skew: sources.stochastic_config.use_hjb_skew, // Enabled when HJB is enabled
             hjb_drift_urgency: sources.drift_adjusted_skew.drift_urgency,
-            directional_variance_mult: sources.drift_adjusted_skew.variance_multiplier,
+            // directional_variance_mult deleted — variance scaling routed through drift urgency
             position_opposes_momentum: sources.drift_adjusted_skew.is_opposed,
             urgency_score: sources.drift_adjusted_skew.urgency_score,
 
@@ -554,7 +546,7 @@ impl ParameterAggregator {
             entropy_thompson_samples: sources.stochastic_config.entropy_thompson_samples,
 
             // === Calibration Fill Rate Controller ===
-            calibration_gamma_mult: sources.calibration_gamma_mult,
+            // calibration_gamma_mult deleted — gamma now log-additive via CalibratedRiskModel
             calibration_progress: sources.calibration_progress,
             calibration_complete: sources.calibration_complete,
 
@@ -629,7 +621,7 @@ impl ParameterAggregator {
             regime_as_expected_bps: 1.0,
             regime_risk_premium_bps: 1.0,
             regime_skew_gain: 1.0,
-            regime_size_multiplier: 0.8,
+            // regime_size_multiplier deleted — regime risk expressed through gamma
             controller_objective: ControllerObjective::MeanRevert,
             max_position_fraction: 0.8,
             total_risk_premium_bps: 1.0, // Wired from regime + addons in quote_engine
@@ -650,7 +642,7 @@ impl ParameterAggregator {
             bootstrap_confidence: 0.0,    // Not calibrated initially
             adverse_uncertainty: 0.1,     // Moderate uncertainty
             adverse_regime: 1,            // Normal regime
-            bayesian_gamma_mult: 1.0,     // No adjustment until computed
+            // bayesian_gamma_mult deleted — posterior gamma via CalibratedRiskModel betas
 
             // === Phase 9: Rate Limit Death Spiral Prevention ===
             rate_limit_headroom_pct: 1.0, // Full budget available by default, updated by caller

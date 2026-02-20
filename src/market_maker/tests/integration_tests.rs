@@ -968,7 +968,9 @@ mod tests {
                 let mut p = MarketParams::default();
                 p.sigma = 0.0001;         // Low volatility
                 p.sigma_effective = 0.0001;
-                p.kappa = 200.0;          // Deep book
+                p.kappa = 200.0;                // Deep book (easy to get filled)
+                p.kappa_bid = 200.0;
+                p.kappa_ask = 200.0;
                 p.microprice = mid;
                 p.market_mid = mid;
                 p.arrival_intensity = 0.3;
@@ -1000,10 +1002,14 @@ mod tests {
                 p.sigma = 0.01;           // Very high volatility
                 p.sigma_effective = 0.01;
                 p.kappa = 30.0;           // Very thin book
+                p.kappa_bid = 30.0;
+                p.kappa_ask = 30.0;
                 p.is_toxic_regime = true;
                 p.microprice = mid;
                 p.market_mid = mid;
                 p.arrival_intensity = 2.0;
+                p.cascade_intensity = 0.8;
+                p.tail_risk_intensity = 1.0;
                 p.falling_knife_score = 0.8;
                 p
             }),

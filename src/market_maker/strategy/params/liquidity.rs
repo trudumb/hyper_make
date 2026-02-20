@@ -23,10 +23,6 @@ pub struct LiquidityParams {
     /// Order arrival intensity (A) - volume ticks per second.
     pub arrival_intensity: f64,
 
-    /// Liquidity-based gamma multiplier [1.0, 2.0].
-    /// > 1.0 when near-touch liquidity is below average (thin book).
-    pub liquidity_gamma_mult: f64,
-
     // Queue model parameters (Gap 3)
     /// Calibrated volume at touch rate (units/sec).
     pub calibrated_volume_rate: f64,
@@ -43,7 +39,6 @@ impl Default for LiquidityParams {
             is_heavy_tailed: false,
             kappa_cv: 1.0,
             arrival_intensity: 0.5,
-            liquidity_gamma_mult: 1.0,
             calibrated_volume_rate: 1.0,
             calibrated_cancel_rate: 0.2,
         }
@@ -58,6 +53,5 @@ mod tests {
     fn test_liquidity_params_default() {
         let params = LiquidityParams::default();
         assert!((params.kappa - 100.0).abs() < f64::EPSILON);
-        assert!((params.liquidity_gamma_mult - 1.0).abs() < f64::EPSILON);
     }
 }

@@ -1251,7 +1251,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let g_base = if mp.adaptive_gamma > 0.0 {
                     mp.adaptive_gamma
                 } else {
-                    mp.calibration_gamma_mult.max(0.01)
+                    0.1 // Conservative gamma base when adaptive not available
                 };
                 // Apply regime multiplier to match ladder strategy's gamma
                 let g = g_base * mp.regime_gamma_multiplier;
@@ -2357,7 +2357,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let g_base = if mp.adaptive_gamma > 0.0 {
                     mp.adaptive_gamma
                 } else {
-                    mp.calibration_gamma_mult.max(0.01)
+                    0.1 // Conservative gamma base when adaptive not available
                 };
                 let g = g_base * mp.regime_gamma_multiplier;
                 let k = if mp.use_kappa_robust && mp.kappa_robust > 0.0 {

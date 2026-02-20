@@ -524,8 +524,8 @@ impl LadderStrategy {
             cascade_severity: if market_params.should_pull_quotes {
                 1.0
             } else {
-                // Scale from tail_risk_multiplier: 1.0 → 0.0, 5.0 → 1.0
-                (market_params.tail_risk_multiplier - 1.0) / 4.0
+                // Scale from tail_risk_intensity: 0.0 → 0.0, 1.0 → 1.0
+                market_params.tail_risk_intensity.clamp(0.0, 1.0)
             },
             book_imbalance: market_params.book_imbalance,
         }
@@ -663,13 +663,9 @@ impl LadderStrategy {
         max_position: f64,
     ) -> SpreadComposition {
         let effective_max_position = market_params.effective_max_position(max_position).min(max_position);
-        let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
-            market_params.adaptive_gamma * market_params.tail_risk_multiplier
-        } else {
-            let base = self.effective_gamma(market_params, 0.0, effective_max_position);
-            base * market_params.liquidity_gamma_mult * market_params.tail_risk_multiplier
-        };
-        let gamma = gamma * market_params.regime_gamma_multiplier;
+        // Single log-additive gamma path (tail risk, liquidity captured by beta coefficients)
+        let gamma = self.effective_gamma(market_params, 0.0, effective_max_position)
+            * market_params.regime_gamma_multiplier;
 
         let kappa = if market_params.use_kappa_robust {
             market_params.kappa_robust
@@ -716,7 +712,7 @@ impl LadderStrategy {
         config: &QuoteConfig,
         position: f64,
         max_position: f64,
-        target_liquidity: f64,
+        _target_liquidity: f64,
         market_params: &MarketParams,
     ) -> Ladder {
         // Circuit breaker: pull all quotes during cascade
@@ -749,69 +745,24 @@ impl LadderStrategy {
             "Quoting capacity: capped by config.max_position"
         );
 
-        // === GAMMA: Adaptive vs Legacy with Bayesian Adjustment ===
-        // When adaptive spreads enabled: use log-additive shrinkage gamma
-        // When disabled: use multiplicative RiskConfig gamma
-        //
-        // In BOTH paths, apply:
-        // 1. calibration_gamma_mult for fill-hungry mode during warmup
-        // 2. bayesian_gamma_mult for posterior-driven adjustments (trend, bootstrap, adverse)
-        let calibration_scalar = market_params.calibration_gamma_mult;
+        // === GAMMA: Single log-additive path via CalibratedRiskModel ===
+        // All risk factors (volatility, toxicity, inventory, cascade, tail risk,
+        // depth, uncertainty, confidence) are captured as beta coefficients in
+        // the log-additive model: log(γ) = log(γ_base) + Σ βᵢ × xᵢ.
+        // No post-hoc multiplicative scalars needed.
+        let gamma = self.effective_gamma(market_params, position, effective_max_position);
 
-        // Compute Bayesian gamma adjustment from posteriors
-        // If pre-computed in MarketParams, use that; otherwise compute here
-        let bayesian_scalar = if (market_params.bayesian_gamma_mult - 1.0).abs() > 0.001 {
-            market_params.bayesian_gamma_mult
-        } else {
-            self.compute_bayesian_gamma_adjustment(market_params)
-        };
-
-        let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
-            // Adaptive gamma: log-additive scaling prevents multiplicative explosion
-            // Still apply tail risk multiplier for cascade protection
-            // Apply calibration scalar for fill-hungry mode
-            // Apply Bayesian scalar for posterior-driven adjustments
-            let adaptive_gamma = market_params.adaptive_gamma;
-            debug!(
-                adaptive_gamma = %format!("{:.4}", adaptive_gamma),
-                tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
-                calibration_mult = %format!("{:.2}", calibration_scalar),
-                bayesian_mult = %format!("{:.3}", bayesian_scalar),
-                warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
-                "Ladder using ADAPTIVE gamma with BAYESIAN adjustment"
-            );
-            adaptive_gamma * market_params.tail_risk_multiplier * calibration_scalar * bayesian_scalar
-        } else {
-            // Legacy: multiplicative RiskConfig gamma
-            // Note: effective_gamma() already includes calibration_scalar
-            let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
-            let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
-            let legacy_gamma = gamma_with_liq * market_params.tail_risk_multiplier;
-            debug!(
-                base_gamma = %format!("{:.4}", base_gamma),
-                gamma_with_liq = %format!("{:.4}", gamma_with_liq),
-                tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
-                bayesian_mult = %format!("{:.3}", bayesian_scalar),
-                "Ladder using LEGACY gamma with BAYESIAN adjustment"
-            );
-            legacy_gamma * bayesian_scalar
-        };
-
-        // === REGIME GAMMA MULTIPLIER (Continuously Blended) ===
-        // Route regime risk through gamma instead of floor clamping.
-        // This lets GLFT naturally widen spreads in volatile/extreme regimes
-        // via δ = (1/γ)ln(1 + γ/κ) — higher γ → wider spread.
-        // The multiplier is continuously blended from regime probabilities
-        // (e.g. probs [0.2, 0.3, 0.3, 0.2] -> 1.76) instead of discrete
-        // jumps {1.0, 1.2, 2.0, 3.0}.
+        // Regime gamma multiplier: applied as post-hoc multiplication.
+        // Mathematically equivalent to log_gamma += ln(regime_gamma_multiplier)
+        // in the log-additive space. Kept separate because regime blending
+        // (from regime probabilities) is computed outside the risk model.
         let gamma = gamma * market_params.regime_gamma_multiplier;
-        if (market_params.regime_gamma_multiplier - 1.0).abs() > 0.01 {
-            tracing::info!(
-                regime_gamma_mult = %format!("{:.2}", market_params.regime_gamma_multiplier),
-                gamma_after = %format!("{:.4}", gamma),
-                "Regime gamma multiplier applied (replaces floor clamping)"
-            );
-        }
+        debug!(
+            gamma = %format!("{:.4}", gamma),
+            regime_gamma_mult = %format!("{:.2}", market_params.regime_gamma_multiplier),
+            warmup_pct = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
+            "Ladder gamma from log-additive CalibratedRiskModel"
+        );
 
         // === KAPPA: Robust V3 > Adaptive > Legacy ===
         // Priority: 1. Robust kappa (outlier-resistant), 2. Adaptive, 3. Legacy
@@ -942,18 +893,15 @@ impl LadderStrategy {
             0.0 // Use zero AS until warmed up
         };
 
-        // Apply cascade size reduction to target_liquidity (but NOT to initial ladder generation)
-        let _adjusted_size = target_liquidity * market_params.cascade_size_factor;
-
-        // For initial ladder generation, use the full quoting capacity so that individual
-        // levels pass the min_notional filter. The entropy optimizer will then correctly
-        // allocate the actual available margin (available_for_bids/asks).
+        // Cascade size reduction removed (B2): cascade exposure reduction is now
+        // handled by beta_cascade in CalibratedRiskModel (wider spreads) and
+        // Kelly correlation_discount() (smaller positions). Multiplicative size
+        // choking was double-penalizing and causing min_notional filter failures.
         //
-        // FIXED: Previously used target_liquidity which was often much smaller than
-        // quoting capacity (e.g., 1.3 HYPE vs 66 HYPE), causing ALL levels to fail
-        // min_notional check, triggering concentration fallback BEFORE entropy optimizer.
-        let size_for_initial_ladder =
-            effective_max_position * market_params.cascade_size_factor;
+        // Use full effective_max_position for initial ladder generation so
+        // individual levels pass the min_notional filter. The entropy optimizer
+        // then allocates the actual available margin (available_for_bids/asks).
+        let size_for_initial_ladder = effective_max_position;
 
         // L2 reservation shift removed — double-counts skew already handled
         // by lead_lag_signal_bps in the directional skew section below.
@@ -1018,7 +966,7 @@ impl LadderStrategy {
             use_drift_adjusted_skew: market_params.use_drift_adjusted_skew,
             hjb_drift_urgency: market_params.hjb_drift_urgency,
             position_opposes_momentum: market_params.position_opposes_momentum,
-            directional_variance_mult: market_params.directional_variance_mult,
+            directional_variance_mult: 1.0, // Multiplicative field removed from MarketParams; dead in LadderEmission
             urgency_score: market_params.urgency_score,
             // Convert annualized funding rate to per-second rate
             // 365.25 * 24 * 60 * 60 = 31,557,600 seconds/year
@@ -1174,16 +1122,14 @@ impl LadderStrategy {
         // Adverse selection defense now handled entirely by the additive E[PnL]
         // filter below (which uses AS cost in bps, not unitless multipliers).
 
-        // [SPREAD TRACE] Phase 6: pre-fill AS (multiplicative removed)
+        // [SPREAD TRACE] Phase 6: pre-fill AS (multiplicative path deleted)
         tracing::info!(
             phase = "pre_fill_as",
-            raw_mult_bid = %format!("{:.3}", market_params.pre_fill_spread_mult_bid),
-            raw_mult_ask = %format!("{:.3}", market_params.pre_fill_spread_mult_ask),
-            status = "bypassed (multiplicative removed, E[PnL] filter handles AS)",
+            status = "deleted (E[PnL] filter handles AS)",
             touch_bid_bps = %format!("{:.2}", dynamic_depths.best_bid_depth().unwrap_or(0.0)),
             touch_ask_bps = %format!("{:.2}", dynamic_depths.best_ask_depth().unwrap_or(0.0)),
             total_at_touch_bps = %format!("{:.2}", dynamic_depths.spread_at_touch().unwrap_or(0.0)),
-            "[SPREAD TRACE] pre-fill AS multipliers bypassed (B3: multiplicative removed)"
+            "[SPREAD TRACE] pre-fill AS multipliers deleted"
         );
 
         // === SPREAD INFLATION CAP ===

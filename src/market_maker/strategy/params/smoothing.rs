@@ -89,13 +89,13 @@ pub struct SmootherConfig {
     #[serde(default = "default_lead_lag_deadband_bps")]
     pub lead_lag_deadband_bps: f64,
 
-    /// EWMA alpha for tail_risk_multiplier when raw > smoothed (fast escalation).
+    /// EWMA alpha for tail_risk_intensity when raw > smoothed (fast escalation).
     #[serde(default = "default_tail_risk_alpha_up")]
     pub tail_risk_alpha_up: f64,
-    /// EWMA alpha for tail_risk_multiplier when raw < smoothed (slow relaxation).
+    /// EWMA alpha for tail_risk_intensity when raw < smoothed (slow relaxation).
     #[serde(default = "default_tail_risk_alpha_down")]
     pub tail_risk_alpha_down: f64,
-    /// Relative deadband for tail_risk_multiplier (fraction).
+    /// Relative deadband for tail_risk_intensity (fraction).
     #[serde(default = "default_tail_risk_deadband_pct")]
     pub tail_risk_deadband_pct: f64,
 
@@ -203,7 +203,7 @@ impl ParameterSmoother {
             kappa_output: None,
             gamma_mult_output: 1.0,
             lead_lag_output: 0.0,
-            tail_risk_output: 1.0,
+            tail_risk_output: 0.0, // Default to 0 tail risk intensity
             last_regime: None,
             regime_change_cycle: None,
             cooldown_until_cycle: 0,
@@ -336,7 +336,7 @@ impl ParameterSmoother {
 
         // --- Tail risk (asymmetric alpha) ---
         {
-            let raw = market_params.tail_risk_multiplier;
+            let raw = market_params.tail_risk_intensity;
             let base_alpha = if raw > self.tail_risk_ema.value || !self.tail_risk_ema.initialized {
                 self.config.tail_risk_alpha_up
             } else {
@@ -356,7 +356,7 @@ impl ParameterSmoother {
             } else {
                 self.deadband_suppressions += 1;
             }
-            market_params.tail_risk_multiplier = self.tail_risk_output;
+            market_params.tail_risk_intensity = self.tail_risk_output;
         }
 
         self.total_updates += 1;
@@ -374,7 +374,7 @@ impl ParameterSmoother {
         self.kappa_output = None;
         self.gamma_mult_output = 1.0;
         self.lead_lag_output = 0.0;
-        self.tail_risk_output = 1.0;
+        self.tail_risk_output = 0.0; // Default to 0 tail risk intensity
         self.last_regime = None;
         self.regime_change_cycle = None;
         self.cooldown_until_cycle = 0;
@@ -468,7 +468,7 @@ mod tests {
         params.regime_kappa = Some(5000.0);
         params.regime_gamma_multiplier = 1.5;
         params.lead_lag_signal_bps = 3.0;
-        params.tail_risk_multiplier = 2.0;
+        params.tail_risk_intensity = 2.0;
 
         smoother.smooth(&mut params, false);
 
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(params.regime_kappa, Some(5000.0));
         assert_eq!(params.regime_gamma_multiplier, 1.5);
         assert_eq!(params.lead_lag_signal_bps, 3.0);
-        assert_eq!(params.tail_risk_multiplier, 2.0);
+        assert_eq!(params.tail_risk_intensity, 2.0);
     }
 
     #[test]
@@ -487,7 +487,7 @@ mod tests {
         params.sigma = 0.005;
         params.regime_gamma_multiplier = 1.5;
         params.lead_lag_signal_bps = 3.0;
-        params.tail_risk_multiplier = 2.0;
+        params.tail_risk_intensity = 2.0;
 
         smoother.smooth(&mut params, false);
 
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(params.sigma, 0.005);
         assert_eq!(params.regime_gamma_multiplier, 1.5);
         assert_eq!(params.lead_lag_signal_bps, 3.0);
-        assert_eq!(params.tail_risk_multiplier, 2.0);
+        assert_eq!(params.tail_risk_intensity, 2.0);
     }
 
     #[test]
@@ -508,7 +508,7 @@ mod tests {
             params.sigma = 0.01;
             params.regime_gamma_multiplier = 1.0;
             params.lead_lag_signal_bps = 0.0;
-            params.tail_risk_multiplier = 1.0;
+            params.tail_risk_intensity = 1.0;
             smoother.smooth(&mut params, false);
         }
 
@@ -517,7 +517,7 @@ mod tests {
         params.sigma = 0.01;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
 
         assert!((params.sigma - 0.01).abs() < 1e-10, "sigma should converge to constant input");
@@ -537,7 +537,7 @@ mod tests {
         params.sigma = 1.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(params.sigma, 1.0);
 
@@ -546,7 +546,7 @@ mod tests {
         params.sigma = 1.01;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         // Should be suppressed — output stays at 1.0
         assert_eq!(params.sigma, 1.0);
@@ -557,7 +557,7 @@ mod tests {
         params.sigma = 1.10;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         // Should pass through
         assert!((params.sigma - 1.10).abs() < 1e-10);
@@ -577,7 +577,7 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 5.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(params.lead_lag_signal_bps, 5.0);
 
@@ -586,7 +586,7 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 6.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         // Suppressed
         assert_eq!(params.lead_lag_signal_bps, 5.0);
@@ -596,7 +596,7 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 9.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert!((params.lead_lag_signal_bps - 9.0).abs() < 1e-10);
     }
@@ -616,7 +616,7 @@ mod tests {
             params.sigma = 1.0;
             params.regime_gamma_multiplier = 1.0;
             params.lead_lag_signal_bps = 0.0;
-            params.tail_risk_multiplier = 1.0;
+            params.tail_risk_intensity = 1.0;
             smoother.smooth(&mut params, false);
         }
 
@@ -625,7 +625,7 @@ mod tests {
         params.sigma = 2.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, true);
 
         // After regime reset, EMA re-initializes to raw value
@@ -647,7 +647,7 @@ mod tests {
         params.sigma = 1.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
 
         // Cycle 1: first regime change accepted
@@ -655,7 +655,7 @@ mod tests {
         params.sigma = 2.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, true);
         assert_eq!(params.sigma, 2.0); // reset to raw
 
@@ -665,7 +665,7 @@ mod tests {
         params.sigma = 3.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, true);
         // Should NOT reset — should apply normal EMA from previous value of 2.0
         // EMA: alpha=0.10 * 3.0 + 0.90 * 2.0 = 2.1. That's > 3% deadband from 2.0, so it updates.
@@ -692,7 +692,7 @@ mod tests {
         params.sigma = 1.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
 
         // Cycle 1: regime change
@@ -700,7 +700,7 @@ mod tests {
         params.sigma = 2.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, true);
         assert_eq!(params.sigma, 2.0); // reset to raw
 
@@ -709,7 +709,7 @@ mod tests {
         params.sigma = 2.5;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         // alpha=0.775: 0.775*2.5 + 0.225*2.0 = 1.9375 + 0.45 = 2.3875
         assert!(
@@ -723,7 +723,7 @@ mod tests {
         params.sigma = 2.5;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         let expected = 0.55 * 2.5 + 0.45 * 2.3875;
         assert!(
@@ -749,7 +749,7 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
 
         // Cycle 1: tail risk spikes to 3.0 — should track fast (alpha_up=0.80)
@@ -757,13 +757,13 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 3.0;
+        params.tail_risk_intensity = 3.0;
         smoother.smooth(&mut params, false);
         let expected = 0.80 * 3.0 + 0.20 * 1.0; // 2.6
         assert!(
-            (params.tail_risk_multiplier - expected).abs() < 1e-10,
+            (params.tail_risk_intensity - expected).abs() < 1e-10,
             "tail risk should escalate fast. got {} expected {}",
-            params.tail_risk_multiplier,
+            params.tail_risk_intensity,
             expected
         );
     }
@@ -783,7 +783,7 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 3.0;
+        params.tail_risk_intensity = 3.0;
         smoother.smooth(&mut params, false);
 
         // Cycle 1: tail risk drops to 1.0 — should relax slowly (alpha_down=0.15)
@@ -791,13 +791,13 @@ mod tests {
         params.sigma = 0.001;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         let expected = 0.15 * 1.0 + 0.85 * 3.0; // 2.7
         assert!(
-            (params.tail_risk_multiplier - expected).abs() < 1e-10,
+            (params.tail_risk_intensity - expected).abs() < 1e-10,
             "tail risk should relax slowly. got {} expected {}",
-            params.tail_risk_multiplier,
+            params.tail_risk_intensity,
             expected
         );
     }
@@ -812,7 +812,7 @@ mod tests {
         params.regime_kappa = None;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(params.regime_kappa, None);
 
@@ -822,7 +822,7 @@ mod tests {
         params.regime_kappa = Some(5000.0);
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(params.regime_kappa, Some(5000.0));
 
@@ -832,7 +832,7 @@ mod tests {
         params.regime_kappa = None;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(params.regime_kappa, None);
         assert!(!smoother.kappa_ema.initialized, "kappa EMA should be reset when None");
@@ -861,7 +861,7 @@ mod tests {
         params.sigma = 1.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 5.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert_eq!(smoother.deadband_suppressions, 0);
 
@@ -870,7 +870,7 @@ mod tests {
         params.sigma = 1.01; // 1% < 10% deadband
         params.regime_gamma_multiplier = 1.01;
         params.lead_lag_signal_bps = 5.5; // 0.5 < 100 bps deadband
-        params.tail_risk_multiplier = 1.01;
+        params.tail_risk_intensity = 1.01;
         smoother.smooth(&mut params, false);
 
         // Should have at least 4 suppressions (one per smoothed param, kappa is None)
@@ -926,7 +926,7 @@ mod tests {
             params.sigma = 0.01;
             params.regime_gamma_multiplier = 1.5;
             params.lead_lag_signal_bps = 3.0;
-            params.tail_risk_multiplier = 2.0;
+            params.tail_risk_intensity = 2.0;
             smoother.smooth(&mut params, false);
         }
         assert!(smoother.total_updates > 0);
@@ -959,7 +959,7 @@ mod tests {
         params.sigma = 1.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
 
         // Step to 2.0 — after 1 cycle: 0.20*2 + 0.80*1 = 1.20
@@ -967,7 +967,7 @@ mod tests {
         params.sigma = 2.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert!((params.sigma - 1.20).abs() < 1e-10);
 
@@ -976,7 +976,7 @@ mod tests {
         params.sigma = 2.0;
         params.regime_gamma_multiplier = 1.0;
         params.lead_lag_signal_bps = 0.0;
-        params.tail_risk_multiplier = 1.0;
+        params.tail_risk_intensity = 1.0;
         smoother.smooth(&mut params, false);
         assert!((params.sigma - 1.36).abs() < 1e-10);
     }
@@ -997,7 +997,7 @@ mod tests {
         p.sigma = 1.0;
         p.regime_gamma_multiplier = 1.0;
         p.lead_lag_signal_bps = 0.0;
-        p.tail_risk_multiplier = 1.0;
+        p.tail_risk_intensity = 1.0;
         smoother.smooth(&mut p, false);
 
         // Cycle 1: regime change accepted

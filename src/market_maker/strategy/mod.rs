@@ -721,12 +721,12 @@ mod tests {
             kappa: 100.0,
             arrival_intensity: 1.0,
             microprice: 100.0,
-            cascade_size_factor: 1.0,
+            cascade_intensity: 0.0,
             ..Default::default()
         };
 
         let cascade_params = MarketParams {
-            cascade_size_factor: 0.5, // 50% size reduction
+            cascade_intensity: 0.5, // 50% size reduction
             ..normal_params.clone()
         };
 

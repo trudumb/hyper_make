@@ -1595,13 +1595,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create market maker config
     // Build StochasticConfig
-    let stochastic_config = {
-        let mut cfg = StochasticConfig::default();
+    let stochastic_config = StochasticConfig {
         // Position ramp starts below exchange minimum at $100 capital on HYPE.
         // Disable until TOML→StochasticConfig wiring is implemented.
-        cfg.enable_position_ramp = false;
-        cfg.enable_performance_gating = false;
-        cfg
+        enable_position_ramp: false,
+        enable_performance_gating: false,
+        ..Default::default()
     };
 
     // Standard HL maker fee: 1.5 bps (add: 0.00015) — same for all profiles
@@ -1726,10 +1725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref risk_cfg) = config.strategy.risk_config {
                 info!(
                     gamma_base = risk_cfg.gamma_base,
-                    volatility_weight = risk_cfg.volatility_weight,
-                    toxicity_sensitivity = risk_cfg.toxicity_sensitivity,
-                    inventory_sensitivity = risk_cfg.inventory_sensitivity,
-                    "Using full RiskConfig for dynamic gamma"
+                    "Using RiskConfig with CalibratedRiskModel for log-additive gamma"
                 );
                 Box::new(GLFTStrategy::with_config(risk_cfg.clone()))
             } else {

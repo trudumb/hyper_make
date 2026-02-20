@@ -34,10 +34,6 @@ pub struct FlowParams {
     pub hawkes_activity_percentile: f64,
 
     // Momentum protection (Gap 10)
-    /// Bid protection factor (>= 1.0 when market falling).
-    pub bid_protection_factor: f64,
-    /// Ask protection factor (>= 1.0 when market rising).
-    pub ask_protection_factor: f64,
     /// Probability momentum continues.
     pub p_momentum_continue: f64,
 }
@@ -46,8 +42,6 @@ impl FlowParams {
     /// Create with default protection factors.
     pub fn new() -> Self {
         Self {
-            bid_protection_factor: 1.0,
-            ask_protection_factor: 1.0,
             p_momentum_continue: 0.5,
             hawkes_activity_percentile: 0.5,
             ..Default::default()
@@ -62,7 +56,6 @@ mod tests {
     #[test]
     fn test_flow_params_new() {
         let params = FlowParams::new();
-        assert!((params.bid_protection_factor - 1.0).abs() < f64::EPSILON);
-        assert!((params.ask_protection_factor - 1.0).abs() < f64::EPSILON);
+        assert!((params.p_momentum_continue - 0.5).abs() < f64::EPSILON);
     }
 }

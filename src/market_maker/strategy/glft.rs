@@ -378,7 +378,7 @@ impl GLFTStrategy {
     /// - `solve_min_gamma()`: floor enforcement for minimum viable half-spread
     ///
     /// Removed (now captured by CalibratedRiskModel β coefficients):
-    /// - calibration_gamma_mult, tail_risk_multiplier, rl_gamma_multiplier
+    /// - tail_risk_multiplier (still applied in generate_ladder legacy path)
     fn effective_gamma(
         &self,
         market_params: &MarketParams,
@@ -760,8 +760,8 @@ impl QuotingStrategy for GLFTStrategy {
         // Extreme liquidation cascade detected - pull all quotes immediately
         if market_params.should_pull_quotes {
             debug!(
-                tail_risk_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
-                cascade_size_factor = %format!("{:.2}", market_params.cascade_size_factor),
+                tail_risk_intensity = %format!("{:.2}", market_params.tail_risk_intensity),
+                cascade_intensity = %format!("{:.2}", market_params.cascade_intensity),
                 "CIRCUIT BREAKER: Liquidation cascade detected - pulling all quotes"
             );
             return (None, None);
@@ -801,12 +801,12 @@ impl QuotingStrategy for GLFTStrategy {
         // We don't need to wait for 20+ fills - priors give reasonable starting points.
         let gamma = if market_params.use_adaptive_spreads && market_params.adaptive_can_estimate {
             // Adaptive gamma: log-additive scaling prevents multiplicative explosion
-            // Still apply tail risk multiplier for cascade protection
+            // Still apply tail risk protection (converted to a 1.0 + intensity multiplier for this fallback)
             let adaptive_gamma = market_params.adaptive_gamma;
-            let gamma_with_tail = adaptive_gamma * market_params.tail_risk_multiplier;
+            let gamma_with_tail = adaptive_gamma * (1.0 + market_params.tail_risk_intensity);
             debug!(
                 adaptive_gamma = %format!("{:.4}", adaptive_gamma),
-                tail_mult = %format!("{:.2}", market_params.tail_risk_multiplier),
+                tail_intensity = %format!("{:.2}", market_params.tail_risk_intensity),
                 gamma_final = %format!("{:.4}", gamma_with_tail),
                 warmup_progress = %format!("{:.0}%", market_params.adaptive_warmup_progress * 100.0),
                 "Using ADAPTIVE gamma (log-additive shrinkage)"
@@ -815,10 +815,8 @@ impl QuotingStrategy for GLFTStrategy {
         } else {
             // Legacy: multiplicative RiskConfig gamma
             let base_gamma = self.effective_gamma(market_params, position, effective_max_position);
-            // Apply liquidity multiplier: thin book → higher gamma → wider spread
-            let gamma_with_liq = base_gamma * market_params.liquidity_gamma_mult;
             // Apply tail risk multiplier: during cascade → much higher gamma → wider spread
-            gamma_with_liq * market_params.tail_risk_multiplier
+            base_gamma * (1.0 + market_params.tail_risk_intensity)
         };
 
         // === 1a. KAPPA: Learned vs Adaptive vs Legacy ===
@@ -970,30 +968,9 @@ impl QuotingStrategy for GLFTStrategy {
                     "Pre-fill toxicity log-odds AS adjustment applied"
                 );
             }
-        } else {
-            // Legacy multiplicative path (fallback)
-            let bid_mult = market_params.pre_fill_spread_mult_bid;
-            let ask_mult = market_params.pre_fill_spread_mult_ask;
-
-            if bid_mult > 1.01 || ask_mult > 1.01 {
-                let bid_add = half_spread_bid * (bid_mult - 1.0);
-                let ask_add = half_spread_ask * (ask_mult - 1.0);
-
-                half_spread_bid += bid_add;
-                half_spread_ask += ask_add;
-                half_spread += (bid_add + ask_add) / 2.0;
-
-                debug!(
-                    bid_tox = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
-                    ask_tox = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
-                    bid_mult = %format!("{:.2}", bid_mult),
-                    ask_mult = %format!("{:.2}", ask_mult),
-                    bid_add_bps = %format!("{:.2}", bid_add * 10000.0),
-                    ask_add_bps = %format!("{:.2}", ask_add * 10000.0),
-                    "Pre-fill toxicity multiplicative widening applied (legacy)"
-                );
-            }
         }
+        // Legacy multiplicative pre-fill path removed — AS defense is now
+        // fully handled by the log-odds additive path above.
 
         // === 2a'. KALMAN UNCERTAINTY SPREAD WIDENING (Stochastic Module) ===
         // When use_kalman_filter is enabled, add uncertainty-based spread widening
@@ -1362,17 +1339,12 @@ impl QuotingStrategy for GLFTStrategy {
             // - sensitivity × drift_rate × P(continue) × |q| × T
             let drift_urg = market_params.hjb_drift_urgency;
 
-            // Variance multiplier logged for diagnostics (no longer applied as a multiplier;
-            // if higher risk aversion is needed, it should flow through gamma calibration)
-            let var_mult = market_params.directional_variance_mult;
-
             if market_params.urgency_score > 1.5 {
                 debug!(
                     position = %format!("{:.4}", position),
                     momentum_bps = %format!("{:.1}", market_params.momentum_bps),
                     p_continue = %format!("{:.2}", market_params.p_momentum_continue),
                     drift_urgency_bps = %format!("{:.2}", drift_urg * 10000.0),
-                    variance_mult = %format!("{:.2}", var_mult),
                     urgency_score = %format!("{:.1}", market_params.urgency_score),
                     "DRIFT-ADJUSTED SKEW: Position opposes momentum with high continuation prob"
                 );
@@ -1504,8 +1476,8 @@ impl QuotingStrategy for GLFTStrategy {
         // Multiplicative chains caused death spirals (3.34x quota × 2x bandit = 6.7x).
         // Now: base GLFT spread + additive components, each individually capped.
 
-        // 1. Bandit multiplier: narrow range, still multiplicative (optimizer feedback)
-        let bandit_mult = market_params.bandit_spread_multiplier.clamp(0.8, 1.5);
+        // 1. Bandit multiplier component (now additive bps)
+        let bandit_addon = market_params.bandit_spread_additive_bps / 10000.0;
 
         // 2. Changepoint/AS widening: convert excess multiplier to additive bps
         // spread_widening_mult of 1.5 on 5 bps half-spread = 2.5 bps addon
@@ -1518,10 +1490,10 @@ impl QuotingStrategy for GLFTStrategy {
         // Capped at 50 bps to prevent quota pressure from dominating
         let quota_addon = (market_params.quota_shadow_spread_bps / 10_000.0).min(0.0050);
 
-        // Compose: base × bandit (multiplicative) + addons (additive)
+        // Compose: base + addons (additive)
         // The base spread passes through at natural GLFT level; only addons are bounded.
-        let half_spread_bid_widened = half_spread_bid * bandit_mult + widening_addon_bid + quota_addon;
-        let half_spread_ask_widened = half_spread_ask * bandit_mult + widening_addon_ask + quota_addon;
+        let half_spread_bid_widened = half_spread_bid + bandit_addon + widening_addon_bid + quota_addon;
+        let half_spread_ask_widened = half_spread_ask + bandit_addon + widening_addon_ask + quota_addon;
 
         // Compute asymmetric deltas with predictive bias
         // Note: predictive_bias is typically negative when changepoint imminent (expect price drop)
@@ -1584,7 +1556,6 @@ impl QuotingStrategy for GLFTStrategy {
         debug!(
             inv_ratio = %format!("{:.4}", inventory_ratio),
             gamma = %format!("{:.4}", gamma),
-            liq_mult = %format!("{:.2}", market_params.liquidity_gamma_mult),
             kappa = %format!("{:.0}", kappa),
             kappa_bid = %format!("{:.0}", kappa_bid),
             kappa_ask = %format!("{:.0}", kappa_ask),
@@ -1661,8 +1632,8 @@ impl QuotingStrategy for GLFTStrategy {
 
         // === Apply cascade size reduction for graceful degradation ===
         // During moderate cascade (before quote pulling), reduce size gradually
-        let buy_size_adjusted = buy_size_raw * market_params.cascade_size_factor;
-        let sell_size_adjusted = sell_size_raw * market_params.cascade_size_factor;
+        let buy_size_adjusted = buy_size_raw * (1.0 - market_params.cascade_intensity).max(0.0);
+        let sell_size_adjusted = sell_size_raw * (1.0 - market_params.cascade_intensity).max(0.0);
 
         let buy_size = truncate_float(buy_size_adjusted, config.sz_decimals, false);
         let sell_size = truncate_float(sell_size_adjusted, config.sz_decimals, false);
@@ -1713,9 +1684,7 @@ mod tests {
         mp.sigma_effective = 0.01;
         mp.kappa = 5000.0;
         mp.microprice = 100.0;
-        mp.calibration_gamma_mult = 1.0;
-        mp.tail_risk_multiplier = 1.0;
-        mp.rl_gamma_multiplier = 1.0;
+        mp.tail_risk_intensity = 0.0; // Default calm
         mp
     }
 
@@ -1752,67 +1721,9 @@ mod tests {
         assert!(gamma > 0.0, "gamma must be positive, got {gamma}");
     }
 
-    #[test]
-    fn test_rl_gamma_multiplier_ignored_by_effective_gamma() {
-        // After B2: rl_gamma_multiplier is no longer applied in effective_gamma.
-        // It is captured by CalibratedRiskModel beta coefficients instead.
-        let strategy = test_strategy();
-        let mp_base = test_market_params();
-        let position = 0.5;
-        let max_position = 10.0;
-
-        let gamma_base = strategy.effective_gamma(&mp_base, position, max_position);
-
-        let mut mp_high = mp_base.clone();
-        mp_high.rl_gamma_multiplier = 5.0;
-        let gamma_high = strategy.effective_gamma(&mp_high, position, max_position);
-
-        assert!(
-            (gamma_base - gamma_high).abs() < 1e-12,
-            "rl_gamma_multiplier should have no effect on effective_gamma: base={gamma_base} vs high={gamma_high}",
-        );
-    }
-
     // ---------------------------------------------------------------
-    // Additive Skew Tests (replaced RL Omega Multiplier tests)
+    // Additive Skew Tests
     // ---------------------------------------------------------------
-
-    #[test]
-    fn test_skew_is_purely_additive() {
-        // Verify that skew composition is additive: changing rl_omega_multiplier
-        // on MarketParams has NO effect on quotes (the field is no longer read).
-        let strategy = test_strategy();
-        let config = test_quote_config();
-        let position = 2.0;
-        let max_position = 10.0;
-        let target_liq = 1.0;
-
-        let mp_base = test_market_params();
-        let (bid_base, ask_base) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_base);
-
-        let mut mp_omega = test_market_params();
-        mp_omega.rl_omega_multiplier = 5.0; // Field still exists, should be ignored
-        let (bid_omega, ask_omega) =
-            strategy.calculate_quotes(&config, position, max_position, target_liq, &mp_omega);
-
-        if let (Some(b1), Some(b2)) = (&bid_base, &bid_omega) {
-            assert!(
-                (b1.price - b2.price).abs() < 1e-10,
-                "rl_omega_multiplier should have no effect: {} vs {}",
-                b1.price,
-                b2.price
-            );
-        }
-        if let (Some(a1), Some(a2)) = (&ask_base, &ask_omega) {
-            assert!(
-                (a1.price - a2.price).abs() < 1e-10,
-                "rl_omega_multiplier should have no effect on asks: {} vs {}",
-                a1.price,
-                a2.price
-            );
-        }
-    }
 
     #[test]
     fn test_no_legacy_momentum_skew_multiplier() {
@@ -1889,8 +1800,6 @@ mod tests {
         let mut mp = test_market_params();
         mp.pre_fill_toxicity_bid = 0.1;
         mp.pre_fill_toxicity_ask = 0.1;
-        mp.pre_fill_spread_mult_bid = 1.0;
-        mp.pre_fill_spread_mult_ask = 1.0;
 
         let (bid_with_tox, _ask_with_tox) =
             strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
@@ -1899,8 +1808,7 @@ mod tests {
         let mut mp_zero = test_market_params();
         mp_zero.pre_fill_toxicity_bid = 0.0;
         mp_zero.pre_fill_toxicity_ask = 0.0;
-        mp_zero.pre_fill_spread_mult_bid = 1.0;
-        mp_zero.pre_fill_spread_mult_ask = 1.0;
+        // pre_fill_spread_mult removed — AS defense via log-odds additive path
 
         let (bid_no_tox, _ask_no_tox) =
             strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
@@ -1929,8 +1837,6 @@ mod tests {
         let mut mp = test_market_params();
         mp.pre_fill_toxicity_bid = 0.7;
         mp.pre_fill_toxicity_ask = 0.7;
-        mp.pre_fill_spread_mult_bid = 1.0;
-        mp.pre_fill_spread_mult_ask = 1.0;
 
         let (bid_tox, _) =
             strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
@@ -1938,8 +1844,7 @@ mod tests {
         let mut mp_zero = test_market_params();
         mp_zero.pre_fill_toxicity_bid = 0.0;
         mp_zero.pre_fill_toxicity_ask = 0.0;
-        mp_zero.pre_fill_spread_mult_bid = 1.0;
-        mp_zero.pre_fill_spread_mult_ask = 1.0;
+        // pre_fill_spread_mult removed — AS defense via log-odds additive path
 
         let (bid_no, _) =
             strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
@@ -1973,8 +1878,6 @@ mod tests {
         let mut mp = test_market_params();
         mp.pre_fill_toxicity_bid = 0.95;
         mp.pre_fill_toxicity_ask = 0.95;
-        mp.pre_fill_spread_mult_bid = 1.0;
-        mp.pre_fill_spread_mult_ask = 1.0;
 
         let (bid_tox, _) =
             strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
@@ -1982,8 +1885,7 @@ mod tests {
         let mut mp_zero = test_market_params();
         mp_zero.pre_fill_toxicity_bid = 0.0;
         mp_zero.pre_fill_toxicity_ask = 0.0;
-        mp_zero.pre_fill_spread_mult_bid = 1.0;
-        mp_zero.pre_fill_spread_mult_ask = 1.0;
+        // pre_fill_spread_mult removed — AS defense via log-odds additive path
 
         let (bid_no, _) =
             strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_zero);
@@ -2005,41 +1907,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_log_odds_as_fallback_multiplicative() {
-        // When use_log_odds_as = false, should use legacy multiplicative path
-        let strategy = test_strategy_with_log_odds(false, 15.0);
-        let config = test_quote_config();
-
-        let mut mp = test_market_params();
-        mp.pre_fill_toxicity_bid = 0.5;
-        mp.pre_fill_toxicity_ask = 0.5;
-        mp.pre_fill_spread_mult_bid = 2.0; // 2x multiplier
-        mp.pre_fill_spread_mult_ask = 2.0;
-
-        let (bid_mult, _) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp);
-
-        let mut mp_no = test_market_params();
-        mp_no.pre_fill_toxicity_bid = 0.0;
-        mp_no.pre_fill_toxicity_ask = 0.0;
-        mp_no.pre_fill_spread_mult_bid = 1.0;
-        mp_no.pre_fill_spread_mult_ask = 1.0;
-
-        let (bid_no, _) =
-            strategy.calculate_quotes(&config, 0.0, 10.0, 1.0, &mp_no);
-
-        // Multiplicative path: spread roughly doubles from 2x multiplier
-        if let (Some(b_mult), Some(b_no)) = (&bid_mult, &bid_no) {
-            let mid = config.mid_price;
-            let widening_bps = ((b_no.price - b_mult.price) / mid) * 10000.0;
-            assert!(
-                widening_bps > 0.5,
-                "Legacy multiplicative (2x mult) should widen spread, got {:.2} bps",
-                widening_bps
-            );
-        }
-    }
+    // test_log_odds_as_fallback_multiplicative removed —
+    // legacy multiplicative pre_fill_spread_mult path deleted;
+    // AS defense now exclusively uses log-odds additive path.
 
     // ---------------------------------------------------------------
     // Taker Elasticity Estimator Tests
@@ -2402,7 +2272,7 @@ mod tests {
 
         // Extreme widening: should be additive, not multiplicative
         mp.spread_widening_mult = 5.0; // Clamped: excess = min(5-1, 1.0) = 1.0 → at most doubles
-        mp.bandit_spread_multiplier = 2.0; // Clamped to 1.5
+        mp.bandit_spread_additive_bps = 10.0; // Assume 10.0 bps for the test
         mp.quota_shadow_spread_bps = 10.0; // 10 bps quota pressure
 
         let (bid_wide, ask_wide) = strategy.calculate_quotes(&config, 0.0, 100.0, 1.0, &mp);
@@ -2421,8 +2291,8 @@ mod tests {
             let wide_spread_bps = (mid - b_wide.price) / mid * 10000.0;
             let ratio = wide_spread_bps / base_spread_bps.max(0.01);
             assert!(
-                ratio < 5.0,
-                "Widened spread should be < 5x base (additive), got {:.1}x ({:.1} vs {:.1} bps)",
+                ratio < 6.0,
+                "Widened spread should be < 6x base (additive), got {:.1}x ({:.1} vs {:.1} bps)",
                 ratio, wide_spread_bps, base_spread_bps
             );
         }

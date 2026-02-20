@@ -1004,7 +1004,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             };
 
             if effective_gamma < 1.0 || effective_sz < 1.0 {
-                market_params.hjb_gamma_multiplier *= effective_gamma;
+                // hjb_gamma_multiplier has been removed: warmup handled by RiskConfig
                 debug!(
                     fill_count,
                     gamma_discount = %format!("{:.2}", effective_gamma),
@@ -1323,7 +1323,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             market_params.regime_as_expected_bps = rp.as_expected_bps;
             market_params.regime_risk_premium_bps = rp.risk_premium_bps;
             market_params.regime_skew_gain = rp.skew_gain;
-            market_params.regime_size_multiplier = rp.size_multiplier;
+            // regime_size_multiplier deleted — regime risk expressed through gamma, not size choking
             market_params.controller_objective = rp.controller_objective;
             market_params.max_position_fraction = rp.max_position_fraction;
             market_params.regime_gamma_multiplier = rp.gamma_multiplier;
@@ -1986,7 +1986,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             beta_book = %format!("{:.6}", market_params.beta_book),
             beta_flow = %format!("{:.6}", market_params.beta_flow),
             book_imbalance = %format!("{:.2}", market_params.book_imbalance),
-            liq_gamma_mult = %format!("{:.2}", market_params.liquidity_gamma_mult),
+            ghost_gamma_mult = %format!("{:.2}", market_params.ghost_liquidity_gamma_mult),
             "Quote inputs with microprice"
         );
 
@@ -2004,11 +2004,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         belief.regime_probs[0],
                         belief.regime_probs[1],
                         belief.regime_probs[2],
-                        (1.0 - market_params.cascade_size_factor).max(0.0),
+                        market_params.cascade_intensity,
                     )
                 } else {
                     // Fallback: use market params to estimate regime
-                    let cascade = (1.0 - market_params.cascade_size_factor).max(0.0);
+                    let cascade = market_params.cascade_intensity;
                     let volatile = if market_params.jump_ratio > 2.0 {
                         0.3
                     } else {
@@ -2019,7 +2019,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     } else {
                         0.0
                     };
-                    let quiet = (1.0 - cascade - volatile - trending).max(0.0);
+                    let quiet = (1.0 - cascade - volatile - trending).clamp(0.0, 1.0);
                     (quiet, trending, volatile, cascade)
                 };
 
@@ -2392,7 +2392,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // Select arm via Thompson Sampling (cold start defaults to mult=1.0 = pure GLFT)
         let bandit_selection = self.stochastic.spread_bandit.select_arm(bandit_context);
-        market_params.bandit_spread_multiplier = bandit_selection.multiplier;
+        market_params.bandit_spread_additive_bps = (bandit_selection.multiplier - 1.0) * market_params.market_spread_bps;
         market_params.bandit_is_exploration = bandit_selection.is_exploration;
 
         // Legacy RL fields — kept at defaults for backward-compatible logging
@@ -2750,7 +2750,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 // calibrated yet — warmup protection must remain active.
                 is_warmup: self.tier1.adverse_selection.fills_measured() < 10,
                 // A2: Cascade + Hawkes circuit breakers
-                cascade_size_factor: market_params.cascade_size_factor,
+                cascade_size_factor: 1.0 - market_params.cascade_intensity,
                 cascade_threshold: 0.3,
                 hawkes_p_cluster: market_params.hawkes_p_cluster,
                 hawkes_branching_ratio: market_params.hawkes_branching_ratio,
@@ -3120,8 +3120,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 let bid_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
                 let ask_spread_bps = ((best_ask.price - mid) / mid) * 10000.0;
 
-                // Determine regime string from cascade_size_factor
-                let cascade_level = 1.0 - market_params.cascade_size_factor;
+                // Determine regime string from cascade_intensity
+                let cascade_level = market_params.cascade_intensity;
                 let regime = if cascade_level > 0.5 {
                     "Cascade"
                 } else if market_params.jump_ratio > 3.0 {
@@ -3153,7 +3153,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     bid_spread_bps,
                     ask_spread_bps,
                     input_kappa: market_params.kappa,
-                    input_gamma: self.config.risk_aversion * market_params.hjb_gamma_multiplier,
+                    input_gamma: self.config.risk_aversion, // hjb_gamma_multiplier was removed
                     input_sigma: market_params.sigma,
                     input_inventory: self.position.position(),
                     regime,

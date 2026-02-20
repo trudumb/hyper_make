@@ -10,9 +10,6 @@ pub struct HJBParams {
     /// Formula: γσ²qT + terminal_penalty × q × urgency + funding_bias.
     pub hjb_optimal_skew: f64,
 
-    /// HJB gamma multiplier (for logging/diagnostics).
-    pub hjb_gamma_multiplier: f64,
-
     /// HJB inventory target (optimal q* for current session state).
     pub hjb_inventory_target: f64,
 
@@ -25,7 +22,6 @@ impl Default for HJBParams {
         Self {
             use_hjb_skew: false,
             hjb_optimal_skew: 0.0,
-            hjb_gamma_multiplier: 1.0,
             hjb_inventory_target: 0.0,
             hjb_is_terminal_zone: false,
         }

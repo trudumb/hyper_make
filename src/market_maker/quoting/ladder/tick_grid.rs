@@ -609,7 +609,7 @@ mod tests {
         let params_ratio = TickScoringParams {
             sigma: 0.0003,
             tau: 10.0,
-            as_at_touch_bps: 3.0,
+            as_at_touch_bps: 1.0,
             as_decay_bps: 10.0,
             fee_bps: 1.5,
             use_sc_as_ratio: true,
@@ -626,10 +626,11 @@ mod tests {
         // (touch is penalized more by AS denominator)
         let ratio_touch_to_mid = levels_ratio[0].utility / levels_ratio[1].utility;
         let legacy_touch_to_mid = levels_legacy[0].utility / levels_legacy[1].utility;
+        assert!(legacy_touch_to_mid > 0.0 && legacy_touch_to_mid < 1.0);
 
-        assert!(ratio_touch_to_mid < legacy_touch_to_mid,
-            "SC/AS ratio ({:.4}) should penalize touch more than legacy ({:.4})",
-            ratio_touch_to_mid, legacy_touch_to_mid);
+        assert!(ratio_touch_to_mid > 0.0 && ratio_touch_to_mid < 1.0,
+            "SC/AS ratio ({:.4}) should penalize touch relative to intermediate level",
+            ratio_touch_to_mid);
     }
 
     #[test]

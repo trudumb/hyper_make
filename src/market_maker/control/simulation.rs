@@ -724,13 +724,13 @@ impl MarketScenario for CascadeScenario {
             params.sigma = 0.001 * self.intensity;
             params.should_pull_quotes = self.intensity > 3.0;
             params.is_toxic_regime = true;
-            params.cascade_size_factor = 0.3;
-            params.tail_risk_multiplier = self.intensity;
+            params.cascade_intensity = 0.7; // was size_factor = 0.3
+            params.tail_risk_intensity = ((self.intensity - 1.0) / 4.0).clamp(0.0, 1.0);
             params.flow_imbalance = -0.8; // Heavy sell pressure
         } else {
             params.sigma = 0.0002;
-            params.cascade_size_factor = 1.0;
-            params.tail_risk_multiplier = 1.0;
+            params.cascade_intensity = 0.0;
+            params.tail_risk_intensity = 0.0;
         }
 
         params

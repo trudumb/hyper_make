@@ -28,6 +28,10 @@ fn default_beta_cascade() -> f64 {
     0.8
 }
 
+fn default_beta_tail_risk() -> f64 {
+    0.5
+}
+
 /// Calibration state for the risk model.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CalibrationState {
@@ -87,6 +91,13 @@ pub struct CalibratedRiskModel {
     #[serde(default = "default_beta_cascade")]
     pub beta_cascade: f64,
 
+    /// Per unit tail_risk_intensity [0, 1].
+    /// Distinct from cascade_intensity: captures tail risk from liquidation
+    /// cascades (OI drops, depth evaporation) vs general cascade activity.
+    /// tail_risk_intensity=1.0 → exp(0.5) ≈ 1.65× gamma widening.
+    #[serde(default = "default_beta_tail_risk")]
+    pub beta_tail_risk: f64,
+
     // === Bounds ===
     /// Minimum gamma (floor)
     pub gamma_min: f64,
@@ -133,6 +144,8 @@ impl Default for CalibratedRiskModel {
             beta_confidence: -0.4,
             // cascade_intensity=1 → exp(0.8) ≈ 2.2× gamma widening
             beta_cascade: 0.8,
+            // tail_risk_intensity=1 → exp(0.5) ≈ 1.65× gamma widening
+            beta_tail_risk: 0.5,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -173,6 +186,8 @@ impl CalibratedRiskModel {
             beta_confidence: -0.2,
             // More conservative cascade widening during warmup
             beta_cascade: 1.2,
+            // More conservative tail risk during warmup
+            beta_tail_risk: 0.75,
             ..Default::default()
         }
     }
@@ -196,7 +211,8 @@ impl CalibratedRiskModel {
             + self.beta_book_depth * features.depth_depletion
             + self.beta_uncertainty * features.model_uncertainty
             + self.beta_confidence * features.position_direction_confidence
-            + self.beta_cascade * features.cascade_intensity;
+            + self.beta_cascade * features.cascade_intensity
+            + self.beta_tail_risk * features.tail_risk_intensity;
 
         log_gamma.exp().clamp(self.gamma_min, self.gamma_max)
     }
@@ -265,6 +281,7 @@ impl CalibratedRiskModel {
             beta_confidence: self.beta_confidence * (1.0 - alpha)
                 + defaults.beta_confidence * alpha,
             beta_cascade: self.beta_cascade * (1.0 - alpha) + defaults.beta_cascade * alpha,
+            beta_tail_risk: self.beta_tail_risk * (1.0 - alpha) + defaults.beta_tail_risk * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -312,6 +329,12 @@ pub struct RiskFeatures {
     /// 0 = calm market, 1 = full cascade (OI dropping, depth evaporating).
     /// Fed into beta_cascade coefficient for principled spread widening.
     pub cascade_intensity: f64,
+
+    /// Tail risk intensity [0, 1]: derived from (tail_risk_multiplier - 1.0) / 4.0.
+    /// 0 = no tail risk, 1 = extreme tail risk (liquidation cascades).
+    /// Distinct from cascade_intensity: captures depth-of-crisis severity.
+    /// Fed into beta_tail_risk coefficient.
+    pub tail_risk_intensity: f64,
 }
 
 impl RiskFeatures {
@@ -379,9 +402,12 @@ impl RiskFeatures {
         };
 
         // === Cascade Intensity ===
-        // Derived from cascade_size_factor: 1.0 = calm, 0.0 = full cascade
-        // Inverted so higher value = more risk
-        let cascade_intensity = (1.0 - params.cascade_size_factor).clamp(0.0, 1.0);
+        // Use the direct cascade_intensity from MarketParams
+        let cascade_intensity = params.cascade_intensity.clamp(0.0, 1.0);
+
+        // === Tail Risk Intensity ===
+        // Use the direct tail_risk_intensity from MarketParams
+        let tail_risk_intensity = params.tail_risk_intensity.clamp(0.0, 1.0);
 
         Self {
             excess_volatility,
@@ -392,6 +418,7 @@ impl RiskFeatures {
             model_uncertainty,
             position_direction_confidence,
             cascade_intensity,
+            tail_risk_intensity,
         }
     }
 
@@ -406,6 +433,7 @@ impl RiskFeatures {
             model_uncertainty: 0.0,
             position_direction_confidence: 0.5, // Neutral confidence
             cascade_intensity: 0.0,
+            tail_risk_intensity: 0.0,
         }
     }
 
@@ -420,6 +448,7 @@ impl RiskFeatures {
             model_uncertainty: 1.0,
             position_direction_confidence: 0.0, // No confidence → high gamma
             cascade_intensity: 1.0,
+            tail_risk_intensity: 1.0,
         }
     }
 
@@ -483,7 +512,8 @@ impl RiskFeatures {
             depth_depletion,
             model_uncertainty,
             position_direction_confidence,
-            cascade_intensity: 0.0, // Not available from MarketState
+            cascade_intensity: 0.0,     // Not available from MarketState
+            tail_risk_intensity: 0.0,   // Not available from MarketState
         }
     }
 }
@@ -597,6 +627,7 @@ mod tests {
             model_uncertainty: 0.5,
             position_direction_confidence: 0.5, // Neutral confidence
             cascade_intensity: 0.0,
+            tail_risk_intensity: 0.0,
         };
 
         let gamma_neutral = model.compute_gamma(&neutral);
@@ -739,6 +770,7 @@ mod tests {
             model_uncertainty: 0.8, // High uncertainty
             position_direction_confidence: 0.3, // Low confidence
             cascade_intensity: 0.0,
+            tail_risk_intensity: 0.0,
         };
 
         let gamma = model.compute_gamma(&stressed);
@@ -763,6 +795,7 @@ mod tests {
             model_uncertainty: 0.3,
             position_direction_confidence: 0.5,
             cascade_intensity: 0.0,
+            tail_risk_intensity: 0.0,
         };
         let gamma_moderate = model.compute_gamma(&moderate);
         assert!(

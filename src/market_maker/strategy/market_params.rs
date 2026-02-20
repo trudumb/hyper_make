@@ -221,11 +221,6 @@ pub struct MarketParams {
     /// Use for directional quote skew adjustment
     pub book_imbalance: f64,
 
-    /// Liquidity-based gamma multiplier [1.0, 2.0]
-    /// Returns values greater than 1.0 when near-touch liquidity is below average (thin book).
-    /// Scales gamma up for wider spreads in thin conditions.
-    pub liquidity_gamma_mult: f64,
-
     // === Microprice (Data-Driven Fair Price) ===
     /// Microprice - fair price incorporating signal predictions.
     /// Quote around this instead of raw mid.
@@ -281,38 +276,19 @@ pub struct MarketParams {
     /// Predicts how toxic an ask fill would be BEFORE it happens.
     pub pre_fill_toxicity_ask: f64,
 
-    /// Pre-fill spread multiplier for bid side [1.0, 3.0].
-    /// Multiply base spread by this to widen when toxic flow expected.
-    pub pre_fill_spread_mult_bid: f64,
-
-    /// Pre-fill spread multiplier for ask side [1.0, 3.0].
-    pub pre_fill_spread_mult_ask: f64,
-
-    /// Pre-fill size multiplier for bid side [0.3, 1.0].
-    /// Reduces order sizes when toxic flow expected on bid side.
-    /// Computed from toxicity: if toxicity > 0.5, mult = (1.0 - (tox - 0.5)).clamp(0.3, 1.0)
-    #[deprecated(
-        note = "Legacy multiplicative size reduction removed. Toxicity defense now handled by additive spread widening."
-    )]
-    pub pre_fill_size_mult_bid: f64,
-
-    /// Pre-fill size multiplier for ask side [0.3, 1.0].
-    #[deprecated(
-        note = "Legacy multiplicative size reduction removed. Toxicity defense now handled by additive spread widening."
-    )]
-    pub pre_fill_size_mult_ask: f64,
-
     // === Tier 1: Liquidation Cascade ===
-    /// Tail risk multiplier for gamma [1.0, 5.0].
-    /// Multiply gamma by this during cascade conditions.
-    pub tail_risk_multiplier: f64,
+    /// Tail risk intensity [0, 1].
+    /// 0 = no tail risk, 1 = extreme tail risk (liquidation cascades).
+    /// Distinct from cascade_intensity: captures depth-of-crisis severity.
+    pub tail_risk_intensity: f64,
 
     /// Should pull all quotes due to extreme cascade?
     pub should_pull_quotes: bool,
 
-    /// Size reduction factor [0, 1] for graceful degradation.
-    /// 1.0 = full size, 0.0 = no quotes (cascade severe).
-    pub cascade_size_factor: f64,
+    /// Cascade intensity [0, 1] for graceful degradation.
+    /// 0.0 = calm market, 1.0 = full cascade severity.
+    /// Fed into CalibratedRiskModel beta_cascade.
+    pub cascade_intensity: f64,
 
     // === Tier 2: Hawkes Order Flow ===
     /// Hawkes buy intensity (λ_buy) - self-exciting arrival rate
@@ -375,20 +351,11 @@ pub struct MarketParams {
     pub rl_expected_q: f64,
     /// Whether RL action was applied to quoting (vs observation-only).
     pub rl_action_applied: bool,
-    /// RL gamma (risk aversion) multiplier [0.5, 2.0].
-    /// Applied to base γ from GLFT: effective_γ = base_γ × rl_gamma_multiplier.
-    /// > 1.0 = wider spreads (defensive), < 1.0 = tighter spreads (aggressive).
-    pub rl_gamma_multiplier: f64,
-    /// RL omega (inventory skew) multiplier [0.25, 2.0].
-    /// Applied to base skew: effective_ω = base_ω × rl_omega_multiplier.
-    /// > 1.0 = stronger inventory clearing, < 1.0 = weaker clearing.
-    pub rl_omega_multiplier: f64,
 
     // --- Contextual Bandit SpreadOptimizer ---
-    /// Bandit-selected spread multiplier [0.85, 1.40].
-    /// Applied after GLFT base spread: final_spread = base × bandit_mult × safety_mults.
-    /// Default 1.0 = pure GLFT (cold start / no bandit observation).
-    pub bandit_spread_multiplier: f64,
+    /// Bandit-selected spread additive adjustment (bps).
+    /// Applied after GLFT base spread: final_spread = base + bandit_additive_bps.
+    pub bandit_spread_additive_bps: f64,
     /// Whether the bandit selection was exploration (Thompson) vs exploitation (greedy).
     pub bandit_is_exploration: bool,
 
@@ -484,10 +451,6 @@ pub struct MarketParams {
     pub premium_alpha: f64,
 
     // Momentum Protection (Gap 10)
-    /// Bid protection factor (>= 1.0 when market falling)
-    pub bid_protection_factor: f64,
-    /// Ask protection factor (>= 1.0 when market rising)
-    pub ask_protection_factor: f64,
     /// Probability momentum continues
     pub p_momentum_continue: f64,
 
@@ -497,9 +460,7 @@ pub struct MarketParams {
     /// HJB optimal inventory skew (from Avellaneda-Stoikov HJB solution)
     /// Formula: γσ²qT + terminal_penalty × q × urgency + funding_bias
     pub hjb_optimal_skew: f64,
-    /// HJB gamma multiplier (for logging/diagnostics)
-    pub hjb_gamma_multiplier: f64,
-    /// HJB inventory target (optimal q* for current session state)
+    /// HJB optimal inventory target (optimal q* for current session state)
     pub hjb_inventory_target: f64,
     /// Whether HJB controller is in terminal zone (near session end)
     pub hjb_is_terminal_zone: bool,
@@ -511,9 +472,6 @@ pub struct MarketParams {
     /// Drift urgency component of HJB skew (from momentum-position opposition).
     /// Positive when position needs urgent reduction (opposed to momentum).
     pub hjb_drift_urgency: f64,
-    /// Variance multiplier from directional risk.
-    /// > 1.0 when position opposes momentum (increased risk).
-    pub directional_variance_mult: f64,
     /// Whether position opposes momentum (short + rising, long + falling).
     pub position_opposes_momentum: bool,
     /// Urgency score [0, 5] combining all urgency factors.
@@ -689,17 +647,11 @@ pub struct MarketParams {
     pub adaptive_uncertainty_factor: f64,
 
     // ==================== Calibration Fill Rate Controller ====================
-    /// Gamma multiplier from calibration controller [0.3, 1.0].
-    /// Lower values = tighter quotes to attract fills during warmup.
-    /// 1.0 = calibration complete, normal GLFT behavior.
-    pub calibration_gamma_mult: f64,
-
     /// Calibration progress [0.0, 1.0].
     /// Based on AS fills + kappa confidence.
     pub calibration_progress: f64,
 
     /// Whether calibration is complete.
-    /// When true, calibration_gamma_mult = 1.0.
     pub calibration_complete: bool,
 
     // ==================== Model-Derived Sizing (GLFT First Principles) ====================
@@ -836,8 +788,6 @@ pub struct MarketParams {
     pub regime_risk_premium_bps: f64,
     /// Regime-conditioned skew gain multiplier.
     pub regime_skew_gain: f64,
-    /// Regime-conditioned size multiplier.
-    pub regime_size_multiplier: f64,
     /// Controller objective for current regime.
     pub controller_objective: ControllerObjective,
     /// Max position fraction for current regime (regime tightening).
@@ -883,11 +833,6 @@ pub struct MarketParams {
     /// Current adverse selection regime (0=Calm, 1=Normal, 2=Volatile).
     /// Volatile regime → wider spreads (higher gamma).
     pub adverse_regime: usize,
-
-    /// Bayesian gamma multiplier computed from above components.
-    /// Pre-computed in orchestrator: bayesian_gamma_mult = trend_discount × bootstrap_discount × uncertainty_premium × regime_mult
-    /// Range: [0.7, 1.5] typically.
-    pub bayesian_gamma_mult: f64,
 
     // ==================== Predictive Bias (A-S Extension) ====================
     /// Changepoint probability from BOCD detector [0, 1].
@@ -1110,7 +1055,6 @@ impl Default for MarketParams {
             falling_knife_score: 0.0,  // Default: no falling knife
             rising_knife_score: 0.0,   // Default: no rising knife
             book_imbalance: 0.0,       // Default: balanced book
-            liquidity_gamma_mult: 1.0, // Default: normal liquidity
             microprice: 0.0,           // Will be set from estimator
             market_mid: 0.0,           // Will be set from latest AllMids
             beta_book: 0.0,            // Will be learned from data
@@ -1126,16 +1070,10 @@ impl Default for MarketParams {
             // Tier 1: Pre-Fill AS Classifier (Phase 3)
             pre_fill_toxicity_bid: 0.0,      // No toxicity initially
             pre_fill_toxicity_ask: 0.0,      // No toxicity initially
-            pre_fill_spread_mult_bid: 1.0,   // No multiplier initially
-            pre_fill_spread_mult_ask: 1.0,   // No multiplier initially
-            #[allow(deprecated)]
-            pre_fill_size_mult_bid: 1.0,     // Full size initially
-            #[allow(deprecated)]
-            pre_fill_size_mult_ask: 1.0,     // Full size initially
             // Tier 1: Liquidation Cascade
-            tail_risk_multiplier: 1.0, // Default: no tail risk scaling
-            should_pull_quotes: false, // Default: don't pull quotes
-            cascade_size_factor: 1.0,  // Default: full size
+            tail_risk_intensity: 0.0, // Default to 0 intensity (calm)
+            should_pull_quotes: false,
+            cascade_intensity: 0.0,  // Default to 0 intensity (calm): full size
             // Tier 2: Hawkes Order Flow
             hawkes_buy_intensity: 0.0,
             hawkes_sell_intensity: 0.0,
@@ -1157,10 +1095,7 @@ impl Default for MarketParams {
             rl_is_exploration: false,
             rl_expected_q: 0.0,
             rl_action_applied: false,
-            rl_gamma_multiplier: 1.0,
-            rl_omega_multiplier: 1.0,
-            // Contextual Bandit SpreadOptimizer
-            bandit_spread_multiplier: 1.0,
+            bandit_spread_additive_bps: 0.0,
             bandit_is_exploration: false,
             // Phase 8: Competitor Model
             competitor_snipe_prob: 0.1,      // 10% baseline
@@ -1195,19 +1130,15 @@ impl Default for MarketParams {
             calibrated_cancel_rate: 0.2,
             premium: 0.0,
             premium_alpha: 0.0,
-            bid_protection_factor: 1.0,
-            ask_protection_factor: 1.0,
             p_momentum_continue: 0.5,
             // HJB Controller (stochastic integration)
             use_hjb_skew: false,         // Default OFF for safety
-            hjb_optimal_skew: 0.0,       // Will be computed from HJB controller
-            hjb_gamma_multiplier: 1.0,   // No multiplier by default
+            hjb_optimal_skew: 0.0,       // Will be computed
             hjb_inventory_target: 0.0,   // Zero inventory target
             hjb_is_terminal_zone: false, // Not in terminal zone
             // Drift-Adjusted Skew (first-principles momentum integration)
             use_drift_adjusted_skew: true, // ON by default for first-principles trading
             hjb_drift_urgency: 0.0,        // No urgency initially
-            directional_variance_mult: 1.0, // No variance adjustment initially
             position_opposes_momentum: false, // No opposition initially
             urgency_score: 0.0,            // No urgency initially
             // Kalman Filter (stochastic integration)
@@ -1263,7 +1194,6 @@ impl Default for MarketParams {
             adaptive_warmup_progress: 0.0, // Start at 0% progress
             adaptive_uncertainty_factor: 1.2, // Start with 20% wider spreads
             // Calibration Fill Rate Controller
-            calibration_gamma_mult: 0.3, // Start fill-hungry (70% gamma reduction)
             calibration_progress: 0.0,   // Start at 0% calibration
             calibration_complete: false, // Not calibrated yet
             // Model-Derived Sizing (GLFT First Principles)
@@ -1309,7 +1239,6 @@ impl Default for MarketParams {
             regime_as_expected_bps: 1.0,
             regime_risk_premium_bps: 1.0,
             regime_skew_gain: 1.0,
-            regime_size_multiplier: 0.8,
             controller_objective: ControllerObjective::MeanRevert,
             max_position_fraction: 0.8,
             total_risk_premium_bps: 1.0, // Default: 1 bps risk premium
@@ -1322,7 +1251,6 @@ impl Default for MarketParams {
             bootstrap_confidence: 0.0,    // Not calibrated initially
             adverse_uncertainty: 0.1,     // Moderate uncertainty (10% std)
             adverse_regime: 1,            // Normal regime initially
-            bayesian_gamma_mult: 1.0,     // No adjustment until computed
             // Predictive Bias (A-S Extension)
             changepoint_prob: 0.0,        // No changepoint detected initially
             spread_widening_mult: 1.0,    // No widening initially
@@ -1490,7 +1418,6 @@ impl MarketParams {
             is_heavy_tailed: self.is_heavy_tailed,
             kappa_cv: self.kappa_cv,
             arrival_intensity: self.arrival_intensity,
-            liquidity_gamma_mult: self.liquidity_gamma_mult,
             calibrated_volume_rate: self.calibrated_volume_rate,
             calibrated_cancel_rate: self.calibrated_cancel_rate,
         }
@@ -1508,8 +1435,6 @@ impl MarketParams {
             hawkes_sell_intensity: self.hawkes_sell_intensity,
             hawkes_imbalance: self.hawkes_imbalance,
             hawkes_activity_percentile: self.hawkes_activity_percentile,
-            bid_protection_factor: self.bid_protection_factor,
-            ask_protection_factor: self.ask_protection_factor,
             p_momentum_continue: self.p_momentum_continue,
         }
     }
@@ -1555,9 +1480,9 @@ impl MarketParams {
     /// Extract cascade parameters as a focused struct.
     pub fn cascade(&self) -> params::CascadeParams {
         params::CascadeParams {
-            tail_risk_multiplier: self.tail_risk_multiplier,
+            tail_risk_intensity: self.tail_risk_intensity,
             should_pull_quotes: self.should_pull_quotes,
-            cascade_size_factor: self.cascade_size_factor,
+            cascade_intensity: self.cascade_intensity,
         }
     }
 
@@ -1576,7 +1501,6 @@ impl MarketParams {
         params::HJBParams {
             use_hjb_skew: self.use_hjb_skew,
             hjb_optimal_skew: self.hjb_optimal_skew,
-            hjb_gamma_multiplier: self.hjb_gamma_multiplier,
             hjb_inventory_target: self.hjb_inventory_target,
             hjb_is_terminal_zone: self.hjb_is_terminal_zone,
         }
@@ -1634,7 +1558,7 @@ impl MarketParams {
             cascade_severity: if self.should_pull_quotes {
                 1.0
             } else {
-                (self.tail_risk_multiplier - 1.0) / 4.0
+                (self.tail_risk_intensity - 1.0) / 4.0
             },
         }
     }

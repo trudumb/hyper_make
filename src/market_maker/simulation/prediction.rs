@@ -27,7 +27,8 @@ pub enum Regime {
 
 impl From<&MarketParams> for Regime {
     fn from(params: &MarketParams) -> Self {
-        if params.should_pull_quotes || params.cascade_size_factor < 0.5 {
+        // Cascade severity > 0.5 triggers cascade regime probabilities
+        if params.cascade_intensity > 0.5 {
             Regime::Cascade
         } else if params.is_toxic_regime || params.jump_ratio > 2.0 {
             Regime::Volatile
@@ -197,11 +198,10 @@ impl MarketStateSnapshot {
             jump_ratio: params.jump_ratio,
             gamma_base,
             gamma_adaptive: params.adaptive_gamma,
-            gamma_calibration_mult: params.calibration_gamma_mult,
+            gamma_calibration_mult: 1.0, // calibration_gamma_mult deleted — gamma now log-additive via CalibratedRiskModel
             gamma_effective: gamma_base
                 * params.adaptive_gamma
-                * params.calibration_gamma_mult
-                * params.tail_risk_multiplier,
+                * (1.0 + params.tail_risk_intensity), // Replaced tail_risk_multiplier with (1.0 + tail_risk_intensity)
             funding_rate: params.funding_rate,
             time_to_funding_settlement_s: params.time_to_funding_settlement_s,
             open_interest: params.open_interest,
@@ -681,6 +681,7 @@ mod tests {
 
         // Cascade regime
         params.should_pull_quotes = true;
+        params.cascade_intensity = 1.0;
         assert_eq!(Regime::from(&params), Regime::Cascade);
     }
 }
