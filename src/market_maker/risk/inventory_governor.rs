@@ -6,21 +6,22 @@
 //! # Position Zones
 //!
 //! ```text
-//! |--- Green (< 60%) ---|--- Yellow (60-80%) ---|--- Red (80-100%) ---|--- Kill (> 100%) ---|
+//! |--- Green (< 50%) ---|--- Yellow (50-80%) ---|--- Red (80-100%) ---|--- Kill (> 100%) ---|
 //! | full two-sided       | bias toward reducing  | reduce-only         | cancel all          |
 //! ```
 
+use crate::market_maker::config::GovernorConfig;
 use serde::{Deserialize, Serialize};
 
 /// Position zone classification for the inventory governor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PositionZone {
-    /// < 60% of max — full two-sided quoting
+    /// < yellow_threshold (default 50%) — full two-sided quoting
     #[default]
     Green,
-    /// 60-80% — bias toward reducing, wider on increasing side
+    /// yellow..red (default 50-80%) — bias toward reducing, wider on increasing side
     Yellow,
-    /// 80-100% — reduce-only both sides
+    /// red..100% (default 80-100%) — reduce-only both sides
     Red,
     /// > 100% — cancel all, kill switch territory
     Kill,
@@ -39,8 +40,9 @@ pub struct PositionAssessment {
     pub position: f64,
     /// Is the position long? (for determining which side is reducing)
     pub is_long: bool,
-    /// Spread multiplier for position-increasing side in Yellow zone
-    pub increasing_side_spread_mult: f64,
+    /// Additive spread widening (bps) for position-increasing side.
+    /// 0.0 in Green, ramps in Yellow, fixed in Red/Kill.
+    pub increasing_side_addon_bps: f64,
 }
 
 /// Position budget with a min-viable floor that prevents compound reductions
@@ -168,6 +170,8 @@ impl PositionBudget {
 pub struct InventoryGovernor {
     /// Hard position ceiling from user config
     max_position: f64,
+    /// Governor zone thresholds and addon configuration.
+    config: GovernorConfig,
 }
 
 impl InventoryGovernor {
@@ -180,7 +184,22 @@ impl InventoryGovernor {
             max_position > 0.0,
             "InventoryGovernor: max_position must be > 0.0, got {max_position}"
         );
-        Self { max_position }
+        Self {
+            max_position,
+            config: GovernorConfig::default(),
+        }
+    }
+
+    /// Create a new inventory governor with custom config.
+    pub fn with_config(max_position: f64, config: GovernorConfig) -> Self {
+        assert!(
+            max_position > 0.0,
+            "InventoryGovernor: max_position must be > 0.0, got {max_position}"
+        );
+        Self {
+            max_position,
+            config,
+        }
     }
 
     /// Returns the hard position ceiling.
@@ -195,21 +214,25 @@ impl InventoryGovernor {
         let is_long = position > 0.0;
         let remaining = (self.max_position - abs_pos).max(0.0);
 
-        let (zone, max_new_exposure, spread_mult) = if ratio >= 1.0 {
+        let yellow = self.config.yellow_threshold;
+        let red = self.config.red_threshold;
+
+        let (zone, max_new_exposure, addon_bps) = if ratio >= 1.0 {
             // Kill zone: position at or above max
-            (PositionZone::Kill, 0.0, 3.0)
-        } else if ratio >= 0.8 {
+            (PositionZone::Kill, 0.0, self.config.kill_addon_bps)
+        } else if ratio >= red {
             // Red zone: reduce-only
-            (PositionZone::Red, 0.0, 2.0)
-        } else if ratio >= 0.6 {
+            (PositionZone::Red, 0.0, self.config.red_addon_bps)
+        } else if ratio >= yellow {
             // Yellow zone: bias toward reducing, cap new exposure
             let capped_exposure = remaining * 0.5;
-            // Linear ramp: 1.0 at ratio=0.6, 2.0 at ratio=0.8
-            let mult = 1.0 + (ratio - 0.6) * (1.0 / 0.2);
-            (PositionZone::Yellow, capped_exposure, mult)
+            // Linear ramp: 0.0 at yellow_threshold, yellow_max_addon_bps at red_threshold
+            let fraction = (ratio - yellow) / (red - yellow);
+            let addon = self.config.yellow_max_addon_bps * fraction;
+            (PositionZone::Yellow, capped_exposure, addon)
         } else {
             // Green zone: full two-sided
-            (PositionZone::Green, remaining, 1.0)
+            (PositionZone::Green, remaining, 0.0)
         };
 
         PositionAssessment {
@@ -218,7 +241,7 @@ impl InventoryGovernor {
             position_ratio: ratio,
             position,
             is_long,
-            increasing_side_spread_mult: spread_mult,
+            increasing_side_addon_bps: addon_bps,
         }
     }
 
@@ -261,9 +284,9 @@ impl InventoryGovernor {
         let ratio = position_abs / self.max_position;
         if ratio >= 1.0 {
             PositionZone::Kill
-        } else if ratio >= 0.8 {
+        } else if ratio >= self.config.red_threshold {
             PositionZone::Red
-        } else if ratio >= 0.6 {
+        } else if ratio >= self.config.yellow_threshold {
             PositionZone::Yellow
         } else {
             PositionZone::Green
@@ -312,7 +335,7 @@ mod tests {
         assert_eq!(a.zone, PositionZone::Green);
         assert!((a.max_new_exposure - 10.0).abs() < 1e-9);
         assert!((a.position_ratio).abs() < 1e-9);
-        assert!((a.increasing_side_spread_mult - 1.0).abs() < 1e-9);
+        assert!(a.increasing_side_addon_bps.abs() < 1e-9);
     }
 
     #[test]
@@ -328,22 +351,36 @@ mod tests {
     #[test]
     fn test_yellow_zone_lower_bound() {
         let gov = InventoryGovernor::new(10.0);
+        // ratio = 0.5 is at yellow_threshold (exact boundary → Yellow)
+        let a = gov.assess(5.0);
+        assert_eq!(a.zone, PositionZone::Yellow);
+        // remaining = 5.0, capped = 2.5
+        assert!((a.max_new_exposure - 2.5).abs() < 1e-9);
+        // addon_bps at yellow lower bound should be 0.0
+        assert!(a.increasing_side_addon_bps.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_yellow_zone_mid() {
+        let gov = InventoryGovernor::new(10.0);
+        // ratio = 0.6 is mid-Yellow
         let a = gov.assess(6.0);
         assert_eq!(a.zone, PositionZone::Yellow);
         // remaining = 4.0, capped = 2.0
         assert!((a.max_new_exposure - 2.0).abs() < 1e-9);
-        // spread_mult at ratio=0.6 should be 1.0
-        assert!((a.increasing_side_spread_mult - 1.0).abs() < 0.01);
+        // addon_bps: 10.0 × (0.6 - 0.5) / (0.8 - 0.5) = 3.33
+        let expected = 10.0 * (0.6 - 0.5) / (0.8 - 0.5);
+        assert!((a.increasing_side_addon_bps - expected).abs() < 0.1);
     }
 
     #[test]
-    fn test_green_zone_at_fifty_pct() {
+    fn test_green_zone_below_yellow() {
         let gov = InventoryGovernor::new(10.0);
-        // ratio = 0.5 is now Green (boundary moved to 0.6)
-        let a = gov.assess(5.0);
+        // ratio = 0.4 is Green (below yellow_threshold 0.5)
+        let a = gov.assess(4.0);
         assert_eq!(a.zone, PositionZone::Green);
-        assert!((a.max_new_exposure - 5.0).abs() < 1e-9);
-        assert!((a.increasing_side_spread_mult - 1.0).abs() < 0.01);
+        assert!((a.max_new_exposure - 6.0).abs() < 1e-9);
+        assert!(a.increasing_side_addon_bps.abs() < 0.01);
     }
 
     #[test]
@@ -354,9 +391,9 @@ mod tests {
         assert_eq!(a.zone, PositionZone::Yellow);
         // remaining = 2.1, capped = 1.05
         assert!((a.max_new_exposure - 1.05).abs() < 1e-9);
-        // spread_mult: 1.0 + (0.79 - 0.6) * (1.0 / 0.2) = 1.0 + 0.95 = 1.95
-        let expected_mult = 1.0 + (0.79 - 0.6) * (1.0 / 0.2);
-        assert!((a.increasing_side_spread_mult - expected_mult).abs() < 0.01);
+        // addon_bps: 10.0 × (0.79 - 0.5) / (0.8 - 0.5) = 10.0 × 0.9667 = 9.667
+        let expected_addon = 10.0 * (0.79 - 0.5) / (0.8 - 0.5);
+        assert!((a.increasing_side_addon_bps - expected_addon).abs() < 0.1);
     }
 
     #[test]
@@ -365,7 +402,7 @@ mod tests {
         let a = gov.assess(8.5);
         assert_eq!(a.zone, PositionZone::Red);
         assert!((a.max_new_exposure).abs() < 1e-9);
-        assert!((a.increasing_side_spread_mult - 2.0).abs() < 1e-9);
+        assert!((a.increasing_side_addon_bps - 15.0).abs() < 1e-9);
     }
 
     #[test]
@@ -374,7 +411,7 @@ mod tests {
         let a = gov.assess(10.5);
         assert_eq!(a.zone, PositionZone::Kill);
         assert!((a.max_new_exposure).abs() < 1e-9);
-        assert!((a.increasing_side_spread_mult - 3.0).abs() < 1e-9);
+        assert!((a.increasing_side_addon_bps - 25.0).abs() < 1e-9);
     }
 
     #[test]
@@ -497,19 +534,19 @@ mod tests {
     }
 
     #[test]
-    fn test_spread_mult_linear_ramp() {
+    fn test_addon_bps_linear_ramp() {
         let gov = InventoryGovernor::new(100.0);
-        // At ratio=0.6: mult should be 1.0 (Yellow lower bound)
-        let a = gov.assess(60.0);
-        assert!((a.increasing_side_spread_mult - 1.0).abs() < 0.01);
+        // At ratio=0.5: addon should be 0.0 (Yellow lower bound)
+        let a = gov.assess(50.0);
+        assert!(a.increasing_side_addon_bps.abs() < 0.01);
 
-        // At ratio=0.7: mult should be 1.5 (midpoint Yellow)
-        let a = gov.assess(70.0);
-        assert!((a.increasing_side_spread_mult - 1.5).abs() < 0.01);
+        // At ratio=0.65: addon should be 5.0 (midpoint Yellow, 10.0 * 0.5)
+        let a = gov.assess(65.0);
+        assert!((a.increasing_side_addon_bps - 5.0).abs() < 0.01);
 
-        // Just below 0.8: mult should approach 2.0
+        // Just below 0.8: addon should approach 10.0
         let a = gov.assess(79.9);
-        assert!((a.increasing_side_spread_mult - 2.0).abs() < 0.05);
+        assert!((a.increasing_side_addon_bps - 10.0).abs() < 0.1);
     }
 
     // --- current_zone tests ---
@@ -519,17 +556,17 @@ mod tests {
         let gov = InventoryGovernor::new(10.0);
         // 0% — Green
         assert_eq!(gov.current_zone(0.0), PositionZone::Green);
-        // 59% — still Green
-        assert_eq!(gov.current_zone(5.9), PositionZone::Green);
+        // 49% — still Green
+        assert_eq!(gov.current_zone(4.9), PositionZone::Green);
     }
 
     #[test]
     fn test_current_zone_yellow() {
         let gov = InventoryGovernor::new(10.0);
-        // 60% exactly — Yellow (>= 0.6)
+        // 50% exactly — Yellow (>= 0.5)
+        assert_eq!(gov.current_zone(5.0), PositionZone::Yellow);
+        // 60% — Yellow
         assert_eq!(gov.current_zone(6.0), PositionZone::Yellow);
-        // 61% — Yellow
-        assert_eq!(gov.current_zone(6.1), PositionZone::Yellow);
         // 79% — Yellow
         assert_eq!(gov.current_zone(7.9), PositionZone::Yellow);
     }

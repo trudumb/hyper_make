@@ -325,6 +325,13 @@ pub struct InformedFlowEstimator {
     /// Whether the estimator has ever reached warmup threshold.
     /// Once true, stays true even if observation count drops (e.g. after reset is NOT called).
     was_ever_warmed: bool,
+
+    /// Per-side EWMA of p_informed for directional toxicity detection.
+    /// Updated on each trade: buy trades → buy_side, sell trades → sell_side.
+    /// Higher values indicate sustained informed flow on that side.
+    buy_side_toxicity_ewma: f64,
+    /// Per-side EWMA of p_informed for sell-side flow.
+    sell_side_toxicity_ewma: f64,
 }
 
 /// Sufficient statistics for online EM
@@ -371,6 +378,8 @@ impl InformedFlowEstimator {
             recent_p_informed: VecDeque::with_capacity(20),
             max_cluster_size: 1,
             was_ever_warmed: false,
+            buy_side_toxicity_ewma: 0.05,  // Start at baseline p_informed prior
+            sell_side_toxicity_ewma: 0.05,
         }
     }
 
@@ -412,6 +421,19 @@ impl InformedFlowEstimator {
 
         // === NEW: Update clustering detection ===
         self.update_clustering(resp[0]); // p_informed
+
+        // === Per-side toxicity EWMA (directional flow defense) ===
+        // Alpha = 0.15 → ~6 trade half-life: fast enough to catch bursts,
+        // slow enough to avoid single-trade noise.
+        let alpha_side = 0.15;
+        let p_informed = resp[0];
+        if features.is_buy {
+            self.buy_side_toxicity_ewma =
+                alpha_side * p_informed + (1.0 - alpha_side) * self.buy_side_toxicity_ewma;
+        } else {
+            self.sell_side_toxicity_ewma =
+                alpha_side * p_informed + (1.0 - alpha_side) * self.sell_side_toxicity_ewma;
+        }
 
         // Store for tracking
         if self.responsibilities.len() >= self.config.buffer_size {
@@ -550,6 +572,15 @@ impl InformedFlowEstimator {
             return 0.0;
         }
         (self.informed_cluster_count as f64 / self.max_cluster_size as f64).min(1.0)
+    }
+
+    /// Per-side toxicity EWMA for directional flow defense.
+    ///
+    /// Returns `(buy_side_toxicity, sell_side_toxicity)` in [0, 1].
+    /// High sell-side toxicity → informed sellers → widen bids.
+    /// High buy-side toxicity → informed buyers → widen asks.
+    pub fn directional_toxicity(&self) -> (f64, f64) {
+        (self.buy_side_toxicity_ewma, self.sell_side_toxicity_ewma)
     }
 
     /// Get enhanced flow decomposition with clustering and Kyle's lambda boost.

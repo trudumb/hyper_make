@@ -591,6 +591,8 @@ impl GLFTStrategy {
             quota_addon_bps,
             warmup_addon_bps,
             fee_bps,
+            cascade_bid_addon_bps: 0.0,
+            cascade_ask_addon_bps: 0.0,
         }
     }
 

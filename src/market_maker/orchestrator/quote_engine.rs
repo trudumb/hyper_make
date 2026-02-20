@@ -11,7 +11,7 @@ use super::super::{
 };
 use crate::market_maker::belief::{BeliefSnapshot, BeliefUpdate};
 // QuoteGate removed (A4) — replaced by ExecutionMode state machine + E[PnL] filter
-use crate::market_maker::estimator::EnhancedFlowContext;
+use crate::market_maker::estimator::{EnhancedFlowContext, MarketEstimator};
 use crate::market_maker::infra::metrics::dashboard::{
     ChangepointDiagnostics, KappaDiagnostics, QuoteDecisionRecord, SignalSnapshot,
 };
@@ -209,24 +209,24 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Long position → bids increase exposure → widen bids only.
         // Short position → asks increase exposure → widen asks only.
         // Reducing side stays at 1.0 (no penalty for reducing position).
-        let mut governor_bid_mult = 1.0_f64;
-        let mut governor_ask_mult = 1.0_f64;
+        let mut governor_bid_addon_bps = 0.0_f64;
+        let mut governor_ask_addon_bps = 0.0_f64;
         let current_position = self.position.position();
 
         // Yellow zone: widen increasing side, cap exposure
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Yellow {
             if current_position > 0.0 {
                 // Long: bids increase position
-                governor_bid_mult = position_assessment.increasing_side_spread_mult;
+                governor_bid_addon_bps = position_assessment.increasing_side_addon_bps;
             } else if current_position < 0.0 {
                 // Short: asks increase position
-                governor_ask_mult = position_assessment.increasing_side_spread_mult;
+                governor_ask_addon_bps = position_assessment.increasing_side_addon_bps;
             }
             debug!(
                 zone = "Yellow",
                 position = %format!("{:.4}", current_position),
-                governor_bid_mult = %format!("{:.2}", governor_bid_mult),
-                governor_ask_mult = %format!("{:.2}", governor_ask_mult),
+                governor_bid_addon_bps = %format!("{:.2}", governor_bid_addon_bps),
+                governor_ask_addon_bps = %format!("{:.2}", governor_ask_addon_bps),
                 max_new_exposure = %format!("{:.4}", position_assessment.max_new_exposure),
                 "InventoryGovernor: Yellow zone — asymmetric widening"
             );
@@ -235,14 +235,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Red {
             risk_reduce_only = true;
             if current_position > 0.0 {
-                governor_bid_mult = position_assessment.increasing_side_spread_mult;
+                governor_bid_addon_bps = position_assessment.increasing_side_addon_bps;
             } else if current_position < 0.0 {
-                governor_ask_mult = position_assessment.increasing_side_spread_mult;
+                governor_ask_addon_bps = position_assessment.increasing_side_addon_bps;
             }
             info!(
                 zone = "Red",
-                governor_bid_mult = %format!("{:.2}", governor_bid_mult),
-                governor_ask_mult = %format!("{:.2}", governor_ask_mult),
+                governor_bid_addon_bps = %format!("{:.2}", governor_bid_addon_bps),
+                governor_ask_addon_bps = %format!("{:.2}", governor_ask_addon_bps),
                 "InventoryGovernor: Red zone — reduce-only mode + asymmetric widening"
             );
         }
@@ -2657,9 +2657,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
         }
 
-        // Wire governor per-side spread mults to market_params for ladder consumption
-        market_params.governor_bid_spread_mult = governor_bid_mult;
-        market_params.governor_ask_spread_mult = governor_ask_mult;
+        // Wire governor per-side spread addons to market_params for ladder consumption
+        market_params.governor_bid_addon_bps = governor_bid_addon_bps;
+        market_params.governor_ask_addon_bps = governor_ask_addon_bps;
 
         // Per-side funding carry is already set on market_params in the funding section above.
 
@@ -2674,6 +2674,54 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Self-impact: additive spread widening based on our book dominance.
         // Coefficient × fraction² (square-root impact law).
         market_params.self_impact_addon_bps = self.self_impact.impact_addon_bps();
+
+        // === DIRECTIONAL FLOW DEFENSE (additive bps) ===
+        // Phase 1: Fill cascade — tracker already computes additive bps per side.
+        market_params.cascade_bid_addon_bps =
+            self.fill_cascade_tracker.spread_addon_bps(Side::Buy);
+        market_params.cascade_ask_addon_bps =
+            self.fill_cascade_tracker.spread_addon_bps(Side::Sell);
+
+        // Phase 2: Asymmetric quote staleness — widen stale side based on mid displacement.
+        // Between quote cycles (5-6s), the market may move, making one side too generous.
+        if self.mid_at_last_quote > 0.0 && self.latest_mid > 0.0 {
+            let move_bps =
+                (self.latest_mid - self.mid_at_last_quote) / self.mid_at_last_quote * 10_000.0;
+            let staleness_cfg = &self.staleness_config;
+            if staleness_cfg.enabled {
+                if move_bps < -staleness_cfg.min_move_bps {
+                    // Market dropped → bids are stale (too high) → widen bids
+                    let abs_move = move_bps.abs();
+                    market_params.staleness_addon_bid_bps = staleness_cfg.max_addon_bps
+                        * (1.0 - (-abs_move / staleness_cfg.decay_bps).exp());
+                }
+                if move_bps > staleness_cfg.min_move_bps {
+                    // Market rose → asks are stale (too low) → widen asks
+                    market_params.staleness_addon_ask_bps = staleness_cfg.max_addon_bps
+                        * (1.0 - (-move_bps / staleness_cfg.decay_bps).exp());
+                }
+            }
+        }
+        // Update mid_at_last_quote AFTER computing staleness (will be read next cycle)
+        self.mid_at_last_quote = self.latest_mid;
+
+        // Phase 3: Directional flow toxicity — per-side EWMA of p_informed.
+        let flow_tox_cfg = &self.flow_toxicity_config;
+        if flow_tox_cfg.enabled {
+            let (buy_tox, sell_tox) = self.estimator.directional_toxicity();
+            if sell_tox > flow_tox_cfg.threshold {
+                // Toxic sell flow → widen bids (don't buy into informed selling)
+                let excess = ((sell_tox - flow_tox_cfg.threshold) / (1.0 - flow_tox_cfg.threshold))
+                    .clamp(0.0, 1.0);
+                market_params.flow_toxicity_addon_bid_bps = flow_tox_cfg.max_addon_bps * excess;
+            }
+            if buy_tox > flow_tox_cfg.threshold {
+                // Toxic buy flow → widen asks (don't sell into informed buying)
+                let excess = ((buy_tox - flow_tox_cfg.threshold) / (1.0 - flow_tox_cfg.threshold))
+                    .clamp(0.0, 1.0);
+                market_params.flow_toxicity_addon_ask_bps = flow_tox_cfg.max_addon_bps * excess;
+            }
+        }
 
         // Try multi-level ladder quoting first
         // HARMONIZED: Use decision-adjusted liquidity (first-principles derived, decision-scaled)

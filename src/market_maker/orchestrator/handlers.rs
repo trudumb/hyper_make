@@ -903,6 +903,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                         .cancel_bulk_orders(&self.config.asset, oids)
                         .await;
                 }
+                // Boost drift estimator responsiveness on cascade events.
+                // 3x process noise → Kalman tracks rapid moves within 2-3 updates.
+                self.drift_estimator.boost_responsiveness(3.0);
             }
 
             let fill_price = fill.px.parse().unwrap_or(0.0);

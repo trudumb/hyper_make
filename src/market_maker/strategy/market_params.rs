@@ -38,6 +38,10 @@ pub struct SpreadComposition {
     /// Included in GLFT computation already, tracked here for decomposition visibility.
     /// Units: basis points.
     pub fee_bps: f64,
+    /// Spread widening from cascade tracker on the bid side.
+    pub cascade_bid_addon_bps: f64,
+    /// Spread widening from cascade tracker on the ask side.
+    pub cascade_ask_addon_bps: f64,
 }
 
 impl Default for SpreadComposition {
@@ -48,6 +52,8 @@ impl Default for SpreadComposition {
             quota_addon_bps: 0.0,
             warmup_addon_bps: 0.0,
             fee_bps: 1.5,
+            cascade_bid_addon_bps: 0.0,
+            cascade_ask_addon_bps: 0.0,
         }
     }
 }
@@ -62,6 +68,16 @@ impl SpreadComposition {
             + self.quota_addon_bps
             + self.warmup_addon_bps)
             .max(self.fee_bps)
+    }
+
+    /// Total Bid half-spread in basis points including asymmetric addons.
+    pub fn bid_half_spread_bps(&self) -> f64 {
+        (self.total_half_spread_bps() + self.cascade_bid_addon_bps).max(self.fee_bps)
+    }
+
+    /// Total Ask half-spread in basis points including asymmetric addons.
+    pub fn ask_half_spread_bps(&self) -> f64 {
+        (self.total_half_spread_bps() + self.cascade_ask_addon_bps).max(self.fee_bps)
     }
 
     /// Diagnostic breakdown string for logging.
@@ -814,6 +830,12 @@ pub struct MarketParams {
     /// Positive = in profit, negative = underwater.
     pub unrealized_pnl_bps: f64,
 
+    // ==================== Component-Level Spread Addons (Phases 1-3) ====================
+    /// Additive spread widening (bps) from FillCascadeTracker (bid side).
+    pub cascade_bid_addon_bps: f64,
+    /// Additive spread widening (bps) from FillCascadeTracker (ask side).
+    pub cascade_ask_addon_bps: f64,
+
     // ==================== Bayesian Gamma Components (Alpha Plan) ====================
     /// Trend confidence [0, 1] from directional signals.
     /// High confidence → can quote tighter spreads (lower gamma).
@@ -1021,13 +1043,13 @@ pub struct MarketParams {
     pub ghost_liquidity_gamma_mult: f64,
 
     // ==================== Governor Asymmetric Spread Widening ====================
-    /// Per-side governor spread multiplier for bids [1.0, 3.0].
-    /// When long, bids increase position → widen. When short, stays 1.0.
-    /// Source: InventoryGovernor.assess().increasing_side_spread_mult
-    pub governor_bid_spread_mult: f64,
-    /// Per-side governor spread multiplier for asks [1.0, 3.0].
-    /// When short, asks increase position → widen. When long, stays 1.0.
-    pub governor_ask_spread_mult: f64,
+    /// Per-side governor spread addon for bids (bps) [0.0, 25.0].
+    /// When long, bids increase position → widen. When short, stays 0.0.
+    /// Source: InventoryGovernor.assess().increasing_side_addon_bps
+    pub governor_bid_addon_bps: f64,
+    /// Per-side governor spread addon for asks (bps) [0.0, 25.0].
+    /// When short, asks increase position → widen. When long, stays 0.0.
+    pub governor_ask_addon_bps: f64,
 
     // ==================== Funding Carry Per-Side ====================
     /// Funding carry cost for bid side (bps). Positive when longs pay funding.
@@ -1047,6 +1069,20 @@ pub struct MarketParams {
     /// Formula: coefficient × (our_fraction)^2.
     /// At 40% book dominance: ~0.8 bps. At 80%: ~3.2 bps.
     pub self_impact_addon_bps: f64,
+
+    // ==================== Directional Flow Defense (additive, bps) ====================
+    /// Quote staleness defense: additive widening on bid side (bps).
+    /// Between quote cycles, price displacement makes stale bids too generous.
+    /// Formula: max_addon × (1 - exp(-|move|/decay)), applied to the stale side.
+    pub staleness_addon_bid_bps: f64,
+    /// Quote staleness defense: additive widening on ask side (bps).
+    pub staleness_addon_ask_bps: f64,
+    /// Directional flow toxicity: additive widening on bid side (bps).
+    /// When sell-side flow is toxic (informed sellers), widens bids.
+    /// Source: InformedFlowEstimator per-side EWMA of p_informed.
+    pub flow_toxicity_addon_bid_bps: f64,
+    /// Directional flow toxicity: additive widening on ask side (bps).
+    pub flow_toxicity_addon_ask_bps: f64,
 }
 
 impl Default for MarketParams {
@@ -1274,6 +1310,9 @@ impl Default for MarketParams {
             avg_entry_price: None,
             breakeven_price: 0.0,
             unrealized_pnl_bps: 0.0,
+            // Component-Level Spread Addons
+            cascade_bid_addon_bps: 0.0,
+            cascade_ask_addon_bps: 0.0,
             // Bayesian Gamma Components (Alpha Plan)
             trend_confidence: 0.5,        // 50% confidence initially (uncertain)
             bootstrap_confidence: 0.0,    // Not calibrated initially
@@ -1331,9 +1370,9 @@ impl Default for MarketParams {
             // Fix 3: Ghost liquidity
             ghost_liquidity_gamma_mult: 1.0,
 
-            // Governor Asymmetric Spread Widening
-            governor_bid_spread_mult: 1.0,
-            governor_ask_spread_mult: 1.0,
+            // Governor Asymmetric Spread Widening (additive bps)
+            governor_bid_addon_bps: 0.0,
+            governor_ask_addon_bps: 0.0,
 
             // Funding Carry Per-Side
             funding_carry_bid_bps: 0.0,
@@ -1344,6 +1383,12 @@ impl Default for MarketParams {
 
             // Self-Impact Estimator
             self_impact_addon_bps: 0.0,
+
+            // Directional Flow Defense (additive, bps)
+            staleness_addon_bid_bps: 0.0,
+            staleness_addon_ask_bps: 0.0,
+            flow_toxicity_addon_bid_bps: 0.0,
+            flow_toxicity_addon_ask_bps: 0.0,
 
             // Unified Adverse Selection Framework (Phase 4)
             use_epnl_filter: false,

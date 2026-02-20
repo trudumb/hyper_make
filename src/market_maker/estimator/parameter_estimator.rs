@@ -2038,6 +2038,10 @@ impl MarketEstimator for ParameterEstimator {
         self.informed_flow.decomposition().confidence
     }
 
+    fn directional_toxicity(&self) -> (f64, f64) {
+        self.informed_flow.directional_toxicity()
+    }
+
     // --- Fill Rate Model (Phase 4) ---
     fn fill_rate_at_depth(&self, depth_bps: f64) -> f64 {
         // Create current market state for fill rate query

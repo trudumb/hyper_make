@@ -113,10 +113,10 @@ pub struct CascadeConfig {
     pub widen_threshold: usize,
     /// Number of same-side fills in 60s window to trigger suppress (reduce-only).
     pub suppress_threshold: usize,
-    /// Spread multiplier when in widen mode.
-    pub widen_multiplier: f64,
-    /// Spread multiplier when in suppress mode (extreme widening before full suppress).
-    pub suppress_multiplier: f64,
+    /// Spread additive widening (bps) when in widen mode.
+    pub widen_addon_bps: f64,
+    /// Spread additive widening (bps) when in suppress mode (extreme widening before full suppress).
+    pub suppress_addon_bps: f64,
     /// Cooldown duration in seconds for widen mode.
     pub widen_cooldown_secs: u64,
     /// Cooldown duration in seconds for suppress mode.
@@ -128,8 +128,8 @@ impl Default for CascadeConfig {
         Self {
             widen_threshold: 5,
             suppress_threshold: 8,
-            widen_multiplier: 2.0,
-            suppress_multiplier: 3.0,
+            widen_addon_bps: 10.0,
+            suppress_addon_bps: 20.0,
             widen_cooldown_secs: 15,
             suppress_cooldown_secs: 30,
         }
@@ -145,19 +145,107 @@ impl CascadeConfig {
                 self.suppress_threshold, self.widen_threshold
             ));
         }
-        if self.widen_multiplier < 1.0 {
+        if self.widen_addon_bps < 0.0 {
             return Err(format!(
-                "widen_multiplier must be >= 1.0, got {}",
-                self.widen_multiplier
+                "widen_addon_bps must be >= 0.0, got {}",
+                self.widen_addon_bps
             ));
         }
-        if self.suppress_multiplier < 1.0 {
+        if self.suppress_addon_bps < 0.0 {
             return Err(format!(
-                "suppress_multiplier must be >= 1.0, got {}",
-                self.suppress_multiplier
+                "suppress_addon_bps must be >= 0.0, got {}",
+                self.suppress_addon_bps
             ));
         }
         Ok(())
+    }
+}
+
+/// Configuration for asymmetric quote staleness defense.
+///
+/// Between quote cycles (5-6s), price may move, making quotes on one side
+/// stale (too generous). This adds per-side spread based on the displacement.
+///
+/// Formula: addon_bps = max_addon_bps × (1 - exp(-|move_bps| / decay_bps))
+/// Applied to the stale side only (bids when market drops, asks when rises).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StalenessConfig {
+    /// Whether staleness defense is enabled.
+    pub enabled: bool,
+    /// Characteristic decay scale (bps). Higher = slower saturation.
+    /// At |move| = decay_bps, addon ≈ 63% of max.
+    pub decay_bps: f64,
+    /// Maximum additive widening from staleness (bps).
+    pub max_addon_bps: f64,
+    /// Minimum price move to trigger (bps). Below this, no widening.
+    pub min_move_bps: f64,
+}
+
+impl Default for StalenessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            decay_bps: 3.0,
+            max_addon_bps: 10.0,
+            min_move_bps: 0.5,
+        }
+    }
+}
+
+/// Configuration for inventory governor zone thresholds.
+///
+/// Controls when the governor transitions between zones and how
+/// aggressively it widens the position-increasing side.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GovernorConfig {
+    /// Position ratio threshold to enter Yellow zone [0.0, 1.0].
+    /// Below this is Green (full two-sided quoting).
+    pub yellow_threshold: f64,
+    /// Position ratio threshold to enter Red zone [yellow, 1.0].
+    /// Red = reduce-only.
+    pub red_threshold: f64,
+    /// Maximum additive spread widening (bps) at the top of Yellow zone.
+    /// Linear ramp from 0.0 at yellow_threshold to this at red_threshold.
+    pub yellow_max_addon_bps: f64,
+    /// Additive spread widening (bps) in Red zone (reduce-only).
+    pub red_addon_bps: f64,
+    /// Additive spread widening (bps) in Kill zone (at/above max position).
+    pub kill_addon_bps: f64,
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            yellow_threshold: 0.50,
+            red_threshold: 0.80,
+            yellow_max_addon_bps: 10.0,
+            red_addon_bps: 15.0,
+            kill_addon_bps: 25.0,
+        }
+    }
+}
+
+/// Configuration for directional flow toxicity defense.
+///
+/// Widens the vulnerable side when informed flow is detected on one side.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FlowToxicityConfig {
+    /// Whether flow toxicity defense is enabled.
+    pub enabled: bool,
+    /// Toxicity threshold to start widening [0.0, 1.0].
+    /// Below this, no addon.
+    pub threshold: f64,
+    /// Maximum additive widening from flow toxicity (bps).
+    pub max_addon_bps: f64,
+}
+
+impl Default for FlowToxicityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: 0.3,
+            max_addon_bps: 8.0,
+        }
     }
 }
 

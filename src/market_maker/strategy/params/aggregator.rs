@@ -630,6 +630,10 @@ impl ParameterAggregator {
             breakeven_price: 0.0,
             unrealized_pnl_bps: 0.0,
 
+            // Component-Level Spread Addons
+            cascade_bid_addon_bps: 0.0, // Wired in quote_engine.rs
+            cascade_ask_addon_bps: 0.0,
+
             // === Bayesian Gamma Components (Alpha Plan) ===
             // These are populated from QuoteGate and TheoreticalEdgeEstimator
             // Default to neutral values; actual values populated in quote_engine.rs
@@ -772,8 +776,8 @@ impl ParameterAggregator {
             ghost_liquidity_gamma_mult: 1.0,
 
             // Governor asymmetric spread widening — populated by quote_engine from InventoryGovernor
-            governor_bid_spread_mult: 1.0,
-            governor_ask_spread_mult: 1.0,
+            governor_bid_addon_bps: 0.0,
+            governor_ask_addon_bps: 0.0,
 
             // Funding carry per-side — populated by quote_engine from funding estimator
             funding_carry_bid_bps: 0.0,
@@ -784,6 +788,12 @@ impl ParameterAggregator {
 
             // Self-impact addon — populated by quote_engine from SelfImpactEstimator
             self_impact_addon_bps: 0.0,
+
+            // Directional flow defense — populated by quote_engine
+            staleness_addon_bid_bps: 0.0,
+            staleness_addon_ask_bps: 0.0,
+            flow_toxicity_addon_bid_bps: 0.0,
+            flow_toxicity_addon_ask_bps: 0.0,
 
             // === Unified Adverse Selection Framework (Phase 4) ===
             // E[PnL] filter: default off during dual-run validation

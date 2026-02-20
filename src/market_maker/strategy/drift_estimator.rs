@@ -292,6 +292,15 @@ impl KalmanDriftEstimator {
     pub fn process_noise(&self) -> f64 {
         self.process_noise
     }
+
+    /// Temporarily boost responsiveness after a cascade event.
+    ///
+    /// Multiplies process_noise by `factor` (bounded at 10.0) so the Kalman
+    /// filter trusts new observations more heavily. `update_parameters()` will
+    /// naturally decay it back when realized drift matches predictions.
+    pub fn boost_responsiveness(&mut self, factor: f64) {
+        self.process_noise = (self.process_noise * factor).min(10.0);
+    }
 }
 
 impl Default for KalmanDriftEstimator {

@@ -150,6 +150,12 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Self-impact estimator: tracks our book dominance and computes spread addon.
     self_impact: estimator::self_impact::SelfImpactEstimator,
 
+    // === Directional Flow Defense Configs ===
+    /// Asymmetric quote staleness: widen stale side between quote cycles.
+    staleness_config: config::StalenessConfig,
+    /// Directional flow toxicity: per-side informed flow defense.
+    flow_toxicity_config: config::FlowToxicityConfig,
+
     // === Bootstrap from Book ===
     /// L2-derived market microstructure profile for kappa/sigma estimation.
     /// Fed by handle_l2_book(), seeds CalibrationCoordinator during warmup.
@@ -248,6 +254,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Reduces order churn by only reconciling when meaningful events occur.
     #[allow(dead_code)] // WIP: Will be used when event handlers are wired
     event_accumulator: orchestrator::EventAccumulator,
+
+    // === Asymmetric Quote Staleness Defense ===
+    /// Mid price when quotes were last placed. Used to detect inter-cycle price
+    /// displacement and widen the stale side (bids on down-move, asks on up-move).
+    mid_at_last_quote: f64,
 
     // === First-Principles Belief System (Bayesian Posterior Updates) ===
     /// Previous mid price for computing returns fed to beliefs_builder.
@@ -560,6 +571,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             exchange_rules,
             // Event-driven churn reduction
             event_accumulator: orchestrator::EventAccumulator::default_config(),
+            // Directional flow defense configs
+            staleness_config: config::StalenessConfig::default(),
+            flow_toxicity_config: config::FlowToxicityConfig::default(),
+            // Asymmetric quote staleness defense
+            mid_at_last_quote: 0.0,
             // First-principles belief system
             prev_mid_for_beliefs: 0.0,
             last_beliefs_update: None,
@@ -1330,10 +1346,10 @@ pub struct FillCascadeTracker {
     widen_cooldown: std::time::Duration,
     /// Cooldown duration for suppress mode
     suppress_cooldown: std::time::Duration,
-    /// Spread multiplier when widening (default 2.0).
-    widen_multiplier: f64,
-    /// Spread multiplier when suppressing (default 3.0).
-    suppress_multiplier: f64,
+    /// Spread widening (bps) when widening (default 10.0).
+    widen_addon_bps: f64,
+    /// Spread widening (bps) when suppressing (default 20.0).
+    suppress_addon_bps: f64,
 }
 
 impl FillCascadeTracker {
@@ -1347,8 +1363,8 @@ impl FillCascadeTracker {
             cooldown_until: None,
             widen_cooldown: std::time::Duration::from_secs(cfg.widen_cooldown_secs),
             suppress_cooldown: std::time::Duration::from_secs(cfg.suppress_cooldown_secs),
-            widen_multiplier: cfg.widen_multiplier,
-            suppress_multiplier: cfg.suppress_multiplier,
+            widen_addon_bps: cfg.widen_addon_bps,
+            suppress_addon_bps: cfg.suppress_addon_bps,
         }
     }
 
@@ -1407,19 +1423,19 @@ impl FillCascadeTracker {
         None
     }
 
-    /// Get spread multiplier for a side (1.0 = normal, configurable widening due to cascade).
-    pub fn spread_multiplier(&self, side: Side) -> f64 {
+    /// Get spread widening for a side (0.0 = normal, configurable widening due to cascade).
+    pub fn spread_addon_bps(&self, side: Side) -> f64 {
         let now = std::time::Instant::now();
         if let Some((expiry, cooldown_side)) = self.cooldown_until {
             if now < expiry && cooldown_side == side {
                 let same_side_count = self.count_same_side(side, now);
                 if same_side_count >= self.suppress_threshold {
-                    return self.suppress_multiplier;
+                    return self.suppress_addon_bps;
                 }
-                return self.widen_multiplier;
+                return self.widen_addon_bps;
             }
         }
-        1.0
+        0.0
     }
 
     /// Check if a side is suppressed (reduce-only).
@@ -1480,7 +1496,7 @@ mod fill_cascade_tests {
         }
         let event = tracker.record_fill(Side::Sell, 5.0); // 5th sell -> WIDEN
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Sell)));
-        assert!(tracker.spread_multiplier(Side::Sell) > 1.0);
+        assert!(tracker.spread_addon_bps(Side::Sell) > 0.0);
 
         let mut tracker2 = FillCascadeTracker::new();
         for i in 0..4 {
@@ -1488,7 +1504,7 @@ mod fill_cascade_tests {
         }
         let event2 = tracker2.record_fill(Side::Buy, -5.0); // 5th buy -> WIDEN
         assert_eq!(event2, Some(CascadeEvent::Widen(Side::Buy)));
-        assert!(tracker2.spread_multiplier(Side::Buy) > 1.0);
+        assert!(tracker2.spread_addon_bps(Side::Buy) > 0.0);
     }
 
     #[test]
@@ -1500,7 +1516,7 @@ mod fill_cascade_tests {
         // 5th buy triggers WIDEN (threshold = 5)
         let event = tracker.record_fill(Side::Buy, 4.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
-        assert!(tracker.spread_multiplier(Side::Buy) > 1.0);
+        assert!(tracker.spread_addon_bps(Side::Buy) > 0.0);
     }
 
     #[test]
@@ -1529,12 +1545,12 @@ mod fill_cascade_tests {
         for _ in 0..5 {
             tracker.record_fill(Side::Sell, -1.0);
         }
-        let mult = tracker.spread_multiplier(Side::Sell);
-        assert!(mult > 1.0, "Sell cascade should widen");
+        let addon = tracker.spread_addon_bps(Side::Sell);
+        assert!(addon > 0.0, "Sell cascade should widen");
 
         // But quote_engine checks position: if position > 0, skip widen for sells
         let position = 5.0; // long
-        let should_widen_sells = mult > 1.0 && position <= 0.0;
+        let should_widen_sells = addon > 0.0 && position <= 0.0;
         assert!(!should_widen_sells, "Should NOT widen sells when long (reducing)");
     }
 

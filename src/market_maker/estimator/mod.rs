@@ -300,6 +300,8 @@ pub trait MarketEstimator: Send + Sync {
     fn p_forced(&self) -> f64;
     /// Confidence in flow decomposition.
     fn flow_decomposition_confidence(&self) -> f64;
+    /// Per-side toxicity EWMA: (buy_side, sell_side) in [0, 1].
+    fn directional_toxicity(&self) -> (f64, f64);
 
     // === Fill Rate Model (Phase 4) ===
     /// Expected fill rate at given depth (bps from mid).

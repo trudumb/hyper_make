@@ -701,6 +701,8 @@ impl LadderStrategy {
             quota_addon_bps,
             warmup_addon_bps,
             fee_bps,
+            cascade_bid_addon_bps: market_params.cascade_bid_addon_bps,
+            cascade_ask_addon_bps: market_params.cascade_ask_addon_bps,
         }
     }
 
@@ -1107,29 +1109,6 @@ impl LadderStrategy {
             }
         }
 
-        // === GOVERNOR ASYMMETRIC SPREAD WIDENING ===
-        // Per-side multiplier from InventoryGovernor: increasing side widens, reducing side 1.0.
-        // Applied after drift adjustment so floor enforcement catches both.
-        if market_params.governor_bid_spread_mult > 1.001 {
-            for depth in dynamic_depths.bid.iter_mut() {
-                *depth *= market_params.governor_bid_spread_mult;
-            }
-        }
-        if market_params.governor_ask_spread_mult > 1.001 {
-            for depth in dynamic_depths.ask.iter_mut() {
-                *depth *= market_params.governor_ask_spread_mult;
-            }
-        }
-        if market_params.governor_bid_spread_mult > 1.001
-            || market_params.governor_ask_spread_mult > 1.001
-        {
-            tracing::debug!(
-                governor_bid_mult = %format!("{:.2}", market_params.governor_bid_spread_mult),
-                governor_ask_mult = %format!("{:.2}", market_params.governor_ask_spread_mult),
-                "Governor asymmetric spread widening applied"
-            );
-        }
-
         // === FUNDING CARRY: Per-side cost in GLFT depths ===
         // Positive funding → longs pay → widen bids. Negative → shorts pay → widen asks.
         // Applied additively to depths (bps). Typically negligible (<0.1 bps) except during
@@ -1154,6 +1133,45 @@ impl LadderStrategy {
             for depth in dynamic_depths.ask.iter_mut() {
                 *depth += market_params.self_impact_addon_bps;
             }
+        }
+
+        // === DIRECTIONAL FLOW DEFENSE (additive bps, per-side) ===
+        // Four independent defense components summed additively, capped at 35 bps total.
+        // Governor + cascade + staleness + flow toxicity — all zero when inactive.
+        let defense_bid_addon_bps = (market_params.governor_bid_addon_bps
+            + market_params.cascade_bid_addon_bps
+            + market_params.staleness_addon_bid_bps
+            + market_params.flow_toxicity_addon_bid_bps)
+            .min(35.0);
+        let defense_ask_addon_bps = (market_params.governor_ask_addon_bps
+            + market_params.cascade_ask_addon_bps
+            + market_params.staleness_addon_ask_bps
+            + market_params.flow_toxicity_addon_ask_bps)
+            .min(35.0);
+        if defense_bid_addon_bps > 0.01 {
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth += defense_bid_addon_bps;
+            }
+        }
+        if defense_ask_addon_bps > 0.01 {
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth += defense_ask_addon_bps;
+            }
+        }
+        if defense_bid_addon_bps > 0.1 || defense_ask_addon_bps > 0.1 {
+            tracing::info!(
+                governor_bid = %format!("{:.1}", market_params.governor_bid_addon_bps),
+                governor_ask = %format!("{:.1}", market_params.governor_ask_addon_bps),
+                cascade_bid = %format!("{:.1}", market_params.cascade_bid_addon_bps),
+                cascade_ask = %format!("{:.1}", market_params.cascade_ask_addon_bps),
+                staleness_bid = %format!("{:.1}", market_params.staleness_addon_bid_bps),
+                staleness_ask = %format!("{:.1}", market_params.staleness_addon_ask_bps),
+                flow_tox_bid = %format!("{:.1}", market_params.flow_toxicity_addon_bid_bps),
+                flow_tox_ask = %format!("{:.1}", market_params.flow_toxicity_addon_ask_bps),
+                total_bid = %format!("{:.1}", defense_bid_addon_bps),
+                total_ask = %format!("{:.1}", defense_ask_addon_bps),
+                "Directional flow defense applied (additive bps)"
+            );
         }
 
         // === KILL-SWITCH SIDE CLEARING (safety-critical) ===

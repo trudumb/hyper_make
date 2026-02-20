@@ -181,6 +181,10 @@ impl MarketEstimator for MockEstimator {
         0.5 // Medium confidence
     }
 
+    fn directional_toxicity(&self) -> (f64, f64) {
+        (0.05, 0.05) // Low toxicity both sides
+    }
+
     // --- Fill Rate Model (Phase 4) ---
     fn fill_rate_at_depth(&self, depth_bps: f64) -> f64 {
         // Simple exponential decay: λ(d) = exp(-d / 10)
