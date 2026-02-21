@@ -5350,3 +5350,13 @@
 {}
 {}
 {}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{"CrossVenue":{"active_pnl_bps":0.0,"inactive_pnl_bps":6.7994492033711325,"marginal_value_bps":-3.3997246016855662},"RegimeDetection":{"active_pnl_bps":6.7994492033711325,"inactive_pnl_bps":0.0,"marginal_value_bps":3.3997246016855662},"LeadLag":{"active_pnl_bps":0.0,"inactive_pnl_bps":6.7994492033711325,"marginal_value_bps":-3.3997246016855662},"VPIN":{"active_pnl_bps":6.7994492033711325,"inactive_pnl_bps":0.0,"marginal_value_bps":3.3997246016855662},"BuyPressure":{"active_pnl_bps":0.0,"inactive_pnl_bps":6.7994492033711325,"marginal_value_bps":-3.3997246016855662},"InformedFlow":{"active_pnl_bps":6.7994492033711325,"inactive_pnl_bps":0.0,"marginal_value_bps":3.3997246016855662}}
+{"CrossVenue":{"active_pnl_bps":0.0,"inactive_pnl_bps":6.7994492033711325,"marginal_value_bps":-3.3997246016855662},"LeadLag":{"active_pnl_bps":0.0,"inactive_pnl_bps":6.7994492033711325,"marginal_value_bps":-3.3997246016855662},"InformedFlow":{"active_pnl_bps":6.7994492033711325,"inactive_pnl_bps":0.0,"marginal_value_bps":3.3997246016855662},"RegimeDetection":{"active_pnl_bps":6.7994492033711325,"inactive_pnl_bps":0.0,"marginal_value_bps":3.3997246016855662},"VPIN":{"active_pnl_bps":6.7994492033711325,"inactive_pnl_bps":0.0,"marginal_value_bps":3.3997246016855662},"BuyPressure":{"active_pnl_bps":0.0,"inactive_pnl_bps":6.7994492033711325,"marginal_value_bps":-3.3997246016855662}}
+{"CrossVenue":{"active_pnl_bps":0.0,"inactive_pnl_bps":78.66159287309917,"marginal_value_bps":-13.110265478849861},"VPIN":{"active_pnl_bps":78.66159287309917,"inactive_pnl_bps":0.0,"marginal_value_bps":13.110265478849861},"BuyPressure":{"active_pnl_bps":0.0,"inactive_pnl_bps":78.66159287309917,"marginal_value_bps":-13.110265478849861},"InformedFlow":{"active_pnl_bps":78.66159287309917,"inactive_pnl_bps":0.0,"marginal_value_bps":13.110265478849861},"LeadLag":{"active_pnl_bps":0.0,"inactive_pnl_bps":78.66159287309917,"marginal_value_bps":-13.110265478849861},"RegimeDetection":{"active_pnl_bps":78.66159287309917,"inactive_pnl_bps":0.0,"marginal_value_bps":13.110265478849861}}
