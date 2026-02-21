@@ -1,6 +1,8 @@
 ---
 name: calibration-analysis
 description: Systematic analysis of model predictions vs realized outcomes. Use when computing Brier Score, Information Ratio, calibration curves, PnL attribution, or conditional calibration by regime/volatility/funding. Identifies which models are adding noise vs value.
+requires:
+  - measurement-infrastructure
 user-invocable: false
 ---
 

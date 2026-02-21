@@ -1,6 +1,8 @@
 ---
 name: daily-calibration-report
 description: Automated daily health check of all model components for early warning of degradation and drift. Use when setting up daily reports, debugging performance issues, or reviewing model health after deployment. Covers PnL attribution, calibration metrics, signal decay, regime analysis, and alerting.
+requires:
+  - calibration-analysis
 disable-model-invocation: true
 context: fork
 agent: analytics

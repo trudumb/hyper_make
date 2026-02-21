@@ -178,35 +178,40 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // The inventory governor enforces config.max_position as a HARD ceiling.
         // This runs BEFORE any other logic to ensure position safety is structural.
         let position_assessment = self.inventory_governor.assess(self.position.position());
-        if position_assessment.zone == crate::market_maker::risk::PositionZone::Kill {
-            warn!(
-                position = %format!("{:.4}", self.position.position()),
-                ratio = %format!("{:.2}", position_assessment.position_ratio),
-                max_position = %format!("{:.4}", self.inventory_governor.max_position()),
-                "InventoryGovernor: KILL zone — cancelling ALL quotes"
-            );
-            let bid_orders = self.orders.get_all_by_side(Side::Buy);
-            let ask_orders = self.orders.get_all_by_side(Side::Sell);
-            let all_oids: Vec<u64> = bid_orders
-                .iter()
-                .chain(ask_orders.iter())
-                .map(|o| o.oid)
-                .collect();
-            if !all_oids.is_empty() {
-                self.environment
-                    .cancel_bulk_orders(&self.config.asset, all_oids)
-                    .await;
-            }
-            return Ok(());
-        }
 
         // === PHASE 7: Graduated risk overlay multipliers ===
         // Track additive spread and size multipliers from all risk sources.
         // Only the kill switch can actually cancel all quotes — everything else
         // applies graduated spread widening and size reduction.
+        // Declared BEFORE governor check so KILL zone can set reduce-only.
         let mut risk_overlay_mult = 1.0_f64;
         let mut risk_size_reduction = 1.0_f64;
         let mut risk_reduce_only = false;
+
+        if position_assessment.zone == crate::market_maker::risk::PositionZone::Kill {
+            // Cancel position-INCREASING orders only, keep reducing-side alive
+            let cancel_oids: Vec<u64> = if position_assessment.is_long {
+                self.orders.get_all_by_side(Side::Buy)
+            } else {
+                self.orders.get_all_by_side(Side::Sell)
+            }.iter().map(|o| o.oid).collect();
+
+            if !cancel_oids.is_empty() {
+                self.environment
+                    .cancel_bulk_orders(&self.config.asset, cancel_oids)
+                    .await;
+            }
+
+            // Set reduce-only + widening, then fall through to normal quote pipeline
+            risk_reduce_only = true;
+            warn!(
+                position = %format!("{:.4}", self.position.position()),
+                ratio = %format!("{:.2}", position_assessment.position_ratio),
+                max_position = %format!("{:.4}", self.inventory_governor.max_position()),
+                "InventoryGovernor: KILL zone — reduce-only mode, cancelling increasing-side"
+            );
+            // NOTE: Do NOT return — fall through to quote generation
+        }
 
         // === Governor per-side asymmetric spread widening ===
         // Long position → bids increase exposure → widen bids only.
@@ -234,20 +239,32 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 "InventoryGovernor: Yellow zone — asymmetric widening"
             );
         }
-        // Red zone: reduce-only + widen increasing side
+        // Red zone: reduce-only + widen increasing side + tighten reducing side
         if position_assessment.zone == crate::market_maker::risk::PositionZone::Red {
             risk_reduce_only = true;
             if current_position > 0.0 {
                 governor_bid_addon_bps = position_assessment.increasing_side_addon_bps;
+                governor_ask_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
             } else if current_position < 0.0 {
                 governor_ask_addon_bps = position_assessment.increasing_side_addon_bps;
+                governor_bid_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
             }
             info!(
                 zone = "Red",
                 governor_bid_addon_bps = %format!("{:.2}", governor_bid_addon_bps),
                 governor_ask_addon_bps = %format!("{:.2}", governor_ask_addon_bps),
-                "InventoryGovernor: Red zone — reduce-only mode + asymmetric widening"
+                "InventoryGovernor: Red zone — reduce-only + tightened reducing side"
             );
+        }
+        // Kill zone: reduce-only + widen increasing side + tighten reducing side
+        if position_assessment.zone == crate::market_maker::risk::PositionZone::Kill {
+            if current_position > 0.0 {
+                governor_bid_addon_bps = position_assessment.increasing_side_addon_bps;
+                governor_ask_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
+            } else if current_position < 0.0 {
+                governor_ask_addon_bps = position_assessment.increasing_side_addon_bps;
+                governor_bid_addon_bps = position_assessment.reducing_side_addon_bps; // negative = tighten
+            }
         }
 
         // === Circuit Breaker Checks (Phase 7: graduated) ===
@@ -523,6 +540,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Get pending exposure from resting orders (prevents position breach from multiple fills)
         let (pending_bid_exposure, pending_ask_exposure) = self.orders.pending_exposure();
 
+        // Compute centralized exposure budget: worst-case position if all orders fill.
+        // available_bid/ask_budget accounts for resting orders to prevent aggregate overexposure.
+        let position_now = self.position.position();
+        let available_bid_budget = (self.effective_max_position - position_now - pending_bid_exposure).max(0.0);
+        let available_ask_budget = (self.effective_max_position + position_now - pending_ask_exposure).max(0.0);
+
         // DEBUG: Log open order details for diagnosing skew issues
         let (bid_count, ask_count) = self.orders.order_counts();
         debug!(
@@ -530,8 +553,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             ask_orders = ask_count,
             pending_bid_exposure = %format!("{:.4}", pending_bid_exposure),
             pending_ask_exposure = %format!("{:.4}", pending_ask_exposure),
+            available_bid_budget = %format!("{:.4}", available_bid_budget),
+            available_ask_budget = %format!("{:.4}", available_ask_budget),
             total_orders = bid_count + ask_count,
-            "Open order state"
+            "Open order state + exposure budget"
         );
 
         // === PHASE 3: config.max_position IS the hard ceiling (InventoryGovernor principle) ===
@@ -817,6 +842,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Pending exposure from resting orders
             pending_bid_exposure,
             pending_ask_exposure,
+            available_bid_budget,
+            available_ask_budget,
             // Dynamic position limits (first principles)
             dynamic_max_position_value,
             dynamic_limit_valid,
@@ -2639,22 +2666,62 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             market_params.current_drawdown_frac = drawdown;
         }
 
-        // Capital-aware warmup bootstrap: small accounts get a warmup floor
-        // to prevent the death spiral (no fills → 10% warmup → inflated gamma → no fills).
-        // Bayesian priors give sufficient starting estimates for bootstrap_from_book tiers.
-        // Fill-based progress: fills/warmup_fill_target (Micro: 5, Small: 10, Large: 50).
+        // E6: Two-phase warmup bootstrap (observation-based, not fill-gated).
+        //
+        // Phase 1 (0→60%): Book-based. Advances from L2 data alone (kappa from book,
+        //   sigma from mid changes). Progress = vol_ticks / vol_target.
+        // Phase 2 (60→100%): Fill-based. Refines with own-fill kappa, AS calibration.
+        //   Progress = fills / fill_target.
+        //
+        // Combined: book_progress × 0.60 + fill_progress × 0.40
+        // Time-based escalation: if no fills after 120s with book data, floor = 0.70
         {
             let policy = &market_params.capital_policy;
-            // Bootstrap floor: tiers with bootstrap_from_book get a floor from priors
-            let bootstrap_floor: f64 = if policy.bootstrap_from_book { 0.40 } else { 0.0 };
-            // Fill-based progress scales by tier-specific target (not hardcoded 50)
             let fills = self.tier1.adverse_selection.fills_measured() as f64;
+
+            // Phase 1: Book-based progress (from estimator's volume ticks)
+            let (vol_ticks, min_vol_ticks, _trade_obs, _min_trades) = self.estimator.warmup_progress();
+            let book_progress = if min_vol_ticks > 0 {
+                (vol_ticks as f64 / min_vol_ticks as f64).min(1.0)
+            } else {
+                1.0
+            };
+
+            // Phase 2: Fill-based progress
             let fill_progress = if policy.warmup_fill_target > 0 {
                 (fills / policy.warmup_fill_target as f64).min(1.0)
             } else {
                 1.0
             };
-            let warmup_floor = bootstrap_floor.max(fill_progress);
+
+            // Combined two-phase warmup: book data contributes 60%, fills contribute 40%
+            let combined = book_progress * 0.60 + fill_progress * 0.40;
+
+            // Bootstrap floor: tiers with bootstrap_from_book get 0.60 floor once
+            // book has made some progress (>50%), preventing fill-gated stalling
+            let bootstrap_floor: f64 = if policy.bootstrap_from_book && book_progress > 0.5 {
+                0.60
+            } else if policy.bootstrap_from_book {
+                // Even without enough book data, give a small floor from Bayesian priors
+                0.30
+            } else {
+                0.0
+            };
+
+            // Time-based escalation: prevent indefinite stalling when fills are scarce.
+            // After 120s with book data but no fills, push floor to 0.70.
+            let time_floor = if let Some(first_data) = self.first_data_time {
+                let elapsed_s = first_data.elapsed().as_secs();
+                if elapsed_s >= 120 && fills < 1.0 && policy.bootstrap_from_book {
+                    0.70
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let warmup_floor = combined.max(bootstrap_floor).max(time_floor);
             if warmup_floor > 0.0 {
                 market_params.adaptive_warmup_progress =
                     market_params.adaptive_warmup_progress.max(warmup_floor);

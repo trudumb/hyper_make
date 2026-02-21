@@ -1,6 +1,9 @@
 ---
 name: fill-intensity-hawkes
 description: Model fill intensity using Hawkes processes for state-dependent kappa estimation. Use when upgrading from simple fill-rate kappa, building fill probability predictions, incorporating queue position dynamics, or adding Hyperliquid-specific features (funding, OI) to fill rate models.
+requires:
+  - measurement-infrastructure
+  - signal-audit
 user-invocable: false
 ---
 
@@ -200,3 +203,11 @@ These are set via `default_regime_multipliers()`. See [implementation.md](./impl
 ## Supporting Files
 
 - [implementation.md](./implementation.md) -- All Rust code: baseline intensity, excitation kernel, full model structs and methods, MLE estimation, online estimator, intensity-to-kappa conversion, validation, regime multipliers, quote engine integration
+
+---
+
+## Known Issues from Production
+
+- **Feb 10: Kappa cycle skip** — Raw kappa (~6400-7700 from L2) was compared against a 5000 threshold. Should have used `kappa_effective` (~3250, blended with adaptive floor). Feature was removed as redundant after the incident. Never compare raw kappa against thresholds — use `kappa_effective`.
+- **Feb 10: Duplicate on_trade double-counting** — Two `on_trade` calls in `handlers.rs` plus the canonical one in `messages/trades.rs` caused 2x kappa inflation. Removed the duplicates. Always verify there is exactly ONE call site for any fill/trade learning callback.
+- **Feb 20: Pearson correlation needs variance** — Drift estimator fill-quote autocorrelation returns warmup prior (0.3) when all fills are same direction (zero x-variance makes r undefined). Test with alternating patterns to verify echo detection.

@@ -6,6 +6,7 @@ maxTurns: 25
 permissionMode: plan
 skills:
   - risk-management
+  - live-incident-response
 memory: project
 ---
 
@@ -23,7 +24,7 @@ All paths relative to `src/market_maker/`:
 
 ## Plan Approval Required
 
-All changes require plan approval. Risk code bugs can cause immediate financial loss.
+All changes require plan approval. Risk code bugs can cause immediate financial loss. Enforced by `.claude/hooks/protected_paths.py`.
 
 ## Key Rules
 

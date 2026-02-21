@@ -2345,6 +2345,78 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
 
         // =====================================================================
+        // === E3: SWEEP CORRELATION GUARD (pre-scoring exposure check) ===
+        // =====================================================================
+        // Orders within a market sweep band are correlated. Total per-side exposure
+        // must respect position limits assuming ALL orders fill simultaneously.
+        // Trim proposed levels if worst-case position would exceed max_position.
+        {
+            let current_pos = self.position.position();
+            let max_pos = if self.config.max_position_user_specified {
+                self.effective_max_position.min(self.config.max_position)
+            } else {
+                self.effective_max_position
+            };
+
+            // Sum resting order exposure by side
+            let resting_bid_size: f64 = self.orders.get_all_by_side(Side::Buy)
+                .iter().map(|o| o.remaining()).sum();
+            let resting_ask_size: f64 = self.orders.get_all_by_side(Side::Sell)
+                .iter().map(|o| o.remaining()).sum();
+
+            // Proposed new exposure from target levels
+            let proposed_bid_size: f64 = bid_levels.iter().map(|l| l.size).sum();
+            let proposed_ask_size: f64 = ask_levels.iter().map(|l| l.size).sum();
+
+            // Worst case: all resting + all proposed fill simultaneously
+            let worst_long = current_pos + resting_bid_size + proposed_bid_size;
+            let worst_short = -current_pos + resting_ask_size + proposed_ask_size;
+
+            // Trim bids if worst-case long exceeds max
+            if worst_long > max_pos && !bid_levels.is_empty() {
+                let excess = worst_long - max_pos;
+                let mut to_trim = excess;
+                // Remove from furthest (last) level first
+                while to_trim > 0.0 && !bid_levels.is_empty() {
+                    let last = bid_levels.last_mut().unwrap();
+                    if last.size <= to_trim {
+                        to_trim -= last.size;
+                        bid_levels.pop();
+                    } else {
+                        last.size -= to_trim;
+                        to_trim = 0.0;
+                    }
+                }
+                info!(
+                    excess = %format!("{:.4}", excess),
+                    remaining_bid_levels = bid_levels.len(),
+                    "E3: Sweep guard trimmed bid levels to fit position limit"
+                );
+            }
+
+            // Trim asks if worst-case short exceeds max
+            if worst_short > max_pos && !ask_levels.is_empty() {
+                let excess = worst_short - max_pos;
+                let mut to_trim = excess;
+                while to_trim > 0.0 && !ask_levels.is_empty() {
+                    let last = ask_levels.last_mut().unwrap();
+                    if last.size <= to_trim {
+                        to_trim -= last.size;
+                        ask_levels.pop();
+                    } else {
+                        last.size -= to_trim;
+                        to_trim = 0.0;
+                    }
+                }
+                info!(
+                    excess = %format!("{:.4}", excess),
+                    remaining_ask_levels = ask_levels.len(),
+                    "E3: Sweep guard trimmed ask levels to fit position limit"
+                );
+            }
+        }
+
+        // =====================================================================
         // === ECONOMIC SCORING + BUDGET ALLOCATION (replaces priority_based_matching) ===
         // =====================================================================
 

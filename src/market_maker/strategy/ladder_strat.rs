@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 use crate::{round_to_significant_and_decimal, truncate_float, EPSILON};
 
 use crate::market_maker::config::{Quote, QuoteConfig, SizeQuantum};
+use crate::market_maker::config::auto_derive::CapitalTier;
 // VolatilityRegime removed - regime_scalar was redundant with vol_scalar
 use crate::market_maker::quoting::{
     BayesianFillModel, DepthSpacing, DynamicDepthConfig, DynamicDepthGenerator,
@@ -436,7 +437,29 @@ impl LadderStrategy {
             max_position,
             &self.risk_model_config,
         );
-        let gamma = self.risk_model.compute_gamma(&features);
+        let mut gamma = self.risk_model.compute_gamma(&features);
+
+        // E5: Micro-tier gamma boost — concentrated single-level exposure
+        // needs higher risk aversion to compensate for lack of diversification
+        if market_params.capital_tier == CapitalTier::Micro {
+            gamma *= 1.5;
+        }
+
+        // E6: Cap warmup gamma inflation — prevent uncertainty from inflating gamma
+        // beyond tier-specific limits. Compute gamma with zero uncertainty to get
+        // the "base" gamma, then cap the ratio to warmup_gamma_max_inflation.
+        if features.model_uncertainty > 0.0 {
+            let mut base_features = features.clone();
+            base_features.model_uncertainty = 0.0;
+            let base_gamma = self.risk_model.compute_gamma(&base_features);
+            if base_gamma > 0.0 {
+                let max_inflation = market_params.capital_policy.warmup_gamma_max_inflation;
+                let max_gamma = base_gamma * max_inflation;
+                if gamma > max_gamma {
+                    gamma = max_gamma;
+                }
+            }
+        }
 
         gamma.clamp(cfg.gamma_min, cfg.gamma_max)
     }
@@ -1375,6 +1398,32 @@ impl LadderStrategy {
             config_max
         };
 
+        // E5: Single-level mode — when capital only supports 1 level per side,
+        // enforce wider spreads to compensate for concentrated exposure.
+        // A 1-level strategy is a valid strategy, not a degenerate 10-level strategy.
+        // (Size capping applied later after available_for_bids/asks are computed.)
+        if capital_limited_levels <= 1 {
+            let policy = &market_params.capital_policy;
+            let min_half_spread = policy.single_level_min_spread_bps;
+            let spread_mult = policy.single_level_spread_mult;
+
+            // Widen touch depths to at least single_level_min_spread_bps per side,
+            // then apply the spread multiplier
+            for depth in dynamic_depths.bid.iter_mut() {
+                *depth = (*depth).max(min_half_spread) * spread_mult;
+            }
+            for depth in dynamic_depths.ask.iter_mut() {
+                *depth = (*depth).max(min_half_spread) * spread_mult;
+            }
+
+            info!(
+                min_half_spread_bps = %format!("{:.1}", min_half_spread),
+                spread_mult = %format!("{:.2}", spread_mult),
+                capital_tier = ?market_params.capital_tier,
+                "E5: Single-level spread widening active"
+            );
+        }
+
         // Create ladder config with dynamic depths and capital-limited levels
         let mut ladder_config = self
             .ladder_config
@@ -1634,6 +1683,44 @@ impl LadderStrategy {
                     "Kelly sizing cap applied"
                 );
                 (capped_bids, capped_asks)
+            } else {
+                (available_for_bids, available_for_asks)
+            };
+
+            // === EXPOSURE BUDGET CAP (E1: aggregate fill protection) ===
+            // Cap per-side sizing to the exposure budget's available capacity.
+            // This prevents the worst-case scenario where all resting + new orders
+            // fill simultaneously and push position beyond max_position.
+            let (available_for_bids, available_for_asks) = {
+                let budget_bid = market_params.available_bid_budget;
+                let budget_ask = market_params.available_ask_budget;
+                let capped_bids = if budget_bid < available_for_bids {
+                    tracing::debug!(
+                        raw = %format!("{:.4}", available_for_bids),
+                        budget = %format!("{:.4}", budget_bid),
+                        "Bid sizing capped by exposure budget"
+                    );
+                    budget_bid
+                } else {
+                    available_for_bids
+                };
+                let capped_asks = if budget_ask < available_for_asks {
+                    tracing::debug!(
+                        raw = %format!("{:.4}", available_for_asks),
+                        budget = %format!("{:.4}", budget_ask),
+                        "Ask sizing capped by exposure budget"
+                    );
+                    budget_ask
+                } else {
+                    available_for_asks
+                };
+                (capped_bids, capped_asks)
+            };
+
+            // E5: Single-level size cap — constrain sizing when capital only supports 1 level
+            let (available_for_bids, available_for_asks) = if capital_limited_levels <= 1 {
+                let max_frac = market_params.capital_policy.single_level_max_size_fraction;
+                (available_for_bids * max_frac, available_for_asks * max_frac)
             } else {
                 (available_for_bids, available_for_asks)
             };

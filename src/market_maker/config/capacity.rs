@@ -380,6 +380,20 @@ pub struct CapitalAwarePolicy {
     /// Wider range = more utility variation across levels = better size differentiation.
     /// Micro: 2.5, Small: 3.0, Medium: 4.0, Large: 5.0.
     pub depth_range_multiplier: f64,
+
+    // --- Scale-adaptive strategy (E5) ---
+    /// Spread multiplier when only 1 level per side. Wider = safer for concentrated exposure.
+    /// Micro: 1.5, Small: 1.3, Medium/Large: 1.0.
+    pub single_level_spread_mult: f64,
+    /// Minimum spread (bps) when only 1 level per side. Floor for single-level mode.
+    /// Micro: 8.0, Small: 6.0, Medium/Large: 0.0 (use GLFT output).
+    pub single_level_min_spread_bps: f64,
+    /// Max fraction of available budget in a single order. Caps concentration risk.
+    /// Micro: 0.70, Small: 0.80, Large: 1.0.
+    pub single_level_max_size_fraction: f64,
+    /// Maximum warmup gamma inflation multiplier. Caps death spiral from no-fill warmup.
+    /// Micro: 1.3, Small: 1.5, Medium: 1.8, Large: 2.0.
+    pub warmup_gamma_max_inflation: f64,
 }
 
 impl CapitalAwarePolicy {
@@ -407,6 +421,10 @@ impl CapitalAwarePolicy {
                 spread_compensation_mult: 1.15,
                 use_greedy_allocation: true,
                 depth_range_multiplier: 2.5,
+                single_level_spread_mult: 1.5,
+                single_level_min_spread_bps: 8.0,
+                single_level_max_size_fraction: 0.70,
+                warmup_gamma_max_inflation: 1.3,
             },
             CapitalTier::Small => Self {
                 tier,
@@ -429,6 +447,10 @@ impl CapitalAwarePolicy {
                 spread_compensation_mult: 1.05,
                 use_greedy_allocation: true,
                 depth_range_multiplier: 3.0,
+                single_level_spread_mult: 1.3,
+                single_level_min_spread_bps: 6.0,
+                single_level_max_size_fraction: 0.80,
+                warmup_gamma_max_inflation: 1.5,
             },
             CapitalTier::Medium => Self {
                 tier,
@@ -451,6 +473,10 @@ impl CapitalAwarePolicy {
                 spread_compensation_mult: 1.0,
                 use_greedy_allocation: false,
                 depth_range_multiplier: 4.0,
+                single_level_spread_mult: 1.0,
+                single_level_min_spread_bps: 0.0,
+                single_level_max_size_fraction: 1.0,
+                warmup_gamma_max_inflation: 1.8,
             },
             CapitalTier::Large => Self {
                 tier,
@@ -473,6 +499,10 @@ impl CapitalAwarePolicy {
                 spread_compensation_mult: 1.0,
                 use_greedy_allocation: false,
                 depth_range_multiplier: 5.0,
+                single_level_spread_mult: 1.0,
+                single_level_min_spread_bps: 0.0,
+                single_level_max_size_fraction: 1.0,
+                warmup_gamma_max_inflation: 2.0,
             },
         }
     }

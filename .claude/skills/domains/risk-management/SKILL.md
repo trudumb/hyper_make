@@ -247,3 +247,12 @@ These must ALWAYS hold — violations are bugs:
 | File | Description |
 |------|-------------|
 | [references/monitor-template.md](references/monitor-template.md) | Complete template for implementing a new RiskMonitor: trait skeleton, registration in RiskAggregator, testing requirements for all severity transitions, common patterns (threshold escalation, hysteresis, cooldown), and implementation checklist |
+
+---
+
+## Known Issues from Production
+
+- **Feb 9: Drawdown denominator bug** — `summary()` divided by `peak_pnl` (tiny after 1 fill, e.g. 0.002 USD) showing 1000%+ drawdown. Fixed to use `account_value` denominator with `min_peak_for_drawdown` guard. See `risk/state.rs:253-262`.
+- **Feb 12: Kill switch checkpoint persistence** — Kill switch `triggered=true` persists across restarts. After a kill switch event, must manually clear `kill_switch.triggered=false` in checkpoint or use `--max-position-usd` override. Without this, the system won't restart.
+- **Feb 12: Emergency clearing death spiral** — Emergency position clearing at 32% of max (threshold was 0.01 = 1%) combined with binary side-clearing created a feedback loop: clear → no bids → position can't reduce → re-trigger → permanent paralysis. Fixed with graduated widening (PositionZone: Green/Yellow/Red/Kill) instead of binary clear.
+- **Feb 18: Emergency threshold regime-wiring** — `max_position_fraction` now varies by regime (Calm=0.90, Normal=0.80, Volatile=0.70, Extreme=0.50). Moderate positions route through sigma spike (2x widening) rather than emergency clearing.

@@ -61,6 +61,10 @@ pub struct ParameterSources<'a> {
     pub pending_bid_exposure: f64,
     pub pending_ask_exposure: f64,
 
+    // Exposure budget: worst-case aggregate capacity per side
+    pub available_bid_budget: f64,
+    pub available_ask_budget: f64,
+
     // Dynamic position limits (first principles)
     /// Dynamic max position VALUE from kill switch (USD).
     /// Derived from: min(leverage_limit, volatility_limit)
@@ -434,6 +438,8 @@ impl ParameterAggregator {
             // Resting orders that would change position if filled
             pending_bid_exposure: sources.pending_bid_exposure,
             pending_ask_exposure: sources.pending_ask_exposure,
+            available_bid_budget: sources.available_bid_budget,
+            available_ask_budget: sources.available_ask_budget,
 
             // === Dynamic Position Limits (First Principles) ===
             // Convert VALUE limit to SIZE limit: max_position = max_value / price

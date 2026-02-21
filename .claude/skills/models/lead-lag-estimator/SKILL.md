@@ -1,6 +1,9 @@
 ---
 name: lead-lag-estimator
 description: Exploit Binance-Hyperliquid lead-lag (50-500ms) for microprice adjustment and quote skew. Use when building cross-exchange signals, adding directional microprice adjustment, improving adverse selection detection for arbitrage flow, or monitoring signal R-squared decay.
+requires:
+  - measurement-infrastructure
+  - signal-audit
 user-invocable: false
 ---
 

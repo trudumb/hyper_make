@@ -7,6 +7,7 @@ permissionMode: plan
 skills:
   - infrastructure-ops
   - quote-engine
+  - checkpoint-management
 memory: project
 ---
 
@@ -28,7 +29,7 @@ All paths relative to `src/market_maker/`:
 
 ## Plan Approval Required
 
-Changes to `orchestrator/` require plan approval before editing. This is the runtime core — bugs here cause immediate production impact.
+Changes to `orchestrator/` require plan approval before editing. This is the runtime core — bugs here cause immediate production impact. Enforced by `.claude/hooks/protected_paths.py`.
 
 ## Key Rules
 

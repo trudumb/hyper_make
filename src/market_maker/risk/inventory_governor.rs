@@ -43,6 +43,10 @@ pub struct PositionAssessment {
     /// Additive spread widening (bps) for position-increasing side.
     /// 0.0 in Green, ramps in Yellow, fixed in Red/Kill.
     pub increasing_side_addon_bps: f64,
+    /// Additive spread adjustment (bps) for position-REDUCING side.
+    /// Negative values TIGHTEN the reducing side to attract fills (Kill/Red zones).
+    /// 0.0 in Green/Yellow (no tightening needed).
+    pub reducing_side_addon_bps: f64,
 }
 
 /// Position budget with a min-viable floor that prevents compound reductions
@@ -217,22 +221,23 @@ impl InventoryGovernor {
         let yellow = self.config.yellow_threshold;
         let red = self.config.red_threshold;
 
-        let (zone, max_new_exposure, addon_bps) = if ratio >= 1.0 {
-            // Kill zone: position at or above max
-            (PositionZone::Kill, 0.0, self.config.kill_addon_bps)
+        let (zone, max_new_exposure, addon_bps, reducing_addon) = if ratio >= 1.0 {
+            // Kill zone: position at or above max.
+            // Tighten reducing side to attract fills and escape the overexposed state.
+            (PositionZone::Kill, 0.0, self.config.kill_addon_bps, -self.config.kill_reducing_addon_bps)
         } else if ratio >= red {
-            // Red zone: reduce-only
-            (PositionZone::Red, 0.0, self.config.red_addon_bps)
+            // Red zone: reduce-only. Mild tightening on reducing side.
+            (PositionZone::Red, 0.0, self.config.red_addon_bps, -self.config.kill_reducing_addon_bps * 0.5)
         } else if ratio >= yellow {
             // Yellow zone: bias toward reducing, cap new exposure
             let capped_exposure = remaining * 0.5;
             // Linear ramp: 0.0 at yellow_threshold, yellow_max_addon_bps at red_threshold
             let fraction = (ratio - yellow) / (red - yellow);
             let addon = self.config.yellow_max_addon_bps * fraction;
-            (PositionZone::Yellow, capped_exposure, addon)
+            (PositionZone::Yellow, capped_exposure, addon, 0.0)
         } else {
             // Green zone: full two-sided
-            (PositionZone::Green, remaining, 0.0)
+            (PositionZone::Green, remaining, 0.0, 0.0)
         };
 
         PositionAssessment {
@@ -242,6 +247,7 @@ impl InventoryGovernor {
             position,
             is_long,
             increasing_side_addon_bps: addon_bps,
+            reducing_side_addon_bps: reducing_addon,
         }
     }
 

@@ -1,6 +1,8 @@
 ---
 name: infrastructure-ops
 description: WebSocket management, event loop, rate limiting, reconnection, recovery, metrics, and order execution infrastructure. Use when working on orchestrator/, infra/, messages/, core/, fills/, or execution/ modules, debugging connectivity or order placement, adding message handlers, or investigating stale data and latency issues.
+requires:
+  - quote-engine
 user-invocable: false
 ---
 

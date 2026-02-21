@@ -215,8 +215,18 @@ impl RunStatistics {
         let sum_sq = self.sum_sq + prior.sum_sq;
 
         if n < 2.0 {
-            // Not enough data, use uninformative
-            return 0.1;
+            // Use prior-based Student-t (same distributional family as r>0).
+            // A flat constant (0.1) for r=0 creates structural bias: r=0 gets 0.1
+            // while r>0 gets ~0.01 for noisy data, causing spurious changepoints.
+            let prior_mean = if prior.n > 0.0 { prior.sum / prior.n } else { 0.0 };
+            let prior_var = if prior.n > 0.0 {
+                (prior.sum_sq / prior.n - prior_mean * prior_mean).max(1e-10)
+            } else {
+                1.0
+            };
+            let scale = prior_var.max(1.0).sqrt();
+            let t = (x - prior_mean) / scale;
+            return student_t_pdf(t, 2.0) / scale;
         }
 
         // Posterior parameters for Normal-Gamma
@@ -521,10 +531,19 @@ impl ChangepointDetector {
         self.run_statistics = new_stats;
         self.observation_count += 1;
 
-        // Update consecutive high-probability counter for confirmation logic
-        let cp_prob = self.changepoint_probability(5);
+        // Update consecutive high-probability counter for confirmation logic.
+        // During warmup, damp the cp_prob to prevent false positives from noisy
+        // early observations. The damping factor ramps linearly from 0→1 over
+        // warmup_observations, so early cycles have near-zero effective cp_prob.
+        let raw_cp_prob = self.changepoint_probability(5);
+        let damped_cp_prob = if self.warmup_observations > 0 && self.observation_count < self.warmup_observations {
+            let warmup_frac = self.observation_count as f64 / self.warmup_observations as f64;
+            raw_cp_prob * warmup_frac
+        } else {
+            raw_cp_prob
+        };
         let threshold = self.effective_threshold();
-        if cp_prob > threshold {
+        if damped_cp_prob > threshold {
             self.consecutive_high_prob += 1;
         } else {
             self.consecutive_high_prob = 0;

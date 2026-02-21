@@ -7,6 +7,10 @@ skills:
   - measurement-infrastructure
   - signal-audit
   - calibration-analysis
+  - fill-intensity-hawkes
+  - adverse-selection-classifier
+  - regime-detection-hmm
+  - lead-lag-estimator
 memory: project
 ---
 
@@ -23,16 +27,20 @@ All paths relative to `src/market_maker/`:
 - `calibration/` — Brier score, IR, conditional metrics, model gating, prediction logging
 - `edge/` — AB testing, signal health monitoring
 
+## Boundaries (hook-enforced)
+
+- **DO NOT edit** `strategy/signal_integration.rs` — propose changes to strategy agent
+- **DO NOT edit** any `mod.rs` re-exports — propose to the lead
+- These boundaries are enforced by `.claude/hooks/file_ownership.py`. Attempts will be blocked.
+
 ## Key Rules
 
-1. **Do NOT edit `signal_integration.rs`** — propose changes via messages to the strategy agent
-2. **Do NOT edit `mod.rs`** re-exports — propose to the lead
-3. Every new signal must have calibration metrics (Brier Score, IR)
-4. Every new estimator must have a warmup counter and confidence metric
-5. Use `#[serde(default)]` on all checkpoint fields for backward compat
-6. `kappa > 0.0` invariant must hold in all code paths
-7. Document units in variable names (`_bps`, `_s`, `_8h`)
-8. No hardcoded parameters — all values must be regime-dependent or configurable
+1. Every new signal must have calibration metrics (Brier Score, IR)
+2. Every new estimator must have a warmup counter and confidence metric
+3. Use `#[serde(default)]` on all checkpoint fields for backward compat
+4. `kappa > 0.0` invariant must hold in all code paths
+5. Document units in variable names (`_bps`, `_s`, `_8h`)
+6. No hardcoded parameters — all values must be regime-dependent or configurable
 
 ## Review Checklist
 

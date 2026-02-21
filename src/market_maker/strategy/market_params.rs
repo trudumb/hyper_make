@@ -548,6 +548,14 @@ pub struct MarketParams {
     /// Total remaining size on resting sell orders (would increase short if filled)
     pub pending_ask_exposure: f64,
 
+    // === Exposure Budget (Worst-Case Aggregate) ===
+    /// Available capacity for new buy orders, accounting for ALL resting + in-flight bids.
+    /// available_bid_budget = max_position - (position + resting_bids + inflight_bids)
+    pub available_bid_budget: f64,
+    /// Available capacity for new sell orders, accounting for ALL resting + in-flight asks.
+    /// available_ask_budget = max_position - (-position + resting_asks + inflight_asks)
+    pub available_ask_budget: f64,
+
     // === Dynamic Position Limits (First Principles) ===
     /// Dynamic max position SIZE derived from first-principles VALUE limit.
     /// Formula: dynamic_max_position = max_position_value / mid_price
@@ -1225,6 +1233,8 @@ impl Default for MarketParams {
             // Pending Exposure
             pending_bid_exposure: 0.0, // No resting orders initially
             pending_ask_exposure: 0.0, // No resting orders initially
+            available_bid_budget: f64::MAX, // Unconstrained until ExposureBudget wired
+            available_ask_budget: f64::MAX,
             // Dynamic Position Limits
             dynamic_max_position: 0.0,    // Will be set from kill switch
             dynamic_limit_valid: false,   // Not valid until margin state refreshed

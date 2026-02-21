@@ -6,6 +6,9 @@ maxTurns: 25
 skills:
   - quote-engine
   - stochastic-controller
+  - regime-detection-hmm
+  - risk-management
+  - lead-lag-estimator
 memory: project
 ---
 
@@ -23,7 +26,7 @@ All paths relative to `src/market_maker/`:
 - `stochastic/` — Bayesian beliefs, conjugate priors, HJB solver, continuation
 - `control/` — stochastic controller, value function, changepoint, actions
 
-## Exclusive Ownership
+## Exclusive Ownership (hook-enforced)
 
 **You are the only agent that edits `strategy/signal_integration.rs`**. Other agents propose changes to you via messages. This file is the central hub where all signals are integrated into the quoting pipeline.
 

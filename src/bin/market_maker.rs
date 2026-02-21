@@ -346,6 +346,12 @@ struct Cli {
     #[arg(long)]
     no_auto_paper: bool,
 
+    /// Paper trading balance in USD (default: 1000).
+    /// Used for auto-deriving position limits, liquidity, and gamma in paper mode.
+    /// Same auto_derive() pipeline as live — the only difference is the capital source.
+    #[arg(long, default_value = "1000.0")]
+    paper_balance: f64,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1119,8 +1125,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Resolved collateral token for DEX"
         );
         collateral_info
+    } else if dex.is_some() {
+        // HIP-3 DEX but meta.collateral_token is absent — attempt spot_meta lookup.
+        // Most HIP-3 DEXs use USDE (token index 235). Fall back to USDC only for
+        // validator perps (no --dex flag).
+        let spot_meta = info_client
+            .spot_meta()
+            .await
+            .map_err(|e| format!("Failed to get spot metadata for HIP-3 collateral: {e}"))?;
+        // Try USDE first (most common HIP-3 collateral)
+        let usde_info = CollateralInfo::from_token_index(235, &spot_meta);
+        warn!(
+            dex = %dex.as_deref().unwrap_or("?"),
+            assumed_collateral = %usde_info.symbol,
+            "HIP-3 DEX meta missing collateralToken field — assuming USDE (index 235)"
+        );
+        usde_info
     } else {
-        // No collateral_token in meta = validator perps = USDC
+        // No collateral_token in meta, no DEX = validator perps = USDC
         CollateralInfo::usdc()
     };
 
@@ -2505,27 +2527,90 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         max_decimals.saturating_sub(sz_decimals)
     });
 
-    // Position limit: conservative default for paper
-    let max_position = cli.max_position.unwrap_or(
-        config.trading.max_absolute_position_size.unwrap_or(1.0),
-    );
+    // === Paper auto-derive: same pipeline as live ===
+    // Query mark price for auto-derive (same API call live uses)
+    let paper_balance = cli.paper_balance;
+    let leverage = cli.leverage
+        .or(config.trading.leverage)
+        .unwrap_or(asset_meta.max_leverage as u32);
+    let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
+
+    let (max_position, derived_target_liquidity, derived_risk_aversion, _derived_capital_profile) =
+        if let Some(mp) = cli.max_position {
+            // Explicit override: respect user's choice (same as live path)
+            info!(
+                max_position = %format!("{:.4}", mp),
+                "Paper: Using explicit --max-position override"
+            );
+            (mp, None, None, None)
+        } else {
+            // Auto-derive: same pipeline as live
+            let asset_data_result = info_client_for_mm
+                .active_asset_data(user_address, asset.clone())
+                .await;
+            let mark_px: f64 = match &asset_data_result {
+                Ok(data) => data.mark_px.parse().unwrap_or(1.0),
+                Err(e) => {
+                    warn!("Failed to query asset data for paper auto-derive: {e}, using mark_px=1.0");
+                    1.0
+                }
+            };
+
+            let exchange_ctx = ExchangeContext {
+                mark_px,
+                account_value: paper_balance,
+                available_margin: paper_balance,
+                max_leverage: leverage as f64,
+                fee_bps: 1.5,
+                sz_decimals,
+                min_notional: 10.0,
+            };
+            let derived = auto_derive(paper_balance, spread_profile, &exchange_ctx);
+
+            info!(
+                paper_balance = %format!("${:.2}", paper_balance),
+                mark_px = %format!("${:.2}", mark_px),
+                derived_max_position = %format!("{:.4}", derived.max_position),
+                capital_tier = ?derived.capital_profile.tier,
+                viable_levels = derived.capital_profile.viable_levels_per_side,
+                derived_target_liquidity = %format!("{:.4}", derived.target_liquidity),
+                derived_risk_aversion = %format!("{:.3}", derived.risk_aversion),
+                "Paper auto-derive (same pipeline as live)"
+            );
+
+            if !derived.viable {
+                if let Some(ref diag) = derived.diagnostic {
+                    warn!("Paper auto-derive: {}", diag);
+                }
+            }
+
+            (
+                derived.max_position,
+                Some(derived.target_liquidity),
+                Some(derived.risk_aversion),
+                Some(derived.capital_profile),
+            )
+        };
 
     // Resolve collateral
     let collateral = if let Some(token_index) = meta.collateral_token {
         let spot_meta = info_client_for_mm.spot_meta().await
             .map_err(|e| format!("Failed to get spot metadata: {e}"))?;
         CollateralInfo::from_token_index(token_index, &spot_meta)
+    } else if dex.is_some() {
+        // HIP-3 DEX but meta.collateral_token absent — assume USDE (most common)
+        let spot_meta = info_client_for_mm.spot_meta().await
+            .map_err(|e| format!("Failed to get spot metadata for HIP-3 collateral: {e}"))?;
+        let usde_info = CollateralInfo::from_token_index(235, &spot_meta);
+        warn!(
+            dex = %dex.as_deref().unwrap_or("?"),
+            assumed_collateral = %usde_info.symbol,
+            "Paper: HIP-3 DEX meta missing collateralToken — assuming USDE (index 235)"
+        );
+        usde_info
     } else {
         CollateralInfo::usdc()
     };
-
-    info!(
-        asset = %asset,
-        duration_s = duration,
-        max_position = %max_position,
-        decimals = decimals,
-        "Starting paper trading mode"
-    );
 
     // Create PaperEnvironment
     let paper_config = PaperEnvironmentConfig {
@@ -2543,17 +2628,25 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     let paper_env = PaperEnvironment::new(paper_config, info_client);
 
     // Build MmConfig (same struct literal pattern as live, simplified)
-    // Paper trader uses conservative defaults when config values are None
-    let risk_aversion = cli.risk_aversion.or(config.trading.risk_aversion).unwrap_or(0.3);
-    let spread_profile = SpreadProfile::from_str(&cli.spread_profile);
+    // Paper trader uses auto-derived values, with CLI/config overrides taking priority
+    let risk_aversion = cli.risk_aversion
+        .or(config.trading.risk_aversion)
+        .or(derived_risk_aversion)
+        .unwrap_or(0.3);
 
     // Fee based on spread profile (same logic as live path)
     // Standard HL maker fee: 1.5 bps (add: 0.00015) — same for all profiles
     let fee_bps = 1.5_f64;
 
+    // Target liquidity: CLI > config > auto-derived > conservative default
+    let target_liquidity = cli.target_liquidity
+        .or(config.trading.target_liquidity)
+        .or(derived_target_liquidity)
+        .unwrap_or(0.01);
+
     let mm_config = MmConfig {
         asset: Arc::from(asset.as_str()),
-        target_liquidity: cli.target_liquidity.or(config.trading.target_liquidity).unwrap_or(0.01),
+        target_liquidity,
         risk_aversion,
         max_bps_diff: cli.max_bps_diff.or(config.trading.max_bps_diff).unwrap_or(5),
         max_position,
@@ -2583,6 +2676,17 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
         reference_symbol: cli.reference_symbol.clone()
             .or_else(|| auto_detect_reference(&asset)),
     };
+
+    info!(
+        asset = %asset,
+        duration_s = duration,
+        paper_balance = %format!("${:.2}", paper_balance),
+        max_position = %format!("{:.4}", max_position),
+        target_liquidity = %format!("{:.4}", target_liquidity),
+        risk_aversion = %format!("{:.3}", risk_aversion),
+        decimals = decimals,
+        "Starting paper trading mode (auto-derived)"
+    );
 
     // Create strategy — respect spread profile (same logic as live path)
     let risk_cfg = match spread_profile {
@@ -2730,10 +2834,7 @@ async fn run_paper_mode(cli: &Cli, duration: u64) -> Result<(), Box<dyn std::err
     }
 
     // Seed paper balance — without this, margin_available=0 and no orders are placed.
-    // Paper balance should be a realistic account size, NOT the max_position_usd (which
-    // is just the position limit). Default $1000 ensures orders pass the $10 minimum
-    // notional check even for low-priced assets.
-    let paper_balance = 1000.0_f64;
+    // Paper balance uses CLI --paper-balance (default $1000) for consistent auto-derive.
     market_maker = market_maker.with_paper_balance(paper_balance);
 
     // Run with optional duration

@@ -1,6 +1,8 @@
 ---
 name: signal-audit
 description: Measure predictive information content of signals using mutual information, correlation, and optimal lag analysis. Use before building models, when adding data sources, debugging signal decay, or selecting features. Covers MI estimation, regime-conditional analysis, and decay tracking.
+requires:
+  - measurement-infrastructure
 user-invocable: false
 ---
 

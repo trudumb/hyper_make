@@ -2,6 +2,8 @@
 name: live-incident-response
 description: Structured triage for live market maker incidents. Use when MM stops quoting, position spikes unexpectedly, kill switch triggers, spreads blow up, rate limits hit, or data goes stale. Decision-tree diagnosis with exact file:line references from past incidents.
 disable-model-invocation: true
+requires:
+  - risk-management
 argument-hint: "[symptom-description]"
 ---
 

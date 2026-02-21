@@ -28,4 +28,6 @@ Agent teams enabled via `.claude/settings.json`. Custom agents in `.claude/agent
 
 ## File Ownership
 
+See `.claude/ownership.json` for the machine-readable ownership manifest (enforced by hooks).
+
 The lead owns: `src/market_maker/mod.rs`, `config/`, `belief/`, `multi/`, `latent/`, `src/bin/`, `src/exchange/`, `src/ws/`, `src/info/`, `src/lib.rs`, `.claude/`, `Cargo.toml`

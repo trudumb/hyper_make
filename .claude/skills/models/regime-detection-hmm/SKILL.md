@@ -1,6 +1,8 @@
 ---
 name: regime-detection-hmm
 description: Bayesian belief tracking over market states (Quiet/Trending/Volatile/Cascade) using Hidden Markov Models. Use when implementing regime-dependent parameters, building aggressive/defensive decisions, debugging regime-specific losses, or replacing hard-coded volatility thresholds with smooth probability blending.
+requires:
+  - measurement-infrastructure
 user-invocable: false
 ---
 
@@ -175,3 +177,11 @@ See [implementation.md](./implementation.md#economic-value-backtest) for full co
 ## Supporting Files
 
 - [implementation.md](./implementation.md) -- All Rust code: state space enum, emission model, HMM params, online filter, regime params, parameter blending, Baum-Welch learning, quote engine integration, validation
+
+---
+
+## Known Issues from Production
+
+- **Feb 10: Cold-start staleness 2.0x** — `staleness_spread_multiplier()` penalized signals with `observation_count == 0` (cold-start) the same as signals that lost data (actually stale). Added `was_ever_warmed_up()` guard to distinguish "never had data" from "lost data."
+- **Feb 12: Regime stuck in Normal** — BUG 3 from mainnet audit. Regime detection was not updating because the kappa multiplier path was dead. Fixed by wiring regime-conditioned kappa multiplier through the HMM belief system.
+- **Feb 20: Regime gamma routing** — Regime risk now routes through `regime_gamma_multiplier` (Calm=1.0, Normal=1.2, Volatile=2.0, Extreme=3.0) instead of floor clamping. This gives continuous risk scaling rather than discrete jumps at regime boundaries.

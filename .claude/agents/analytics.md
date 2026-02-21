@@ -6,6 +6,8 @@ maxTurns: 25
 skills:
   - calibration-analysis
   - daily-calibration-report
+  - measurement-infrastructure
+  - signal-audit
 memory: project
 ---
 

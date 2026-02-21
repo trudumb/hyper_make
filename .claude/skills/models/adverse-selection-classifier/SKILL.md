@@ -1,6 +1,8 @@
 ---
 name: adverse-selection-classifier
 description: Predict informed vs noise trades for dynamic spread/kappa adjustment. Use when building AS prediction, debugging fill losses, adding liquidation cascade detection, or tuning toxic flow response. Covers trade classification, 26-feature engineering, MLP classifier, and real-time integration.
+requires:
+  - measurement-infrastructure
 user-invocable: false
 ---
 
@@ -178,3 +180,11 @@ See [implementation.md](./implementation.md) for the `ClassifierValidation` stru
 ## Supporting Files
 
 - [implementation.md](./implementation.md) -- All Rust code: feature structs, classifiers, training loop, real-time integration, liquidation detector, validation
+
+---
+
+## Known Issues from Production
+
+- **Feb 12 (Mainnet): 2x AS overestimate** — AS classifier double-counted in certain flow conditions, leading to spreads wider than necessary. The fix introduced markout-based AS exclusively (deferred fill-time AS).
+- **Feb 18: Binary side-clearing via TOXICITY CANCEL** — Code path cleared ALL quotes on one side when toxicity was high. This created a death spiral (no bids → position can't reduce → more toxicity → permanent quote loss). TOXICITY CANCEL was deleted. Route toxicity through AS spread multipliers instead. Binary side-clearing is ALWAYS wrong.
+- **Feb 20: AS deduplication** — Vol compensation `0.5*gamma*sigma^2*T` is already in GLFT. Must subtract it from measured AS before adding the residual: `as_net = max(0, as_raw - vol_floor)`. Without dedup, AS and GLFT vol compensation double-count.

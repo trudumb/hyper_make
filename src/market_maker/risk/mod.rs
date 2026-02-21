@@ -40,6 +40,7 @@
 mod aggregator;
 mod circuit_breaker;
 mod drawdown;
+pub mod exposure_budget;
 mod inventory_governor;
 mod kill_switch;
 mod limits;

@@ -585,6 +585,12 @@ impl RegimeState {
     /// Standalone method for external callers that want to inject CP evidence
     /// outside the normal `update()` cycle.
     pub fn inject_changepoint_evidence(&mut self, cp_probability: f64) {
+        // Guard: skip boost entirely for low cp_probability to prevent
+        // continuous belief erosion from noisy changepoint detectors.
+        // Without this, cp_prob=0.1 every cycle slowly shifts beliefs toward Volatile.
+        if cp_probability < 0.3 {
+            return;
+        }
         let mut beliefs = [0.25, 0.25, 0.25, 0.25];
         Self::apply_changepoint_evidence_to(&mut beliefs, cp_probability);
         let target = BlendedRegimeParams::from_beliefs(&beliefs);

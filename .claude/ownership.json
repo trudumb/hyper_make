@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "description": "File ownership manifest. Referenced by hooks and agent docs. Source of truth for agent file boundaries.",
+  "base_path": "src/market_maker/",
+  "agents": {
+    "signals": {
+      "owns": [
+        "estimator/*",
+        "adverse_selection/*",
+        "calibration/*",
+        "edge/*"
+      ],
+      "exclusive": [],
+      "cannot_edit": [
+        "strategy/signal_integration.rs"
+      ]
+    },
+    "strategy": {
+      "owns": [
+        "strategy/*",
+        "quoting/*",
+        "process_models/*",
+        "stochastic/*",
+        "control/*"
+      ],
+      "exclusive": [
+        "strategy/signal_integration.rs"
+      ],
+      "cannot_edit": []
+    },
+    "infra": {
+      "owns": [
+        "orchestrator/*",
+        "infra/*",
+        "messages/*",
+        "core/*",
+        "fills/*",
+        "execution/*",
+        "events/*"
+      ],
+      "exclusive": [],
+      "cannot_edit": [],
+      "plan_required": [
+        "orchestrator/*"
+      ]
+    },
+    "analytics": {
+      "owns": [
+        "analytics/*",
+        "learning/*",
+        "tracking/*",
+        "simulation/*",
+        "checkpoint/*",
+        "adaptive/*"
+      ],
+      "exclusive": [],
+      "cannot_edit": []
+    },
+    "risk": {
+      "owns": [
+        "risk/*",
+        "safety/*",
+        "monitoring/*"
+      ],
+      "exclusive": [],
+      "cannot_edit": [],
+      "plan_required": [
+        "risk/*",
+        "safety/*"
+      ]
+    },
+    "lead": {
+      "owns": [
+        "mod.rs",
+        "config/*",
+        "belief/*",
+        "multi/*",
+        "latent/*"
+      ],
+      "exclusive": [
+        "mod.rs"
+      ],
+      "also_owns": [
+        "src/bin/*",
+        "src/exchange/*",
+        "src/ws/*",
+        "src/info/*",
+        "src/lib.rs",
+        ".claude/*",
+        "Cargo.toml"
+      ]
+    }
+  },
+  "global_rules": {
+    "mod_rs_reexports": "lead-only -- propose changes via message",
+    "signal_integration": "strategy-only -- other agents propose via message"
+  }
+}
