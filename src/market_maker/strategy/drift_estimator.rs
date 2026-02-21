@@ -208,15 +208,20 @@ impl KalmanDriftEstimator {
     /// Trend observation from multi-timeframe trend detector.
     ///
     /// z = -magnitude × agreement × p_continuation
-    /// R = σ_trend² / agreement² (higher agreement = lower noise = more weight)
-    pub fn update_trend(&mut self, magnitude: f64, agreement: f64, p_continuation: f64) {
+    /// R = σ_trend² / agreement² × r_multiplier
+    ///
+    /// `r_multiplier` inflates observation noise to attenuate echo signals on thin venues.
+    /// - 1.0 = default (LiquidCex), 5.0+ = ThinDex (heavily distrust trend)
+    /// - Combined from venue_base, lambda-adaptive, and echo estimator
+    pub fn update_trend(&mut self, magnitude: f64, agreement: f64, p_continuation: f64, r_multiplier: f64) {
         if agreement < 0.1 || !magnitude.is_finite() {
             return;
         }
 
         let z = -magnitude * agreement * p_continuation;
         let sigma_trend = 2.0;
-        let r = sigma_trend * sigma_trend / (agreement * agreement).max(0.01);
+        let base_r = sigma_trend * sigma_trend / (agreement * agreement).max(0.01);
+        let r = base_r * r_multiplier.max(0.1);
         self.update_single_observation(z, r);
     }
 
@@ -241,6 +246,20 @@ impl KalmanDriftEstimator {
     /// This is what enters the GLFT formula: r = S + μτ − γΣqτ
     pub fn drift_rate_per_sec(&self) -> f64 {
         self.state_mean / 10_000.0
+    }
+
+    /// James-Stein shrunken drift rate (fractional per second).
+    /// drift_shrunk = drift × max(0, 1 - P/drift²)
+    /// SNR < 1 → returns 0. SNR >> 1 → returns near-raw.
+    /// Prevents noisy sub-threshold drift from creating phantom skew.
+    pub fn shrunken_drift_rate_per_sec(&self) -> f64 {
+        let drift_bps = self.state_mean;
+        let drift_sq = drift_bps * drift_bps;
+        if drift_sq < 1e-12 {
+            return 0.0;
+        }
+        let shrinkage = (1.0 - self.state_variance / drift_sq).max(0.0);
+        (drift_bps * shrinkage) / 10_000.0
     }
 
     /// Posterior drift in bps/sec (for logging).
@@ -541,8 +560,8 @@ mod tests {
         let mut est = KalmanDriftEstimator::default();
         est.last_update_ms = now_ms();
 
-        // Strong bearish trend with high agreement
-        est.update_trend(5.0, 0.9, 0.8);
+        // Strong bearish trend with high agreement (r_multiplier=1.0 for LiquidCex)
+        est.update_trend(5.0, 0.9, 0.8, 1.0);
 
         // z = -5.0 * 0.9 * 0.8 = -3.6, R = 4.0 / 0.81 ≈ 4.94
         assert!(
@@ -904,5 +923,56 @@ mod tests {
             cascade_drift,
             recovered_drift
         );
+    }
+
+    #[test]
+    fn test_shrunken_drift_zeros_low_snr() {
+        let mut est = KalmanDriftEstimator::default();
+        // SNR < 1: drift=0.78, P=2.0 → drift²=0.608, P/drift²=3.29 → shrinkage=0
+        est.state_mean = 0.78;
+        est.state_variance = 2.0;
+        assert_eq!(
+            est.shrunken_drift_rate_per_sec(),
+            0.0,
+            "Sub-threshold drift (SNR<1) should be shrunk to zero"
+        );
+    }
+
+    #[test]
+    fn test_shrunken_drift_partial_at_moderate_snr() {
+        let mut est = KalmanDriftEstimator::default();
+        // SNR = 2: drift=2.0, P=2.0 → drift²=4.0, shrinkage=0.5 → effective=1.0 bps
+        est.state_mean = 2.0;
+        est.state_variance = 2.0;
+        let shrunk = est.shrunken_drift_rate_per_sec();
+        let expected_bps = 1.0; // 2.0 * 0.5
+        let expected_frac = expected_bps / 10_000.0;
+        assert!(
+            (shrunk - expected_frac).abs() < 1e-10,
+            "Moderate SNR should give partial shrinkage: got {shrunk}, expected {expected_frac}"
+        );
+    }
+
+    #[test]
+    fn test_shrunken_drift_preserves_strong_signal() {
+        let mut est = KalmanDriftEstimator::default();
+        // SNR = 12.5: drift=5.0, P=2.0 → drift²=25.0, shrinkage=0.92
+        est.state_mean = 5.0;
+        est.state_variance = 2.0;
+        let shrunk = est.shrunken_drift_rate_per_sec();
+        let raw = est.drift_rate_per_sec();
+        let retention = shrunk / raw;
+        assert!(
+            retention > 0.9,
+            "Strong signal should be mostly preserved: retention={retention:.3}"
+        );
+    }
+
+    #[test]
+    fn test_shrunken_drift_zero_drift_returns_zero() {
+        let mut est = KalmanDriftEstimator::default();
+        est.state_mean = 0.0;
+        est.state_variance = 2.0;
+        assert_eq!(est.shrunken_drift_rate_per_sec(), 0.0);
     }
 }

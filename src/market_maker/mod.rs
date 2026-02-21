@@ -333,6 +333,9 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Used by quote_engine to blend with fill-count warmup.
     /// 0.0 = cold-start (no prior), 1.0 = fully calibrated fresh prior.
     prior_confidence: f64,
+    /// Source mode of the injected prior ("paper", "live", or "").
+    /// Used for ConvergenceSnapshot logging.
+    prior_source_mode: String,
 
     // === RL Agent Control ===
     // REMOVED — RL superseded by SpreadBandit (contextual bandit).
@@ -403,16 +406,36 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Bayesian drift estimator: fuses all directional signals into posterior μ.
     drift_estimator: strategy::drift_estimator::KalmanDriftEstimator,
 
+    // === Trend Echo Attenuation (Fix 13) ===
+    /// Hysteresis gate for trend feeding drift Kalman.
+    /// Must earn past return_autocorrelation > 0.12 before activating.
+    /// Cold start = false (gate off).
+    trend_gate_active: bool,
+    /// Tracks self-echo vs external signal contribution to trend changes.
+    echo_estimator: strategy::echo_estimator::EchoEstimator,
+
     // === Cancel-on-Toxicity (Session 2 Sprint 2.2) ===
     /// Last time bid ladder was cleared due to high toxicity.
     last_toxicity_cancel_bid: Option<std::time::Instant>,
     /// Last time ask ladder was cleared due to high toxicity.
     last_toxicity_cancel_ask: Option<std::time::Instant>,
 
+    // === Phase 14: Information-Gain Cycle Timer === //
+    pub cycle_state_changes: crate::market_maker::orchestrator::event_accumulator::CycleStateChanges,
+    pub cycle_timer: crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer,
+
     // === Cancel-Race AS Tracking (Sprint 6.3) ===
     /// Tracks adverse selection from cancel-race events (cancel sent, fill arrived first).
     /// Excess race AS feeds into spread floor to protect against latency disadvantage.
     pub cancel_race_tracker: adverse_selection::CancelRaceTracker,
+
+    // === Q18: Vol Sampling Bias Tracker ===
+    /// Tracks fill-conditioned sampling bias in volatility estimation.
+    /// σ̂ conditioned on fills overweights volatile regimes.
+    /// Diagnostics-only for Phase 1; Phase 2 adds importance weighting.
+    sampling_bias_tracker: estimator::SamplingBiasTracker,
+    /// Fill count at the start of the current quote cycle (for had_fill detection).
+    last_bias_fill_count: usize,
 }
 
 impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
@@ -612,6 +635,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             checkpoint_manager: None,
             last_checkpoint_save: std::time::Instant::now(),
             prior_confidence: 0.0, // Updated by inject_prior
+            prior_source_mode: String::new(),
             // Phase 4: RL agent control fields removed (now SpreadBandit)
             // Experience logging (disabled by default, enabled via with_experience_logging)
             experience_logger: None,
@@ -646,9 +670,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             reference_perp_drift_ema: 0.0,
             reference_perp_last_update_ms: 0,
             drift_estimator: strategy::drift_estimator::KalmanDriftEstimator::default(),
+            trend_gate_active: false,
+            echo_estimator: strategy::echo_estimator::EchoEstimator::default(),
             last_toxicity_cancel_bid: None,
             last_toxicity_cancel_ask: None,
+            cycle_state_changes: crate::market_maker::orchestrator::event_accumulator::CycleStateChanges::default(),
+            cycle_timer: crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer::new(),
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
+            // Q18: Vol sampling bias tracker (diagnostics Phase 1)
+            sampling_bias_tracker: estimator::SamplingBiasTracker::new(),
+            last_bias_fill_count: 0,
         }
     }
 
@@ -804,8 +835,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
     /// Raises threshold from 0.50 → 0.85 and requires 2 confirmations,
     /// reducing false changepoints from noisy thin-book data.
     pub fn set_changepoint_regime_thin_dex(&mut self) {
-        use control::MarketRegime;
-        self.stochastic.controller.set_changepoint_regime(MarketRegime::ThinDex);
+        use crate::market_maker::config::RegimeProfile;
+        self.stochastic.controller.set_changepoint_regime_profile(&RegimeProfile::thin_dex());
     }
 
     /// Enable experience logging for RL SARSA tuples.
@@ -840,8 +871,12 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
     /// Assemble a checkpoint bundle from current state.
     fn assemble_checkpoint_bundle(&self) -> checkpoint::CheckpointBundle {
-        let (vol_filter, informed_flow, fill_rate, kappa_own, kappa_bid, kappa_ask, momentum) =
+        let (mut vol_filter, informed_flow, fill_rate, kappa_own, kappa_bid, kappa_ask, momentum, kappa_orchestrator_cp) =
             self.estimator.to_checkpoint();
+
+        // Q18: Populate bias tracker fields on vol_filter checkpoint
+        vol_filter.bias_fill_intervals = self.sampling_bias_tracker.fill_intervals();
+        vol_filter.bias_nonfill_intervals = self.sampling_bias_tracker.nonfill_intervals();
 
         checkpoint::CheckpointBundle {
             metadata: checkpoint::CheckpointMetadata {
@@ -879,6 +914,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     ewma_losses: kt.avg_loss(),
                     n_losses: total.saturating_sub(n_wins),
                     decay: 0.99,
+                    horizon_ms: self.learning.config().prediction_horizon_ms,
                 }
             },
             ensemble_weights: checkpoint::EnsembleWeightsCheckpoint {
@@ -894,6 +930,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             kill_switch: self.safety.kill_switch.to_checkpoint(),
             readiness: checkpoint::PriorReadiness::default(),
             calibration_coordinator: self.calibration_coordinator.clone(),
+            kappa_orchestrator: kappa_orchestrator_cp,
             prior_confidence: 0.0,
         }
     }
@@ -927,6 +964,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .restore_from_checkpoint(&bundle.kill_switch);
         // Restore calibration coordinator (L2-derived kappa blending state)
         self.calibration_coordinator = bundle.calibration_coordinator.clone();
+        // Q18: Restore bias tracker intervals from checkpoint
+        self.sampling_bias_tracker.restore(
+            bundle.vol_filter.bias_fill_intervals,
+            bundle.vol_filter.bias_nonfill_intervals,
+        );
     }
 
     // =========================================================================
@@ -1011,6 +1053,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> checkpoint::PriorInject
         );
         let prior_conf = gate.confidence(prior, age_s);
         self.prior_confidence = prior_conf.overall;
+        self.prior_source_mode = prior.metadata.source_mode.clone();
 
         info!(
             asset = %prior.metadata.asset,
@@ -1196,6 +1239,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             max_ladder_one_side_contracts: self.safety.kill_switch.state().max_ladder_one_side_contracts,
             // Preserve initial position from startup for runaway exemption
             initial_position: self.safety.kill_switch.state().initial_position,
+            // Q20: Stuck inventory state (preserved from kill switch state)
+            position_stuck_cycles: self.safety.kill_switch.state().position_stuck_cycles,
+            unrealized_as_cost_usd: self.safety.kill_switch.state().unrealized_as_cost_usd,
+            has_reducing_quotes: self.safety.kill_switch.state().has_reducing_quotes,
+            prev_mid_for_stuck: self.safety.kill_switch.state().prev_mid_for_stuck,
         };
 
         // Update position in kill switch (for value calculation)

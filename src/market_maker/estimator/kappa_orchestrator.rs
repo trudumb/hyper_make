@@ -209,6 +209,10 @@ pub(crate) struct KappaOrchestrator {
     /// but we don't revert to the warmup blending formula.
     has_exited_warmup: bool,
 
+    /// Cumulative own-fill count (never decremented by rolling window expiry).
+    /// Survives checkpoint restore so warmup graduation persists across restarts.
+    total_own_fills: u64,
+
     /// EWMA of (kappa_book - kappa_robust) for empirical bias tracking
     book_robust_bias_ewma: f64,
     /// EWMA of (kappa_robust - kappa_robust_prev)^2 for robust variance tracking
@@ -246,6 +250,8 @@ impl KappaOrchestrator {
             smoothed_kappa_initialized: false,
             // Start in warmup mode - will graduate permanently after 5 fills
             has_exited_warmup: false,
+            // Cumulative fill count (persisted across restarts)
+            total_own_fills: 0,
             // Precision-weighted blending stats (initialized to 0, warm up naturally)
             book_robust_bias_ewma: 0.0,
             robust_rolling_var: 0.0,
@@ -300,10 +306,12 @@ impl KappaOrchestrator {
     /// Post-warmup: Full confidence-weighted blending of all sources.
     /// As own-fill confidence grows, it dominates the estimate.
     fn kappa_raw(&self) -> f64 {
-        // CRITICAL: Warmup detection uses observation count, NOT posterior confidence
-        // own_kappa.confidence() returns 93% just from tight prior, NOT from data
-        let min_own_fills = 5;
-        let has_own_fills = self.own_kappa.observation_count() >= min_own_fills;
+        // CRITICAL: Warmup detection uses cumulative fill count, NOT rolling-window observation count.
+        // own_kappa.confidence() returns 93% just from tight prior, NOT from data.
+        // total_own_fills survives restarts via checkpoint persistence, unlike observation_count()
+        // which resets when old fills expire from the rolling window.
+        let min_own_fills: u64 = 5;
+        let has_own_fills = self.total_own_fills >= min_own_fills;
 
         // Get market signals
         let book_kappa = self.book_kappa.kappa();
@@ -457,8 +465,8 @@ impl KappaOrchestrator {
         bool,       // is_warmup (market signal used with prior blend)
     ) {
         // Mirror the warmup logic from kappa_raw exactly
-        let min_own_fills = 5;
-        let has_own_fills = self.own_kappa.observation_count() >= min_own_fills;
+        let min_own_fills: u64 = 5;
+        let has_own_fills = self.total_own_fills >= min_own_fills;
         // CRITICAL: Use has_exited_warmup to match kappa_raw() logic
         let is_warmup = !has_own_fills && !self.has_exited_warmup;
 
@@ -565,7 +573,9 @@ impl KappaOrchestrator {
                 book = %format!("{:.0} ({:.0}%)", k_book, w_book * 100.0),
                 robust = %format!("{:.0} ({:.0}%)", k_robust, w_robust * 100.0),
                 prior = %format!("{:.0} ({:.0}%)", k_prior, w_prior * 100.0),
-                own_fills = self.own_kappa.observation_count(),
+                own_fills_rolling = self.own_kappa.observation_count(),
+                total_own_fills = self.total_own_fills,
+                has_exited_warmup = self.has_exited_warmup,
                 outliers = self.robust_kappa.outlier_count(),
                 warmup = is_warmup,
                 "Kappa orchestrator breakdown"
@@ -585,12 +595,16 @@ impl KappaOrchestrator {
         // Feed to own-fill Bayesian estimator
         self.own_kappa.on_trade(timestamp_ms, price, size, mid);
 
+        // Increment cumulative fill count (never decremented, survives restarts)
+        self.total_own_fills += 1;
+
         // Check for warmup exit transition (prevents re-entry bug)
-        // Once we have 5+ own fills, we "graduate" from warmup PERMANENTLY.
-        // This prevents kappa from swinging 2-3x when old fills expire.
-        const MIN_OWN_FILLS_FOR_WARMUP_EXIT: usize = 5;
+        // Once we have 5+ cumulative fills, we "graduate" from warmup PERMANENTLY.
+        // Uses total_own_fills (cumulative) instead of observation_count() (rolling window)
+        // so graduation survives restarts via checkpoint persistence.
+        const MIN_OWN_FILLS_FOR_WARMUP_EXIT: u64 = 5;
         if !self.has_exited_warmup
-            && self.own_kappa.observation_count() >= MIN_OWN_FILLS_FOR_WARMUP_EXIT
+            && self.total_own_fills >= MIN_OWN_FILLS_FOR_WARMUP_EXIT
         {
             self.has_exited_warmup = true;
             tracing::info!(
@@ -690,6 +704,38 @@ impl KappaOrchestrator {
     /// Get robust kappa observation count.
     pub(crate) fn robust_kappa_obs_count(&self) -> u64 {
         self.robust_kappa.observation_count()
+    }
+
+    /// Get cumulative own-fill count for diagnostics.
+    #[allow(dead_code)] // Used in tests and future checkpoint diagnostics
+    pub(crate) fn total_own_fills(&self) -> u64 {
+        self.total_own_fills
+    }
+
+    /// Get warmup graduation status for diagnostics.
+    #[allow(dead_code)] // Used in tests and future checkpoint diagnostics
+    pub(crate) fn has_exited_warmup(&self) -> bool {
+        self.has_exited_warmup
+    }
+
+    /// Extract checkpoint state for persistence.
+    pub(crate) fn to_checkpoint(&self) -> crate::market_maker::checkpoint::KappaOrchestratorCheckpoint {
+        crate::market_maker::checkpoint::KappaOrchestratorCheckpoint {
+            has_exited_warmup: self.has_exited_warmup,
+            total_own_fills: self.total_own_fills,
+        }
+    }
+
+    /// Restore checkpoint state from persistence.
+    pub(crate) fn restore_from_checkpoint(&mut self, cp: &crate::market_maker::checkpoint::KappaOrchestratorCheckpoint) {
+        self.total_own_fills = cp.total_own_fills;
+        self.has_exited_warmup = cp.has_exited_warmup;
+        if self.has_exited_warmup {
+            tracing::info!(
+                total_own_fills = cp.total_own_fills,
+                "Kappa orchestrator restored from checkpoint (warmup already graduated)"
+            );
+        }
     }
 
     /// Update the prior kappa used for regularization.
@@ -895,5 +941,53 @@ mod tests {
             "Book should have <0.1% weight when biased, got {:.6}",
             book_tau / robust_tau
         );
+    }
+
+    #[test]
+    fn test_kappa_checkpoint_round_trip() {
+        let mut orch = KappaOrchestrator::new(KappaOrchestratorConfig::default());
+        let mid = 100.0;
+
+        // Add fills to exit warmup
+        for i in 0..10 {
+            let fill_price = mid * (1.0 + 0.001);
+            orch.on_own_fill(i * 1000, fill_price, 1.0, mid);
+        }
+
+        assert!(orch.has_exited_warmup());
+        assert_eq!(orch.total_own_fills(), 10);
+
+        // Save checkpoint
+        let cp = orch.to_checkpoint();
+        assert!(cp.has_exited_warmup);
+        assert_eq!(cp.total_own_fills, 10);
+
+        // Create fresh orchestrator and restore
+        let mut orch2 = KappaOrchestrator::new(KappaOrchestratorConfig::default());
+        assert!(!orch2.has_exited_warmup());
+        assert_eq!(orch2.total_own_fills(), 0);
+
+        orch2.restore_from_checkpoint(&cp);
+        assert!(orch2.has_exited_warmup());
+        assert_eq!(orch2.total_own_fills(), 10);
+
+        // Verify warmup is NOT re-entered (even though rolling window is empty)
+        let (_, _, _, _, is_warmup) = orch2.component_breakdown();
+        assert!(!is_warmup, "Should not re-enter warmup after checkpoint restore");
+    }
+
+    #[test]
+    fn test_total_own_fills_never_decrements() {
+        let mut orch = KappaOrchestrator::new(KappaOrchestratorConfig::default());
+        let mid = 100.0;
+
+        for i in 0..3 {
+            orch.on_own_fill(i * 1000, mid * 1.001, 1.0, mid);
+        }
+        assert_eq!(orch.total_own_fills(), 3);
+
+        // total_own_fills should only go up
+        orch.on_own_fill(3000, mid * 1.001, 1.0, mid);
+        assert_eq!(orch.total_own_fills(), 4);
     }
 }

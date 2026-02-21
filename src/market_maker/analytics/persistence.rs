@@ -8,7 +8,7 @@ use super::attribution::SignalPnLAttributor;
 use super::edge_metrics::EdgeSnapshot;
 #[cfg(test)]
 use super::edge_metrics::EdgePhase;
-use super::sharpe::SharpeSummary;
+use super::sharpe::{EquityCurveSummary, SharpeSummary};
 use super::CycleContributions;
 
 /// JSONL file writer for analytics persistence.
@@ -20,6 +20,8 @@ pub struct AnalyticsLogger {
     contributions_writer: BufWriter<File>,
     signal_pnl_writer: BufWriter<File>,
     edge_writer: BufWriter<File>,
+    equity_sharpe_writer: BufWriter<File>,
+    gamma_calibration_writer: BufWriter<File>,
 }
 
 impl AnalyticsLogger {
@@ -45,6 +47,8 @@ impl AnalyticsLogger {
             contributions_writer: open_append("signal_contributions.jsonl")?,
             signal_pnl_writer: open_append("signal_pnl.jsonl")?,
             edge_writer: open_append("edge_validation.jsonl")?,
+            equity_sharpe_writer: open_append("equity_sharpe_metrics.jsonl")?,
+            gamma_calibration_writer: open_append("gamma_calibration.jsonl")?,
         })
     }
 
@@ -84,12 +88,26 @@ impl AnalyticsLogger {
         writeln!(self.edge_writer, "{json}")
     }
 
+    /// Log an equity-curve Sharpe summary as one JSONL line.
+    pub fn log_equity_sharpe(&mut self, summary: &EquityCurveSummary) -> std::io::Result<()> {
+        let json = serde_json::to_string(summary)?;
+        writeln!(self.equity_sharpe_writer, "{json}")
+    }
+
+    /// Log a per-fill gamma calibration record for offline regression.
+    pub fn log_gamma_calibration(&mut self, record: &GammaCalibrationRecord) -> std::io::Result<()> {
+        let json = serde_json::to_string(record)?;
+        writeln!(self.gamma_calibration_writer, "{json}")
+    }
+
     /// Flush all writers to disk.
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.sharpe_writer.flush()?;
         self.contributions_writer.flush()?;
         self.signal_pnl_writer.flush()?;
         self.edge_writer.flush()?;
+        self.equity_sharpe_writer.flush()?;
+        self.gamma_calibration_writer.flush()?;
         Ok(())
     }
 }
@@ -100,6 +118,31 @@ struct SignalPnlSnapshot {
     active_pnl_bps: f64,
     inactive_pnl_bps: f64,
     marginal_value_bps: f64,
+}
+
+/// Per-fill record for offline gamma calibration regression.
+///
+/// Captures the feature vector, gamma used, and realized AS at fill time.
+/// After 2-3 sessions, load gamma_calibration.jsonl and:
+/// 1. Bin by toxicity deciles, compute mean(realized_as_bps) per bin
+/// 2. Compute gamma_needed such that GLFT spread >= E[AS|features] + fees
+/// 3. Regress ln(gamma_needed / gamma_base) on feature vector → posterior betas
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GammaCalibrationRecord {
+    /// Timestamp in nanoseconds.
+    pub timestamp_ns: u64,
+    /// Toxicity score [0, 1] at fill time.
+    pub toxicity: f64,
+    /// Cascade intensity [0, 1] at fill time.
+    pub cascade: f64,
+    /// Tail risk intensity [0, 1] at fill time.
+    pub tail_risk: f64,
+    /// Gamma value used for the fill.
+    pub gamma_used: f64,
+    /// Realized adverse selection (5s markout, unsigned bps).
+    pub realized_as_bps: f64,
+    /// Half-spread at fill time (bps).
+    pub spread_bps: f64,
 }
 
 #[cfg(test)]
@@ -129,6 +172,8 @@ mod tests {
         assert!(dir.join("signal_contributions.jsonl").exists());
         assert!(dir.join("signal_pnl.jsonl").exists());
         assert!(dir.join("edge_validation.jsonl").exists());
+        assert!(dir.join("equity_sharpe_metrics.jsonl").exists());
+        assert!(dir.join("gamma_calibration.jsonl").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

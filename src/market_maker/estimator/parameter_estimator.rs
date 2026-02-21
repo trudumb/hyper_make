@@ -1856,6 +1856,7 @@ impl ParameterEstimator {
     // === Checkpoint persistence ===
 
     /// Extract checkpoint state from all sub-estimators.
+    #[allow(clippy::type_complexity)]
     pub fn to_checkpoint(
         &self,
     ) -> (
@@ -1866,6 +1867,7 @@ impl ParameterEstimator {
         crate::market_maker::checkpoint::KappaCheckpoint,
         crate::market_maker::checkpoint::KappaCheckpoint,
         crate::market_maker::checkpoint::MomentumCheckpoint,
+        crate::market_maker::checkpoint::KappaOrchestratorCheckpoint,
     ) {
         (
             self.volatility_filter.to_checkpoint(),
@@ -1875,6 +1877,7 @@ impl ParameterEstimator {
             self.own_kappa_bid.to_checkpoint(),
             self.own_kappa_ask.to_checkpoint(),
             self.momentum_model.to_checkpoint(),
+            self.kappa_orchestrator.to_checkpoint(),
         )
     }
 
@@ -1890,6 +1893,7 @@ impl ParameterEstimator {
         self.own_kappa_bid.restore_checkpoint(&bundle.kappa_bid);
         self.own_kappa_ask.restore_checkpoint(&bundle.kappa_ask);
         self.momentum_model.restore_checkpoint(&bundle.momentum);
+        self.kappa_orchestrator.restore_from_checkpoint(&bundle.kappa_orchestrator);
 
         // Recover adapted kappa prior from the own_kappa checkpoint.
         // The prior_alpha/prior_beta in the checkpoint reflect any prior adaptation

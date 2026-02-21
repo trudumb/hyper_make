@@ -115,7 +115,9 @@ pub use volatility::{
     BlendedParameters, RegimeBeliefState, RegimeParameterBlender, RegimeParameterConfig,
     StochasticVolParams, VolatilityRegime,
 };
-pub use volatility_filter::{VolFilterConfig, VolParticle, VolRegimeParams, VolatilityFilter};
+pub use volatility_filter::{
+    SamplingBiasTracker, VolFilterConfig, VolParticle, VolRegimeParams, VolatilityFilter,
+};
 
 // Mutual information for feature quality assessment
 pub use mutual_info::{

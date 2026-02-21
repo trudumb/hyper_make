@@ -164,6 +164,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             if prev_mid > 0.0 && self.latest_mid > 0.0 {
                 let return_bps = (self.latest_mid - prev_mid) / prev_mid * 10_000.0;
                 self.stochastic.threshold_kappa.update(return_bps);
+                
+                // Track information gain for AdaptiveCycleTimer
+                self.cycle_state_changes.mid_move_bps += return_bps.abs();
             }
 
             // === Price Velocity Tracking (Flash Crash Detection) ===
@@ -222,6 +225,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                                 ref_mid,
                                 current_time_ms as i64,
                             );
+                            
+                            // Fix 13: Update EchoEstimator on external reference move
+                            // If reference mid changed, feed the current trend magnitude
+                            if (ref_mid - self.prev_reference_perp_mid).abs() > 0.0 {
+                                let position_value = (self.position.position().abs() * self.latest_mid).max(1.0);
+                                let trend_signal = self.estimator.trend_signal(position_value);
+                                self.echo_estimator.update_on_reference_move(trend_signal.long_momentum_bps.abs());
+                            }
                         }
                     }
                 }
@@ -546,6 +557,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
             // Add to buffer
             self.cached_trades.push_back((size, is_buy, timestamp_ms));
+            
+            // Track information gain for AdaptiveCycleTimer
+            self.cycle_state_changes.trades_observed += 1;
 
             // Keep bounded
             while self.cached_trades.len() > MAX_CACHED_TRADES {
@@ -915,6 +929,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Feed fill to Kalman drift estimator: bid fill → bearish, ask fill → bullish
             let sigma = self.estimator.sigma_effective();
             self.drift_estimator.update_fill(is_buy, fill_price, self.latest_mid, sigma);
+
+            // Fix 13: Update EchoEstimator with current trend magnitude on own fill
+            let position_value = (self.position.position().abs() * self.latest_mid).max(1.0);
+            let trend_signal = self.estimator.trend_signal(position_value);
+            self.echo_estimator.update_on_fill(trend_signal.long_momentum_bps.abs());
 
             // GM fill update on microprice V̂: adversarial evidence shifts fair value
             // Ask fill (they bought from us) → V̂ shifts upward
@@ -2078,6 +2097,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // === Tombstone cleanup: expire cancelled-order tombstones older than TTL ===
         self.safety.fill_processor.cleanup_tombstones();
 
+        // === Equity Curve Snapshot: Portfolio-level Sharpe tracking ===
+        {
+            let pnl_snap = self.tier2.pnl_tracker.summary(self.latest_mid);
+            let total_equity_usd = pnl_snap.total_pnl;
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            self.live_analytics.snapshot_equity(now_ns, total_equity_usd);
+        }
+
         // === Live Analytics: Periodic summary (Sharpe, signal attribution) ===
         let mean_edge = self.tier2.edge_tracker.mean_realized_edge();
         let logged_summary = self.live_analytics.maybe_log_summary(mean_edge);
@@ -2085,12 +2115,29 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // === PnL Summary (only when analytics summary fires, to avoid log spam) ===
         if logged_summary {
             let pnl_summary = self.tier2.pnl_tracker.summary(self.latest_mid);
+
+            // PnL decomposition: spread capture, AS, funding, fees, unrealized
             tracing::info!(
                 realized = %format!("${:.2}", pnl_summary.realized_pnl),
                 unrealized = %format!("${:.2}", pnl_summary.unrealized_pnl),
                 total = %format!("${:.2}", pnl_summary.total_pnl),
+                spread_capture = %format!("${:.2}", pnl_summary.spread_capture),
+                adverse_selection = %format!("${:.2}", pnl_summary.adverse_selection),
+                funding = %format!("${:.2}", pnl_summary.funding),
+                fees = %format!("${:.2}", pnl_summary.fees),
                 fills = pnl_summary.fill_count,
-                "[PnL] session summary"
+                "[PnL] session decomposition"
+            );
+
+            // Equity Sharpe alongside fill Sharpe (clearly labeled)
+            let eq_summary = self.live_analytics.equity_summary();
+            tracing::info!(
+                fill_sharpe = %format!("{:.2}", self.live_analytics.sharpe_tracker().sharpe_ratio()),
+                equity_sharpe = %format!("{:.2}", eq_summary.sharpe_all),
+                equity_sharpe_1h = %format!("{:.2}", eq_summary.sharpe_1h),
+                max_dd_bps = %format!("{:.1}", eq_summary.max_drawdown_bps),
+                equity_snapshots = eq_summary.snapshot_count,
+                "[ANALYTICS] fill vs equity Sharpe"
             );
         }
 

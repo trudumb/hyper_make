@@ -89,6 +89,24 @@ pub struct KillSwitchConfig {
 
     /// Enable/disable the kill switch (for testing)
     pub enabled: bool,
+
+    // === Q20: Stuck Inventory Detection ===
+    /// Maximum consecutive cycles with significant position but no reducing quotes
+    /// before kill switch triggers. Default: 30 (~5 min at 10s/cycle).
+    pub max_stuck_cycles: u32,
+    /// Warning threshold in stuck cycles — triggers `ForceReducingQuotes`.
+    /// Default: 10 (~100s at 10s/cycle).
+    pub stuck_warning_cycles: u32,
+    /// Minimum position fraction of max to consider "stuck".
+    /// Default: 0.10 (10% of max_position).
+    pub position_stuck_threshold_fraction: f64,
+    /// Unrealized AS cost (fraction of max_position_notional) that triggers warning.
+    /// Dollar threshold = max_position_value × this fraction.
+    /// Default: 0.01 (1% → ~$2 for $200 max).
+    pub unrealized_as_warn_fraction: f64,
+    /// Unrealized AS cost (fraction of max_position_notional) that triggers kill.
+    /// Default: 0.05 (5% → ~$10 for $200 max).
+    pub unrealized_as_kill_fraction: f64,
 }
 
 impl Default for KillSwitchConfig {
@@ -112,6 +130,12 @@ impl Default for KillSwitchConfig {
             position_velocity_threshold: 0.20,
             max_absolute_drawdown: 5.0, // Conservative $5 default
             enabled: true,
+            // Q20: Stuck inventory defaults
+            max_stuck_cycles: 30,
+            stuck_warning_cycles: 10,
+            position_stuck_threshold_fraction: 0.10,
+            unrealized_as_warn_fraction: 0.01,
+            unrealized_as_kill_fraction: 0.05,
         }
     }
 }
@@ -153,6 +177,12 @@ impl KillSwitchConfig {
             // Catches small-capital scenarios where percentage check is bypassed.
             max_absolute_drawdown: (max_position_usd * 0.02).max(1.0),
             enabled: true,
+            // Q20 defaults
+            max_stuck_cycles: 30,
+            stuck_warning_cycles: 10,
+            position_stuck_threshold_fraction: 0.10,
+            unrealized_as_warn_fraction: 0.01,
+            unrealized_as_kill_fraction: 0.05,
         }
     }
 
@@ -344,6 +374,48 @@ pub enum KillReason {
         position_delta: f64,
         max_position: f64,
     },
+    /// Inventory stuck: position cannot be reduced through normal quoting.
+    /// Triggered when stuck_cycles or unrealized_as_cost exceeds thresholds.
+    InventoryStuck {
+        stuck_cycles: u32,
+        unrealized_as_cost_usd: f64,
+        cause: StuckCause,
+    },
+}
+
+/// Cause of stuck inventory for diagnostics.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StuckCause {
+    /// E[PnL] filter says all reducing quotes are negative EV
+    EpnlBlocking,
+    /// Reducing quotes exist but keep getting adversely filled
+    AdverseSelection,
+    /// Reducing side has no takers
+    NoLiquidity,
+    /// Unknown / multiple causes
+    Unknown,
+}
+
+impl std::fmt::Display for StuckCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EpnlBlocking => write!(f, "E[PnL] filter blocking"),
+            Self::AdverseSelection => write!(f, "adverse selection"),
+            Self::NoLiquidity => write!(f, "no liquidity"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Escalation level for stuck inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckEscalation {
+    /// No stuck condition detected
+    None,
+    /// Warning: force reducing quotes at progressively wider spreads
+    ForceReducingQuotes,
+    /// Kill: trigger kill switch
+    Kill,
 }
 
 impl std::fmt::Display for KillReason {
@@ -400,6 +472,16 @@ impl std::fmt::Display for KillReason {
                     20.0 // display the threshold percentage
                 )
             }
+            KillReason::InventoryStuck {
+                stuck_cycles,
+                unrealized_as_cost_usd,
+                cause,
+            } => {
+                write!(
+                    f,
+                    "Inventory stuck: {stuck_cycles} cycles, ${unrealized_as_cost_usd:.2} unrealized AS cost ({cause})"
+                )
+            }
         }
     }
 }
@@ -431,6 +513,17 @@ pub struct KillSwitchState {
     /// Position at startup (pre-existing). Used to exempt inherited positions from
     /// the runaway check — reduce-only mode handles these, not the kill switch.
     pub initial_position: f64,
+
+    // === Q20: Stuck Inventory Detection ===
+    /// Consecutive cycles with significant position but no reducing quotes.
+    pub position_stuck_cycles: u32,
+    /// Cumulative adverse mid-move against position (USD).
+    /// Only counts moves against the position (conservative: never credits favorable moves).
+    pub unrealized_as_cost_usd: f64,
+    /// Whether reducing-side quotes exist in the current ladder.
+    pub has_reducing_quotes: bool,
+    /// Previous mid price for computing mid-move per cycle.
+    pub prev_mid_for_stuck: f64,
 }
 
 impl Default for KillSwitchState {
@@ -447,6 +540,11 @@ impl Default for KillSwitchState {
             leverage: 1.0,
             max_ladder_one_side_contracts: 0.0,
             initial_position: 0.0,
+            // Q20: Stuck inventory
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
+            has_reducing_quotes: true,
+            prev_mid_for_stuck: 0.0,
         }
     }
 }
@@ -941,6 +1039,103 @@ impl KillSwitch {
         }
         None
     }
+
+    /// Q20: Report reducing quote status and update stuck inventory detection.
+    ///
+    /// Called each quote cycle with:
+    /// - `position`: current inventory
+    /// - `mid_price`: current mid price
+    /// - `max_position_contracts`: configured max position
+    /// - `has_reducing_quotes`: whether the ladder has quotes on the reducing side
+    ///
+    /// Returns the escalation level: None, ForceReducingQuotes, or Kill.
+    pub fn report_reducing_quote_status(
+        &self,
+        position: f64,
+        mid_price: f64,
+        max_position_contracts: f64,
+        has_reducing_quotes: bool,
+    ) -> StuckEscalation {
+        let config = self.config.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+
+        let position_threshold = max_position_contracts * config.position_stuck_threshold_fraction;
+
+        // If position is below threshold, reset stuck detection
+        if position.abs() < position_threshold {
+            state.position_stuck_cycles = 0;
+            state.unrealized_as_cost_usd = 0.0;
+            state.has_reducing_quotes = true;
+            state.prev_mid_for_stuck = mid_price;
+            return StuckEscalation::None;
+        }
+
+        // If we have reducing quotes, reset cycle counter (but keep AS cost tracking)
+        if has_reducing_quotes {
+            state.position_stuck_cycles = 0;
+            state.has_reducing_quotes = true;
+        } else {
+            state.position_stuck_cycles += 1;
+            state.has_reducing_quotes = false;
+        }
+
+        // Compute unrealized adverse mid-move
+        if state.prev_mid_for_stuck > 0.0 && mid_price > 0.0 {
+            let mid_move_against = if position > 0.0 {
+                (state.prev_mid_for_stuck - mid_price).max(0.0) // long, market dropping
+            } else {
+                (mid_price - state.prev_mid_for_stuck).max(0.0) // short, market rising
+            };
+            state.unrealized_as_cost_usd += position.abs() * mid_move_against;
+        }
+        state.prev_mid_for_stuck = mid_price;
+
+        // Compute dollar thresholds from config fractions
+        let warn_usd = config.max_position_value * config.unrealized_as_warn_fraction;
+        let kill_usd = config.max_position_value * config.unrealized_as_kill_fraction;
+
+        // Check kill conditions (either cycles OR cost)
+        if state.position_stuck_cycles >= config.max_stuck_cycles
+            || state.unrealized_as_cost_usd >= kill_usd
+        {
+            let cause = if !has_reducing_quotes {
+                StuckCause::EpnlBlocking
+            } else {
+                StuckCause::Unknown
+            };
+            tracing::error!(
+                stuck_cycles = state.position_stuck_cycles,
+                unrealized_as_cost_usd = %format!("{:.2}", state.unrealized_as_cost_usd),
+                kill_threshold_usd = %format!("{:.2}", kill_usd),
+                position = %format!("{:.4}", position),
+                cause = %cause,
+                "Q20: Inventory stuck — triggering kill switch"
+            );
+            return StuckEscalation::Kill;
+        }
+
+        // Check warning conditions
+        if state.position_stuck_cycles >= config.stuck_warning_cycles
+            || state.unrealized_as_cost_usd >= warn_usd
+        {
+            tracing::warn!(
+                stuck_cycles = state.position_stuck_cycles,
+                unrealized_as_cost_usd = %format!("{:.2}", state.unrealized_as_cost_usd),
+                warn_threshold_usd = %format!("{:.2}", warn_usd),
+                position = %format!("{:.4}", position),
+                "Q20: Inventory stuck — forcing reducing quotes"
+            );
+            return StuckEscalation::ForceReducingQuotes;
+        }
+
+        StuckEscalation::None
+    }
+
+    /// Q20: Get current stuck inventory state (for diagnostics).
+    pub fn stuck_state(&self) -> (u32, f64) {
+        let state = self.state.lock().unwrap();
+        (state.position_stuck_cycles, state.unrealized_as_cost_usd)
+    }
 }
 
 /// Summary of kill switch status for logging/monitoring.
@@ -1000,6 +1195,9 @@ impl KillSwitch {
             peak_pnl: state.peak_pnl,
             triggered_at_ms,
             saved_at_ms: now_ms,
+            // Q20: Stuck inventory state
+            position_stuck_cycles: state.position_stuck_cycles,
+            unrealized_as_cost_usd: state.unrealized_as_cost_usd,
         }
     }
 
@@ -1027,6 +1225,9 @@ impl KillSwitch {
             let mut state = self.state.lock().unwrap();
             state.daily_pnl = checkpoint.daily_pnl;
             state.peak_pnl = checkpoint.peak_pnl;
+            // Q20: Restore stuck inventory state (same-day only)
+            state.position_stuck_cycles = checkpoint.position_stuck_cycles;
+            state.unrealized_as_cost_usd = checkpoint.unrealized_as_cost_usd;
         } else {
             let checkpoint_day = checkpoint.saved_at_ms / MS_PER_DAY;
             let current_day = now_ms / MS_PER_DAY;
@@ -1561,6 +1762,8 @@ mod tests {
             peak_pnl: 50.0,
             triggered_at_ms: twenty_five_hours_ago,
             saved_at_ms: twenty_five_hours_ago,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1589,6 +1792,8 @@ mod tests {
             peak_pnl: 0.0,
             triggered_at_ms: now_ms,
             saved_at_ms: now_ms,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1618,6 +1823,8 @@ mod tests {
             peak_pnl: 0.0,
             triggered_at_ms: yesterday_ms,
             saved_at_ms: yesterday_ms,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1650,6 +1857,8 @@ mod tests {
             peak_pnl: 10.0,
             triggered_at_ms: one_min_ago,
             saved_at_ms: one_min_ago,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1681,6 +1890,8 @@ mod tests {
             peak_pnl: 0.0,
             triggered_at_ms: twelve_hours_ago,
             saved_at_ms: twelve_hours_ago,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1719,6 +1930,8 @@ mod tests {
             peak_pnl: 0.0,
             triggered_at_ms: yesterday_ms,
             saved_at_ms: yesterday_ms,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1754,6 +1967,8 @@ mod tests {
             peak_pnl: 200.0,
             triggered_at_ms: yesterday_ms,
             saved_at_ms: yesterday_ms,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -1778,6 +1993,8 @@ mod tests {
             peak_pnl: 1.0,
             triggered_at_ms: 0,
             saved_at_ms: 0, // simulates old checkpoint without this field
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         };
 
         ks.restore_from_checkpoint(&checkpoint);
@@ -2040,5 +2257,152 @@ mod tests {
         // This test just verifies validate_for_capital doesn't panic
         let ks = KillSwitch::new(KillSwitchConfig::default());
         ks.validate_for_capital(100.0); // $500 max_daily_loss > $100 account -> should warn
+    }
+
+    // === Q20: Stuck Inventory Detection Tests ===
+
+    #[test]
+    fn test_stuck_counter_increments_and_resets() {
+        let config = KillSwitchConfig {
+            max_stuck_cycles: 30,
+            stuck_warning_cycles: 10,
+            position_stuck_threshold_fraction: 0.10,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Position below threshold — no stuck
+        let result = ks.report_reducing_quote_status(0.05, 100.0, 1.0, false);
+        assert_eq!(result, StuckEscalation::None);
+        assert_eq!(ks.stuck_state().0, 0);
+
+        // Position above threshold, no reducing quotes — starts counting
+        let result = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        assert_eq!(result, StuckEscalation::None);
+        assert_eq!(ks.stuck_state().0, 1);
+
+        // Another cycle without reducing quotes
+        let result = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        assert_eq!(result, StuckEscalation::None);
+        assert_eq!(ks.stuck_state().0, 2);
+
+        // Reducing quotes appear — resets cycle counter
+        let result = ks.report_reducing_quote_status(0.5, 100.0, 1.0, true);
+        assert_eq!(result, StuckEscalation::None);
+        assert_eq!(ks.stuck_state().0, 0);
+    }
+
+    #[test]
+    fn test_unrealized_as_cost_accumulates() {
+        let config = KillSwitchConfig {
+            max_position_value: 200.0,
+            unrealized_as_warn_fraction: 0.01,
+            unrealized_as_kill_fraction: 0.05,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Long position, market dropping
+        let _ = ks.report_reducing_quote_status(3.0, 100.0, 10.0, false);
+        // Mid drops from 100 to 99.9 = 0.1 drop, position=3 → cost = 3 * 0.1 = 0.3
+        let _ = ks.report_reducing_quote_status(3.0, 99.9, 10.0, false);
+        let (_, cost) = ks.stuck_state();
+        assert!((cost - 0.3).abs() < 0.01, "Expected ~$0.30, got ${cost:.2}");
+
+        // Mid drops more: 99.9 → 99.5 = 0.4 drop → cost += 3 * 0.4 = 1.2
+        let _ = ks.report_reducing_quote_status(3.0, 99.5, 10.0, false);
+        let (_, cost) = ks.stuck_state();
+        assert!((cost - 1.5).abs() < 0.01, "Expected ~$1.50, got ${cost:.2}");
+    }
+
+    #[test]
+    fn test_unrealized_as_cost_resets_on_small_position() {
+        let config = KillSwitchConfig::default();
+        let ks = KillSwitch::new(config);
+
+        // Build up cost
+        let _ = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        let _ = ks.report_reducing_quote_status(0.5, 99.0, 1.0, false);
+        assert!(ks.stuck_state().1 > 0.0);
+
+        // Position drops below threshold → resets
+        let _ = ks.report_reducing_quote_status(0.05, 99.0, 1.0, false);
+        assert_eq!(ks.stuck_state().1, 0.0);
+    }
+
+    #[test]
+    fn test_cost_threshold_triggers_before_cycle_threshold() {
+        let config = KillSwitchConfig {
+            max_position_value: 100.0,
+            max_stuck_cycles: 30,
+            stuck_warning_cycles: 10,
+            unrealized_as_warn_fraction: 0.01,  // $1 warn
+            unrealized_as_kill_fraction: 0.05,   // $5 kill
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Big position, market moves fast against us
+        let _ = ks.report_reducing_quote_status(5.0, 100.0, 10.0, false);
+        // Drop from 100 to 99.0 → cost = 5 * 1.0 = $5.0 (kill threshold)
+        let result = ks.report_reducing_quote_status(5.0, 99.0, 10.0, false);
+        assert_eq!(result, StuckEscalation::Kill);
+        // Only 2 cycles, not 30 — cost triggered first
+        assert!(ks.stuck_state().0 < 30);
+    }
+
+    #[test]
+    fn test_cycle_threshold_triggers_in_flat_market() {
+        let config = KillSwitchConfig {
+            max_position_value: 10_000.0,
+            max_stuck_cycles: 5,
+            stuck_warning_cycles: 3,
+            unrealized_as_warn_fraction: 0.01,
+            unrealized_as_kill_fraction: 0.05,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Flat market: mid barely moves, but position stuck without reducing quotes
+        for _ in 0..3 {
+            let result = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+            if result == StuckEscalation::ForceReducingQuotes {
+                // Warning triggered by cycle count
+                return;
+            }
+        }
+        let result = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        assert_eq!(result, StuckEscalation::ForceReducingQuotes);
+    }
+
+    #[test]
+    fn test_stuck_kill_trigger() {
+        let config = KillSwitchConfig {
+            max_stuck_cycles: 3,
+            stuck_warning_cycles: 2,
+            ..Default::default()
+        };
+        let ks = KillSwitch::new(config);
+
+        // Accumulate to kill threshold
+        for _ in 0..3 {
+            let _ = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        }
+        let result = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        assert_eq!(result, StuckEscalation::Kill);
+    }
+
+    #[test]
+    fn test_checkpoint_stuck_persistence() {
+        let config = KillSwitchConfig::default();
+        let ks = KillSwitch::new(config);
+
+        // Accumulate some stuck state
+        let _ = ks.report_reducing_quote_status(0.5, 100.0, 1.0, false);
+        let _ = ks.report_reducing_quote_status(0.5, 99.5, 1.0, false);
+
+        let checkpoint = ks.to_checkpoint();
+        assert!(checkpoint.position_stuck_cycles > 0);
+        assert!(checkpoint.unrealized_as_cost_usd > 0.0);
     }
 }

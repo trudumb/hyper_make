@@ -82,96 +82,267 @@ impl QuoteOutcome {
     }
 }
 
-/// Bin for tracking fill rates at different spread levels.
+/// Posterior estimate of fill rate from Beta distribution.
+#[derive(Debug, Clone, Copy)]
+pub struct FillRateEstimate {
+    /// Posterior mean = α/(α+β)
+    pub mean: f64,
+    /// Posterior variance = αβ/((α+β)²(α+β+1))
+    pub variance: f64,
+    /// Total observations in this bin
+    pub n_observations: u64,
+    /// Whether hierarchical blend is active (variance may be understated)
+    pub blend_active: bool,
+}
+
+impl FillRateEstimate {
+    /// Variance with 1.5x multiplier when hierarchical blend is active.
+    /// Use this instead of raw `variance` — accounts for heuristic blending
+    /// understating true uncertainty during the transition regime.
+    pub fn variance_adjusted(&self) -> f64 {
+        if self.blend_active {
+            self.variance * 1.5
+        } else {
+            self.variance
+        }
+    }
+
+    /// Standard deviation (adjusted for blend).
+    pub fn std_adjusted(&self) -> f64 {
+        self.variance_adjusted().sqrt()
+    }
+}
+
+/// Bin for tracking fill rates at different spread levels using Beta posteriors.
 #[derive(Debug, Clone)]
 pub struct SpreadBin {
     /// Lower bound of bin (bps)
     pub lo_bps: f64,
     /// Upper bound of bin (bps)
     pub hi_bps: f64,
-    /// Number of fills in this bin
-    pub fills: u64,
-    /// Total quotes in this bin
-    pub total: u64,
+    /// Beta posterior alpha (pseudo-count of fills = prior + observed)
+    pub alpha: f64,
+    /// Beta posterior beta (pseudo-count of misses = prior + observed)
+    pub beta: f64,
+    /// Raw observed fills (for checkpoint/diagnostics, excludes prior)
+    pub observed_fills: u64,
+    /// Raw observed total (for checkpoint/diagnostics, excludes prior)
+    pub observed_total: u64,
 }
 
+/// Shrinkage rate: fine bin accumulates ~50 obs before mostly ignoring coarse parent.
+const HIERARCHICAL_TAU: f64 = 50.0;
+
+/// Initial prior weight for hierarchical blending.
+const HIERARCHICAL_PRIOR_WEIGHT: f64 = 5.0;
+
 impl SpreadBin {
-    fn fill_rate(&self) -> f64 {
-        if self.total == 0 {
-            0.0
+    /// Create a new bin with uniform Beta(1,1) prior.
+    fn new(lo_bps: f64, hi_bps: f64) -> Self {
+        Self {
+            lo_bps,
+            hi_bps,
+            alpha: 1.0,
+            beta: 1.0,
+            observed_fills: 0,
+            observed_total: 0,
+        }
+    }
+
+    /// Record an observation: fill or miss.
+    fn record(&mut self, filled: bool) {
+        if filled {
+            self.alpha += 1.0;
+            self.observed_fills += 1;
         } else {
-            self.fills as f64 / self.total as f64
+            self.beta += 1.0;
+        }
+        self.observed_total += 1;
+    }
+
+    /// Posterior mean of fill rate (own data only, no hierarchical blend).
+    fn posterior_mean(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    /// Compute fill rate estimate with hierarchical shrinkage toward coarse parent.
+    fn fill_rate_estimate(&self, coarse_alpha: f64, coarse_beta: f64) -> FillRateEstimate {
+        let n_fine = self.observed_total as f64;
+        let w = HIERARCHICAL_PRIOR_WEIGHT / (1.0 + n_fine / HIERARCHICAL_TAU);
+        let blend_active = w > 0.01; // blend is negligible below 1%
+
+        let eff_alpha = self.alpha + w * coarse_alpha;
+        let eff_beta = self.beta + w * coarse_beta;
+        let total = eff_alpha + eff_beta;
+
+        let mean = eff_alpha / total;
+        let variance = (eff_alpha * eff_beta) / (total * total * (total + 1.0));
+
+        FillRateEstimate {
+            mean,
+            variance,
+            n_observations: self.observed_total,
+            blend_active,
+        }
+    }
+
+    /// Simple fill rate (for backward compat with all_rates).
+    fn fill_rate(&self) -> f64 {
+        self.posterior_mean()
+    }
+}
+
+/// Coarse bin for hierarchical prior aggregation.
+#[derive(Debug, Clone)]
+struct CoarseBin {
+    /// Lower bound of coarse bin (bps)
+    lo_bps: f64,
+    /// Upper bound of coarse bin (bps)
+    hi_bps: f64,
+    /// Beta posterior alpha (fills + prior)
+    alpha: f64,
+    /// Beta posterior beta (misses + prior)
+    beta: f64,
+    /// Indices of fine bins that belong to this coarse bin
+    fine_indices: Vec<usize>,
+}
+
+impl CoarseBin {
+    fn new(lo_bps: f64, hi_bps: f64) -> Self {
+        Self {
+            lo_bps,
+            hi_bps,
+            alpha: 1.0, // Uniform prior
+            beta: 1.0,
+            fine_indices: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, filled: bool) {
+        if filled {
+            self.alpha += 1.0;
+        } else {
+            self.beta += 1.0;
         }
     }
 }
 
-/// Tracks P(fill | spread_bin) empirically.
+/// Tracks P(fill | spread_bin) with Beta posteriors and hierarchical shrinkage.
+///
+/// Two-layer hierarchy:
+/// - **Coarse layer** (4 bins: `[0,5), [5,10), [10,20), [20,∞)`): aggregated posteriors
+/// - **Fine layer** (8 bins): each bin's prior shrinks toward its coarse parent
+///
+/// No hard switching threshold — shrinkage is continuous via prior strength
+/// that decays as fine-bin observations accumulate.
 #[derive(Debug, Clone)]
 pub struct BinnedFillRate {
+    /// Fine bins (8 bins, same edges as before)
     pub bins: Vec<SpreadBin>,
+    /// Coarse bins (4 bins) for hierarchical prior
+    coarse_bins: Vec<CoarseBin>,
+    /// Mapping: fine_bin_index -> coarse_bin_index
+    fine_to_coarse: Vec<usize>,
 }
 
 impl BinnedFillRate {
-    /// Create binned tracker with default bin edges.
-    /// Bins: [0,2), [2,4), [4,6), [6,8), [8,10), [10,15), [15,20), [20,∞)
+    /// Create binned tracker with default bin edges and hierarchical structure.
+    /// Fine bins: [0,2), [2,4), [4,6), [6,8), [8,10), [10,15), [15,20), [20,∞)
+    /// Coarse bins: [0,5), [5,10), [10,20), [20,∞)
     pub fn new() -> Self {
-        let edges = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 1e9];
-        let bins = edges
+        let fine_edges = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0, 1e9];
+        let bins: Vec<SpreadBin> = fine_edges
             .windows(2)
-            .map(|w| SpreadBin {
-                lo_bps: w[0],
-                hi_bps: w[1],
-                fills: 0,
-                total: 0,
-            })
+            .map(|w| SpreadBin::new(w[0], w[1]))
             .collect();
-        Self { bins }
+
+        let coarse_edges = [(0.0, 5.0), (5.0, 10.0), (10.0, 20.0), (20.0, 1e9)];
+        let mut coarse_bins: Vec<CoarseBin> = coarse_edges
+            .iter()
+            .map(|&(lo, hi)| CoarseBin::new(lo, hi))
+            .collect();
+
+        // Map fine bins to coarse parents
+        let mut fine_to_coarse = Vec::with_capacity(bins.len());
+        for (fine_idx, fine_bin) in bins.iter().enumerate() {
+            let fine_mid = (fine_bin.lo_bps + fine_bin.hi_bps.min(100.0)) / 2.0;
+            let coarse_idx = coarse_bins
+                .iter()
+                .position(|c| fine_mid >= c.lo_bps && fine_mid < c.hi_bps)
+                .unwrap_or(coarse_bins.len() - 1);
+            fine_to_coarse.push(coarse_idx);
+            coarse_bins[coarse_idx].fine_indices.push(fine_idx);
+        }
+
+        Self {
+            bins,
+            coarse_bins,
+            fine_to_coarse,
+        }
     }
 
     /// Record a quote outcome in the appropriate spread bin.
     pub fn record(&mut self, spread_bps: f64, filled: bool) {
-        for bin in &mut self.bins {
+        for (fine_idx, bin) in self.bins.iter_mut().enumerate() {
             if spread_bps >= bin.lo_bps && spread_bps < bin.hi_bps {
-                bin.total += 1;
-                if filled {
-                    bin.fills += 1;
-                }
+                bin.record(filled);
+                // Update coarse parent
+                let coarse_idx = self.fine_to_coarse[fine_idx];
+                self.coarse_bins[coarse_idx].record(filled);
                 break;
             }
         }
     }
 
-    /// Get fill rate for a given spread.
-    pub fn fill_rate_at(&self, spread_bps: f64) -> Option<f64> {
-        for bin in &self.bins {
+    /// Get fill rate estimate for a given spread — always returns a value.
+    ///
+    /// Uses Beta posterior with hierarchical shrinkage: weak prior gives
+    /// uncertain but usable estimate even with 0 observations.
+    pub fn fill_rate_at(&self, spread_bps: f64) -> FillRateEstimate {
+        for (fine_idx, bin) in self.bins.iter().enumerate() {
             if spread_bps >= bin.lo_bps && spread_bps < bin.hi_bps {
-                if bin.total >= 5 {
-                    return Some(bin.fill_rate());
-                } else {
-                    return None; // Insufficient data
-                }
+                let coarse_idx = self.fine_to_coarse[fine_idx];
+                let coarse = &self.coarse_bins[coarse_idx];
+                return bin.fill_rate_estimate(coarse.alpha, coarse.beta);
             }
         }
-        None
+        // Fallback: uniform prior
+        FillRateEstimate {
+            mean: 0.5,
+            variance: 1.0 / 12.0,
+            n_observations: 0,
+            blend_active: true,
+        }
+    }
+
+    /// Get fill rate as Option<f64> for backward compatibility.
+    /// Returns None only when there are fewer than 5 observations.
+    pub fn fill_rate_at_optional(&self, spread_bps: f64) -> Option<f64> {
+        let est = self.fill_rate_at(spread_bps);
+        if est.n_observations >= 5 {
+            Some(est.mean)
+        } else {
+            None
+        }
     }
 
     /// Get (spread_midpoint, fill_rate, sample_count) for all bins with data.
     pub fn all_rates(&self) -> Vec<(f64, f64, u64)> {
         self.bins
             .iter()
-            .filter(|b| b.total >= 5 && b.hi_bps.is_finite())
-            .map(|b| ((b.lo_bps + b.hi_bps) / 2.0, b.fill_rate(), b.total))
+            .filter(|b| b.observed_total >= 5 && b.hi_bps.is_finite())
+            .map(|b| ((b.lo_bps + b.hi_bps) / 2.0, b.fill_rate(), b.observed_total))
             .collect()
     }
 
     /// Total quotes tracked across all bins.
     pub fn total_quotes(&self) -> u64 {
-        self.bins.iter().map(|b| b.total).sum()
+        self.bins.iter().map(|b| b.observed_total).sum()
     }
 
     /// Total fills tracked across all bins.
     pub fn total_fills(&self) -> u64 {
-        self.bins.iter().map(|b| b.fills).sum()
+        self.bins.iter().map(|b| b.observed_fills).sum()
     }
 }
 
@@ -380,19 +551,36 @@ impl QuoteOutcomeTracker {
     pub fn to_checkpoint(&self) -> QuoteOutcomeCheckpoint {
         QuoteOutcomeCheckpoint {
             bins: self.fill_rate.bins.iter()
-                .map(|b| (b.lo_bps, b.hi_bps, b.fills, b.total))
+                .map(|b| (b.lo_bps, b.hi_bps, b.observed_fills, b.observed_total))
                 .collect(),
         }
     }
 
     /// Restore fill rate bins from a checkpoint.
+    ///
+    /// Handles backward compatibility: old checkpoints store raw (fills, total),
+    /// which are migrated to Beta posteriors: alpha = fills + 1.0, beta = total - fills + 1.0.
     pub fn restore_from_checkpoint(&mut self, cp: &QuoteOutcomeCheckpoint) {
         if cp.bins.len() == self.fill_rate.bins.len() {
             for (bin, &(lo, hi, fills, total)) in self.fill_rate.bins.iter_mut().zip(cp.bins.iter()) {
                 bin.lo_bps = lo;
                 bin.hi_bps = hi;
-                bin.fills = fills;
-                bin.total = total;
+                bin.observed_fills = fills;
+                bin.observed_total = total;
+                // Migrate from count format to Beta posterior:
+                // alpha = prior(1) + observed fills, beta = prior(1) + observed misses
+                bin.alpha = 1.0 + fills as f64;
+                bin.beta = 1.0 + (total - fills) as f64;
+            }
+            // Rebuild coarse bins from restored fine bins
+            for coarse in &mut self.fill_rate.coarse_bins {
+                coarse.alpha = 1.0;
+                coarse.beta = 1.0;
+                for &fine_idx in &coarse.fine_indices {
+                    let fine = &self.fill_rate.bins[fine_idx];
+                    coarse.alpha += fine.observed_fills as f64;
+                    coarse.beta += (fine.observed_total - fine.observed_fills) as f64;
+                }
             }
         }
         // If bin count doesn't match (format change), start fresh — safe default
@@ -430,9 +618,9 @@ impl QuoteOutcomeTracker {
     /// Uses the outcome log to find filled outcomes near this spread
     /// and returns P(fill) × E[edge | fill]. Returns 0.0 if no data.
     pub fn expected_edge_at(&self, spread_bps: f64) -> f64 {
-        let fill_rate = self.fill_rate.fill_rate_at(spread_bps).unwrap_or(0.0);
+        let fill_rate_est = self.fill_rate.fill_rate_at(spread_bps);
         let mean_edge = self.mean_edge_at_spread(spread_bps);
-        fill_rate * mean_edge
+        fill_rate_est.mean * mean_edge
     }
 
     /// Mean realized edge for fills near a given spread level.
@@ -606,11 +794,103 @@ mod tests {
         }
 
         // Bin [4,6) should have 13 total, 3 fills
-        let rate = bfr.fill_rate_at(5.0).unwrap();
-        assert!((rate - 3.0 / 13.0).abs() < 0.01);
+        // Beta posterior: alpha = 1 + 3, beta = 1 + 10, plus hierarchical blend
+        let est = bfr.fill_rate_at(5.0);
+        assert_eq!(est.n_observations, 13);
+        // Allow tolerance for prior + hierarchical influence
+        assert!((est.mean - 3.0 / 13.0).abs() < 0.1, "Mean should be near 3/13. Got: {}", est.mean);
 
         assert_eq!(bfr.total_quotes(), 13);
         assert_eq!(bfr.total_fills(), 3);
+    }
+
+    #[test]
+    fn test_beta_posterior_with_zero_observations() {
+        let bfr = BinnedFillRate::new();
+
+        // With no data, should return prior mean (~0.5) with high variance
+        let est = bfr.fill_rate_at(5.0);
+        assert_eq!(est.n_observations, 0);
+        assert!((est.mean - 0.5).abs() < 0.1, "Empty bin should have mean ~0.5. Got: {}", est.mean);
+        assert!(est.variance > 0.01, "Empty bin should have high variance. Got: {}", est.variance);
+        assert!(est.blend_active, "Blend should be active with zero observations");
+    }
+
+    #[test]
+    fn test_beta_posterior_converges() {
+        let mut bfr = BinnedFillRate::new();
+
+        // 100 fills out of 200 → mean should converge to ≈ 0.5
+        for _ in 0..100 {
+            bfr.record(5.0, true);
+        }
+        for _ in 0..100 {
+            bfr.record(5.0, false);
+        }
+
+        let est = bfr.fill_rate_at(5.0);
+        assert!((est.mean - 0.5).abs() < 0.05, "200 obs should converge to ~0.5. Got: {}", est.mean);
+        assert!(est.variance < 0.005, "200 obs should have tight variance. Got: {}", est.variance);
+    }
+
+    #[test]
+    fn test_hierarchical_shrinkage() {
+        let mut bfr = BinnedFillRate::new();
+
+        // Populate coarse parent [0,5) with data in [0,2) bin
+        for _ in 0..200 {
+            bfr.record(1.0, true);
+        }
+        for _ in 0..200 {
+            bfr.record(1.0, false);
+        }
+
+        // Check [2,4) bin with only 3 fills (sparse)
+        for _ in 0..3 {
+            bfr.record(3.0, true);
+        }
+        let sparse_est = bfr.fill_rate_at(3.0);
+        // Should be pulled below 1.0 by coarse prior (~0.5)
+        assert!(sparse_est.mean < 0.95, "3 obs should shrink toward parent. Got: {}", sparse_est.mean);
+        assert!(sparse_est.blend_active, "Blend should be active with 3 observations");
+
+        // Add 1000 more observations to [2,4) — should mostly ignore parent
+        for _ in 0..1000 {
+            bfr.record(3.0, true);
+        }
+        let dense_est = bfr.fill_rate_at(3.0);
+        assert!(dense_est.mean > 0.8, "Many obs should mostly ignore parent. Got: {}", dense_est.mean);
+    }
+
+    #[test]
+    fn test_fill_rate_always_returns_value() {
+        let bfr = BinnedFillRate::new();
+
+        for spread in [0.5, 3.0, 5.0, 7.0, 9.0, 12.0, 18.0, 25.0, 100.0] {
+            let est = bfr.fill_rate_at(spread);
+            assert!(est.mean >= 0.0 && est.mean <= 1.0,
+                "Mean must be in [0,1]. Got: {} at {} bps", est.mean, spread);
+            assert!(est.variance >= 0.0, "Variance must be non-negative at {} bps", spread);
+        }
+    }
+
+    #[test]
+    fn test_variance_adjusted_multiplier() {
+        let with_blend = FillRateEstimate {
+            mean: 0.5,
+            variance: 0.10,
+            n_observations: 5,
+            blend_active: true,
+        };
+        assert!((with_blend.variance_adjusted() - 0.15).abs() < 1e-9, "1.5x when blend active");
+
+        let without_blend = FillRateEstimate {
+            mean: 0.5,
+            variance: 0.10,
+            n_observations: 100,
+            blend_active: false,
+        };
+        assert!((without_blend.variance_adjusted() - 0.10).abs() < 1e-9, "1.0x when no blend");
     }
 
     #[test]
@@ -682,9 +962,11 @@ mod tests {
         restored.restore_from_checkpoint(&cp);
 
         // Verify fill rates match
-        let orig_rate = tracker.fill_rate().fill_rate_at(3.0);
-        let restored_rate = restored.fill_rate().fill_rate_at(3.0);
-        assert_eq!(orig_rate, restored_rate);
+        let orig_est = tracker.fill_rate().fill_rate_at(3.0);
+        let restored_est = restored.fill_rate().fill_rate_at(3.0);
+        assert!((orig_est.mean - restored_est.mean).abs() < 0.01,
+            "Restored mean should match original. Got: {} vs {}", restored_est.mean, orig_est.mean);
+        assert_eq!(orig_est.n_observations, restored_est.n_observations);
     }
 
     #[test]
@@ -721,5 +1003,37 @@ mod tests {
         // Still only 1 reconciliation data point
         let (bias2, _) = tracker.epnl_prediction_accuracy();
         assert!((bias2 - 0.5).abs() < 0.01, "Bias unchanged. Got: {}", bias2);
+    }
+
+    #[test]
+    fn test_checkpoint_migration_from_counts() {
+        // Simulate an old checkpoint with raw (fills=10, total=20)
+        let old_cp = QuoteOutcomeCheckpoint {
+            bins: vec![
+                (0.0, 2.0, 10, 20),
+                (2.0, 4.0, 5, 15),
+                (4.0, 6.0, 0, 0),
+                (6.0, 8.0, 0, 0),
+                (8.0, 10.0, 0, 0),
+                (10.0, 15.0, 0, 0),
+                (15.0, 20.0, 0, 0),
+                (20.0, 1e9, 0, 0),
+            ],
+        };
+
+        let mut tracker = QuoteOutcomeTracker::new();
+        tracker.restore_from_checkpoint(&old_cp);
+
+        // Bin [0,2): fills=10, total=20 → alpha = 1+10 = 11, beta = 1+10 = 11
+        // Posterior mean ≈ 0.5 (with small hierarchical shift)
+        let est = tracker.fill_rate().fill_rate_at(1.0);
+        assert_eq!(est.n_observations, 20);
+        assert!((est.mean - 0.5).abs() < 0.1, "Migrated bin should have mean ~0.5. Got: {}", est.mean);
+
+        // Bin [2,4): fills=5, total=15 → alpha = 1+5 = 6, beta = 1+10 = 11
+        // Posterior mean ≈ 5/15 ≈ 0.33 (shifted by hierarchy)
+        let est2 = tracker.fill_rate().fill_rate_at(3.0);
+        assert_eq!(est2.n_observations, 15);
+        assert!((est2.mean - 0.33).abs() < 0.15, "Migrated bin should have mean ~0.33. Got: {}", est2.mean);
     }
 }

@@ -175,6 +175,26 @@ pub struct EntropyDistributionConfig {
     /// 0 = instant, 1 = no change. Typical: 0.9
     #[serde(default = "default_entropy_smoothing")]
     pub entropy_smoothing: f64,
+
+    /// Confidence in AS estimate [0, 1]. 0.0 = ignore AS entirely (legacy behavior).
+    /// 1.0 = trust AS point estimate fully. Default: 0.7 (acknowledge AS uncertainty).
+    ///
+    /// Lower values are appropriate when:
+    /// - AS estimate has high posterior variance (few observations)
+    /// - Market microstructure is changing (new listing, regime shift)
+    ///
+    /// Higher values when AS estimate is well-calibrated (many fills, stable regime).
+    #[serde(default = "default_as_confidence")]
+    pub as_confidence: f64,
+
+    /// Minimum EV floor for any level. Represents the option value of touch presence:
+    /// queue priority, order-flow information, market presence.
+    /// Default: 0.01 (small positive — we always want some touch presence).
+    /// Set to 0.0 to allow touch to go to zero when net-EV is negative.
+    /// Note: the existing `min_allocation_floor=0.02` provides a hard guarantee
+    /// post-allocation; this controls the pre-allocation utility signal.
+    #[serde(default = "default_min_touch_ev")]
+    pub min_touch_ev: f64,
 }
 
 fn default_min_entropy() -> f64 {
@@ -213,6 +233,12 @@ fn default_max_temp_multiplier() -> f64 {
 fn default_entropy_smoothing() -> f64 {
     0.8
 }
+fn default_as_confidence() -> f64 {
+    0.7 // Acknowledge AS uncertainty; 0.0 = legacy (ignore AS)
+}
+fn default_min_touch_ev() -> f64 {
+    0.01 // Small positive: touch always has some option value
+}
 
 impl Default for EntropyDistributionConfig {
     fn default() -> Self {
@@ -229,6 +255,8 @@ impl Default for EntropyDistributionConfig {
             adaptive_temperature: default_adaptive_temperature(),
             max_temp_multiplier: default_max_temp_multiplier(),
             entropy_smoothing: default_entropy_smoothing(),
+            as_confidence: default_as_confidence(),
+            min_touch_ev: default_min_touch_ev(),
         }
     }
 }
@@ -285,18 +313,26 @@ pub struct MarketRegime {
 /// - Robust to any input scale (log, linear, exponential)
 fn compute_utilities(
     levels: &[EntropyLevelParams],
-    _config: &EntropyDistributionConfig,
+    config: &EntropyDistributionConfig,
 ) -> Vec<f64> {
     if levels.is_empty() {
         return vec![];
     }
 
-    // Step 1: Compute expected values (proper GLFT formulation)
-    // EV = P(fill) × spread_capture
-    // This naturally discounts deep levels with low fill probability
+    // Step 1: Net EV = fill_prob × (spread_capture - as_confidence × adverse_selection)
+    // This replaces the old EV = fill_prob × spread_capture.max(0.0) which completely
+    // ignored the adverse_selection field, causing touch-level oversizing.
+    //
+    // With as_confidence=0.0, this reduces to the legacy formula (backward compat).
+    // The min_touch_ev floor provides explicit option value for touch presence.
     let evs: Vec<f64> = levels
         .iter()
-        .map(|level| level.fill_probability * level.spread_capture.max(0.0))
+        .map(|level| {
+            let net_edge = level.spread_capture - config.as_confidence * level.adverse_selection;
+            let net_ev = level.fill_probability * net_edge;
+            // Floor: touch always has some option value (queue priority, information)
+            net_ev.max(config.min_touch_ev)
+        })
         .collect();
 
     // Step 2: Use rank-based utilities for robustness to extreme ranges
@@ -1098,6 +1134,177 @@ mod tests {
             dist.effective_levels >= 3.5,
             "Effective levels {} too low in worst case",
             dist.effective_levels
+        );
+    }
+
+    #[test]
+    fn test_net_ev_penalizes_negative_edge_touch() {
+        // Touch: AS=5 > SC=2 → net-EV should be near floor (min_touch_ev)
+        // Deeper levels: AS < SC → positive net-EV → higher allocation
+        let config = EntropyDistributionConfig {
+            as_confidence: 0.7,
+            min_touch_ev: 0.01,
+            thompson_samples: 1, // Reduce stochasticity
+            ..Default::default()
+        };
+        let mut dist = EntropyDistributor::with_seed(config, 42);
+
+        let levels = vec![
+            EntropyLevelParams {
+                depth_bps: 2.0,
+                spread_capture: 2.0,
+                fill_probability: 0.9,
+                adverse_selection: 5.0, // AS > SC → negative net edge
+                historical_fill_rate: 0.7,
+            },
+            EntropyLevelParams {
+                depth_bps: 10.0,
+                spread_capture: 4.0,
+                fill_probability: 0.5,
+                adverse_selection: 2.0, // AS < SC → positive net edge
+                historical_fill_rate: 0.5,
+            },
+            EntropyLevelParams {
+                depth_bps: 20.0,
+                spread_capture: 6.0,
+                fill_probability: 0.3,
+                adverse_selection: 0.5, // Low AS → strong positive edge
+                historical_fill_rate: 0.3,
+            },
+        ];
+        let regime = MarketRegime::default();
+        let result = dist.compute_distribution(&levels, &regime);
+
+        // Touch (level 0) should get less than level 1
+        assert!(
+            result.probabilities[0] < result.probabilities[1],
+            "Touch with AS>SC should get less allocation than level 2: touch={:.3}, level2={:.3}",
+            result.probabilities[0],
+            result.probabilities[1]
+        );
+    }
+
+    #[test]
+    fn test_net_ev_legacy_mode() {
+        // With as_confidence=0.0, the AS term disappears → legacy behavior
+        let config_legacy = EntropyDistributionConfig {
+            as_confidence: 0.0,
+            min_touch_ev: 0.0, // No floor either
+            thompson_samples: 1,
+            ..Default::default()
+        };
+        let config_default = EntropyDistributionConfig {
+            as_confidence: 0.0,
+            min_touch_ev: 0.0,
+            thompson_samples: 1,
+            ..Default::default()
+        };
+
+        let levels = make_levels(5);
+        let regime = MarketRegime::default();
+
+        let mut dist_legacy = EntropyDistributor::with_seed(config_legacy, 42);
+        let mut dist_default = EntropyDistributor::with_seed(config_default, 42);
+
+        let result_legacy = dist_legacy.compute_distribution(&levels, &regime);
+        let result_default = dist_default.compute_distribution(&levels, &regime);
+
+        // Same config → identical results
+        for (a, b) in result_legacy
+            .probabilities
+            .iter()
+            .zip(result_default.probabilities.iter())
+        {
+            assert!(
+                (a - b).abs() < 1e-10,
+                "Legacy mode should produce identical results: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_min_touch_ev_prevents_elimination() {
+        // Even with very high AS, touch should still get some allocation via min_touch_ev
+        let config = EntropyDistributionConfig {
+            as_confidence: 1.0, // Full trust in AS
+            min_touch_ev: 0.01,
+            thompson_samples: 1,
+            ..Default::default()
+        };
+        let mut dist = EntropyDistributor::with_seed(config, 42);
+
+        let levels = vec![
+            EntropyLevelParams {
+                depth_bps: 2.0,
+                spread_capture: 1.0,
+                fill_probability: 0.9,
+                adverse_selection: 10.0, // Extremely negative net edge
+                historical_fill_rate: 0.7,
+            },
+            EntropyLevelParams {
+                depth_bps: 15.0,
+                spread_capture: 8.0,
+                fill_probability: 0.4,
+                adverse_selection: 1.0,
+                historical_fill_rate: 0.4,
+            },
+        ];
+        let regime = MarketRegime::default();
+        let result = dist.compute_distribution(&levels, &regime);
+
+        // Touch should still have > 0 allocation (from min_touch_ev + allocation floor)
+        assert!(
+            result.probabilities[0] > 0.0,
+            "Touch should never be eliminated: got {:.6}",
+            result.probabilities[0]
+        );
+    }
+
+    #[test]
+    fn test_net_ev_gradient_favors_depth() {
+        // When AS is high at touch but low deeper, allocation should shift toward depth
+        let config = EntropyDistributionConfig {
+            as_confidence: 0.7,
+            min_touch_ev: 0.01,
+            thompson_samples: 1,
+            ..Default::default()
+        };
+        let mut dist = EntropyDistributor::with_seed(config, 42);
+
+        let levels = vec![
+            EntropyLevelParams {
+                depth_bps: 3.0,
+                spread_capture: 2.0,
+                fill_probability: 0.85,
+                adverse_selection: 4.0, // Net edge = 2 - 0.7*4 = -0.8 (negative)
+                historical_fill_rate: 0.8,
+            },
+            EntropyLevelParams {
+                depth_bps: 8.0,
+                spread_capture: 3.5,
+                fill_probability: 0.55,
+                adverse_selection: 2.0, // Net edge = 3.5 - 0.7*2 = 2.1 (positive)
+                historical_fill_rate: 0.5,
+            },
+            EntropyLevelParams {
+                depth_bps: 15.0,
+                spread_capture: 5.0,
+                fill_probability: 0.3,
+                adverse_selection: 0.5, // Net edge = 5.0 - 0.35 = 4.65 (strong positive)
+                historical_fill_rate: 0.3,
+            },
+        ];
+        let regime = MarketRegime::default();
+        let result = dist.compute_distribution(&levels, &regime);
+
+        // Level 2 (mid-depth, positive net-EV) should get more than touch
+        assert!(
+            result.probabilities[1] > result.probabilities[0],
+            "Mid-depth with positive net-EV should beat touch: mid={:.3}, touch={:.3}",
+            result.probabilities[1],
+            result.probabilities[0]
         );
     }
 }

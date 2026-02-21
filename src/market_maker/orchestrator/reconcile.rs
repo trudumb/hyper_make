@@ -2542,15 +2542,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             budget_exhausted = allocation.budget_exhausted,
             total_value_bps = %format!("{:.2}", allocation.total_value_bps),
             suppressed = allocation.suppressed_count,
-            actions = allocation.actions.len(),
+            bid_actions = allocation.bid_actions.len(),
+            ask_actions = allocation.ask_actions.len(),
             "[Unified] Budget allocation result"
         );
 
         // Partition actions by type and side for execution
         let (bid_cancels, bid_modifies, bid_places) =
-            partition_ladder_actions(&allocation.actions, Side::Buy);
+            partition_ladder_actions(&allocation.bid_actions, Side::Buy);
         let (ask_cancels, ask_modifies, ask_places) =
-            partition_ladder_actions(&allocation.actions, Side::Sell);
+            partition_ladder_actions(&allocation.ask_actions, Side::Sell);
 
         let cancel_count = bid_cancels.len() + ask_cancels.len();
         let modify_count = bid_modifies.len() + ask_modifies.len();

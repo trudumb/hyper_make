@@ -25,4 +25,4 @@ pub use attribution::{CycleContributions, SignalContribution, SignalPnLAttributo
 pub use edge_metrics::{EdgeSnapshot, EdgeTracker};
 pub use live::{LiveAnalytics, LiveAnalyticsSummary};
 pub use persistence::AnalyticsLogger;
-pub use sharpe::{PerSignalSharpeTracker, SharpeSummary, SharpeTracker};
+pub use sharpe::{EquityCurveSharpe, EquityCurveSummary, PerSignalSharpeTracker, SharpeSummary, SharpeTracker};

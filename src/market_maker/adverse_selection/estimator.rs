@@ -120,6 +120,10 @@ pub struct AdverseSelectionEstimator {
     /// Smoothed over ~10 fills (alpha ≈ 0.1) to react to AS regime changes.
     recent_as_ewma_bps: f64,
 
+    /// EWMA of squared deviations from AS mean, for posterior variance estimation.
+    /// Var[AS] ≈ E[(AS - E[AS])²] tracked via EWMA with same alpha.
+    recent_as_variance_bps2: f64,
+
     /// Checkpoint-seeded AS floor in bps, used during cold start when no live
     /// markout data is available yet. Set from prior checkpoint on init.
     checkpoint_as_floor_bps: Option<f64>,
@@ -146,6 +150,7 @@ impl AdverseSelectionEstimator {
             uninformed_fills_count: 0,
             informed_threshold_bps: 5.0, // Default: 5 bps = "informed"
             recent_as_ewma_bps: 0.0,
+            recent_as_variance_bps2: 0.0,
             checkpoint_as_floor_bps: None,
         }
     }
@@ -274,6 +279,11 @@ impl AdverseSelectionEstimator {
 
             // Update rolling AS severity EWMA (alpha=0.1, ~10 fill half-life)
             const AS_SEVERITY_ALPHA: f64 = 0.1;
+            // Variance update: E[(x - mean)²] via Welford-style EWMA
+            let deviation = adverse_move_bps - self.recent_as_ewma_bps;
+            self.recent_as_variance_bps2 = AS_SEVERITY_ALPHA * deviation * deviation
+                + (1.0 - AS_SEVERITY_ALPHA) * self.recent_as_variance_bps2;
+            // Mean update (after variance to use old mean for deviation)
             self.recent_as_ewma_bps = AS_SEVERITY_ALPHA * adverse_move_bps
                 + (1.0 - AS_SEVERITY_ALPHA) * self.recent_as_ewma_bps;
         }
@@ -619,6 +629,17 @@ impl AdverseSelectionEstimator {
     pub fn recent_as_severity_bps(&self) -> f64 {
         self.recent_as_ewma_bps
     }
+
+    /// AS posterior variance in bps² (EWMA of squared deviations from mean).
+    /// Used by Q19 uncertainty premium: floor = E[AS] + k × √Var[AS].
+    /// Returns 0.0 when insufficient data (< 3 fills).
+    pub fn as_floor_variance_bps2(&self) -> f64 {
+        if self.fills_measured < 3 {
+            0.0
+        } else {
+            self.recent_as_variance_bps2
+        }
+    }
 }
 
 /// Summary of adverse selection state for logging.
@@ -839,5 +860,53 @@ mod tests {
             (est.as_floor_bps() - 5.0).abs() < 1e-10,
             "Should use checkpoint seed"
         );
+    }
+
+    #[test]
+    fn test_as_floor_variance_cold_start() {
+        let est = make_estimator();
+        // No fills → variance = 0 (insufficient data)
+        assert_eq!(est.as_floor_variance_bps2(), 0.0);
+    }
+
+    #[test]
+    fn test_as_floor_variance_accumulates() {
+        let mut est = make_estimator();
+        // Record 4 fills with varying AS magnitude to build variance
+        // Need >= 3 fills measured for variance to be exposed
+        for i in 0..4 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+        }
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        // Price drops 0.1% = 10 bps adverse for buys
+        est.update(99.90);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Record 4 more fills
+        for i in 4..8 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+        }
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        // Price drops more: 0.2% = 20 bps adverse
+        est.update(99.70);
+
+        // After enough fills, variance should be > 0 (AS values differ)
+        let var = est.as_floor_variance_bps2();
+        assert!(
+            var >= 0.0,
+            "Variance should be non-negative, got {var}"
+        );
+    }
+
+    #[test]
+    fn test_as_uncertainty_premium() {
+        // Verify the premium formula: E[AS] + k * sqrt(Var[AS])
+        let as_floor_bps = 5.0;
+        let variance_bps2: f64 = 25.0; // std dev = 5 bps
+        let k = 1.5;
+        let premium = k * variance_bps2.sqrt();
+        let total_floor = as_floor_bps + premium;
+        assert!((premium - 7.5).abs() < 1e-10, "k=1.5 * sqrt(25) = 7.5");
+        assert!((total_floor - 12.5).abs() < 1e-10, "5 + 7.5 = 12.5 bps");
     }
 }

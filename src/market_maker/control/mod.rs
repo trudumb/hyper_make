@@ -645,6 +645,11 @@ impl StochasticController {
         self.changepoint.set_regime(regime);
     }
 
+    /// Set the changepoint detector's regime profile (includes adaptive hazard thresholds).
+    pub fn set_changepoint_regime_profile(&mut self, profile: &crate::market_maker::config::RegimeProfile) {
+        self.changepoint.update_from_profile(profile);
+    }
+
     /// Reset the controller.
     pub fn reset(&mut self) {
         self.belief = BeliefState::default();

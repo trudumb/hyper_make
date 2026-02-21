@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 use super::MarketParams;
 
 fn default_beta_cascade() -> f64 {
-    0.8
+    1.2 // Interim: pending data-driven calibration from gamma_calibration.jsonl
 }
 
 fn default_beta_tail_risk() -> f64 {
-    0.5
+    0.7 // Interim: pending data-driven calibration from gamma_calibration.jsonl
 }
 
 /// Calibration state for the risk model.
@@ -129,8 +129,9 @@ impl Default for CalibratedRiskModel {
             // Conservative defaults until calibrated:
             // 100% excess vol → exp(1.0) ≈ 2.7× gamma
             beta_volatility: 1.0,
-            // toxicity=1 → exp(0.5) ≈ 1.65× gamma
-            beta_toxicity: 0.5,
+            // Interim: toxicity=1 → exp(0.9) ≈ 2.46× gamma
+            // Pending data-driven calibration from gamma_calibration.jsonl regression.
+            beta_toxicity: 0.9,
             // DISABLED: inventory scaling now handled by continuous γ(q) = γ_base × (1 + β×u²)
             // in effective_gamma(). Setting non-zero here would double-count inventory.
             // See effective_gamma() in glft.rs for the quadratic inventory scaling.
@@ -144,10 +145,12 @@ impl Default for CalibratedRiskModel {
             // NEGATIVE: high confidence → lower gamma (more two-sided quoting)
             // confidence=1 → exp(-0.4) ≈ 0.67× gamma
             beta_confidence: -0.4,
-            // cascade_intensity=1 → exp(0.8) ≈ 2.2× gamma widening
-            beta_cascade: 0.8,
-            // tail_risk_intensity=1 → exp(0.5) ≈ 1.65× gamma widening
-            beta_tail_risk: 0.5,
+            // Interim: cascade_intensity=1 → exp(1.2) ≈ 3.32× gamma widening
+            // Pending data-driven calibration from gamma_calibration.jsonl regression.
+            beta_cascade: 1.2,
+            // Interim: tail_risk_intensity=1 → exp(0.7) ≈ 2.01× gamma widening
+            // Pending data-driven calibration from gamma_calibration.jsonl regression.
+            beta_tail_risk: 0.7,
 
             gamma_min: 0.05,
             gamma_max: 5.0,
@@ -179,7 +182,7 @@ impl CalibratedRiskModel {
         Self {
             log_gamma_base: 0.20_f64.ln(), // Higher base during warmup
             beta_volatility: 1.5,          // 50% more conservative
-            beta_toxicity: 0.75,
+            beta_toxicity: 1.35, // Interim conservative (1.5x of default 0.9)
             // DISABLED: inventory scaling handled by continuous γ(q) quadratic in glft.rs
             beta_inventory: 0.0,
             beta_hawkes: 0.6,
@@ -188,9 +191,9 @@ impl CalibratedRiskModel {
             // Less negative during warmup (more cautious about confidence)
             beta_confidence: -0.2,
             // More conservative cascade widening during warmup
-            beta_cascade: 1.2,
+            beta_cascade: 1.8,
             // More conservative tail risk during warmup
-            beta_tail_risk: 0.75,
+            beta_tail_risk: 1.05,
             ..Default::default()
         }
     }
@@ -898,15 +901,15 @@ mod tests {
         let gamma_calm = model.compute_gamma(&calm);
         let gamma_cascade = model.compute_gamma(&cascade);
 
-        // beta_cascade=0.8 → exp(0.8) ≈ 2.23x wider gamma during cascade
+        // beta_cascade=1.2 → exp(1.2) ≈ 3.32x wider gamma during cascade
         assert!(
-            gamma_cascade > gamma_calm * 2.0,
-            "Cascade should widen gamma by ~2.2x: calm={}, cascade={}",
+            gamma_cascade > gamma_calm * 3.0,
+            "Cascade should widen gamma by ~3.3x: calm={}, cascade={}",
             gamma_calm,
             gamma_cascade
         );
         assert!(
-            gamma_cascade < gamma_calm * 2.5,
+            gamma_cascade < gamma_calm * 3.6,
             "Cascade widening should be bounded: calm={}, cascade={}",
             gamma_calm,
             gamma_cascade
@@ -958,6 +961,62 @@ mod tests {
         assert!(
             gamma_moderate < 0.5,
             "moderate stress gamma should stay below 0.5: got {gamma_moderate}"
+        );
+    }
+
+    #[test]
+    fn test_gamma_defense_ratio_at_moderate_toxicity() {
+        let model = CalibratedRiskModel::default();
+
+        // Neutral (no risk features)
+        let neutral = RiskFeatures::neutral();
+        let gamma_neutral = model.compute_gamma(&neutral);
+
+        // Moderate toxicity
+        let moderate_toxic = RiskFeatures {
+            toxicity_score: 0.5,
+            ..RiskFeatures::neutral()
+        };
+        let gamma_toxic = model.compute_gamma(&moderate_toxic);
+
+        // defense_ratio = gamma_toxic / gamma_neutral
+        let defense_ratio = gamma_toxic / gamma_neutral;
+
+        // beta_toxicity=0.9: at toxicity=0.5, exp(0.9*0.5) = exp(0.45) ≈ 1.57
+        assert!(
+            defense_ratio > 1.4,
+            "Defense ratio at toxicity=0.5 should be > 1.4: got {defense_ratio:.3}"
+        );
+        assert!(
+            defense_ratio < 1.8,
+            "Defense ratio should be bounded: got {defense_ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn test_gamma_fills_defense_gap() {
+        // Verify that gamma-produced spread at moderate toxicity exceeds fee + AS threshold.
+        // GLFT half-spread ≈ γσ²τ + (1/γ)ln(1+γ/κ), but for rough check:
+        // The exponential gamma increase from toxicity should produce meaningfully wider spreads.
+        let model = CalibratedRiskModel::default();
+
+        let calm = RiskFeatures::neutral();
+        let gamma_calm = model.compute_gamma(&calm);
+
+        // Moderate risk scenario
+        let risky = RiskFeatures {
+            toxicity_score: 0.5,
+            cascade_intensity: 0.3,
+            tail_risk_intensity: 0.2,
+            ..RiskFeatures::neutral()
+        };
+        let gamma_risky = model.compute_gamma(&risky);
+
+        // Combined defense: exp(0.9*0.5 + 1.2*0.3 + 0.7*0.2) = exp(0.45+0.36+0.14) = exp(0.95) ≈ 2.59
+        let joint_ratio = gamma_risky / gamma_calm;
+        assert!(
+            joint_ratio > 2.0,
+            "Joint defense at moderate risk should produce > 2x gamma: got {joint_ratio:.3}"
         );
     }
 

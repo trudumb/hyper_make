@@ -55,6 +55,18 @@ pub struct DecisionEngineConfig {
     // All uncertainty is now handled through gamma scaling (kappa_ci_width flows
     // through uncertainty_scalar). The GLFT formula naturally widens spreads
     // when gamma increases due to uncertainty.
+
+    // === Realized Edge Feedback (feeds back into A-S information asymmetry) ===
+    /// Mean realized gross edge in bps from EdgeTracker.
+    /// Fed externally each cycle. Used to compute P(edge > 0) from outcomes.
+    pub realized_edge_mean: f64,
+    /// Std of realized gross edge in bps from EdgeTracker.
+    pub realized_edge_std: f64,
+    /// Count of resolved edge snapshots.
+    pub realized_edge_n: usize,
+    /// Minimum edge observations before realized feedback activates.
+    /// Below this threshold, p_positive is purely prediction-based.
+    pub min_edge_observations: usize,
 }
 
 impl Default for DecisionEngineConfig {
@@ -77,6 +89,12 @@ impl Default for DecisionEngineConfig {
             baseline_edge_std: 1.0, // 1 bps edge uncertainty as baseline
             // NOTE: uncertainty_spread_scaling and max_spread_multiplier removed
             // All uncertainty flows through gamma scaling (kappa_ci_width → uncertainty_scalar)
+
+            // Realized edge feedback (inactive until enough fills)
+            realized_edge_mean: 0.0,
+            realized_edge_std: 1.0,
+            realized_edge_n: 0,
+            min_edge_observations: 20,
         }
     }
 }
@@ -158,9 +176,45 @@ impl DecisionEngine {
         let mu = ensemble.mean; // Expected edge (drift) in bps
         let sigma_mu = ensemble.std.max(0.001); // Uncertainty in edge estimate
 
-        // P(edge > 0) = Φ(μ / σ_μ)
+        // P(edge > 0) from ensemble predictions
         let z = mu / sigma_mu;
-        let p_positive_edge = normal_cdf(z);
+        let p_positive_predicted = normal_cdf(z);
+
+        // === Realized edge feedback: blend prediction-based p_positive with
+        // realized-edge p_positive (Bayesian update from EdgeTracker) ===
+        //
+        // The bug this fixes: p_positive stayed near 0.5 because it was computed
+        // ONLY from ensemble predictions. Realized edge outcomes were never
+        // incorporated. If EdgeTracker shows persistent negative realized edge,
+        // the posterior P(edge > 0) should shift below 0.5, increasing information
+        // asymmetry and reducing size — all within the A-S framework.
+        let p_positive_realized = if self.config.realized_edge_n >= self.config.min_edge_observations {
+            // Floor SE at 0.5 bps to prevent unreasonably sharp posteriors on small
+            // samples with tight clustering (e.g., narrow spread regime with consistent
+            // small negative marks that may reverse). Without this floor, n=25 fills
+            // with std=0.3 gives SE=0.06, and mean=-0.5 gives z=-8.3 → p≈0.
+            let se = (self.config.realized_edge_std / (self.config.realized_edge_n as f64).sqrt())
+                .max(0.5);
+            normal_cdf(self.config.realized_edge_mean / se)
+        } else {
+            0.5 // Uninformative: insufficient data
+        };
+
+        // Blend: trust realized outcomes more as fill count grows.
+        // At 0 fills: pure prediction. At min_edge_obs: 50/50. At 2×min: ~67% realized.
+        // Cap at 80%: always retain 20% weight on ensemble predictions to avoid
+        // purely backward-looking behavior. The ensemble may detect regime changes
+        // before realized edge statistics update.
+        let realized_trust = if self.config.realized_edge_n >= self.config.min_edge_observations {
+            let excess = (self.config.realized_edge_n - self.config.min_edge_observations) as f64;
+            let scale = self.config.min_edge_observations as f64;
+            (0.5 + 0.5 * (excess / scale).min(1.0)).min(0.8)
+        } else {
+            0.0 // Pure prediction before threshold
+        };
+
+        let p_positive_edge = (1.0 - realized_trust) * p_positive_predicted
+            + realized_trust * p_positive_realized;
 
         // Information asymmetry: 0 at p=0.5 (neutral), 1 at p=0 or p=1 (informed)
         let information_asymmetry = (2.0 * (p_positive_edge - 0.5)).abs();
@@ -716,6 +770,217 @@ mod tests {
                 );
             }
             _ => panic!("Expected Quote decision"),
+        }
+    }
+
+    // === Realized edge feedback tests ===
+
+    #[test]
+    fn test_p_positive_blends_with_realized_negative_edge() {
+        // Negative realized edge should reduce p_blended below 0.5
+        let config = DecisionEngineConfig {
+            realized_edge_mean: -2.0,  // Persistently negative
+            realized_edge_std: 4.0,
+            realized_edge_n: 30,       // Above threshold (20)
+            min_edge_observations: 20,
+            ..Default::default()
+        };
+        let engine = DecisionEngine::new(config);
+        let health = ModelHealth::default();
+
+        // Ensemble says neutral (p_predicted ≈ 0.5)
+        let neutral = EnsemblePrediction {
+            mean: 0.0,
+            std: 1.0,
+            disagreement: 0.1,
+            model_contributions: vec![],
+        };
+        let decision = engine.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
+
+        match decision {
+            QuoteDecision::Quote { size_fraction, confidence, .. } => {
+                // With negative realized edge, information asymmetry should increase
+                // → size_fraction should decrease and confidence should decrease
+                // vs. pure prediction (where neutral → size ≈ 1.0, confidence ≈ 1.0)
+                assert!(
+                    size_fraction < 0.95,
+                    "Negative realized edge should reduce size: {}",
+                    size_fraction
+                );
+                assert!(
+                    confidence < 0.95,
+                    "Negative realized edge should reduce confidence: {}",
+                    confidence
+                );
+            }
+            _ => panic!("Expected Quote"),
+        }
+    }
+
+    #[test]
+    fn test_p_positive_no_blend_below_threshold() {
+        // Below min observations → pure prediction, realized edge ignored
+        let config = DecisionEngineConfig {
+            realized_edge_mean: -10.0,  // Very negative, but insufficient data
+            realized_edge_std: 1.0,
+            realized_edge_n: 5,        // Below threshold (20)
+            min_edge_observations: 20,
+            ..Default::default()
+        };
+        let engine_insufficient = DecisionEngine::new(config);
+
+        // Compare against engine with zero realized data
+        let engine_default = DecisionEngine::default();
+        let health = ModelHealth::default();
+
+        let prediction = EnsemblePrediction {
+            mean: 0.1,
+            std: 1.0,
+            disagreement: 0.1,
+            model_contributions: vec![],
+        };
+
+        let decision_insufficient = engine_insufficient.should_quote(&prediction, &health, 0.0, TEST_SIGMA);
+        let decision_default = engine_default.should_quote(&prediction, &health, 0.0, TEST_SIGMA);
+
+        match (decision_insufficient, decision_default) {
+            (
+                QuoteDecision::Quote { size_fraction: s1, confidence: c1, .. },
+                QuoteDecision::Quote { size_fraction: s2, confidence: c2, .. },
+            ) => {
+                // Should be identical: insufficient data → pure prediction
+                assert!(
+                    (s1 - s2).abs() < 0.001,
+                    "Below threshold should match default: {} vs {}",
+                    s1, s2
+                );
+                assert!(
+                    (c1 - c2).abs() < 0.001,
+                    "Confidence should match: {} vs {}",
+                    c1, c2
+                );
+            }
+            _ => panic!("Expected both to be Quote"),
+        }
+    }
+
+    #[test]
+    fn test_p_positive_blended_positive_realized() {
+        // Positive realized edge → p_blended > 0.5 → higher asymmetry → smaller size
+        // (This is the A-S framework: knowing direction reduces quoting size)
+        let config = DecisionEngineConfig {
+            realized_edge_mean: 3.0,   // Positive realized edge
+            realized_edge_std: 2.0,
+            realized_edge_n: 40,       // Well above threshold
+            min_edge_observations: 20,
+            ..Default::default()
+        };
+        let engine = DecisionEngine::new(config);
+        let health = ModelHealth::default();
+
+        let neutral = EnsemblePrediction {
+            mean: 0.0,
+            std: 1.0,
+            disagreement: 0.1,
+            model_contributions: vec![],
+        };
+        let decision = engine.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
+
+        match decision {
+            QuoteDecision::Quote { size_fraction, .. } => {
+                // Positive realized edge → p_blended > 0.5 → information asymmetry > 0
+                // → size reduced (but not by much since A-S sensitivity is 0.5)
+                assert!(
+                    size_fraction < 1.0,
+                    "Positive realized edge should increase asymmetry → smaller size: {}",
+                    size_fraction
+                );
+            }
+            _ => panic!("Expected Quote"),
+        }
+    }
+
+    #[test]
+    fn test_realized_trust_caps_at_80_percent() {
+        // Even with many fills, 20% prediction weight retained
+        let config = DecisionEngineConfig {
+            realized_edge_mean: -5.0,  // Very negative
+            realized_edge_std: 1.0,
+            realized_edge_n: 1000,     // Way above threshold
+            min_edge_observations: 20,
+            ..Default::default()
+        };
+        let engine_many = DecisionEngine::new(config.clone());
+
+        let config_2x = DecisionEngineConfig {
+            realized_edge_n: 40,  // Exactly 2x threshold
+            ..config
+        };
+        let engine_2x = DecisionEngine::new(config_2x);
+        let health = ModelHealth::default();
+
+        let neutral = EnsemblePrediction {
+            mean: 0.0,
+            std: 1.0,
+            disagreement: 0.1,
+            model_contributions: vec![],
+        };
+
+        let decision_many = engine_many.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
+        let decision_2x = engine_2x.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
+
+        match (decision_many, decision_2x) {
+            (
+                QuoteDecision::Quote { size_fraction: s_many, .. },
+                QuoteDecision::Quote { size_fraction: s_2x, .. },
+            ) => {
+                // At n=1000 and n=40 (2x threshold), trust is capped at 0.8
+                // so 1000 fills should give same result as 40 fills
+                // (both have realized_trust capped at 0.8)
+                assert!(
+                    (s_many - s_2x).abs() < 0.01,
+                    "Cap at 80%: n=1000 and n=40 should give similar size: {} vs {}",
+                    s_many, s_2x
+                );
+            }
+            _ => panic!("Expected both to be Quote"),
+        }
+    }
+
+    #[test]
+    fn test_existing_inverse_kelly_preserved() {
+        // With zero realized_edge_n, behavior is identical to original code
+        let engine = DecisionEngine::default();
+        let health = ModelHealth::default();
+
+        // Verify config defaults
+        assert_eq!(engine.config().realized_edge_n, 0);
+        assert_eq!(engine.config().min_edge_observations, 20);
+
+        // Near-neutral edge → high size (inverse kelly)
+        let neutral = EnsemblePrediction {
+            mean: 0.1,
+            std: 1.0,
+            disagreement: 0.1,
+            model_contributions: vec![],
+        };
+        let decision = engine.should_quote(&neutral, &health, 0.0, TEST_SIGMA);
+
+        match decision {
+            QuoteDecision::Quote { size_fraction, confidence, .. } => {
+                // Neutral prediction → high size, high confidence (inverse of Kelly)
+                assert!(
+                    size_fraction > 0.9,
+                    "Neutral prediction with no realized data should have high size: {}",
+                    size_fraction
+                );
+                assert!(
+                    confidence > 0.85,
+                    "Neutral prediction should have high confidence: {}",
+                    confidence
+                );
+            }
+            _ => panic!("Expected Quote"),
         }
     }
 }

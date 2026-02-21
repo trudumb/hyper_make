@@ -12,9 +12,94 @@
 //! - **LiquidCex**: Standard threshold (0.5) for responsive detection
 //! - **Cascade**: Low threshold (0.3) for high sensitivity during stress
 //!
-//! Additionally, the detector supports confirmation requirements where
-//! multiple consecutive high-probability signals are needed before declaring
-//! a confirmed changepoint.
+use std::time::Instant;
+
+/// Adaptive hazard rate for changepoint detection.
+///
+/// Modulates the base hazard rate based on observation cadence (`dt`).
+/// - Fast cadence (dt < soft_boost): Use base hazard rate
+/// - Slow cadence (dt > force_extreme): Boost hazard rate by 5x
+/// - Intermediate cadence: Smoothly scale between 1x and 5x
+#[derive(Debug, Clone)]
+pub struct AdaptiveHazard {
+    /// Base hazard rate from regime profile
+    pub base_hazard: f64,
+    /// Threshold for soft boosting probability (seconds)
+    pub soft_boost_threshold: f64,
+    /// Threshold to force extreme regime (seconds)
+    pub force_extreme_threshold: f64,
+    /// Maximum boost multiplier
+    pub max_boost: f64,
+    /// Time of last observation
+    pub last_observation: Option<Instant>,
+}
+
+impl Default for AdaptiveHazard {
+    fn default() -> Self {
+        Self {
+            base_hazard: 1.0 / 250.0,
+            soft_boost_threshold: 0.35,
+            force_extreme_threshold: 0.65,
+            max_boost: 5.0,
+            last_observation: None,
+        }
+    }
+}
+
+impl AdaptiveHazard {
+    /// Create new adaptive hazard tracking
+    pub fn new(base: f64, soft: f64, extreme: f64) -> Self {
+        Self {
+            base_hazard: base,
+            soft_boost_threshold: soft,
+            force_extreme_threshold: extreme,
+            max_boost: 5.0,
+            last_observation: None,
+        }
+    }
+
+    /// Update with regime profile settings
+    pub fn update_from_regime(&mut self, base: f64, soft: f64, extreme: f64) {
+        self.base_hazard = base;
+        self.soft_boost_threshold = soft;
+        self.force_extreme_threshold = extreme;
+    }
+
+    /// Calculate current hazard rate based on elapsed time since last observation
+    pub fn current_hazard(&mut self) -> f64 {
+        let now = Instant::now();
+        let dt = match self.last_observation {
+            Some(last) => now.duration_since(last).as_secs_f64(),
+            None => {
+                self.last_observation = Some(now);
+                return self.base_hazard;
+            }
+        };
+
+        // Update last observation time for NEXT call
+        self.last_observation = Some(now);
+
+        if dt <= self.soft_boost_threshold {
+            self.base_hazard
+        } else if dt >= self.force_extreme_threshold {
+            self.base_hazard * self.max_boost
+        } else {
+            // Linear interpolation between soft and extreme
+            let range = self.force_extreme_threshold - self.soft_boost_threshold;
+            if range <= f64::EPSILON {
+                return self.base_hazard * self.max_boost;
+            }
+            let fraction = (dt - self.soft_boost_threshold) / range;
+            let multiplier = 1.0 + (self.max_boost - 1.0) * fraction;
+            self.base_hazard * multiplier
+        }
+    }
+    
+    /// Reset the observation tracker (e.g., when changepoint is confirmed)
+    pub fn on_changepoint_confirmed(&mut self) {
+        self.last_observation = None;
+    }
+}
 
 // ============================================================================
 // Regime-Aware Changepoint Detection Types
@@ -166,8 +251,8 @@ pub struct ChangepointDetector {
     run_statistics: Vec<RunStatistics>,
     /// Prior statistics
     prior: RunStatistics,
-    /// Hazard rate (probability of changepoint per time step)
-    hazard: f64,
+    /// Adaptive tracking for the hazard rate
+    pub adaptive_hazard: AdaptiveHazard,
     /// Maximum run length to track
     max_run_length: usize,
     /// Changepoint threshold (default, can be overridden by regime)
@@ -283,7 +368,10 @@ impl ChangepointDetector {
             run_length_probs,
             run_statistics,
             prior,
-            hazard: config.hazard,
+            adaptive_hazard: AdaptiveHazard {
+                base_hazard: config.hazard,
+                ..Default::default()
+            },
             max_run_length: config.max_run_length,
             threshold: config.threshold,
             recent_obs: Vec::new(),
@@ -309,6 +397,16 @@ impl ChangepointDetector {
         self.confirmation_required = regime.confirmation_count();
         // Reset consecutive count when regime changes
         self.consecutive_high_prob = 0;
+    }
+
+    /// Update adaptive hazard tracking using RegimeProfile values.
+    pub fn update_from_profile(&mut self, profile: &crate::market_maker::config::RegimeProfile) {
+        self.set_regime(profile.regime);
+        self.adaptive_hazard.update_from_regime(
+            profile.cp_hazard_rate,
+            profile.cp_soft_boost_threshold,
+            profile.cp_force_extreme_threshold,
+        );
     }
 
     /// Get the current market regime.
@@ -383,15 +481,16 @@ impl ChangepointDetector {
 
         // Probability of changepoint (r_t = 0)
         let mut cp_prob = 0.0;
+        let current_hazard = self.adaptive_hazard.current_hazard();
         for (r, &prob) in self.run_length_probs.iter().enumerate() {
-            cp_prob += prob * self.hazard * pred_probs[r];
+            cp_prob += prob * current_hazard * pred_probs[r];
         }
         new_probs[0] = cp_prob;
 
         // Probability of growth (r_t = r_{t-1} + 1)
         for (r, &prob) in self.run_length_probs.iter().enumerate() {
             if r + 1 < new_probs.len() {
-                new_probs[r + 1] = prob * (1.0 - self.hazard) * pred_probs[r];
+                new_probs[r + 1] = prob * (1.0 - current_hazard) * pred_probs[r];
             }
         }
 
@@ -563,6 +662,7 @@ impl ChangepointDetector {
         self.recent_obs.clear();
         self.observation_count = 0;
         self.consecutive_high_prob = 0;
+        self.adaptive_hazard.on_changepoint_confirmed();
         // Note: current_regime is preserved across reset
     }
 
@@ -779,6 +879,32 @@ mod tests {
         detector.reset();
         assert!(!detector.is_warmed_up());
         assert_eq!(detector.observation_count, 0);
+    }
+
+    #[test]
+    fn test_adaptive_hazard_cadence() {
+        let mut hazard = AdaptiveHazard::new(0.01, 1.0, 5.0);
+        
+        // Initial call sets observation and returns base
+        assert_eq!(hazard.current_hazard(), 0.01);
+
+        // Fast cadence (< soft boost)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(hazard.current_hazard(), 0.01);
+
+        // Interpolation (dt ~ 3.0, halfway between 1.0 and 5.0)
+        // Expected multiplier: 1.0 + 4.0 * (3.0 - 1.0) / 4.0 = 3.0 -> 0.03
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+        let cur = hazard.current_hazard();
+        assert!(cur > 0.02 && cur < 0.04);
+        
+        // Extreme cadence (> force extreme)
+        std::thread::sleep(std::time::Duration::from_millis(5500));
+        assert_eq!(hazard.current_hazard(), 0.05); // 0.01 * 5.0
+        
+        // Reset
+        hazard.on_changepoint_confirmed();
+        assert_eq!(hazard.current_hazard(), 0.01);
     }
 
     #[test]

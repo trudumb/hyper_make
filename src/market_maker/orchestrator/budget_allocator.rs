@@ -50,8 +50,10 @@ impl ApiBudget {
 /// Result of budget allocation.
 #[derive(Debug, Clone)]
 pub(crate) struct AllocationResult {
-    /// Actions to execute (already converted to LadderActions).
-    pub actions: Vec<LadderAction>,
+    /// Bid actions to execute (already converted to LadderActions).
+    pub bid_actions: Vec<LadderAction>,
+    /// Ask actions to execute (already converted to LadderActions).
+    pub ask_actions: Vec<LadderAction>,
     /// Total API calls consumed by selected actions.
     pub calls_used: u32,
     /// Budget that was available.
@@ -82,7 +84,8 @@ pub(crate) fn allocate(
     budget: &ApiBudget,
     sz_decimals: u32,
 ) -> AllocationResult {
-    let mut actions = Vec::new();
+    let mut bid_actions = Vec::new();
+    let mut ask_actions = Vec::new();
     let mut calls_used: u32 = 0;
     let mut latched_count: u32 = 0;
     let mut total_value_bps: f64 = 0.0;
@@ -94,7 +97,12 @@ pub(crate) fn allocate(
     for update in scored.drain(..) {
         if is_emergency(&update) {
             if let Some(ladder_actions) = to_ladder_actions(&update, sz_decimals) {
-                actions.extend(ladder_actions);
+                use crate::market_maker::tracking::Side;
+                if update.side == Side::Buy {
+                    bid_actions.extend(ladder_actions);
+                } else {
+                    ask_actions.extend(ladder_actions);
+                }
             }
             total_value_bps += update.value_bps;
             // Emergency calls NOT counted against budget
@@ -134,7 +142,12 @@ pub(crate) fn allocate(
         let cost = update.api_calls;
         if calls_used + cost <= budget.max_calls {
             if let Some(ladder_actions) = to_ladder_actions(update, sz_decimals) {
-                actions.extend(ladder_actions);
+                use crate::market_maker::tracking::Side;
+                if update.side == Side::Buy {
+                    bid_actions.extend(ladder_actions);
+                } else {
+                    ask_actions.extend(ladder_actions);
+                }
             }
             calls_used += cost;
             total_value_bps += update.value_bps;
@@ -151,13 +164,11 @@ pub(crate) fn allocate(
     // Allow 1-2 call overrun to satisfy this guarantee.
     if budget.max_calls >= 4 {
         use crate::market_maker::tracking::Side;
-        let has_bid_action = actions.iter().any(|a| matches!(a,
-            LadderAction::Place { side: Side::Buy, .. } |
-            LadderAction::Modify { side: Side::Buy, .. }
+        let has_bid_action = bid_actions.iter().any(|a| matches!(a,
+            LadderAction::Place { .. } | LadderAction::Modify { .. }
         ));
-        let has_ask_action = actions.iter().any(|a| matches!(a,
-            LadderAction::Place { side: Side::Sell, .. } |
-            LadderAction::Modify { side: Side::Sell, .. }
+        let has_ask_action = ask_actions.iter().any(|a| matches!(a,
+            LadderAction::Place { .. } | LadderAction::Modify { .. }
         ));
 
         // Find best unallocated action for the starved side
@@ -169,7 +180,11 @@ pub(crate) fn allocate(
                 || (!has_ask_action && update.side == Side::Sell);
             if is_needed_side && update.value_bps > -2.0 {
                 if let Some(ladder_actions) = to_ladder_actions(update, sz_decimals) {
-                    actions.extend(ladder_actions);
+                    if update.side == Side::Buy {
+                        bid_actions.extend(ladder_actions);
+                    } else {
+                        ask_actions.extend(ladder_actions);
+                    }
                 }
                 calls_used += update.api_calls;
                 total_value_bps += update.value_bps;
@@ -180,7 +195,8 @@ pub(crate) fn allocate(
     }
 
     AllocationResult {
-        actions,
+        bid_actions,
+        ask_actions,
         calls_used,
         calls_budget: budget.max_calls,
         latched_count,
@@ -345,9 +361,9 @@ mod tests {
         let result = allocate(&mut scored, &budget, 2);
 
         // Emergency should execute even with 0 budget
-        assert!(!result.actions.is_empty());
+        assert!(!result.bid_actions.is_empty());
         // The stale cancel is emergency, the modify is suppressed
-        let cancel_count = result.actions.iter().filter(|a| matches!(a, LadderAction::Cancel { .. })).count();
+        let cancel_count = result.bid_actions.iter().filter(|a| matches!(a, LadderAction::Cancel { .. })).count();
         assert_eq!(cancel_count, 1);
     }
 
@@ -366,7 +382,7 @@ mod tests {
 
         assert_eq!(result.calls_used, 0);
         assert_eq!(result.suppressed_count, 0);
-        assert!(result.actions.is_empty());
+        assert!(result.bid_actions.is_empty() && result.ask_actions.is_empty());
     }
 
     #[test]
@@ -440,8 +456,8 @@ mod tests {
         let result = allocate(&mut scored, &budget, 2);
 
         // Should have at least one Sell action from side balance
-        let has_sell = result.actions.iter().any(|a| matches!(a,
-            LadderAction::Place { side: Side::Sell, .. }
+        let has_sell = result.ask_actions.iter().any(|a| matches!(a,
+            LadderAction::Place { .. }
         ));
         assert!(has_sell, "Side balance should ensure at least one sell action");
     }

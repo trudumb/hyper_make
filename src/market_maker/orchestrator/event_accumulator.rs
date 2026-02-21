@@ -472,20 +472,110 @@ impl EventAccumulatorStats {
     }
 }
 
+/// Tracks the amount of new market information that has arrived during the current cycle.
+/// Used by AdaptiveCycleTimer to determine when the next quote update is actually required.
+#[derive(Debug, Clone, Default)]
+pub struct CycleStateChanges {
+    /// Accumulated absolute mid price movement (bps)
+    pub mid_move_bps: f64,
+    /// Number of trades observed
+    pub trades_observed: u64,
+    /// Absolute change in the primary directional signal (e.g., drift) in bps/s
+    pub signal_divergence_bps: f64,
+}
+
+impl CycleStateChanges {
+    /// Resets the accumulated changes for the next cycle
+    pub fn reset(&mut self) {
+        self.mid_move_bps = 0.0;
+        self.trades_observed = 0;
+        self.signal_divergence_bps = 0.0;
+    }
+}
+
+/// Determines the optimal time for the next quote update based on both
+/// expected staleness (Brownian motion) AND realized information gain.
+#[derive(Debug, Clone)]
+pub struct AdaptiveCycleTimer {
+    /// Minimum allowed interval between cycles
+    pub min_interval: Duration,
+    /// Maximum allowed interval between cycles
+    pub max_interval: Duration,
+    /// Time of the last quote cycle
+    pub last_cycle_time: Instant,
+}
+
+impl Default for AdaptiveCycleTimer {
+    fn default() -> Self {
+        Self {
+            min_interval: Duration::from_secs(1),
+            max_interval: Duration::from_secs(30),
+            last_cycle_time: Instant::now(),
+        }
+    }
+}
+
+impl AdaptiveCycleTimer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compute whether we should trigger a new cycle right now based on accumulated 
+    /// information and time elapsed.
+    pub fn should_trigger(
+        &self,
+        changes: &CycleStateChanges,
+        sigma: f64,
+        latch_bps: f64,
+        headroom: f64,
+    ) -> bool {
+        let elapsed = self.last_cycle_time.elapsed();
+        
+        // 1. Time-bounds override
+        if elapsed < self.min_interval {
+            return false;
+        }
+        if elapsed >= self.max_interval {
+            return true;
+        }
+        
+        // 2. Headroom penalty: if API budget is running low, require MORE information to trigger
+        let headroom_penalty = (0.5 / headroom.max(0.01)).clamp(0.5, 5.0);
+        
+        // 3. Information threshold
+        // The base threshold is the expected price move to hit the latch.
+        let target_info = latch_bps * headroom_penalty;
+        
+        // 4. Realized information gain
+        // Sum of different information channels, converted into a "bps equivalent" metric
+        let realized_info = 
+            changes.mid_move_bps.abs() + 
+            (changes.trades_observed as f64 * 0.1) + // 10 trades ~ 1 bps of information
+            changes.signal_divergence_bps.abs();     // Signal changes factor into bps equivalent
+
+        // 5. Time decay: as time passes, we lower the information threshold 
+        // to eventually trigger even in quiet markets (converges to compute_next_cycle_time logic).
+        let sigma_bps = (sigma * 10_000.0).max(0.0001);
+        
+        // Expected time to hit latch under Brownian motion
+        let t_stale_expected = (latch_bps / sigma_bps).powi(2).clamp(1.0, 30.0);
+        
+        let time_progress = (elapsed.as_secs_f64() / t_stale_expected).clamp(0.0, 1.0);
+        
+        // As time_progress -> 1.0, required_info -> 0.0
+        let required_info = target_info * (1.0 - time_progress);
+        
+        realized_info >= required_info
+    }
+
+    /// Reset the timer for a new cycle
+    pub fn reset_timer(&mut self) {
+        self.last_cycle_time = Instant::now();
+    }
+}
+
 /// Compute adaptive cycle interval from market conditions.
-///
-/// Based on expected time for price to drift beyond latch threshold.
-/// From Brownian motion: E[first passage time] = (threshold / sigma)^2
-///
-/// Properties:
-/// - High volatility -> short interval (quotes go stale faster)
-/// - Low volatility -> long interval (quotes stay fresh longer)
-/// - Low headroom -> longer minimum floor (conserve API budget)
-///
-/// # Arguments
-/// * `sigma` - Price volatility (per-second, fractional, e.g. 0.001 = 10 bps/s)
-/// * `latch_bps` - Current latch threshold in basis points
-/// * `headroom` - API headroom fraction [0, 1]
+/// Now delegates to AdaptiveCycleTimer internally or can be used as a fallback.
 pub(crate) fn compute_next_cycle_time(sigma: f64, latch_bps: f64, headroom: f64) -> Duration {
     let sigma_bps = sigma * 10_000.0;
     let t_stale = if sigma_bps > 0.001 {

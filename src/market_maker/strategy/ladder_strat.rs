@@ -1282,13 +1282,29 @@ impl LadderStrategy {
             ask_params.kappa_side = market_params.kappa_ask;
             ask_params.cascade_addon_bps = market_params.cascade_ask_addon_bps;
 
+            // Position-convex threshold: reducing side gets negative E[PnL] carve-out
+            // proportional to position urgency. Accumulating side still requires E[PnL] > 0.
+            // This prevents the death spiral where E[PnL] < 0 on ALL levels kills both sides
+            // while inventory screams to unwind. The carve-out grows with |position/max|^1.5,
+            // and the gamma ratio widens it further in volatile regimes.
+            let bid_is_reducing = position < -1e-9;
+            let ask_is_reducing = position > 1e-9;
+
+            let gamma_baseline = self.risk_config.gamma_base;
+            let reducing_thresh = super::glft::reducing_threshold_bps(
+                position, effective_max_position, fee_bps, gamma, gamma_baseline,
+            );
+
+            let bid_threshold = if bid_is_reducing { reducing_thresh } else { 0.0 };
+            let ask_threshold = if ask_is_reducing { reducing_thresh } else { 0.0 };
+
             dynamic_depths.bid.retain(|&depth| {
                 bid_params.depth_bps = depth;
-                super::glft::expected_pnl_bps_enhanced(&bid_params) > 0.0
+                super::glft::expected_pnl_bps_enhanced(&bid_params) > bid_threshold
             });
             dynamic_depths.ask.retain(|&depth| {
                 ask_params.depth_bps = depth;
-                super::glft::expected_pnl_bps_enhanced(&ask_params) > 0.0
+                super::glft::expected_pnl_bps_enhanced(&ask_params) > ask_threshold
             });
 
             let bid_dropped = pre_bid_count - dynamic_depths.bid.len();
@@ -1298,6 +1314,8 @@ impl LadderStrategy {
                     bid_dropped, ask_dropped,
                     bid_remaining = dynamic_depths.bid.len(),
                     ask_remaining = dynamic_depths.ask.len(),
+                    bid_exempt = bid_is_reducing,
+                    ask_exempt = ask_is_reducing,
                     position = %format!("{:.4}", position),
                     drift_bps = %format!("{:.2}", market_params.drift_rate_per_sec * 10_000.0),
                     "E[PnL] filter: dropped negative-EV levels"

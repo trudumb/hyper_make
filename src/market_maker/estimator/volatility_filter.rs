@@ -564,6 +564,9 @@ impl VolatilityFilter {
             sigma_std: self.cache.sigma_std,
             regime_probs: self.cache.regime_probs,
             observation_count: self.observation_count,
+            // Q18 bias tracker fields — populated externally by checkpoint assembler
+            bias_fill_intervals: 0,
+            bias_nonfill_intervals: 0,
         }
     }
 
@@ -634,6 +637,141 @@ fn sample_standard_normal<R: Rng>(rng: &mut R) -> f64 {
     let u1: f64 = rng.gen::<f64>().max(1e-10);
     let u2: f64 = rng.gen();
     (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+}
+
+// ============================================================================
+// Sampling Bias Tracker (Q18: Vol Debiasing)
+// ============================================================================
+
+/// EWMA decay for bias tracking (~100 observation half-life).
+const BIAS_EWMA_ALPHA: f64 = 0.007;
+
+/// Tracks sampling bias in volatility estimation: σ̂ conditioned on fills
+/// overweights volatile regimes. Computes the ratio σ̂_fillable / σ̂_nonfillable
+/// for diagnostics, and provides Phase 2 importance weighting infrastructure.
+#[derive(Debug, Clone)]
+pub struct SamplingBiasTracker {
+    /// EWMA of sigma during fill intervals
+    sigma_fill_ewma: f64,
+    /// EWMA of sigma during non-fill intervals
+    sigma_nonfill_ewma: f64,
+    /// Count of fill intervals observed
+    fill_intervals: u64,
+    /// Count of non-fill intervals observed
+    nonfill_intervals: u64,
+    /// Total intervals observed (for fillable_fraction)
+    total_intervals: u64,
+    /// Whether the tracker has enough data to be meaningful
+    warmed_up: bool,
+}
+
+impl SamplingBiasTracker {
+    /// Create a new sampling bias tracker.
+    pub fn new() -> Self {
+        Self {
+            sigma_fill_ewma: 0.0,
+            sigma_nonfill_ewma: 0.0,
+            fill_intervals: 0,
+            nonfill_intervals: 0,
+            total_intervals: 0,
+            warmed_up: false,
+        }
+    }
+
+    /// Record a quote cycle interval with current sigma and whether a fill occurred.
+    pub fn record_interval(&mut self, sigma: f64, had_fill: bool) {
+        if sigma <= 0.0 {
+            return;
+        }
+
+        self.total_intervals += 1;
+
+        if had_fill {
+            self.fill_intervals += 1;
+            if self.fill_intervals == 1 {
+                self.sigma_fill_ewma = sigma;
+            } else {
+                self.sigma_fill_ewma =
+                    BIAS_EWMA_ALPHA * sigma + (1.0 - BIAS_EWMA_ALPHA) * self.sigma_fill_ewma;
+            }
+        } else {
+            self.nonfill_intervals += 1;
+            if self.nonfill_intervals == 1 {
+                self.sigma_nonfill_ewma = sigma;
+            } else {
+                self.sigma_nonfill_ewma =
+                    BIAS_EWMA_ALPHA * sigma + (1.0 - BIAS_EWMA_ALPHA) * self.sigma_nonfill_ewma;
+            }
+        }
+
+        // Need data in both categories to be meaningful
+        self.warmed_up = self.fill_intervals >= 10 && self.nonfill_intervals >= 10;
+    }
+
+    /// Ratio of sigma during fills vs non-fills.
+    /// \> 1.0 indicates upward bias from fill-conditioned sampling.
+    /// Returns 1.0 when insufficient data.
+    pub fn sampling_bias_ratio(&self) -> f64 {
+        if !self.warmed_up || self.sigma_nonfill_ewma <= 0.0 {
+            return 1.0;
+        }
+        self.sigma_fill_ewma / self.sigma_nonfill_ewma
+    }
+
+    /// Fraction of intervals that had fills (dead-time analysis).
+    pub fn fillable_fraction(&self) -> f64 {
+        if self.total_intervals == 0 {
+            return 0.0;
+        }
+        self.fill_intervals as f64 / self.total_intervals as f64
+    }
+
+    /// Whether the tracker is warmed up with enough data.
+    pub fn is_warmed_up(&self) -> bool {
+        self.warmed_up
+    }
+
+    /// Phase 2 stub: compute importance weight for a vol observation during a fill.
+    /// weight = 1.0 / fill_prob, where fill_prob comes from Q17's Beta posterior.
+    /// Gated behind data sufficiency checks.
+    ///
+    /// Returns 1.0 (no correction) until Phase 2 is enabled.
+    pub fn importance_weight_for(&self, _fill_prob: f64) -> f64 {
+        // Phase 2: importance weighting. Disabled until:
+        // 1. Q17 fill rate model has >100 total observations
+        // 2. ESS > 20% of nominal sample count
+        // 3. Manual review of bias_ratio
+        1.0
+    }
+
+    /// Fill interval count (for checkpoint).
+    pub fn fill_intervals(&self) -> u64 {
+        self.fill_intervals
+    }
+
+    /// Non-fill interval count (for checkpoint).
+    pub fn nonfill_intervals(&self) -> u64 {
+        self.nonfill_intervals
+    }
+
+    /// Total interval count (for checkpoint).
+    pub fn total_intervals(&self) -> u64 {
+        self.total_intervals
+    }
+
+    /// Restore from checkpoint values.
+    pub fn restore(&mut self, fill_intervals: u64, nonfill_intervals: u64) {
+        self.fill_intervals = fill_intervals;
+        self.nonfill_intervals = nonfill_intervals;
+        self.total_intervals = fill_intervals + nonfill_intervals;
+        self.warmed_up = fill_intervals >= 10 && nonfill_intervals >= 10;
+    }
+}
+
+impl Default for SamplingBiasTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ============================================================================
@@ -830,5 +968,64 @@ mod tests {
         // Should be back to initial state
         assert!(!filter.is_warmed_up());
         assert_eq!(filter.observation_count(), 0);
+    }
+
+    // ======================== SamplingBiasTracker tests ========================
+
+    #[test]
+    fn test_bias_tracker_no_fills() {
+        let mut tracker = SamplingBiasTracker::new();
+
+        // Only non-fill intervals
+        for _ in 0..20 {
+            tracker.record_interval(0.001, false);
+        }
+
+        // Not warmed up (no fills)
+        assert!(!tracker.is_warmed_up());
+        assert!((tracker.sampling_bias_ratio() - 1.0).abs() < 1e-9, "Should return 1.0 when not warmed up");
+        assert!((tracker.fillable_fraction() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_bias_tracker_volatile_fill_bias() {
+        let mut tracker = SamplingBiasTracker::new();
+
+        // Fills occur during high-sigma periods (0.005)
+        for _ in 0..30 {
+            tracker.record_interval(0.005, true);
+        }
+        // Non-fills during low-sigma periods (0.001)
+        for _ in 0..30 {
+            tracker.record_interval(0.001, false);
+        }
+
+        assert!(tracker.is_warmed_up());
+        let ratio = tracker.sampling_bias_ratio();
+        assert!(ratio > 1.5, "Fills during high vol should show bias > 1.5. Got: {}", ratio);
+    }
+
+    #[test]
+    fn test_importance_weight_computation() {
+        let tracker = SamplingBiasTracker::new();
+
+        // Phase 2 stub: always returns 1.0
+        assert!((tracker.importance_weight_for(0.5) - 1.0).abs() < 1e-9);
+        assert!((tracker.importance_weight_for(0.1) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fillable_fraction() {
+        let mut tracker = SamplingBiasTracker::new();
+
+        for _ in 0..30 {
+            tracker.record_interval(0.001, true);
+        }
+        for _ in 0..70 {
+            tracker.record_interval(0.001, false);
+        }
+
+        let frac = tracker.fillable_fraction();
+        assert!((frac - 0.3).abs() < 0.01, "Should be ~30% fillable. Got: {}", frac);
     }
 }

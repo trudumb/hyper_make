@@ -1981,6 +1981,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (pos_val * 0.02).max(1.0)
         },
         enabled: ks_toml.enabled,
+        // Q20: Stuck inventory detection — use defaults
+        max_stuck_cycles: 30,
+        stuck_warning_cycles: 10,
+        position_stuck_threshold_fraction: 0.10,
+        unrealized_as_warn_fraction: 0.01,
+        unrealized_as_kill_fraction: 0.05,
     };
     info!(
         max_daily_loss = %kill_switch_config.max_daily_loss,

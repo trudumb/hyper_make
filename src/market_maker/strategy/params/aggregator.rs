@@ -796,6 +796,8 @@ impl ParameterAggregator {
             // Phase 8: Warm/Cold tier features (set in quote_engine)
             vol_term_structure_ratio: 1.0,
             as_ratio_adjustment: 1.0,
+            as_floor_variance_bps2: 0.0,
+            profile_spread_floor_bps: 0.0,
         }
     }
 }

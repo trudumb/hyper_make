@@ -71,7 +71,7 @@ pub fn discover_prior(
     if let Some(dex_name) = dex {
         candidates.push(
             Path::new(checkpoint_root)
-                .join(format!("{dex_name}:{base}"))
+                .join(format!("{dex_name}_{base}"))
                 .join("prior.json"),
         );
     }
@@ -87,7 +87,7 @@ pub fn discover_prior(
     if let Some(dex_name) = dex {
         candidates.push(
             Path::new(checkpoint_root)
-                .join(format!("{dex_name}:{base}"))
+                .join(format!("{dex_name}_{base}"))
                 .join("latest/checkpoint.json"),
         );
     }
@@ -220,11 +220,11 @@ mod tests {
     fn test_discover_dex_prefixed_path() {
         let root = test_dir();
         let prior = make_prior("hyna:HYPE", 1700000000000);
-        save_prior(&root, "hyna:HYPE/prior.json", &prior);
+        save_prior(&root, "hyna_HYPE/prior.json", &prior);
 
         let found = discover_prior("HYPE", Some("hyna"), root.to_str().unwrap(), None);
         assert!(found.is_some());
-        assert!(found.unwrap().path.to_str().unwrap().contains("hyna:HYPE"));
+        assert!(found.unwrap().path.to_str().unwrap().contains("hyna_HYPE"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -269,7 +269,7 @@ mod tests {
 
         // Newer prior in dex-prefixed path
         let new_prior = make_prior("hyna:HYPE", 1700000099000);
-        save_prior(&root, "hyna:HYPE/prior.json", &new_prior);
+        save_prior(&root, "hyna_HYPE/prior.json", &new_prior);
 
         let found = discover_prior("HYPE", Some("hyna"), root.to_str().unwrap(), None);
         assert!(found.is_some());

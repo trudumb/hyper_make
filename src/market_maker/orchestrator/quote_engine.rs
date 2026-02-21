@@ -20,7 +20,7 @@ use crate::market_maker::config::{CapacityBudget, Viability};
 use crate::market_maker::risk::{CircuitBreakerAction, RiskCheckResult};
 use crate::market_maker::strategy::action_to_inventory_ratio;
 use crate::market_maker::strategy::drift_estimator::{
-    SignalObservation, BASE_MOMENTUM_VAR, BASE_TREND_VAR, BASE_LL_VAR, BASE_FLOW_VAR,
+    SignalObservation, BASE_MOMENTUM_VAR, BASE_LL_VAR, BASE_FLOW_VAR,
 };
 
 /// Minimum order notional value in USD (Hyperliquid requirement)
@@ -141,8 +141,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .as_ref()
             .map(|c| c.headroom_pct())
             .unwrap_or(1.0);
-        // Adaptive cycle interval from market conditions.
-        // Replaces fixed tiers with sigma-based staleness estimate.
+        
+        // Adaptive cycle interval from market conditions and information gain (Fix 14).
+        // Uses the AdaptiveCycleTimer to measure both time staleness and state changes.
         let sigma_for_cycle = self.estimator.sigma();
         let latch_bps_for_cycle = self
             .cached_market_params
@@ -152,23 +153,25 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 (half_spread * 0.3).clamp(1.0, 10.0)
             })
             .unwrap_or(3.0);
-        let min_cycle_interval_ms = super::event_accumulator::compute_next_cycle_time(
+            
+        let should_trigger = self.cycle_timer.should_trigger(
+            &self.cycle_state_changes,
             sigma_for_cycle,
             latch_bps_for_cycle,
             headroom_for_throttle,
-        ).as_millis() as u64;
-        if let Some(last) = self.last_quote_cycle_time {
-            let elapsed_ms = last.elapsed().as_millis() as u64;
-            if elapsed_ms < min_cycle_interval_ms {
-                tracing::debug!(
-                    headroom_pct = %format!("{:.1}%", headroom_for_throttle * 100.0),
-                    min_interval_ms = min_cycle_interval_ms,
-                    elapsed_ms,
-                    "Quota throttle: skipping cycle to conserve API quota"
-                );
-                return Ok(());
-            }
+        );
+
+        if !should_trigger {
+            tracing::debug!(
+                headroom_pct = %format!("{:.1}%", headroom_for_throttle * 100.0),
+                "Quota throttle: skipping cycle to conserve API quota (insufficient info gain)"
+            );
+            return Ok(());
         }
+        
+        // Cycle triggered: reset timer and state changes
+        self.cycle_timer.reset_timer();
+        self.cycle_state_changes.reset();
         self.last_quote_cycle_time = Some(std::time::Instant::now());
 
         // === PHASE 3: INVENTORY GOVERNOR — First structural check ===
@@ -575,7 +578,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Regime probabilities modulate variance: in trending markets momentum
         // has low variance (high weight), trend has high variance (low weight).
         let regime_probs = self.stochastic.regime_hmm.regime_probabilities();
-        let p_stress = regime_probs[2] + regime_probs[3]; // P(Volatile) + P(Extreme)
+        let _p_stress = regime_probs[2] + regime_probs[3]; // P(Volatile) + P(Extreme)
         let sigma_effective = self.estimator.sigma_effective();
         let vol_ratio = sigma_effective / self.stochastic.stochastic_config.sigma_baseline.max(1e-9);
 
@@ -590,14 +593,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             });
         }
 
-        // 2. Long-term trend
-        if trend_signal.is_warmed_up && trend_signal.long_momentum_bps.abs() > 1.0 {
-            drift_signals.push(SignalObservation {
-                value_bps_per_sec: trend_signal.long_momentum_bps,
-                variance: BASE_TREND_VAR * (1.0 + p_stress * 3.0),
-                // CALIBRATION TARGET: BASE_TREND_VAR=200.0
-            });
-        }
+        // 2. Long-term trend — REMOVED from SignalObservation vector (Fix 13).
+        // Trend was double-fed: once here AND again via update_trend() below.
+        // On thin venues, all timeframes trivially agree (agreement=1.0) because
+        // sparse fills produce correlated momentum windows (Bayesian consistency violation).
+        // Trend now enters ONLY via update_trend() with echo-attenuated R.
 
         // 3. Lead-lag (reference perp)
         if self.reference_perp_drift_ema.abs() > 1e-12 {
@@ -625,13 +625,37 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .as_millis() as u64;
         self.drift_estimator.update(&drift_signals, now_ms);
 
-        // Additional Kalman observations from trend detector
-        if trend_signal.is_warmed_up && trend_signal.trend_confidence > 0.2 {
-            self.drift_estimator.update_trend(
-                trend_signal.long_momentum_bps,
-                trend_signal.timeframe_agreement,
-                p_continuation,
-            );
+        // Trend observation with hysteresis gate + echo-attenuated R (Fix 13).
+        // Hysteresis: must earn past 0.12 autocorrelation before trend feeds drift.
+        // Once active, stays active until drops below 0.08. Cold start = gate off.
+        {
+            const TRENDING_ON: f64 = 0.12;
+            const TRENDING_OFF: f64 = 0.08;
+            let gate = if self.trend_gate_active {
+                trend_signal.return_autocorrelation > TRENDING_OFF
+            } else {
+                trend_signal.return_autocorrelation > TRENDING_ON
+            };
+            self.trend_gate_active = gate;
+
+            if gate && trend_signal.is_warmed_up && trend_signal.trend_confidence > 0.2 {
+                // Lambda-adaptive R: low fill rate → inflate R (less precise observations)
+                let kappa_prior = self.estimator.adapted_kappa_prior();
+                let recent_kappa = self.estimator.kappa_orchestrator().kappa_effective().max(1.0);
+                let lambda_ratio = (recent_kappa / kappa_prior.max(1.0)).clamp(0.1, 3.0);
+
+                // Echo R multiplier: high self-echo → heavily distrust trend
+                let venue_base_r = 5.0; // Hardcoded default since it's not in StochasticConfig
+                let echo_r = self.echo_estimator.r_multiplier(venue_base_r);
+                let effective_r_mult = echo_r / lambda_ratio;
+
+                self.drift_estimator.update_trend(
+                    trend_signal.long_momentum_bps,
+                    trend_signal.timeframe_agreement,
+                    p_continuation,
+                    effective_r_mult,
+                );
+            }
         }
 
         // For HJB controller: still need effective_momentum for its internal EWMA
@@ -833,7 +857,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Wire DriftEstimator output for GLFT asymmetric bid/ask spreads.
         // Bayesian fusion of momentum, trend, lead-lag, and flow signals (Phase 5).
         // Falls back to 0.0 when no signals are active (symmetric quotes).
-        market_params.drift_rate_per_sec = self.drift_estimator.drift_rate_per_sec();
+        market_params.drift_rate_per_sec = self.drift_estimator.shrunken_drift_rate_per_sec();
         market_params.drift_uncertainty_bps = self.drift_estimator.drift_uncertainty_bps();
 
         // === Directional kappa from trade flow (Phase 3) ===
@@ -971,7 +995,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         {
             let as_floor = self.tier1.adverse_selection.as_floor_bps();
             market_params.as_floor_bps = as_floor.max(self.as_floor_hwm);
+            // Q19: AS posterior variance for uncertainty premium
+            market_params.as_floor_variance_bps2 =
+                self.tier1.adverse_selection.as_floor_variance_bps2();
         }
+
+        // Q19: Profile spread floor from SpreadProfile (static safety bound)
+        market_params.profile_spread_floor_bps =
+            self.config.spread_profile.profile_min_half_spread_bps();
 
         // === Fix 3: Wire ghost liquidity gamma mult from kappa orchestrator ===
         market_params.ghost_liquidity_gamma_mult =
@@ -1027,6 +1058,33 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     "Warmup graduated uncertainty active (prior-blended)"
                 );
             }
+
+            // ConvergenceSnapshot: log every 10 fills for A/B measurement of prior quality.
+            // Data pipeline for future empirical estimation of paper→live domain gap.
+            #[allow(clippy::manual_is_multiple_of)]
+            if fill_count > 0 && fill_count % 10 == 0 {
+                use crate::market_maker::calibration::gate::{
+                    ConvergenceSnapshot,
+                    spread_multiplier_from_confidence as spread_mult_fn,
+                    size_multiplier_from_confidence as size_mult_fn,
+                };
+                let snapshot = ConvergenceSnapshot {
+                    fill_count,
+                    session_elapsed_s: self.session_start_time.elapsed().as_secs_f64(),
+                    prior_confidence: prior_conf,
+                    spread_multiplier: spread_mult_fn(prior_conf),
+                    size_multiplier: size_mult_fn(prior_conf),
+                    cumulative_pnl_bps: self.tier2.pnl_tracker.summary(anticipated_mid).total_pnl
+                        / anticipated_mid.max(1e-9) * 10_000.0,
+                    mean_realized_edge_bps: self.tier2.edge_tracker.mean_gross_edge(),
+                    has_prior: prior_conf > 0.0,
+                    prior_source_mode: self.prior_source_mode.clone(),
+                };
+                let _ = serde_json::to_string(&snapshot).map(|json| {
+                    info!(convergence_snapshot = %json, "ConvergenceSnapshot");
+                });
+            }
+
             effective_sz
         };
 
@@ -1312,6 +1370,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             &regime_probs,
             bocpd_cp,
             signals_for_regime.kappa_effective,
+            signals_for_regime.kappa_confidence,
         );
         if regime_changed {
             info!(
@@ -2235,6 +2294,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 last_realized_edge_bps: self.tier2.edge_tracker.last_realized_edge_bps(),
                 market_spread_bps: market_params.market_spread_bps,
             };
+
+            // Feed realized edge stats from EdgeTracker into DecisionEngine's
+            // A-S information asymmetry framework. When realized edge is persistently
+            // negative, blended P(edge > 0) shifts below 0.5, reducing size.
+            self.learning.update_realized_edge_stats(
+                self.tier2.edge_tracker.mean_gross_edge(),
+                self.tier2.edge_tracker.gross_edge_variance().sqrt(),
+                self.tier2.edge_tracker.edge_count(),
+            );
 
             // Get Layer 2 output for the controller
             let learning_output = self.learning.output(
@@ -3526,6 +3594,64 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .dashboard
             .update_position(position, position_value);
 
+        // === Q18: Vol Sampling Bias Tracking ===
+        // Record whether this cycle interval had a fill, using AS fill count as signal.
+        {
+            let current_fill_count = self.tier1.adverse_selection.fills_measured();
+            let had_fill = current_fill_count > self.last_bias_fill_count;
+            self.last_bias_fill_count = current_fill_count;
+            let sigma = market_params.sigma;
+            if sigma > 0.0 {
+                self.sampling_bias_tracker.record_interval(sigma, had_fill);
+            }
+        }
+
+        // === Q20: Stuck Inventory Detection ===
+        // Check if position is stuck without reducing quotes and escalate if needed.
+        if position.abs() > 0.0 && self.latest_mid > 0.0 {
+            let reducing_side = if position > 0.0 {
+                super::super::tracking::Side::Sell
+            } else {
+                super::super::tracking::Side::Buy
+            };
+            let reducing_orders = self.orders.get_all_by_side(reducing_side);
+            let has_reducing_quotes = !reducing_orders.is_empty();
+
+            let escalation = self.safety.kill_switch.report_reducing_quote_status(
+                position,
+                self.latest_mid,
+                self.effective_max_position,
+                has_reducing_quotes,
+            );
+
+            match escalation {
+                super::super::risk::StuckEscalation::Kill => {
+                    error!(
+                        position = %format!("{:.4}", position),
+                        mid = %format!("{:.2}", self.latest_mid),
+                        "Q20: Stuck inventory kill — triggering emergency shutdown"
+                    );
+                    let (stuck_cycles, as_cost) = self.safety.kill_switch.stuck_state();
+                    self.safety.kill_switch.trigger_manual(format!(
+                        "Q20 inventory stuck: cycles={}, as_cost_usd={:.2}",
+                        stuck_cycles, as_cost
+                    ));
+                }
+                super::super::risk::StuckEscalation::ForceReducingQuotes => {
+                    // Escalation warning logged by kill_switch internally.
+                    // The graduated risk system (inventory governor) already widens
+                    // spreads and forces reduce-only in Yellow/Red zones.
+                    // This log confirms the Q20 stuck detection is active.
+                    warn!(
+                        position = %format!("{:.4}", position),
+                        has_reducing = has_reducing_quotes,
+                        "Q20: ForceReducingQuotes escalation active"
+                    );
+                }
+                super::super::risk::StuckEscalation::None => {}
+            }
+        }
+
         // WS7: Estimator diagnostics — log every 10 cycles or when unusual
         if self.quote_cycle_count.is_multiple_of(10) || self.quote_cycle_count < 3 {
             self.log_estimator_diagnostics(&market_params);
@@ -3565,10 +3691,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let spread_bps = market_params.market_spread_bps;
         let skew_bps = market_params.rl_bid_skew_bps - market_params.rl_ask_skew_bps;
 
+        // Gamma defense diagnostics: log risk features that feed into gamma
+        let toxicity = market_params.toxicity_score;
+        let cascade = market_params.cascade_intensity;
+        let tail_risk = market_params.tail_risk_intensity;
+
+        // Q18: Vol sampling bias diagnostics
+        let vol_bias_ratio = self.sampling_bias_tracker.sampling_bias_ratio();
+        let fillable_frac = self.sampling_bias_tracker.fillable_fraction();
+
         // Check for unusual state
         let is_unusual = !(0.5..=1.5).contains(&sigma_ratio)
             || fill_autocorr > 0.7
-            || drift_uncertainty > 20.0;
+            || drift_uncertainty > 20.0
+            || vol_bias_ratio > 1.5;
 
         if is_unusual || self.quote_cycle_count < 3 {
             info!(
@@ -3582,6 +3718,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 latency_ms = %format!("{:.1}", self.latency_ewma_ms),
                 spread_bps = %format!("{:.2}", spread_bps),
                 skew_bps = %format!("{:.2}", skew_bps),
+                toxicity = %format!("{:.2}", toxicity),
+                cascade = %format!("{:.2}", cascade),
+                tail_risk = %format!("{:.2}", tail_risk),
+                vol_bias = %format!("{:.3}", vol_bias_ratio),
+                fillable = %format!("{:.3}", fillable_frac),
                 "ESTIMATOR_DIAGNOSTICS"
             );
         } else {
@@ -3590,6 +3731,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 sigma_ratio = %format!("{:.3}", sigma_ratio),
                 mid_shift_bps = %format!("{:.3}", shift_bps),
                 spread_bps = %format!("{:.2}", spread_bps),
+                toxicity = %format!("{:.2}", toxicity),
+                cascade = %format!("{:.2}", cascade),
+                vol_bias = %format!("{:.3}", vol_bias_ratio),
                 "ESTIMATOR_DIAGNOSTICS"
             );
         }

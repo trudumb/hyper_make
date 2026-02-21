@@ -4,6 +4,7 @@
 //! `QuotingStrategy` trait.
 
 pub mod drift_estimator;
+pub mod echo_estimator;
 pub mod feature_store;
 mod glft;
 mod kelly;

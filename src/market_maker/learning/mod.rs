@@ -86,7 +86,7 @@ impl Default for LearningConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            prediction_horizon_ms: 1000, // 1 second
+            prediction_horizon_ms: 500, // 500ms — aligned with AS measurement horizon
             min_predictions_for_update: 20,
             use_decision_filter: true, // Enabled by default - GLFT math is proven
             health_log_interval: 100,
@@ -191,6 +191,11 @@ impl LearningModule {
         self.config.enabled
     }
 
+    /// Get the learning config for checkpoint serialization.
+    pub fn config(&self) -> &LearningConfig {
+        &self.config
+    }
+
     /// Update the last known mid price.
     pub fn update_mid(&mut self, mid: f64) {
         self.last_mid = mid;
@@ -275,11 +280,28 @@ impl LearningModule {
             self.coefficient_estimator.record_sample(sample);
 
             // Update Kelly win/loss tracker
-            if outcome.realized_edge_bps > 0.0 {
+            let is_win = outcome.realized_edge_bps > 0.0;
+            if is_win {
                 self.kelly_tracker.record_win(outcome.realized_edge_bps);
             } else {
                 self.kelly_tracker.record_loss(-outcome.realized_edge_bps);
             }
+
+            // Diagnostic: log per-fill Kelly edge decomposition
+            let spread_captured_bps = if outcome.prediction.fill.quoted_half_spread_bps > 0.0 {
+                outcome.prediction.fill.quoted_half_spread_bps * 10000.0
+            } else {
+                outcome.prediction.depth_bps
+            };
+            tracing::debug!(
+                spread_captured_bps = %format!("{:.2}", spread_captured_bps),
+                as_measured_bps = %format!("{:.2}", outcome.realized_as_bps),
+                fee_bps = %format!("{:.2}", self.config.fee_bps),
+                edge_bps = %format!("{:.2}", outcome.realized_edge_bps),
+                horizon_ms = self.config.prediction_horizon_ms,
+                is_win = is_win,
+                "Kelly edge decomposition"
+            );
         }
     }
 
@@ -631,18 +653,44 @@ impl LearningModule {
     }
 
     /// Restore Kelly tracker and ensemble weights from checkpoint.
+    ///
+    /// Kelly state is invalidated if the checkpoint horizon differs from the
+    /// current config horizon — observations measured under a different window
+    /// don't inform the current posterior (stale-observation invalidation).
     pub fn restore_from_checkpoint(
         &mut self,
         kelly: &crate::market_maker::checkpoint::KellyTrackerCheckpoint,
         ensemble: &crate::market_maker::checkpoint::EnsembleWeightsCheckpoint,
     ) {
-        self.kelly_tracker.restore_from_checkpoint(
-            kelly.ewma_wins,
-            kelly.n_wins,
-            kelly.ewma_losses,
-            kelly.n_losses,
-            kelly.decay,
-        );
+        // Stale-observation invalidation: if horizon changed, discard Kelly state
+        // and start from priors. This prevents 63 stale 1000ms losses from
+        // contaminating a fresh 500ms model.
+        if kelly.horizon_ms != 0 && kelly.horizon_ms != self.config.prediction_horizon_ms {
+            tracing::warn!(
+                checkpoint_horizon_ms = kelly.horizon_ms,
+                config_horizon_ms = self.config.prediction_horizon_ms,
+                stale_wins = kelly.n_wins,
+                stale_losses = kelly.n_losses,
+                "Kelly horizon mismatch — discarding stale checkpoint, starting from priors"
+            );
+            // Don't restore — keep default priors (ewma_wins=5.0, ewma_losses=3.0)
+        } else {
+            self.kelly_tracker.restore_from_checkpoint(
+                kelly.ewma_wins,
+                kelly.n_wins,
+                kelly.ewma_losses,
+                kelly.n_losses,
+                kelly.decay,
+            );
+            if kelly.horizon_ms > 0 {
+                tracing::info!(
+                    horizon_ms = kelly.horizon_ms,
+                    n_wins = kelly.n_wins,
+                    n_losses = kelly.n_losses,
+                    "Kelly tracker restored from checkpoint (horizon matches)"
+                );
+            }
+        }
         self.ensemble
             .restore_weights(&ensemble.model_weights, ensemble.total_updates);
     }
@@ -650,6 +698,22 @@ impl LearningModule {
     /// Get the risk model config for consistency with strategy.
     pub fn risk_model_config(&self) -> &RiskModelConfig {
         &self.risk_model_config
+    }
+
+    /// Update realized edge statistics from EdgeTracker for A-S feedback.
+    ///
+    /// Feeds realized edge outcomes back into the decision engine's p_positive
+    /// calculation. When realized edge is persistently negative, the blended
+    /// P(edge > 0) shifts below 0.5, increasing information asymmetry and
+    /// reducing size — all within the existing A-S framework.
+    pub fn update_realized_edge_stats(&mut self, mean_bps: f64, std_bps: f64, count: usize) {
+        let config = self.decision_engine.config().clone();
+        self.decision_engine.set_config(decision::DecisionEngineConfig {
+            realized_edge_mean: mean_bps,
+            realized_edge_std: std_bps,
+            realized_edge_n: count,
+            ..config
+        });
     }
 
     /// Generate output for Layer 3 (StochasticController).
@@ -725,7 +789,7 @@ mod tests {
     fn test_learning_config_default() {
         let config = LearningConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.prediction_horizon_ms, 1000);
+        assert_eq!(config.prediction_horizon_ms, 500);
         assert_eq!(config.min_predictions_for_update, 20);
         assert_eq!(config.fee_bps, 1.5);
     }
@@ -735,5 +799,68 @@ mod tests {
         let module = LearningModule::default();
         assert!(module.is_enabled());
         assert_eq!(module.pending_predictions_count(), 0);
+    }
+
+    #[test]
+    fn test_kelly_stale_invalidation_horizon_mismatch() {
+        // Restore with horizon_ms=1000 into config with 500ms → state resets to priors
+        let mut module = LearningModule::default(); // config has 500ms
+        assert_eq!(module.config.prediction_horizon_ms, 500);
+
+        let stale_kelly = crate::market_maker::checkpoint::KellyTrackerCheckpoint {
+            ewma_wins: 10.0,
+            n_wins: 0,
+            ewma_losses: 20.0,
+            n_losses: 63,
+            decay: 0.99,
+            horizon_ms: 1000, // Mismatch!
+        };
+        let ensemble = crate::market_maker::checkpoint::EnsembleWeightsCheckpoint::default();
+        module.restore_from_checkpoint(&stale_kelly, &ensemble);
+
+        // Should NOT have restored the stale state — should be at default priors
+        assert_eq!(module.kelly_tracker.total_trades(), 0);
+        assert_eq!(module.kelly_tracker.avg_win(), 5.0); // Default prior
+        assert_eq!(module.kelly_tracker.avg_loss(), 3.0); // Default prior
+    }
+
+    #[test]
+    fn test_kelly_fresh_restore_horizon_matches() {
+        // Restore with horizon_ms=500 into config with 500ms → state preserved
+        let mut module = LearningModule::default();
+
+        let fresh_kelly = crate::market_maker::checkpoint::KellyTrackerCheckpoint {
+            ewma_wins: 8.0,
+            n_wins: 30,
+            ewma_losses: 4.0,
+            n_losses: 20,
+            decay: 0.99,
+            horizon_ms: 500, // Matches config
+        };
+        let ensemble = crate::market_maker::checkpoint::EnsembleWeightsCheckpoint::default();
+        module.restore_from_checkpoint(&fresh_kelly, &ensemble);
+
+        // Should have restored the state
+        assert_eq!(module.kelly_tracker.total_trades(), 50);
+    }
+
+    #[test]
+    fn test_kelly_restore_legacy_zero_horizon() {
+        // Old checkpoints have horizon_ms=0 (default) — should restore (backward compat)
+        let mut module = LearningModule::default();
+
+        let legacy_kelly = crate::market_maker::checkpoint::KellyTrackerCheckpoint {
+            ewma_wins: 7.0,
+            n_wins: 25,
+            ewma_losses: 3.5,
+            n_losses: 15,
+            decay: 0.99,
+            horizon_ms: 0, // Legacy — no horizon recorded
+        };
+        let ensemble = crate::market_maker::checkpoint::EnsembleWeightsCheckpoint::default();
+        module.restore_from_checkpoint(&legacy_kelly, &ensemble);
+
+        // Should have restored (0 == "unknown", don't invalidate)
+        assert_eq!(module.kelly_tracker.total_trades(), 40);
     }
 }

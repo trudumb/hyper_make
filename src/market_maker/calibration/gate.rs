@@ -32,7 +32,8 @@ pub struct PriorConfidence {
     /// From `prior_age_confidence()`.
     pub age: f64,
     /// Overall confidence: combined score [0,1].
-    /// `min(structural, age) × (0.5 + 0.5 × execution)`.
+    /// `min(structural, age) × (base + (1 - base) × execution)`.
+    /// `base` is source-dependent: paper=0.3, live=0.5, unknown=0.4.
     pub overall: f64,
 }
 
@@ -78,6 +79,25 @@ pub struct CalibrationGateConfig {
     pub max_prior_age_s: f64,
     /// Whether Marginal verdict is acceptable for live trading
     pub allow_marginal: bool,
+    /// Base credit for execution confidence when prior source is paper.
+    /// Paper has no realistic queue/latency/adversarial flow, so execution
+    /// confidence gets a lower base than live. Formula:
+    /// `overall = min(structural, age) × (base + (1 - base) × execution)`
+    /// Default: 0.3 (30% base credit for paper).
+    #[serde(default = "default_paper_execution_base_credit")]
+    pub paper_execution_base_credit: f64,
+    /// Base credit for execution confidence when prior source is live.
+    /// Default: 0.5 (50% base credit — unchanged from original formula).
+    #[serde(default = "default_live_execution_base_credit")]
+    pub live_execution_base_credit: f64,
+}
+
+fn default_paper_execution_base_credit() -> f64 {
+    0.3
+}
+
+fn default_live_execution_base_credit() -> f64 {
+    0.5
 }
 
 impl Default for CalibrationGateConfig {
@@ -91,6 +111,8 @@ impl Default for CalibrationGateConfig {
             min_kelly_fills: 5,
             max_prior_age_s: 14400.0,
             allow_marginal: true,
+            paper_execution_base_credit: 0.3,
+            live_execution_base_credit: 0.5,
         }
     }
 }
@@ -221,10 +243,24 @@ impl CalibrationGate {
         // Age confidence from policy
         let age = prior_age_confidence(age_s, &age_policy);
 
-        // Overall: min(structural, age) × (0.5 + 0.5 × execution)
+        // Source-aware execution base credit:
+        // Paper has no realistic queue/latency/adversarial flow — execution confidence
+        // gets a lower base than live. Unknown source (old checkpoints with empty
+        // source_mode) gets midpoint as safe default.
+        let base_credit = match bundle.metadata.source_mode.as_str() {
+            "paper" => self.config.paper_execution_base_credit,
+            "live" => self.config.live_execution_base_credit,
+            _ => {
+                // Unknown source: average of paper and live as safe default
+                (self.config.paper_execution_base_credit
+                    + self.config.live_execution_base_credit) / 2.0
+            }
+        };
+
+        // Overall: min(structural, age) × (base + (1 - base) × execution)
         // Structural and age are both required foundations.
-        // Execution is additive on top — zero execution still gets 50% base.
-        let overall = structural.min(age) * (0.5 + 0.5 * execution);
+        // Execution is additive on top — zero execution gets `base` credit.
+        let overall = structural.min(age) * (base_credit + (1.0 - base_credit) * execution);
 
         PriorConfidence {
             structural,
@@ -339,6 +375,33 @@ pub fn warmup_size_multiplier(fill_count: usize) -> f64 {
     }
 }
 
+/// Snapshot for A/B measurement of prior convergence speed.
+///
+/// Logged periodically to analytics JSONL for future empirical estimation of
+/// the paper→live domain gap. Will eventually replace heuristic base credits
+/// with measured precision inflation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergenceSnapshot {
+    /// Total fills received since session start.
+    pub fill_count: usize,
+    /// Seconds since session start.
+    pub session_elapsed_s: f64,
+    /// Current prior confidence [0, 1].
+    pub prior_confidence: f64,
+    /// Current spread multiplier from confidence.
+    pub spread_multiplier: f64,
+    /// Current size multiplier from confidence.
+    pub size_multiplier: f64,
+    /// Cumulative PnL in bps.
+    pub cumulative_pnl_bps: f64,
+    /// Mean realized gross edge in bps.
+    pub mean_realized_edge_bps: f64,
+    /// Whether a prior was loaded at startup.
+    pub has_prior: bool,
+    /// Source mode of the prior ("paper", "live", or empty).
+    pub prior_source_mode: String,
+}
+
 /// Result of loading and assessing a prior checkpoint.
 #[allow(dead_code)]
 pub enum PriorStatus {
@@ -416,6 +479,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: crate::market_maker::checkpoint::types::CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator: crate::market_maker::checkpoint::types::KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
         }
     }
@@ -629,8 +693,8 @@ mod tests {
         let conf = gate.confidence(&bundle, 100.0);
         assert!(conf.structural > 0.9, "structural should be ~1.0: {}", conf.structural);
         assert_eq!(conf.execution, 0.0);
-        // overall = min(1.0, 1.0) * (0.5 + 0.5*0) = 0.5
-        assert!((conf.overall - 0.5).abs() < 0.05, "overall ~0.5: {}", conf.overall);
+        // overall = min(1.0, 1.0) * (0.4 + 0.6*0) = 0.4  (unknown source → 0.4 base)
+        assert!((conf.overall - 0.4).abs() < 0.05, "overall ~0.4: {}", conf.overall);
     }
 
     #[test]
@@ -668,5 +732,113 @@ mod tests {
         assert!((size_multiplier_from_confidence(1.0) - 1.0).abs() < 0.001);
         assert!((size_multiplier_from_confidence(0.0) - 0.1).abs() < 0.001);
         assert!((size_multiplier_from_confidence(0.5) - 0.55).abs() < 0.001);
+    }
+
+    // === Source-aware confidence tests ===
+
+    fn make_bundle_with_source(
+        source_mode: &str,
+        vol_obs: usize,
+        kappa_obs: usize,
+        as_samples: usize,
+        regime_obs: u64,
+        fill_rate_obs: usize,
+    ) -> CheckpointBundle {
+        let mut bundle = make_bundle(2000.0, vol_obs, kappa_obs, as_samples, regime_obs, fill_rate_obs, 5, 5);
+        bundle.metadata.source_mode = source_mode.to_string();
+        bundle
+    }
+
+    #[test]
+    fn test_confidence_paper_vs_live_source_mode() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+
+        // Same observations, different source modes
+        let paper_bundle = make_bundle_with_source("paper", 100, 5, 15, 100, 15);
+        let live_bundle = make_bundle_with_source("live", 100, 5, 15, 100, 15);
+
+        let paper_conf = gate.confidence(&paper_bundle, 100.0);
+        let live_conf = gate.confidence(&live_bundle, 100.0);
+
+        // Paper should get lower overall confidence due to lower base credit
+        assert!(
+            paper_conf.overall < live_conf.overall,
+            "Paper confidence {} should be < live confidence {}",
+            paper_conf.overall, live_conf.overall
+        );
+
+        // Structural and execution should be the same (source doesn't affect these)
+        assert!(
+            (paper_conf.structural - live_conf.structural).abs() < 0.001,
+            "Structural should be equal"
+        );
+        assert!(
+            (paper_conf.execution - live_conf.execution).abs() < 0.001,
+            "Execution should be equal"
+        );
+    }
+
+    #[test]
+    fn test_confidence_unknown_source_mode() {
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+
+        let paper_bundle = make_bundle_with_source("paper", 100, 5, 15, 100, 15);
+        let unknown_bundle = make_bundle_with_source("", 100, 5, 15, 100, 15);
+        let live_bundle = make_bundle_with_source("live", 100, 5, 15, 100, 15);
+
+        let paper_conf = gate.confidence(&paper_bundle, 100.0);
+        let unknown_conf = gate.confidence(&unknown_bundle, 100.0);
+        let live_conf = gate.confidence(&live_bundle, 100.0);
+
+        // Unknown should be between paper and live
+        assert!(
+            unknown_conf.overall > paper_conf.overall,
+            "Unknown {} should be > paper {}",
+            unknown_conf.overall, paper_conf.overall
+        );
+        assert!(
+            unknown_conf.overall < live_conf.overall,
+            "Unknown {} should be < live {}",
+            unknown_conf.overall, live_conf.overall
+        );
+    }
+
+    #[test]
+    fn test_convergence_snapshot_serde() {
+        let snapshot = ConvergenceSnapshot {
+            fill_count: 42,
+            session_elapsed_s: 1800.0,
+            prior_confidence: 0.35,
+            spread_multiplier: 2.3,
+            size_multiplier: 0.42,
+            cumulative_pnl_bps: -1.5,
+            mean_realized_edge_bps: -0.06,
+            has_prior: true,
+            prior_source_mode: "paper".to_string(),
+        };
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let deserialized: ConvergenceSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.fill_count, 42);
+        assert!((deserialized.prior_confidence - 0.35).abs() < f64::EPSILON);
+        assert_eq!(deserialized.prior_source_mode, "paper");
+    }
+
+    #[test]
+    fn test_confidence_paper_zero_execution() {
+        // Paper with zero execution → base credit = 0.3
+        let gate = CalibrationGate::new(CalibrationGateConfig::default());
+        let bundle = make_bundle_with_source("paper", 100, 0, 0, 100, 0);
+
+        let conf = gate.confidence(&bundle, 100.0);
+        assert!(conf.structural > 0.9);
+        assert_eq!(conf.execution, 0.0);
+        // overall = min(~1, 1) × (0.3 + 0.7×0) = 0.3
+        assert!(
+            (conf.overall - 0.3).abs() < 0.05,
+            "Paper with zero execution should get ~0.3: {}",
+            conf.overall
+        );
     }
 }

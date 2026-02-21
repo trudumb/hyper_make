@@ -292,6 +292,20 @@ pub struct RiskConfig {
     /// Options-theoretic spread floor configuration.
     #[serde(default)]
     pub option_floor: OptionFloor,
+
+    /// AS uncertainty premium coefficient (k-sigma bound).
+    /// Controls risk aversion to AS posterior uncertainty in spread floor:
+    /// `floor = E[AS] + k × √Var[AS]`
+    /// - k=1.0 → ~16% chance of quoting below true AS (one-sigma)
+    /// - k=1.5 → ~7% chance (default, consistent with Kelly underbetting)
+    /// - k=2.0 → ~2.5% chance (very conservative)
+    #[serde(default = "default_as_uncertainty_premium_k")]
+    pub as_uncertainty_premium_k: f64,
+
+    /// Profile-level spread floor in fractional terms (e.g., 0.00075 = 7.5 bps half-spread).
+    /// Overridden from SpreadProfile at runtime. 0.0 = no profile floor.
+    #[serde(default)]
+    pub profile_spread_floor_frac: f64,
 }
 
 fn default_inventory_beta() -> f64 {
@@ -316,6 +330,10 @@ fn default_true() -> bool {
 
 fn default_max_as_adjustment_bps() -> f64 {
     15.0
+}
+
+fn default_as_uncertainty_premium_k() -> f64 {
+    1.5
 }
 
 impl RiskConfig {
@@ -547,6 +565,10 @@ impl Default for RiskConfig {
             min_observations_for_elasticity: 50,
             // Options-theoretic volatility floor: DISABLED by default for safe rollout
             option_floor: OptionFloor::default(),
+            // AS uncertainty premium: k=1.5 (1.5-sigma, ~7% below true AS)
+            as_uncertainty_premium_k: default_as_uncertainty_premium_k(),
+            // Profile floor: 0.0 by default (set from SpreadProfile at runtime)
+            profile_spread_floor_frac: 0.0,
         }
     }
 }
@@ -603,6 +625,10 @@ impl RiskConfig {
             min_observations_for_elasticity: 50,
             // Options-theoretic volatility floor: DISABLED by default
             option_floor: OptionFloor::default(),
+            // AS uncertainty premium: k=1.5 (same as default)
+            as_uncertainty_premium_k: default_as_uncertainty_premium_k(),
+            // Profile floor: set from SpreadProfile at runtime (7.5 bps for HIP-3)
+            profile_spread_floor_frac: 0.00075, // 7.5 bps half-spread = 15 bps total
         }
     }
 }

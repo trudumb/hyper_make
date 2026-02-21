@@ -38,12 +38,24 @@ pub struct RegimeProfile {
 
     // ==================== Changepoint Detection ====================
     /// Changepoint probability threshold (higher = more tolerant of noise)
-    /// ThinDex: 0.85, LiquidCex: 0.5, Cascade: 0.3
+    /// ThinDex: 0.65, LiquidCex: 0.5, Cascade: 0.3
     pub changepoint_threshold: f64,
 
     /// Number of consecutive high-prob signals required to confirm changepoint
-    /// ThinDex: 2-3, LiquidCex: 1, Cascade: 1
+    /// ThinDex: 1, LiquidCex: 1, Cascade: 1
     pub changepoint_confirmation_count: usize,
+
+    /// Prior hazard rate (expected frequency of regime switches)
+    pub cp_hazard_rate: f64,
+
+    /// Threshold for soft boosting probability
+    pub cp_soft_boost_threshold: f64,
+
+    /// Threshold to force extreme regime
+    pub cp_force_extreme_threshold: f64,
+
+    /// Multiplier for trend echo estimation
+    pub trend_r_base_multiplier: f64,
 
     // ==================== Estimator Parameters ====================
     /// Kappa prior for fill intensity estimation (fills per hour)
@@ -129,8 +141,12 @@ impl RegimeProfile {
             regime: MarketRegime::ThinDex,
 
             // Changepoint: very tolerant of noise
-            changepoint_threshold: 0.85,
-            changepoint_confirmation_count: 2,
+            changepoint_threshold: 0.65,
+            changepoint_confirmation_count: 1,
+            cp_hazard_rate: 0.03, // (1/250) / (200/1500)
+            cp_soft_boost_threshold: 0.35,
+            cp_force_extreme_threshold: 0.65,
+            trend_r_base_multiplier: 5.0,
 
             // Estimator: conservative assumptions
             kappa_prior: 200.0, // Low fill rate
@@ -176,6 +192,10 @@ impl RegimeProfile {
             // Changepoint: standard sensitivity
             changepoint_threshold: 0.5,
             changepoint_confirmation_count: 1,
+            cp_hazard_rate: 0.004, // 1/250
+            cp_soft_boost_threshold: 0.50,
+            cp_force_extreme_threshold: 0.90,
+            trend_r_base_multiplier: 1.0,
 
             // Estimator: liquid market assumptions
             kappa_prior: 1500.0, // High fill rate
@@ -220,6 +240,10 @@ impl RegimeProfile {
             // Changepoint: very sensitive
             changepoint_threshold: 0.3,
             changepoint_confirmation_count: 1,
+            cp_hazard_rate: 0.04, // (1/250) / max(0.1, 50/1500)
+            cp_soft_boost_threshold: 0.20,
+            cp_force_extreme_threshold: 0.40,
+            trend_r_base_multiplier: 5.0, // cascade also trusts itself less
 
             // Estimator: assume chaos
             kappa_prior: 50.0, // Very low - expect no fills
@@ -313,7 +337,7 @@ mod tests {
 
         assert_eq!(profile.name, "thin_dex");
         assert!(matches!(profile.regime, MarketRegime::ThinDex));
-        assert_eq!(profile.changepoint_threshold, 0.85);
+        assert_eq!(profile.changepoint_threshold, 0.65);
         assert_eq!(profile.kappa_prior, 200.0);
         assert_eq!(profile.min_spread_bps, 25.0);
         assert!(profile.quote_flat_without_edge);

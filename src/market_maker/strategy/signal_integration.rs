@@ -402,6 +402,9 @@ pub struct IntegratedSignals {
     pub kappa_effective: f64,
     /// Current dominant regime index.
     pub current_regime: usize,
+    /// Confidence in kappa estimate [0, 1]. From `1/(1+CV)` of posterior.
+    /// Low fills → high CV → low confidence → trust belief-weighted kappa.
+    pub kappa_confidence: f64,
 
     // === Model Gating ===
     /// Overall model confidence [0, 1].
@@ -991,9 +994,11 @@ impl SignalIntegrator {
         if self.config.use_regime_kappa {
             signals.kappa_effective = self.regime_kappa.kappa_effective();
             signals.current_regime = self.regime_kappa.current_regime();
+            signals.kappa_confidence = self.regime_kappa.confidence();
         } else {
             signals.kappa_effective = 2000.0; // Default
             signals.current_regime = 1; // Normal
+            signals.kappa_confidence = 0.0; // No data → trust belief-weighted kappa
         }
 
         // === Model Gating ===
@@ -1779,10 +1784,10 @@ mod tests {
     #[test]
     fn test_additive_spread_multiplier_vs_multiplicative() {
         // Three 1.5x multipliers should produce ~2.5x (additive) not 3.375x (multiplicative)
-        let mut signals = IntegratedSignals::default();
-        signals.informed_flow_spread_mult = 1.5;
-        signals.gating_spread_mult = 1.5;
-        signals.cross_venue_spread_mult = 1.5;
+        let mut _signals = IntegratedSignals::default();
+        _signals.informed_flow_spread_mult = 1.5;
+        _signals.gating_spread_mult = 1.5;
+        _signals.cross_venue_spread_mult = 1.5;
 
         // Old multiplicative: 1.5 * 1.5 * 1.5 = 3.375
         let multiplicative: f64 = 1.5 * 1.5 * 1.5;
@@ -1808,11 +1813,11 @@ mod tests {
     #[test]
     fn test_additive_spread_cap_enforced() {
         // Construct signals that would exceed the cap
-        let mut signals = IntegratedSignals::default();
+        let mut _signals = IntegratedSignals::default();
         // Each excess = 2.0 (i.e., mult=3.0), three of them = 6.0 excess
-        signals.informed_flow_spread_mult = 3.0;
-        signals.gating_spread_mult = 3.0;
-        signals.cross_venue_spread_mult = 3.0;
+        _signals.informed_flow_spread_mult = 3.0;
+        _signals.gating_spread_mult = 3.0;
+        _signals.cross_venue_spread_mult = 3.0;
         // Uncapped additive: 1.0 + 2.0 + 2.0 + 2.0 = 7.0
         // Cap at 20 bps → max_excess = 20/10 = 2.0 → capped mult = 3.0
 

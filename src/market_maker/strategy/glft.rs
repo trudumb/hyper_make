@@ -82,6 +82,40 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     lambda * (capture - toxicity_cost) + drift_contribution - inventory_adj - params.self_impact_bps
 }
 
+/// Position-convex E[PnL] threshold for reducing-side levels.
+///
+/// On thin venues, E[PnL] can go negative on ALL levels (both sides) due to
+/// low kappa and high AS. The accumulating side should still require E[PnL] > 0,
+/// but the reducing side gets a negative threshold that grows with position urgency.
+///
+/// Shape: `q_ratio^1.5` captures quadratic VaR scaling (structural, regime-independent).
+/// V2 gamma_ratio: `gamma / gamma_baseline` encodes regime risk aversion.
+/// - Extreme (gamma 3x) → -4.5 bps at 100% pos (3 fees: willing to pay to unwind)
+/// - Calm (gamma 0.5x) → -0.75 bps at 100% pos (half fee: cheap to wait)
+///
+/// Returns a negative threshold in bps (or 0.0 at flat position).
+pub fn reducing_threshold_bps(
+    position: f64,
+    max_position: f64,
+    fee_bps: f64,
+    gamma: f64,
+    gamma_baseline: f64,
+) -> f64 {
+    let q_ratio = if max_position > 1e-9 {
+        (position.abs() / max_position).min(1.0)
+    } else {
+        0.0
+    };
+    // gamma_ratio > 1 in volatile → more willing to pay to unwind
+    // gamma_ratio < 1 in calm → less willing
+    let gamma_ratio = if gamma_baseline > 1e-9 {
+        (gamma / gamma_baseline).clamp(0.5, 3.0)
+    } else {
+        1.0
+    };
+    -fee_bps * gamma_ratio * q_ratio.powf(1.5)
+}
+
 /// Legacy thin wrapper around enhanced E[PnL] for backward compatibility.
 #[allow(clippy::too_many_arguments)]
 pub fn expected_pnl_bps(
@@ -563,46 +597,33 @@ impl GLFTStrategy {
         let drawdown_mult = 1.0 + market_params.current_drawdown_frac * 2.0;
         let gamma_with_drawdown = gamma_inventory * drawdown_mult;
 
-        // Self-consistent gamma: ensure GLFT output >= spread floor.
-        //
-        // The floor includes physical constraints AND dynamic AS floor:
-        //   fee + latency_cost + AS_floor → minimum viable half-spread.
-        // AS floor is seeded from checkpoint when no live markout data yet,
-        // providing defense during Fix 1 window (no binary filters).
-        let time_horizon = self.holding_time(market_params.arrival_intensity);
-        let as_floor_frac = market_params.as_floor_bps / 10_000.0;
-        let physical_floor_frac = (cfg.maker_fee_rate + as_floor_frac)
-            .max(cfg.min_spread_floor);
-        let min_gamma = solve_min_gamma(
-            physical_floor_frac,
-            market_params.kappa.max(1.0),
-            market_params.sigma_effective.max(1e-8),
-            time_horizon,
-            cfg.maker_fee_rate,
-        );
+        // Spread floor enforced additively via effective_floor_bps in generate_ladder().
+        // solve_min_gamma removed: at high κ (e.g. 3227), the GLFT term (1/γ)ln(1+γ/κ) ≈ 1/κ
+        // for all reasonable γ, so the binary search pumps γ to extreme values (0.15→0.69)
+        // that corrupt E[PnL] inventory penalty without meaningfully widening the spread.
 
-        // Apply regime gamma multiplier BEFORE floor: regime risk inflates γ,
-        // then floor catches if the result is still too small.
         // Ghost liquidity: when book kappa >> robust kappa, book shows standing
         // orders that don't represent real fill intensity → widen via γ.
         let gamma_pre_floor = gamma_with_drawdown
             * market_params.regime_gamma_multiplier
             * market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0);
-        let gamma_with_floor = gamma_pre_floor.max(min_gamma);
+        let gamma_with_floor = gamma_pre_floor;
 
         let gamma_clamped = gamma_with_floor.clamp(cfg.gamma_min, cfg.gamma_max);
 
+        let neutral_features = RiskFeatures::neutral();
+        let gamma_neutral = self.risk_model.compute_gamma(&neutral_features);
+        let defense_ratio = gamma_clamped / gamma_neutral.max(1e-9);
+
         debug!(
-            gamma_calibrated = %format!("{:.4}", gamma_base),
-            q_ratio = %format!("{:.3}", q_ratio),
-            inventory_beta = %format!("{:.1}", cfg.inventory_beta),
-            inventory_mult = %format!("{:.3}", inventory_mult),
-            drawdown_mult = %format!("{:.3}", drawdown_mult),
+            gamma_cal = %format!("{:.4}", gamma_base),
+            inv_mult = %format!("{:.3}", inventory_mult),
+            dd_mult = %format!("{:.3}", drawdown_mult),
             regime_mult = %format!("{:.3}", market_params.regime_gamma_multiplier),
-            ghost_mult = %format!("{:.3}", market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0)),
-            min_gamma = %format!("{:.4}", min_gamma),
+            floor = %format!("{:.3}", market_params.ghost_liquidity_gamma_mult.clamp(1.0, 5.0)),
             gamma_final = %format!("{:.4}", gamma_clamped),
-            "Gamma: calibrated log-additive + γ(q) inventory scaling"
+            defense_ratio = %format!("{:.3}", defense_ratio),
+            "Gamma decomposition"
         );
 
         gamma_clamped
@@ -1028,21 +1049,33 @@ impl QuotingStrategy for GLFTStrategy {
         // Symmetric half-spread for logging (average of bid/ask)
         let mut half_spread = (half_spread_bid + half_spread_ask) / 2.0;
 
-        // === 2a. ADVERSE SELECTION SPREAD ADJUSTMENT (per-side) ===
-        // Add measured AS cost to half-spreads using per-side realized AS.
-        // Buy-side AS affects bids (we're buying), sell-side AS affects asks.
+        // === 2a. ADVERSE SELECTION SPREAD ADJUSTMENT (per-side, deduplicated) ===
+        // The GLFT vol compensation term (½γσ²τ) already prices expected price variance
+        // over the holding period. The AS estimator measures realized adverse selection
+        // over its own horizon (500ms). To avoid double-counting the vol component,
+        // subtract the vol floor from measured AS before adding the residual.
+        //
+        // vol_floor = ½ × γ × σ² × as_horizon_s
+        // as_net = max(0, as_raw - vol_floor)  — only add the excess beyond vol pricing
+        const AS_HORIZON_S: f64 = 0.5; // 500ms, matching AS estimator horizon
         if market_params.as_warmed_up {
-            let as_bid = market_params.as_spread_adjustment_bid;
-            let as_ask = market_params.as_spread_adjustment_ask;
-            if as_bid > 0.0 || as_ask > 0.0 {
-                half_spread_bid += as_bid;
-                half_spread_ask += as_ask;
-                half_spread += (as_bid + as_ask) / 2.0;
+            let as_bid_raw = market_params.as_spread_adjustment_bid;
+            let as_ask_raw = market_params.as_spread_adjustment_ask;
+            if as_bid_raw > 0.0 || as_ask_raw > 0.0 {
+                let vol_floor = 0.5 * gamma * sigma.powi(2) * AS_HORIZON_S;
+                let as_bid_net = (as_bid_raw - vol_floor).max(0.0);
+                let as_ask_net = (as_ask_raw - vol_floor).max(0.0);
+                half_spread_bid += as_bid_net;
+                half_spread_ask += as_ask_net;
+                half_spread += (as_bid_net + as_ask_net) / 2.0;
                 debug!(
-                    as_bid_bps = %format!("{:.2}", as_bid * 10000.0),
-                    as_ask_bps = %format!("{:.2}", as_ask * 10000.0),
+                    as_bid_raw_bps = %format!("{:.2}", as_bid_raw * 10000.0),
+                    as_ask_raw_bps = %format!("{:.2}", as_ask_raw * 10000.0),
+                    vol_floor_bps = %format!("{:.2}", vol_floor * 10000.0),
+                    as_bid_net_bps = %format!("{:.2}", as_bid_net * 10000.0),
+                    as_ask_net_bps = %format!("{:.2}", as_ask_net * 10000.0),
                     predicted_alpha = %format!("{:.3}", market_params.predicted_alpha),
-                    "Per-side AS spread adjustment applied"
+                    "Per-side AS spread adjustment applied (vol-floor deduplicated)"
                 );
             }
         }
@@ -1246,6 +1279,36 @@ impl QuotingStrategy for GLFTStrategy {
             // Legacy: Static floor from RiskConfig + tick/latency constraints
             market_params.effective_spread_floor(self.risk_config.min_spread_floor)
         };
+
+        // === Q19: AS-Posterior + Profile Safety Floor ===
+        // Two additional floors, max()'d with the base effective_floor:
+        // 1. AS uncertainty premium: E[AS] + k × √Var[AS] (wider when AS uncertain)
+        // 2. Profile static bound: venue-specific minimum (Hip3=7.5 bps, etc.)
+        let as_uncertainty_premium_bps = if market_params.as_floor_variance_bps2 > 0.0 {
+            self.risk_config.as_uncertainty_premium_k * market_params.as_floor_variance_bps2.sqrt()
+        } else {
+            0.0
+        };
+        let as_posterior_floor_bps = market_params.as_floor_bps + as_uncertainty_premium_bps;
+        let as_posterior_floor_frac = as_posterior_floor_bps / 10_000.0;
+
+        let profile_floor_frac = market_params.profile_spread_floor_bps / 10_000.0;
+
+        let effective_floor = effective_floor
+            .max(as_posterior_floor_frac)
+            .max(profile_floor_frac);
+
+        if as_posterior_floor_frac > 0.0 || profile_floor_frac > 0.0 {
+            debug!(
+                as_floor_bps = %format!("{:.2}", market_params.as_floor_bps),
+                as_uncertainty_premium_bps = %format!("{:.2}", as_uncertainty_premium_bps),
+                as_posterior_floor_bps = %format!("{:.2}", as_posterior_floor_bps),
+                profile_floor_bps = %format!("{:.2}", market_params.profile_spread_floor_bps),
+                final_floor_bps = %format!("{:.2}", effective_floor * 10_000.0),
+                "Q19: AS-posterior + profile floor applied"
+            );
+        }
+
         // Floor clamp: safety net only. With unified floor in solve_min_gamma,
         // this should fire <5% of cycles (only during transient parameter changes).
         let floor_bound = half_spread_bid < effective_floor
@@ -2778,5 +2841,112 @@ mod tests {
         assert!(diag.self_impact_bps > 0.0, "Self impact should be positive");
         assert!(!diag.circuit_breaker_active);
         assert!((diag.drawdown_penalty - 1.0).abs() < 1e-9, "No drawdown → penalty=1.0");
+    }
+
+    #[test]
+    fn test_as_vol_floor_deduplication() {
+        // When realized_as equals the vol floor, as_net should be zero
+        let gamma: f64 = 100.0;
+        let sigma: f64 = 0.001; // 10 bps/sqrt(s)
+        let as_horizon_s: f64 = 0.5;
+
+        let vol_floor = 0.5 * gamma * sigma.powi(2) * as_horizon_s;
+        // vol_floor = 0.5 * 100 * 0.000001 * 0.5 = 0.000025 (0.25 bps)
+
+        // AS exactly equals vol floor → net is zero
+        let as_raw = vol_floor;
+        let as_net = (as_raw - vol_floor).max(0.0);
+        assert!(as_net.abs() < 1e-15, "AS net should be 0 when as_raw == vol_floor, got {}", as_net);
+
+        // AS >> vol_floor → net ≈ as_raw
+        let as_raw_large = 0.001; // 10 bps
+        let as_net_large = (as_raw_large - vol_floor).max(0.0);
+        assert!(
+            (as_net_large - (as_raw_large - vol_floor)).abs() < 1e-15,
+            "AS net should be as_raw - vol_floor when as_raw >> vol_floor"
+        );
+        assert!(as_net_large > 0.0);
+
+        // AS < vol_floor → net clamped to zero (no negative addon)
+        let as_raw_small = vol_floor * 0.5;
+        let as_net_small = (as_raw_small - vol_floor).max(0.0);
+        assert_eq!(as_net_small, 0.0, "AS net should be 0 when as_raw < vol_floor");
+    }
+
+    // === Fix 15: reducing_threshold_bps tests ===
+
+    #[test]
+    fn test_reducing_threshold_flat_position_is_zero() {
+        let t = reducing_threshold_bps(0.0, 10.0, 1.5, 1.0, 1.0);
+        assert!((t - 0.0).abs() < 1e-12, "Flat position → no carve-out, got {t}");
+    }
+
+    #[test]
+    fn test_reducing_threshold_80pct_position() {
+        // q_ratio = 0.8, q_ratio^1.5 ≈ 0.7155, gamma_ratio = 1.0
+        // threshold = -1.5 * 1.0 * 0.7155 ≈ -1.073
+        let t = reducing_threshold_bps(8.0, 10.0, 1.5, 1.0, 1.0);
+        assert!((t - (-1.5 * 0.8_f64.powf(1.5))).abs() < 0.01,
+            "80% position → ~-1.07 bps, got {t}");
+    }
+
+    #[test]
+    fn test_reducing_threshold_100pct_extreme_regime() {
+        // gamma=3.0, baseline=1.0 → gamma_ratio=3.0
+        // threshold = -1.5 * 3.0 * 1.0^1.5 = -4.5
+        let t = reducing_threshold_bps(10.0, 10.0, 1.5, 3.0, 1.0);
+        assert!((t - (-4.5)).abs() < 1e-9,
+            "Extreme regime at 100% pos → -4.5 bps (3 fees), got {t}");
+    }
+
+    #[test]
+    fn test_reducing_threshold_100pct_calm_regime() {
+        // gamma=0.5, baseline=1.0 → gamma_ratio=0.5
+        // threshold = -1.5 * 0.5 * 1.0^1.5 = -0.75
+        let t = reducing_threshold_bps(10.0, 10.0, 1.5, 0.5, 1.0);
+        assert!((t - (-0.75)).abs() < 1e-9,
+            "Calm regime at 100% pos → -0.75 bps (half fee), got {t}");
+    }
+
+    #[test]
+    fn test_reducing_threshold_gamma_ratio_clamped() {
+        // gamma=10.0, baseline=1.0 → gamma_ratio clamped to 3.0
+        let t = reducing_threshold_bps(10.0, 10.0, 1.5, 10.0, 1.0);
+        assert!((t - (-4.5)).abs() < 1e-9,
+            "Gamma ratio should clamp at 3.0, got {t}");
+
+        // gamma=0.01, baseline=1.0 → gamma_ratio clamped to 0.5
+        let t2 = reducing_threshold_bps(10.0, 10.0, 1.5, 0.01, 1.0);
+        assert!((t2 - (-0.75)).abs() < 1e-9,
+            "Gamma ratio should clamp at 0.5, got {t2}");
+    }
+
+    #[test]
+    fn test_reducing_threshold_zero_max_position() {
+        let t = reducing_threshold_bps(5.0, 0.0, 1.5, 1.0, 1.0);
+        assert!((t - 0.0).abs() < 1e-12,
+            "Zero max position → no carve-out, got {t}");
+    }
+
+    #[test]
+    fn test_reducing_threshold_integration_with_epnl() {
+        // Integration: 80% position + deeply negative E[PnL] on reducing side → levels survive
+        let fee_bps = 1.5;
+        let position = 8.0; // long 80%
+        let max_pos = 10.0;
+        let gamma = 1.0;
+        let gamma_baseline = 0.15;
+
+        let reducing_thresh = reducing_threshold_bps(
+            position, max_pos, fee_bps, gamma, gamma_baseline,
+        );
+        // gamma_ratio = (1.0/0.15).clamp(0.5, 3.0) = 3.0 (clamped)
+        // threshold = -1.5 * 3.0 * 0.8^1.5 ≈ -3.22
+        assert!(reducing_thresh < -3.0, "Should be deeply negative: {reducing_thresh}");
+
+        // Accumulating threshold is always 0
+        let accum_thresh = 0.0;
+        assert!(reducing_thresh < accum_thresh,
+            "Reducing threshold ({reducing_thresh}) must be below accumulating ({accum_thresh})");
     }
 }

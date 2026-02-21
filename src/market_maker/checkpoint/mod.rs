@@ -246,6 +246,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
         }
     }

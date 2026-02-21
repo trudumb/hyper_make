@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use super::attribution::{CycleContributions, SignalContribution, SignalPnLAttributor};
 use super::edge_metrics::EdgeSnapshot;
 use super::persistence::AnalyticsLogger;
-use super::sharpe::{PerSignalSharpeTracker, SharpeSummary, SharpeTracker};
+use super::sharpe::{EquityCurveSharpe, EquityCurveSummary, PerSignalSharpeTracker, SharpeSummary, SharpeTracker};
 use crate::market_maker::strategy::SignalContributionRecord;
 
 /// Summary snapshot returned by `LiveAnalytics::summary()`.
@@ -36,8 +36,10 @@ pub struct LiveAnalyticsSummary {
 /// Provides analytics for both paper and live environments. The `EdgeTracker` is NOT included
 /// here because it already lives in `Tier2Components`.
 pub struct LiveAnalytics {
-    /// Return-based Sharpe ratio tracker.
+    /// Return-based Sharpe ratio tracker (per-fill).
     sharpe_tracker: SharpeTracker,
+    /// Portfolio-level Sharpe from equity curve snapshots.
+    equity_sharpe: EquityCurveSharpe,
     /// Per-signal Sharpe ratio tracker.
     signal_sharpe: PerSignalSharpeTracker,
     /// Per-signal PnL attribution (active vs inactive).
@@ -74,6 +76,7 @@ impl LiveAnalytics {
 
         Self {
             sharpe_tracker: SharpeTracker::new(),
+            equity_sharpe: EquityCurveSharpe::new(),
             signal_sharpe: PerSignalSharpeTracker::new(),
             signal_attributor: SignalPnLAttributor::new(),
             logger,
@@ -215,6 +218,8 @@ impl LiveAnalytics {
         if let Some(ref mut logger) = self.logger {
             let _ = logger.log_sharpe(&sharpe_summary);
             let _ = logger.log_signal_pnl(&self.signal_attributor);
+            let equity_summary = self.equity_sharpe.summary();
+            let _ = logger.log_equity_sharpe(&equity_summary);
             let _ = logger.flush();
         }
 
@@ -227,6 +232,23 @@ impl LiveAnalytics {
         if let Some(ref mut logger) = self.logger {
             let _ = logger.flush();
         }
+    }
+
+    /// Take an equity snapshot for portfolio-level Sharpe computation.
+    /// Call this each quote cycle with `(timestamp_ns, total_equity_usd)`.
+    pub fn snapshot_equity(&mut self, timestamp_ns: u64, total_equity_usd: f64) {
+        self.equity_sharpe
+            .maybe_snapshot(timestamp_ns, total_equity_usd);
+    }
+
+    /// Get equity-curve Sharpe summary.
+    pub fn equity_summary(&self) -> EquityCurveSummary {
+        self.equity_sharpe.summary()
+    }
+
+    /// Get a reference to the equity Sharpe tracker.
+    pub fn equity_sharpe(&self) -> &EquityCurveSharpe {
+        &self.equity_sharpe
     }
 
     /// Get a summary snapshot of the current analytics state.

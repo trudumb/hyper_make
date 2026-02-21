@@ -146,6 +146,9 @@ pub struct CheckpointBundle {
     /// Calibration coordinator state for L2-derived kappa blending
     #[serde(default)]
     pub calibration_coordinator: CalibrationCoordinatorCheckpoint,
+    /// Kappa orchestrator warmup state (cumulative fills, graduation flag)
+    #[serde(default)]
+    pub kappa_orchestrator: KappaOrchestratorCheckpoint,
     /// Prior confidence [0,1] from injection — how much to trust this prior.
     /// 0.0 = cold-start, 1.0 = fully calibrated and fresh.
     #[serde(default)]
@@ -360,6 +363,12 @@ pub struct VolFilterCheckpoint {
     /// Total observations processed
     #[serde(default, deserialize_with = "deserialize_usize_or_null")]
     pub observation_count: usize,
+    /// Q18: Number of quote-cycle intervals where a fill occurred (bias tracker)
+    #[serde(default)]
+    pub bias_fill_intervals: u64,
+    /// Q18: Number of quote-cycle intervals without a fill (bias tracker)
+    #[serde(default)]
+    pub bias_nonfill_intervals: u64,
 }
 
 impl Default for VolFilterCheckpoint {
@@ -369,6 +378,8 @@ impl Default for VolFilterCheckpoint {
             sigma_std: 0.0002, // Non-degenerate prior spread
             regime_probs: [0.1, 0.7, 0.15, 0.05],
             observation_count: 0,
+            bias_fill_intervals: 0,
+            bias_nonfill_intervals: 0,
         }
     }
 }
@@ -519,6 +530,23 @@ impl Default for KappaCheckpoint {
     }
 }
 
+/// KappaOrchestrator warmup state.
+///
+/// Persists cumulative fill count and warmup graduation so the
+/// orchestrator doesn't re-enter warmup mode after every restart
+/// (which causes kappa to swing 2-3x as the blending formula changes).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KappaOrchestratorCheckpoint {
+    /// Whether the orchestrator has ever exited warmup mode.
+    /// Once true, warmup is never re-entered (prevents kappa swings).
+    #[serde(default)]
+    pub has_exited_warmup: bool,
+    /// Cumulative own-fill count (never decremented by rolling window expiry).
+    /// Used for warmup gate instead of rolling-window observation_count.
+    #[serde(default)]
+    pub total_own_fills: u64,
+}
+
 /// MomentumModel learned continuation probabilities.
 ///
 /// The observation VecDeque is NOT persisted — it's a rolling window.
@@ -567,6 +595,11 @@ pub struct KellyTrackerCheckpoint {
     /// EWMA decay factor
     #[serde(default, deserialize_with = "deserialize_f64_or_null")]
     pub decay: f64,
+    /// Prediction horizon (ms) used when these observations were collected.
+    /// On restore, if this differs from the current config horizon, the
+    /// Kelly state is discarded and reset to priors (stale-observation invalidation).
+    #[serde(default)]
+    pub horizon_ms: u64,
 }
 
 impl Default for KellyTrackerCheckpoint {
@@ -577,6 +610,7 @@ impl Default for KellyTrackerCheckpoint {
             ewma_losses: 3.0,
             n_losses: 0,
             decay: 0.99,
+            horizon_ms: 0,
         }
     }
 }
@@ -653,6 +687,14 @@ pub struct KillSwitchCheckpoint {
     /// Used to detect trading day boundaries and reset daily P&L on new day.
     #[serde(default, deserialize_with = "deserialize_u64_or_null")]
     pub saved_at_ms: u64,
+
+    /// Q20: Consecutive stuck cycles at checkpoint time.
+    #[serde(default)]
+    pub position_stuck_cycles: u32,
+
+    /// Q20: Cumulative unrealized adverse selection cost in USD.
+    #[serde(default)]
+    pub unrealized_as_cost_usd: f64,
 }
 
 impl Default for KillSwitchCheckpoint {
@@ -664,6 +706,8 @@ impl Default for KillSwitchCheckpoint {
             peak_pnl: 0.0,
             triggered_at_ms: 0,
             saved_at_ms: 0,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
         }
     }
 }
@@ -698,6 +742,8 @@ mod tests {
                 sigma_std: 0.005,
                 regime_probs: [0.1, 0.5, 0.3, 0.1],
                 observation_count: 500,
+                bias_fill_intervals: 0,
+                bias_nonfill_intervals: 0,
             },
             regime_hmm: RegimeHMMCheckpoint::default(),
             informed_flow: InformedFlowCheckpoint::default(),
@@ -720,6 +766,7 @@ mod tests {
                 ewma_losses: 2.1,
                 n_losses: 18,
                 decay: 0.98,
+                horizon_ms: 500,
             },
             ensemble_weights: EnsembleWeightsCheckpoint {
                 model_weights: vec![0.6, 0.25, 0.15],
@@ -738,9 +785,12 @@ mod tests {
                 peak_pnl: 50.0,
                 triggered_at_ms: 1700000000000,
                 saved_at_ms: 1700000000000,
+                position_stuck_cycles: 0,
+                unrealized_as_cost_usd: 0.0,
             },
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
         };
 
@@ -830,6 +880,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
         };
 
@@ -883,6 +934,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
@@ -923,6 +975,7 @@ mod tests {
             kill_switch: KillSwitchCheckpoint::default(),
             readiness: PriorReadiness::default(),
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
+            kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
         };
         let json = serde_json::to_string(&bundle).expect("serialize");

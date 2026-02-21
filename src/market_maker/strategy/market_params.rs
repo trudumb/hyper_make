@@ -1031,6 +1031,14 @@ pub struct MarketParams {
     /// Seeded from checkpoint when no live markout data yet.
     pub as_floor_bps: f64,
 
+    /// AS posterior variance in bps² for uncertainty premium computation.
+    /// floor = E[AS] + k × √Var[AS] where k = as_uncertainty_premium_k.
+    pub as_floor_variance_bps2: f64,
+
+    /// Profile-level spread floor in bps (static safety bound from SpreadProfile).
+    /// max()'d with adaptive floor — can never make spreads tighter.
+    pub profile_spread_floor_bps: f64,
+
     // === Fix 4: Proactive AS — Hawkes σ_conditional ===
     // REMOVED: sigma_cascade_mult — WS2 CovarianceTracker handles realized vol feedback.
     // The Bayesian posterior on σ automatically inflates when realized vol > predicted.
@@ -1352,6 +1360,8 @@ impl Default for MarketParams {
 
             // Fix 2: AS floor
             as_floor_bps: 0.0,
+            as_floor_variance_bps2: 0.0,
+            profile_spread_floor_bps: 0.0,
 
             // Fix 3: Ghost liquidity
             ghost_liquidity_gamma_mult: 1.0,
@@ -1377,6 +1387,7 @@ impl Default for MarketParams {
             // Phase 8: Warm/Cold tier features
             vol_term_structure_ratio: 1.0,
             as_ratio_adjustment: 1.0,
+
         }
     }
 }
@@ -2043,6 +2054,12 @@ pub struct EstimatorDiagnostics {
     pub spread_bps: f64,
     /// Current skew in bps (from GLFT).
     pub skew_bps: f64,
+
+    // --- Vol Sampling Bias (Q18) ---
+    /// Ratio of sigma during fills vs non-fills. > 1.0 = upward vol bias.
+    pub vol_sampling_bias_ratio: f64,
+    /// Fraction of intervals that had fills (dead-time analysis).
+    pub fillable_fraction: f64,
 }
 
 impl EstimatorDiagnostics {
@@ -2052,5 +2069,6 @@ impl EstimatorDiagnostics {
             || self.sigma_correction_factor < 0.5
             || self.gamma_tracking_error > 0.5
             || self.fill_quote_autocorrelation > 0.7
+            || self.vol_sampling_bias_ratio > 1.5
     }
 }

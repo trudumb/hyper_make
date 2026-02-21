@@ -499,11 +499,16 @@ impl RegimeState {
     /// * `hmm_probs` - HMM posterior probabilities [p_calm, p_normal, p_volatile, p_extreme]
     /// * `bocpd_cp` - BOCPD changepoint probability (0.0-1.0)
     /// * `kappa_effective` - Regime-blended kappa from signal integration
+    /// * `kappa_confidence` - Posterior confidence in kappa estimate [0, 1].
+    ///   From `1/(1+CV)` of `BayesianKappaEstimator`. Low fills → high CV → low
+    ///   confidence → trust belief-weighted kappa. Many fills → tight posterior →
+    ///   trust observed kappa_effective.
     pub fn update(
         &mut self,
         hmm_probs: &[f64; 4],
         bocpd_cp: f64,
         kappa_effective: f64,
+        kappa_confidence: f64,
     ) -> bool {
         let now = Instant::now();
 
@@ -517,10 +522,21 @@ impl RegimeState {
         // Step 3: EWMA smooth toward target
         self.blended.ewma_toward(&target, BLENDING_ALPHA);
 
-        // Step 4: Override kappa with kappa_effective when available
+        // Step 4: Blend kappa with kappa_effective weighted by posterior confidence.
+        // Low fills → high CV → low confidence → trust belief-weighted kappa.
+        // Many fills → tight posterior → trust observed kappa_effective.
+        // Cap at 0.95: always retain 5% regime belief weight (robustness constraint).
+        //
+        // NOTE: For quadratic loss, the Bayes-optimal weight is
+        // w = var_prior / (var_prior + var_posterior) (inverse-variance weighting).
+        // 1/(1+CV) approximates this but isn't exact. The approximation error is
+        // dominated by regime mixture variance and other noise sources.
+        // The 0.95 cap also partially compensates: even if the CV mapping overstates
+        // certainty (CV near 0 → confidence near 1), the cap prevents the data-driven
+        // estimate from fully dominating the regime belief.
         if kappa_effective > 0.0 {
-            // Blend: 50% belief-weighted kappa + 50% observed kappa_effective
-            self.blended.kappa = (0.5 * self.blended.kappa + 0.5 * kappa_effective).max(1.0);
+            let w = kappa_confidence.clamp(0.0, 0.95);
+            self.blended.kappa = ((1.0 - w) * self.blended.kappa + w * kappa_effective).max(1.0);
         }
 
         // Step 5: Update confidence to max belief
@@ -866,7 +882,7 @@ mod tests {
 
         let probs = [0.30, 0.28, 0.22, 0.20];
         for _ in 0..50 {
-            let changed = state.update(&probs, 0.0, 0.0);
+            let changed = state.update(&probs, 0.0, 0.0, 0.0);
             assert!(!changed, "Label should NOT change with near-uniform beliefs");
         }
         assert_eq!(state.regime, MarketRegime::Normal);
@@ -886,7 +902,7 @@ mod tests {
         let mut state = state_with_conviction(MarketRegime::Normal, 121.0);
 
         let probs = [0.80, 0.05, 0.10, 0.05];
-        let changed = state.update(&probs, 0.0, 0.0);
+        let changed = state.update(&probs, 0.0, 0.0, 0.0);
         assert!(changed, "Should transition with strong conviction + sufficient dwell");
         assert_eq!(state.regime, MarketRegime::Calm);
     }
@@ -896,7 +912,7 @@ mod tests {
         let mut state = state_with_conviction(MarketRegime::Normal, 0.0);
 
         let probs = [0.05, 0.10, 0.15, 0.70];
-        let changed = state.update(&probs, 0.0, 500.0);
+        let changed = state.update(&probs, 0.0, 500.0, 0.5);
         assert!(changed, "Extreme should transition immediately (0s dwell)");
         assert_eq!(state.regime, MarketRegime::Extreme);
     }
@@ -906,12 +922,12 @@ mod tests {
         let mut state = state_with_conviction(MarketRegime::Extreme, 100.0);
 
         let probs = [0.05, 0.80, 0.10, 0.05];
-        let changed = state.update(&probs, 0.0, 2000.0);
+        let changed = state.update(&probs, 0.0, 2000.0, 0.5);
         assert!(!changed, "Should NOT de-escalate from Extreme with only 100s dwell");
         assert_eq!(state.regime, MarketRegime::Extreme);
 
         let mut state2 = state_with_conviction(MarketRegime::Extreme, 301.0);
-        let changed2 = state2.update(&probs, 0.0, 2000.0);
+        let changed2 = state2.update(&probs, 0.0, 2000.0, 0.5);
         assert!(changed2, "Should de-escalate from Extreme after 300s dwell");
         assert_eq!(state2.regime, MarketRegime::Normal);
     }
@@ -922,7 +938,7 @@ mod tests {
 
         // HMM already leans Extreme, BOCPD > 0.9 pushes it over conviction threshold
         let probs = [0.05, 0.10, 0.25, 0.60];
-        let changed = state.update(&probs, 0.95, 1000.0);
+        let changed = state.update(&probs, 0.95, 1000.0, 0.5);
         assert!(changed, "BOCPD > 0.9 should force Extreme transition");
         assert_eq!(state.regime, MarketRegime::Extreme);
     }
@@ -934,7 +950,7 @@ mod tests {
         let extreme_kappa = MarketRegime::Extreme.default_params().kappa;
 
         let extreme_probs = [0.0, 0.05, 0.10, 0.85];
-        state.update(&extreme_probs, 0.0, 0.0);
+        state.update(&extreme_probs, 0.0, 0.0, 0.0);
         let after_1 = state.blended.kappa;
         assert!(
             (after_1 - initial_kappa).abs() < (initial_kappa - extreme_kappa).abs() * 0.15,
@@ -942,7 +958,7 @@ mod tests {
         );
 
         for _ in 0..19 {
-            state.update(&extreme_probs, 0.0, 0.0);
+            state.update(&extreme_probs, 0.0, 0.0, 0.0);
         }
         assert!(
             state.blended.kappa < initial_kappa * 0.7,
@@ -956,7 +972,7 @@ mod tests {
 
         let uniform = [0.25, 0.25, 0.25, 0.25];
         for _ in 0..20 {
-            let changed = state.update(&uniform, 0.0, 0.0);
+            let changed = state.update(&uniform, 0.0, 0.0, 0.0);
             assert!(!changed, "Uniform beliefs should never trigger transition (KL=0)");
         }
         assert_eq!(state.regime, MarketRegime::Normal);
@@ -977,11 +993,11 @@ mod tests {
         let mut state = RegimeState::new();
 
         let normal_probs = [0.1, 0.8, 0.05, 0.05];
-        state.update(&normal_probs, 0.0, 0.0);
+        state.update(&normal_probs, 0.0, 0.0, 0.0);
         assert!(state.blended.kappa > 0.0, "Kappa must always be > 0.0");
 
         for _ in 0..100 {
-            state.update(&normal_probs, 0.0, 0.1);
+            state.update(&normal_probs, 0.0, 0.1, 0.5);
         }
         assert!(state.blended.kappa >= 1.0, "Kappa clamped to >= 1.0, got {}", state.blended.kappa);
     }
@@ -1017,7 +1033,7 @@ mod tests {
         // Feed many extreme updates to EWMA toward extreme spread floor
         let extreme_probs = [0.0, 0.05, 0.1, 0.85];
         for _ in 0..100 {
-            state.update(&extreme_probs, 0.0, 500.0);
+            state.update(&extreme_probs, 0.0, 500.0, 0.5);
         }
         assert!(
             state.spread_adjustment_bps() > 5.0,
@@ -1034,7 +1050,7 @@ mod tests {
         // Beliefs where Calm leads but margin < CONVICTION_MARGIN (0.20)
         let low_margin = [0.35, 0.30, 0.20, 0.15];
         for _ in 0..20 {
-            let changed = state.update(&low_margin, 0.0, 0.0);
+            let changed = state.update(&low_margin, 0.0, 0.0, 0.0);
             assert!(!changed, "Margin 0.05 < 0.20 threshold should not trigger transition");
         }
         assert_eq!(state.regime, MarketRegime::Normal);
@@ -1141,7 +1157,7 @@ mod tests {
 
         // Transition to Extreme (0s dwell, strong conviction)
         let extreme_probs = [0.0, 0.05, 0.1, 0.85];
-        let changed = state.update(&extreme_probs, 0.0, 500.0);
+        let changed = state.update(&extreme_probs, 0.0, 500.0, 0.5);
         assert!(changed, "Should transition to Extreme");
         assert_eq!(
             state.params.controller_objective,
@@ -1521,5 +1537,111 @@ mod tests {
         assert!(ur.kappa_effective > 0.0);
         assert!((ur.gamma_multiplier - 1.0).abs() < f64::EPSILON);
         assert!((ur.max_position_fraction - 1.0).abs() < f64::EPSILON);
+    }
+
+    // === Kappa confidence-weighted blend tests ===
+
+    #[test]
+    fn test_kappa_blend_low_confidence() {
+        // conf=0.2 → ~80% belief + 20% effective
+        let mut state = state_with_conviction(MarketRegime::Normal, 60.0);
+        // Set blended kappa to a known value
+        state.blended.kappa = 2000.0;
+
+        let probs = [0.0, 1.0, 0.0, 0.0]; // Pure Normal
+        state.update(&probs, 0.0, 1000.0, 0.2);
+
+        // w=0.2: kappa = 0.8 * blended + 0.2 * 1000
+        // blended was 2000 but EWMA moved it slightly; the key check:
+        // with low confidence, kappa should stay closer to belief (higher) than to effective (1000)
+        assert!(
+            state.blended.kappa > 1500.0,
+            "Low confidence should keep kappa closer to belief: {}",
+            state.blended.kappa
+        );
+    }
+
+    #[test]
+    fn test_kappa_blend_high_confidence() {
+        // conf=0.9 → ~10% belief + 90% effective
+        let mut state = state_with_conviction(MarketRegime::Normal, 60.0);
+        state.blended.kappa = 2000.0;
+
+        let probs = [0.0, 1.0, 0.0, 0.0];
+        state.update(&probs, 0.0, 1000.0, 0.9);
+
+        // w=0.9: kappa = 0.1 * blended + 0.9 * 1000
+        // With high confidence, kappa should be pulled strongly toward effective (1000)
+        assert!(
+            state.blended.kappa < 1300.0,
+            "High confidence should pull kappa toward effective: {}",
+            state.blended.kappa
+        );
+    }
+
+    #[test]
+    fn test_kappa_blend_zero_confidence() {
+        // conf=0.0 → 100% belief, 0% effective
+        let mut state = state_with_conviction(MarketRegime::Normal, 60.0);
+        let initial_kappa = state.blended.kappa;
+
+        let probs = [0.0, 1.0, 0.0, 0.0];
+        state.update(&probs, 0.0, 1000.0, 0.0);
+
+        // w=0.0: kappa = 1.0 * blended + 0.0 * 1000
+        // EWMA still moves blended toward target, but the kappa_effective blend has no effect
+        // The initial blended was ~2000 (Normal default), and we're feeding Normal beliefs
+        // So blended should stay very close to where EWMA alone takes it
+        let after_ewma_only = (1.0 - BLENDING_ALPHA) * initial_kappa
+            + BLENDING_ALPHA * MarketRegime::Normal.default_params().kappa;
+        assert!(
+            (state.blended.kappa - after_ewma_only).abs() < 1.0,
+            "Zero confidence: kappa {} should match pure EWMA {}",
+            state.blended.kappa, after_ewma_only
+        );
+    }
+
+    #[test]
+    fn test_kappa_blend_cap_at_95() {
+        // conf=1.0 → capped at 0.95, retains 5% belief weight
+        let mut state = state_with_conviction(MarketRegime::Normal, 60.0);
+        state.blended.kappa = 2000.0;
+
+        let probs = [0.0, 1.0, 0.0, 0.0];
+        state.update(&probs, 0.0, 1000.0, 1.0);
+
+        // w capped at 0.95: kappa = 0.05 * blended + 0.95 * 1000
+        // blended was EWMA'd first toward Normal(2000), so ≈2000
+        // Result ≈ 0.05 * 2000 + 0.95 * 1000 = 100 + 950 = 1050
+        assert!(
+            state.blended.kappa > 1000.0,
+            "Cap at 0.95 should retain some belief weight: {}",
+            state.blended.kappa
+        );
+        // But also very close to effective
+        assert!(
+            state.blended.kappa < 1100.0,
+            "Cap at 0.95 with effective=1000 should be near 1050: {}",
+            state.blended.kappa
+        );
+    }
+
+    #[test]
+    fn test_kappa_blend_zero_effective_skips_blend() {
+        // kappa_effective=0.0 → no blend (existing guard)
+        let mut state = state_with_conviction(MarketRegime::Normal, 60.0);
+        let initial_kappa = state.blended.kappa;
+
+        let probs = [0.0, 1.0, 0.0, 0.0];
+        state.update(&probs, 0.0, 0.0, 0.9);
+
+        // EWMA moves toward Normal target, but no kappa_effective blend
+        let after_ewma = (1.0 - BLENDING_ALPHA) * initial_kappa
+            + BLENDING_ALPHA * MarketRegime::Normal.default_params().kappa;
+        assert!(
+            (state.blended.kappa - after_ewma).abs() < 1.0,
+            "Zero kappa_effective should skip blend: {} vs {}",
+            state.blended.kappa, after_ewma
+        );
     }
 }
