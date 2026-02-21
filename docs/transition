@@ -1,0 +1,90 @@
+# Clean-Slate Architecture Implementation Plan
+
+This document outlines the end-to-end implementation plan for transitioning `hyper_make` from its current ad-hoc, veto-driven loop to the principled, event-driven, 6-subsystem "Clean-Slate" architecture. The core objective is to make Expected PnL (`E[PnL]`) the single foundational mathematical truth for quoting, naturally baking in adverse selection, endogenous impact, and continuous risk, rather than bolting them on as arbitrary filters.
+
+## User Review Required
+> [!WARNING]
+> This is a massive structural refactoring that entirely replaces `src/market_maker/mod.rs` (the current "God Loop") with an event-driven orchestrator. 
+> Please review the mapping below to ensure the distribution of logic aligns with your vision for the 6-engineer topology.
+
+## Proposed Changes
+
+### 1. Dissolving the Monolith
+The current system bottlenecks in a single monolithic `quote_cycle`. We will replace this with an event-driven orchestrator.
+
+#### [MODIFY] [market_maker/mod.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/mod.rs)
+- Delete the monolithic `quote_cycle` and post-hoc filters.
+- Initialize the 6 subsystems (Sensor, Belief System, Governor, Actuary, Executor, Evaluator) connected via ring buffers/async channels.
+
+***
+
+### 2. Engineer 1: Microstructure & Event Engine (Sensor)
+Responsible for parsing exchange data, extracting features, and standardizing events.
+
+#### [NEW] [market_maker/events/bus.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/events/bus.rs)
+- Implement the central event bus (MPSC channels or RingBuffer) to route L2, trades, and funding events.
+
+#### [MODIFY] [market_maker/features/pipeline.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/features/pipeline.rs)
+- Add deterministic feature extraction: Order flow imbalance (OFI), micro-price metrics, and cross-venue signal propagation (e.g., Binance BTC lead).
+
+***
+
+### 3. Engineer 2: Latent State Filter (Belief System)
+Replaces hardcoded naive fair value with a principled joint distribution of market state.
+
+#### [NEW] [market_maker/estimator/bayesian_drift.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/estimator/bayesian_drift.rs)
+- Implement the Bayesian Drift Estimator (Kalman Filter) to replace the static `drift_adj_bps`. It will output `(V, μ, σ)` combining order book features and adversarial fills.
+
+#### [NEW] [market_maker/estimator/glosten_milgrom.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/estimator/glosten_milgrom.rs)
+- Implement GM informed-flow updates to instantly shift beliefs upon toxic fills.
+
+***
+
+### 4. Engineer 3: Risk & Capital Allocation (Governor)
+Removes discrete position zones in favor of a continuous penalty curve.
+
+#### [NEW] [market_maker/risk/continuous_inventory.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/risk/continuous_inventory.rs)
+- Create continuous risk aversion curve `γ(q)`.
+- Replace the `position_zones` hard stop with a mathematically smooth pricing penalty that feeds into the Actuary.
+
+***
+
+### 5. Engineer 4: Economic Pricing Engine (Actuary)
+The heart of the new `E[PnL]` construct. Treating quotes as short options and modeling self-impact.
+
+#### [NEW] [market_maker/models/endogenous_impact.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/models/endogenous_impact.rs)
+- Replace the "Entropy-Based Distribution" with an Endogenous Impact cost module.
+
+#### [NEW] [market_maker/quoting/epnl_surface.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/quoting/epnl_surface.rs)
+- Unify the quoting math. Provide the math engine to compute: `E[PnL] = Premium - E[Adverse Selection] - Impact(size) - Risk(γ) - Carry(Funding)`.
+
+***
+
+### 6. Engineer 5: Optimization & Control (Executor)
+Replaces veto-driven logic with queue-preserving optimizations.
+
+#### [NEW] [market_maker/execution/optimizer.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/execution/optimizer.rs)
+- Implement convex optimization to map the Actuary's `E[PnL]` surface into discrete, adaptive quote levels, maximizing total edge while respecting margin constraints.
+
+#### [MODIFY] [market_maker/execution/reconciliation.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/execution/reconciliation.rs)
+- Enforce queue-preservation logic: Always prioritize MODIFY over CANCEL/PLACE when adjusting existing quotes near the target `E[PnL]` peak.
+
+***
+
+### 7. Engineer 6: Online Learning & Feedback (Evaluator)
+Cloning the execution realities back into the belief systems.
+
+#### [NEW] [market_maker/analytics/markout_decomposition.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/analytics/markout_decomposition.rs)
+- Implement shape-based fill decomposition (Shape A-E) to track where we are losing edge.
+
+#### [NEW] [market_maker/learning/multiplicative_weights.rs](file:///C:/Users/17808/Desktop/hyper_make/src/market_maker/learning/multiplicative_weights.rs)
+- Implement online learning algorithms to dynamically tune parameters for specific venues based on counterfactual edge.
+
+## Verification Plan
+1. **Unit Tests & Integration Tests:** 
+   - Write tests for the mathematically intensive components (`bayesian_drift.rs`, `continuous_inventory.rs`, `epnl_surface.rs`), ensuring correctness devoid of exchange-specific state.
+   - Run via `cargo test --package hyper_make` in the hyper_make root directory.
+2. **Simulated Execution (Shadow Mode):**
+   - Run the updated system without live execution keys enabled. Sensor, Belief System, Governor, and Actuary will process real websocket data and generate theoretical quote surfaces.
+3. **Data Verification:**
+   - Log the theoretical `E[PnL]` surfaces alongside subsequent fill analysis to validate if the new Bayesian Drift prevented the adverse selection observed on Feb 19. If validations are green, we proceed to enable the Executor.

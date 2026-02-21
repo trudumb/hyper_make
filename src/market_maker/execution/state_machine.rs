@@ -22,9 +22,10 @@ use crate::market_maker::config::auto_derive::CapitalTier;
 use crate::market_maker::PositionZone;
 
 /// Execution mode determined by the state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum ExecutionMode {
     /// Cancel all quotes — position zone Kill, or Toxic+flat
+    #[default]
     Flat,
     /// GLFT ladder quoting, optionally one-sided
     Maker {
@@ -38,12 +39,6 @@ pub enum ExecutionMode {
         /// Urgency [0, 1] — higher = more aggressive pricing
         urgency: f64,
     },
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::Flat
-    }
 }
 
 impl fmt::Display for ExecutionMode {

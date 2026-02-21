@@ -30,18 +30,13 @@ pub enum ControllerObjective {
 }
 
 /// Discrete market regime — drives all regime-dependent parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MarketRegime {
     Calm,     // Low vol, mean-reverting
+    #[default]
     Normal,   // Typical conditions
     Volatile, // Elevated vol, trending possible
     Extreme,  // Cascade / liquidation regime
-}
-
-impl Default for MarketRegime {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl MarketRegime {

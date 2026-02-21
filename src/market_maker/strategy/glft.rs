@@ -11,12 +11,78 @@ use super::{
     RiskModelConfig, SpreadComposition,
 };
 
-/// Per-level expected PnL computation for the E[PnL] filter (Phase 4).
-///
-/// E[PnL](δ, side) = λ(δ) × [δ - AS - fee - carry] + drift_contribution - inventory_penalty
-///
-/// When E[PnL] ≤ 0, optimal size at that level is zero.
-/// This naturally produces one-sided quoting without a binary gate.
+/// Parameter struct for evaluating comprehensive Expected PnL
+#[derive(Debug, Clone)]
+pub struct EPnLParams {
+    pub depth_bps: f64,
+    pub is_bid: bool,
+    pub gamma: f64,
+    pub kappa_side: f64,
+    pub sigma: f64,
+    pub time_horizon: f64,
+    pub drift_rate: f64,
+    pub position: f64,
+    pub max_position: f64,
+    pub as_cost_bps: f64,
+    pub fee_bps: f64,
+    pub carry_cost_bps: f64,
+    pub toxicity_score: f64,
+    pub circuit_breaker_active: bool,
+    pub drawdown_frac: f64,
+    pub self_impact_bps: f64,
+    pub cascade_addon_bps: f64,
+    pub inventory_beta: f64,
+}
+
+/// Enhanced per-level E[PnL] computation absorbing all former multiplicative overlays.
+pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
+    let depth_frac = params.depth_bps / 10_000.0;
+    
+    // Fill intensity at this depth: λ(δ) = κ × exp(-κ × δ)
+    let mut lambda = params.kappa_side * (-params.kappa_side * depth_frac).exp();
+    
+    // Circuit breaker → staleness discount on lambda
+    if params.circuit_breaker_active {
+        lambda *= 0.1; 
+    }
+    
+    // Drawdown → reduces lambda
+    let drawdown_penalty = (1.0 - params.drawdown_frac * 5.0).max(0.1);
+    lambda *= drawdown_penalty;
+    
+    // Toxicity amplifies AS economically
+    let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
+    
+    // Spread capture net of costs
+    let capture = params.depth_bps - params.as_cost_bps - params.fee_bps - params.carry_cost_bps - params.cascade_addon_bps;
+    
+    // Drift contribution: directional, mirrors GLFT ±μ̂×τ/2 asymmetry.
+    let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
+    let drift_contribution = if params.is_bid { drift_bps } else { -drift_bps };
+    
+    // Inventory penalty uses continuous gamma(q) = gamma_base × (1 + beta × (q/q_max)²)
+    let q_ratio = if params.max_position > 1e-9 {
+        (params.position.abs() / params.max_position).min(1.0)
+    } else {
+        0.0
+    };
+    
+    let gamma_q = params.gamma * (1.0 + params.inventory_beta * q_ratio.powi(2));
+    
+    let is_reducing = (params.is_bid && params.position < 0.0) || (!params.is_bid && params.position > 0.0);
+    let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2) * params.time_horizon * 10_000.0;
+    
+    let inventory_adj = if is_reducing {
+        -0.5 * inv_penalty_bps // Bonus for reducing
+    } else {
+        inv_penalty_bps // Penalty for accumulating
+    };
+    
+    // Total E[PnL] = fill_probability × (capture - toxicity_cost) + drift_contribution - inventory_penalty - impact_cost
+    lambda * (capture - toxicity_cost) + drift_contribution - inventory_adj - params.self_impact_bps
+}
+
+/// Legacy thin wrapper around enhanced E[PnL] for backward compatibility.
 #[allow(clippy::too_many_arguments)]
 pub fn expected_pnl_bps(
     depth_bps: f64,
@@ -32,36 +98,27 @@ pub fn expected_pnl_bps(
     fee_bps: f64,
     carry_cost_bps: f64,
 ) -> f64 {
-    let depth_frac = depth_bps / 10_000.0;
-
-    // Fill intensity at this depth: λ(δ) = κ × exp(-κ × δ)
-    let lambda = kappa_side * (-kappa_side * depth_frac).exp();
-
-    // Spread capture net of costs
-    let capture = depth_bps - as_cost_bps - fee_bps - carry_cost_bps;
-
-    // Drift contribution: directional, mirrors GLFT ±μ̂×τ/2 asymmetry.
-    // Positive drift → buying favorable (bid positive), selling unfavorable (ask negative).
-    // Negative drift → selling favorable (ask positive), buying unfavorable (bid negative).
-    let drift_bps = drift_rate * 10_000.0 * time_horizon / 2.0;
-    let drift_contribution = if is_bid { drift_bps } else { -drift_bps };
-
-    // Inventory penalty (accumulating) or bonus (reducing)
-    let is_reducing = (is_bid && position < 0.0) || (!is_bid && position > 0.0);
-    let utilization = if max_position > 1e-9 {
-        (position.abs() / max_position).min(1.0)
-    } else {
-        0.0
+    let params = EPnLParams {
+        depth_bps,
+        is_bid,
+        gamma,
+        kappa_side,
+        sigma,
+        time_horizon,
+        drift_rate,
+        position,
+        max_position,
+        as_cost_bps,
+        fee_bps,
+        carry_cost_bps,
+        toxicity_score: 0.0,
+        circuit_breaker_active: false,
+        drawdown_frac: 0.0,
+        self_impact_bps: 0.0,
+        cascade_addon_bps: 0.0,
+        inventory_beta: 0.0,
     };
-    let inv_penalty_bps = gamma * utilization * sigma.powi(2) * time_horizon * 10_000.0;
-    let inventory_adj = if is_reducing {
-        -0.5 * inv_penalty_bps // Bonus for reducing
-    } else {
-        inv_penalty_bps // Penalty for accumulating
-    };
-
-    // Total E[PnL] = fill_probability × capture + adjustments
-    lambda * capture + drift_contribution - inventory_adj
+    expected_pnl_bps_enhanced(&params)
 }
 
 /// Taker price elasticity estimator for monopolist LP pricing.
@@ -2429,5 +2486,187 @@ mod tests {
             "Extreme sigma + inventory: ask E[PnL] should be negative, got {:.4}",
             ask_epnl
         );
+    }
+
+    // --- Enhanced E[PnL] Function Tests ---
+    
+    #[test]
+    fn test_epnl_toxicity_reduces_ev() {
+        let mut params = EPnLParams {
+            depth_bps: 10.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 5.0,
+            sigma: 0.001,
+            time_horizon: 10.0,
+            drift_rate: 0.0,
+            position: 0.0,
+            max_position: 100.0,
+            as_cost_bps: 2.0,
+            fee_bps: -0.5,
+            carry_cost_bps: 0.0,
+            toxicity_score: 0.0,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.0,
+            cascade_addon_bps: 0.0,
+            inventory_beta: 7.0,
+        };
+        let pnl_clean = expected_pnl_bps_enhanced(&params);
+        
+        params.toxicity_score = 1.0;
+        let pnl_toxic = expected_pnl_bps_enhanced(&params);
+        
+        assert!(pnl_toxic < pnl_clean, "Toxicity should reduce Expected PnL");
+    }
+
+    #[test]
+    fn test_epnl_cb_reduces_lambda() {
+        let mut params = EPnLParams {
+            depth_bps: 10.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 5.0,
+            sigma: 0.001,
+            time_horizon: 10.0,
+            drift_rate: 0.0,
+            position: 0.0,
+            max_position: 100.0,
+            as_cost_bps: 2.0,
+            fee_bps: -0.5,
+            carry_cost_bps: 0.0,
+            toxicity_score: 0.0,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.0,
+            cascade_addon_bps: 0.0,
+            inventory_beta: 7.0,
+        };
+        let pnl_normal = expected_pnl_bps_enhanced(&params);
+        
+        params.circuit_breaker_active = true;
+        let pnl_cb = expected_pnl_bps_enhanced(&params);
+        
+        assert!(pnl_cb < pnl_normal, "Circuit breaker should apply staleness discount reducing EV");
+    }
+
+    #[test]
+    fn test_epnl_drawdown_reduces_ev() {
+        let mut params = EPnLParams {
+            depth_bps: 10.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 5.0,
+            sigma: 0.001,
+            time_horizon: 10.0,
+            drift_rate: 0.0,
+            position: 0.0,
+            max_position: 100.0,
+            as_cost_bps: 2.0,
+            fee_bps: -0.5,
+            carry_cost_bps: 0.0,
+            toxicity_score: 0.0,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.0,
+            cascade_addon_bps: 0.0,
+            inventory_beta: 7.0,
+        };
+        let pnl_normal = expected_pnl_bps_enhanced(&params);
+        
+        params.drawdown_frac = 0.10; // 10% drawdown
+        let pnl_drawdown = expected_pnl_bps_enhanced(&params);
+        
+        assert!(pnl_drawdown < pnl_normal, "Drawdown should reduce fill probability confidence");
+    }
+
+    #[test]
+    fn test_epnl_impact_near_touch() {
+        let mut params = EPnLParams {
+            depth_bps: 5.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 5.0,
+            sigma: 0.001,
+            time_horizon: 10.0,
+            drift_rate: 0.0,
+            position: 0.0,
+            max_position: 100.0,
+            as_cost_bps: 2.0,
+            fee_bps: -0.5,
+            carry_cost_bps: 0.0,
+            toxicity_score: 0.0,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.0,
+            cascade_addon_bps: 0.0,
+            inventory_beta: 7.0,
+        };
+        let pnl_no_impact = expected_pnl_bps_enhanced(&params);
+        
+        params.self_impact_bps = 2.0; // Touch quotes have self impact
+        let pnl_impact = expected_pnl_bps_enhanced(&params);
+        
+        // The subtraction is entirely linear in the equation
+        assert!((pnl_impact - (pnl_no_impact - 2.0)).abs() < 1e-9, "Self impact should be exactly subtracted");
+    }
+
+    #[test]
+    fn test_epnl_cascade_reduces_capture() {
+        let mut params = EPnLParams {
+            depth_bps: 10.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 5.0,
+            sigma: 0.001,
+            time_horizon: 10.0,
+            drift_rate: 0.0,
+            position: 0.0,
+            max_position: 100.0,
+            as_cost_bps: 2.0,
+            fee_bps: -0.5,
+            carry_cost_bps: 0.0,
+            toxicity_score: 0.0,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.0,
+            cascade_addon_bps: 0.0,
+            inventory_beta: 7.0,
+        };
+        let pnl_normal = expected_pnl_bps_enhanced(&params);
+        
+        params.cascade_addon_bps = 3.0;
+        let pnl_cascade = expected_pnl_bps_enhanced(&params);
+        
+        assert!(pnl_cascade < pnl_normal, "Cascade addon should compress spread capture");
+    }
+
+    #[test]
+    fn test_epnl_struct_matches_legacy() {
+        let legacy = expected_pnl_bps(10.0, true, 0.1, 5.0, 0.001, 10.0, 0.0, 50.0, 100.0, 2.0, -0.5, 0.5);
+        
+        let params = EPnLParams {
+            depth_bps: 10.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 5.0,
+            sigma: 0.001,
+            time_horizon: 10.0,
+            drift_rate: 0.0,
+            position: 50.0,
+            max_position: 100.0,
+            as_cost_bps: 2.0,
+            fee_bps: -0.5,
+            carry_cost_bps: 0.5,
+            toxicity_score: 0.0,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.0,
+            cascade_addon_bps: 0.0,
+            inventory_beta: 0.0,
+        };
+        let enhanced = expected_pnl_bps_enhanced(&params);
+        
+        assert!((legacy - enhanced).abs() < 1e-9, "Legacy wrapper with zeroed struct overlays must match enhanced precisely");
     }
 }

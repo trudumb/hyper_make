@@ -896,34 +896,55 @@ impl LadderStrategy {
         // then allocates the actual available margin (available_for_bids/asks).
         let size_for_initial_ladder = effective_max_position;
 
-        // L2 reservation shift removed — double-counts skew already handled
-        // by lead_lag_signal_bps in the directional skew section below.
-        let adjusted_microprice = market_params.microprice;
+        // === UNIFIED RESERVATION PRICE (WS3) ===
+        // Single equation incorporating:
+        // 1. Drift (lead/lag & momentum)
+        // 2. Continuous inventory penalty (q * gamma * sigma^2 * T)
+        // 3. Funding carry
 
-        // === DIRECTIONAL SKEW: Apply combined skew as mid-price offset ===
-        // lead_lag_signal_bps carries combined_skew_bps + position_guard_skew_bps
-        // from the signal integrator and position guard.
-        // Positive skew = bullish → shift mid UP → tighten bids, widen asks.
-        // Negative skew = bearish → shift mid DOWN → widen bids, tighten asks.
-        let skew_bps = market_params.lead_lag_signal_bps;
-        let skew_fraction = skew_bps / 10_000.0;
-        let skewed_microprice = adjusted_microprice * (1.0 + skew_fraction);
+        // 1. Drift
+        let drift_shift_bps = market_params.lead_lag_signal_bps;
+        
+        // 2. Inventory Penalty
+        // gamma has regime & beta_inventory applied natively via effective_gamma
+        let q = if effective_max_position > EPSILON {
+            position / effective_max_position
+        } else {
+            0.0
+        };
+        // Penalty = q * gamma * sigma^2 * T in bps
+        let inv_penalty_bps = q * gamma * market_params.sigma.powi(2) * time_horizon * 10_000.0;
+        
+        // 3. Funding Carry (annualized rate converted to per-second, multiply by T)
+        // 365.25 * 24 * 60 * 60 = 31,557,600
+        let funding_per_sec = market_params.funding_rate / 31_557_600.0;
+        let funding_carry_bps = funding_per_sec * time_horizon * 10_000.0;
+        
+        // Total shift combines all fundamental flows
+        // Drift pulls reservation price in direction of momentum.
+        // Inventory penalty pushes reservation price away from position (short pushes down, long pushes up).
+        // Funding carry pushes reservation price away from expensive funding side.
+        let total_shift_bps = drift_shift_bps - inv_penalty_bps - funding_carry_bps;
+        let shift_fraction = total_shift_bps / 10_000.0;
+        
+        let reservation_mid = market_params.microprice * (1.0 + shift_fraction);
 
-        // SAFETY: Bound skewed mid within 80% of GLFT half-spread to prevent crossing.
-        // Uses the GLFT formula directly so the bound is consistent with our quoting depth.
+        // SAFETY: Bound skewed mid within 95% of GLFT half-spread to prevent crossing.
         let glft_half_spread_frac = self.depth_generator.glft_optimal_spread(gamma, kappa);
-        let half_spread_bound = glft_half_spread_frac * 0.8;
+        let half_spread_bound = glft_half_spread_frac * 0.95;
         let max_mid = market_params.market_mid * (1.0 + half_spread_bound);
         let min_mid = market_params.market_mid * (1.0 - half_spread_bound);
-        let effective_mid = skewed_microprice.clamp(min_mid, max_mid);
+        let effective_mid = reservation_mid.clamp(min_mid, max_mid);
 
-        if skew_bps.abs() > 0.5 {
+        if total_shift_bps.abs() > 0.5 {
             tracing::debug!(
-                skew_bps = %format!("{:.2}", skew_bps),
-                adjusted_microprice = %format!("{:.4}", adjusted_microprice),
+                drift_bps = %format!("{:.2}", drift_shift_bps),
+                inv_penalty_bps = %format!("{:.2}", inv_penalty_bps),
+                funding_carry_bps = %format!("{:.2}", funding_carry_bps),
+                total_shift_bps = %format!("{:.2}", total_shift_bps),
+                reservation_mid = %format!("{:.4}", reservation_mid),
                 effective_mid = %format!("{:.4}", effective_mid),
-                market_mid = %format!("{:.4}", market_params.market_mid),
-                "Directional skew applied to mid price"
+                "Unified continuous reservation mid computed"
             );
         }
 
@@ -1234,21 +1255,40 @@ impl LadderStrategy {
             let pre_bid_count = dynamic_depths.bid.len();
             let pre_ask_count = dynamic_depths.ask.len();
 
+            use super::glft::EPnLParams;
+            let mut bid_params = EPnLParams {
+                depth_bps: 0.0,
+                is_bid: true,
+                gamma,
+                kappa_side: market_params.kappa_bid,
+                sigma: market_params.sigma,
+                time_horizon,
+                drift_rate: market_params.drift_rate_per_sec,
+                position,
+                max_position: effective_max_position,
+                as_cost_bps: as_at_touch_bps,
+                fee_bps,
+                carry_cost_bps: market_params.funding_carry_bps,
+                toxicity_score: market_params.toxicity_score,
+                circuit_breaker_active: market_params.should_pull_quotes,
+                drawdown_frac: 0.0, // handled by capital coordinator
+                self_impact_bps: 0.0, // self impact handled by actuary later
+                cascade_addon_bps: market_params.cascade_bid_addon_bps,
+                inventory_beta: self.risk_model.beta_inventory,
+            };
+
+            let mut ask_params = bid_params.clone();
+            ask_params.is_bid = false;
+            ask_params.kappa_side = market_params.kappa_ask;
+            ask_params.cascade_addon_bps = market_params.cascade_ask_addon_bps;
+
             dynamic_depths.bid.retain(|&depth| {
-                super::glft::expected_pnl_bps(
-                    depth, true, gamma, market_params.kappa_bid, market_params.sigma,
-                    time_horizon, market_params.drift_rate_per_sec, position,
-                    effective_max_position, as_at_touch_bps, fee_bps,
-                    market_params.funding_carry_bps,
-                ) > 0.0
+                bid_params.depth_bps = depth;
+                super::glft::expected_pnl_bps_enhanced(&bid_params) > 0.0
             });
             dynamic_depths.ask.retain(|&depth| {
-                super::glft::expected_pnl_bps(
-                    depth, false, gamma, market_params.kappa_ask, market_params.sigma,
-                    time_horizon, market_params.drift_rate_per_sec, position,
-                    effective_max_position, as_at_touch_bps, fee_bps,
-                    market_params.funding_carry_bps,
-                ) > 0.0
+                ask_params.depth_bps = depth;
+                super::glft::expected_pnl_bps_enhanced(&ask_params) > 0.0
             });
 
             let bid_dropped = pre_bid_count - dynamic_depths.bid.len();
@@ -3529,5 +3569,124 @@ mod tests {
             !ladder.bids.is_empty() || !ladder.asks.is_empty(),
             "should_pull_quotes=true should NOT produce empty ladder when solvent"
         );
+    }
+
+    // --- Unified Reservation Mid Tests (WS3) ---
+
+    #[test]
+    fn test_reservation_mid_drift() {
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams::default();
+        params.microprice = 100.0;
+        params.market_mid = 100.0;
+        params.margin_available = 1000.0;
+        params.leverage = 1.0;
+        params.sigma = 0.005;
+        params.kappa = 2000.0;
+        params.arrival_intensity = 0.5;
+        
+        // Bullish drift
+        params.lead_lag_signal_bps = 5.0; // 5 bps upward drift
+        let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let bid_price_drift = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
+        
+        params.lead_lag_signal_bps = 0.0;
+        let ladder_no_drift = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let bid_price_no_drift = ladder_no_drift.bids.first().map(|l| l.price).unwrap_or(0.0);
+        
+        assert!(bid_price_drift > bid_price_no_drift, "Bullish drift should raise bid prices");
+    }
+
+    #[test]
+    fn test_reservation_mid_inventory_penalty() {
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams::default();
+        params.microprice = 100.0;
+        params.market_mid = 100.0;
+        params.margin_available = 1000.0;
+        params.leverage = 1.0;
+        params.sigma = 0.005;
+        params.kappa = 2000.0;
+        
+        // Long position
+        let ladder_long = strategy.calculate_ladder(&config, 50.0, 100.0, 100.0, &params);
+        let ask_price_long = ladder_long.asks.first().map(|l| l.price).unwrap_or(0.0);
+        
+        // Neutral position
+        let ladder_neutral = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let ask_price_neutral = ladder_neutral.asks.first().map(|l| l.price).unwrap_or(0.0);
+        
+        assert!(ask_price_long < ask_price_neutral, "Long inventory should push ask prices down (aggressive)");
+    }
+
+    #[test]
+    fn test_reservation_mid_funding_carry() {
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams::default();
+        params.microprice = 100.0;
+        params.market_mid = 100.0;
+        params.margin_available = 1000.0;
+        params.leverage = 1.0;
+        params.sigma = 0.005;
+        params.kappa = 2000.0;
+        
+        // High positive funding rate (longs pay shorts)
+        params.funding_rate = 31_557_600.0 * 1.0; 
+        
+        let ladder_funding = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let ask_price_funding = ladder_funding.asks.first().map(|l| l.price).unwrap_or(0.0);
+        
+        params.funding_rate = 0.0;
+        let ladder_no_funding = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        let ask_price_no_funding = ladder_no_funding.asks.first().map(|l| l.price).unwrap_or(0.0);
+        
+        assert!(ask_price_funding < ask_price_no_funding, "Positive funding carry should lower ask prices to build short");
+    }
+
+    #[test]
+    fn test_reservation_mid_clamp() {
+        let strategy = LadderStrategy::new(0.5);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 1.0,
+        };
+        let mut params = MarketParams::default();
+        params.microprice = 100.0;
+        params.market_mid = 100.0;
+        params.margin_available = 1000.0;
+        params.leverage = 1.0;
+        params.sigma = 0.005;
+        params.kappa = 2000.0;
+        
+        // Extreme bullish drift
+        params.lead_lag_signal_bps = 500.0; 
+        let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+        
+        let bid_price = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
+        
+        // It must not cross the market ask (which is bounded by mid)
+        // Our constraint on half_spread_bound + depth means it effectively won't cross the mid.
+        // Even with huge drift, bounded reservation + depth subtraction keeps bids sane.
+        assert!(bid_price <= 100.0, "Clamped reservation mid should prevent crossing the real market mid. bid: {}", bid_price);
     }
 }

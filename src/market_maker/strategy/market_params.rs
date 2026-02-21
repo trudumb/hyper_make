@@ -1370,7 +1370,7 @@ impl Default for MarketParams {
             self_impact_addon_bps: 0.0,
 
             // Unified Adverse Selection Framework (Phase 4)
-            use_epnl_filter: false,
+            use_epnl_filter: true,
             funding_carry_bps: 0.0,
 
             // Phase 8: Warm/Cold tier features

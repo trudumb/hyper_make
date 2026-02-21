@@ -183,17 +183,12 @@ pub struct TradingOutcome {
 }
 
 /// Model health status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Health {
+    #[default]
     Good,
     Warning,
     Degraded,
-}
-
-impl Default for Health {
-    fn default() -> Self {
-        Self::Good
-    }
 }
 
 /// Overall model health assessment.

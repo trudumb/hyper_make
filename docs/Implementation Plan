@@ -1,0 +1,322 @@
+# Implementation Plan: Proprietary Algorithmic Extensions
+
+Since the foundational infrastructure (Microstructure, Latent State Filter, Control Orchestrator) is already largely implemented, the focus shifts entirely to building the **Layer B Specializations** — the proprietary algorithms that extract edge from the specific structural properties of thin, transparent perpetual futures markets (like HIP-3 assets).
+
+Here is the implementation plan for the 7 Proprietary Algorithms.
+
+---
+
+## 1. Liquidation Frontier Mapping
+
+**Objective:** Predict and exploit forced liquidation cascades before they occur.
+**Component Owners:** Microstructure Engine (Sensor) & Pricing Engine.
+
+### Implementation Steps
+1. **Density Function Builder:** 
+   - Parse the Open Interest (OI) data stream combined with mark price history.
+   - Build a real-time approximate FIFO queue of positions to estimate density functions: `ρ_long(p)` and `ρ_short(p)`.
+   - Discretize the liquidation density into 1-bps price bins.
+2. **Cascade Detector:**
+   - Implement `is_cascade_active(oi_change_rate, price, cluster_price)` to detect when liquidations are actively firing and when the derivative `d(ΔOI)/dt` drops (indicating exhaustion).
+3. **Strategic Quote Overrides:**
+   - **Approaching Cluster:** Pull bids (if dropping) from the cascade zone (danger). Place limit bids *below* the expected overshoot, and place aggressive asks *inside* the cascade to profit from forced buying.
+   - **Post Cascade:** Enter `unwind_urgency = VERY_LOW` mode to patiently hold the overshot acquired inventory for mean-reversion.
+
+---
+
+## 2. Information Propagation Function
+
+**Objective:** Exploit cross-venue latency arbitrage using a measurable information state function $I(t)$.
+**Component Owners:** Microstructure Engine & Latent State Filter.
+
+### Implementation Steps
+1. **Temporal Delay Calibrator:**
+   - Track major cross-venue moves (e.g., Binance BTC > 3σ moves). 
+   - Compute `I_hat(t) = |Δmid_hype(t)| / |Δmid_hype(benchmark)|` in real-time.
+   - Fit `I(t)` to extract participant class delays ($\lambda_k$, $\tau_k$).
+2. **Dynamic Volatility / Spread Skew:**
+   - Inject `spread_multiplier(t) = 1 + spread_alpha * (1 - I(t))^2` into the Pricing Engine.
+   - Widen immediately on event detection (when $I(t) \approx 0$). Tighten as $I(t) \to 1$.
+3. **Temporal Arbitrage Execution:**
+   - Calculate `cancel_urgency = max(0, τ_competitor - our_latency)`. Immediately execute unilateral quote pulls on the wrong side before the 1-2 second propagation wave hits the slower competitors.
+
+---
+
+## 3. Adversarial Participant Fingerprinting
+
+**Objective:** Reverse engineer the behavior of the 3-5 active competitors to undercut them or fade their withdrawal.
+**Component Owners:** Microstructure Engine & Risk Governor.
+
+### Implementation Steps
+1. **L2 Diff Event Clustering:**
+   - Maintain a running state of `BookEvent` diffs.
+   - Implement streaming DBSCAN or GMM to cluster features: `characteristic_sizes`, `depth_profile`, `update_frequency`, and `cancel_pattern`.
+2. **Liquidity Withdrawal Detection (P0 Signal):**
+   - Calculate `participant_liquidity_withdrawal = Σ_participants (normal_depth - current_depth) / normal_depth`.
+   - If withdrawal > 0.5 (competitors bailed), inject a massive spike into the IMM Filter's crisis probability ($P_{crisis}$), drastically widening your own spreads predicting an imminent adverse shock.
+3. **Competitor Cycle Exploitation:**
+   - Build a lightweight regression predicting `Δquote_c(t+dt)`.
+   - Output short-term forecast windows allowing the Execution Orchestrator to step in front of competitors just before they refresh, capturing their flow.
+
+---
+
+## 4. Endogenous Impact Modeling
+
+**Objective:** Replace naive dispersion heuristics (like Entropy) with true mathematical self-impact costing.
+**Component Owners:** Economic Pricing Engine.
+
+### Implementation Steps
+1. **Self-Impact Calibration Module:**
+   - Run historical regressions on our own fills: `|impact| ~ α * (fill_size / book_depth)^β * σ`. Extract current $\alpha, \beta$ scaling factors.
+2. **Impact-Aware E[PnL] Surface:**
+   - Update the expected PnL equation to subtract `SELF_IMPACT(s)` and `ROUND_TRIP_IMPACT(s)`.
+   - Crucially calculate `projected_reducing_depth` making sure to *exclude* our own opposite-side quotes.
+3. **Backward Induction Solver:**
+   - In the quoting logic, solve for optimal sizes starting at the deepest level and working inward to the touch, factoring in that outer fills thin the book and dynamically alter inner-fill expected impact.
+
+---
+
+## 5. Funding Settlement Microstructure Exploitation
+
+**Objective:** Exploit the deterministic hourly clock on Hyperliquid perpetuals.
+**Component Owners:** Risk & Capital Allocation (Governor).
+
+### Implementation Steps
+1. **Continuous Funding Forecaster:**
+   - Compute real-time $f_{next}$ using current premium, OI rates, and trailing EMA. 
+2. **Pre-Settlement Skew Mechanism:**
+   - Implement `settlement_flow_intensity(time_to_settlement)`. 
+   - Between `T-600s` and `T-0s`, systematically widen spreads on the side getting hit and tighten the opposite side to accumulate positions *in the direction of the expected settlement flow*. 
+3. **Post-Settlement Reversion Hold:**
+   - From `T+0s` to `T+180s`, set `unwind_patience = HIGH`. Hold the acquired pre-settlement inventory as the market mean-reverts.
+
+---
+
+## 6. Volatility Surface Extraction (Options Model)
+
+**Objective:** Ensure the spread collected always exceeds realized volatility.
+**Component Owners:** Economic Pricing Engine.
+
+### Implementation Steps
+1. **Implied vs. Realized Volatility Monitor:**
+   - Compute `σ_implied = spread_bps / (0.80 * sqrt(τ_cycle))` for resting limit orders.
+   - Maintain rolling `σ_realized_5s`.
+   - Track the delta: `vol_edge = σ_implied - σ_realized_5s`.
+2. **Crisis Widen / Quote Pull:**
+   - If `vol_edge < 0` (we are writing options at a negative premium), strictly override the base GLFT model. Widen the option floor until it is positive.
+3. **Gamma-Constrained Size Optimization:**
+   - Compute portfolio $\Theta$ (expected spread income) and $\Gamma$ (adverse selection sensitivity).
+   - Alter the solver to allocate size proportionally to `Θ/|Γ|`, natively pulling size away from the dangerous touch levels without heuristic zone logic.
+
+---
+
+## 7. Growth-Optimal (Non-Ergodic Kelly) Sizing
+
+**Objective:** Size positions dynamically based on system growth capacity rather than arbitrary static configuration constants.
+**Component Owners:** Risk & Capital Allocation.
+
+### Implementation Steps
+1. **Correlation Matrix Estimator:**
+   - Compute the probability of cascading fills $\rho(i,j) = P(\text{fill}_j | \text{fill}_i)$.
+   - Condition the matrix using the IMM Regime outputs (Quiet = sparse, Crisis = dense).
+2. **Multivariate Kelly Fractional Sizer:**
+   - Calculate $S^* = e_{vec}^T * \Sigma^{-1} * 1 / (1^T * \Sigma^{-1} * 1)$.
+   - Apply a fractional Kelly scalar dependent on the regime ($f \approx 0.7$ quiet, $0.15$ crisis).
+3. **Dynamic Gamma Translation:**
+   - Derive the continuous risk aversion parameter dynamically via $\gamma_{effective} = W / S^*_{kelly}$, fully abandoning the hard-coded `gamma_base`.
+
+---
+
+## Prioritization Plan
+
+1. **P0: Endogenous Impact & Volatility Surface (Algorithms 4 & 6)**
+   * *Why?* Replaces the final legacy heuristics (Entropy logic and static GLFT spread reliance). Directly protects capacity on thin books.
+2. **P1: Liquidation Mapping & Funding Settlement (Algorithms 1 & 5)**
+   * *Why?* Highly predictable, mechanism-driven structural alpha. Captures immediate observable edge not found on traditional venues.
+3. **P2: Information Propagation & Fingerprinting (Algorithms 2 & 3)**
+   * *Why?* Sophisticated adversarial modeling that enables latency arbitrage against slower MMs. 
+4. **P3: Growth-Optimal Kelly Sizing (Algorithm 7)**
+   * *Why?* Replaces arbitrary size multipliers with mathematically sound capital scaling.
+
+
+The walkthrough (docs/Walkthrough) describes a "Clean-Slate Architecture" with 6 new components (EventDrivenOrchestrator, BayesianDriftEstimator, GMInformedFlowModel, ContinuousInventoryModel, ExpectedPnLSurface,       
+ CapitalAllocator). Audit finding: all 11 files are dead code. None are declared in their module's mod.rs, none are referenced from the production pipeline, the EventDrivenOrchestrator is never instantiated, and the     
+ actual system runs GLFT + ladder + 6 multiplicative risk overlays.
+
+ The three RFCs (rfc_from_scratch_architecture.md, rfc_entropy_to_endogenous_impact.md, rfc_proprietary_to_clean_slate.md) articulate a unified E[PnL]-driven architecture where protection emerges from E[PnL] < 0
+ naturally -- no binary gates, no multiplicative overlays, no discrete zones. This was never delivered.
+
+ Critical discovery: The E[PnL] infrastructure already exists in the production codebase but is disabled:
+ - expected_pnl_bps() in glft.rs:13-64 -- full per-level E[PnL] computation
+ - use_epnl_filter flag in ladder_strat.rs:1233-1266 -- filter that drops E[PnL] < 0 levels (hardcoded false)
+ - effective_gamma() in glft.rs:421 -- continuous gamma scaling (already used)
+ - kappa_bid/kappa_ask on MarketParams -- directional kappa (already populated)
+
+ This is not a rewrite. It is an activation, enhancement, and cleanup.
+
+ The current system's problems (proven by Feb 19 incident):
+ 1. Drift capped at ±3 bps downstream -- ignores strong trends
+ 2. Binary quote gate at 50% position ratio (ONLY_BIDS/ONLY_ASKS)
+ 3. Discrete PositionZone boundaries (Green/Yellow/Red) cause discontinuities
+ 4. Toxicity is cosmetic (3-17% size reduction)
+ 5. 6+ sequential multiplicative overlays compound errors
+ 6. Funding is peripheral, not in reservation price
+
+ ---
+ Workstreams (7 total, 5 agents)
+
+ WS1: Dead Code Removal — Agent: infra
+
+ Files: Delete 11 orphaned files, clean mod.rs
+ Deps: None (first)
+
+ 1. git checkout HEAD -- src/market_maker/mod.rs (restore from overwrite by dead EventDrivenOrchestrator)
+ 2. Delete: events/bus.rs, estimator/bayesian_drift.rs, estimator/glosten_milgrom.rs, risk/continuous_inventory.rs, quoting/epnl_surface.rs, models/endogenous_impact.rs, execution/optimizer.rs,
+ execution/reconciliation.rs, analytics/markout_decomposition.rs, learning/multiplicative_weights.rs, tests/test_epnl.rs
+ 3. Remove any stale pub mod or use referencing deleted files
+ 4. Verify: cargo clippy -- -D warnings clean
+
+ ---
+ WS2: Enhanced E[PnL] Function — Agent: strategy
+
+ Files: strategy/glft.rs
+ Deps: WS1
+
+ Enhance existing expected_pnl_bps() to absorb all overlay costs via an EPnLParams struct:
+
+ pub struct EPnLParams {
+     // existing fields (depth, is_bid, gamma, kappa_side, sigma, time_horizon,
+     //   drift_rate, position, max_position, as_cost_bps, fee_bps, carry_cost_bps)
+     // NEW fields absorbing overlay costs:
+     pub toxicity_score: f64,       // [0,1] from PreFillASClassifier
+     pub circuit_breaker_active: bool,
+     pub drawdown_frac: f64,        // current drawdown fraction
+     pub self_impact_bps: f64,      // from SelfImpactEstimator
+     pub cascade_addon_bps: f64,    // from FillCascadeTracker
+ }
+
+ Enhanced formula (all costs in one equation):
+ - lambda(depth) × (capture - toxicity_cost) + drift_contribution - inventory_penalty - impact_cost
+ - toxicity_cost = toxicity_score × (as_cost + 2.0) -- toxicity amplifies AS economically
+ - circuit_breaker → staleness_discount on lambda -- stale data = unreliable fill probability
+ - drawdown → reduces lambda -- losing money = model may be miscalibrated
+ - Inventory penalty uses continuous gamma(q) = gamma_base × (1 + beta × (q/q_max)²) inline
+
+ Keep old function signature as thin wrapper for backward compat with existing tests.
+
+ Tests: +6 (toxicity_reduces_ev, cb_reduces_lambda, drawdown_reduces_ev, impact_near_touch, cascade_reduces_capture, struct_matches_legacy)
+
+ ---
+ WS3: Unified Reservation Price — Agent: strategy
+
+ Files: strategy/ladder_strat.rs, strategy/market_params.rs
+ Deps: WS2
+
+ Replace multi-step mid (anticipated_mid → adjusted_microprice → skewed_microprice → clamped):
+
+ reservation_mid = microprice × (1 + clamped_shift)
+ where shift = drift_shift - inventory_penalty - funding_carry
+ clamped at ±95% of half_spread
+
+ - Drift shift: drift_rate × T/2 (existing, but uncapped -- was limited to ±80% via skew path)
+ - Inventory penalty: -gamma × (q/q_max) × sigma² × T (new -- shifts mid away from inventory)
+ - Funding carry: -funding_rate × T (new -- positive funding shifts mid down for longs)
+
+ Key change: drift flows through reservation price directly. Skew path carries only non-drift signals (buy_pressure, cross-venue directional).
+
+ Tests: +4 (long_shifts_down, funding_shifts_down, drift_shifts_up, clamped_at_95pct)
+
+ ---
+ WS4: Activate E[PnL] Gate + Remove Overlays — Agent: strategy (lead approval for quote_engine.rs)
+
+ Files: orchestrator/quote_engine.rs, strategy/market_params.rs, strategy/params/aggregator.rs, strategy/ladder_strat.rs
+ Deps: WS2 + WS3
+
+ 4A: Set use_epnl_filter: true in aggregator.rs and market_params.rs Default. Enhance filter in ladder_strat.rs to populate all EPnLParams fields.
+
+ 4B: Remove multiplicative spread_widening_mult chain:
+ - Remove tail_risk widening (→ absorbed into toxicity_score)
+ - Remove cross_venue_spread_mult (→ absorbed into sigma)
+ - Remove risk_overlay_mult cascade (→ absorbed into circuit_breaker + drawdown)
+ - Set spread_widening_mult = 1.0 always (keep field for diagnostics)
+
+ 4C: Remove TOXICITY_CANCEL binary gate (the ladder.bids.clear() block). High toxicity now makes touch-level E[PnL] negative naturally.
+
+ 4D: Remove risk_size_reduction multiplier. Circuit breaker / drawdown reduce via fill probability discount in E[PnL], naturally dropping deeper levels.
+
+ Keep: Kill switch check, data quality gate, warmup gate, use_epnl_filter as runtime toggle.
+
+ Tests: +5 (filter_drops_neg_ev_in_trend, drops_accumulating_at_high_inv, keeps_reducing_at_high_inv, replaces_toxicity_cancel, no_spread_widening_applied)
+
+ ---
+ WS5: Remove Discrete Position Zones from Quote Pipeline — Agent: risk
+
+ Files: orchestrator/quote_engine.rs, execution/state_machine.rs
+ Deps: WS4
+
+ Simplify select_mode():
+ - Keep: Kill → Flat, Cascade → Flat, Hawkes critical → Flat
+ - Remove: Red zone + opposing flow → InventoryReduce (E[PnL] handles this: γ(q) at 80%+ makes accumulating E[PnL] deeply negative)
+ - Everything else: Maker { bid: true, ask: true }
+
+ Remove Yellow/Red zone branching in quote_engine.rs (governor addon bps, risk_reduce_only). Keep Kill zone as hard safety boundary.
+
+ Tests: update zone tests to new expectations, +2 (high_inv_epnl_drops_accumulating, moderate_inv_epnl_widens)
+
+ ---
+ WS6: Drift De-capping and Signal Routing — Agent: signals
+
+ Files: strategy/signal_integration.rs, orchestrator/quote_engine.rs
+ Deps: WS3
+
+ - Add non_drift_skew_bps() to SignalIntegrator -- returns only buy_pressure + cross_venue skew, excluding lead-lag (already in drift estimator)
+ - Wire market_params.lead_lag_signal_bps = non_drift_skew_bps() instead of full combined skew
+ - Remove 5 bps cap on anticipated_mid shift (reservation price has its own 95% clamp)
+
+ Tests: +3 (drift_not_double_counted, buy_pressure_still_in_skew, uncapped_drift_shift)
+
+ ---
+ WS7: E[PnL] Diagnostics — Agent: analytics
+
+ Files: analytics/mod.rs, orchestrator/handlers.rs
+ Deps: WS4
+
+ Add EPnLDiagnostics struct logged every cycle:
+ - levels_evaluated/positive per side, touch E[PnL], most negative E[PnL], primary drop reason
+ - On fill: record epnl_at_fill_time, compare with 5s markout realized_pnl_bps
+ - Wire into existing QuoteOutcomeTracker for calibration: E[PnL] overestimate → model too optimistic
+
+ Tests: +3 (diagnostics_populated, drop_reason_toxicity, drop_reason_inventory)
+
+ ---
+ Dependency Graph
+
+ WS1 (dead code)
+  └→ WS2 (E[PnL] function)
+      ├→ WS3 (reservation price) ──→ WS6 (signal routing)
+      └→ WS4 (activate + remove overlays)
+          ├→ WS5 (remove zones)
+          └→ WS7 (diagnostics)
+
+ Parallel: WS3 + WS4 after WS2. WS5 + WS6 + WS7 can overlap.
+
+ What's KEPT (battle-tested, not touched)
+
+ - KalmanDriftEstimator, BayesianKappaEstimator, RegimeHMM, TradeFlowTracker
+ - PreFillASClassifier, FillProcessor, OrderManager, CovarianceTracker
+ - Reconcile pipeline (scorer, budget_allocator, outcome_tracker)
+ - Kill switch, entropy distribution, all checkpoint infrastructure
+
+ Risk Mitigation
+
+ - use_epnl_filter stays as a runtime config flag -- instant rollback to overlays
+ - Kill zone is NEVER removed (hard circuit breaker, no E[PnL] justification needed)
+ - Paper trade before live: verify E[PnL] filter drops match old overlay behavior
+
+ Verification
+
+ 1. cargo clippy -- -D warnings clean after each WS
+ 2. cargo test -- all existing tests pass (zone tests updated)
+ 3. ~+23 new tests across workstreams
+ 4. Paper trading session: compare E[PnL] filter behavior vs old overlays
+ 5. Key scenario: 70% inventory + high toxicity → touch levels drop via E[PnL] < 0 (not binary clear)

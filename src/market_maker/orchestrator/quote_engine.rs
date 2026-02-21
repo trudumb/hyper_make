@@ -3476,7 +3476,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             .update_position(position, position_value);
 
         // WS7: Estimator diagnostics — log every 10 cycles or when unusual
-        if self.quote_cycle_count % 10 == 0 || self.quote_cycle_count < 3 {
+        if self.quote_cycle_count.is_multiple_of(10) || self.quote_cycle_count < 3 {
             self.log_estimator_diagnostics(&market_params);
         }
 

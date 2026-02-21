@@ -791,7 +791,7 @@ impl ParameterAggregator {
 
             // === Unified Adverse Selection Framework (Phase 4) ===
             // E[PnL] filter: default off during dual-run validation
-            use_epnl_filter: false,
+            use_epnl_filter: true,
             // Funding carry cost: computed by quote engine from funding estimator
             funding_carry_bps: 0.0,
             // Phase 8: Warm/Cold tier features (set in quote_engine)
