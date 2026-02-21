@@ -306,6 +306,8 @@ impl Ladder {
             &ask_sizes,
             params.mid_price,
             params.market_mid,
+            params.cached_best_bid,
+            params.cached_best_ask,
             params.decimals,
             params.sz_decimals,
             params.min_notional,
@@ -806,6 +808,8 @@ pub(crate) fn build_asymmetric_ladder(
     ask_sizes: &[f64],
     mid: f64,
     market_mid: f64,
+    exchange_best_bid: f64,
+    exchange_best_ask: f64,
     decimals: u32,
     sz_decimals: u32,
     min_notional: f64,
@@ -813,11 +817,22 @@ pub(crate) fn build_asymmetric_ladder(
     let mut bids = LadderLevels::new();
     let mut asks = LadderLevels::new();
 
-    // FIX: Use safe base prices to prevent crossing market spread
-    // When microprice < market_mid (selling pressure), asks must still be above market_mid
-    // When microprice > market_mid (buying pressure), bids must still be below market_mid
-    let bid_base = mid.min(market_mid);
-    let ask_base = mid.max(market_mid);
+    // Use exchange BBO for safety cap (same logic as build_raw_ladder).
+    // When exchange BBO is valid, use it. Otherwise fall back to market_mid.
+    let min_tick = 10.0_f64.powi(-(decimals as i32));
+    let effective_bid_cap = if exchange_best_ask > 0.0 {
+        exchange_best_ask - min_tick
+    } else {
+        market_mid
+    };
+    let effective_ask_floor = if exchange_best_bid > 0.0 {
+        exchange_best_bid + min_tick
+    } else {
+        market_mid
+    };
+
+    let bid_base = mid.min(effective_bid_cap);
+    let ask_base = mid.max(effective_ask_floor);
 
     // Build bid levels using safe base
     for (&depth_bps, &size) in bid_depths.iter().zip(bid_sizes.iter()) {
@@ -1981,7 +1996,7 @@ mod tests {
         let ladder = build_asymmetric_ladder(
             &asym_depths, &asym_sizes,
             &asym_depths, &asym_sizes,
-            mid, mid, 2, 4, min_notional,
+            mid, mid, 0.0, 0.0, 2, 4, min_notional,
         );
 
         for level in &ladder.bids {

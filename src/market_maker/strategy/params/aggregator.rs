@@ -238,6 +238,7 @@ impl ParameterAggregator {
             flow_imbalance: est.flow_imbalance(),
             // Lead-lag signal (wired in quote_engine.rs when lag model is warmed up)
             lead_lag_signal_bps: 0.0,
+            drift_signal_bps: 0.0,
             lead_lag_confidence: 0.0,
             falling_knife_score: est.falling_knife_score(),
             rising_knife_score: est.rising_knife_score(),
@@ -659,8 +660,6 @@ impl ParameterAggregator {
             } else {
                 0.0 // Populated from stochastic controller in quote_engine
             },
-            spread_widening_mult: sources.adverse_selection.recent_as_severity_mult(),  // AS severity baseline; further multiplied by QuoteGate in quote_engine
-
             // === First-Principles Stochastic Control (Belief System) ===
             // Phase 7: Centralized beliefs are the single source of truth.
             // Fallbacks to beliefs_builder are DEPRECATED and only for safety.

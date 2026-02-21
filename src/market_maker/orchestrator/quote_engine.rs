@@ -1097,14 +1097,15 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Adjust spread widening based on skewness
             // High positive skewness = risk of upward vol spike
             if tail_risk > 0.3 {
-                let widening = 1.0 + (tail_risk * 0.2); // Up to 20% wider
-                market_params.spread_widening_mult *= widening;
-                
+                // Additive risk premium: tail_risk [0.3, 1.0] → 0.3-1.0 bps addon
+                let tail_premium_bps = tail_risk * 1.0;
+                market_params.total_risk_premium_bps += tail_premium_bps;
+
                 debug!(
                     sigma_skewness = %format!("{:.2}", skew),
                     tail_risk = %format!("{:.2}", tail_risk),
-                    widening = %format!("{:.2}", widening),
-                    "Belief skewness: applying defensive spread widening"
+                    tail_premium_bps = %format!("{:.2}", tail_premium_bps),
+                    "Belief skewness: additive risk premium"
                 );
             }
         }
@@ -1475,6 +1476,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         if signals.lead_lag_actionable {
             // Real cross-exchange signal from Binance feed
             market_params.lead_lag_signal_bps = signals.combined_skew_bps + position_guard_skew_bps;
+            // Uncapped drift for reservation mid — bounded only by ±95% GLFT half-spread clamp
+            market_params.drift_signal_bps = signals.drift_signal_bps + position_guard_skew_bps;
             market_params.lead_lag_confidence = signals.model_confidence;
 
             if signals.combined_skew_bps.abs() > 1.0 {
@@ -1502,6 +1505,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     // Negative lag = signal leads target
                     // Amplify momentum signal by confidence (fallback mode)
                     market_params.lead_lag_signal_bps = market_params.momentum_bps * confidence * 0.5;
+                    // Fallback drift = same as skew (no separate uncapped source)
+                    market_params.drift_signal_bps = market_params.lead_lag_signal_bps;
 
                     if market_params.lead_lag_signal_bps.abs() > 1.0 {
                         trace!(
@@ -1532,8 +1537,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Use cross-venue signals from joint Binance + Hyperliquid analysis.
         // When venues agree, boost confidence in direction. When they disagree, widen spreads.
         if signals.cross_venue_valid {
-            // Apply cross-venue spread multiplier (widens when venues disagree or high toxicity)
-            market_params.spread_widening_mult *= signals.cross_venue_spread_mult;
+            // Cross-venue disagreement → additive risk premium
+            let cv_premium_bps = (signals.cross_venue_spread_mult - 1.0).max(0.0) * 5.0;
+            market_params.total_risk_premium_bps += cv_premium_bps;
 
             // Add cross-venue skew to lead-lag signal (directional boost from agreement)
             // Scale by agreement: high agreement = strong signal, disagreement = muted
@@ -1679,11 +1685,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Store total risk premium on market_params for solve_min_gamma()
         market_params.total_risk_premium_bps = total_risk_premium;
 
-        // === Compose final spread_widening_mult ===
-        // Phase 7: Single risk_overlay_mult (from graduated responses above), capped at 3x
+        // === Compose final risk overlay ===
+        // Phase 7: risk_overlay_mult → additive premium, capped at 3x excess
         let spread_multiplier = risk_overlay_mult.min(3.0);
         if spread_multiplier > 1.01 {
-            market_params.spread_widening_mult *= spread_multiplier;
+            // Convert multiplicative excess to additive bps (assuming ~5 bps base)
+            let overlay_premium_bps = (spread_multiplier - 1.0) * 5.0;
+            market_params.total_risk_premium_bps += overlay_premium_bps;
         }
 
         if total_risk_premium > 0.1 || spread_multiplier > 1.01 {
@@ -2612,12 +2620,14 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let stale_mult = compute_staleness_spread_penalty(book_age_ms, exchange_limits_age_ms);
 
             if stale_mult > 1.0 {
-                market_params.spread_widening_mult *= stale_mult;
+                // Staleness → additive risk premium (assuming ~5 bps base)
+                let stale_premium_bps = (stale_mult - 1.0) * 5.0;
+                market_params.total_risk_premium_bps += stale_premium_bps;
                 debug!(
                     book_age_ms = book_age_ms,
                     exchange_limits_age_ms = exchange_limits_age_ms,
-                    stale_mult = %format!("{stale_mult:.2}"),
-                    "Stale data: widening spreads"
+                    stale_premium_bps = %format!("{stale_premium_bps:.2}"),
+                    "Stale data: additive risk premium"
                 );
             }
 
@@ -3115,6 +3125,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             // Done BEFORE finalize() so tracking uses pre-widening prices.
             {
                 use crate::market_maker::learning::quote_outcome::{CompactMarketState, PendingQuote};
+                use crate::market_maker::{EPnLParams, expected_pnl_bps_enhanced};
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -3128,22 +3139,62 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     toxicity_score: market_params.toxicity_score,
                     kappa: market_params.kappa,
                 };
+                // WS7d: Compute E[PnL] at registration for reconciliation
+                let epnl_time_horizon = if market_params.arrival_intensity > 0.0 {
+                    (1.0 / market_params.arrival_intensity).min(300.0)
+                } else {
+                    60.0
+                };
+                let base_epnl_params = EPnLParams {
+                    depth_bps: 0.0, // filled per-side below
+                    is_bid: true,
+                    gamma: 0.1, // conservative default for reconciliation
+                    kappa_side: market_params.kappa_bid,
+                    sigma: market_params.sigma,
+                    time_horizon: epnl_time_horizon,
+                    drift_rate: market_params.drift_rate_per_sec,
+                    position,
+                    max_position: self.effective_max_position,
+                    as_cost_bps: market_params.total_as_bps,
+                    fee_bps: 1.5, // Hyperliquid maker fee constant
+                    carry_cost_bps: market_params.funding_carry_bps,
+                    toxicity_score: market_params.toxicity_score,
+                    circuit_breaker_active: market_params.should_pull_quotes,
+                    drawdown_frac: 0.0,
+                    self_impact_bps: 0.0,
+                    cascade_addon_bps: market_params.cascade_bid_addon_bps,
+                    inventory_beta: 0.0,
+                };
                 if let Some(best_bid) = viable.bids.first() {
                     let half_spread_bps = ((mid - best_bid.price) / mid) * 10000.0;
+                    let mut bid_params = base_epnl_params.clone();
+                    bid_params.depth_bps = half_spread_bps;
+                    bid_params.is_bid = true;
+                    bid_params.kappa_side = market_params.kappa_bid;
+                    bid_params.cascade_addon_bps = market_params.cascade_bid_addon_bps;
+                    let epnl = expected_pnl_bps_enhanced(&bid_params);
                     self.quote_outcome_tracker.register_quote(PendingQuote {
                         timestamp_ms: now_ms,
                         half_spread_bps,
                         is_bid: true,
                         state: compact_state.clone(),
+                        epnl_at_registration: Some(epnl),
                     });
                 }
                 if let Some(best_ask) = viable.asks.first() {
                     let half_spread_bps = ((best_ask.price - mid) / mid) * 10000.0;
+                    let mut ask_params = base_epnl_params;
+                    ask_params.depth_bps = half_spread_bps;
+                    ask_params.is_bid = false;
+                    ask_params.kappa_side = market_params.kappa_ask;
+                    ask_params.cascade_addon_bps = market_params.cascade_ask_addon_bps;
+                    let epnl = expected_pnl_bps_enhanced(&ask_params);
                     self.quote_outcome_tracker.register_quote(PendingQuote {
                         timestamp_ms: now_ms,
                         half_spread_bps,
                         is_bid: false,
                         state: compact_state,
+                        epnl_at_registration: Some(epnl),
                     });
                 }
             }

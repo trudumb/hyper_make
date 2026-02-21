@@ -121,6 +121,82 @@ pub fn expected_pnl_bps(
     expected_pnl_bps_enhanced(&params)
 }
 
+/// Decomposition of E[PnL] for diagnostics and reconciliation.
+#[derive(Debug, Clone, Default)]
+pub struct EPnLDiagnostics {
+    pub depth_bps: f64,
+    pub is_bid: bool,
+    pub lambda: f64,
+    pub capture_bps: f64,
+    pub toxicity_cost_bps: f64,
+    pub drift_contribution_bps: f64,
+    pub inventory_adj_bps: f64,
+    pub self_impact_bps: f64,
+    pub epnl_bps: f64,
+    pub circuit_breaker_active: bool,
+    pub drawdown_penalty: f64,
+}
+
+/// Same computation as `expected_pnl_bps_enhanced()` but returns the decomposition.
+pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagnostics) {
+    let depth_frac = params.depth_bps / 10_000.0;
+
+    let mut lambda = params.kappa_side * (-params.kappa_side * depth_frac).exp();
+
+    if params.circuit_breaker_active {
+        lambda *= 0.1;
+    }
+
+    let drawdown_penalty = (1.0 - params.drawdown_frac * 5.0).max(0.1);
+    lambda *= drawdown_penalty;
+
+    let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
+
+    let capture = params.depth_bps - params.as_cost_bps - params.fee_bps
+        - params.carry_cost_bps - params.cascade_addon_bps;
+
+    let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
+    let drift_contribution = if params.is_bid { drift_bps } else { -drift_bps };
+
+    let q_ratio = if params.max_position > 1e-9 {
+        (params.position.abs() / params.max_position).min(1.0)
+    } else {
+        0.0
+    };
+
+    let gamma_q = params.gamma * (1.0 + params.inventory_beta * q_ratio.powi(2));
+
+    let is_reducing = (params.is_bid && params.position < 0.0)
+        || (!params.is_bid && params.position > 0.0);
+    let inv_penalty_bps = gamma_q * q_ratio * params.sigma.powi(2)
+        * params.time_horizon * 10_000.0;
+
+    let inventory_adj = if is_reducing {
+        -0.5 * inv_penalty_bps
+    } else {
+        inv_penalty_bps
+    };
+
+    let epnl = lambda * (capture - toxicity_cost) + drift_contribution
+        - inventory_adj - params.self_impact_bps;
+
+    let diag = EPnLDiagnostics {
+        depth_bps: params.depth_bps,
+        is_bid: params.is_bid,
+        lambda,
+        capture_bps: capture,
+        toxicity_cost_bps: toxicity_cost,
+        drift_contribution_bps: drift_contribution,
+        inventory_adj_bps: inventory_adj,
+        self_impact_bps: params.self_impact_bps,
+        epnl_bps: epnl,
+        circuit_breaker_active: params.circuit_breaker_active,
+        drawdown_penalty,
+    };
+
+    (epnl, diag)
+}
+
 /// Taker price elasticity estimator for monopolist LP pricing.
 ///
 /// Tracks (spread_width, fill_rate) pairs over a rolling window and
@@ -639,12 +715,9 @@ impl GLFTStrategy {
         let glft_half_frac = self.half_spread(gamma, kappa, sigma, tau);
         let glft_half_bps = glft_half_frac * 10_000.0;
 
-        // Risk premium: convert the widening_mult excess to additive bps
-        // spread_widening_mult of 1.5 on 5 bps GLFT = 2.5 bps addon.
-        // Capped at 100% of GLFT spread (at most doubles the base).
-        let widening_excess = (market_params.spread_widening_mult - 1.0).clamp(0.0, 1.0);
-        let risk_premium_bps = glft_half_bps * widening_excess
-            + market_params.regime_risk_premium_bps
+        // Risk premium: additive bps from regime + risk overlays
+        // All widening now routes through E[PnL] gate or additive total_risk_premium_bps.
+        let risk_premium_bps = market_params.regime_risk_premium_bps
             + market_params.total_risk_premium_bps;
 
         // Quota addon: already in bps, capped at 50
@@ -1535,21 +1608,14 @@ impl QuotingStrategy for GLFTStrategy {
         // 1. Bandit multiplier component (now additive bps)
         let bandit_addon = market_params.bandit_spread_additive_bps / 10000.0;
 
-        // 2. Changepoint/AS widening: convert excess multiplier to additive bps
-        // spread_widening_mult of 1.5 on 5 bps half-spread = 2.5 bps addon
-        // Capped at 100% of base spread (i.e., at most doubles the base)
-        let widening_excess = (market_params.spread_widening_mult - 1.0).clamp(0.0, 1.0);
-        let widening_addon_bid = half_spread_bid * widening_excess;
-        let widening_addon_ask = half_spread_ask * widening_excess;
-
-        // 3. Quota shadow spread: already in bps, convert to price fraction
+        // 2. Quota shadow spread: already in bps, convert to price fraction
         // Capped at 50 bps to prevent quota pressure from dominating
         let quota_addon = (market_params.quota_shadow_spread_bps / 10_000.0).min(0.0050);
 
         // Compose: base + addons (additive)
         // The base spread passes through at natural GLFT level; only addons are bounded.
-        let half_spread_bid_widened = half_spread_bid + bandit_addon + widening_addon_bid + quota_addon;
-        let half_spread_ask_widened = half_spread_ask + bandit_addon + widening_addon_ask + quota_addon;
+        let half_spread_bid_widened = half_spread_bid + bandit_addon + quota_addon;
+        let half_spread_ask_widened = half_spread_ask + bandit_addon + quota_addon;
 
         // Compute asymmetric deltas with predictive bias
         // Note: predictive_bias is typically negative when changepoint imminent (expect price drop)
@@ -2326,21 +2392,20 @@ mod tests {
         // Baseline spread with no widening
         let (bid_base, _ask_base) = strategy.calculate_quotes(&config, 0.0, 100.0, 1.0, &mp);
 
-        // Extreme widening: should be additive, not multiplicative
-        mp.spread_widening_mult = 5.0; // Clamped: excess = min(5-1, 1.0) = 1.0 → at most doubles
-        mp.bandit_spread_additive_bps = 10.0; // Assume 10.0 bps for the test
+        // Additive widening: bandit + quota (spread_widening_mult removed)
+        mp.bandit_spread_additive_bps = 10.0; // 10 bps bandit addon
         mp.quota_shadow_spread_bps = 10.0; // 10 bps quota pressure
+        mp.total_risk_premium_bps = 5.0; // 5 bps risk premium addon
 
         let (bid_wide, ask_wide) = strategy.calculate_quotes(&config, 0.0, 100.0, 1.0, &mp);
 
         // Both quotes should exist
-        assert!(bid_wide.is_some(), "Bid should exist even with extreme widening");
-        assert!(ask_wide.is_some(), "Ask should exist even with extreme widening");
+        assert!(bid_wide.is_some(), "Bid should exist even with additive widening");
+        assert!(ask_wide.is_some(), "Ask should exist even with additive widening");
 
-        // Verify additive not multiplicative:
-        // Old multiplicative: base × 5.0 × 2.0 = 10x
-        // New additive: base × 1.5 (bandit) + base × 1.0 (widening) + 10bps (quota)
-        //             = 2.5 × base + 10bps ≈ 3.5x base (much less than 10x)
+        // Verify additive composition:
+        // base + bandit(10bps) + quota(10bps) + risk_premium(5bps)
+        // Should widen moderately, not multiplicatively
         if let (Some(b_base), Some(b_wide)) = (bid_base, bid_wide) {
             let mid = mp.microprice;
             let base_spread_bps = (mid - b_base.price) / mid * 10000.0;
@@ -2668,5 +2733,50 @@ mod tests {
         let enhanced = expected_pnl_bps_enhanced(&params);
         
         assert!((legacy - enhanced).abs() < 1e-9, "Legacy wrapper with zeroed struct overlays must match enhanced precisely");
+    }
+
+    #[test]
+    fn test_epnl_diagnostics_decomposition() {
+        // WS7: Verify diagnostics decomposition matches the scalar result.
+        let params = EPnLParams {
+            depth_bps: 8.0,
+            is_bid: true,
+            gamma: 0.1,
+            kappa_side: 3000.0,
+            sigma: 0.005,
+            time_horizon: 10.0,
+            drift_rate: 0.0001, // slight bullish drift
+            position: 2.0,
+            max_position: 10.0,
+            as_cost_bps: 2.0,
+            fee_bps: 1.5,
+            carry_cost_bps: 0.0,
+            toxicity_score: 0.3,
+            circuit_breaker_active: false,
+            drawdown_frac: 0.0,
+            self_impact_bps: 0.1,
+            cascade_addon_bps: 0.5,
+            inventory_beta: 1.0,
+        };
+
+        let scalar = expected_pnl_bps_enhanced(&params);
+        let (diag_scalar, diag) = expected_pnl_bps_with_diagnostics(&params);
+
+        // Scalar from both functions must match exactly
+        assert!(
+            (scalar - diag_scalar).abs() < 1e-12,
+            "Diagnostics scalar must match enhanced. scalar={}, diag={}",
+            scalar, diag_scalar
+        );
+
+        // Verify diagnostics fields are populated
+        assert!((diag.depth_bps - 8.0).abs() < 1e-9);
+        assert!(diag.is_bid);
+        assert!(diag.lambda > 0.0, "Lambda should be positive");
+        assert!(diag.toxicity_cost_bps > 0.0, "Toxicity cost should be positive");
+        assert!(diag.drift_contribution_bps > 0.0, "Bullish drift on bid should be positive");
+        assert!(diag.self_impact_bps > 0.0, "Self impact should be positive");
+        assert!(!diag.circuit_breaker_active);
+        assert!((diag.drawdown_penalty - 1.0).abs() < 1e-9, "No drawdown → penalty=1.0");
     }
 }

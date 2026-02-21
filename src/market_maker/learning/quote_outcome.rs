@@ -40,6 +40,8 @@ pub struct PendingQuote {
     pub is_bid: bool,
     /// Market state snapshot at quote time
     pub state: CompactMarketState,
+    /// E[PnL] prediction at registration time (bps), for reconciliation against realized markout.
+    pub epnl_at_registration: Option<f64>,
 }
 
 /// Outcome of a quote cycle.
@@ -199,6 +201,12 @@ pub struct QuoteOutcomeTracker {
     fill_rate: BinnedFillRate,
     /// Current mid price for computing subsequent moves on expiry.
     last_mid: f64,
+    /// Running sum of (epnl_predicted - realized_edge) for bias calculation.
+    epnl_error_sum: f64,
+    /// Running sum of (epnl_predicted - realized_edge)^2 for RMSE.
+    epnl_error_sq_sum: f64,
+    /// Number of fills with E[PnL] predictions for reconciliation.
+    epnl_reconciliation_count: u64,
 }
 
 impl QuoteOutcomeTracker {
@@ -209,6 +217,9 @@ impl QuoteOutcomeTracker {
             outcome_log: VecDeque::with_capacity(MAX_OUTCOME_LOG),
             fill_rate: BinnedFillRate::new(),
             last_mid: 0.0,
+            epnl_error_sum: 0.0,
+            epnl_error_sq_sum: 0.0,
+            epnl_reconciliation_count: 0,
         }
     }
 
@@ -239,6 +250,15 @@ impl QuoteOutcomeTracker {
 
         if let Some(idx) = idx {
             let quote = self.pending_quotes.remove(idx).unwrap();
+
+            // WS7c: Reconcile E[PnL] prediction against realized markout
+            if let Some(predicted) = quote.epnl_at_registration {
+                let error = predicted - edge_bps;
+                self.epnl_error_sum += error;
+                self.epnl_error_sq_sum += error * error;
+                self.epnl_reconciliation_count += 1;
+            }
+
             let outcome = QuoteOutcome::Filled {
                 edge_bps,
                 state: quote.state,
@@ -341,6 +361,19 @@ impl QuoteOutcomeTracker {
     /// Total outcomes recorded.
     pub fn total_outcomes(&self) -> usize {
         self.outcome_log.len()
+    }
+
+    /// E[PnL] prediction accuracy: (bias_bps, rmse_bps).
+    /// Bias > 0 means predictions are optimistic, < 0 means pessimistic.
+    /// Returns (0.0, 0.0) if no reconciliation data yet.
+    pub fn epnl_prediction_accuracy(&self) -> (f64, f64) {
+        if self.epnl_reconciliation_count == 0 {
+            return (0.0, 0.0);
+        }
+        let n = self.epnl_reconciliation_count as f64;
+        let bias = self.epnl_error_sum / n;
+        let rmse = (self.epnl_error_sq_sum / n).sqrt();
+        (bias, rmse)
     }
 
     /// Create a checkpoint of the fill rate bins.
@@ -487,6 +520,7 @@ mod tests {
             half_spread_bps: 5.0,
             is_bid: true,
             state: make_state(100.0),
+            epnl_at_registration: None,
         });
 
         assert_eq!(tracker.pending_count(), 1);
@@ -512,6 +546,7 @@ mod tests {
             half_spread_bps: 5.0,
             is_bid: true,
             state: make_state(100.0),
+            epnl_at_registration: None,
         });
 
         // Move time forward past expiry
@@ -538,6 +573,7 @@ mod tests {
                 half_spread_bps: 5.0,
                 is_bid: true,
                 state: make_state(100.0),
+                epnl_at_registration: None,
             });
         }
 
@@ -587,6 +623,7 @@ mod tests {
             half_spread_bps: 5.0,
             is_bid: true,
             state: make_state(100.0),
+            epnl_at_registration: None,
         });
 
         // Try to fill the ask side — should not match
@@ -607,6 +644,7 @@ mod tests {
                 half_spread_bps: 5.0,
                 is_bid: true,
                 state: make_state(100.0),
+                epnl_at_registration: None,
             });
         }
 
@@ -627,6 +665,7 @@ mod tests {
                 half_spread_bps: 3.0,
                 is_bid: true,
                 state: make_state(100.0),
+                epnl_at_registration: None,
             });
         }
         for _ in 0..3 {
@@ -646,5 +685,41 @@ mod tests {
         let orig_rate = tracker.fill_rate().fill_rate_at(3.0);
         let restored_rate = restored.fill_rate().fill_rate_at(3.0);
         assert_eq!(orig_rate, restored_rate);
+    }
+
+    #[test]
+    fn test_epnl_reconciliation() {
+        let mut tracker = QuoteOutcomeTracker::new();
+        tracker.update_mid(100.0);
+
+        // Register quote with E[PnL] prediction of 2.0 bps
+        tracker.register_quote(PendingQuote {
+            timestamp_ms: 1000,
+            half_spread_bps: 5.0,
+            is_bid: true,
+            state: make_state(100.0),
+            epnl_at_registration: Some(2.0),
+        });
+
+        // Fill with realized edge of 1.5 bps → error = 2.0 - 1.5 = 0.5
+        tracker.on_fill(true, 1.5);
+
+        let (bias, rmse) = tracker.epnl_prediction_accuracy();
+        assert!((bias - 0.5).abs() < 0.01, "Bias should be +0.5 (optimistic). Got: {}", bias);
+        assert!((rmse - 0.5).abs() < 0.01, "RMSE should be 0.5. Got: {}", rmse);
+
+        // Register another with None — should not affect reconciliation
+        tracker.register_quote(PendingQuote {
+            timestamp_ms: 2000,
+            half_spread_bps: 5.0,
+            is_bid: true,
+            state: make_state(100.0),
+            epnl_at_registration: None,
+        });
+        tracker.on_fill(true, 3.0);
+
+        // Still only 1 reconciliation data point
+        let (bias2, _) = tracker.epnl_prediction_accuracy();
+        assert!((bias2 - 0.5).abs() < 0.01, "Bias unchanged. Got: {}", bias2);
     }
 }

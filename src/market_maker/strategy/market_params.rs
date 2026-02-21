@@ -216,7 +216,13 @@ pub struct MarketParams {
     /// Binance → Hyperliquid: when Binance moves, Hyperliquid follows.
     /// Positive = predicted upward move, Negative = predicted downward move.
     /// Confidence-weighted: signal * (mutual_info / 0.1).min(1.0)
+    /// NOTE: This is the CAPPED skew signal. For reservation mid drift, use `drift_signal_bps`.
     pub lead_lag_signal_bps: f64,
+
+    /// Uncapped drift signal for reservation mid (bps, positive = bullish).
+    /// Separated from skew: drift shifts reservation mid, skew shifts bid/ask asymmetry.
+    /// Only bounded by ±95% of GLFT half-spread clamp in the reservation mid calculation.
+    pub drift_signal_bps: f64,
 
     /// Lead-lag signal confidence [0, 1].
     /// Based on mutual information between signal and target.
@@ -862,11 +868,6 @@ pub struct MarketParams {
     /// Used to compute predictive bias β_t for preemptive quote skewing.
     pub changepoint_prob: f64,
 
-    /// Spread widening multiplier from changepoint detection.
-    /// Applied when changepoint is pending confirmation (< required confirmations).
-    /// Range: [1.0, 2.0] typically.
-    pub spread_widening_mult: f64,
-
     // ==================== First-Principles Stochastic Control ====================
     /// Belief-derived predictive bias β_t = E[μ | data].
     /// This is the posterior mean of drift from Normal-Inverse-Gamma update.
@@ -1103,6 +1104,7 @@ impl Default for MarketParams {
             momentum_bps: 0.0,         // Default: no momentum
             flow_imbalance: 0.0,       // Default: balanced flow
             lead_lag_signal_bps: 0.0,  // Default: no cross-exchange signal
+            drift_signal_bps: 0.0,    // Default: no drift signal
             lead_lag_confidence: 0.0,  // Default: no confidence
             falling_knife_score: 0.0,  // Default: no falling knife
             rising_knife_score: 0.0,   // Default: no rising knife
@@ -1308,7 +1310,6 @@ impl Default for MarketParams {
             adverse_regime: 1,            // Normal regime initially
             // Predictive Bias (A-S Extension)
             changepoint_prob: 0.0,        // No changepoint detected initially
-            spread_widening_mult: 1.0,    // No widening initially
             // First-Principles Stochastic Control
             belief_predictive_bias: 0.0,  // No drift bias until beliefs updated
             belief_expected_sigma: 0.0001, // Default sigma

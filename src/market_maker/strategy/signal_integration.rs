@@ -495,6 +495,10 @@ pub struct IntegratedSignals {
     pub signal_risk_premium_bps: f64,
     /// Combined skew in bps (positive = bullish).
     pub combined_skew_bps: f64,
+    /// Uncapped drift signal for reservation mid (bps, positive = bullish).
+    /// Separated from skew: drift shifts the reservation mid, skew shifts bid/ask asymmetry.
+    /// Only bounded by the ±95% GLFT half-spread clamp in ladder_strat.rs.
+    pub drift_signal_bps: f64,
 
     // === Attribution ===
     /// Per-signal contribution record for attribution analysis.
@@ -898,11 +902,14 @@ impl SignalIntegrator {
             };
 
             signals.skew_direction = self.last_lead_lag_signal.skew_direction;
-            signals.lead_lag_skew_bps = self
-                .last_lead_lag_signal
-                .skew_magnitude_bps
+            let raw_magnitude = self.last_lead_lag_signal.skew_magnitude_bps;
+            signals.lead_lag_skew_bps = raw_magnitude
                 .min(self.config.max_lead_lag_skew_bps)
                 * ll_weight;
+            // Uncapped drift: bounded only by ±95% GLFT half-spread clamp in reservation mid
+            signals.drift_signal_bps = raw_magnitude
+                * ll_weight
+                * self.last_lead_lag_signal.skew_direction as f64;
             signals.lead_lag_actionable = ll_weight > 0.0;
             signals.binance_hl_diff_bps = self.last_lead_lag_signal.diff_bps;
         } else if self.config.use_lead_lag
@@ -915,6 +922,8 @@ impl SignalIntegrator {
             signals.lead_lag_skew_bps = preemptive_skew
                 .abs()
                 .min(self.config.max_lead_lag_skew_bps);
+            // Uncapped drift from CUSUM (preemptive, lower confidence)
+            signals.drift_signal_bps = preemptive_skew;
             signals.skew_direction = if preemptive_skew > 0.0 { 1 } else { -1 };
             signals.lead_lag_actionable = true;
             signals.binance_hl_diff_bps = self.cusum_divergence_bps;

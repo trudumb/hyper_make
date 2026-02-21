@@ -902,8 +902,8 @@ impl LadderStrategy {
         // 2. Continuous inventory penalty (q * gamma * sigma^2 * T)
         // 3. Funding carry
 
-        // 1. Drift
-        let drift_shift_bps = market_params.lead_lag_signal_bps;
+        // 1. Drift — uncapped signal, bounded only by ±95% GLFT half-spread clamp below
+        let drift_shift_bps = market_params.drift_signal_bps;
         
         // 2. Inventory Penalty
         // gamma has regime & beta_inventory applied natively via effective_gamma
@@ -1301,6 +1301,36 @@ impl LadderStrategy {
                     position = %format!("{:.4}", position),
                     drift_bps = %format!("{:.2}", market_params.drift_rate_per_sec * 10_000.0),
                     "E[PnL] filter: dropped negative-EV levels"
+                );
+            }
+
+            // WS7b: Log E[PnL] decomposition for tightest surviving bid/ask
+            if let Some(&touch_bid_depth) = dynamic_depths.bid.first() {
+                bid_params.depth_bps = touch_bid_depth;
+                let (_, diag) = super::glft::expected_pnl_bps_with_diagnostics(&bid_params);
+                tracing::debug!(
+                    depth_bps = %format!("{:.2}", diag.depth_bps),
+                    lambda = %format!("{:.4}", diag.lambda),
+                    capture_bps = %format!("{:.2}", diag.capture_bps),
+                    toxicity_cost = %format!("{:.2}", diag.toxicity_cost_bps),
+                    drift = %format!("{:.2}", diag.drift_contribution_bps),
+                    inv_adj = %format!("{:.2}", diag.inventory_adj_bps),
+                    epnl = %format!("{:.3}", diag.epnl_bps),
+                    "E[PnL] diagnostics: touch BID"
+                );
+            }
+            if let Some(&touch_ask_depth) = dynamic_depths.ask.first() {
+                ask_params.depth_bps = touch_ask_depth;
+                let (_, diag) = super::glft::expected_pnl_bps_with_diagnostics(&ask_params);
+                tracing::debug!(
+                    depth_bps = %format!("{:.2}", diag.depth_bps),
+                    lambda = %format!("{:.4}", diag.lambda),
+                    capture_bps = %format!("{:.2}", diag.capture_bps),
+                    toxicity_cost = %format!("{:.2}", diag.toxicity_cost_bps),
+                    drift = %format!("{:.2}", diag.drift_contribution_bps),
+                    inv_adj = %format!("{:.2}", diag.inventory_adj_bps),
+                    epnl = %format!("{:.3}", diag.epnl_bps),
+                    "E[PnL] diagnostics: touch ASK"
                 );
             }
         }
@@ -3590,17 +3620,21 @@ mod tests {
         params.sigma = 0.005;
         params.kappa = 2000.0;
         params.arrival_intensity = 0.5;
-        
-        // Bullish drift
-        params.lead_lag_signal_bps = 5.0; // 5 bps upward drift
+        params.capital_policy.use_tick_grid = false; // Force non-tick-grid path for reservation mid testing
+        // Set valid BBO so build_raw_ladder doesn't clamp bid_base to market_mid
+        params.cached_best_bid = 99.95;
+        params.cached_best_ask = 100.05;
+
+        // Bullish drift (reservation mid reads drift_signal_bps)
+        params.drift_signal_bps = 5.0; // 5 bps upward drift
         let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let bid_price_drift = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
-        
-        params.lead_lag_signal_bps = 0.0;
+
+        params.drift_signal_bps = 0.0;
         let ladder_no_drift = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         let bid_price_no_drift = ladder_no_drift.bids.first().map(|l| l.price).unwrap_or(0.0);
-        
-        assert!(bid_price_drift > bid_price_no_drift, "Bullish drift should raise bid prices");
+
+        assert!(bid_price_drift > bid_price_no_drift, "Bullish drift should raise bid prices. drift={bid_price_drift}, no_drift={bid_price_no_drift}");
     }
 
     #[test]
@@ -3619,16 +3653,25 @@ mod tests {
         params.leverage = 1.0;
         params.sigma = 0.005;
         params.kappa = 2000.0;
-        
+        params.capital_policy.use_tick_grid = false;
+        params.cached_best_bid = 99.95;
+        params.cached_best_ask = 100.05;
+
         // Long position
         let ladder_long = strategy.calculate_ladder(&config, 50.0, 100.0, 100.0, &params);
-        let ask_price_long = ladder_long.asks.first().map(|l| l.price).unwrap_or(0.0);
-        
         // Neutral position
         let ladder_neutral = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
-        let ask_price_neutral = ladder_neutral.asks.first().map(|l| l.price).unwrap_or(0.0);
-        
-        assert!(ask_price_long < ask_price_neutral, "Long inventory should push ask prices down (aggressive)");
+
+        // Compare average ask prices across all levels to avoid touch-level rounding masking the effect
+        let avg_ask_long: f64 = ladder_long.asks.iter().map(|l| l.price).sum::<f64>()
+            / ladder_long.asks.len().max(1) as f64;
+        let avg_ask_neutral: f64 = ladder_neutral.asks.iter().map(|l| l.price).sum::<f64>()
+            / ladder_neutral.asks.len().max(1) as f64;
+
+        assert!(
+            avg_ask_long < avg_ask_neutral,
+            "Long inventory should push ask prices down (aggressive). avg_long={avg_ask_long:.4}, avg_neutral={avg_ask_neutral:.4}"
+        );
     }
 
     #[test]
@@ -3647,18 +3690,29 @@ mod tests {
         params.leverage = 1.0;
         params.sigma = 0.005;
         params.kappa = 2000.0;
-        
+        params.capital_policy.use_tick_grid = false; // Force non-tick-grid path for reservation mid testing
+        // Set valid BBO so build_raw_ladder doesn't clamp ask_floor to market_mid
+        params.cached_best_bid = 99.95;
+        params.cached_best_ask = 100.05;
+
         // High positive funding rate (longs pay shorts)
-        params.funding_rate = 31_557_600.0 * 1.0; 
-        
+        params.funding_rate = 31_557_600.0 * 1.0;
+
         let ladder_funding = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
-        let ask_price_funding = ladder_funding.asks.first().map(|l| l.price).unwrap_or(0.0);
-        
+
         params.funding_rate = 0.0;
         let ladder_no_funding = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
-        let ask_price_no_funding = ladder_no_funding.asks.first().map(|l| l.price).unwrap_or(0.0);
-        
-        assert!(ask_price_funding < ask_price_no_funding, "Positive funding carry should lower ask prices to build short");
+
+        // Compare average ask prices across all levels to avoid touch-level rounding masking the effect
+        let avg_ask_funding: f64 = ladder_funding.asks.iter().map(|l| l.price).sum::<f64>()
+            / ladder_funding.asks.len().max(1) as f64;
+        let avg_ask_no_funding: f64 = ladder_no_funding.asks.iter().map(|l| l.price).sum::<f64>()
+            / ladder_no_funding.asks.len().max(1) as f64;
+
+        assert!(
+            avg_ask_funding < avg_ask_no_funding,
+            "Positive funding carry should lower ask prices to build short. avg_funding={avg_ask_funding:.4}, avg_no_funding={avg_ask_no_funding:.4}"
+        );
     }
 
     #[test]
@@ -3677,9 +3731,12 @@ mod tests {
         params.leverage = 1.0;
         params.sigma = 0.005;
         params.kappa = 2000.0;
-        
-        // Extreme bullish drift
-        params.lead_lag_signal_bps = 500.0; 
+        params.capital_policy.use_tick_grid = false; // Force non-tick-grid path for reservation mid testing
+        params.cached_best_bid = 99.95;
+        params.cached_best_ask = 100.05;
+
+        // Extreme bullish drift (reservation mid reads drift_signal_bps)
+        params.drift_signal_bps = 500.0;
         let ladder = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
         
         let bid_price = ladder.bids.first().map(|l| l.price).unwrap_or(0.0);
@@ -3688,5 +3745,48 @@ mod tests {
         // Our constraint on half_spread_bound + depth means it effectively won't cross the mid.
         // Even with huge drift, bounded reservation + depth subtraction keeps bids sane.
         assert!(bid_price <= 100.0, "Clamped reservation mid should prevent crossing the real market mid. bid: {}", bid_price);
+    }
+
+    #[test]
+    fn test_drift_above_old_skew_cap_shifts_reservation_mid() {
+        // WS6: Drift > 5 bps (old max_lead_lag_skew_bps cap) should shift reservation mid.
+        // The ±95% GLFT half-spread clamp is the only bound.
+        // Use kappa=200 so GLFT half-spread ≈ 50 bps → clamp at ±47.5 bps allows both test values through.
+        let strategy = LadderStrategy::new(0.1);
+        let config = QuoteConfig {
+            mid_price: 100.0,
+            decimals: 4,
+            sz_decimals: 2,
+            min_notional: 10.0,
+        };
+        let mut params = MarketParams::default();
+        params.microprice = 100.0;
+        params.market_mid = 100.0;
+        params.margin_available = 1000.0;
+        params.leverage = 1.0;
+        params.sigma = 0.005;
+        params.kappa = 200.0; // Wide GLFT half-spread so clamp range > 15 bps
+        params.arrival_intensity = 0.5;
+        params.capital_policy.use_tick_grid = false;
+        params.cached_best_bid = 99.90;
+        params.cached_best_ask = 100.10;
+
+        // 5 bps drift (at old cap)
+        params.drift_signal_bps = 5.0;
+        let ladder_5 = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+
+        // 15 bps drift (3x old cap — was impossible before de-capping)
+        params.drift_signal_bps = 15.0;
+        let ladder_15 = strategy.calculate_ladder(&config, 0.0, 100.0, 100.0, &params);
+
+        // Compare average bid prices across all levels
+        let avg_bid_5: f64 = ladder_5.bids.iter().map(|l| l.price).sum::<f64>()
+            / ladder_5.bids.len().max(1) as f64;
+        let avg_bid_15: f64 = ladder_15.bids.iter().map(|l| l.price).sum::<f64>()
+            / ladder_15.bids.len().max(1) as f64;
+        assert!(
+            avg_bid_15 > avg_bid_5,
+            "Drift > old 5 bps cap should shift reservation mid further. avg@5bps={avg_bid_5:.4}, avg@15bps={avg_bid_15:.4}",
+        );
     }
 }
