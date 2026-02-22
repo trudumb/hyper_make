@@ -1102,11 +1102,21 @@ impl SignalIntegrator {
             0.0
         };
 
-        // INVENTORY SKEW REMOVED: Was double-counting with GLFT's own q-term
-        // (inventory_skew_with_flow in glft.rs). The GLFT q-term is the theoretically
-        // correct source from Guéant-Lehalle-Fernandez-Tapia. Keeping variable for
-        // backward compat with logging but set to 0.
-        let inventory_skew_bps = 0.0_f64;
+        // === INVENTORY SKEW: Avellaneda-Stoikov indifference price offset ===
+        // Lean quotes away from inventory to encourage mean reversion.
+        // This is ADDITIVE to GLFT's q-term (which handles gamma*sigma^2*q*T/2),
+        // providing a faster-acting, signal-layer nudge that the GLFT vol-risk term
+        // does not cover (GLFT q-term is slow to respond because it depends on sigma and T).
+        // Gated by config.use_inventory_skew to allow disabling if double-counting is observed.
+        const MAX_INVENTORY_SKEW_BPS: f64 = 5.0; // absolute max skew from inventory alone
+        const INVENTORY_SKEW_CLAMP_BPS: f64 = 4.0; // safety clamp on output
+        let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
+            let inventory_ratio = self.position / self.max_position; // [-1, 1]
+            let raw_skew = -inventory_ratio * MAX_INVENTORY_SKEW_BPS;
+            raw_skew.clamp(-INVENTORY_SKEW_CLAMP_BPS, INVENTORY_SKEW_CLAMP_BPS)
+        } else {
+            0.0
+        };
 
         // === SIGNAL SKEW: Directional skew from alpha/trend signals ===
         // Alpha > 0.5 = bullish (lean bids), alpha < 0.5 = bearish (lean asks).
@@ -1123,8 +1133,8 @@ impl SignalIntegrator {
             0.0
         };
 
-        // Skew sources: base (cross-exchange) + cross-venue + buy pressure + signal
-        // Inventory skew deliberately excluded — handled by GLFT q-term
+        // Skew sources: base (cross-exchange) + cross-venue + buy pressure + inventory + signal
+        // Inventory skew re-enabled as fast-acting Avellaneda-Stoikov nudge (capped at 4 bps).
         let raw_skew = base_skew_bps + cross_venue_skew_bps + buy_pressure_skew_bps
             + inventory_skew_bps + signal_skew_bps;
 
@@ -2064,9 +2074,9 @@ mod tests {
         );
     }
 
-    // NOTE: test_inventory_skew_{long,short,scales} removed — inventory skew was
-    // intentionally moved from signal_integration to GLFT q-term (inventory_skew_with_flow)
-    // during the Principled Architecture Redesign (Feb 2026). See glft.rs tests.
+    // NOTE: inventory skew re-enabled as fast-acting Avellaneda-Stoikov nudge (Feb 2026).
+    // GLFT q-term still handles the gamma*sigma^2*q*T/2 component; this signal-layer skew
+    // provides faster mean-reversion that doesn't depend on sigma/T calibration.
 
     #[test]
     fn test_skew_clamped_prevents_crossing() {

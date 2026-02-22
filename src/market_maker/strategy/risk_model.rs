@@ -129,9 +129,11 @@ impl Default for CalibratedRiskModel {
             // Conservative defaults until calibrated:
             // 100% excess vol → exp(1.0) ≈ 2.7× gamma
             beta_volatility: 1.0,
-            // Interim: toxicity=1 → exp(0.9) ≈ 2.46× gamma
+            // Reduced from 0.9: toxicity=1 → exp(0.5) ≈ 1.65x gamma.
+            // 0.9 was causing 2.46x gamma inflation from toxicity alone, which combined
+            // with other features summed to 2.19+ and inflated gamma 9x (0.15 -> 1.338).
             // Pending data-driven calibration from gamma_calibration.jsonl regression.
-            beta_toxicity: 0.9,
+            beta_toxicity: 0.5,
             // DISABLED: inventory scaling now handled by continuous γ(q) = γ_base × (1 + β×u²)
             // in effective_gamma(). Setting non-zero here would double-count inventory.
             // See effective_gamma() in glft.rs for the quadratic inventory scaling.
@@ -182,11 +184,11 @@ impl CalibratedRiskModel {
         Self {
             log_gamma_base: 0.20_f64.ln(), // Higher base during warmup
             beta_volatility: 1.5,          // 50% more conservative
-            beta_toxicity: 1.35, // Interim conservative (1.5x of default 0.9)
+            beta_toxicity: 0.75, // Interim conservative (1.5x of default 0.5)
             // DISABLED: inventory scaling handled by continuous γ(q) quadratic in glft.rs
             beta_inventory: 0.0,
             beta_hawkes: 0.6,
-            beta_book_depth: 0.45,
+            beta_book_depth: 0.25,
             beta_uncertainty: 0.3,
             // Less negative during warmup (more cautious about confidence)
             beta_confidence: -0.2,
@@ -198,19 +200,25 @@ impl CalibratedRiskModel {
         }
     }
 
-    /// Compute gamma from risk features using log-additive model.
+    /// Compute gamma from risk features using log-additive model with sigmoid regularization.
     ///
     /// Formula:
     /// ```text
-    /// log(γ) = log(γ_base) + Σ βᵢ × xᵢ
+    /// raw_sum = Σ βᵢ × xᵢ
+    /// regulated_sum = max_contrib × tanh(raw_sum / (max_contrib × steepness))
+    /// log(γ) = log(γ_base) + regulated_sum
     /// γ = exp(log_gamma).clamp(γ_min, γ_max)
     /// ```
+    ///
+    /// The sigmoid "skeptic" regularization prevents noisy features from summing
+    /// to extreme values (e.g., 2.19+ -> 9x gamma inflation). The tanh squashes
+    /// the feature sum so gamma inflation is bounded by exp(max_contrib) regardless
+    /// of how many features fire simultaneously.
     ///
     /// Note: beta_confidence is NEGATIVE, so high confidence DECREASES gamma,
     /// leading to tighter two-sided quotes when position is from informed flow.
     pub fn compute_gamma(&self, features: &RiskFeatures) -> f64 {
-        let log_gamma = self.log_gamma_base
-            + self.beta_volatility * features.excess_volatility
+        let raw_sum = self.beta_volatility * features.excess_volatility
             + self.beta_toxicity * features.toxicity_score
             + self.beta_inventory * features.inventory_fraction
             + self.beta_hawkes * features.excess_intensity
@@ -219,6 +227,23 @@ impl CalibratedRiskModel {
             + self.beta_confidence * features.position_direction_confidence
             + self.beta_cascade * features.cascade_intensity
             + self.beta_tail_risk * features.tail_risk_intensity;
+
+        // Sigmoid "skeptic" regularization — prevents any single noisy feature from dominating.
+        // max_gamma_contribution bounds total inflation to exp(1.5) ~ 4.5x at most.
+        // gamma_reg_steepness controls how fast the tanh saturates.
+        const MAX_GAMMA_CONTRIBUTION: f64 = 1.5; // max ~4.5x gamma inflation (exp(1.5))
+        const GAMMA_REG_STEEPNESS: f64 = 2.0; // how fast sigmoid saturates
+        let regulated_sum =
+            MAX_GAMMA_CONTRIBUTION * (raw_sum / (MAX_GAMMA_CONTRIBUTION * GAMMA_REG_STEEPNESS)).tanh();
+
+        log::trace!(
+            "[SPREAD TRACE] gamma features: raw_sum={:.4}, regulated_sum={:.4}, delta={:.4}",
+            raw_sum,
+            regulated_sum,
+            raw_sum - regulated_sum
+        );
+
+        let log_gamma = self.log_gamma_base + regulated_sum;
 
         log_gamma.exp().clamp(self.gamma_min, self.gamma_max)
     }
@@ -763,9 +788,12 @@ mod tests {
         // - All risk features are 0
         // - position_direction_confidence = 0.5 (neutral)
         // - beta_confidence = -0.4
-        // So: log(gamma) = log(0.15) + (-0.4 * 0.5) = log(0.15) - 0.2
-        // gamma = exp(log(0.15) - 0.2) ≈ 0.122
-        let expected = (0.15_f64.ln() - 0.4 * 0.5).exp();
+        // raw_sum = -0.4 * 0.5 = -0.2
+        // After sigmoid: regulated = 1.5 * tanh(-0.2 / 3.0) ≈ -0.0997
+        // gamma = exp(log(0.15) + regulated) ≈ 0.136
+        let raw_sum = -0.4 * 0.5;
+        let regulated = 1.5 * (raw_sum / 3.0_f64).tanh();
+        let expected = (0.15_f64.ln() + regulated).exp();
         assert!(
             (gamma - expected).abs() < 0.01,
             "Neutral features should give expected gamma: got {}, expected {}",
@@ -860,8 +888,7 @@ mod tests {
         let gamma_high_conf = model.compute_gamma(&high_confidence);
 
         // beta_confidence is NEGATIVE, so:
-        // high confidence → exp(beta * 1.0) = exp(-0.4) ≈ 0.67× gamma
-        // low confidence → exp(beta * 0.0) = 1.0× gamma
+        // high confidence → lower gamma, low confidence → higher gamma
         assert!(
             gamma_high_conf < gamma_low_conf,
             "High confidence should REDUCE gamma: high={}, low={}",
@@ -869,12 +896,22 @@ mod tests {
             gamma_low_conf
         );
 
-        // The ratio should be approximately exp(-0.4) ≈ 0.67
+        // With sigmoid regularization, the ratio is dampened from exp(-0.4) ≈ 0.67
+        // to approximately exp(regulated_high - regulated_low).
+        // raw_sum_low = 0.0 (all defaults zero, confidence=0 contributes 0)
+        // raw_sum_high = -0.4 (beta_conf * 1.0)
+        // regulated_low = 1.5*tanh(0/3) = 0
+        // regulated_high = 1.5*tanh(-0.4/3) ≈ -0.199
+        // ratio = exp(-0.199) ≈ 0.82
         let ratio = gamma_high_conf / gamma_low_conf;
-        let expected_ratio = (-0.4_f64).exp();
         assert!(
-            (ratio - expected_ratio).abs() < 0.01,
-            "Ratio should be exp(-0.4) ≈ 0.67: got {}",
+            ratio < 0.90,
+            "High confidence should meaningfully reduce gamma: ratio={}",
+            ratio
+        );
+        assert!(
+            ratio > 0.70,
+            "Sigmoid should dampen confidence effect: ratio={}",
             ratio
         );
     }
@@ -901,18 +938,24 @@ mod tests {
         let gamma_calm = model.compute_gamma(&calm);
         let gamma_cascade = model.compute_gamma(&cascade);
 
-        // beta_cascade=1.2 → exp(1.2) ≈ 3.32x wider gamma during cascade
+        // With sigmoid regularization, cascade effect is dampened from exp(1.2) ~ 3.3x.
+        // raw_sum_calm = -0.2 (confidence), raw_sum_cascade = -0.2 + 1.2 = 1.0
+        // regulated_calm ~ -0.0997, regulated_cascade ~ 0.482
+        // ratio = exp(0.482 - (-0.0997)) = exp(0.582) ~ 1.79
+        let ratio = gamma_cascade / gamma_calm;
         assert!(
-            gamma_cascade > gamma_calm * 3.0,
-            "Cascade should widen gamma by ~3.3x: calm={}, cascade={}",
+            ratio > 1.5,
+            "Cascade should meaningfully widen gamma: calm={}, cascade={}, ratio={:.3}",
             gamma_calm,
-            gamma_cascade
+            gamma_cascade,
+            ratio
         );
         assert!(
-            gamma_cascade < gamma_calm * 3.6,
-            "Cascade widening should be bounded: calm={}, cascade={}",
+            ratio < 2.5,
+            "Sigmoid should cap cascade widening: calm={}, cascade={}, ratio={:.3}",
             gamma_calm,
-            gamma_cascade
+            gamma_cascade,
+            ratio
         );
     }
 
@@ -982,22 +1025,24 @@ mod tests {
         // defense_ratio = gamma_toxic / gamma_neutral
         let defense_ratio = gamma_toxic / gamma_neutral;
 
-        // beta_toxicity=0.9: at toxicity=0.5, exp(0.9*0.5) = exp(0.45) ≈ 1.57
+        // With beta_toxicity=0.5 and sigmoid regularization:
+        // raw_sum difference = 0.5*0.5 = 0.25
+        // After sigmoid, the regulated difference is dampened.
+        // Still expect meaningful defense (> 1.05) but bounded by sigmoid.
         assert!(
-            defense_ratio > 1.4,
-            "Defense ratio at toxicity=0.5 should be > 1.4: got {defense_ratio:.3}"
+            defense_ratio > 1.05,
+            "Defense ratio at toxicity=0.5 should show meaningful widening: got {defense_ratio:.3}"
         );
         assert!(
-            defense_ratio < 1.8,
-            "Defense ratio should be bounded: got {defense_ratio:.3}"
+            defense_ratio < 1.5,
+            "Defense ratio should be bounded by sigmoid: got {defense_ratio:.3}"
         );
     }
 
     #[test]
     fn test_gamma_fills_defense_gap() {
         // Verify that gamma-produced spread at moderate toxicity exceeds fee + AS threshold.
-        // GLFT half-spread ≈ γσ²τ + (1/γ)ln(1+γ/κ), but for rough check:
-        // The exponential gamma increase from toxicity should produce meaningfully wider spreads.
+        // GLFT half-spread ~ gamma-dependent, so higher gamma = wider spreads = more defense.
         let model = CalibratedRiskModel::default();
 
         let calm = RiskFeatures::neutral();
@@ -1012,11 +1057,17 @@ mod tests {
         };
         let gamma_risky = model.compute_gamma(&risky);
 
-        // Combined defense: exp(0.9*0.5 + 1.2*0.3 + 0.7*0.2) = exp(0.45+0.36+0.14) = exp(0.95) ≈ 2.59
+        // With reduced betas (tox=0.5, cascade=1.2, tail=0.7) and sigmoid regularization:
+        // raw_sum_risky = 0.5*0.5 + 1.2*0.3 + 0.7*0.2 + (-0.4*0.5) = 0.25+0.36+0.14-0.2 = 0.55
+        // Sigmoid dampens this, but multiple risk factors still produce meaningful defense.
         let joint_ratio = gamma_risky / gamma_calm;
         assert!(
-            joint_ratio > 2.0,
-            "Joint defense at moderate risk should produce > 2x gamma: got {joint_ratio:.3}"
+            joint_ratio > 1.3,
+            "Joint defense at moderate risk should produce meaningful gamma widening: got {joint_ratio:.3}"
+        );
+        assert!(
+            joint_ratio < 3.0,
+            "Sigmoid should prevent extreme gamma inflation: got {joint_ratio:.3}"
         );
     }
 

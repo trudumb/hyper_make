@@ -2557,50 +2557,112 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         // Merge both sides and allocate within budget
         let mut all_scored: Vec<_> = bid_scored.drain(..).chain(ask_scored.drain(..)).collect();
 
-        // Priority-filtered execution: when headroom is tight, drop low-value actions
-        // to preserve quota for high-value ones (new placements, large price moves).
-        // Low-value = small price moves (<5 bps) or size-only modifications with value < 1 bps.
-        if headroom_pct < 0.20 {
-            let pre_filter = all_scored.len();
-            let pre_scored = all_scored.clone();
+        // Kelly-style continuous opportunity cost (replaces binary headroom wall).
+        // Instead of a hard cutoff at headroom < 20% that causes quota paralysis
+        // (latches cost 0 API calls so headroom never recovers), we apply an
+        // exponential cost curve that lets high-value actions through at any headroom
+        // while progressively filtering low-value ones as quota tightens.
+        {
+            use crate::market_maker::tracking::ActionType;
+
+            /// Headroom above which no filtering is applied (abundant quota).
+            const QUOTA_ABUNDANCE_THRESHOLD: f64 = 0.50;
+            /// Base opportunity cost in bps at the onset of quota scarcity.
+            const QUOTA_COST_BASE_BPS: f64 = 0.1;
+            /// Steepness of exponential cost growth as headroom shrinks.
+            const QUOTA_COST_STEEPNESS: f64 = 2.0;
+            /// Cancel actions use a lower opportunity cost (cleanup is cheap to defer).
+            const CANCEL_COST_DISCOUNT: f64 = 0.5;
+
+            let api_opportunity_cost_bps = if headroom_pct > QUOTA_ABUNDANCE_THRESHOLD {
+                0.0 // abundant quota — no filtering
+            } else {
+                // Exponential cost: increases as headroom shrinks toward 0
+                QUOTA_COST_BASE_BPS * (QUOTA_COST_STEEPNESS * (1.0 - headroom_pct)).exp()
+            };
+
+            let actions_proposed = all_scored.len();
+
+            // Save pre-filter snapshot for minimum placement guarantee
+            let pre_filter_snapshot = if api_opportunity_cost_bps > 0.0 {
+                all_scored.clone()
+            } else {
+                Vec::new() // no filtering will happen, skip the clone
+            };
+
             all_scored.retain(|s| {
-                use crate::market_maker::tracking::ActionType;
-                // Always keep: latches (0 API cost), stale cancels (cleanup), new placements
-                match s.action {
-                    ActionType::Latch => true,
-                    ActionType::StaleCancel | ActionType::NewPlace => true,
-                    // Size-only mods: keep only if value > 1 bps
-                    ActionType::ModifySize => s.value_bps > 1.0,
-                    // Price moves & cancel+place: keep only if value > 0.5 bps
-                    ActionType::ModifyPrice | ActionType::CancelPlace => s.value_bps > 0.5,
+                // Always keep: latches (0 API cost) and emergency actions
+                if s.action == ActionType::Latch || s.is_emergency {
+                    return true;
                 }
+                // Always keep: stale cancels (cleanup, prevents ghost orders)
+                if s.action == ActionType::StaleCancel {
+                    return true;
+                }
+                // Cancel-type actions (CancelPlace) get a lower opportunity cost
+                // because cleaning up stale positions is higher priority than mods.
+                let effective_cost = if s.action == ActionType::CancelPlace {
+                    api_opportunity_cost_bps * CANCEL_COST_DISCOUNT
+                } else {
+                    api_opportunity_cost_bps
+                };
+                s.value_bps > effective_cost
             });
 
-            // Safety: don't let priority filter leave us with 0 active orders
-            let has_any_order = all_scored.iter().any(|s| {
-                use crate::market_maker::tracking::ActionType;
-                matches!(
-                    s.action,
-                    ActionType::Latch
-                        | ActionType::NewPlace
-                        | ActionType::ModifyPrice
-                        | ActionType::ModifySize
-                )
-            });
-            if !has_any_order && !pre_scored.is_empty() {
-                warn!(
-                    "[Unified] Priority filter would leave book empty — restoring all actions"
-                );
-                all_scored = pre_scored;
+            // Minimum placement guarantee: ensure at least 1 CancelPlace/ModifyPrice/NewPlace
+            // action per side survives filtering, regardless of opportunity cost.
+            // Without this, both sides can lose all placement actions simultaneously.
+            if !pre_filter_snapshot.is_empty() {
+                for side in [Side::Buy, Side::Sell] {
+                    let has_placement = all_scored.iter().any(|s| {
+                        s.side == side
+                            && matches!(
+                                s.action,
+                                ActionType::NewPlace
+                                    | ActionType::CancelPlace
+                                    | ActionType::ModifyPrice
+                            )
+                    });
+                    if !has_placement {
+                        // Add back the highest-value placement action for this side
+                        if let Some(best) = pre_filter_snapshot
+                            .iter()
+                            .filter(|s| {
+                                s.side == side
+                                    && matches!(
+                                        s.action,
+                                        ActionType::NewPlace
+                                            | ActionType::CancelPlace
+                                            | ActionType::ModifyPrice
+                                    )
+                            })
+                            .max_by(|a, b| {
+                                a.value_bps
+                                    .partial_cmp(&b.value_bps)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                        {
+                            all_scored.push(best.clone());
+                        }
+                    }
+                }
             }
 
-            let filtered = pre_filter - all_scored.len();
-            if filtered > 0 {
-                info!(
-                    filtered_count = filtered,
-                    remaining = all_scored.len(),
+            let actions_after_filter = all_scored.len();
+            // Don't count Latch actions toward remaining action budget — they cost 0 API calls
+            let non_latch_actions = all_scored
+                .iter()
+                .filter(|s| s.action != ActionType::Latch)
+                .count();
+
+            if actions_proposed != actions_after_filter {
+                debug!(
+                    actions_proposed,
+                    actions_after_filter,
+                    non_latch_actions,
+                    api_opportunity_cost_bps = %format!("{:.3}", api_opportunity_cost_bps),
                     headroom_pct = %format!("{:.1}%", headroom_pct * 100.0),
-                    "[Unified] Priority-filtered low-value actions under quota pressure"
+                    "[Unified] Kelly-style opportunity cost filter"
                 );
             }
         }

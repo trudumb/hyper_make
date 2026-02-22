@@ -2048,6 +2048,48 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         }
         self.effective_target_liquidity = new_effective_liquidity;
 
+        // === TARGET LIQUIDITY FLOOR ===
+        // Prevent target_liquidity from collapsing below a viable level.
+        // Without this floor, combined_size_mult (risk * warmup) can drive
+        // target_liquidity from config 6.73 down to 0.75, starving the ladder.
+        {
+            /// Never drop below this fraction of the user's configured target.
+            const TARGET_LIQUIDITY_MIN_FRACTION: f64 = 0.3;
+            /// Absolute minimum: at least this many levels worth of min-viable orders.
+            const TARGET_LIQUIDITY_MIN_LEVELS: f64 = 4.0;
+            /// Inventory ratio above which reducing side gets full config liquidity.
+            const INVENTORY_RATIO_LIQUIDITY_BOOST: f64 = 0.5;
+
+            let config_target = self.config.target_liquidity;
+            let liquidity_floor = (config_target * TARGET_LIQUIDITY_MIN_FRACTION)
+                .max(min_viable_liquidity * TARGET_LIQUIDITY_MIN_LEVELS);
+            let pre_floor = self.effective_target_liquidity;
+            self.effective_target_liquidity = self.effective_target_liquidity.max(liquidity_floor);
+
+            // Reducing-side liquidity guarantee: when inventory is high (>50% of max),
+            // the system MUST have enough liquidity to unwind. The reducing side
+            // (asks when long, bids when short) needs at least config_target worth
+            // of liquidity to provide meaningful exit depth.
+            let current_pos = self.position.position();
+            let max_pos = self.effective_max_position.max(0.01);
+            let inventory_ratio = current_pos.abs() / max_pos;
+            if inventory_ratio > INVENTORY_RATIO_LIQUIDITY_BOOST {
+                self.effective_target_liquidity =
+                    self.effective_target_liquidity.max(config_target);
+            }
+
+            if self.effective_target_liquidity > pre_floor + 0.001 {
+                debug!(
+                    pre_floor = %format!("{:.6}", pre_floor),
+                    post_floor = %format!("{:.6}", self.effective_target_liquidity),
+                    config_target = %format!("{:.6}", config_target),
+                    liquidity_floor = %format!("{:.6}", liquidity_floor),
+                    inventory_ratio = %format!("{:.3}", inventory_ratio),
+                    "Target liquidity floor applied"
+                );
+            }
+        }
+
         // Log adaptive system status if enabled
         if self.stochastic.stochastic_config.use_adaptive_spreads {
             let adaptive = &self.stochastic.adaptive_spreads;
