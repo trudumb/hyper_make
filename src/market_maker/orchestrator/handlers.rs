@@ -1179,6 +1179,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     realized_edge_bps,
                     timestamp_ms,
                     order_id: Some(fill.oid),
+                    quoted_size: fill_size, // Best available; exact quoted size not tracked here
                 });
 
                 // === Phase 8: RL Agent Learning Update ===

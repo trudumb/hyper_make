@@ -804,6 +804,9 @@ impl ParameterAggregator {
             as_ratio_adjustment: 1.0,
             as_floor_variance_bps2: 0.0,
             profile_spread_floor_bps: 0.0,
+            // Bayesian Fair Value Model
+            fv_cascade_score: 0.0,
+            fv_confidence: 0.0,
         }
     }
 }

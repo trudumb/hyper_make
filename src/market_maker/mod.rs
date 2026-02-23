@@ -932,6 +932,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             calibration_coordinator: self.calibration_coordinator.clone(),
             kappa_orchestrator: kappa_orchestrator_cp,
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         }
     }
 

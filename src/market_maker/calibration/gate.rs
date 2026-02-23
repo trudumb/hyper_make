@@ -481,6 +481,7 @@ mod tests {
             calibration_coordinator: crate::market_maker::checkpoint::types::CalibrationCoordinatorCheckpoint::default(),
             kappa_orchestrator: crate::market_maker::checkpoint::types::KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         }
     }
 

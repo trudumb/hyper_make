@@ -1088,6 +1088,14 @@ pub struct MarketParams {
     // REMOVED: staleness_addon_bid/ask_bps — WS5 latency-aware mid handles price displacement.
     // REMOVED: flow_toxicity_addon_bid/ask_bps — β_toxicity in CalibratedRiskModel handles
     //   informed flow through γ. Higher toxicity → higher γ → wider spreads automatically.
+
+    // ==================== Bayesian Fair Value Model ====================
+    /// Cascade z-score from Bayesian fair value posterior drift rate.
+    /// High values (> 2.5) indicate a sweep cascade detected via posterior shift velocity.
+    pub fv_cascade_score: f64,
+    /// Fair value model confidence [0, 1] based on fill count and posterior tightness.
+    /// Used for blending posterior mean into microprice.
+    pub fv_confidence: f64,
 }
 
 impl Default for MarketParams {
@@ -1398,6 +1406,9 @@ impl Default for MarketParams {
             vol_term_structure_ratio: 1.0,
             as_ratio_adjustment: 1.0,
 
+            // Bayesian Fair Value Model
+            fv_cascade_score: 0.0,
+            fv_confidence: 0.0,
         }
     }
 }

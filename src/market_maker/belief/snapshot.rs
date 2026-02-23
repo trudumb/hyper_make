@@ -15,6 +15,7 @@
 //! - **EdgeBeliefs**: Expected trading edge
 //! - **CalibrationState**: Model quality metrics
 
+use super::bayesian_fair_value::FairValueBeliefs;
 use super::Regime;
 
 /// Complete snapshot of all belief state.
@@ -51,6 +52,11 @@ pub struct BeliefSnapshot {
     // === Cross-Venue (Bivariate Flow Model) ===
     /// Cross-venue beliefs from joint Binance + Hyperliquid analysis
     pub cross_venue: CrossVenueBeliefs,
+
+    // === Fair Value (Bayesian Kalman Filter) ===
+    /// Bayesian posterior over latent fair value offset from mid.
+    /// Fills, book state, and trade flow are observations that update this posterior.
+    pub fair_value: FairValueBeliefs,
 
     // === Calibration ===
     /// Model calibration metrics

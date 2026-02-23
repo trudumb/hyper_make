@@ -74,11 +74,15 @@
 //! - `estimator::RegimeHMM` - Still provides regime probabilities (forwarded here)
 //! - `control::changepoint` - Still provides BOCD (forwarded here)
 
+pub mod bayesian_fair_value;
 mod central;
 mod messages;
 mod publisher;
 mod snapshot;
 
+pub use bayesian_fair_value::{
+    BayesianFairValue, BayesianFairValueCheckpoint, BayesianFairValueConfig, FairValueBeliefs,
+};
 pub use central::{CentralBeliefConfig, CentralBeliefState};
 pub use messages::{BeliefUpdate, PredictionLog, PredictionType};
 pub use publisher::{BeliefPublisher, PublishError, PublisherHandle};

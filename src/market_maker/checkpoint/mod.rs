@@ -248,6 +248,7 @@ mod tests {
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         }
     }
 

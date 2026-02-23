@@ -60,6 +60,9 @@ pub enum BeliefUpdate {
         timestamp_ms: u64,
         /// Order ID for linking predictions
         order_id: Option<u64>,
+        /// Size we had quoted at this level (for fill-size scaling).
+        /// Defaults to fill size if unknown.
+        quoted_size: f64,
     },
 
     /// Market trade observation (for robust kappa estimation).
@@ -215,6 +218,20 @@ pub enum BeliefUpdate {
         timestamp_ms: u64,
     },
 
+    /// Trade flow imbalance update from TradeFlowTracker.
+    ///
+    /// Published by: Quote engine (after TradeFlowTracker updates)
+    FlowUpdate {
+        /// 1-second EWMA trade flow imbalance [-1, 1]
+        imbalance_1s: f64,
+        /// 5-second EWMA trade flow imbalance [-1, 1]
+        imbalance_5s: f64,
+        /// 30-second EWMA trade flow imbalance [-1, 1]
+        imbalance_30s: f64,
+        /// Timestamp (epoch ms)
+        timestamp_ms: u64,
+    },
+
     // =========================================================================
     // Control
     // =========================================================================
@@ -361,6 +378,7 @@ mod tests {
             realized_edge_bps: 2.0,
             timestamp_ms: 12345,
             order_id: Some(42),
+            quoted_size: 1.0,
         };
 
         let _regime_update = BeliefUpdate::RegimeUpdate {

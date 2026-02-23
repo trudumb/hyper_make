@@ -153,6 +153,10 @@ pub struct CheckpointBundle {
     /// 0.0 = cold-start, 1.0 = fully calibrated and fresh.
     #[serde(default)]
     pub prior_confidence: f64,
+    /// Bayesian fair value model learned parameters (α_book, β_flow, σ_noise).
+    /// Posterior state (μ, σ²) is NOT persisted — it resets relative to current mid.
+    #[serde(default)]
+    pub bayesian_fair_value: crate::market_maker::belief::BayesianFairValueCheckpoint,
 }
 
 /// Checkpoint metadata for versioning and diagnostics.
@@ -792,6 +796,7 @@ mod tests {
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         };
 
         // Serialize to JSON
@@ -882,6 +887,7 @@ mod tests {
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         };
 
         // Serialize to JSON
@@ -936,6 +942,7 @@ mod tests {
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -977,6 +984,7 @@ mod tests {
             calibration_coordinator: CalibrationCoordinatorCheckpoint::default(),
             kappa_orchestrator: KappaOrchestratorCheckpoint::default(),
             prior_confidence: 0.0,
+            bayesian_fair_value: Default::default(),
         };
         let json = serde_json::to_string(&bundle).expect("serialize");
         let mut map: serde_json::Value = serde_json::from_str(&json).expect("parse");

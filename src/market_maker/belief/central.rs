@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Instant;
 
+use super::bayesian_fair_value::{BayesianFairValue, BayesianFairValueConfig, FairValueBeliefs};
 use super::messages::{BeliefUpdate, PredictionLog, PredictionType};
 use super::snapshot::{
     BeliefSnapshot, BeliefStats, CalibrationMetrics, CalibrationState, ChangepointBeliefs,
@@ -81,6 +82,11 @@ pub struct CentralBeliefConfig {
     // === EWMA ===
     /// EWMA smoothing factor for kappa (0.9 = 90% previous, 10% new)
     pub kappa_ewma_alpha: f64,
+
+    // === Bayesian Fair Value ===
+    /// Configuration for the Bayesian fair value model.
+    /// Set to None to disable the model entirely.
+    pub bayesian_fv_config: Option<BayesianFairValueConfig>,
 }
 
 impl Default for CentralBeliefConfig {
@@ -96,6 +102,7 @@ impl Default for CentralBeliefConfig {
             changepoint_hazard: 1.0 / 250.0,
             changepoint_threshold: 0.7,
             kappa_ewma_alpha: 0.9,
+            bayesian_fv_config: Some(BayesianFairValueConfig::default()),
         }
     }
 }
@@ -108,6 +115,7 @@ impl CentralBeliefConfig {
             kappa_prior_strength: 15.0,
             min_fills: 3,
             changepoint_hazard: 1.0 / 150.0, // More sensitive
+            bayesian_fv_config: Some(BayesianFairValueConfig::default()),
             ..Default::default()
         }
     }
@@ -118,6 +126,7 @@ impl CentralBeliefConfig {
             kappa_prior: 2500.0,
             kappa_prior_strength: 5.0,
             min_observation_time: 30.0,
+            bayesian_fv_config: Some(BayesianFairValueConfig::default()),
             ..Default::default()
         }
     }
@@ -125,6 +134,11 @@ impl CentralBeliefConfig {
 
 /// Internal state (mutable, protected by RwLock).
 struct InternalState {
+    // === Bayesian Fair Value ===
+    bayesian_fv: Option<BayesianFairValue>,
+    /// Latest mid price for Bayesian FV flow updates (BookUpdate/PriceReturn set this).
+    last_mid_for_fv: f64,
+
     // === Drift/Volatility ===
     drift_sum: f64,
     drift_sum_sq: f64,
@@ -269,6 +283,10 @@ impl Default for InternalState {
         }
 
         Self {
+            // Bayesian fair value (lazy-init from config)
+            bayesian_fv: None,
+            last_mid_for_fv: 0.0,
+
             // Drift/vol
             drift_sum: 0.0,
             drift_sum_sq: 0.0,
@@ -406,7 +424,13 @@ struct CrossVenueParams {
 impl CentralBeliefState {
     /// Create a new centralized belief state.
     pub fn new(config: CentralBeliefConfig) -> Self {
+        let bayesian_fv = config
+            .bayesian_fv_config
+            .as_ref()
+            .map(|fv_config| BayesianFairValue::new(fv_config.clone()));
+
         let state = InternalState {
+            bayesian_fv,
             kappa_smoothed: config.kappa_prior,
             own_kappa_alpha: config.kappa_prior_strength,
             own_kappa_beta: config.kappa_prior_strength / config.kappa_prior,
@@ -477,14 +501,15 @@ impl CentralBeliefState {
 
             BeliefUpdate::OwnFill {
                 price,
-                size: _,
+                size,
                 mid,
+                is_buy,
                 is_aligned,
                 realized_as_bps,
                 realized_edge_bps,
                 timestamp_ms,
                 order_id,
-                ..
+                quoted_size,
             } => {
                 let fill = OwnFillParams {
                     price,
@@ -496,6 +521,12 @@ impl CentralBeliefState {
                     order_id,
                 };
                 self.process_own_fill(state, &fill);
+
+                // Update Bayesian fair value model
+                if let Some(ref mut fv) = state.bayesian_fv {
+                    let vpin = state.vpin;
+                    fv.update_on_fill(price, size, quoted_size, is_buy, mid, vpin);
+                }
             }
 
             BeliefUpdate::MarketTrade {
@@ -507,13 +538,35 @@ impl CentralBeliefState {
             }
 
             BeliefUpdate::BookUpdate {
-                bids: _,
-                asks: _,
-                mid: _,
+                bids,
+                asks,
+                mid,
                 timestamp_ms: _,
             } => {
-                // Book kappa updates would go here
-                // For now, handled externally by KappaOrchestrator
+                // Book kappa updates handled externally by KappaOrchestrator.
+                // Bayesian fair value uses L2 imbalance.
+                // Track mid for FV flow updates and predict step
+                state.last_mid_for_fv = mid;
+                if let Some(ref mut fv) = state.bayesian_fv {
+                    let bid_depth: f64 = bids.iter().map(|(_, s)| s).sum();
+                    let ask_depth: f64 = asks.iter().map(|(_, s)| s).sum();
+                    let total = bid_depth + ask_depth;
+                    if total > 0.0 {
+                        let imbalance = (bid_depth - ask_depth) / total;
+                        fv.update_on_book(imbalance, mid);
+                    }
+                }
+            }
+
+            BeliefUpdate::FlowUpdate {
+                imbalance_1s,
+                imbalance_5s,
+                imbalance_30s,
+                timestamp_ms: _,
+            } => {
+                if let Some(ref mut fv) = state.bayesian_fv {
+                    fv.update_on_flow(imbalance_1s, imbalance_5s, imbalance_30s, state.last_mid_for_fv);
+                }
             }
 
             BeliefUpdate::RegimeUpdate { probs, features: _ } => {
@@ -647,6 +700,17 @@ impl CentralBeliefState {
         state.n_price_obs += 1;
         state.total_time += dt_secs;
         state.last_update_ms = timestamp_ms;
+
+        // Update Bayesian fair value model: predict step (variance grows, mean reverts)
+        if let Some(ref mut fv) = state.bayesian_fv {
+            // Derive new mid from return: mid_new = mid_old × (1 + return_frac)
+            // If last_mid_for_fv is not yet set (0.0), initialize from a reasonable default
+            if state.last_mid_for_fv > 0.0 {
+                let new_mid = state.last_mid_for_fv * (1.0 + return_frac);
+                fv.predict(new_mid, dt_secs, timestamp_ms);
+                state.last_mid_for_fv = new_mid;
+            }
+        }
 
         // Apply decay periodically
         if state.n_price_obs.is_multiple_of(1000) {
@@ -913,6 +977,7 @@ impl CentralBeliefState {
             microstructure: self.build_microstructure_beliefs(state),
             cross_venue: self.build_cross_venue_beliefs(state),
             calibration: self.build_calibration_state(state),
+            fair_value: self.build_fair_value_beliefs(state),
             stats: BeliefStats {
                 n_price_obs: state.n_price_obs,
                 n_fills: state.n_fills,
@@ -1351,6 +1416,13 @@ impl CentralBeliefState {
         }
     }
 
+    fn build_fair_value_beliefs(&self, state: &InternalState) -> FairValueBeliefs {
+        match &state.bayesian_fv {
+            Some(fv) => fv.beliefs(),
+            None => FairValueBeliefs::default(),
+        }
+    }
+
     fn compute_warmup_progress(&self, state: &InternalState) -> f64 {
         let price_progress =
             (state.n_price_obs as f64 / self.config.min_price_obs as f64).min(1.0);
@@ -1431,6 +1503,7 @@ mod tests {
                 realized_edge_bps: 2.0,
                 timestamp_ms: i * 1000,
                 order_id: Some(i),
+                quoted_size: 1.0,
             });
         }
 
@@ -1509,6 +1582,7 @@ mod tests {
                 realized_edge_bps: 2.0,
                 timestamp_ms: i * 1000,
                 order_id: Some(i),
+                quoted_size: 1.0,
             });
         }
 

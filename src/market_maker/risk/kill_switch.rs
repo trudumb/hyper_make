@@ -1259,6 +1259,7 @@ impl KillSwitch {
             .trigger_reasons
             .iter()
             .filter(|r| !r.contains("Position runaway"))
+            .filter(|r| !is_transient_reason(r))
             .filter(|r| same_day || !is_daily_scoped_reason(r))
             .collect();
 
@@ -1294,6 +1295,15 @@ fn is_same_utc_day(ts1_ms: u64, ts2_ms: u64) -> bool {
 /// These reasons should not survive across trading day boundaries.
 fn is_daily_scoped_reason(reason: &str) -> bool {
     reason.contains("daily loss") || reason.contains("drawdown")
+}
+
+/// Returns true if the kill reason is transient/environmental — conditions that are
+/// re-evaluated in real-time on each startup and should not persist across restarts.
+fn is_transient_reason(reason: &str) -> bool {
+    reason.contains("Stale data")
+        || reason.contains("stale data")
+        || reason.contains("Rate limit")
+        || reason.contains("Cascade")
 }
 
 #[cfg(test)]
@@ -2031,6 +2041,81 @@ mod tests {
         assert!(!is_daily_scoped_reason(
             "Liquidation cascade detected: severity 3.00"
         ));
+    }
+
+    #[test]
+    fn test_is_transient_reason() {
+        assert!(is_transient_reason(
+            "Stale data: no update for 51.9s > 30.0s threshold"
+        ));
+        assert!(is_transient_reason("Rate limit errors: 5 > 2 max"));
+        assert!(is_transient_reason("Cascade detected: OI drop 15%"));
+        // Non-transient reasons
+        assert!(!is_transient_reason("Manual shutdown: test"));
+        assert!(!is_transient_reason(
+            "Max daily loss exceeded: $5.02 > $5.00"
+        ));
+    }
+
+    #[test]
+    fn test_stale_data_trigger_not_restored_from_checkpoint() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec![
+                "Stale data: no update for 51.9s > 30.0s threshold".to_string(),
+            ],
+            daily_pnl: -2.0,
+            peak_pnl: 10.0,
+            triggered_at_ms: now_ms - 60_000, // 1 minute ago (within 24h)
+            saved_at_ms: now_ms - 60_000,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Stale data is transient — should NOT re-trigger
+        assert!(!ks.is_triggered());
+    }
+
+    #[test]
+    fn test_mixed_transient_and_persistent_reasons_from_checkpoint() {
+        let ks = KillSwitch::new(KillSwitchConfig::default());
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let checkpoint = KillSwitchCheckpoint {
+            triggered: true,
+            trigger_reasons: vec![
+                "Stale data: no update for 51.9s > 30.0s threshold".to_string(),
+                "Manual shutdown: user requested".to_string(),
+            ],
+            daily_pnl: -2.0,
+            peak_pnl: 10.0,
+            triggered_at_ms: now_ms - 60_000,
+            saved_at_ms: now_ms - 60_000,
+            position_stuck_cycles: 0,
+            unrealized_as_cost_usd: 0.0,
+        };
+
+        ks.restore_from_checkpoint(&checkpoint);
+
+        // Manual shutdown is persistent — should still trigger
+        assert!(ks.is_triggered());
+        let reasons = ks.trigger_reasons();
+        // Only the persistent reason survives
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].to_string().contains("Manual shutdown"));
     }
 
     // === Liquidation self-detection tests ===
