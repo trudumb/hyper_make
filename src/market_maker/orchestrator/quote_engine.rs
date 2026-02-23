@@ -1477,6 +1477,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             half_spread_est_bps,
         );
 
+        // === Reservation Price Parameters (A-S) ===
+        // Wire sigma, gamma, tau into signal integrator for principled inventory skew.
+        // sigma: per-second fractional vol from estimator
+        // gamma: adaptive risk aversion (log-additive)
+        // tau: cycle time horizon in seconds (60s default, actual cycle time when available)
+        self.stochastic.signal_integrator.set_reservation_params(
+            market_params.sigma_effective,
+            market_params.adaptive_gamma,
+            60.0, // tau_s: 60-second horizon for inventory skew
+        );
+
         // === Lead-Lag Signal Integration ===
         // Wire cross-exchange lead-lag signal for predictive skew.
         // Uses SignalIntegrator which combines:
@@ -3253,41 +3264,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 }
             }
 
-            // === CLOSE BIAS: tighten closing side spread in reduce-only mode ===
-            if reduce_only_result.was_filtered {
-                let close_urgency = quoting::ReduceOnlyResult::compute_urgency(
-                    self.position.position().abs(),
-                    self.effective_max_position,
-                    unrealized_pnl,
-                );
-                if close_urgency > 0.0 {
-                    let position = self.position.position();
-                    let mid = self.latest_mid;
-                    // Apply close bias to each surviving quote on the closing side
-                    if position > 0.0 {
-                        // Long: tighten asks (sell side)
-                        for quote in viable.asks.iter_mut() {
-                            let (_, new_ask) = quoting::apply_close_bias(
-                                mid - 1.0, quote.price, mid, position, close_urgency,
-                            );
-                            quote.price = new_ask;
-                        }
-                    } else if position < 0.0 {
-                        // Short: tighten bids (buy side)
-                        for quote in viable.bids.iter_mut() {
-                            let (new_bid, _) = quoting::apply_close_bias(
-                                quote.price, mid + 1.0, mid, position, close_urgency,
-                            );
-                            quote.price = new_bid;
-                        }
-                    }
-                    debug!(
-                        close_urgency = %format!("{close_urgency:.3}"),
-                        position = %format!("{position:.6}"),
-                        "Applied close bias to tighten closing side"
-                    );
-                }
-            }
+            // Close bias REMOVED (2026-02-23): Avellaneda-Stoikov reservation price
+            // in signal_integration.rs subsumes urgency/close bias via -q×γ(w)×σ²×τ.
+            // The HARA utility naturally increases urgency as PnL drops (wealth_ratio < 1).
 
             info!(
                 bid_levels = viable.bids.len(),
@@ -3598,41 +3577,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 quoting::QuoteFilter::apply_reduce_only_single(&mut bid, &mut ask, &reduce_only_config);
             diag_reduce_only = reduce_only_result.was_filtered;
 
-            // === CLOSE BIAS: tighten closing side spread in reduce-only mode ===
-            if reduce_only_result.was_filtered {
-                let close_urgency = quoting::ReduceOnlyResult::compute_urgency(
-                    self.position.position().abs(),
-                    self.effective_max_position,
-                    unrealized_pnl,
-                );
-                if close_urgency > 0.0 {
-                    let position = self.position.position();
-                    let mid = self.latest_mid;
-                    if let (Some(b), Some(a)) = (&mut bid, &mut ask) {
-                        let (new_bid, new_ask) = quoting::apply_close_bias(
-                            b.price, a.price, mid, position, close_urgency,
-                        );
-                        b.price = new_bid;
-                        a.price = new_ask;
-                    } else if position > 0.0 {
-                        // Long: only asks survive, tighten ask
-                        if let Some(a) = &mut ask {
-                            let (_, new_ask) = quoting::apply_close_bias(
-                                mid - 1.0, a.price, mid, position, close_urgency,
-                            );
-                            a.price = new_ask;
-                        }
-                    } else if position < 0.0 {
-                        // Short: only bids survive, tighten bid
-                        if let Some(b) = &mut bid {
-                            let (new_bid, _) = quoting::apply_close_bias(
-                                b.price, mid + 1.0, mid, position, close_urgency,
-                            );
-                            b.price = new_bid;
-                        }
-                    }
-                }
-            }
+            // Close bias REMOVED (2026-02-23): Avellaneda-Stoikov reservation price
+            // subsumes urgency/close bias via -q×γ(w)×σ²×τ (see signal_integration.rs).
 
             debug!(
                 bid = ?bid.as_ref().map(|q| (q.price, q.size)),

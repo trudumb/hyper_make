@@ -116,6 +116,47 @@ pub fn reducing_threshold_bps(
     -fee_bps * gamma_ratio * q_ratio.powf(1.5)
 }
 
+/// Avellaneda-Stoikov reservation price shift with HARA utility.
+///
+/// Computes the optimal shift from mid price for a risk-averse market maker
+/// with inventory `position`. The shift is negative when long (sell pressure)
+/// and positive when short (buy pressure).
+///
+/// HARA extension: dynamic gamma increases as wealth drops, producing
+/// more aggressive inventory reduction when underwater.
+///
+/// # Arguments
+/// * `position` - Signed inventory (+ = long, - = short), in asset units
+/// * `sigma` - Volatility (per-second, fractional — NOT bps, NOT annualized)
+/// * `tau_s` - Time horizon in seconds
+/// * `gamma_base` - Base risk aversion coefficient
+/// * `unrealized_pnl` - Current unrealized P&L ($)
+/// * `capital` - Total capital ($)
+///
+/// # Returns
+/// Shift from mid in **fractional** price units (multiply by 10000 for bps).
+pub fn reservation_price_shift(
+    position: f64,
+    sigma: f64,
+    tau_s: f64,
+    gamma_base: f64,
+    unrealized_pnl: f64,
+    capital: f64,
+) -> f64 {
+    // HARA dynamic gamma: risk aversion increases as wealth drops
+    // γ(w) = γ_base / (w/w₀) where w = capital + unrealized_pnl
+    let wealth_ratio = if capital > 1e-9 {
+        ((capital + unrealized_pnl) / capital).max(0.1)
+    } else {
+        1.0
+    };
+    let dynamic_gamma = gamma_base / wealth_ratio;
+
+    // Avellaneda-Stoikov optimal shift: r(s,q) = s - q × γ × σ² × τ
+    // Returns the SHIFT only (negative = below mid when long)
+    -position * dynamic_gamma * sigma * sigma * tau_s
+}
+
 /// Legacy thin wrapper around enhanced E[PnL] for backward compatibility.
 #[allow(clippy::too_many_arguments)]
 pub fn expected_pnl_bps(

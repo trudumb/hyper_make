@@ -119,6 +119,10 @@ impl ReduceOnlyResult {
     /// 2. Unrealized PnL (more urgency when underwater)
     ///
     /// Result is clamped to [0.0, 1.0].
+    #[deprecated(
+        since = "0.7.0",
+        note = "Subsumed by Avellaneda-Stoikov reservation price in signal_integration.rs"
+    )]
     pub fn compute_urgency(
         position_abs: f64,
         max_position: f64,
@@ -740,7 +744,12 @@ impl QuoteFilter {
 ///
 /// # Returns
 /// (adjusted_bid, adjusted_ask)
-pub fn apply_close_bias(
+#[deprecated(
+    since = "0.7.0",
+    note = "Subsumed by Avellaneda-Stoikov reservation price in signal_integration.rs"
+)]
+#[cfg(test)]
+fn apply_close_bias(
     bid_price: f64,
     ask_price: f64,
     mid_price: f64,

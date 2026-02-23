@@ -592,6 +592,14 @@ pub struct SignalIntegrator {
     /// Whether we've logged the initial signal availability state.
     logged_signal_state: Cell<bool>,
 
+    // === A-S Reservation Price Parameters (set each cycle) ===
+    /// Per-second fractional volatility for A-S inventory skew.
+    as_sigma: f64,
+    /// Risk aversion coefficient for A-S inventory skew.
+    as_gamma: f64,
+    /// Time horizon in seconds for A-S inventory skew.
+    as_tau_s: f64,
+
     // === CUSUM Predictive Lead-Lag (Phase 5) ===
     /// CUSUM changepoint detector for rapid divergence detection.
     cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector,
@@ -638,6 +646,10 @@ impl SignalIntegrator {
             logged_signal_state: Cell::new(false),
             cusum_detector: crate::market_maker::estimator::lag_analysis::CusumDetector::default(),
             cusum_divergence_bps: 0.0,
+            // A-S reservation price defaults
+            as_sigma: 0.0002, // 2 bps/sec default
+            as_gamma: 1.0,
+            as_tau_s: 60.0,   // 1 minute default
         }
     }
 
@@ -828,8 +840,8 @@ impl SignalIntegrator {
     /// Update inventory and signal context for skew computation.
     ///
     /// Must be called each quote cycle before `get_signals()` to provide
-    /// position, max_position, predicted_alpha, and half-spread estimate.
-    /// These drive inventory-based and signal-based directional skew.
+    /// position, max_position, predicted_alpha, half-spread estimate,
+    /// and A-S reservation price parameters (sigma, gamma, tau).
     pub fn set_skew_context(
         &mut self,
         position: f64,
@@ -841,6 +853,16 @@ impl SignalIntegrator {
         self.max_position = max_position;
         self.predicted_alpha = predicted_alpha;
         self.half_spread_estimate_bps = half_spread_estimate_bps;
+    }
+
+    /// Set Avellaneda-Stoikov reservation price parameters for inventory skew.
+    ///
+    /// These feed the A-S formula: shift = -q × γ × σ² × τ, replacing
+    /// the old hardcoded ±5 bps linear inventory skew.
+    pub fn set_reservation_params(&mut self, sigma: f64, gamma: f64, tau_s: f64) {
+        self.as_sigma = sigma;
+        self.as_gamma = gamma;
+        self.as_tau_s = tau_s;
     }
 
     /// Update buy pressure tracker with a trade observation.
@@ -1102,18 +1124,19 @@ impl SignalIntegrator {
             0.0
         };
 
-        // === INVENTORY SKEW: Avellaneda-Stoikov indifference price offset ===
-        // Lean quotes away from inventory to encourage mean reversion.
-        // This is ADDITIVE to GLFT's q-term (which handles gamma*sigma^2*q*T/2),
-        // providing a faster-acting, signal-layer nudge that the GLFT vol-risk term
-        // does not cover (GLFT q-term is slow to respond because it depends on sigma and T).
-        // Gated by config.use_inventory_skew to allow disabling if double-counting is observed.
-        const MAX_INVENTORY_SKEW_BPS: f64 = 5.0; // absolute max skew from inventory alone
-        const INVENTORY_SKEW_CLAMP_BPS: f64 = 4.0; // safety clamp on output
+        // === INVENTORY SKEW: Avellaneda-Stoikov reservation price shift ===
+        // A-S formula: shift = -q × γ × σ² × τ (in fractional price units)
+        // Replaces the old hardcoded ±5 bps linear inventory skew with the
+        // theoretically-grounded A-S reservation price offset.
+        // The formula self-limits via gamma, sigma, and tau — no arbitrary cap needed.
+        // Safety clamp retained as defense-first hard limit.
         let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
-            let inventory_ratio = self.position / self.max_position; // [-1, 1]
-            let raw_skew = -inventory_ratio * MAX_INVENTORY_SKEW_BPS;
-            raw_skew.clamp(-INVENTORY_SKEW_CLAMP_BPS, INVENTORY_SKEW_CLAMP_BPS)
+            let shift_frac = -self.position * self.as_gamma
+                * self.as_sigma * self.as_sigma * self.as_tau_s;
+            let shift_bps = shift_frac * 10_000.0;
+            // Safety clamp: prevents crossing even in extreme parameter regimes
+            let max_skew_bps = self.config.max_lead_lag_skew_bps * 2.0;
+            shift_bps.clamp(-max_skew_bps, max_skew_bps)
         } else {
             0.0
         };

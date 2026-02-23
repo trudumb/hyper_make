@@ -651,6 +651,18 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     timestamp_ms,
                 };
                 self.stochastic.signal_integrator.on_trade(&features);
+
+                // === WS4: Wire InformedFlow EM → AS estimator alpha calibration ===
+                // After each trade, if the EM decomposition has sufficient confidence,
+                // calibrate the AS estimator's P(informed) using the flow model's estimate.
+                // This replaces hardcoded alpha weights (0.3, 0.4, 0.3) with empirical values.
+                let flow_decomp = self.stochastic.signal_integrator.flow_decomposition();
+                if flow_decomp.confidence > 0.25 {
+                    self.tier1.adverse_selection.calibrate_alpha_from_flow(
+                        flow_decomp.p_informed,
+                        flow_decomp.confidence,
+                    );
+                }
             }
 
             if let Some(_vpin_value) = self.stochastic.vpin.on_trade(size, trade_price, self.latest_mid, timestamp_ms) {

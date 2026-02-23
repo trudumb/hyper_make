@@ -60,11 +60,6 @@ pub struct AdverseSelectionConfig {
     /// Default: 1000
     pub max_pending_fills: usize,
 
-    /// Spread adjustment multiplier (how much to widen based on AS)
-    /// spread_adjustment = multiplier × realized_as
-    /// Default: 2.0 (widen by 2x the AS cost)
-    pub spread_adjustment_multiplier: f64,
-
     /// Maximum spread adjustment (as fraction of mid price)
     /// Default: 0.005 (0.5%)
     pub max_spread_adjustment: f64,
@@ -93,7 +88,6 @@ impl Default for AdverseSelectionConfig {
             // Increased from 1000 to handle 10-minute tracking window.
             // At ~2 fills/sec peak, 10 min = ~1200 fills. Use 5000 for safety margin.
             max_pending_fills: 5000,
-            spread_adjustment_multiplier: 2.0,
             max_spread_adjustment: 0.005,
             min_spread_adjustment: 0.0,
             // Alpha prediction weights (simple linear combination)

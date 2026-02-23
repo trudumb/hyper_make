@@ -14,7 +14,7 @@ pub mod viable;
 
 pub use exchange_rules::{ExchangeRules, QuoteRejection, ValidatedQuote, ValidationReport};
 pub use filter::{
-    apply_close_bias, QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
+    QuoteFilter, ReduceOnlyConfig, ReduceOnlyReason, ReduceOnlyResult,
     DEFAULT_LIQUIDATION_TRIGGER_THRESHOLD,
 };
 pub use kappa_spread::{

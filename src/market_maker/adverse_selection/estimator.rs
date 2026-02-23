@@ -127,6 +127,25 @@ pub struct AdverseSelectionEstimator {
     /// Checkpoint-seeded AS floor in bps, used during cold start when no live
     /// markout data is available yet. Set from prior checkpoint on init.
     checkpoint_as_floor_bps: Option<f64>,
+
+    // === Glosten-Milgrom: Informed jump magnitude tracking ===
+    /// EWMA of AS magnitude (fractional) for fills classified as informed.
+    /// E[ΔP | informed] — the expected price jump given an informed trade.
+    informed_as_ewma: f64,
+    /// Per-side informed jump EWMA: buy fills classified as informed.
+    informed_as_buy_ewma: f64,
+    /// Per-side informed jump EWMA: sell fills classified as informed.
+    informed_as_sell_ewma: f64,
+    /// Per-side informed/uninformed counts for empirical alpha by side.
+    informed_buy_count: usize,
+    uninformed_buy_count: usize,
+    informed_sell_count: usize,
+    uninformed_sell_count: usize,
+
+    // === InformedFlow EM calibration ===
+    /// Latest EM-derived P(informed) and its confidence from the Hawkes GMM.
+    /// Used to probabilistically override the heuristic alpha weights in `predicted_alpha()`.
+    gmm_alpha_signal: Option<(f64, f64)>, // (p_informed, confidence)
 }
 
 impl AdverseSelectionEstimator {
@@ -152,6 +171,15 @@ impl AdverseSelectionEstimator {
             recent_as_ewma_bps: 0.0,
             recent_as_variance_bps2: 0.0,
             checkpoint_as_floor_bps: None,
+            // Glosten-Milgrom fields
+            informed_as_ewma: 0.0,
+            informed_as_buy_ewma: 0.0,
+            informed_as_sell_ewma: 0.0,
+            informed_buy_count: 0,
+            uninformed_buy_count: 0,
+            informed_sell_count: 0,
+            uninformed_sell_count: 0,
+            gmm_alpha_signal: None,
         }
     }
 
@@ -273,8 +301,26 @@ impl AdverseSelectionEstimator {
             let adverse_move_bps = signed_as.abs() * 10000.0;
             if adverse_move_bps > self.informed_threshold_bps {
                 self.informed_fills_count += 1;
+                // Glosten-Milgrom: Track informed jump magnitude (fractional)
+                const GM_ALPHA: f64 = 0.1;
+                self.informed_as_ewma = GM_ALPHA * signed_as.abs()
+                    + (1.0 - GM_ALPHA) * self.informed_as_ewma;
+                if is_buy {
+                    self.informed_buy_count += 1;
+                    self.informed_as_buy_ewma = GM_ALPHA * signed_as.abs()
+                        + (1.0 - GM_ALPHA) * self.informed_as_buy_ewma;
+                } else {
+                    self.informed_sell_count += 1;
+                    self.informed_as_sell_ewma = GM_ALPHA * signed_as.abs()
+                        + (1.0 - GM_ALPHA) * self.informed_as_sell_ewma;
+                }
             } else {
                 self.uninformed_fills_count += 1;
+                if is_buy {
+                    self.uninformed_buy_count += 1;
+                } else {
+                    self.uninformed_sell_count += 1;
+                }
             }
 
             // Update rolling AS severity EWMA (alpha=0.1, ~10 fill half-life)
@@ -425,19 +471,34 @@ impl AdverseSelectionEstimator {
         self.checkpoint_as_floor_bps = Some(floor_bps);
     }
 
-    /// Get recommended spread adjustment (as fraction of mid price).
+    /// Glosten-Milgrom spread adjustment (as fraction of mid price).
     ///
-    /// This is the amount to widen spreads to compensate for adverse selection.
+    /// Break-even adjustment = P(informed) × E[ΔP | informed].
+    /// This replaces the old `realized_as × 2.0` heuristic with a principled
+    /// conditional expectation from the Glosten-Milgrom model.
+    ///
     /// Returns 0.0 if not warmed up.
     pub fn spread_adjustment(&self) -> f64 {
         if !self.is_warmed_up() {
             return 0.0;
         }
 
-        let raw_adjustment = self.realized_as_total * self.config.spread_adjustment_multiplier;
+        // P(informed | fill): empirical when available, predicted (with GMM blend) as fallback
+        let p_informed = self.empirical_alpha_touch()
+            .unwrap_or_else(|| self.predicted_alpha());
 
-        // Clamp to configured bounds
-        raw_adjustment
+        // E[ΔP | informed]: EWMA of AS magnitude for informed-classified fills
+        // Falls back to realized_as_total when no informed fills tracked yet
+        let expected_informed_jump = if self.informed_as_ewma > 0.0 {
+            self.informed_as_ewma
+        } else {
+            self.realized_as_total
+        };
+
+        // Glosten-Milgrom: break-even adjustment = P(informed) × E[ΔP|informed]
+        let gm_adjustment = p_informed * expected_informed_jump;
+
+        gm_adjustment
             .max(self.config.min_spread_adjustment)
             .min(self.config.max_spread_adjustment)
     }
@@ -447,71 +508,90 @@ impl AdverseSelectionEstimator {
         self.spread_adjustment() * 10000.0
     }
 
-    /// Per-side spread adjustment for bids (based on buy-side AS).
-    /// When buy fills show high AS, widen bid side more.
+    /// Per-side Glosten-Milgrom spread adjustment for bids (buy-side AS).
+    /// Uses buy-side P(informed) and buy-side E[ΔP|informed].
     pub fn spread_adjustment_bid(&self) -> f64 {
         if !self.is_warmed_up() {
             return 0.0;
         }
-        let raw = self.realized_as_buy * self.config.spread_adjustment_multiplier;
+        let total_buy = self.informed_buy_count + self.uninformed_buy_count;
+        let p_informed_buy = if total_buy > 0 {
+            self.informed_buy_count as f64 / total_buy as f64
+        } else {
+            self.empirical_alpha_touch()
+                .unwrap_or_else(|| self.predicted_alpha())
+        };
+        let jump_buy = if self.informed_as_buy_ewma > 0.0 {
+            self.informed_as_buy_ewma
+        } else {
+            self.realized_as_buy.abs()
+        };
+        let raw = p_informed_buy * jump_buy;
         raw.max(self.config.min_spread_adjustment)
             .min(self.config.max_spread_adjustment)
     }
 
-    /// Per-side spread adjustment for asks (based on sell-side AS).
-    /// When sell fills show high AS, widen ask side more.
+    /// Per-side Glosten-Milgrom spread adjustment for asks (sell-side AS).
+    /// Uses sell-side P(informed) and sell-side E[ΔP|informed].
     pub fn spread_adjustment_ask(&self) -> f64 {
         if !self.is_warmed_up() {
             return 0.0;
         }
-        let raw = self.realized_as_sell * self.config.spread_adjustment_multiplier;
+        let total_sell = self.informed_sell_count + self.uninformed_sell_count;
+        let p_informed_sell = if total_sell > 0 {
+            self.informed_sell_count as f64 / total_sell as f64
+        } else {
+            self.empirical_alpha_touch()
+                .unwrap_or_else(|| self.predicted_alpha())
+        };
+        let jump_sell = if self.informed_as_sell_ewma > 0.0 {
+            self.informed_as_sell_ewma
+        } else {
+            self.realized_as_sell.abs()
+        };
+        let raw = p_informed_sell * jump_sell;
         raw.max(self.config.min_spread_adjustment)
             .min(self.config.max_spread_adjustment)
     }
 
     /// Get predicted alpha: P(next trade is informed).
     ///
-    /// Uses a simple weighted combination of signals:
-    /// - Volatility surprise (higher realized vs expected = more informed)
-    /// - Flow imbalance magnitude (extreme imbalance = directional informed)
-    /// - Jump ratio (high RV/BV = toxic informed flow)
-    ///
-    /// Returns value in [0, 1].
+    /// If the Hawkes GMM has high confidence, its mathematically derived P(informed)
+    /// takes over. Otherwise, gracefully degrades to the heuristic signals.
     pub fn predicted_alpha(&self) -> f64 {
         let cfg = &self.config;
 
-        // Normalize signals to [0, 1] range
+        // 1. Calculate the baseline heuristic alpha (Volatility, Imbalance, Jump)
         let vol_signal = (self.cached_vol_surprise.max(0.0) / 2.0).min(1.0);
         let flow_signal = self.cached_flow_magnitude; // Already in [0, 1]
         let jump_signal = ((self.cached_jump_ratio - 1.0).max(0.0) / 4.0).min(1.0);
 
-        // Weighted combination
         let raw_alpha = cfg.alpha_volatility_weight * vol_signal
             + cfg.alpha_flow_weight * flow_signal
             + cfg.alpha_jump_weight * jump_signal;
 
-        // Sigmoid squashing to [0, 1]
-        1.0 / (1.0 + (-4.0 * (raw_alpha - 0.5)).exp())
+        let heuristic_alpha = 1.0 / (1.0 + (-4.0 * (raw_alpha - 0.5)).exp());
+
+        // 2. Bayesian blend with the latent GMM probability (if available)
+        if let Some((gmm_p_informed, confidence)) = self.gmm_alpha_signal {
+            // Confidence [0.0, 1.0] controls the interpolation.
+            // A highly confident GMM completely overrides the heuristics.
+            (gmm_p_informed * confidence) + (heuristic_alpha * (1.0 - confidence))
+        } else {
+            heuristic_alpha
+        }
     }
 
-    /// Get asymmetric spread adjustment for bid/ask.
+    /// Get asymmetric Glosten-Milgrom spread adjustment for bid/ask.
     ///
-    /// Returns (bid_adjustment, ask_adjustment) where each is the amount
-    /// to widen that side based on side-specific AS.
+    /// Returns (bid_adjustment, ask_adjustment) using per-side GM conditional
+    /// expectations: P(informed|side) × E[ΔP|informed, side].
     pub fn asymmetric_adjustment(&self) -> (f64, f64) {
         if !self.is_warmed_up() {
             return (0.0, 0.0);
         }
 
-        let mult = self.config.spread_adjustment_multiplier;
-        let max_adj = self.config.max_spread_adjustment;
-
-        // If we're seeing more AS on buys, widen bids more
-        let bid_adj = (self.realized_as_buy.abs() * mult).min(max_adj);
-        // If we're seeing more AS on sells, widen asks more
-        let ask_adj = (self.realized_as_sell.abs() * mult).min(max_adj);
-
-        (bid_adj, ask_adj)
+        (self.spread_adjustment_bid(), self.spread_adjustment_ask())
     }
 
     /// Get diagnostic summary for logging.
@@ -586,6 +666,28 @@ impl AdverseSelectionEstimator {
         }
     }
 
+    /// Empirical P(informed | buy fill) from per-side classification.
+    pub fn empirical_alpha_buy(&self) -> Option<f64> {
+        let total = self.informed_buy_count + self.uninformed_buy_count;
+        if total == 0 { None } else { Some(self.informed_buy_count as f64 / total as f64) }
+    }
+
+    /// Empirical P(informed | sell fill) from per-side classification.
+    pub fn empirical_alpha_sell(&self) -> Option<f64> {
+        let total = self.informed_sell_count + self.uninformed_sell_count;
+        if total == 0 { None } else { Some(self.informed_sell_count as f64 / total as f64) }
+    }
+
+    /// Calibrate P(informed) from InformedFlowEstimator's EM decomposition.
+    ///
+    /// Feed the latent flow decomposition from the Hawkes GMM into the AS estimator.
+    /// This bridges the microstructure flow tracking with the pricing model.
+    /// The raw (p_informed, confidence) is stored and used by `predicted_alpha()`
+    /// to perform a Bayesian blend — high confidence GMM overrides the heuristics.
+    pub fn calibrate_alpha_from_flow(&mut self, p_informed: f64, confidence: f64) {
+        self.gmm_alpha_signal = Some((p_informed, confidence));
+    }
+
     /// Consume the informed/uninformed counts for parameter learning.
     /// Returns (informed_count, uninformed_count) and resets both to zero.
     /// This allows periodic batch updates to the Bayesian parameter.
@@ -608,13 +710,26 @@ impl AdverseSelectionEstimator {
         self.informed_threshold_bps
     }
 
-    /// Spread multiplier based on recent AS severity (rolling EWMA over ~10 fills).
+    /// Arrow-Pratt variance risk premium: prices AS uncertainty as 0.5 × γ × Var[AS].
     ///
-    /// Returns a multiplier to widen spreads when recent fills show persistent
-    /// adverse selection:
-    /// - > 5 bps AS: 1.5x (heavy AS, widen 50%)
-    /// - > 3 bps AS: 1.25x (moderate AS, widen 25%)
-    /// - otherwise: 1.0x (normal)
+    /// Returns an **additive** bps premium (NOT a multiplier). This replaces the old
+    /// step-function `recent_as_severity_mult()` (1.5×/>5bps, 1.25×/>3bps, 1.0×)
+    /// with a continuous, differentiable, and theoretically-grounded formulation.
+    ///
+    /// The premium compensates a risk-averse agent for facing uncertain AS costs:
+    /// higher variance in realized AS → wider spreads to buffer uncertainty.
+    pub fn as_variance_risk_premium_bps(&self, gamma: f64) -> f64 {
+        if self.fills_measured < 3 {
+            return 0.0;
+        }
+        // Arrow-Pratt: exact risk premium for a risk-averse agent
+        // Premium = 0.5 × γ × Var[AS]
+        0.5 * gamma * self.recent_as_variance_bps2
+    }
+
+    /// Deprecated: use `as_variance_risk_premium_bps(gamma)` instead.
+    /// Kept for backward compatibility during transition.
+    #[deprecated(note = "Use as_variance_risk_premium_bps(gamma) — returns additive bps, not multiplier")]
     pub fn recent_as_severity_mult(&self) -> f64 {
         if self.recent_as_ewma_bps > 5.0 {
             1.5
@@ -665,7 +780,6 @@ mod tests {
             ewma_alpha: 0.5,             // High alpha for visible changes
             min_fills_warmup: 3,
             max_pending_fills: 100,
-            spread_adjustment_multiplier: 2.0,
             max_spread_adjustment: 0.01,
             min_spread_adjustment: 0.0,
             ..Default::default()
@@ -908,5 +1022,153 @@ mod tests {
         let total_floor = as_floor_bps + premium;
         assert!((premium - 7.5).abs() < 1e-10, "k=1.5 * sqrt(25) = 7.5");
         assert!((total_floor - 12.5).abs() < 1e-10, "5 + 7.5 = 12.5 bps");
+    }
+
+    // === Glosten-Milgrom Tests ===
+
+    #[test]
+    fn test_gm_spread_adjustment_proportional_to_alpha() {
+        // GM adjustment = P(informed) × E[ΔP|informed]
+        // With known P(informed) and E[jump], adjustment should scale linearly
+        let mut est = make_estimator();
+
+        // Create 3 informed fills (> 5 bps AS) and 3 uninformed (< 5 bps)
+        for i in 0..3 {
+            est.record_fill(i as u64 * 2, 1.0, true, 100.0);
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            est.update(99.9); // 10 bps adverse → informed
+
+            est.record_fill(i as u64 * 2 + 1, 1.0, true, 100.0);
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            est.update(99.98); // 2 bps adverse → uninformed
+        }
+
+        assert!(est.is_warmed_up(), "Should be warmed up after 6 fills");
+        let adj = est.spread_adjustment();
+        assert!(adj > 0.0, "GM adjustment should be positive with mixed fills");
+        // P(informed) ≈ 0.5, E[jump|informed] ≈ 0.001 → adj ≈ 0.0005
+        assert!(adj < 0.005, "GM adjustment should be reasonable: got {adj}");
+    }
+
+    #[test]
+    fn test_gm_per_side_tracks_independently() {
+        let mut est = make_estimator();
+
+        // All buy fills are informed (10 bps AS), all sell fills are uninformed (2 bps AS)
+        for i in 0..3 {
+            est.record_fill(i as u64 * 2, 1.0, true, 100.0); // buy
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            est.update(99.9); // 10 bps adverse for buy → informed
+
+            est.record_fill(i as u64 * 2 + 1, 1.0, false, 100.0); // sell
+            std::thread::sleep(TEST_HORIZON_SLEEP);
+            est.update(100.02); // 2 bps adverse for sell → uninformed
+        }
+
+        // Buy-side should have higher adjustment than sell-side
+        let bid_adj = est.spread_adjustment_bid();
+        let ask_adj = est.spread_adjustment_ask();
+        assert!(bid_adj > ask_adj,
+            "Buy-side (more informed) should have higher adj: bid={bid_adj} ask={ask_adj}");
+    }
+
+    // === Arrow-Pratt Tests ===
+
+    #[test]
+    fn test_arrow_pratt_premium_proportional_to_gamma_and_variance() {
+        let mut est = make_estimator();
+
+        // Build up some variance
+        for i in 0..4 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+        }
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        est.update(99.9); // 10 bps
+        for i in 4..8 {
+            est.record_fill(i as u64, 1.0, true, 100.0);
+        }
+        std::thread::sleep(TEST_HORIZON_SLEEP);
+        est.update(99.7); // 30 bps
+
+        let var = est.as_floor_variance_bps2();
+        assert!(var > 0.0, "Variance should be positive after differing AS magnitudes");
+
+        // Premium = 0.5 × γ × Var[AS]
+        let premium_g1 = est.as_variance_risk_premium_bps(1.0);
+        let premium_g2 = est.as_variance_risk_premium_bps(2.0);
+        assert!((premium_g2 - 2.0 * premium_g1).abs() < 1e-10,
+            "Premium should scale linearly with gamma");
+        assert!((premium_g1 - 0.5 * var).abs() < 1e-10,
+            "Premium(γ=1) = 0.5 × Var[AS]");
+    }
+
+    #[test]
+    fn test_arrow_pratt_zero_before_warmup() {
+        let est = make_estimator();
+        // No fills → zero premium regardless of gamma
+        assert_eq!(est.as_variance_risk_premium_bps(1.0), 0.0);
+        assert_eq!(est.as_variance_risk_premium_bps(10.0), 0.0);
+    }
+
+    // === Flow Calibration Tests ===
+
+    #[test]
+    fn test_calibrate_alpha_from_flow() {
+        let mut est = make_estimator();
+
+        // Without GMM signal, predicted_alpha uses only heuristics
+        let baseline_alpha = est.predicted_alpha();
+
+        // Feed GMM signal with high confidence
+        est.calibrate_alpha_from_flow(0.92, 0.85);
+        let gmm_alpha = est.predicted_alpha();
+
+        // With 0.85 confidence, GMM dominates: 0.85 * 0.92 + 0.15 * baseline
+        let expected = 0.85 * 0.92 + 0.15 * baseline_alpha;
+        assert!(
+            (gmm_alpha - expected).abs() < 0.01,
+            "Expected ~{expected:.3}, got {gmm_alpha:.3}"
+        );
+        // GMM should push alpha UP toward 0.92
+        assert!(gmm_alpha > baseline_alpha, "GMM should increase alpha");
+
+        // Low confidence GMM → heuristic dominates
+        est.calibrate_alpha_from_flow(0.92, 0.1);
+        let low_conf_alpha = est.predicted_alpha();
+        let expected_low = 0.1 * 0.92 + 0.9 * baseline_alpha;
+        assert!(
+            (low_conf_alpha - expected_low).abs() < 0.01,
+            "Expected ~{expected_low:.3}, got {low_conf_alpha:.3}"
+        );
+        // Should be much closer to baseline than the high-confidence case
+        assert!(
+            (low_conf_alpha - baseline_alpha).abs() < (gmm_alpha - baseline_alpha).abs(),
+            "Low confidence should stay closer to baseline"
+        );
+    }
+
+    // === HARA Gamma Test ===
+
+    #[test]
+    fn test_reservation_price_shift_basics() {
+        // Verify the A-S formula: shift = -q × γ × σ² × τ
+        use crate::market_maker::strategy::reservation_price_shift;
+
+        // Long position → negative shift (sell pressure)
+        let shift_long = reservation_price_shift(10.0, 0.0002, 60.0, 1.0, 0.0, 1000.0);
+        assert!(shift_long < 0.0, "Long position should produce negative shift");
+
+        // Short position → positive shift (buy pressure)
+        let shift_short = reservation_price_shift(-10.0, 0.0002, 60.0, 1.0, 0.0, 1000.0);
+        assert!(shift_short > 0.0, "Short position should produce positive shift");
+
+        // Flat position → zero shift
+        let shift_flat = reservation_price_shift(0.0, 0.0002, 60.0, 1.0, 0.0, 1000.0);
+        assert!((shift_flat).abs() < 1e-15, "Flat position should have zero shift");
+
+        // HARA: losing money → higher gamma → larger shift
+        let shift_losing = reservation_price_shift(10.0, 0.0002, 60.0, 1.0, -500.0, 1000.0);
+        assert!(shift_losing.abs() > shift_long.abs(),
+            "Losing PnL should increase shift magnitude via HARA gamma");
     }
 }
