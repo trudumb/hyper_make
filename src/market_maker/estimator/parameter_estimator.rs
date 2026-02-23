@@ -156,6 +156,9 @@ pub struct ParameterEstimator {
     last_trade_time_ms: u64,
     /// Force warmup complete (set by timeout fallback)
     warmup_override: bool,
+    /// Cached Hawkes intensity ratio (current/baseline) for activity-scaled
+    /// Kalman process noise. Set from handlers.rs where Hawkes is already computed.
+    cached_hawkes_intensity_ratio: f64,
 
     /// Unscented Kalman Filter tracking V, mu, sigma natively
     pub latent_filter: LatentStateFilter,
@@ -322,6 +325,7 @@ impl ParameterEstimator {
             edge_surface: EdgeSurface::default_config(),
             last_trade_time_ms: 0,
             warmup_override: false,
+            cached_hawkes_intensity_ratio: 1.0,
             latent_filter,
             // Adaptive kappa prior — starts at config value, adapts toward market
             adapted_kappa_prior: initial_kappa_prior,
@@ -332,6 +336,17 @@ impl ParameterEstimator {
             first_update_time_ms: None,
             own_fill_count: 0,
         }
+    }
+
+    /// Set the cached Hawkes intensity ratio for activity-scaled Kalman process noise.
+    ///
+    /// Called from handlers.rs where Hawkes intensity_ratio is already computed.
+    /// The ratio is current_intensity / baseline_intensity:
+    /// - 1.0 = normal activity
+    /// - >1.0 = elevated (toxic sweep) → larger Q → faster Kalman adaptation
+    /// - <1.0 = quiet period → smaller Q → more stable estimates
+    pub fn set_hawkes_intensity_ratio(&mut self, ratio: f64) {
+        self.cached_hawkes_intensity_ratio = ratio;
     }
 
     /// Update current mid price.
@@ -474,8 +489,9 @@ impl ParameterEstimator {
                 bucket.end_time_ms.saturating_sub(bucket.start_time_ms) as f64 / 1000.0;
             // Use a minimum dt to avoid numerical instability
             let dt = bucket_duration_secs.max(0.1);
+            let activity_mult = self.cached_hawkes_intensity_ratio;
             self.kalman_filter
-                .set_process_noise_from_volatility(sigma, dt);
+                .set_process_noise_from_volatility(sigma, dt, activity_mult);
 
             // Slowly update baseline from slow sigma (long-term anchor)
             // Using slow sigma as the stable reference for regime thresholds

@@ -834,6 +834,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             cached_best_ask: self.cached_best_ask,
             // CalibrationCoordinator for L2-derived warmup kappa
             calibration_coordinator: &self.calibration_coordinator,
+            // Bayesian sigma correction from markout feedback
+            sigma_correction_factor: self.covariance_tracker.sigma_correction_factor()
+                * self.fill_cascade_tracker.sigma_boost_factor(),
             // Exchange position limits
             exchange_limits_valid: exchange_limits.is_initialized(),
             exchange_effective_bid_limit: exchange_limits.effective_bid_limit(),
@@ -3809,6 +3812,10 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let vol_bias_ratio = self.sampling_bias_tracker.sampling_bias_ratio();
         let fillable_frac = self.sampling_bias_tracker.fillable_fraction();
 
+        // Sigma correction diagnostics
+        let sigma_correction = self.covariance_tracker.sigma_correction_factor();
+        let burst_boost = self.fill_cascade_tracker.sigma_boost_factor();
+
         // Check for unusual state
         let is_unusual = !(0.5..=1.5).contains(&sigma_ratio)
             || fill_autocorr > 0.7
@@ -3832,6 +3839,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 tail_risk = %format!("{:.2}", tail_risk),
                 vol_bias = %format!("{:.3}", vol_bias_ratio),
                 fillable = %format!("{:.3}", fillable_frac),
+                sigma_corrected = %format!("{:.3}", sigma_correction),
+                burst_boost = %format!("{:.1}", burst_boost),
                 "ESTIMATOR_DIAGNOSTICS"
             );
         } else {
@@ -3843,6 +3852,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 toxicity = %format!("{:.2}", toxicity),
                 cascade = %format!("{:.2}", cascade),
                 vol_bias = %format!("{:.3}", vol_bias_ratio),
+                sigma_corrected = %format!("{:.3}", sigma_correction),
+                burst_boost = %format!("{:.1}", burst_boost),
                 "ESTIMATOR_DIAGNOSTICS"
             );
         }

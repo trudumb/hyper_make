@@ -118,6 +118,12 @@ pub struct ParameterSources<'a> {
     // === CalibrationCoordinator (Bootstrap from Book) ===
     /// Reference to the CalibrationCoordinator for L2-derived kappa.
     pub calibration_coordinator: &'a crate::market_maker::estimator::calibration_coordinator::CalibrationCoordinator,
+
+    // === Sigma Correction (CovarianceTracker) ===
+    /// Bayesian posterior correction factor for sigma_effective.
+    /// When realized vol > predicted vol, this inflates sigma (> 1.0).
+    /// Default 1.0 (no correction, model-only sigma).
+    pub sigma_correction_factor: f64,
 }
 
 /// Learned parameter values for use in quoting calculations.
@@ -196,7 +202,7 @@ impl ParameterAggregator {
             // === Volatility (dual-sigma architecture) ===
             sigma: est.sigma_clean(),
             sigma_total: est.sigma_total(),
-            sigma_effective: est.sigma_effective(),
+            sigma_effective: est.sigma_effective() * sources.sigma_correction_factor,
             sigma_leverage_adjusted: est.sigma_leverage_adjusted(),
             volatility_regime: est.volatility_regime(),
 

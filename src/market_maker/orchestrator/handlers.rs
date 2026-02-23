@@ -360,6 +360,17 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     .on_fill(fill_dist_bps, was_adverse);
             }
 
+            // === Bayesian sigma correction: feed markout to CovarianceTracker ===
+            // realized_bps = absolute mid movement from fill to markout (5s window).
+            // predicted_bps = sigma_effective × √τ × 10_000 (what we predicted).
+            {
+                let realized_bps = mid_change_bps.abs();
+                let sigma_eff = self.estimator.sigma_effective();
+                let predicted_bps = sigma_eff * MARKOUT_SECONDS.sqrt() * 10_000.0;
+                self.covariance_tracker
+                    .observe_markout(realized_bps, predicted_bps);
+            }
+
             // Close prediction→correction loop: if classifier overpredicts AS,
             // bias correction reduces effective toxicity in spread_multiplier().
             // predicted_as_bps_val and markout_as_bps computed below in EdgeSnapshot block.
@@ -914,6 +925,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 self.drift_estimator.boost_responsiveness(3.0);
             }
 
+            // Check for fill burst (fast cascade reaction — 3 fills in 5s).
+            // Activates sigma boost (2x) for 30s, doubling spreads during sweeps.
+            if self.fill_cascade_tracker.check_burst(fill_side) {
+                // Burst detected — boost drift estimator too for fast reaction
+                self.drift_estimator.boost_responsiveness(2.0);
+            }
+
             let fill_price = fill.px.parse().unwrap_or(0.0);
             let fill_event = WsFillEvent {
                 oid: fill.oid,
@@ -1139,6 +1157,9 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                     let vpin = self.stochastic.vpin.vpin();
                     let hawkes_intensity_ratio = self.tier2.hawkes.intensity_ratio();
                     let size_anomaly_sigma = self.stochastic.trade_size_dist.anomaly_sigma();
+
+                    // Wire Hawkes intensity into Kalman filter for activity-scaled Q
+                    self.estimator.set_hawkes_intensity_ratio(hawkes_intensity_ratio);
 
                     // Use stress-aware BOCPD update (First-Principles Gap 1)
                     let changepoint = self.stochastic.bocpd_kappa.update_with_stress(

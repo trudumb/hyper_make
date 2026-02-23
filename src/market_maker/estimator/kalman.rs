@@ -326,12 +326,21 @@ impl KalmanPriceFilter {
     /// # Arguments
     /// * `sigma` - Per-second volatility (e.g., from bipower variation)
     /// * `dt_seconds` - Time step in seconds (typical: 0.5-2.0 for volume ticks)
+    /// * `activity_mult` - Hawkes intensity ratio (current/baseline), clamped [0.5, 5.0].
+    ///   During toxic sweeps (100 trades/sec), activity_mult >> 1 → larger Q → faster adaptation.
+    ///   During quiet periods, activity_mult < 1 → smaller Q → more stable estimates.
     ///
-    /// Scales Q as sigma^2 * dt to match actual market volatility.
-    /// This provides faster adaptation than learning Q from innovations.
-    pub fn set_process_noise_from_volatility(&mut self, sigma: f64, dt_seconds: f64) {
-        // Q = sigma^2 * dt for random walk with volatility sigma per second
-        let new_q = sigma.powi(2) * dt_seconds;
+    /// Scales Q as sigma^2 * dt * activity_mult to match actual market volatility
+    /// and activity level. This provides faster adaptation than learning Q from innovations.
+    pub fn set_process_noise_from_volatility(
+        &mut self,
+        sigma: f64,
+        dt_seconds: f64,
+        activity_mult: f64,
+    ) {
+        // Q = sigma^2 * dt * activity_mult
+        let clamped_mult = activity_mult.clamp(0.5, 5.0);
+        let new_q = sigma.powi(2) * dt_seconds * clamped_mult;
 
         // Use faster adaptation during warmup, slower after
         let alpha = if self.update_count < 20 { 0.3 } else { 0.05 };

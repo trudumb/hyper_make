@@ -223,11 +223,11 @@ impl InventoryGovernor {
 
         let (zone, max_new_exposure, addon_bps, reducing_addon) = if ratio >= 1.0 {
             // Kill zone: position at or above max.
-            // Tighten reducing side to attract fills and escape the overexposed state.
+            // Aggressively tighten reducing side to attract fills and escape overexposed state.
             (PositionZone::Kill, 0.0, self.config.kill_addon_bps, -self.config.kill_reducing_addon_bps)
         } else if ratio >= red {
-            // Red zone: reduce-only. Mild tightening on reducing side.
-            (PositionZone::Red, 0.0, self.config.red_addon_bps, -self.config.kill_reducing_addon_bps * 0.5)
+            // Red zone: reduce-only. Tighten reducing side to attract fills.
+            (PositionZone::Red, 0.0, self.config.red_addon_bps, -self.config.red_reducing_addon_bps)
         } else if ratio >= yellow {
             // Yellow zone: bias toward reducing, cap new exposure
             let capped_exposure = remaining * 0.5;
@@ -824,6 +824,30 @@ mod tests {
         // effective = min(3.0, 100.0) * 1.0 * 1.0 = 3.0
         assert!((limits.hard_max - 3.0).abs() < 1e-9);
         assert!((limits.effective() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_kill_zone_reducing_addon_25bps() {
+        let gov = InventoryGovernor::new(10.0);
+        let a = gov.assess(10.5); // Kill zone
+        assert_eq!(a.zone, PositionZone::Kill);
+        assert!(
+            (a.reducing_side_addon_bps - (-25.0)).abs() < 1e-9,
+            "Kill zone reducing addon should be -25.0: {}",
+            a.reducing_side_addon_bps
+        );
+    }
+
+    #[test]
+    fn test_red_zone_reducing_addon_15bps() {
+        let gov = InventoryGovernor::new(10.0);
+        let a = gov.assess(8.5); // Red zone
+        assert_eq!(a.zone, PositionZone::Red);
+        assert!(
+            (a.reducing_side_addon_bps - (-15.0)).abs() < 1e-9,
+            "Red zone reducing addon should be -15.0: {}",
+            a.reducing_side_addon_bps
+        );
     }
 
     #[test]

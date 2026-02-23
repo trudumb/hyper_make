@@ -821,20 +821,37 @@ mod tests {
             ..Default::default()
         });
 
-        // Feed stable observations
-        for _ in 0..50 {
-            detector.update(0.0);
+        // Feed stable observations with natural variance.
+        // Identical values (all 0.0) create degenerate zero-variance statistics,
+        // making predictive probabilities underflow for any non-zero observation.
+        // Alternating ±0.5 gives mean≈0 with realistic variance.
+        for i in 0..50 {
+            let obs = if i % 2 == 0 { 0.5 } else { -0.5 };
+            detector.update(obs);
         }
 
-        // Sudden jump
+        // Sudden jump — well outside the stable distribution
         for _ in 0..10 {
-            detector.update(5.0); // Big change
+            detector.update(5.0);
         }
 
-        // Should detect changepoint
-        // Note: Detection depends on parameters and may not trigger immediately
+        // Should detect changepoint.
+        // After 10 post-change observations, the most likely run length is 10
+        // (meaning changepoint happened exactly 10 steps ago). 93%+ of mass
+        // concentrates there, confirming detection.
         let summary = detector.summary();
-        assert!(summary.cp_prob_10 > 0.1); // Some increase in CP probability
+        assert!(
+            summary.most_likely_run <= 12,
+            "Most likely run should be short (≈10 = post-change obs count), got {}",
+            summary.most_likely_run,
+        );
+        // Also check that P(r ≤ 15) is high — changepoint within last 15 steps
+        let cp_prob_15 = detector.changepoint_probability(15);
+        assert!(
+            cp_prob_15 > 0.9,
+            "Changepoint probability within 15 steps should be > 0.9, got {}",
+            cp_prob_15,
+        );
     }
 
     #[test]

@@ -738,8 +738,10 @@ impl HawkesGmmCalibrator {
 pub struct OnlineHawkesCalibrator {
     /// Window size in seconds
     window_size_secs: f64,
-    /// EWMA decay for statistics
+    /// EWMA decay for statistics (fast, for mean)
     ewma_alpha: f64,
+    /// Slower EWMA decay for variance (2nd-order moment needs more stability)
+    ewma_alpha_var: f64,
     /// Running mean of counts
     ewma_mean: f64,
     /// Running variance (Welford's algorithm adapted for EWMA)
@@ -763,9 +765,14 @@ impl OnlineHawkesCalibrator {
     /// - `beta_prior`: Prior estimate of decay rate
     pub fn new(window_size_secs: f64, half_life_windows: f64, beta_prior: f64) -> Self {
         let ewma_alpha = 1.0 - (-2.0_f64.ln() / half_life_windows).exp();
+        // Variance is a 2nd-order moment — needs slower alpha for stability.
+        // With fast alpha, variance can momentarily drop near zero, causing
+        // autocorrelation spikes. Use ~1/3 of the mean alpha.
+        let ewma_alpha_var = ewma_alpha * 0.3;
         Self {
             window_size_secs,
             ewma_alpha,
+            ewma_alpha_var,
             ewma_mean: 0.0,
             ewma_variance: 1.0,
             ewma_autocorr: 0.0,
@@ -791,16 +798,20 @@ impl OnlineHawkesCalibrator {
         let old_mean = self.ewma_mean;
         self.ewma_mean = self.ewma_alpha * x + (1.0 - self.ewma_alpha) * self.ewma_mean;
 
-        // Update variance (simplified EWMA variance)
+        // Update variance with slower alpha (2nd-order moment needs more stability)
         let diff = x - old_mean;
         let var_obs = diff * diff;
         self.ewma_variance =
-            self.ewma_alpha * var_obs + (1.0 - self.ewma_alpha) * self.ewma_variance;
+            self.ewma_alpha_var * var_obs + (1.0 - self.ewma_alpha_var) * self.ewma_variance;
 
-        // Update autocorrelation
+        // Update autocorrelation with bounded observations
         if let Some(last) = self.last_count {
             let last_diff = last as f64 - old_mean;
-            let autocorr_obs = diff * last_diff / (self.ewma_variance + 0.001);
+            // Normalize each diff by sqrt(variance) before multiplying to keep
+            // autocorr_obs in [-1, 1]. This prevents spikes when variance
+            // momentarily drops near zero.
+            let denom = (self.ewma_variance + 0.001).sqrt();
+            let autocorr_obs = ((diff / denom) * (last_diff / denom)).clamp(-1.0, 1.0);
             self.ewma_autocorr =
                 self.ewma_alpha * autocorr_obs + (1.0 - self.ewma_alpha) * self.ewma_autocorr;
         }
@@ -838,10 +849,16 @@ impl OnlineHawkesCalibrator {
             0.0
         };
 
-        // Estimate beta from autocorrelation
+        // Estimate beta from autocorrelation — robust for all signs
         let beta = if self.ewma_autocorr > 0.01 && self.ewma_autocorr < 0.99 {
+            // Normal case: positive autocorrelation → clustered arrivals
             (-self.ewma_autocorr.ln() / t).clamp(0.01, 10.0)
+        } else if self.ewma_autocorr <= 0.01 {
+            // Negative or near-zero autocorrelation → anti-bunching or Poisson
+            // ln(negative) would be NaN; use 2x prior (faster decay than clustered)
+            (self.beta_prior * 2.0).min(10.0)
         } else {
+            // autocorr >= 0.99 → near-perfect correlation, use prior
             self.beta_prior
         };
 
@@ -878,6 +895,7 @@ impl OnlineHawkesCalibrator {
         self.ewma_autocorr = 0.0;
         self.last_count = None;
         self.n_windows = 0;
+        // ewma_alpha_var and beta_prior are configuration — don't reset
     }
 }
 
@@ -2152,5 +2170,89 @@ mod tests {
         assert!((predictor.synchronicity_coefficient() - 0.0).abs() < 1e-9);
         assert!(predictor.inter_arrival_buffer.is_empty());
         assert!(predictor.last_event_time_secs.is_none());
+    }
+
+    // ============================================================================
+    // Fix 3: Hawkes Autocorrelation Stabilization Tests
+    // ============================================================================
+
+    #[test]
+    fn test_online_calibrator_constant_count_bounded_autocorr() {
+        // Fix 3A/B: Feed constant counts (zero variance in x).
+        // With the old code, variance could drop near zero → autocorr spikes.
+        // With slow alpha for variance + bounded autocorr, this stays stable.
+        let mut calibrator = OnlineHawkesCalibrator::new(1.0, 10.0, 0.1);
+
+        for _ in 0..30 {
+            calibrator.update(5); // All same count
+        }
+
+        // Autocorrelation should stay bounded in [-1, 1]
+        assert!(
+            calibrator.ewma_autocorr >= -1.0 && calibrator.ewma_autocorr <= 1.0,
+            "Autocorr must be bounded: got {}",
+            calibrator.ewma_autocorr
+        );
+
+        // Should still produce a valid estimate
+        let result = calibrator.estimate();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(r.beta.is_finite(), "Beta must be finite, got {}", r.beta);
+    }
+
+    #[test]
+    fn test_online_calibrator_antibunching_beta() {
+        // Fix 3C: Alternating high/low counts → negative autocorrelation.
+        // Beta should use 2x prior (faster decay) rather than NaN.
+        let mut calibrator = OnlineHawkesCalibrator::new(1.0, 10.0, 0.1);
+
+        for i in 0..40 {
+            let count = if i % 2 == 0 { 10 } else { 1 };
+            calibrator.update(count);
+        }
+
+        let result = calibrator.estimate();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        // With anti-bunching, beta should be >= beta_prior (faster decay)
+        assert!(
+            r.beta >= calibrator.beta_prior,
+            "Anti-bunching should give beta >= prior: beta={}, prior={}",
+            r.beta,
+            calibrator.beta_prior
+        );
+        assert!(r.beta.is_finite(), "Beta must not be NaN: {}", r.beta);
+    }
+
+    #[test]
+    fn test_online_calibrator_normal_clustering_beta() {
+        // Fix 3C: Correlated counts → positive autocorrelation → sensible beta.
+        let mut calibrator = OnlineHawkesCalibrator::new(1.0, 10.0, 0.1);
+
+        // Simulate correlated counts (clustering)
+        for i in 0..50 {
+            // Gradually ramp up then down to create autocorrelation
+            let count = 5 + (i / 5) % 5;
+            calibrator.update(count);
+        }
+
+        let result = calibrator.estimate();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(r.beta > 0.0, "Beta should be positive: {}", r.beta);
+        assert!(r.beta.is_finite(), "Beta must be finite: {}", r.beta);
+    }
+
+    #[test]
+    fn test_online_calibrator_slow_variance_alpha() {
+        // Fix 3A: Verify the variance uses a slower alpha than the mean.
+        let calibrator = OnlineHawkesCalibrator::new(1.0, 10.0, 0.1);
+        assert!(
+            calibrator.ewma_alpha_var < calibrator.ewma_alpha,
+            "Variance alpha ({}) should be slower than mean alpha ({})",
+            calibrator.ewma_alpha_var,
+            calibrator.ewma_alpha
+        );
     }
 }

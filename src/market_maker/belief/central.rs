@@ -78,6 +78,12 @@ pub struct CentralBeliefConfig {
     pub changepoint_hazard: f64,
     /// Threshold for changepoint detection
     pub changepoint_threshold: f64,
+    /// Minimum consecutive high-probability observations to confirm a changepoint.
+    /// Higher values reduce false positives from noise. Default: 2.
+    pub changepoint_min_confirmations: usize,
+    /// Cooldown period (ms) between confirmed changepoints.
+    /// Prevents rapid resets that destroy learned parameters. Default: 0 (no cooldown).
+    pub changepoint_cooldown_ms: u64,
 
     // === EWMA ===
     /// EWMA smoothing factor for kappa (0.9 = 90% previous, 10% new)
@@ -101,6 +107,8 @@ impl Default for CentralBeliefConfig {
             decay_factor: 0.999,
             changepoint_hazard: 1.0 / 250.0,
             changepoint_threshold: 0.7,
+            changepoint_min_confirmations: 2,
+            changepoint_cooldown_ms: 0,
             kappa_ewma_alpha: 0.9,
             bayesian_fv_config: Some(BayesianFairValueConfig::default()),
         }
@@ -115,6 +123,8 @@ impl CentralBeliefConfig {
             kappa_prior_strength: 15.0,
             min_fills: 3,
             changepoint_hazard: 1.0 / 150.0, // More sensitive
+            changepoint_min_confirmations: 4, // 4 consecutive required (vs default 2)
+            changepoint_cooldown_ms: 300_000, // 5 minute cooldown between confirmed changepoints
             bayesian_fv_config: Some(BayesianFairValueConfig::default()),
             ..Default::default()
         }
@@ -182,6 +192,8 @@ struct InternalState {
     changepoint_run_probs: Vec<f64>,
     changepoint_obs_count: usize,
     changepoint_consecutive_high: usize,
+    /// Timestamp (ms) of last confirmed changepoint, for cooldown enforcement.
+    last_changepoint_confirmed_ms: u64,
 
     // === Edge ===
     edge_sum: f64,
@@ -323,6 +335,7 @@ impl Default for InternalState {
             changepoint_run_probs,
             changepoint_obs_count: 0,
             changepoint_consecutive_high: 0,
+            last_changepoint_confirmed_ms: 0,
 
             // Edge
             edge_sum: 0.0,
@@ -565,7 +578,14 @@ impl CentralBeliefState {
                 timestamp_ms: _,
             } => {
                 if let Some(ref mut fv) = state.bayesian_fv {
-                    fv.update_on_flow(imbalance_1s, imbalance_5s, imbalance_30s, state.last_mid_for_fv);
+                    // Decorrelate flow observations: raw imbalances are nested
+                    // (1s ⊆ 5s ⊆ 30s), not independent. Batch Kalman treats them
+                    // as orthogonal, overcounting information by ~2-3x.
+                    // Compute exclusive increments so each observation is independent.
+                    let flow_short = imbalance_1s; // 0-1s (exclusive)
+                    let flow_medium = imbalance_5s - imbalance_1s; // 1-5s increment
+                    let flow_long = imbalance_30s - imbalance_5s; // 5-30s increment
+                    fv.update_on_flow(flow_short, flow_medium, flow_long, state.last_mid_for_fv);
                 }
             }
 
@@ -790,6 +810,10 @@ impl CentralBeliefState {
         // Track consecutive high probability
         if cp_prob > self.config.changepoint_threshold {
             state.changepoint_consecutive_high += 1;
+            // Record timestamp when confirmation threshold is first reached
+            if state.changepoint_consecutive_high == self.config.changepoint_min_confirmations {
+                state.last_changepoint_confirmed_ms = state.last_update_ms;
+            }
         } else {
             state.changepoint_consecutive_high = 0;
         }
@@ -1239,13 +1263,25 @@ impl CentralBeliefState {
             .map(|&p| p * p.ln())
             .sum::<f64>();
 
-        // Determine result
+        // Determine result with configurable confirmation gate and cooldown
         let result = if state.changepoint_obs_count < 10
             || prob_5 <= self.config.changepoint_threshold
         {
             ChangepointResult::None
-        } else if state.changepoint_consecutive_high >= 2 {
-            ChangepointResult::Confirmed
+        } else if state.changepoint_consecutive_high >= self.config.changepoint_min_confirmations {
+            // Check cooldown: suppress confirmed if too soon after last one
+            let elapsed_ms = state.last_update_ms.saturating_sub(state.last_changepoint_confirmed_ms);
+            if self.config.changepoint_cooldown_ms > 0
+                && state.last_changepoint_confirmed_ms > 0
+                && elapsed_ms < self.config.changepoint_cooldown_ms
+            {
+                // Still in cooldown — demote to Pending instead of Confirmed
+                ChangepointResult::Pending(state.changepoint_consecutive_high)
+            } else {
+                // Note: last_changepoint_confirmed_ms is set in process_changepoint_obs
+                // when consecutive_high first reaches the confirmation threshold.
+                ChangepointResult::Confirmed
+            }
         } else {
             ChangepointResult::Pending(state.changepoint_consecutive_high)
         };
@@ -1598,5 +1634,19 @@ mod tests {
         // CDF(-∞) → 0, CDF(+∞) → 1
         assert!(normal_cdf(-5.0) < 0.01);
         assert!(normal_cdf(5.0) > 0.99);
+    }
+
+    #[test]
+    fn test_hip3_needs_4_confirmations() {
+        let config = CentralBeliefConfig::hip3();
+        assert_eq!(config.changepoint_min_confirmations, 4);
+        assert_eq!(config.changepoint_cooldown_ms, 300_000);
+    }
+
+    #[test]
+    fn test_default_needs_2_confirmations() {
+        let config = CentralBeliefConfig::default();
+        assert_eq!(config.changepoint_min_confirmations, 2);
+        assert_eq!(config.changepoint_cooldown_ms, 0);
     }
 }

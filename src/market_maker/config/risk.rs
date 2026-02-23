@@ -211,15 +211,23 @@ pub struct GovernorConfig {
     pub red_addon_bps: f64,
     /// Additive spread widening (bps) in Kill zone (at/above max position).
     pub kill_addon_bps: f64,
-    /// Additive spread TIGHTENING (bps) for the reducing side in Kill/Red zones.
+    /// Additive spread TIGHTENING (bps) for the reducing side in Kill zone.
     /// Applied as negative addon to attract fills and escape overexposed state.
-    /// E.g., 5.0 → reducing side quotes tightened by 5 bps in Kill zone, 2.5 in Red.
+    /// E.g., 25.0 → reducing side quotes tightened by 25 bps in Kill zone.
     #[serde(default = "default_kill_reducing_addon")]
     pub kill_reducing_addon_bps: f64,
+    /// Additive spread TIGHTENING (bps) for the reducing side in Red zone.
+    /// Milder than Kill zone but still attracts reducing fills.
+    #[serde(default = "default_red_reducing_addon")]
+    pub red_reducing_addon_bps: f64,
 }
 
 fn default_kill_reducing_addon() -> f64 {
-    5.0
+    25.0
+}
+
+fn default_red_reducing_addon() -> f64 {
+    15.0
 }
 
 impl Default for GovernorConfig {
@@ -230,7 +238,8 @@ impl Default for GovernorConfig {
             yellow_max_addon_bps: 10.0,
             red_addon_bps: 15.0,
             kill_addon_bps: 25.0,
-            kill_reducing_addon_bps: 5.0,
+            kill_reducing_addon_bps: 25.0,
+            red_reducing_addon_bps: 15.0,
         }
     }
 }

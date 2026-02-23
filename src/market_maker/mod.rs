@@ -429,6 +429,11 @@ pub struct MarketMaker<S: QuotingStrategy, Env: TradingEnvironment> {
     /// Excess race AS feeds into spread floor to protect against latency disadvantage.
     pub cancel_race_tracker: adverse_selection::CancelRaceTracker,
 
+    // === Bayesian Sigma Correction (CovarianceTracker) ===
+    /// Tracks realized vs predicted sigma via markout feedback.
+    /// `sigma_correction_factor()` multiplies into sigma_effective.
+    covariance_tracker: estimator::covariance_tracker::CovarianceTracker,
+
     // === Q18: Vol Sampling Bias Tracker ===
     /// Tracks fill-conditioned sampling bias in volatility estimation.
     /// σ̂ conditioned on fills overweights volatile regimes.
@@ -677,6 +682,8 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             cycle_state_changes: crate::market_maker::orchestrator::event_accumulator::CycleStateChanges::default(),
             cycle_timer: crate::market_maker::orchestrator::event_accumulator::AdaptiveCycleTimer::new(),
             cancel_race_tracker: adverse_selection::CancelRaceTracker::default(),
+            // Bayesian sigma correction from markout feedback
+            covariance_tracker: estimator::covariance_tracker::CovarianceTracker::new(),
             // Q18: Vol sampling bias tracker (diagnostics Phase 1)
             sampling_bias_tracker: estimator::SamplingBiasTracker::new(),
             last_bias_fill_count: 0,
@@ -1407,6 +1414,15 @@ pub struct FillCascadeTracker {
     widen_addon_bps: f64,
     /// Spread widening (bps) when suppressing (default 20.0).
     suppress_addon_bps: f64,
+    // === Fill burst detection (fast cascade reaction) ===
+    /// Short window for burst detection (default 5s).
+    burst_window: std::time::Duration,
+    /// Number of same-side fills in burst window to trigger sigma boost.
+    burst_threshold: usize,
+    /// When sigma boost expires (None = inactive).
+    burst_sigma_boost_until: Option<std::time::Instant>,
+    /// Duration of sigma boost after burst detected.
+    burst_sigma_boost_duration: std::time::Duration,
 }
 
 impl FillCascadeTracker {
@@ -1422,6 +1438,10 @@ impl FillCascadeTracker {
             suppress_cooldown: std::time::Duration::from_secs(cfg.suppress_cooldown_secs),
             widen_addon_bps: cfg.widen_addon_bps,
             suppress_addon_bps: cfg.suppress_addon_bps,
+            burst_window: std::time::Duration::from_secs(5),
+            burst_threshold: 3,
+            burst_sigma_boost_until: None,
+            burst_sigma_boost_duration: std::time::Duration::from_secs(30),
         }
     }
 
@@ -1504,6 +1524,52 @@ impl FillCascadeTracker {
             }
         }
         false
+    }
+
+    /// Check for fill burst (short-window clustering).
+    /// Returns true when burst threshold is newly crossed, activating sigma boost.
+    pub fn check_burst(&mut self, side: Side) -> bool {
+        let now = std::time::Instant::now();
+        let cutoff = now.checked_sub(self.burst_window).unwrap_or(now);
+        let burst_count = self
+            .recent_fills
+            .iter()
+            .filter(|(t, s)| *t >= cutoff && *s == side)
+            .count();
+        if burst_count >= self.burst_threshold {
+            let was_active = self.sigma_boost_active();
+            self.burst_sigma_boost_until = Some(now + self.burst_sigma_boost_duration);
+            if !was_active {
+                tracing::warn!(
+                    side = ?side,
+                    burst_count,
+                    boost_secs = self.burst_sigma_boost_duration.as_secs(),
+                    "Fill BURST detected: {} same-side fills in {}s — sigma boost activated",
+                    burst_count,
+                    self.burst_window.as_secs()
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether sigma boost from burst detection is currently active.
+    pub fn sigma_boost_active(&self) -> bool {
+        if let Some(expiry) = self.burst_sigma_boost_until {
+            std::time::Instant::now() < expiry
+        } else {
+            false
+        }
+    }
+
+    /// Sigma multiplier from burst detection: 2.0 when active, 1.0 otherwise.
+    pub fn sigma_boost_factor(&self) -> f64 {
+        if self.sigma_boost_active() {
+            2.0
+        } else {
+            1.0
+        }
     }
 
     /// Count same-side fills within the window.
@@ -1631,5 +1697,45 @@ mod fill_cascade_tests {
         // 5th buy -> WIDEN
         let event = tracker.record_fill(Side::Buy, 0.0);
         assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
+    }
+
+    #[test]
+    fn test_burst_detection_triggers_on_3_fills() {
+        let mut tracker = FillCascadeTracker::new();
+        // 3 same-side fills in quick succession should trigger burst
+        tracker.record_fill(Side::Buy, 0.0);
+        tracker.record_fill(Side::Buy, 0.0);
+        tracker.record_fill(Side::Buy, 0.0);
+        // check_burst should detect 3 fills within 5s window
+        let triggered = tracker.check_burst(Side::Buy);
+        assert!(triggered, "3 same-side fills should trigger burst");
+        assert!(tracker.sigma_boost_active(), "Sigma boost should be active");
+        assert!(
+            (tracker.sigma_boost_factor() - 2.0).abs() < f64::EPSILON,
+            "Sigma boost factor should be 2.0"
+        );
+    }
+
+    #[test]
+    fn test_burst_detection_does_not_trigger_below_threshold() {
+        let mut tracker = FillCascadeTracker::new();
+        // Only 2 fills — below burst threshold of 3
+        tracker.record_fill(Side::Sell, 0.0);
+        tracker.record_fill(Side::Sell, 0.0);
+        let triggered = tracker.check_burst(Side::Sell);
+        assert!(!triggered, "2 fills should not trigger burst");
+        assert!(!tracker.sigma_boost_active());
+        assert!(
+            (tracker.sigma_boost_factor() - 1.0).abs() < f64::EPSILON,
+            "No boost without burst"
+        );
+    }
+
+    #[test]
+    fn test_burst_boost_default_duration() {
+        let tracker = FillCascadeTracker::new();
+        assert_eq!(tracker.burst_window.as_secs(), 5);
+        assert_eq!(tracker.burst_threshold, 3);
+        assert_eq!(tracker.burst_sigma_boost_duration.as_secs(), 30);
     }
 }

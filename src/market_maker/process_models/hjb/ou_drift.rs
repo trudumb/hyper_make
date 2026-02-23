@@ -202,23 +202,29 @@ impl OUDriftEstimator {
             .min(self.config.max_variance);
         let threshold = self.config.reconcile_k * total_uncertainty.sqrt();
 
-        // Check if innovation exceeds threshold
-        let should_reconcile = innovation.abs() > threshold;
+        // === Sigmoid Soft-Gate ===
+        // Replace hard deadband with sigmoid: a slow continuous trend that stays
+        // below threshold was actively reversed by the OU prediction step (the
+        // "boiling frog" problem). The soft-gate always passes some fraction of
+        // the Kalman gain, ensuring slow drifts are tracked.
+        const MIN_GATE_WEIGHT: f64 = 0.05;
 
-        let (new_drift, new_variance, gain) = if should_reconcile {
-            // === Update Step (Kalman filter) ===
-            // Kalman gain: K = P_pred / (P_pred + R)
-            let kalman_gain = predicted_variance / (predicted_variance + observation_noise);
+        let z = innovation.abs() / total_uncertainty.sqrt().max(1e-12);
+        let gate_weight = MIN_GATE_WEIGHT
+            + (1.0 - MIN_GATE_WEIGHT) / (1.0 + (-3.0 * (z - self.config.reconcile_k)).exp());
 
-            // Updated state: D_new = D_pred + K × innovation
-            let updated_drift = predicted_drift + kalman_gain * innovation;
+        // Always compute Kalman gain, scale by gate weight
+        let kalman_gain = predicted_variance / (predicted_variance + observation_noise);
+        let effective_gain = kalman_gain * gate_weight;
 
-            // Updated variance: P_new = (1 - K) × P_pred
-            let updated_variance = ((1.0 - kalman_gain) * predicted_variance)
-                .max(self.config.min_variance)
-                .min(self.config.max_variance);
+        let new_drift = predicted_drift + effective_gain * innovation;
+        let new_variance = ((1.0 - effective_gain) * predicted_variance)
+            .max(self.config.min_variance)
+            .min(self.config.max_variance);
 
-            // Update adaptive σ_D estimation
+        // Update adaptive sigma_D only for significant innovations (above threshold)
+        let should_reconcile = z > self.config.reconcile_k;
+        if should_reconcile {
             self.innovation_sum_sq += innovation.powi(2);
             self.innovation_count += 1;
 
@@ -234,12 +240,9 @@ impl OUDriftEstimator {
                 self.innovation_sum_sq = 0.0;
                 self.innovation_count = 0;
             }
+        }
 
-            (updated_drift, updated_variance, kalman_gain)
-        } else {
-            // No update - use predicted values (filter out noise)
-            (predicted_drift, predicted_variance, 0.0)
-        };
+        let gain = effective_gain;
 
         // Update state
         self.drift = new_drift;
@@ -508,6 +511,97 @@ mod tests {
             (estimator.config.reconcile_k - 1.5).abs() < 1e-12,
             "trending reconcile_k should be 1.5, got {}",
             estimator.config.reconcile_k
+        );
+    }
+
+    #[test]
+    fn test_sigmoid_gate_slow_ramp() {
+        // Fix 2: Verify sigmoid soft-gate tracks slow continuous trends.
+        // With the old hard deadband, sub-threshold innovations were zeroed out,
+        // causing the filter to fight slow trends ("boiling frog" problem).
+        let mut estimator = OUDriftEstimator::default_config();
+
+        // Initialize
+        estimator.update(0, 0.0);
+
+        // Feed 50 observations of linearly increasing drift, each below threshold.
+        // The drift increments are small enough to stay below the deadband
+        // individually, but cumulatively represent a real trend.
+        for i in 1..=50 {
+            let observed = 0.0001 * i as f64; // Slow ramp: 0.1 bps/step
+            estimator.update(i * 100, observed);
+        }
+
+        // With sigmoid soft-gate, drift should track the trend (not stuck at μ=0)
+        assert!(
+            estimator.drift() > 0.001,
+            "Sigmoid gate should track slow ramp. Drift={}, expected > 0.001",
+            estimator.drift()
+        );
+    }
+
+    #[test]
+    fn test_sigmoid_gate_noise_rejection() {
+        // Fix 2: Verify noise rejection still works — small random noise
+        // around μ should result in drift staying near μ.
+        let mut estimator = OUDriftEstimator::default_config();
+
+        // Initialize
+        estimator.update(0, 0.0);
+
+        // Feed 50 observations of pure noise around μ=0
+        // Small noise should get ~5% gate weight, keeping drift near 0
+        let noise_vals = [
+            0.00005, -0.00003, 0.00002, -0.00004, 0.00001,
+        ];
+        for i in 1u64..=50 {
+            let noise = noise_vals[(i as usize) % noise_vals.len()];
+            estimator.update(i * 100, noise);
+        }
+
+        // Drift should stay near zero (noise suppressed by low gate weight)
+        assert!(
+            estimator.drift().abs() < 0.001,
+            "Noise should be mostly rejected. Drift={}, expected near 0",
+            estimator.drift()
+        );
+    }
+
+    #[test]
+    fn test_sigmoid_gate_large_innovation_full_gain() {
+        // Fix 2: A single large innovation should get nearly full Kalman gain.
+        let mut estimator = OUDriftEstimator::default_config();
+
+        // Initialize
+        estimator.update(0, 0.0);
+
+        // Large jump: should trigger near-full gate weight
+        let result = estimator.update(1000, 0.05); // 50 bps jump
+        assert!(
+            result.gain > 0.3,
+            "Large innovation should get substantial gain. Gain={}",
+            result.gain
+        );
+        assert!(
+            estimator.drift().abs() > 0.01,
+            "Large innovation should move drift significantly. Drift={}",
+            estimator.drift()
+        );
+    }
+
+    #[test]
+    fn test_sigmoid_gate_always_nonzero() {
+        // Fix 2: Effective gain should never be exactly 0 (minimum gate weight = 5%).
+        let mut estimator = OUDriftEstimator::default_config();
+        estimator.update(0, 0.0);
+
+        // Very small innovation
+        let result = estimator.update(100, 0.000001);
+        // Gain should be > 0 due to MIN_GATE_WEIGHT
+        assert!(
+            result.gain > 0.0,
+            "Gain should never be exactly 0 with sigmoid gate. Gain={}",
+            result.gain
         );
     }
 }

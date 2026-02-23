@@ -388,6 +388,12 @@ impl KalmanDriftEstimator {
 
         let denom = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
         if denom < 1e-10 {
+            // All fills same direction → zero variance in fill_direction.
+            // This IS the cascade/echo pattern: every fill confirms the same skew.
+            // Return high autocorrelation to suppress Kalman gain (fills uninformative).
+            if self.fill_skew_history.len() >= MIN_FILLS_FOR_AUTOCORRELATION {
+                return 0.8;
+            }
             return AUTOCORRELATION_WARMUP_PRIOR;
         }
 
@@ -974,5 +980,60 @@ mod tests {
         est.state_mean = 0.0;
         est.state_variance = 2.0;
         assert_eq!(est.shrunken_drift_rate_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn test_same_direction_fills_high_autocorrelation() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // 20 same-direction buy fills (zero variance in fill direction)
+        for _ in 0..20 {
+            est.record_fill_for_autocorrelation(1.0, 0.5);
+        }
+
+        let ac = est.fill_quote_autocorrelation();
+        assert!(
+            ac >= 0.7,
+            "All same-direction fills should return high autocorrelation (cascade pattern): {}",
+            ac
+        );
+    }
+
+    #[test]
+    fn test_same_direction_fills_below_threshold_returns_warmup() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Only 10 same-direction fills (below MIN_FILLS_FOR_AUTOCORRELATION=20)
+        for _ in 0..10 {
+            est.record_fill_for_autocorrelation(1.0, 0.5);
+        }
+
+        let ac = est.fill_quote_autocorrelation();
+        assert!(
+            (ac - AUTOCORRELATION_WARMUP_PRIOR).abs() < 0.01,
+            "Below threshold should return warmup prior: {}",
+            ac
+        );
+    }
+
+    #[test]
+    fn test_mixed_fills_proper_pearson() {
+        let mut est = KalmanDriftEstimator::default();
+        est.last_update_ms = now_ms();
+
+        // Alternating fills with matching skew = high echo
+        for _ in 0..10 {
+            est.record_fill_for_autocorrelation(1.0, 0.8);
+            est.record_fill_for_autocorrelation(-1.0, -0.8);
+        }
+
+        let ac = est.fill_quote_autocorrelation();
+        assert!(
+            ac > 0.6,
+            "Mixed fills with matching skew should compute proper Pearson r: {}",
+            ac
+        );
     }
 }

@@ -26,6 +26,11 @@ use super::{
 };
 
 
+/// Inventory utilization ratio at which kill-switch side-clearing activates.
+/// At 90% (vs old 100%), clearing triggers 10% earlier, preventing the final
+/// 10% accumulation that leads to kill-switch activation.
+const KILL_CLEAR_INVENTORY_RATIO: f64 = 0.90;
+
 /// Maximum fraction of effective_max_position allowed in a single resting order.
 ///
 /// GLFT inventory theory: a single fill at max position creates reservation price
@@ -889,12 +894,12 @@ impl LadderStrategy {
         // risk aversion. Kill-switch safety guard at >100% is the only discrete cutoff.
         let abs_inventory_ratio = inventory_ratio.abs();
 
-        // Kill-switch guard: clear accumulating side at >100% utilization (safety-critical)
-        if abs_inventory_ratio >= 1.0 {
+        // Kill-switch guard: clear accumulating side at >=90% utilization (safety-critical)
+        if abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO {
             if position > 0.0 {
-                tracing::warn!(position, "Kill-switch: clearing bids at >100% utilization");
+                tracing::warn!(position, ratio = %format!("{:.2}", abs_inventory_ratio), "Kill-switch: clearing bids at >=90% utilization");
             } else if position < 0.0 {
-                tracing::warn!(position, "Kill-switch: clearing asks at >100% utilization");
+                tracing::warn!(position, ratio = %format!("{:.2}", abs_inventory_ratio), "Kill-switch: clearing asks at >=90% utilization");
             }
         }
 
@@ -1203,7 +1208,7 @@ impl LadderStrategy {
 
         // === KILL-SWITCH SIDE CLEARING (safety-critical) ===
         // Only fires at >100% utilization. Continuous γ(q) handles everything else.
-        if abs_inventory_ratio >= 1.0 {
+        if abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO {
             if position > 0.0 {
                 // Long: clear bids (don't buy more), keep asks (let us sell)
                 dynamic_depths.bid.clear();
@@ -1878,9 +1883,9 @@ impl LadderStrategy {
                 let (ask_allocs, ask_diag) = allocate_risk_budget(&selected_asks, &ask_budget, &softmax_params);
 
                 // Skip if Red zone cleared accumulating side
-                let bid_cleared_by_zone = abs_inventory_ratio >= 1.0
+                let bid_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
                     && position > 0.0;
-                let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
+                let ask_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
                     && position < 0.0;
 
                 // Build ladder from tick-grid allocations
@@ -2248,7 +2253,7 @@ impl LadderStrategy {
                 .max(ladder_config.min_depth_bps);
 
             // Bid concentration fallback — skip if Red zone cleared bids (reduce-only for longs)
-            let bid_cleared_by_zone = abs_inventory_ratio >= 1.0
+            let bid_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
                 && position > 0.0;
             if ladder.bids.is_empty() && !bid_cleared_by_zone {
                 // Total available size for bids, capped at 25% of the USER'S risk-based
@@ -2299,7 +2304,7 @@ impl LadderStrategy {
             }
 
             // Ask concentration fallback — skip if Red zone cleared asks (reduce-only for shorts)
-            let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
+            let ask_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
                 && position < 0.0;
             if ladder.asks.is_empty() && !ask_cleared_by_zone {
                 // Total available size for asks, capped at 25% of the USER'S risk-based
@@ -2508,9 +2513,9 @@ impl LadderStrategy {
             // Skew = up to 30% of half-spread, proportional to inventory
             let guaranteed_skew_bps = guaranteed_inv_ratio * guaranteed_half_spread_bps * 0.3;
 
-            let bid_cleared_by_zone = abs_inventory_ratio >= 1.0
+            let bid_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
                 && position > 0.0;
-            let ask_cleared_by_zone = abs_inventory_ratio >= 1.0
+            let ask_cleared_by_zone = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO
                 && position < 0.0;
 
             // WS4: Guaranteed quotes always apply (no binary circuit breaker gate).
@@ -3555,23 +3560,35 @@ mod tests {
 
     #[test]
     fn test_kill_guard_clears_accumulating_side() {
-        // At >=100% utilization, accumulating side is cleared (kill guard).
+        // At >=90% utilization (KILL_CLEAR_INVENTORY_RATIO), accumulating side is cleared.
         // This is the only discrete cutoff — everything else is continuous γ(q).
         let position = 1.0_f64;
-        let abs_inventory_ratio = 1.05; // >100%
-        let bid_cleared = abs_inventory_ratio >= 1.0 && position > 0.0;
-        let ask_cleared = abs_inventory_ratio >= 1.0 && position < 0.0;
+        let abs_inventory_ratio = 0.95; // Above 90% threshold
+        let bid_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
+        let ask_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
 
-        assert!(bid_cleared, "Long at >100%: bids should be cleared");
-        assert!(!ask_cleared, "Long at >100%: asks should NOT be cleared");
+        assert!(bid_cleared, "Long at 95%: bids should be cleared (threshold=90%)");
+        assert!(!ask_cleared, "Long at 95%: asks should NOT be cleared");
 
-        // Short at >100%: asks cleared
+        // Short at >90%: asks cleared
         let position_short = -1.0_f64;
-        let bid_cleared_short = abs_inventory_ratio >= 1.0 && position_short > 0.0;
-        let ask_cleared_short = abs_inventory_ratio >= 1.0 && position_short < 0.0;
+        let bid_cleared_short = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position_short > 0.0;
+        let ask_cleared_short = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position_short < 0.0;
 
-        assert!(!bid_cleared_short, "Short at >100%: bids should NOT be cleared");
-        assert!(ask_cleared_short, "Short at >100%: asks should be cleared");
+        assert!(!bid_cleared_short, "Short at 95%: bids should NOT be cleared");
+        assert!(ask_cleared_short, "Short at 95%: asks should be cleared");
+    }
+
+    #[test]
+    fn test_kill_guard_does_not_clear_below_threshold() {
+        // At 85% utilization (below KILL_CLEAR_INVENTORY_RATIO=0.90), nothing is cleared.
+        let position = 1.0_f64;
+        let abs_inventory_ratio = 0.85;
+        let bid_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position > 0.0;
+        let ask_cleared = abs_inventory_ratio >= KILL_CLEAR_INVENTORY_RATIO && position < 0.0;
+
+        assert!(!bid_cleared, "Long at 85%: bids should NOT be cleared (below 90% threshold)");
+        assert!(!ask_cleared, "Long at 85%: asks should NOT be cleared");
     }
 
     #[test]
