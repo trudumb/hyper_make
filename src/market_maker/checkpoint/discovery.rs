@@ -180,7 +180,8 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("discovery_test_{id}"));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("discovery_test_{pid}_{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
