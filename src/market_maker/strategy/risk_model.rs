@@ -240,9 +240,9 @@ impl CalibratedRiskModel {
             beta_cascade: 1.8,
             // More conservative tail risk during warmup
             beta_tail_risk: 1.05,
-            beta_drawdown: 2.0, // More conservative during warmup
-            beta_regime: 1.5,   // More conservative during warmup
-            beta_ghost: 0.75,   // More conservative during warmup
+            beta_drawdown: 2.0,       // More conservative during warmup
+            beta_regime: 1.5,         // More conservative during warmup
+            beta_ghost: 0.75,         // More conservative during warmup
             beta_continuation: -0.25, // Less confident in continuation during warmup
             ..Default::default()
         }
@@ -375,7 +375,8 @@ impl CalibratedRiskModel {
             beta_drawdown: self.beta_drawdown * (1.0 - alpha) + defaults.beta_drawdown * alpha,
             beta_regime: self.beta_regime * (1.0 - alpha) + defaults.beta_regime * alpha,
             beta_ghost: self.beta_ghost * (1.0 - alpha) + defaults.beta_ghost * alpha,
-            beta_continuation: self.beta_continuation * (1.0 - alpha) + defaults.beta_continuation * alpha,
+            beta_continuation: self.beta_continuation * (1.0 - alpha)
+                + defaults.beta_continuation * alpha,
             gamma_min: self.gamma_min,
             gamma_max: self.gamma_max,
             n_samples: self.n_samples,
@@ -584,9 +585,9 @@ impl RiskFeatures {
             position_direction_confidence: 0.0, // No confidence → high gamma
             cascade_intensity: 1.0,
             tail_risk_intensity: 1.0,
-            drawdown_fraction: 0.5,  // 50% drawdown
-            regime_risk_score: 0.59, // ln(1.8) — extreme regime
-            ghost_depletion: 1.0,    // Full ghost depletion
+            drawdown_fraction: 0.5,        // 50% drawdown
+            regime_risk_score: 0.59,       // ln(1.8) — extreme regime
+            ghost_depletion: 1.0,          // Full ghost depletion
             continuation_probability: 0.0, // No continuation -> higher gamma
         }
     }
@@ -670,11 +671,11 @@ impl RiskFeatures {
             depth_depletion,
             model_uncertainty,
             position_direction_confidence,
-            cascade_intensity: 0.0,   // Not available from MarketState
-            tail_risk_intensity: 0.0, // Not available from MarketState
-            drawdown_fraction: 0.0,   // Not available from MarketState
-            regime_risk_score: 0.0,   // Not available from MarketState
-            ghost_depletion: 0.0,     // Not available from MarketState
+            cascade_intensity: 0.0,        // Not available from MarketState
+            tail_risk_intensity: 0.0,      // Not available from MarketState
+            drawdown_fraction: 0.0,        // Not available from MarketState
+            regime_risk_score: 0.0,        // Not available from MarketState
+            ghost_depletion: 0.0,          // Not available from MarketState
             continuation_probability: 0.5, // Not available from MarketState, use neutral
         }
     }

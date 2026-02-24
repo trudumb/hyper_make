@@ -25,7 +25,6 @@
 
 use crate::market_maker::stochastic::ContinuationPosterior;
 
-
 /// Configuration for PositionDecisionEngine.
 #[derive(Debug, Clone)]
 pub struct PositionDecisionConfig {
@@ -87,7 +86,6 @@ pub struct PositionDecisionEngine {
     /// Fill count since last decay
     fills_since_decay: u64,
 }
-
 
 impl Default for PositionDecisionEngine {
     fn default() -> Self {
@@ -197,7 +195,6 @@ impl PositionDecisionEngine {
         &self.current_regime
     }
 }
-
 
 #[cfg(test)]
 mod tests {

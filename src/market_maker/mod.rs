@@ -1590,72 +1590,73 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 /// Used by handlers to trigger immediate cancel of resting accumulating orders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadeEvent {
-    /// 5+ same-side fills: widen that side's spread
+    /// Intensity ratio crossed widen threshold: widen that side's spread
     Widen(Side),
-    /// 8+ same-side fills: suppress (reduce-only) that side
+    /// Intensity ratio crossed suppress threshold: suppress (reduce-only) that side
     Suppress(Side),
 }
 
-/// Tracks consecutive same-side fills to detect and mitigate fill cascades.
+/// Cascade severity level for tracking escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CascadeLevel {
+    None,
+    Widen,
+    Suppress,
+}
+
+/// Size-weighted Hawkes cascade tracker.
 ///
-/// When the MM receives fills on one side (e.g., 5+ same-side fills in 60s),
-/// this tracker widens that side's spread (2x) or suppresses it entirely (after 8+),
-/// preventing runaway position accumulation during trending markets.
-///
-/// ALL same-side fills are counted, including reducing fills. Even "reducing" fills
-/// indicate one-directional flow that may flip position and continue accumulating.
-///
-/// The key insight: fill clustering on one side is a strong signal of adverse flow.
-/// Position limits alone are too late — by the time position hits the limit,
-/// the loss is already realized.
+/// Replaces naive VecDeque+count with two `IncrementalHawkes` instances (one per side).
+/// Intensity ratio λ/μ drives graduated response: burst → widen → suppress.
+/// Large fills contribute proportionally more via `size_scale` normalization.
 #[derive(Debug)]
 pub struct FillCascadeTracker {
-    /// Recent fills: (timestamp, side)
-    recent_fills: std::collections::VecDeque<(std::time::Instant, Side)>,
-    /// Rolling window for cascade detection
-    window: std::time::Duration,
-    /// Number of same-side fills to trigger widening
-    widen_threshold: usize,
-    /// Number of same-side fills to trigger suppression (reduce-only mode)
-    suppress_threshold: usize,
-    /// Cooldown: suppressed side and expiry time
-    cooldown_until: Option<(std::time::Instant, Side)>,
-    /// Cooldown duration for widen mode
+    hawkes_buy: process_models::IncrementalHawkes,
+    hawkes_sell: process_models::IncrementalHawkes,
+    baseline_intensity: f64,
+    cooldown_until: Option<(std::time::Instant, Side, CascadeLevel)>,
     widen_cooldown: std::time::Duration,
-    /// Cooldown duration for suppress mode
     suppress_cooldown: std::time::Duration,
-    /// Spread widening (bps) when widening (default 10.0).
+    widen_intensity_ratio: f64,
+    suppress_intensity_ratio: f64,
+    burst_intensity_ratio: f64,
     widen_addon_bps: f64,
-    /// Spread widening (bps) when suppressing (default 20.0).
     suppress_addon_bps: f64,
-    // === Fill burst detection (fast cascade reaction) ===
-    /// Short window for burst detection (default 5s).
-    burst_window: std::time::Duration,
-    /// Number of same-side fills in burst window to trigger sigma boost.
-    burst_threshold: usize,
-    /// When sigma boost expires (None = inactive).
     burst_sigma_boost_until: Option<std::time::Instant>,
-    /// Duration of sigma boost after burst detected.
     burst_sigma_boost_duration: std::time::Duration,
+    last_level_buy: CascadeLevel,
+    last_level_sell: CascadeLevel,
 }
 
 impl FillCascadeTracker {
     /// Create a fill cascade tracker from a CascadeConfig.
     pub fn new_with_config(cfg: &CascadeConfig) -> Self {
         Self {
-            recent_fills: std::collections::VecDeque::with_capacity(32),
-            window: std::time::Duration::from_secs(60),
-            widen_threshold: cfg.widen_threshold,
-            suppress_threshold: cfg.suppress_threshold,
+            hawkes_buy: process_models::IncrementalHawkes::new(
+                cfg.baseline_intensity,
+                cfg.alpha,
+                cfg.beta,
+                cfg.size_scale,
+            ),
+            hawkes_sell: process_models::IncrementalHawkes::new(
+                cfg.baseline_intensity,
+                cfg.alpha,
+                cfg.beta,
+                cfg.size_scale,
+            ),
+            baseline_intensity: cfg.baseline_intensity,
             cooldown_until: None,
             widen_cooldown: std::time::Duration::from_secs(cfg.widen_cooldown_secs),
             suppress_cooldown: std::time::Duration::from_secs(cfg.suppress_cooldown_secs),
+            widen_intensity_ratio: cfg.widen_intensity_ratio,
+            suppress_intensity_ratio: cfg.suppress_intensity_ratio,
+            burst_intensity_ratio: cfg.burst_intensity_ratio,
             widen_addon_bps: cfg.widen_addon_bps,
             suppress_addon_bps: cfg.suppress_addon_bps,
-            burst_window: std::time::Duration::from_secs(5),
-            burst_threshold: 3,
             burst_sigma_boost_until: None,
-            burst_sigma_boost_duration: std::time::Duration::from_secs(30),
+            burst_sigma_boost_duration: std::time::Duration::from_secs(cfg.burst_sigma_boost_secs),
+            last_level_buy: CascadeLevel::None,
+            last_level_sell: CascadeLevel::None,
         }
     }
 
@@ -1664,103 +1665,162 @@ impl FillCascadeTracker {
         Self::new_with_config(&CascadeConfig::default())
     }
 
-    /// Record a fill event. ALL same-side fills are counted regardless of current position.
-    /// Returns `Some(CascadeEvent)` when a threshold is newly crossed,
-    /// signaling the handler to cancel resting accumulating-side orders immediately.
-    pub fn record_fill(&mut self, side: Side, _position: f64) -> Option<CascadeEvent> {
-        // Count ALL same-side fills — even "reducing" fills indicate one-directional flow
-        // that may flip position and continue accumulating.
-        let now = std::time::Instant::now();
-        let prev_count = self.count_same_side(side, now);
-        self.recent_fills.push_back((now, side));
-        self.prune_old_fills(now);
+    /// Record a size-weighted fill event.
+    /// Returns `Some(CascadeEvent)` when intensity ratio newly crosses a threshold.
+    pub fn record_fill(&mut self, side: Side, _position: f64, size: f64) -> Option<CascadeEvent> {
+        self.clear_expired_cooldown();
 
-        // Check for cascade
-        let same_side_count = self.count_same_side(side, now);
-        if same_side_count >= self.suppress_threshold {
-            self.cooldown_until = Some((now + self.suppress_cooldown, side));
-            let newly_crossed = prev_count < self.suppress_threshold;
-            tracing::warn!(
-                side = ?side,
-                count = same_side_count,
-                suppress_secs = self.suppress_cooldown.as_secs(),
-                newly_crossed,
-                "Fill cascade SUPPRESS: {} same-side fills in {}s window",
-                same_side_count,
-                self.window.as_secs()
-            );
-            if newly_crossed {
-                return Some(CascadeEvent::Suppress(side));
-            }
-        } else if same_side_count >= self.widen_threshold {
-            // Only set widen cooldown if not already in suppress mode for this side
-            if !self.is_suppressed(side) {
-                let newly_crossed = prev_count < self.widen_threshold;
-                self.cooldown_until = Some((now + self.widen_cooldown, side));
+        let hawkes = match side {
+            Side::Buy => &mut self.hawkes_buy,
+            Side::Sell => &mut self.hawkes_sell,
+        };
+
+        // Record event and compute ratio from returned intensity (avoids double Instant::now())
+        let intensity = hawkes.record_event(size);
+        let ratio = if self.baseline_intensity > 0.0 {
+            intensity / self.baseline_intensity
+        } else {
+            1.0
+        };
+
+        // Determine current cascade level from ratio
+        let current_level = if ratio >= self.suppress_intensity_ratio {
+            CascadeLevel::Suppress
+        } else if ratio >= self.widen_intensity_ratio {
+            CascadeLevel::Widen
+        } else {
+            CascadeLevel::None
+        };
+
+        // Check burst: if ratio >= burst threshold, activate sigma boost
+        if ratio >= self.burst_intensity_ratio {
+            let was_active = self.sigma_boost_active();
+            self.burst_sigma_boost_until =
+                Some(std::time::Instant::now() + self.burst_sigma_boost_duration);
+            if !was_active {
                 tracing::warn!(
                     side = ?side,
-                    count = same_side_count,
-                    widen_secs = self.widen_cooldown.as_secs(),
-                    newly_crossed,
-                    "Fill cascade WIDEN: {} same-side fills in {}s window",
-                    same_side_count,
-                    self.window.as_secs()
+                    ratio = format!("{:.2}", ratio),
+                    boost_secs = self.burst_sigma_boost_duration.as_secs(),
+                    "Fill BURST detected: intensity ratio {:.2} >= {:.2} — sigma boost activated",
+                    ratio,
+                    self.burst_intensity_ratio,
                 );
-                if newly_crossed {
-                    return Some(CascadeEvent::Widen(side));
-                }
             }
         }
-        None
+
+        let last_level = match side {
+            Side::Buy => &mut self.last_level_buy,
+            Side::Sell => &mut self.last_level_sell,
+        };
+
+        // Only emit event when level escalates (current > previous)
+        let event = if current_level > *last_level {
+            let now = std::time::Instant::now();
+            match current_level {
+                CascadeLevel::Suppress => {
+                    self.cooldown_until =
+                        Some((now + self.suppress_cooldown, side, CascadeLevel::Suppress));
+                    tracing::warn!(
+                        side = ?side,
+                        ratio = format!("{:.2}", ratio),
+                        suppress_secs = self.suppress_cooldown.as_secs(),
+                        "Fill cascade SUPPRESS: intensity ratio {:.2} >= {:.2}",
+                        ratio,
+                        self.suppress_intensity_ratio,
+                    );
+                    Some(CascadeEvent::Suppress(side))
+                }
+                CascadeLevel::Widen => {
+                    self.cooldown_until =
+                        Some((now + self.widen_cooldown, side, CascadeLevel::Widen));
+                    tracing::warn!(
+                        side = ?side,
+                        ratio = format!("{:.2}", ratio),
+                        widen_secs = self.widen_cooldown.as_secs(),
+                        "Fill cascade WIDEN: intensity ratio {:.2} >= {:.2}",
+                        ratio,
+                        self.widen_intensity_ratio,
+                    );
+                    Some(CascadeEvent::Widen(side))
+                }
+                CascadeLevel::None => None,
+            }
+        } else {
+            None
+        };
+
+        // Update tracked level — decay back to None if ratio dropped below thresholds
+        *last_level = current_level;
+
+        event
     }
 
     /// Get spread widening for a side (0.0 = normal, configurable widening due to cascade).
     pub fn spread_addon_bps(&self, side: Side) -> f64 {
-        let now = std::time::Instant::now();
-        if let Some((expiry, cooldown_side)) = self.cooldown_until {
-            if now < expiry && cooldown_side == side {
-                let same_side_count = self.count_same_side(side, now);
-                if same_side_count >= self.suppress_threshold {
-                    return self.suppress_addon_bps;
-                }
-                return self.widen_addon_bps;
+        // Check active cooldown first
+        if let Some((expiry, cooldown_side, level)) = self.cooldown_until {
+            if std::time::Instant::now() < expiry && cooldown_side == side {
+                return match level {
+                    CascadeLevel::Suppress => self.suppress_addon_bps,
+                    CascadeLevel::Widen => self.widen_addon_bps,
+                    CascadeLevel::None => 0.0,
+                };
             }
         }
-        0.0
+        // Fallback: check live intensity ratio via snapshot (no &mut needed)
+        let ratio = match side {
+            Side::Buy => self.hawkes_buy.intensity_ratio_snapshot(),
+            Side::Sell => self.hawkes_sell.intensity_ratio_snapshot(),
+        };
+        if ratio >= self.suppress_intensity_ratio {
+            self.suppress_addon_bps
+        } else if ratio >= self.widen_intensity_ratio {
+            self.widen_addon_bps
+        } else {
+            0.0
+        }
     }
 
     /// Check if a side is suppressed (reduce-only).
     pub fn is_suppressed(&self, side: Side) -> bool {
-        let now = std::time::Instant::now();
-        if let Some((expiry, cooldown_side)) = self.cooldown_until {
-            if now < expiry && cooldown_side == side {
-                return self.count_same_side(side, now) >= self.suppress_threshold;
+        // Check active cooldown
+        if let Some((expiry, cooldown_side, level)) = self.cooldown_until {
+            if std::time::Instant::now() < expiry
+                && cooldown_side == side
+                && level == CascadeLevel::Suppress
+            {
+                return true;
             }
         }
-        false
+        // Fallback: check live intensity ratio via snapshot
+        let ratio = match side {
+            Side::Buy => self.hawkes_buy.intensity_ratio_snapshot(),
+            Side::Sell => self.hawkes_sell.intensity_ratio_snapshot(),
+        };
+        ratio >= self.suppress_intensity_ratio
     }
 
-    /// Check for fill burst (short-window clustering).
-    /// Returns true when burst threshold is newly crossed, activating sigma boost.
+    /// Check for fill burst (intensity ratio above burst threshold).
+    /// Returns true when sigma boost is newly activated.
     pub fn check_burst(&mut self, side: Side) -> bool {
-        let now = std::time::Instant::now();
-        let cutoff = now.checked_sub(self.burst_window).unwrap_or(now);
-        let burst_count = self
-            .recent_fills
-            .iter()
-            .filter(|(t, s)| *t >= cutoff && *s == side)
-            .count();
-        if burst_count >= self.burst_threshold {
+        let hawkes = match side {
+            Side::Buy => &mut self.hawkes_buy,
+            Side::Sell => &mut self.hawkes_sell,
+        };
+        let ratio = hawkes.intensity_ratio();
+        if ratio >= self.burst_intensity_ratio {
             let was_active = self.sigma_boost_active();
-            self.burst_sigma_boost_until = Some(now + self.burst_sigma_boost_duration);
+            self.burst_sigma_boost_until =
+                Some(std::time::Instant::now() + self.burst_sigma_boost_duration);
             if !was_active {
                 tracing::warn!(
                     side = ?side,
-                    burst_count,
+                    ratio = format!("{:.2}", ratio),
                     boost_secs = self.burst_sigma_boost_duration.as_secs(),
-                    "Fill BURST detected: {} same-side fills in {}s — sigma boost activated",
-                    burst_count,
-                    self.burst_window.as_secs()
+                    "Fill BURST detected: intensity ratio {:.2} >= {:.2} — sigma boost activated",
+                    ratio,
+                    self.burst_intensity_ratio,
                 );
                 return true;
             }
@@ -1786,28 +1846,10 @@ impl FillCascadeTracker {
         }
     }
 
-    /// Count same-side fills within the window.
-    fn count_same_side(&self, side: Side, now: std::time::Instant) -> usize {
-        let cutoff = now.checked_sub(self.window).unwrap_or(now);
-        self.recent_fills
-            .iter()
-            .filter(|(t, s)| *t >= cutoff && *s == side)
-            .count()
-    }
-
-    /// Remove fills older than the window.
-    fn prune_old_fills(&mut self, now: std::time::Instant) {
-        let cutoff = now.checked_sub(self.window).unwrap_or(now);
-        while let Some(&(t, _)) = self.recent_fills.front() {
-            if t < cutoff {
-                self.recent_fills.pop_front();
-            } else {
-                break;
-            }
-        }
-        // Also clear expired cooldown
-        if let Some((expiry, _)) = self.cooldown_until {
-            if now >= expiry {
+    /// Clear expired cooldown.
+    fn clear_expired_cooldown(&mut self) {
+        if let Some((expiry, _, _)) = self.cooldown_until {
+            if std::time::Instant::now() >= expiry {
                 self.cooldown_until = None;
             }
         }
@@ -1824,143 +1866,205 @@ impl Default for FillCascadeTracker {
 mod fill_cascade_tests {
     use super::*;
 
-    #[test]
-    fn test_all_same_side_fills_counted() {
-        let mut tracker = FillCascadeTracker::new();
-        // ALL same-side fills counted regardless of position
-        for i in 0..4 {
-            assert!(
-                tracker.record_fill(Side::Sell, 5.0).is_none(),
-                "fill {} should not trigger",
-                i + 1
-            );
+    /// Test config: baseline=1.0, alpha=1.1, beta=2.0, size_scale=1.0
+    /// Each unit-size fill adds 1.1 to weighted_sum. With fast tests (micro-second gaps),
+    /// ratio after N fills ≈ 1 + N*1.1 (comfortably above thresholds, avoids exact boundaries).
+    fn test_cascade_config() -> CascadeConfig {
+        CascadeConfig {
+            baseline_intensity: 1.0,
+            alpha: 1.1,
+            beta: 2.0,
+            size_scale: 1.0,
+            widen_intensity_ratio: 3.0,
+            suppress_intensity_ratio: 5.0,
+            burst_intensity_ratio: 2.0,
+            widen_addon_bps: 10.0,
+            suppress_addon_bps: 20.0,
+            widen_cooldown_secs: 15,
+            suppress_cooldown_secs: 30,
+            burst_sigma_boost_secs: 30,
         }
-        let event = tracker.record_fill(Side::Sell, 5.0); // 5th sell -> WIDEN
-        assert_eq!(event, Some(CascadeEvent::Widen(Side::Sell)));
-        assert!(tracker.spread_addon_bps(Side::Sell) > 0.0);
-
-        let mut tracker2 = FillCascadeTracker::new();
-        for i in 0..4 {
-            assert!(
-                tracker2.record_fill(Side::Buy, -5.0).is_none(),
-                "fill {} should not trigger",
-                i + 1
-            );
-        }
-        let event2 = tracker2.record_fill(Side::Buy, -5.0); // 5th buy -> WIDEN
-        assert_eq!(event2, Some(CascadeEvent::Widen(Side::Buy)));
-        assert!(tracker2.spread_addon_bps(Side::Buy) > 0.0);
     }
 
     #[test]
-    fn test_accumulating_fills_trigger_cascade() {
-        let mut tracker = FillCascadeTracker::new();
-        for i in 0..4 {
-            assert!(tracker.record_fill(Side::Buy, i as f64).is_none());
-        }
-        // 5th buy triggers WIDEN (threshold = 5)
-        let event = tracker.record_fill(Side::Buy, 4.0);
-        assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
-        assert!(tracker.spread_addon_bps(Side::Buy) > 0.0);
+    fn test_fill_cascade_small_fills_no_cascade() {
+        // 1 fill → ratio ≈ 2.1, below widen (3.0)
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        let event = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(event.is_none(), "single fill should not trigger cascade");
     }
 
     #[test]
-    fn test_suppress_at_eight_same_side_fills() {
-        let mut tracker = FillCascadeTracker::new();
-        // 4 sells -> no trigger yet
-        for _ in 0..4 {
-            assert!(tracker.record_fill(Side::Sell, 0.0).is_none());
-        }
-        // 5th sell -> Widen
-        let event5 = tracker.record_fill(Side::Sell, -1.0);
-        assert_eq!(event5, Some(CascadeEvent::Widen(Side::Sell)));
-        // 6th and 7th -> no new event
-        for _ in 0..2 {
-            assert!(tracker.record_fill(Side::Sell, -2.0).is_none());
-        }
-        // 8th sell -> Suppress (threshold = 8)
-        let event8 = tracker.record_fill(Side::Sell, -3.0);
-        assert_eq!(event8, Some(CascadeEvent::Suppress(Side::Sell)));
-        assert!(tracker.is_suppressed(Side::Sell));
+    fn test_fill_cascade_widen_at_threshold() {
+        // 2 fills → ratio ≈ 3.2, triggers Widen
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        let e1 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(e1.is_none(), "first fill below widen");
+        let e2 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert_eq!(e2, Some(CascadeEvent::Widen(Side::Buy)));
     }
 
     #[test]
-    fn test_widen_skips_reducing_side() {
-        let mut tracker = FillCascadeTracker::new();
-        for _ in 0..5 {
-            tracker.record_fill(Side::Sell, -1.0);
-        }
-        let addon = tracker.spread_addon_bps(Side::Sell);
-        assert!(addon > 0.0, "Sell cascade should widen");
+    fn test_fill_cascade_suppress_at_threshold() {
+        // 4 fills → ratio ≈ 5.4, triggers Suppress (after Widen at 2)
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        let e1 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(e1.is_none());
+        let e2 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert_eq!(e2, Some(CascadeEvent::Widen(Side::Buy)));
+        let e3 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(e3.is_none(), "already at widen, not yet suppress");
+        let e4 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert_eq!(e4, Some(CascadeEvent::Suppress(Side::Buy)));
+        assert!(tracker.is_suppressed(Side::Buy));
+    }
 
-        // But quote_engine checks position: if position > 0, skip widen for sells
-        let position = 5.0; // long
-        let should_widen_sells = addon > 0.0 && position <= 0.0;
-        assert!(
-            !should_widen_sells,
-            "Should NOT widen sells when long (reducing)"
+    #[test]
+    fn test_fill_cascade_size_weighting() {
+        // 1 fill of size 3.0 ≈ 3 fills of size 1.0, hits widen
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        // size_scale=1.0, alpha=1.1, so size 3.0 contributes 3.3 to weighted_sum
+        // ratio = (1.0 + 3.3) / 1.0 = 4.3 ≥ widen(3.0)
+        let event = tracker.record_fill(Side::Sell, 0.0, 3.0);
+        assert_eq!(
+            event,
+            Some(CascadeEvent::Widen(Side::Sell)),
+            "single large fill should trigger widen"
         );
     }
 
     #[test]
-    fn test_cooldown_durations() {
-        let tracker = FillCascadeTracker::new();
-        assert_eq!(tracker.widen_cooldown.as_secs(), 15);
-        assert_eq!(tracker.suppress_cooldown.as_secs(), 30);
+    fn test_fill_cascade_sides_independent() {
+        // 10 buy fills, sell ratio stays ≈ 1.0
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        for _ in 0..10 {
+            tracker.record_fill(Side::Buy, 0.0, 1.0);
+        }
+        // Sell side should be unaffected
+        assert!(
+            !tracker.is_suppressed(Side::Sell),
+            "sell side should not be suppressed"
+        );
+        assert!(
+            tracker.spread_addon_bps(Side::Sell) < f64::EPSILON,
+            "sell side should have no addon"
+        );
     }
 
     #[test]
-    fn test_mixed_sides_all_counted() {
-        let mut tracker = FillCascadeTracker::new();
-        // Mix of sides -- each side counted independently
-        tracker.record_fill(Side::Buy, 0.0); // 1 buy
-        tracker.record_fill(Side::Sell, 1.0); // 1 sell
-        tracker.record_fill(Side::Buy, 0.0); // 2 buys
-        tracker.record_fill(Side::Sell, 1.0); // 2 sells
-        tracker.record_fill(Side::Buy, 0.0); // 3 buys
-        tracker.record_fill(Side::Buy, 0.0); // 4 buys
-                                             // 5th buy -> WIDEN
-        let event = tracker.record_fill(Side::Buy, 0.0);
-        assert_eq!(event, Some(CascadeEvent::Widen(Side::Buy)));
+    fn test_fill_cascade_newly_crossed_only() {
+        // After Widen, additional fill at same level returns None
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        tracker.record_fill(Side::Buy, 0.0, 1.0); // ratio ≈ 2.1
+        let e2 = tracker.record_fill(Side::Buy, 0.0, 1.0); // ratio ≈ 3.2 → Widen
+        assert_eq!(e2, Some(CascadeEvent::Widen(Side::Buy)));
+        // 3rd fill: ratio ≈ 4.3, still Widen level, no re-emit
+        let e3 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(e3.is_none(), "should not re-emit Widen");
     }
 
     #[test]
-    fn test_burst_detection_triggers_on_3_fills() {
-        let mut tracker = FillCascadeTracker::new();
-        // 3 same-side fills in quick succession should trigger burst
-        tracker.record_fill(Side::Buy, 0.0);
-        tracker.record_fill(Side::Buy, 0.0);
-        tracker.record_fill(Side::Buy, 0.0);
-        // check_burst should detect 3 fills within 5s window
-        let triggered = tracker.check_burst(Side::Buy);
-        assert!(triggered, "3 same-side fills should trigger burst");
-        assert!(tracker.sigma_boost_active(), "Sigma boost should be active");
+    fn test_fill_cascade_re_trigger_after_decay() {
+        // Use high beta so events decay very fast, with alpha < beta
+        let mut cfg = test_cascade_config();
+        cfg.beta = 50.0;
+        cfg.alpha = 1.5; // alpha < beta, each fill adds 1.5 to weighted_sum
+        let mut tracker = FillCascadeTracker::new_with_config(&cfg);
+
+        // First burst: 2 fills → ratio ≈ 1 + 1.5 + 1.5 = 4.0 → Widen (3.0)
+        tracker.record_fill(Side::Buy, 0.0, 1.0);
+        let e2 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert_eq!(e2, Some(CascadeEvent::Widen(Side::Buy)));
+
+        // Sleep briefly to let intensity decay (beta=50 → exp(-50*0.2) ≈ 0)
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // After decay, first fill resets level to below widen
+        // ratio ≈ 1 + 1.5 = 2.5 < widen(3.0) → CascadeLevel::None
+        // last_level updates from Widen → None
+        let e3 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(e3.is_none(), "first fill after decay below widen");
+
+        // Second fill re-triggers Widen: ratio ≈ 1 + 1.5 + 1.5 = 4.0 ≥ widen(3.0)
+        let e4 = tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert_eq!(
+            e4,
+            Some(CascadeEvent::Widen(Side::Buy)),
+            "should re-trigger widen after decay"
+        );
+    }
+
+    #[test]
+    fn test_fill_cascade_burst_activates_sigma() {
+        // Fill above burst ratio → sigma_boost_active + factor 2.0
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        // 1 fill of size 1.0 → ratio ≈ 2.1 ≥ burst(2.0)
+        tracker.record_fill(Side::Buy, 0.0, 1.0);
+        assert!(
+            tracker.sigma_boost_active(),
+            "burst should activate sigma boost"
+        );
         assert!(
             (tracker.sigma_boost_factor() - 2.0).abs() < f64::EPSILON,
-            "Sigma boost factor should be 2.0"
+            "sigma boost factor should be 2.0"
         );
     }
 
     #[test]
-    fn test_burst_detection_does_not_trigger_below_threshold() {
-        let mut tracker = FillCascadeTracker::new();
-        // Only 2 fills — below burst threshold of 3
-        tracker.record_fill(Side::Sell, 0.0);
-        tracker.record_fill(Side::Sell, 0.0);
-        let triggered = tracker.check_burst(Side::Sell);
-        assert!(!triggered, "2 fills should not trigger burst");
-        assert!(!tracker.sigma_boost_active());
+    fn test_fill_cascade_burst_below_threshold() {
+        // 1 tiny fill → ratio < burst threshold → no sigma boost
+        let mut cfg = test_cascade_config();
+        cfg.burst_intensity_ratio = 3.0; // raise burst threshold
+        let mut tracker = FillCascadeTracker::new_with_config(&cfg);
+        tracker.record_fill(Side::Sell, 0.0, 0.5);
+        // ratio = 1.0 + 1.1*0.5 = 1.55 < burst(3.0)
+        assert!(
+            !tracker.sigma_boost_active(),
+            "tiny fill should not trigger burst"
+        );
         assert!(
             (tracker.sigma_boost_factor() - 1.0).abs() < f64::EPSILON,
-            "No boost without burst"
+            "no boost without burst"
         );
     }
 
     #[test]
-    fn test_burst_boost_default_duration() {
-        let tracker = FillCascadeTracker::new();
-        assert_eq!(tracker.burst_window.as_secs(), 5);
-        assert_eq!(tracker.burst_threshold, 3);
-        assert_eq!(tracker.burst_sigma_boost_duration.as_secs(), 30);
+    fn test_fill_cascade_cooldown_spread_addon() {
+        // After Widen, spread_addon_bps returns widen_addon_bps
+        let mut tracker = FillCascadeTracker::new_with_config(&test_cascade_config());
+        tracker.record_fill(Side::Sell, 0.0, 1.0);
+        tracker.record_fill(Side::Sell, 0.0, 1.0); // triggers Widen
+        let addon = tracker.spread_addon_bps(Side::Sell);
+        assert!(
+            (addon - 10.0).abs() < f64::EPSILON,
+            "widen addon should be 10.0, got {}",
+            addon
+        );
+    }
+
+    #[test]
+    fn test_fill_cascade_config_default_validates() {
+        assert!(CascadeConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_fill_cascade_config_rejects_bad_params() {
+        // alpha >= beta (non-stationary)
+        let mut cfg = CascadeConfig::default();
+        cfg.alpha = cfg.beta;
+        assert!(cfg.validate().is_err(), "alpha >= beta should fail");
+
+        // baseline <= 0
+        let mut cfg2 = CascadeConfig::default();
+        cfg2.baseline_intensity = 0.0;
+        assert!(cfg2.validate().is_err(), "zero baseline should fail");
+
+        // suppress <= widen ratio
+        let mut cfg3 = CascadeConfig::default();
+        cfg3.suppress_intensity_ratio = cfg3.widen_intensity_ratio;
+        assert!(
+            cfg3.validate().is_err(),
+            "suppress <= widen ratio should fail"
+        );
     }
 }

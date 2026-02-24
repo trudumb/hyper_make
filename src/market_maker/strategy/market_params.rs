@@ -911,7 +911,6 @@ pub struct MarketParams {
     pub time_since_adverse_move: f64,
 
     // Used to transform inventory_ratio for GLFT skew calculation.
-
     /// P(continuation) from Beta-Binomial posterior.
     /// Higher values indicate the position direction is likely to continue.
     /// Range: [0, 1], prior mean depends on regime.
@@ -920,7 +919,7 @@ pub struct MarketParams {
     /// Confidence in continuation estimate [0, 1].
     /// Based on variance reduction from uniform prior.
     /// Higher with more fill observations.
-    pub continuation_confidence: f64,    // ==================== Bayesian Learned Parameters (Phase 6) ====================
+    pub continuation_confidence: f64, // ==================== Bayesian Learned Parameters (Phase 6) ====================
     /// Whether using Bayesian learned parameters instead of static config values.
     /// When true, learned_kappa, learned_alpha_touch, etc. are being used.
     pub use_learned_parameters: bool,
@@ -1333,8 +1332,8 @@ impl Default for MarketParams {
             position_direction_confidence: 0.5, // Neutral confidence initially
             time_since_adverse_move: 0.0,       // No history initially
             // Position Continuation Model
-            continuation_p: 0.5,                               // Neutral prior
-            continuation_confidence: 0.0,                      // No confidence until fills observed
+            continuation_p: 0.5,          // Neutral prior
+            continuation_confidence: 0.0, // No confidence until fills observed
             // Bayesian Learned Parameters (Phase 6)
             use_learned_parameters: false,    // Off until calibrated
             learned_kappa: 2000.0,            // Prior mean

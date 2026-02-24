@@ -974,13 +974,13 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             }
 
             // Record fill side in cascade tracker for same-side run detection.
-            // Only accumulating fills count (position-aware).
             let is_buy = fill.side == "B" || fill.side.to_lowercase() == "buy";
             let fill_side = if is_buy { Side::Buy } else { Side::Sell };
             let current_pos = self.position.position();
-            if let Some(cascade_event) = self
-                .fill_cascade_tracker
-                .record_fill(fill_side, current_pos)
+            let fill_size: f64 = fill.sz.parse().unwrap_or(0.0);
+            if let Some(cascade_event) =
+                self.fill_cascade_tracker
+                    .record_fill(fill_side, current_pos, fill_size)
             {
                 // Cascade threshold newly crossed — cancel resting orders on the
                 // accumulating side immediately, before they get filled in the race.
@@ -1046,7 +1046,7 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
             let fill_event = WsFillEvent {
                 oid: fill.oid,
                 tid: fill.tid,
-                size: fill.sz.parse().unwrap_or(0.0),
+                size: fill_size,
                 price: fill_price,
                 is_buy,
                 coin: fill.coin.clone(),

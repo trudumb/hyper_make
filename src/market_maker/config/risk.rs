@@ -101,34 +101,57 @@ impl DynamicRiskConfig {
 
 /// Configuration for fill cascade detection and mitigation.
 ///
-/// When the MM receives clustered fills on one side, this controls
-/// how aggressively to widen spreads (widen) or suppress quoting (suppress)
-/// to prevent runaway position accumulation.
+/// Uses a size-weighted Hawkes process (one per side) to detect fill clustering.
+/// Intensity ratio λ/μ drives graduated response: burst → widen → suppress.
+/// Large fills excite more than small fills via `size_scale` normalization.
 #[derive(Debug, Clone)]
 pub struct CascadeConfig {
-    /// Number of same-side fills in 60s window to trigger spread widening.
-    pub widen_threshold: usize,
-    /// Number of same-side fills in 60s window to trigger suppress (reduce-only).
-    pub suppress_threshold: usize,
+    // === Hawkes process parameters ===
+    /// Baseline fill intensity μ (fills/sec/side). ~5 fills/min = 0.08.
+    pub baseline_intensity: f64,
+    /// Self-excitation α. Must be < β for stationarity.
+    pub alpha: f64,
+    /// Decay rate β (per second). β=0.1 → ~10s effective memory.
+    pub beta: f64,
+    /// Size normalization. Contribution per fill = α × (size / size_scale).
+    pub size_scale: f64,
+
+    // === Intensity ratio thresholds ===
+    /// λ/μ ratio to trigger widen (spread addon).
+    pub widen_intensity_ratio: f64,
+    /// λ/μ ratio to trigger suppress (reduce-only).
+    pub suppress_intensity_ratio: f64,
+    /// λ/μ ratio for burst detection (sigma boost). Lower than widen.
+    pub burst_intensity_ratio: f64,
+
+    // === Response parameters ===
     /// Spread additive widening (bps) when in widen mode.
     pub widen_addon_bps: f64,
-    /// Spread additive widening (bps) when in suppress mode (extreme widening before full suppress).
+    /// Spread additive widening (bps) when in suppress mode.
     pub suppress_addon_bps: f64,
     /// Cooldown duration in seconds for widen mode.
     pub widen_cooldown_secs: u64,
     /// Cooldown duration in seconds for suppress mode.
     pub suppress_cooldown_secs: u64,
+    /// Duration in seconds for sigma boost after burst detected.
+    pub burst_sigma_boost_secs: u64,
 }
 
 impl Default for CascadeConfig {
     fn default() -> Self {
         Self {
-            widen_threshold: 5,
-            suppress_threshold: 8,
+            baseline_intensity: 0.08,
+            alpha: 0.05,
+            beta: 0.1,
+            size_scale: 20.0,
+            widen_intensity_ratio: 3.0,
+            suppress_intensity_ratio: 5.0,
+            burst_intensity_ratio: 2.0,
             widen_addon_bps: 10.0,
             suppress_addon_bps: 20.0,
             widen_cooldown_secs: 15,
             suppress_cooldown_secs: 30,
+            burst_sigma_boost_secs: 30,
         }
     }
 }
@@ -136,10 +159,37 @@ impl Default for CascadeConfig {
 impl CascadeConfig {
     /// Validate cascade configuration invariants.
     pub fn validate(&self) -> Result<(), String> {
-        if self.suppress_threshold <= self.widen_threshold {
+        if self.baseline_intensity <= 0.0 {
             return Err(format!(
-                "suppress_threshold ({}) must be > widen_threshold ({})",
-                self.suppress_threshold, self.widen_threshold
+                "baseline_intensity must be > 0.0, got {}",
+                self.baseline_intensity
+            ));
+        }
+        if self.alpha <= 0.0 {
+            return Err(format!("alpha must be > 0.0, got {}", self.alpha));
+        }
+        if self.beta <= 0.0 {
+            return Err(format!("beta must be > 0.0, got {}", self.beta));
+        }
+        if self.alpha >= self.beta {
+            return Err(format!(
+                "alpha ({}) must be < beta ({}) for stationarity",
+                self.alpha, self.beta
+            ));
+        }
+        if self.size_scale <= 0.0 {
+            return Err(format!("size_scale must be > 0.0, got {}", self.size_scale));
+        }
+        if self.suppress_intensity_ratio <= self.widen_intensity_ratio {
+            return Err(format!(
+                "suppress_intensity_ratio ({}) must be > widen_intensity_ratio ({})",
+                self.suppress_intensity_ratio, self.widen_intensity_ratio
+            ));
+        }
+        if self.burst_intensity_ratio <= 1.0 {
+            return Err(format!(
+                "burst_intensity_ratio must be > 1.0, got {}",
+                self.burst_intensity_ratio
             ));
         }
         if self.widen_addon_bps < 0.0 {
@@ -312,9 +362,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cascade_config_validate_rejects_bad_thresholds() {
+    fn test_cascade_config_validate_rejects_bad_ratio_ordering() {
         let mut cfg = CascadeConfig::default();
-        cfg.suppress_threshold = cfg.widen_threshold; // equal -> invalid
+        cfg.suppress_intensity_ratio = cfg.widen_intensity_ratio; // equal -> invalid
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_cascade_config_validate_rejects_alpha_ge_beta() {
+        let mut cfg = CascadeConfig::default();
+        cfg.alpha = cfg.beta; // non-stationary
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_cascade_config_validate_rejects_zero_baseline() {
+        let mut cfg = CascadeConfig::default();
+        cfg.baseline_intensity = 0.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_cascade_config_validate_rejects_low_burst_ratio() {
+        let mut cfg = CascadeConfig::default();
+        cfg.burst_intensity_ratio = 1.0; // must be > 1.0
         assert!(cfg.validate().is_err());
     }
 }

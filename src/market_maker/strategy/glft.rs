@@ -213,10 +213,7 @@ pub fn expected_pnl_bps_enhanced(params: &EPnLParams) -> f64 {
     let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
 
     // Spread capture net of costs
-    let capture = params.depth_bps
-        - params.as_cost_bps
-        - params.fee_bps
-        - params.carry_cost_bps;
+    let capture = params.depth_bps - params.as_cost_bps - params.fee_bps - params.carry_cost_bps;
 
     // Drift contribution: directional, mirrors GLFT ±μ̂×τ/2 asymmetry.
     let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
@@ -391,10 +388,7 @@ pub fn expected_pnl_bps_with_diagnostics(params: &EPnLParams) -> (f64, EPnLDiagn
 
     let toxicity_cost = params.toxicity_score * (params.as_cost_bps + 2.0);
 
-    let capture = params.depth_bps
-        - params.as_cost_bps
-        - params.fee_bps
-        - params.carry_cost_bps;
+    let capture = params.depth_bps - params.as_cost_bps - params.fee_bps - params.carry_cost_bps;
 
     let drift_bps = params.drift_rate * 10_000.0 * params.time_horizon / 2.0;
     let drift_contribution = if params.is_bid { drift_bps } else { -drift_bps };
@@ -2911,8 +2905,6 @@ mod tests {
             "Self impact should be exactly subtracted"
         );
     }
-
-
 
     #[test]
     fn test_epnl_struct_matches_legacy() {
