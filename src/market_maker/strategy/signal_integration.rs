@@ -1124,16 +1124,24 @@ impl SignalIntegrator {
             0.0
         };
 
-        // === INVENTORY SKEW: Avellaneda-Stoikov reservation price shift ===
+        // === INVENTORY SKEW: Hybrid A-S / Linear fallback ===
         // A-S formula: shift = -q × γ × σ² × τ (in fractional price units)
-        // Replaces the old hardcoded ±5 bps linear inventory skew with the
-        // theoretically-grounded A-S reservation price offset.
-        // The formula self-limits via gamma, sigma, and tau — no arbitrary cap needed.
-        // Safety clamp retained as defense-first hard limit.
+        // At short horizons with realistic crypto σ (per-second), A-S produces
+        // negligible skew (~0.006 bps at pos=7.73, σ=0.000303, γ=0.15, τ=60).
+        // Fallback to direct linear skew (position_fraction × 5 bps) when A-S < 0.5 bps,
+        // ensuring meaningful inventory control at all times.
         let inventory_skew_bps = if self.config.use_inventory_skew && self.max_position > 0.0 {
-            let shift_frac = -self.position * self.as_gamma
+            let as_shift_frac = -self.position * self.as_gamma
                 * self.as_sigma * self.as_sigma * self.as_tau_s;
-            let shift_bps = shift_frac * 10_000.0;
+            let as_shift_bps = as_shift_frac * 10_000.0;
+            // Linear fallback: position_fraction × 5 bps (old proven formula)
+            let linear_fallback_bps = -(self.position / self.max_position) * 5.0;
+            // Use A-S when it produces meaningful skew, otherwise linear
+            let shift_bps = if as_shift_bps.abs() > 0.5 {
+                as_shift_bps
+            } else {
+                linear_fallback_bps
+            };
             // Safety clamp: prevents crossing even in extreme parameter regimes
             let max_skew_bps = self.config.max_lead_lag_skew_bps * 2.0;
             shift_bps.clamp(-max_skew_bps, max_skew_bps)

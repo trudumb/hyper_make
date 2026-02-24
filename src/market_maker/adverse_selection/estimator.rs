@@ -710,6 +710,11 @@ impl AdverseSelectionEstimator {
         self.informed_threshold_bps
     }
 
+    /// Whether the Hawkes GMM has provided a P(informed) signal.
+    pub fn has_gmm_signal(&self) -> bool {
+        self.gmm_alpha_signal.is_some()
+    }
+
     /// Arrow-Pratt variance risk premium: prices AS uncertainty as 0.5 × γ × Var[AS].
     ///
     /// Returns an **additive** bps premium (NOT a multiplier). This replaces the old

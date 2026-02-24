@@ -2900,36 +2900,46 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
 
         // === TOXICITY HANDLING ===
         // Normal toxicity routes through GLFT parameter space (AS multipliers on spread).
-        // Binary side-clearing at LOW thresholds was the root cause of the bid=0 death spiral.
-        //
-        // EXTREME toxicity (>0.75): cancel resting orders on the toxic side to avoid
-        // getting filled at minimum tick during a directional move. This is distinct from
-        // the death spiral case because: (1) threshold is very high, (2) 5s cooldown prevents
-        // oscillation, (3) only clears one side at a time.
-        const TOXICITY_CANCEL_THRESHOLD: f64 = 0.75;
-        const TOXICITY_CANCEL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+        // Binary side-clearing is ALWAYS wrong (domain gotcha) — it was the root cause of
+        // the bid=0 death spiral. Instead, apply extreme spread widening (+50 bps) which
+        // keeps quotes in the book but makes them very wide. The E[PnL] filter will
+        // naturally drop the worst levels.
+        const TOXICITY_WIDEN_THRESHOLD: f64 = 0.75;
+        const TOXICITY_WIDEN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+        const TOXICITY_EXTREME_WIDEN_BPS: f64 = 50.0;
         let now = std::time::Instant::now();
+        let mid = quote_config.mid_price;
 
-        if market_params.pre_fill_toxicity_bid > TOXICITY_CANCEL_THRESHOLD
+        if market_params.pre_fill_toxicity_bid > TOXICITY_WIDEN_THRESHOLD
             && self.last_toxicity_cancel_bid
-                .is_none_or(|t| now.duration_since(t) > TOXICITY_CANCEL_COOLDOWN)
+                .is_none_or(|t| now.duration_since(t) > TOXICITY_WIDEN_COOLDOWN)
         {
-            ladder.bids.clear();
+            let widen_price = TOXICITY_EXTREME_WIDEN_BPS * mid / 10_000.0;
+            for quote in ladder.bids.iter_mut() {
+                quote.price -= widen_price; // Push bids lower (wider)
+            }
             self.last_toxicity_cancel_bid = Some(now);
             tracing::warn!(
                 toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_bid),
-                "Cancel-on-toxicity: cleared bid ladder (extreme toxic flow on bid side)"
+                widen_bps = %format!("{:.1}", TOXICITY_EXTREME_WIDEN_BPS),
+                bid_count = ladder.bids.len(),
+                "Toxicity defense: widened bid ladder (extreme toxic flow on bid side)"
             );
         }
-        if market_params.pre_fill_toxicity_ask > TOXICITY_CANCEL_THRESHOLD
+        if market_params.pre_fill_toxicity_ask > TOXICITY_WIDEN_THRESHOLD
             && self.last_toxicity_cancel_ask
-                .is_none_or(|t| now.duration_since(t) > TOXICITY_CANCEL_COOLDOWN)
+                .is_none_or(|t| now.duration_since(t) > TOXICITY_WIDEN_COOLDOWN)
         {
-            ladder.asks.clear();
+            let widen_price = TOXICITY_EXTREME_WIDEN_BPS * mid / 10_000.0;
+            for quote in ladder.asks.iter_mut() {
+                quote.price += widen_price; // Push asks higher (wider)
+            }
             self.last_toxicity_cancel_ask = Some(now);
             tracing::warn!(
                 toxicity = %format!("{:.3}", market_params.pre_fill_toxicity_ask),
-                "Cancel-on-toxicity: cleared ask ladder (extreme toxic flow on ask side)"
+                widen_bps = %format!("{:.1}", TOXICITY_EXTREME_WIDEN_BPS),
+                ask_count = ladder.asks.len(),
+                "Toxicity defense: widened ask ladder (extreme toxic flow on ask side)"
             );
         }
 
@@ -3747,12 +3757,20 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
         let shift_bps = raw_shift.clamp(-max_shift, max_shift) * 10_000.0;
 
         let spread_bps = market_params.market_spread_bps;
-        let skew_bps = market_params.rl_bid_skew_bps - market_params.rl_ask_skew_bps;
+        // Fix: use actual inventory skew sources instead of legacy RL fields (always 0.0)
+        let position_guard_skew = self.safety.position_guard.inventory_skew_bps();
+        let skew_bps = market_params.lead_lag_signal_bps;
 
         // Gamma defense diagnostics: log risk features that feed into gamma
         let toxicity = market_params.toxicity_score;
         let cascade = market_params.cascade_intensity;
         let tail_risk = market_params.tail_risk_intensity;
+
+        // GM/Arrow-Pratt diagnostics from AS estimator
+        let gm_spread_adj_bps = self.tier1.adverse_selection.spread_adjustment_bps();
+        let p_informed = self.tier1.adverse_selection.predicted_alpha();
+        let variance_premium_bps = self.tier1.adverse_selection.as_variance_risk_premium_bps(market_params.adaptive_gamma);
+        let gmm_signal = self.tier1.adverse_selection.has_gmm_signal();
 
         // Q18: Vol sampling bias diagnostics
         let vol_bias_ratio = self.sampling_bias_tracker.sampling_bias_ratio();
@@ -3787,6 +3805,11 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 fillable = %format!("{:.3}", fillable_frac),
                 sigma_corrected = %format!("{:.3}", sigma_correction),
                 burst_boost = %format!("{:.1}", burst_boost),
+                gm_spread_adj_bps = %format!("{:.2}", gm_spread_adj_bps),
+                p_informed = %format!("{:.3}", p_informed),
+                var_premium_bps = %format!("{:.2}", variance_premium_bps),
+                gmm_signal,
+                pos_guard_skew = %format!("{:.2}", position_guard_skew),
                 "ESTIMATOR_DIAGNOSTICS"
             );
         } else {
@@ -3795,11 +3818,16 @@ impl<S: QuotingStrategy, Env: TradingEnvironment> MarketMaker<S, Env> {
                 sigma_ratio = %format!("{:.3}", sigma_ratio),
                 mid_shift_bps = %format!("{:.3}", shift_bps),
                 spread_bps = %format!("{:.2}", spread_bps),
+                skew_bps = %format!("{:.2}", skew_bps),
                 toxicity = %format!("{:.2}", toxicity),
                 cascade = %format!("{:.2}", cascade),
                 vol_bias = %format!("{:.3}", vol_bias_ratio),
                 sigma_corrected = %format!("{:.3}", sigma_correction),
                 burst_boost = %format!("{:.1}", burst_boost),
+                gm_spread_adj_bps = %format!("{:.2}", gm_spread_adj_bps),
+                p_informed = %format!("{:.3}", p_informed),
+                var_premium_bps = %format!("{:.2}", variance_premium_bps),
+                gmm_signal,
                 "ESTIMATOR_DIAGNOSTICS"
             );
         }

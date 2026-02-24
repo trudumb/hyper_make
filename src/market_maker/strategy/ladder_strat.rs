@@ -1326,6 +1326,10 @@ impl LadderStrategy {
             let bid_threshold = if bid_is_reducing { reducing_thresh } else { 0.0 };
             let ask_threshold = if ask_is_reducing { reducing_thresh } else { 0.0 };
 
+            // Save closest levels before filtering — needed for cascade exemption
+            let closest_bid_depth = dynamic_depths.bid.first().copied();
+            let closest_ask_depth = dynamic_depths.ask.first().copied();
+
             dynamic_depths.bid.retain(|&depth| {
                 bid_params.depth_bps = depth;
                 super::glft::expected_pnl_bps_enhanced(&bid_params) > bid_threshold
@@ -1334,6 +1338,36 @@ impl LadderStrategy {
                 ask_params.depth_bps = depth;
                 super::glft::expected_pnl_bps_enhanced(&ask_params) > ask_threshold
             });
+
+            // Cascade exemption: when cascade addons push depths so wide that ALL levels
+            // have negative E[PnL], exempt the closest level to prevent complete side
+            // starvation. Without this, a 20+ bps cascade addon kills all levels because
+            // fill probability at extreme depths ≈ 0, making E[PnL] ≈ 0 - AS < 0.
+            const CASCADE_EXEMPT_THRESHOLD_BPS: f64 = 10.0;
+            if dynamic_depths.bid.is_empty() && pre_bid_count > 0
+                && market_params.cascade_bid_addon_bps > CASCADE_EXEMPT_THRESHOLD_BPS
+            {
+                if let Some(depth) = closest_bid_depth {
+                    dynamic_depths.bid.push(depth);
+                    tracing::info!(
+                        depth_bps = %format!("{:.2}", depth),
+                        cascade_addon_bps = %format!("{:.1}", market_params.cascade_bid_addon_bps),
+                        "E[PnL] cascade exemption: kept closest bid level"
+                    );
+                }
+            }
+            if dynamic_depths.ask.is_empty() && pre_ask_count > 0
+                && market_params.cascade_ask_addon_bps > CASCADE_EXEMPT_THRESHOLD_BPS
+            {
+                if let Some(depth) = closest_ask_depth {
+                    dynamic_depths.ask.push(depth);
+                    tracing::info!(
+                        depth_bps = %format!("{:.2}", depth),
+                        cascade_addon_bps = %format!("{:.1}", market_params.cascade_ask_addon_bps),
+                        "E[PnL] cascade exemption: kept closest ask level"
+                    );
+                }
+            }
 
             let bid_dropped = pre_bid_count - dynamic_depths.bid.len();
             let ask_dropped = pre_ask_count - dynamic_depths.ask.len();
